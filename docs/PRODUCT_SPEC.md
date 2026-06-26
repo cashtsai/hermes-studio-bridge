@@ -1,7 +1,7 @@
 # Studio OS — Product Spec
 
 > 善彰的個人 OS:一個像通訊軟體的 App,作為 Studio(cashcamp)上多個 agent 的統一窗口。
-> 活文件 — 隨設計逐段更新。狀態:§1 已鎖,§2 討論中。
+> 活文件 — 隨設計逐段更新。狀態:§1–§3 已鎖 + Roadmap;**M1 完成**(會話續 Telegram canonical→持倉/脈絡回來 build 56;通訊軟體式聊天列表+2 分頁)。下一個 M2。
 
 ## 北極星(一句話)
 
