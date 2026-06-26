@@ -94,10 +94,17 @@ class ACPSession:
                         fut.set_result(msg.get("result"))
             elif msg.get("method") == "session/update":
                 upd = (msg.get("params") or {}).get("update") or {}
-                if upd.get("sessionUpdate") == "agent_message_chunk":
+                kind = upd.get("sessionUpdate")
+                if kind == "agent_message_chunk":
                     text = (upd.get("content") or {}).get("text", "")
                     if text and self._active_q is not None:
-                        self._active_q.put_nowait(text)
+                        self._active_q.put_nowait(("text", text))
+                elif kind == "tool_call":
+                    # title is "functionName: summary" or just "functionName"
+                    title = (upd.get("title") or "").strip()
+                    name = (title.split(":", 1)[0].strip() or "tool")
+                    if self._active_q is not None:
+                        self._active_q.put_nowait(("tool", name))
             elif msg.get("method") == "session/request_permission" and mid is not None:
                 opts = (msg.get("params") or {}).get("options") or []
                 allow = None

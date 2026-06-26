@@ -63,8 +63,9 @@ async def acp_full(model: str, prompt: str) -> str:
     """Collect a whole ACP turn into one string (non-streaming clients)."""
     session = await POOL.get(model, home_for(model))
     parts = []
-    async for piece in session.prompt_stream(prompt):
-        parts.append(piece)
+    async for kind, val in session.prompt_stream(prompt):
+        if kind == "text":
+            parts.append(val)
     return ("".join(parts)).strip() or "(空回應)"
 
 
@@ -153,33 +154,38 @@ async def chat_completions(request: Request):
             async def pump():
                 try:
                     session = await POOL.get(model, home_for(model))
-                    async for piece in session.prompt_stream(prompt):
-                        await q.put(("c", piece))
+                    async for kind, val in session.prompt_stream(prompt):
+                        await q.put((kind, val))            # ("text", …) / ("tool", name)
                 except Exception as e:                      # noqa: BLE001
-                    await q.put(("e", str(e)))
+                    await q.put(("error", str(e)))
                 finally:
-                    await q.put(("done", None))
+                    await q.put(("end", None))
 
             asyncio.create_task(pump())
-            got_any = False
+            got_text = False
+            seen_tools: set[str] = set()
             while True:
                 try:
                     kind, val = await asyncio.wait_for(q.get(), timeout=2.0)
                 except asyncio.TimeoutError:
                     yield ": keepalive\n\n"
                     continue
-                if kind == "c":
-                    got_any = True
+                if kind == "text":
+                    got_text = True
                     yield chunk({"content": val})
-                elif kind == "e":
-                    if not got_any:                          # ACP failed cold → fall back
+                elif kind == "tool":
+                    if val not in seen_tools:                # one status line per tool
+                        seen_tools.add(val)
+                        yield chunk({"content": f"\n› 🔧 `{val}`\n"})
+                elif kind == "error":
+                    if not got_text:                         # ACP failed cold → fall back
                         try:
                             yield chunk({"content": await run_hermes(model, prompt)})
                         except Exception as e2:              # noqa: BLE001
                             yield chunk({"content": f"⚠️ {e2}"})
                     else:
                         yield chunk({"content": f"\n\n⚠️ 串流中斷:{val}"})
-                else:  # done
+                else:  # end
                     break
             yield chunk({}, finish="stop")
             yield "data: [DONE]\n\n"
