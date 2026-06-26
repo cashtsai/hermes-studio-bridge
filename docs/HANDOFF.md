@@ -59,3 +59,9 @@ neither restarts or reconfigures the other.
 1. ~~Real ACP streaming~~ ✅ DONE (`acp_client.py`, persistent warm process + live chunks + auto-permission). Next: surface tool-call progress as visible steps.
 2. **HTTPS** via Tailscale Serve; drop the iOS `NSAllowsArbitraryLoads`.
 3. Per-conversation sessions (currently one `--continue owui-<persona>` per persona).
+
+## M3 — CC/Codex 調度(dispatch)
+
+- **bridge `POST /dispatch`** `{tool:claude-code|codex, task, cwd, parent}` → spawn headless 子 agent(`claude -p --output-format stream-json --permission-mode bypassPermissions` / `codex exec`),註冊成子會話,串流轉錄。子會話用 `model=<session_id>` 經 `/v1/chat/completions` 重播。
+- **`deploy/studio-dispatch`** → `~/.local/bin/studio-dispatch`(token 讀 `~/.config/studio/token`)。Hermes persona 經 skill `studio-dispatch`(在各 home 的 skills)呼叫它派工。
+- 權限:子 agent 走 `bypassPermissions`(善彰已授權),轉錄全攤在 App、可中斷。

@@ -1,0 +1,8 @@
+#!/bin/zsh
+# studio-dispatch <claude-code|codex> "<task>" [cwd] [parent]
+# 派一個 Claude Code / Codex 子 agent 到 Studio,回傳 session id(會出現在 App)。
+TOKEN=$(cat ~/.config/studio/token 2>/dev/null)
+TOOL="${1:-claude-code}"; TASK="$2"; CWD="${3:-$PWD}"; PARENT="${4:-yuanfang}"
+[ -z "$TASK" ] && { echo "用法: studio-dispatch <claude-code|codex> \"<task>\" [cwd] [parent]"; exit 1; }
+BODY=$(TASK="$TASK" TOOL="$TOOL" CWD="$CWD" PARENT="$PARENT" python3 -c 'import json,os;print(json.dumps({"tool":os.environ["TOOL"],"task":os.environ["TASK"],"cwd":os.environ["CWD"],"parent":os.environ["PARENT"]}))')
+curl -s http://127.0.0.1:8081/dispatch -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" -d "$BODY"
