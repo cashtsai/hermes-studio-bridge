@@ -301,8 +301,19 @@ async def _run_dispatch(sid: str, tool: str, task: str, cwd: str):
         if tool == "codex":
             argv = [CODEX_BIN, "exec", "--json", task]
         else:  # claude-code
-            argv = [CLAUDE_BIN, "-p", task, "--output-format", "stream-json",
-                    "--verbose", "--permission-mode", "bypassPermissions"]
+            # M4: give the sub-agent the studio-memory MCP so it shares the
+            # parent persona's canonical Hermes long-term memory.
+            mem_home = home_for(sub.get("parent", "yuanfang"))
+            mcp_cfg = json.dumps({"mcpServers": {"studio-memory": {
+                "command": "python3",
+                "args": ["/Users/xcash/apps/hermes-openwebui-bridge/studio_memory_mcp.py"],
+                "env": {"STUDIO_MEMORY_HOME": mem_home}}}}, ensure_ascii=False)
+            hint = ("你可以用 studio-memory MCP 的 read_memory / search_memory 讀善彰的"
+                    "Hermes 長期記憶(身份、持倉、專案、人脈),做任務前先讀以對齊脈絡;"
+                    "有值得長期記住的新事實再用 write_memory 寫回。")
+            argv = [CLAUDE_BIN, "-p", task, "--output-format", "stream-json", "--verbose",
+                    "--permission-mode", "bypassPermissions",
+                    "--mcp-config", mcp_cfg, "--append-system-prompt", hint]
         proc = await asyncio.create_subprocess_exec(
             *argv, cwd=cwd, stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL)
