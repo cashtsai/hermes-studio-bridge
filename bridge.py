@@ -25,6 +25,10 @@ from acp_client import ACPPool
 # fallback if ACP ever fails.
 POOL = ACPPool()
 
+# M2/M3 — registry of dispatched CC/Codex sub-sessions, surfaced in GET /sessions
+# and continuable like a persona. Keyed by an opaque session id.
+SUBSESSIONS: dict = {}
+
 # Bearer token gate. The bridge fronts a tool-executing agent, so it must not
 # be an open control surface even on the tailnet. Open WebUI sends this as its
 # OpenAI API key. Override via the BRIDGE_TOKEN env var.
@@ -249,6 +253,46 @@ async def chat_completions(request: Request):
     })
 
 
+def _persona_preview(home: str):
+    """Latest message of the persona's canonical Telegram session → (text, ts)."""
+    import sqlite3
+    db = os.path.join(home, "state.db")
+    if not os.path.exists(db):
+        return (None, None)
+    try:
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=5)
+        cur = con.execute(
+            "SELECT m.content, m.timestamp FROM messages m "
+            "JOIN sessions s ON s.id = m.session_id "
+            "WHERE s.source='telegram' AND m.role IN ('user','assistant') "
+            "AND m.content IS NOT NULL AND m.content != '' "
+            "ORDER BY m.timestamp DESC LIMIT 1")
+        row = cur.fetchone()
+        con.close()
+        if row:
+            return (str(row[0])[:80], row[1])
+    except Exception:
+        pass
+    return (None, None)
+
+
+@app.get("/sessions")
+async def list_sessions(request: Request):
+    """Unified conversation list: personas (pinned) + dispatched sub-sessions."""
+    _check_auth(request)
+    out = []
+    for mid, (disp, home) in PERSONAS.items():
+        text, ts = _persona_preview(home)
+        out.append({"id": mid, "type": "persona", "name": disp,
+                    "preview": text, "lastAt": ts, "status": "idle"})
+    for key, s in SUBSESSIONS.items():
+        out.append({"id": key, "type": "subprocess", "name": s.get("name"),
+                    "parent": s.get("parent"), "tool": s.get("tool"),
+                    "preview": s.get("preview"), "lastAt": s.get("lastAt"),
+                    "status": s.get("status", "running")})
+    return {"sessions": out}
+
+
 @app.get("/health")
 async def health():
-    return {"ok": True, "personas": list(PERSONAS)}
+    return {"ok": True, "personas": list(PERSONAS), "subsessions": len(SUBSESSIONS)}
