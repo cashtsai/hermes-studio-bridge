@@ -68,8 +68,37 @@ class ACPSession:
                 "protocolVersion": 1, "clientCapabilities": {},
                 "clientInfo": {"name": "studio-bridge", "version": "1.0"},
             }, timeout=30)
+            # M1: continue the persona's canonical conversation (the Telegram
+            # session the gateway drives) so accumulated context — holdings,
+            # projects, people — is present, instead of a blank session/new.
+            sid = self._latest_telegram_session()
+            if sid:
+                try:
+                    await self._request("session/load",
+                                        {"cwd": self.home, "sessionId": sid, "mcpServers": []},
+                                        timeout=120)
+                    self.session_id = sid
+                    return
+                except Exception:
+                    pass
             r = await self._request("session/new", {"cwd": self.home, "mcpServers": []}, timeout=60)
             self.session_id = (r or {}).get("sessionId")
+
+    def _latest_telegram_session(self):
+        import sqlite3
+        db = os.path.join(self.home, "state.db")
+        if not os.path.exists(db):
+            return None
+        try:
+            con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=5)
+            cur = con.execute(
+                "SELECT id FROM sessions WHERE source='telegram' AND message_count > 0 "
+                "ORDER BY started_at DESC LIMIT 1")
+            row = cur.fetchone()
+            con.close()
+            return row[0] if row else None
+        except Exception:
+            return None
 
     async def _read_loop(self):
         proc = self.proc
