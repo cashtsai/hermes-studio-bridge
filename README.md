@@ -45,7 +45,7 @@ Reach it from your phone over Tailscale: **http://100.67.0.12:3000**
 
 ## Roadmap / known limits
 
-- **Streaming is heartbeat-based** (keepalive every 2s, then the full reply) — this fixes the long-turn "connection lost". Real token-by-token + tool-progress streaming = drive Hermes **ACP** instead of `hermes -z` (next optimization).
+- **Streaming is live over a persistent ACP session** (`acp_client.py`): one warm `hermes acp` process per persona removes the ~5s `hermes -z` cold start (warm turn ≈1.6s vs ≈6s) and streams real text chunks. SSE keepalives cover pre-first-token gaps. Cold `hermes -z` remains a fallback. Tool permission prompts are auto-approved.
 - One ongoing session per persona (`--continue owui-<persona>`); no per-conversation isolation yet.
 - `hermes -z` shares the persona `state.db` with its live Telegram gateway — fine in practice, watch for write contention on very long turns.
 

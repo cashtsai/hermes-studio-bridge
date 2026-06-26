@@ -18,6 +18,13 @@ import uuid
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
 
+from acp_client import ACPPool
+
+# Persistent warm ACP process per persona — removes the ~5s `hermes -z`
+# cold start per message and streams output live. Cold `hermes -z` stays as a
+# fallback if ACP ever fails.
+POOL = ACPPool()
+
 # Bearer token gate. The bridge fronts a tool-executing agent, so it must not
 # be an open control surface even on the tailnet. Open WebUI sends this as its
 # OpenAI API key. Override via the BRIDGE_TOKEN env var.
@@ -46,6 +53,20 @@ PERSONAS = {
 # one continuing conversation per persona (matches "talk to each persona").
 def session_name(model: str) -> str:
     return f"owui-{model}"
+
+
+def home_for(model: str) -> str:
+    return PERSONAS.get(model, (None, HOME_ROOT))[1]
+
+
+async def acp_full(model: str, prompt: str) -> str:
+    """Collect a whole ACP turn into one string (non-streaming clients)."""
+    session = await POOL.get(model, home_for(model))
+    parts = []
+    async for piece in session.prompt_stream(prompt):
+        parts.append(piece)
+    return ("".join(parts)).strip() or "(空回應)"
+
 
 app = FastAPI(title="Hermes ↔ OpenAI bridge")
 
@@ -108,12 +129,11 @@ async def chat_completions(request: Request):
     created = int(time.time())
 
     if stream:
-        # Heartbeat streaming: Hermes turns are agentic and can run 60–90s.
-        # A plain blocking response with no bytes for that long gets the
-        # client connection dropped ("network connection lost"). We run the
-        # turn in the background and emit SSE keepalive comments every ~2s so
-        # the connection stays alive, then push the full reply. (Real
-        # token-by-token streaming + tool progress = ACP, a later upgrade.)
+        # Live streaming over a warm ACP session: a background pump feeds text
+        # chunks onto a queue; the SSE generator drains it with a 2s timeout,
+        # emitting keepalive comments during gaps (e.g. tool reasoning before
+        # the first token) so the socket never goes idle long enough to drop.
+        # Falls back to cold `hermes -z` only if ACP yields nothing.
         async def gen():
             def chunk(delta, finish=None):
                 payload = {"id": cid, "object": "chat.completion.chunk",
@@ -124,19 +144,51 @@ async def chat_completions(request: Request):
             yield chunk({"role": "assistant", "content": ""})  # open the bubble
             if not prompt:
                 yield chunk({"content": "(沒有收到訊息)"})
-            else:
-                task = asyncio.create_task(run_hermes(model, prompt))
-                while not task.done():
-                    try:
-                        await asyncio.wait_for(asyncio.shield(task), timeout=2.0)
-                    except asyncio.TimeoutError:
-                        yield ": keepalive\n\n"   # SSE comment — keeps the socket warm
-                yield chunk({"content": task.result()})
+                yield chunk({}, finish="stop")
+                yield "data: [DONE]\n\n"
+                return
+
+            q: asyncio.Queue = asyncio.Queue()
+
+            async def pump():
+                try:
+                    session = await POOL.get(model, home_for(model))
+                    async for piece in session.prompt_stream(prompt):
+                        await q.put(("c", piece))
+                except Exception as e:                      # noqa: BLE001
+                    await q.put(("e", str(e)))
+                finally:
+                    await q.put(("done", None))
+
+            asyncio.create_task(pump())
+            got_any = False
+            while True:
+                try:
+                    kind, val = await asyncio.wait_for(q.get(), timeout=2.0)
+                except asyncio.TimeoutError:
+                    yield ": keepalive\n\n"
+                    continue
+                if kind == "c":
+                    got_any = True
+                    yield chunk({"content": val})
+                elif kind == "e":
+                    if not got_any:                          # ACP failed cold → fall back
+                        try:
+                            yield chunk({"content": await run_hermes(model, prompt)})
+                        except Exception as e2:              # noqa: BLE001
+                            yield chunk({"content": f"⚠️ {e2}"})
+                    else:
+                        yield chunk({"content": f"\n\n⚠️ 串流中斷:{val}"})
+                else:  # done
+                    break
             yield chunk({}, finish="stop")
             yield "data: [DONE]\n\n"
         return StreamingResponse(gen(), media_type="text/event-stream")
 
-    content = "(沒有收到訊息)" if not prompt else await run_hermes(model, prompt)
+    try:
+        content = "(沒有收到訊息)" if not prompt else await acp_full(model, prompt)
+    except Exception:
+        content = await run_hermes(model, prompt)
     return JSONResponse({
         "id": cid, "object": "chat.completion", "created": created, "model": model,
         "choices": [{"index": 0, "message": {"role": "assistant", "content": content},

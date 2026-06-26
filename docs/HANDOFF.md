@@ -56,7 +56,6 @@ neither restarts or reconfigures the other.
 
 ## Next optimizations (not yet done)
 
-1. **Real ACP streaming** — replace `hermes -z` with an ACP client so tokens +
-   tool progress stream live (vs. heartbeat-then-dump).
+1. ~~Real ACP streaming~~ ✅ DONE (`acp_client.py`, persistent warm process + live chunks + auto-permission). Next: surface tool-call progress as visible steps.
 2. **HTTPS** via Tailscale Serve; drop the iOS `NSAllowsArbitraryLoads`.
 3. Per-conversation sessions (currently one `--continue owui-<persona>` per persona).
