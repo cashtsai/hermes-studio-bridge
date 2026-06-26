@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>ai.studio.hermes-bridge</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/xcash/apps/hermes-agent/runtime/venv/bin/python</string>
+        <string>-m</string>
+        <string>uvicorn</string>
+        <string>bridge:app</string>
+        <string>--host</string>
+        <string>0.0.0.0</string>
+        <string>--port</string>
+        <string>8081</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/xcash/apps/hermes-openwebui-bridge</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/Users/xcash/apps/hermes-agent/runtime/venv/bin:/Users/xcash/.local/bin:/Users/xcash/.local/node-v24.14.1-darwin-arm64/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>BRIDGE_TOKEN</key>
+        <string>REPLACE_WITH_BRIDGE_TOKEN</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/Users/xcash/apps/hermes-openwebui-bridge/bridge.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/xcash/apps/hermes-openwebui-bridge/bridge.err.log</string>
+</dict>
+</plist>
