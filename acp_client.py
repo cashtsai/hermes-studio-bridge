@@ -141,12 +141,26 @@ class ACPSession:
                     allow = opts[0].get("optionId")
                 await self._send({"jsonrpc": "2.0", "id": mid,
                                   "result": {"outcome": {"outcome": "selected", "optionId": allow}}})
+                # surface what was auto-approved so the client can show it
+                if self._active_q is not None:
+                    title = ((msg.get("params") or {}).get("toolCall") or {}).get("title") \
+                        or (msg.get("params") or {}).get("title") or "工具"
+                    self._active_q.put_nowait(("perm", str(title).split(":", 1)[0].strip()))
         # process died — fail any waiters so callers don't hang
         for fut in self._pending.values():
             if not fut.done():
                 fut.set_exception(RuntimeError("acp process ended"))
         self._pending.clear()
         self.session_id = None
+
+    async def cancel(self):
+        """Interrupt the current turn (Esc-style)."""
+        if self.proc and self.proc.returncode is None and self.session_id:
+            try:
+                await self._send({"jsonrpc": "2.0", "method": "session/cancel",
+                                  "params": {"sessionId": self.session_id}})
+            except Exception:
+                pass
 
     async def prompt_stream(self, text: str):
         """Async generator yielding text chunks for one turn."""

@@ -150,12 +150,12 @@ async def chat_completions(request: Request):
                 return
 
             q: asyncio.Queue = asyncio.Queue()
+            session = await POOL.get(model, home_for(model))
 
             async def pump():
                 try:
-                    session = await POOL.get(model, home_for(model))
                     async for kind, val in session.prompt_stream(prompt):
-                        await q.put((kind, val))            # ("text", …) / ("tool", name)
+                        await q.put((kind, val))
                 except Exception as e:                      # noqa: BLE001
                     await q.put(("error", str(e)))
                 finally:
@@ -163,6 +163,8 @@ async def chat_completions(request: Request):
 
             asyncio.create_task(pump())
             got_text = False
+            completed = False
+            last_usage = None
             thought_buf: list[str] = []
 
             def flush_thought():
@@ -173,50 +175,65 @@ async def chat_completions(request: Request):
                         return f"\n<details><summary>💭 思考</summary>\n\n{t}\n\n</details>\n\n"
                 return None
 
-            while True:
-                try:
-                    kind, val = await asyncio.wait_for(q.get(), timeout=2.0)
-                except asyncio.TimeoutError:
-                    yield ": keepalive\n\n"
-                    continue
-                if kind == "text":
-                    if not got_text:                         # surface buffered thinking first
-                        ft = flush_thought()
-                        if ft:
-                            yield chunk({"content": ft})
-                    got_text = True
-                    yield chunk({"content": val})
-                elif kind == "thought":
-                    thought_buf.append(val)                   # buffered, shown before the answer
-                elif kind == "tool_start":
-                    name = val.get("name", "tool")
-                    cmd = (val.get("cmd") or "").strip().splitlines()
-                    cmd1 = (cmd[0] if cmd else "")[:140]
-                    line = f"\n› 🔧 **{name}**" + (f" `{cmd1}`" if cmd1 else "") + "\n"
-                    yield chunk({"content": line})
-                elif kind == "tool_result":
-                    res = (val.get("text") or "").strip()
-                    if res:
-                        short = res[:900]
-                        more = "\n…(截斷)" if len(res) > 900 else ""
-                        yield chunk({"content":
-                            f"<details><summary>↳ 結果</summary>\n\n```\n{short}{more}\n```\n\n</details>\n"})
-                elif kind == "usage":
-                    pass                                     # Phase 2: status line
-                elif kind == "error":
-                    if not got_text:                         # ACP failed cold → fall back
-                        try:
-                            yield chunk({"content": await run_hermes(model, prompt)})
-                        except Exception as e2:              # noqa: BLE001
-                            yield chunk({"content": f"⚠️ {e2}"})
-                    else:
-                        yield chunk({"content": f"\n\n⚠️ 串流中斷:{val}"})
-                else:  # end
-                    break
-            ft = flush_thought()                             # thinking but no answer text
-            if ft:
-                yield chunk({"content": ft})
-            yield chunk({}, finish="stop")
+            try:
+                while True:
+                    try:
+                        kind, val = await asyncio.wait_for(q.get(), timeout=2.0)
+                    except asyncio.TimeoutError:
+                        yield ": keepalive\n\n"
+                        continue
+                    if kind == "text":
+                        if not got_text:                     # surface buffered thinking first
+                            ft = flush_thought()
+                            if ft:
+                                yield chunk({"content": ft})
+                        got_text = True
+                        yield chunk({"content": val})
+                    elif kind == "thought":
+                        thought_buf.append(val)              # buffered, shown before the answer
+                    elif kind == "tool_start":
+                        name = val.get("name", "tool")
+                        cmd = (val.get("cmd") or "").strip().splitlines()
+                        cmd1 = (cmd[0] if cmd else "")[:140]
+                        line = f"\n› 🔧 **{name}**" + (f" `{cmd1}`" if cmd1 else "") + "\n"
+                        yield chunk({"content": line})
+                    elif kind == "tool_result":
+                        res = (val.get("text") or "").strip()
+                        if res:
+                            short = res[:900]
+                            more = "\n…(截斷)" if len(res) > 900 else ""
+                            yield chunk({"content":
+                                f"<details><summary>↳ 結果</summary>\n\n```\n{short}{more}\n```\n\n</details>\n"})
+                    elif kind == "perm":
+                        yield chunk({"content": f"\n› 🔐 自動允許 **{val}**\n"})
+                    elif kind == "usage":
+                        last_usage = val                     # {used, size} — emitted in final chunk
+                    elif kind == "error":
+                        if not got_text:                     # ACP failed cold → fall back
+                            try:
+                                yield chunk({"content": await run_hermes(model, prompt)})
+                            except Exception as e2:          # noqa: BLE001
+                                yield chunk({"content": f"⚠️ {e2}"})
+                        else:
+                            yield chunk({"content": f"\n\n⚠️ 串流中斷:{val}"})
+                    else:  # end
+                        completed = True
+                        break
+                ft = flush_thought()                         # thinking but no answer text
+                if ft:
+                    yield chunk({"content": ft})
+            finally:
+                if not completed:
+                    # client disconnected mid-turn → interrupt the agent (Esc).
+                    asyncio.create_task(session.cancel())
+
+            final = {"index": 0, "delta": {}, "finish_reason": "stop"}
+            payload = {"id": cid, "object": "chat.completion.chunk", "created": created,
+                       "model": model, "choices": [final]}
+            if last_usage and last_usage.get("size"):
+                payload["usage"] = {"context_used": last_usage.get("used"),
+                                    "context_size": last_usage.get("size")}
+            yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
             yield "data: [DONE]\n\n"
         return StreamingResponse(gen(), media_type="text/event-stream")
 
