@@ -1,7 +1,7 @@
 # Studio OS — Product Spec
 
 > 善彰的個人 OS:一個像通訊軟體的 App,作為 Studio(cashcamp)上多個 agent 的統一窗口。
-> 活文件 — 隨設計逐段更新。狀態:§1–§3 已鎖 + Roadmap;**M1 完成** + **M2 完成**(GET /sessions 控制通道 + 子會話註冊表,真實對話預覽)。**M3 完成**(bridge /dispatch spawn CC/Codex 子會話、studio-dispatch CLI + 袁方 skill、App 列表顯示子會話+唯讀轉錄 build 57)。下一個 M4(MCP 記憶)/M5(附件/品牌)。
+> 活文件 — 隨設計逐段更新。狀態:§1–§3 已鎖 + Roadmap;**M1 完成** + **M2 完成**(GET /sessions 控制通道 + 子會話註冊表,真實對話預覽)。**M3 完成**(bridge /dispatch spawn CC/Codex 子會話、studio-dispatch CLI + 袁方 skill、App 列表顯示子會話+唯讀轉錄 build 57)。**M4 完成**(studio-memory MCP,CC/Codex 讀寫 Hermes 記憶,實測通過)。剩 M5(附件/品牌)。
 
 ## 北極星(一句話)
 
