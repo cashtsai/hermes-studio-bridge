@@ -134,6 +134,18 @@ async def chat_completions(request: Request):
     if model in SUBSESSIONS:
         sub = SUBSESSIONS[model]
 
+        # Follow-up turn: a new, non-empty user message resumes the sub-agent.
+        # Stream from the current tail so we don't re-replay the whole transcript.
+        new_prompt = _last_user_message(body.get("messages", []))
+        start_idx = 0
+        if new_prompt and new_prompt != sub.get("last_user") and sub.get("status") != "running":
+            start_idx = len(sub["output"])
+            sub["last_user"] = new_prompt
+            sub["status"] = "running"
+            sub["output"].append(("text", f"\n\n---\n**追問:** {new_prompt}\n\n"))
+            sub["lastAt"] = time.time()
+            asyncio.create_task(_run_resume(model, new_prompt))
+
         def schunk(delta, finish=None):
             payload = {"id": cid, "object": "chat.completion.chunk", "created": created,
                        "model": model, "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}
@@ -141,7 +153,7 @@ async def chat_completions(request: Request):
 
         async def sgen():
             yield schunk({"role": "assistant", "content": ""})
-            idx = 0
+            idx = start_idx
             while True:
                 while idx < len(sub["output"]):
                     kind, val = sub["output"][idx]
@@ -292,28 +304,32 @@ CLAUDE_BIN = "/Users/xcash/.local/bin/claude"
 CODEX_BIN = "/Users/xcash/.local/bin/codex"
 
 
-async def _run_dispatch(sid: str, tool: str, task: str, cwd: str):
-    """Spawn a headless Claude Code / Codex sub-agent and stream its work
-    (text + tool calls) into the sub-session's output buffer."""
+def _claude_argv(parent: str, prompt: str, resume: str | None = None):
+    """Build a headless Claude Code argv. `resume` continues an existing CC
+    session id so follow-up turns keep the sub-agent's full context."""
+    mem_home = home_for(parent or "yuanfang")
+    mcp_cfg = json.dumps({"mcpServers": {"studio-memory": {
+        "command": "python3",
+        "args": ["/Users/xcash/apps/hermes-openwebui-bridge/studio_memory_mcp.py"],
+        "env": {"STUDIO_MEMORY_HOME": mem_home}}}}, ensure_ascii=False)
+    hint = ("你可以用 studio-memory MCP 的 read_memory / search_memory 讀善彰的"
+            "Hermes 長期記憶(身份、持倉、專案、人脈),做任務前先讀以對齊脈絡;"
+            "有值得長期記住的新事實再用 write_memory 寫回。")
+    argv = [CLAUDE_BIN, "-p", prompt, "--output-format", "stream-json", "--verbose",
+            "--permission-mode", "bypassPermissions",
+            "--mcp-config", mcp_cfg, "--append-system-prompt", hint]
+    if resume:
+        argv += ["--resume", resume]
+    return argv
+
+
+async def _stream_agent(sid: str, argv: list, cwd: str, fail_label: str):
+    """Run a sub-agent subprocess, append its transcript to the sub's output
+    buffer, capture the Claude Code session id (for later --resume), and mark
+    the sub done when it exits."""
     sub = SUBSESSIONS[sid]
     out = sub["output"]
     try:
-        if tool == "codex":
-            argv = [CODEX_BIN, "exec", "--json", task]
-        else:  # claude-code
-            # M4: give the sub-agent the studio-memory MCP so it shares the
-            # parent persona's canonical Hermes long-term memory.
-            mem_home = home_for(sub.get("parent", "yuanfang"))
-            mcp_cfg = json.dumps({"mcpServers": {"studio-memory": {
-                "command": "python3",
-                "args": ["/Users/xcash/apps/hermes-openwebui-bridge/studio_memory_mcp.py"],
-                "env": {"STUDIO_MEMORY_HOME": mem_home}}}}, ensure_ascii=False)
-            hint = ("你可以用 studio-memory MCP 的 read_memory / search_memory 讀善彰的"
-                    "Hermes 長期記憶(身份、持倉、專案、人脈),做任務前先讀以對齊脈絡;"
-                    "有值得長期記住的新事實再用 write_memory 寫回。")
-            argv = [CLAUDE_BIN, "-p", task, "--output-format", "stream-json", "--verbose",
-                    "--permission-mode", "bypassPermissions",
-                    "--mcp-config", mcp_cfg, "--append-system-prompt", hint]
         proc = await asyncio.create_subprocess_exec(
             *argv, cwd=cwd, stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL)
@@ -326,14 +342,40 @@ async def _run_dispatch(sid: str, tool: str, task: str, cwd: str):
                 ev = json.loads(line)
             except Exception:
                 continue
+            sess = ev.get("session_id") if isinstance(ev, dict) else None
+            if sess:
+                sub["cc_session"] = sess          # latest id → resume target
             for item in _parse_agent_event(ev):
                 out.append(item)
             sub["lastAt"] = time.time()
         await proc.wait()
     except Exception as e:                                  # noqa: BLE001
-        out.append(("text", f"\n⚠️ dispatch 失敗:{e}"))
+        out.append(("text", f"\n⚠️ {fail_label}:{e}"))
     finally:
         sub["status"] = "done"
+        sub["lastAt"] = time.time()
+
+
+async def _run_dispatch(sid: str, tool: str, task: str, cwd: str):
+    """Spawn a headless Claude Code / Codex sub-agent for the initial task."""
+    sub = SUBSESSIONS[sid]
+    if tool == "codex":
+        argv = [CODEX_BIN, "exec", "--json", task]
+    else:
+        argv = _claude_argv(sub.get("parent", "yuanfang"), task)
+    await _stream_agent(sid, argv, cwd, "dispatch 失敗")
+
+
+async def _run_resume(sid: str, prompt: str):
+    """Follow-up turn into an existing sub-session — resumes the CC session so
+    the sub-agent keeps its full prior context."""
+    sub = SUBSESSIONS[sid]
+    cwd = sub.get("cwd") or HOME_ROOT
+    if sub.get("tool") == "codex":
+        argv = [CODEX_BIN, "exec", "--json", prompt]   # codex: new exec in same cwd
+    else:
+        argv = _claude_argv(sub.get("parent", "yuanfang"), prompt, resume=sub.get("cc_session"))
+    await _stream_agent(sid, argv, cwd, "追問失敗")
 
 
 def _parse_agent_event(ev: dict):
