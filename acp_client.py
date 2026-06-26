@@ -95,16 +95,40 @@ class ACPSession:
             elif msg.get("method") == "session/update":
                 upd = (msg.get("params") or {}).get("update") or {}
                 kind = upd.get("sessionUpdate")
+                q = self._active_q
+                if q is None:
+                    continue
+
+                def _content_text(u):
+                    # tool_call / tool_call_update carry content:[{type:content,
+                    # content:{type:text,text:…}}]; messages carry content:{text}
+                    c = u.get("content")
+                    if isinstance(c, dict):
+                        return c.get("text", "")
+                    if isinstance(c, list):
+                        for item in c:
+                            cc = (item or {}).get("content") or {}
+                            if cc.get("type") == "text" and cc.get("text"):
+                                return cc["text"]
+                    return ""
+
                 if kind == "agent_message_chunk":
-                    text = (upd.get("content") or {}).get("text", "")
-                    if text and self._active_q is not None:
-                        self._active_q.put_nowait(("text", text))
+                    t = _content_text(upd)
+                    if t:
+                        q.put_nowait(("text", t))
+                elif kind == "agent_thought_chunk":
+                    t = _content_text(upd)
+                    if t:
+                        q.put_nowait(("thought", t))
                 elif kind == "tool_call":
-                    # title is "functionName: summary" or just "functionName"
                     title = (upd.get("title") or "").strip()
                     name = (title.split(":", 1)[0].strip() or "tool")
-                    if self._active_q is not None:
-                        self._active_q.put_nowait(("tool", name))
+                    q.put_nowait(("tool_start", {"name": name, "cmd": _content_text(upd)}))
+                elif kind == "tool_call_update":
+                    q.put_nowait(("tool_result", {"text": _content_text(upd),
+                                                  "status": upd.get("status", "")}))
+                elif kind == "usage_update":
+                    q.put_nowait(("usage", {"used": upd.get("used"), "size": upd.get("size")}))
             elif msg.get("method") == "session/request_permission" and mid is not None:
                 opts = (msg.get("params") or {}).get("options") or []
                 allow = None

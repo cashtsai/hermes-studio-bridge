@@ -163,7 +163,16 @@ async def chat_completions(request: Request):
 
             asyncio.create_task(pump())
             got_text = False
-            seen_tools: set[str] = set()
+            thought_buf: list[str] = []
+
+            def flush_thought():
+                if thought_buf:
+                    t = "".join(thought_buf).strip()
+                    thought_buf.clear()
+                    if t:
+                        return f"\n<details><summary>💭 思考</summary>\n\n{t}\n\n</details>\n\n"
+                return None
+
             while True:
                 try:
                     kind, val = await asyncio.wait_for(q.get(), timeout=2.0)
@@ -171,12 +180,29 @@ async def chat_completions(request: Request):
                     yield ": keepalive\n\n"
                     continue
                 if kind == "text":
+                    if not got_text:                         # surface buffered thinking first
+                        ft = flush_thought()
+                        if ft:
+                            yield chunk({"content": ft})
                     got_text = True
                     yield chunk({"content": val})
-                elif kind == "tool":
-                    if val not in seen_tools:                # one status line per tool
-                        seen_tools.add(val)
-                        yield chunk({"content": f"\n› 🔧 `{val}`\n"})
+                elif kind == "thought":
+                    thought_buf.append(val)                   # buffered, shown before the answer
+                elif kind == "tool_start":
+                    name = val.get("name", "tool")
+                    cmd = (val.get("cmd") or "").strip().splitlines()
+                    cmd1 = (cmd[0] if cmd else "")[:140]
+                    line = f"\n› 🔧 **{name}**" + (f" `{cmd1}`" if cmd1 else "") + "\n"
+                    yield chunk({"content": line})
+                elif kind == "tool_result":
+                    res = (val.get("text") or "").strip()
+                    if res:
+                        short = res[:900]
+                        more = "\n…(截斷)" if len(res) > 900 else ""
+                        yield chunk({"content":
+                            f"<details><summary>↳ 結果</summary>\n\n```\n{short}{more}\n```\n\n</details>\n"})
+                elif kind == "usage":
+                    pass                                     # Phase 2: status line
                 elif kind == "error":
                     if not got_text:                         # ACP failed cold → fall back
                         try:
@@ -187,6 +213,9 @@ async def chat_completions(request: Request):
                         yield chunk({"content": f"\n\n⚠️ 串流中斷:{val}"})
                 else:  # end
                     break
+            ft = flush_thought()                             # thinking but no answer text
+            if ft:
+                yield chunk({"content": ft})
             yield chunk({}, finish="stop")
             yield "data: [DONE]\n\n"
         return StreamingResponse(gen(), media_type="text/event-stream")
