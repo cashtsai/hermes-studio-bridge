@@ -126,12 +126,47 @@ async def chat_completions(request: Request):
     _check_auth(request)
     body = await request.json()
     model = body.get("model", "xcash")
-    if model not in PERSONAS:
-        model = "xcash"
-    prompt = _last_user_message(body.get("messages", []))
     stream = bool(body.get("stream", False))
     cid = "chatcmpl-" + uuid.uuid4().hex[:24]
     created = int(time.time())
+
+    # Sub-session (dispatched CC/Codex) — replay + follow its work transcript.
+    if model in SUBSESSIONS:
+        sub = SUBSESSIONS[model]
+
+        def schunk(delta, finish=None):
+            payload = {"id": cid, "object": "chat.completion.chunk", "created": created,
+                       "model": model, "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}
+            return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+        async def sgen():
+            yield schunk({"role": "assistant", "content": ""})
+            idx = 0
+            while True:
+                while idx < len(sub["output"]):
+                    kind, val = sub["output"][idx]
+                    idx += 1
+                    c = _fmt_item(kind, val)
+                    if c:
+                        yield schunk({"content": c})
+                if sub.get("status") == "done" and idx >= len(sub["output"]):
+                    break
+                await asyncio.sleep(0.4)
+                yield ": keepalive\n\n"
+            yield schunk({}, finish="stop")
+            yield "data: [DONE]\n\n"
+
+        if stream:
+            return StreamingResponse(sgen(), media_type="text/event-stream")
+        text = "".join(v for k, v in sub["output"] if k == "text")
+        return JSONResponse({"id": cid, "object": "chat.completion", "created": created,
+                             "model": model,
+                             "choices": [{"index": 0, "message": {"role": "assistant", "content": text},
+                                          "finish_reason": "stop"}]})
+
+    if model not in PERSONAS:
+        model = "xcash"
+    prompt = _last_user_message(body.get("messages", []))
 
     if stream:
         # Live streaming over a warm ACP session: a background pump feeds text
@@ -253,6 +288,72 @@ async def chat_completions(request: Request):
     })
 
 
+CLAUDE_BIN = "/Users/xcash/.local/bin/claude"
+CODEX_BIN = "/Users/xcash/.local/bin/codex"
+
+
+async def _run_dispatch(sid: str, tool: str, task: str, cwd: str):
+    """Spawn a headless Claude Code / Codex sub-agent and stream its work
+    (text + tool calls) into the sub-session's output buffer."""
+    sub = SUBSESSIONS[sid]
+    out = sub["output"]
+    try:
+        if tool == "codex":
+            argv = [CODEX_BIN, "exec", "--json", task]
+        else:  # claude-code
+            argv = [CLAUDE_BIN, "-p", task, "--output-format", "stream-json",
+                    "--verbose", "--permission-mode", "bypassPermissions"]
+        proc = await asyncio.create_subprocess_exec(
+            *argv, cwd=cwd, stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL)
+        sub["proc"] = proc
+        async for raw in proc.stdout:
+            line = raw.decode("utf-8", "replace").strip()
+            if not line:
+                continue
+            try:
+                ev = json.loads(line)
+            except Exception:
+                continue
+            for item in _parse_agent_event(ev):
+                out.append(item)
+            sub["lastAt"] = time.time()
+        await proc.wait()
+    except Exception as e:                                  # noqa: BLE001
+        out.append(("text", f"\n⚠️ dispatch 失敗:{e}"))
+    finally:
+        sub["status"] = "done"
+
+
+def _parse_agent_event(ev: dict):
+    """Map a Claude-Code / Codex stream-json event → transcript items."""
+    items = []
+    t = ev.get("type")
+    if t == "assistant":
+        for c in ((ev.get("message") or {}).get("content") or []):
+            if c.get("type") == "text" and c.get("text"):
+                items.append(("text", c["text"]))
+            elif c.get("type") == "tool_use":
+                name = c.get("name", "tool")
+                inp = c.get("input") or {}
+                cmd = inp.get("command") or inp.get("file_path") or inp.get("path") \
+                    or (json.dumps(inp, ensure_ascii=False)[:120] if inp else "")
+                items.append(("tool_start", {"name": name, "cmd": cmd}))
+    elif t == "user":
+        for c in ((ev.get("message") or {}).get("content") or []):
+            if c.get("type") == "tool_result":
+                res = c.get("content")
+                if isinstance(res, list):
+                    res = " ".join(p.get("text", "") for p in res if isinstance(p, dict))
+                if res:
+                    items.append(("tool_result", {"text": str(res), "status": "done"}))
+    elif t in ("item.completed", "message"):  # codex-ish fallback
+        txt = ev.get("text") or ev.get("content")
+        if isinstance(txt, str) and txt:
+            items.append(("text", txt))
+    return items
+
+
 def _persona_preview(home: str):
     """Latest message of the persona's canonical Telegram session → (text, ts)."""
     import sqlite3
@@ -291,6 +392,47 @@ async def list_sessions(request: Request):
                     "preview": s.get("preview"), "lastAt": s.get("lastAt"),
                     "status": s.get("status", "running")})
     return {"sessions": out}
+
+
+@app.post("/dispatch")
+async def dispatch(request: Request):
+    """Hermes (or a tool) asks the bridge to spawn a CC/Codex sub-agent.
+    Returns a session id that shows up in GET /sessions and streams like a chat."""
+    _check_auth(request)
+    body = await request.json()
+    tool = body.get("tool", "claude-code")
+    task = (body.get("task") or "").strip()
+    cwd = body.get("cwd") or HOME_ROOT
+    parent = body.get("parent", "yuanfang")
+    if not task:
+        raise HTTPException(status_code=400, detail="task required")
+    sid = "sub-" + uuid.uuid4().hex[:16]
+    SUBSESSIONS[sid] = {"name": task[:40], "parent": parent, "tool": tool,
+                        "status": "running", "lastAt": time.time(), "cwd": cwd,
+                        "proc": None, "output": [("text", f"**任務:** {task}\n\n")]}
+    asyncio.create_task(_run_dispatch(sid, tool, task, cwd))
+    return {"session_id": sid, "type": "subprocess", "tool": tool, "parent": parent}
+
+
+def _fmt_item(kind, val):
+    """Format one transcript item (text/tool/result/perm) → SSE content string."""
+    if kind == "text":
+        return val
+    if kind == "tool_start":
+        name = val.get("name", "tool")
+        cmd = (val.get("cmd") or "").strip().splitlines()
+        cmd1 = (cmd[0] if cmd else "")[:140]
+        return f"\n› 🔧 **{name}**" + (f" `{cmd1}`" if cmd1 else "") + "\n"
+    if kind == "tool_result":
+        res = (val.get("text") or "").strip()
+        if not res:
+            return None
+        short = res[:900]
+        more = "\n…(截斷)" if len(res) > 900 else ""
+        return f"<details><summary>↳ 結果</summary>\n\n```\n{short}{more}\n```\n\n</details>\n"
+    if kind == "perm":
+        return f"\n› 🔐 自動允許 **{val}**\n"
+    return None
 
 
 @app.get("/health")
