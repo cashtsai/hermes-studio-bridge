@@ -722,6 +722,16 @@ def _blocks_text(content) -> str:
     return ""
 
 
+def _cc_time(ts) -> str:
+    if not ts:
+        return ""
+    try:
+        from datetime import datetime
+        return datetime.fromisoformat(str(ts).replace("Z", "+00:00")).astimezone().strftime("%m/%d %H:%M")
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 def _fmt_cc_event(d: dict) -> str:
     """One transcript jsonl event → display markdown the app's TranscriptView
     already renders (tool rows, collapsible thinking/results, answer text)."""
@@ -730,7 +740,9 @@ def _fmt_cc_event(d: dict) -> str:
     if t == "user":
         content = msg.get("content")
         if isinstance(content, str):
-            return f"\n\n**🧑 你:** {content}\n\n"
+            ts = _cc_time(d.get("timestamp"))
+            stamp = f" _{ts}_" if ts else ""
+            return f"\n\n**🧑 你:**{stamp} {content}\n\n"
         if isinstance(content, list):
             parts = []
             for b in content:
@@ -958,6 +970,12 @@ def _clean_report(s: str) -> str:
     m = _REPORT_START.search(s)
     if m and 0 < m.start() < 600:
         return s[m.start():].strip()
+    # Fallback (e.g. 午報): drop leading non-CJK working-note lines before the
+    # first line that actually contains Chinese.
+    lines = s.split("\n")
+    for i, line in enumerate(lines):
+        if any("一" <= c <= "鿿" for c in line):
+            return "\n".join(lines[i:]).strip() if i > 0 else s.strip()
     return s.strip()
 
 
