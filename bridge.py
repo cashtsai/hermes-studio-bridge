@@ -801,6 +801,126 @@ async def cc_session_input(name: str, request: Request):
     return {"ok": True}
 
 
+# ───────────────────────── scheduled reports + notification toggles ─────────
+# Hermes runs the daily briefs via cron (jobs.json); each job already has an
+# enabled/paused state the scheduler honours, and `hermes cron pause/resume`
+# toggles it safely. The app surfaces the reports (so they land in Pocket Agent,
+# not just Telegram) and exposes per-notification on/off switches.
+
+CRON_JOBS_JSON = os.path.expanduser("~/apps/hermes-agent/home/cron/jobs.json")
+HERMES_HOME_DIR = os.path.expanduser("~/apps/hermes-agent/home")
+STATE_DB = os.path.join(HERMES_HOME_DIR, "state.db")
+
+# User-facing notification jobs → friendly label. Everything else (signal
+# collector, session reset/hygiene) is internal and hidden from the app.
+NOTIFY_LABELS = {
+    "morning-brief-0700": "晨報",
+    "stock-premarket-0850": "盤前速覽",
+    "afternoon-brief-1330": "午報",
+    "memory-consolidation-2200": "晚間三省",
+}
+
+
+def _cron_jobs():
+    try:
+        data = json.load(open(CRON_JOBS_JSON, encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return []
+    out = []
+    for j in data.get("jobs", []):
+        name = j.get("name", "")
+        on = bool(j.get("enabled", True)) and j.get("state") != "paused"
+        out.append({"id": j.get("id"), "name": name, "label": NOTIFY_LABELS.get(name),
+                    "schedule": j.get("schedule_display") or j.get("schedule", {}).get("display", ""),
+                    "enabled": on, "notify": name in NOTIFY_LABELS})
+    return out
+
+
+async def _hermes_cron(action: str, job_id: str):
+    env = dict(os.environ)
+    env["HERMES_HOME"] = HERMES_HOME_DIR
+    try:
+        p = await asyncio.create_subprocess_exec(
+            HERMES_BIN, "cron", action, job_id, env=env,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+        out, _ = await asyncio.wait_for(p.communicate(), timeout=30)
+        return p.returncode == 0, (out or b"").decode("utf-8", "replace")
+    except Exception as e:  # noqa: BLE001
+        return False, str(e)
+
+
+_REPORT_START = re.compile(r"(🌅|🌙|☀️|🌇|🌃|📊|🗓️|善彰[，,、]?\s*(早安|午安|晚安)|早安|午安|晚安)")
+
+
+def _clean_report(s: str) -> str:
+    """Trim a leading English working-note preamble some cron runs leak before
+    the actual brief (the SKILL says not to emit it, but it sneaks in)."""
+    m = _REPORT_START.search(s)
+    if m and 0 < m.start() < 600:
+        return s[m.start():].strip()
+    return s.strip()
+
+
+def _reports(limit: int = 20):
+    """Latest delivered report per recent cron run (the session's final assistant
+    message), newest first — only the user-facing notification jobs."""
+    import sqlite3
+    if not os.path.exists(STATE_DB):
+        return []
+    jobs = {j["id"]: j for j in _cron_jobs()}
+    try:
+        con = sqlite3.connect(f"file:{STATE_DB}?mode=ro", uri=True, timeout=5)
+        sids = con.execute(
+            "SELECT m.session_id, MAX(m.timestamp) ts FROM messages m "
+            "JOIN sessions s ON s.id = m.session_id WHERE s.source='cron' "
+            "GROUP BY m.session_id ORDER BY ts DESC LIMIT ?", (limit * 3,)).fetchall()
+        out = []
+        for sid, _ts in sids:
+            mobj = re.search(r"cron_([0-9a-f]+)_", str(sid))
+            job = jobs.get(mobj.group(1)) if mobj else None
+            if not (job and job.get("notify")):
+                continue                       # skip internal / unknown jobs
+            last = con.execute(
+                "SELECT content, timestamp FROM messages WHERE session_id=? "
+                "AND role='assistant' AND content IS NOT NULL AND content!='' "
+                "ORDER BY timestamp DESC LIMIT 1", (sid,)).fetchone()
+            if last and last[0]:
+                out.append({"label": job.get("label") or job.get("name"),
+                            "name": job.get("name"), "content": _clean_report(last[0]),
+                            "ts": last[1]})
+            if len(out) >= limit:
+                break
+        con.close()
+        return out
+    except Exception:  # noqa: BLE001
+        return []
+
+
+@app.get("/cron/jobs")
+async def cron_jobs(request: Request):
+    _check_auth(request)
+    return {"jobs": _cron_jobs()}
+
+
+@app.post("/cron/jobs/{job_id}/{action}")
+async def cron_toggle(job_id: str, action: str, request: Request):
+    _check_auth(request)
+    if action not in ("pause", "resume"):
+        raise HTTPException(status_code=400, detail="action must be pause|resume")
+    if not any(j["id"] == job_id for j in _cron_jobs()):
+        raise HTTPException(status_code=404, detail="unknown job")
+    ok, msg = await _hermes_cron(action, job_id)
+    if not ok:
+        raise HTTPException(status_code=500, detail=msg[:300] or "toggle failed")
+    return {"ok": True, "enabled": action == "resume"}
+
+
+@app.get("/reports")
+async def reports(request: Request, limit: int = 20):
+    _check_auth(request)
+    return {"reports": _reports(max(1, min(limit, 50)))}
+
+
 @app.post("/dispatch")
 async def dispatch(request: Request):
     """Hermes (or a tool) asks the bridge to spawn a CC/Codex sub-agent.
