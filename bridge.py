@@ -491,6 +491,30 @@ def _persona_preview(home: str):
     return (None, None)
 
 
+def _persona_history(home: str, limit: int = 100):
+    """Full recent transcript of the persona's canonical Telegram session, so a
+    fresh app install / new device can render the conversation instead of a
+    blank thread. Returns oldest→newest [{role, content, ts}]."""
+    import sqlite3
+    db = os.path.join(home, "state.db")
+    if not os.path.exists(db):
+        return []
+    try:
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=5)
+        cur = con.execute(
+            "SELECT m.role, m.content, m.timestamp FROM messages m "
+            "JOIN sessions s ON s.id = m.session_id "
+            "WHERE s.source='telegram' AND m.role IN ('user','assistant') "
+            "AND m.content IS NOT NULL AND m.content != '' "
+            "ORDER BY m.timestamp DESC LIMIT ?", (limit,))
+        rows = cur.fetchall()
+        con.close()
+        rows.reverse()  # oldest → newest for natural top-to-bottom rendering
+        return [{"role": r[0], "content": r[1], "ts": r[2]} for r in rows]
+    except Exception:  # noqa: BLE001
+        return []
+
+
 @app.get("/sessions")
 async def list_sessions(request: Request):
     """Unified conversation list: personas (pinned) + dispatched sub-sessions."""
@@ -506,6 +530,17 @@ async def list_sessions(request: Request):
                     "preview": s.get("preview"), "lastAt": s.get("lastAt"),
                     "status": s.get("status", "running")})
     return {"sessions": out}
+
+
+@app.get("/sessions/{persona}/messages")
+async def persona_messages(persona: str, request: Request, limit: int = 100):
+    """Server-side persona history (from Hermes state.db) so the app can seed a
+    conversation that survives reinstall / new device, not just local storage."""
+    _check_auth(request)
+    if persona not in PERSONAS:
+        raise HTTPException(status_code=404, detail="unknown persona")
+    _, home = PERSONAS[persona]
+    return {"messages": _persona_history(home, max(1, min(limit, 500)))}
 
 
 @app.post("/dispatch")
