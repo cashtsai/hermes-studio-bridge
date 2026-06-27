@@ -240,6 +240,9 @@ def _canon_init():
         id TEXT PRIMARY KEY, session TEXT NOT NULL, role TEXT NOT NULL,
         content TEXT, attachments TEXT, created_at REAL NOT NULL, status TEXT)""")
     con.execute("CREATE INDEX IF NOT EXISTS idx_msg_session_time ON messages(session, created_at)")
+    con.execute("""CREATE TABLE IF NOT EXISTS approvals(
+        id TEXT PRIMARY KEY, title TEXT, source TEXT, risk TEXT, detail TEXT,
+        created_at REAL, expires_at REAL, status TEXT, decided_at REAL, result TEXT)""")
     con.commit()
     con.close()
 
@@ -1111,6 +1114,95 @@ async def app_post_message(request: Request):
         yield "data: [DONE]\n\n"
 
     return StreamingResponse(agen(), media_type="text/event-stream")
+
+
+# ───────────────────────── Approval Center (M21) ───────────────────────────
+# Hermes skills (post / email / story / backup cleanup / risky tasks) POST an
+# approval here; the app shows a native approve/reject card with TTL + risk; the
+# skill polls the decision. Bridge owns the store (no Hermes internals exposed).
+
+def _approval_row(r):
+    return {"id": r[0], "title": r[1], "source": r[2], "risk": r[3], "detail": r[4],
+            "created_at": r[5], "expires_at": r[6], "status": r[7],
+            "decided_at": r[8], "result": r[9]}
+
+
+def _approvals_expire(con):
+    con.execute("UPDATE approvals SET status='expired' WHERE status='pending' "
+                "AND expires_at IS NOT NULL AND expires_at < ?", (time.time(),))
+
+
+@app.post("/app/v1/approvals")
+async def approval_create(request: Request):
+    """Create a pending approval (called by Hermes / a skill)."""
+    _check_auth(request)
+    import sqlite3
+    b = await request.json()
+    aid = b.get("id") or uuid.uuid4().hex
+    ttl = b.get("ttl_seconds")
+    now = time.time()
+    con = sqlite3.connect(CANON_DB)
+    con.execute("INSERT OR REPLACE INTO approvals"
+                "(id,title,source,risk,detail,created_at,expires_at,status,decided_at,result) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (aid, b.get("title") or "需要核准", b.get("source") or "", b.get("risk") or "",
+                 b.get("detail") or "", now, (now + ttl) if ttl else None, "pending", None, None))
+    con.commit()
+    con.close()
+    return {"id": aid, "status": "pending"}
+
+
+@app.get("/app/v1/approvals")
+async def approval_list(request: Request, status: str = "", limit: int = 50):
+    _check_auth(request)
+    import sqlite3
+    con = sqlite3.connect(CANON_DB)
+    _approvals_expire(con)
+    con.commit()
+    if status:
+        rows = con.execute("SELECT id,title,source,risk,detail,created_at,expires_at,status,decided_at,result "
+                           "FROM approvals WHERE status=? ORDER BY created_at DESC LIMIT ?",
+                           (status, limit)).fetchall()
+    else:
+        rows = con.execute("SELECT id,title,source,risk,detail,created_at,expires_at,status,decided_at,result "
+                           "FROM approvals ORDER BY created_at DESC LIMIT ?", (limit,)).fetchall()
+    con.close()
+    return {"approvals": [_approval_row(r) for r in rows]}
+
+
+@app.get("/app/v1/approvals/{aid}")
+async def approval_get(aid: str, request: Request):
+    """Poll a decision (called by the requesting skill)."""
+    _check_auth(request)
+    import sqlite3
+    con = sqlite3.connect(CANON_DB)
+    _approvals_expire(con)
+    con.commit()
+    r = con.execute("SELECT id,title,source,risk,detail,created_at,expires_at,status,decided_at,result "
+                    "FROM approvals WHERE id=?", (aid,)).fetchone()
+    con.close()
+    if not r:
+        raise HTTPException(status_code=404, detail="unknown approval")
+    return _approval_row(r)
+
+
+@app.post("/app/v1/approvals/{aid}/decision")
+async def approval_decide(aid: str, request: Request):
+    """Approve / reject (from the app)."""
+    _check_auth(request)
+    import sqlite3
+    b = await request.json()
+    decision = "approved" if b.get("approve") else "rejected"
+    con = sqlite3.connect(CANON_DB)
+    cur = con.execute("UPDATE approvals SET status=?, decided_at=?, result=? "
+                      "WHERE id=? AND status='pending'",
+                      (decision, time.time(), b.get("result") or "", aid))
+    con.commit()
+    changed = cur.rowcount
+    con.close()
+    if not changed:
+        raise HTTPException(status_code=409, detail="already decided or expired")
+    return {"id": aid, "status": decision}
 
 
 @app.post("/dispatch")
