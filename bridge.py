@@ -147,15 +147,15 @@ def _save_data_uri(data_uri: str, filename: str = "") -> str | None:
     return str(path)
 
 
-def _last_user_message(messages: list) -> str:
+def _extract_user_parts(messages: list):
+    """Last user message → (text, image_paths, [(label, file_path)]). Persists
+    any attachments to UPLOAD_DIR."""
     for m in reversed(messages or []):
         if m.get("role") == "user":
             c = m.get("content")
             if not isinstance(c, list):
-                return (c or "").strip()
-            # OpenAI vision-style parts: keep text, persist image/file parts and
-            # append their on-disk paths so the agent can Read them.
-            texts, saved = [], []
+                return ((c or "").strip(), [], [])
+            texts, images, files = [], [], []
             for p in c:
                 if not isinstance(p, dict):
                     continue
@@ -163,23 +163,64 @@ def _last_user_message(messages: list) -> str:
                 if t == "text" and p.get("text"):
                     texts.append(p["text"])
                 elif t == "image_url":
-                    url = (p.get("image_url") or {}).get("url", "")
-                    path = _save_data_uri(url, "image.jpg")
+                    path = _save_data_uri((p.get("image_url") or {}).get("url", ""), "image.jpg")
                     if path:
-                        saved.append(("圖片", path))
+                        images.append(path)
                 elif t == "file":
                     f = p.get("file") or {}
                     path = _save_data_uri(f.get("file_data", ""), f.get("filename", "file"))
                     if path:
-                        saved.append((f.get("filename") or "檔案", path))
-            text = " ".join(texts).strip()
-            if saved:
-                lines = "\n".join(f"- {label}:{path}" for label, path in saved)
-                note = ("\n\n[使用者附了以下檔案,已存到本機。請先用 Read/檔案工具讀取再回答]\n"
-                        + lines)
-                text = (text + note).strip()
-            return text
-    return ""
+                        files.append((f.get("filename") or "檔案", path))
+            return (" ".join(texts).strip(), images, files)
+    return ("", [], [])
+
+
+def _last_user_message(messages: list) -> str:
+    """Text + on-disk paths for the last user turn. Used by CC/Codex sub-sessions,
+    which can Read image files natively, so images stay as path references."""
+    text, images, files = _extract_user_parts(messages)
+    notes = [f"- 圖片:{p}" for p in images] + [f"- {label}:{p}" for label, p in files]
+    if notes:
+        text = (text + "\n\n[使用者附了以下檔案,已存到本機。請先用 Read/檔案工具讀取再回答]\n"
+                + "\n".join(notes)).strip()
+    return text
+
+
+async def _describe_image(path: str) -> str:
+    """Hermes personas have no vision, so we pre-read images with Claude Code
+    (which does) and hand the persona a text description instead of a bare path.
+    This is what makes image attachments actually work for a persona turn."""
+    proc = None
+    try:
+        argv = [CLAUDE_BIN, "-p",
+                (f"請讀取圖片檔 {path},用繁體中文詳細描述內容;"
+                 "若是截圖,把可見的關鍵文字與數字也讀出來。只回描述本身,不要客套。"),
+                "--permission-mode", "bypassPermissions", "--output-format", "text"]
+        proc = await asyncio.create_subprocess_exec(
+            *argv, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=90)
+        return (out or b"").decode("utf-8", "replace").strip()
+    except Exception:  # noqa: BLE001
+        if proc:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        return ""
+
+
+async def _resolve_persona_prompt(messages: list) -> str:
+    """Prompt for a persona turn: text + file paths + vision descriptions of any
+    images (so a non-vision Hermes persona can still 'see' the picture)."""
+    text, images, files = _extract_user_parts(messages)
+    notes = [f"- {label}:{p}(請用 Read 讀取)" for label, p in files]
+    for path in images:
+        desc = await _describe_image(path)
+        notes.append(f"- 圖片內容({path}):{desc}" if desc
+                     else f"- 圖片:{path}(自動描述失敗,請嘗試 Read)")
+    if notes:
+        text = (text + "\n\n[使用者附件]\n" + "\n".join(notes)).strip()
+    return text
 
 
 @app.post("/v1/chat/completions")
@@ -239,7 +280,7 @@ async def chat_completions(request: Request):
 
     if model not in PERSONAS:
         model = "xcash"
-    prompt = _last_user_message(body.get("messages", []))
+    prompt = await _resolve_persona_prompt(body.get("messages", []))
 
     if stream:
         # Live streaming over a warm ACP session: a background pump feeds text
@@ -287,11 +328,20 @@ async def chat_completions(request: Request):
                         return f"\n<details><summary>💭 思考</summary>\n\n{t}\n\n</details>\n\n"
                 return None
 
+            import time as _t
+            last_event = _t.monotonic()
+            STALL_LIMIT = 300                          # no event at all for 5 min → hung
             try:
                 while True:
                     try:
                         kind, val = await asyncio.wait_for(q.get(), timeout=2.0)
+                        last_event = _t.monotonic()
                     except asyncio.TimeoutError:
+                        if _t.monotonic() - last_event > STALL_LIMIT:
+                            asyncio.create_task(session.cancel())
+                            yield chunk({"content": "\n\n⚠️ 回合逾時(伺服器端 5 分鐘無回應),已中止。"})
+                            completed = True
+                            break
                         yield ": keepalive\n\n"
                         continue
                     if kind == "text":

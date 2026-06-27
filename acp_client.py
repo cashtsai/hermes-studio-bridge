@@ -33,6 +33,7 @@ class ACPSession:
         self._lock = asyncio.Lock()       # one turn at a time per persona
         self._start_lock = asyncio.Lock()
         self._loaded_session = False      # True if session came from session/load
+        self._proved_alive = False        # True once any turn produced output
 
     def _next_id(self) -> int:
         self._id += 1
@@ -240,7 +241,13 @@ class ACPSession:
             async for item in self._attempt(text):
                 produced += 1
                 yield item
-            if produced == 0 and self._loaded_session:
+            if produced:
+                self._proved_alive = True
+            # Self-heal ONLY for an inert just-loaded session we've never seen
+            # respond. Once a loaded session has produced output, a later empty
+            # turn is treated as legitimate — we must NOT drop the session and
+            # lose the accumulated Telegram context.
+            elif self._loaded_session and not self._proved_alive:
                 await self._force_new_session()
                 async for item in self._attempt(text):
                     yield item
