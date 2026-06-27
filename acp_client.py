@@ -32,6 +32,7 @@ class ACPSession:
         self._reader = None
         self._lock = asyncio.Lock()       # one turn at a time per persona
         self._start_lock = asyncio.Lock()
+        self._loaded_session = False      # True if session came from session/load
 
     def _next_id(self) -> int:
         self._id += 1
@@ -78,11 +79,20 @@ class ACPSession:
                                         {"cwd": self.home, "sessionId": sid, "mcpServers": []},
                                         timeout=120)
                     self.session_id = sid
+                    self._loaded_session = True
                     return
                 except Exception:
                     pass
             r = await self._request("session/new", {"cwd": self.home, "mcpServers": []}, timeout=60)
             self.session_id = (r or {}).get("sessionId")
+            self._loaded_session = False
+
+    async def _force_new_session(self):
+        """Drop the loaded session and start a blank one — recovery path for a
+        loaded Telegram session that turns out inert (prompts yield nothing)."""
+        r = await self._request("session/new", {"cwd": self.home, "mcpServers": []}, timeout=60)
+        self.session_id = (r or {}).get("sessionId")
+        self._loaded_session = False
 
     def _latest_telegram_session(self):
         import sqlite3
@@ -191,35 +201,49 @@ class ACPSession:
             except Exception:
                 pass
 
+    async def _attempt(self, text: str):
+        """One session/prompt turn — yields (kind, val) items."""
+        rid = self._next_id()
+        done = asyncio.get_event_loop().create_future()
+        self._pending[rid] = done
+        q: asyncio.Queue = asyncio.Queue()
+        self._active_q = q
+        await self._send({"jsonrpc": "2.0", "id": rid, "method": "session/prompt",
+                          "params": {"sessionId": self.session_id,
+                                     "messageId": uuid.uuid4().hex,
+                                     "prompt": [{"type": "text", "text": text}]}})
+        try:
+            while True:
+                getter = asyncio.ensure_future(q.get())
+                d, _ = await asyncio.wait({getter, done}, return_when=asyncio.FIRST_COMPLETED)
+                if getter in d:
+                    yield getter.result()
+                    continue
+                getter.cancel()
+                while not q.empty():
+                    yield q.get_nowait()
+                break
+        finally:
+            self._active_q = None
+            self._pending.pop(rid, None)
+        if done.done() and done.exception():
+            raise done.exception()
+
     async def prompt_stream(self, text: str):
-        """Async generator yielding text chunks for one turn."""
+        """Async generator yielding (kind, val) items for one turn. Self-heals:
+        if a *loaded* Telegram session produces an inert, empty turn, it drops
+        to a fresh session/new and retries once (fixes old sessions that load
+        but no longer respond)."""
         async with self._lock:
             await self.ensure_started()
-            rid = self._next_id()
-            done = asyncio.get_event_loop().create_future()
-            self._pending[rid] = done
-            q: asyncio.Queue = asyncio.Queue()
-            self._active_q = q
-            await self._send({"jsonrpc": "2.0", "id": rid, "method": "session/prompt",
-                              "params": {"sessionId": self.session_id,
-                                         "messageId": uuid.uuid4().hex,
-                                         "prompt": [{"type": "text", "text": text}]}})
-            try:
-                while True:
-                    getter = asyncio.ensure_future(q.get())
-                    d, _ = await asyncio.wait({getter, done}, return_when=asyncio.FIRST_COMPLETED)
-                    if getter in d:
-                        yield getter.result()
-                        continue
-                    getter.cancel()
-                    while not q.empty():
-                        yield q.get_nowait()
-                    break
-            finally:
-                self._active_q = None
-                self._pending.pop(rid, None)
-            if done.done() and done.exception():
-                raise done.exception()
+            produced = 0
+            async for item in self._attempt(text):
+                produced += 1
+                yield item
+            if produced == 0 and self._loaded_session:
+                await self._force_new_session()
+                async for item in self._attempt(text):
+                    yield item
 
 
 class ACPPool:
