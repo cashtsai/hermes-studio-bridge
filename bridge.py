@@ -11,6 +11,7 @@ Run:  uvicorn bridge:app --host 0.0.0.0 --port 8081
 """
 import asyncio
 import base64
+import glob
 import json
 import os
 import re
@@ -591,6 +592,213 @@ async def persona_messages(persona: str, request: Request, limit: int = 100):
         raise HTTPException(status_code=404, detail="unknown persona")
     _, home = PERSONAS[persona]
     return {"messages": _persona_history(home, max(1, min(limit, 500)))}
+
+
+# ───────────────────────── ccsess remote Claude Code sessions ──────────────
+# Persistent `claude --remote-control` sessions (managed by ~/.local/bin/ccsess
+# in tmux). The app reads each session's live transcript jsonl directly and can
+# type into it via tmux send-keys — same live view/control as SSH-ing in.
+
+CCSESS_CONF = os.path.expanduser("~/.config/ccsess/sessions.conf")
+TMUX_BIN = "/opt/homebrew/bin/tmux" if os.path.exists("/opt/homebrew/bin/tmux") else "tmux"
+
+
+def _cc_project_dir(workdir: str) -> str:
+    return os.path.expanduser("~/.claude/projects/" + workdir.replace("/", "-"))
+
+
+def _cc_latest_jsonl(workdir: str):
+    files = glob.glob(os.path.join(_cc_project_dir(workdir), "*.jsonl"))
+    return max(files, key=os.path.getmtime) if files else None
+
+
+def _cc_conf_rows():
+    rows = []
+    try:
+        with open(CCSESS_CONF) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                parts = line.split("|")
+                if len(parts) >= 3:
+                    rows.append((parts[0], parts[1], parts[2].strip()))
+    except Exception:  # noqa: BLE001
+        pass
+    return rows
+
+
+async def _tmux_alive(name: str) -> bool:
+    try:
+        p = await asyncio.create_subprocess_exec(
+            TMUX_BIN, "has-session", "-t", "=" + name,
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
+        return (await p.wait()) == 0
+    except Exception:  # noqa: BLE001
+        return False
+
+
+async def _cc_sessions():
+    out = []
+    for name, workdir, enabled in _cc_conf_rows():
+        if enabled != "1":
+            continue
+        out.append({"name": name, "workdir": workdir,
+                    "status": "running" if await _tmux_alive(name) else "down"})
+    return out
+
+
+def _blocks_text(content) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(b.get("text", "") for b in content
+                         if isinstance(b, dict) and b.get("type") in (None, "text"))
+    return ""
+
+
+def _fmt_cc_event(d: dict) -> str:
+    """One transcript jsonl event → display markdown the app's TranscriptView
+    already renders (tool rows, collapsible thinking/results, answer text)."""
+    t = d.get("type")
+    msg = d.get("message") or {}
+    if t == "user":
+        content = msg.get("content")
+        if isinstance(content, str):
+            return f"\n\n**🧑 你:** {content}\n\n"
+        if isinstance(content, list):
+            parts = []
+            for b in content:
+                if isinstance(b, dict) and b.get("type") == "tool_result":
+                    txt = _blocks_text(b.get("content"))
+                    if txt:
+                        short = txt[:900]
+                        more = "\n…(截斷)" if len(txt) > 900 else ""
+                        parts.append(f"<details><summary>↳ 結果</summary>\n\n```\n{short}{more}\n```\n\n</details>\n")
+            return "".join(parts)
+        return ""
+    if t == "assistant":
+        content = msg.get("content")
+        if not isinstance(content, list):
+            return ""
+        out = []
+        for b in content:
+            if not isinstance(b, dict):
+                continue
+            bt = b.get("type")
+            if bt == "text" and b.get("text"):
+                out.append(b["text"])
+            elif bt == "thinking" and b.get("thinking"):
+                out.append(f"\n<details><summary>💭 思考</summary>\n\n{b['thinking']}\n\n</details>\n")
+            elif bt == "tool_use":
+                name = b.get("name", "tool")
+                inp = b.get("input") or {}
+                cmd = (inp.get("command") or inp.get("file_path") or inp.get("path")
+                       or inp.get("pattern") or "")
+                if not cmd and isinstance(inp, dict):
+                    cmd = next((str(v) for v in inp.values() if isinstance(v, (str, int))), "")
+                cmd = str(cmd).splitlines()[0][:140] if cmd else ""
+                out.append(f"\n› 🔧 **{name}**" + (f" `{cmd}`" if cmd else "") + "\n")
+        return "\n".join(out)
+    return ""
+
+
+@app.get("/ccsessions")
+async def cc_list(request: Request):
+    _check_auth(request)
+    return {"sessions": await _cc_sessions()}
+
+
+@app.get("/ccsessions/{name}/stream")
+async def cc_session_stream(name: str, request: Request, replay: int = 80):
+    """Live transcript of a ccsess session: replay the recent tail of its
+    Claude Code jsonl, then follow it in real time (OpenAI-style SSE so the app
+    reuses its chat stream parser)."""
+    _check_auth(request)
+    row = next((r for r in _cc_conf_rows() if r[0] == name), None)
+    if not row:
+        raise HTTPException(status_code=404, detail="unknown session")
+    workdir = row[1]
+    cid = "ccsess-" + uuid.uuid4().hex[:16]
+
+    def chunk(delta, finish=None):
+        payload = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()),
+                   "model": name, "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}
+        return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+    async def gen():
+        yield chunk({"role": "assistant", "content": ""})
+        jsonl = _cc_latest_jsonl(workdir)
+        pos = 0
+        if jsonl and os.path.exists(jsonl):
+            try:
+                lines = open(jsonl, encoding="utf-8", errors="replace").read().splitlines()
+            except Exception:  # noqa: BLE001
+                lines = []
+            for line in lines[-replay:]:
+                try:
+                    c = _fmt_cc_event(json.loads(line))
+                except Exception:  # noqa: BLE001
+                    continue
+                if c:
+                    yield chunk({"content": c})
+            pos = os.path.getsize(jsonl)
+        # follow
+        idle = 0
+        while True:
+            if await request.is_disconnected():
+                break
+            await asyncio.sleep(1.0)
+            cur = _cc_latest_jsonl(workdir)
+            if cur != jsonl:                      # session rotated to a new jsonl
+                jsonl, pos = cur, 0
+            if jsonl and os.path.exists(jsonl):
+                size = os.path.getsize(jsonl)
+                if size > pos:
+                    with open(jsonl, encoding="utf-8", errors="replace") as f:
+                        f.seek(pos)
+                        new = f.read()
+                        pos = f.tell()
+                    for line in new.splitlines():
+                        if not line.strip():
+                            continue
+                        try:
+                            c = _fmt_cc_event(json.loads(line))
+                        except Exception:  # noqa: BLE001
+                            continue
+                        if c:
+                            yield chunk({"content": c})
+                    idle = 0
+            idle += 1
+            if idle >= 15:                        # ~15s quiet → keepalive comment
+                idle = 0
+                yield ": keepalive\n\n"
+
+    return StreamingResponse(gen(), media_type="text/event-stream")
+
+
+@app.post("/ccsessions/{name}/input")
+async def cc_session_input(name: str, request: Request):
+    """Type a line into the live Claude Code session (tmux send-keys), exactly
+    as if you SSH-attached and typed it. Sent literally, then Enter."""
+    _check_auth(request)
+    if not any(r[0] == name for r in _cc_conf_rows()):
+        raise HTTPException(status_code=404, detail="unknown session")
+    body = await request.json()
+    text = (body.get("text") or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="empty")
+    if not await _tmux_alive(name):
+        raise HTTPException(status_code=409, detail="session not running")
+    try:
+        p = await asyncio.create_subprocess_exec(TMUX_BIN, "send-keys", "-t", "=" + name, "-l", text)
+        await p.wait()
+        await asyncio.sleep(0.15)
+        p2 = await asyncio.create_subprocess_exec(TMUX_BIN, "send-keys", "-t", "=" + name, "Enter")
+        await p2.wait()
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=str(e))
+    return {"ok": True}
 
 
 @app.post("/dispatch")
