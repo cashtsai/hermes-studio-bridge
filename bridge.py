@@ -224,6 +224,153 @@ async def _resolve_persona_prompt(messages: list) -> str:
     return text
 
 
+# ───────────────────────── canonical store (M20) ───────────────────────────
+# Bridge-owned source of truth for app turns, so the iPhone is NOT the only copy
+# — survives reinstall / new device and interleaves with the Telegram history.
+# The app talks to it through the versioned /app/v1 API; it never touches the
+# Hermes state.db schema or cron JSON directly.
+CANON_DB = os.path.expanduser("~/.local/share/pocket-agent/canonical.db")
+
+
+def _canon_init():
+    import sqlite3
+    os.makedirs(os.path.dirname(CANON_DB), exist_ok=True)
+    con = sqlite3.connect(CANON_DB)
+    con.execute("""CREATE TABLE IF NOT EXISTS messages(
+        id TEXT PRIMARY KEY, session TEXT NOT NULL, role TEXT NOT NULL,
+        content TEXT, attachments TEXT, created_at REAL NOT NULL, status TEXT)""")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_msg_session_time ON messages(session, created_at)")
+    con.commit()
+    con.close()
+
+
+def _canon_add(session: str, role: str, content: str, attachments=None,
+               mid: str | None = None, status: str = "done") -> str:
+    import sqlite3
+    mid = mid or uuid.uuid4().hex
+    try:
+        con = sqlite3.connect(CANON_DB)
+        con.execute("INSERT OR REPLACE INTO messages"
+                    "(id,session,role,content,attachments,created_at,status) VALUES(?,?,?,?,?,?,?)",
+                    (mid, session, role, content, json.dumps(attachments or [], ensure_ascii=False),
+                     time.time(), status))
+        con.commit()
+        con.close()
+    except Exception:  # noqa: BLE001
+        pass
+    return mid
+
+
+def _canon_messages(session: str, limit: int = 200):
+    import sqlite3
+    try:
+        con = sqlite3.connect(f"file:{CANON_DB}?mode=ro", uri=True, timeout=5)
+        rows = con.execute("SELECT id,role,content,attachments,created_at,status FROM messages "
+                           "WHERE session=? ORDER BY created_at DESC LIMIT ?", (session, limit)).fetchall()
+        con.close()
+    except Exception:  # noqa: BLE001
+        return []
+    rows.reverse()
+    return [{"id": r[0], "role": r[1], "content": r[2],
+             "attachments": json.loads(r[3] or "[]"), "ts": r[4],
+             "status": r[5], "source": "app"} for r in rows]
+
+
+_canon_init()
+
+
+async def _persona_content_stream(model: str, prompt: str):
+    """Core persona turn → yields ('content', str) pieces, ('keepalive', None)
+    during gaps, ('usage', {used,size}) once. Shared by /v1/chat/completions and
+    /app/v1/messages so both stream identically (the latter also records the
+    accumulated reply to the canonical store)."""
+    if not prompt:
+        yield ("content", "(沒有收到訊息)")
+        return
+    q: asyncio.Queue = asyncio.Queue()
+    session = await POOL.get(model, home_for(model))
+
+    async def pump():
+        try:
+            async for kind, val in session.prompt_stream(prompt):
+                await q.put((kind, val))
+        except Exception as e:  # noqa: BLE001
+            await q.put(("error", str(e)))
+        finally:
+            await q.put(("end", None))
+
+    asyncio.create_task(pump())
+    got_text = False
+    completed = False
+    thought_buf: list[str] = []
+
+    def flush_thought():
+        if thought_buf:
+            t = "".join(thought_buf).strip()
+            thought_buf.clear()
+            if t:
+                return f"\n<details><summary>💭 思考</summary>\n\n{t}\n\n</details>\n\n"
+        return None
+
+    import time as _t
+    last_event = _t.monotonic()
+    STALL_LIMIT = 300
+    try:
+        while True:
+            try:
+                kind, val = await asyncio.wait_for(q.get(), timeout=2.0)
+                last_event = _t.monotonic()
+            except asyncio.TimeoutError:
+                if _t.monotonic() - last_event > STALL_LIMIT:
+                    asyncio.create_task(session.cancel())
+                    yield ("content", "\n\n⚠️ 回合逾時(伺服器端 5 分鐘無回應),已中止。")
+                    completed = True
+                    break
+                yield ("keepalive", None)
+                continue
+            if kind == "text":
+                if not got_text:
+                    ft = flush_thought()
+                    if ft:
+                        yield ("content", ft)
+                got_text = True
+                yield ("content", val)
+            elif kind == "thought":
+                thought_buf.append(val)
+            elif kind == "tool_start":
+                name = val.get("name", "tool")
+                cmd = (val.get("cmd") or "").strip().splitlines()
+                cmd1 = (cmd[0] if cmd else "")[:140]
+                yield ("content", f"\n› 🔧 **{name}**" + (f" `{cmd1}`" if cmd1 else "") + "\n")
+            elif kind == "tool_result":
+                res = (val.get("text") or "").strip()
+                if res:
+                    short = res[:900]
+                    more = "\n…(截斷)" if len(res) > 900 else ""
+                    yield ("content", f"<details><summary>↳ 結果</summary>\n\n```\n{short}{more}\n```\n\n</details>\n")
+            elif kind == "perm":
+                yield ("content", f"\n› 🔐 自動允許 **{val}**\n")
+            elif kind == "usage":
+                yield ("usage", val)
+            elif kind == "error":
+                if not got_text:
+                    try:
+                        yield ("content", await run_hermes(model, prompt))
+                    except Exception as e2:  # noqa: BLE001
+                        yield ("content", f"⚠️ {e2}")
+                else:
+                    yield ("content", f"\n\n⚠️ 串流中斷:{val}")
+            else:
+                completed = True
+                break
+        ft = flush_thought()
+        if ft:
+            yield ("content", ft)
+    finally:
+        if not completed:
+            asyncio.create_task(session.cancel())
+
+
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
     _check_auth(request)
@@ -297,99 +444,14 @@ async def chat_completions(request: Request):
                 return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
             yield chunk({"role": "assistant", "content": ""})  # open the bubble
-            if not prompt:
-                yield chunk({"content": "(沒有收到訊息)"})
-                yield chunk({}, finish="stop")
-                yield "data: [DONE]\n\n"
-                return
-
-            q: asyncio.Queue = asyncio.Queue()
-            session = await POOL.get(model, home_for(model))
-
-            async def pump():
-                try:
-                    async for kind, val in session.prompt_stream(prompt):
-                        await q.put((kind, val))
-                except Exception as e:                      # noqa: BLE001
-                    await q.put(("error", str(e)))
-                finally:
-                    await q.put(("end", None))
-
-            asyncio.create_task(pump())
-            got_text = False
-            completed = False
             last_usage = None
-            thought_buf: list[str] = []
-
-            def flush_thought():
-                if thought_buf:
-                    t = "".join(thought_buf).strip()
-                    thought_buf.clear()
-                    if t:
-                        return f"\n<details><summary>💭 思考</summary>\n\n{t}\n\n</details>\n\n"
-                return None
-
-            import time as _t
-            last_event = _t.monotonic()
-            STALL_LIMIT = 300                          # no event at all for 5 min → hung
-            try:
-                while True:
-                    try:
-                        kind, val = await asyncio.wait_for(q.get(), timeout=2.0)
-                        last_event = _t.monotonic()
-                    except asyncio.TimeoutError:
-                        if _t.monotonic() - last_event > STALL_LIMIT:
-                            asyncio.create_task(session.cancel())
-                            yield chunk({"content": "\n\n⚠️ 回合逾時(伺服器端 5 分鐘無回應),已中止。"})
-                            completed = True
-                            break
-                        yield ": keepalive\n\n"
-                        continue
-                    if kind == "text":
-                        if not got_text:                     # surface buffered thinking first
-                            ft = flush_thought()
-                            if ft:
-                                yield chunk({"content": ft})
-                        got_text = True
-                        yield chunk({"content": val})
-                    elif kind == "thought":
-                        thought_buf.append(val)              # buffered, shown before the answer
-                    elif kind == "tool_start":
-                        name = val.get("name", "tool")
-                        cmd = (val.get("cmd") or "").strip().splitlines()
-                        cmd1 = (cmd[0] if cmd else "")[:140]
-                        line = f"\n› 🔧 **{name}**" + (f" `{cmd1}`" if cmd1 else "") + "\n"
-                        yield chunk({"content": line})
-                    elif kind == "tool_result":
-                        res = (val.get("text") or "").strip()
-                        if res:
-                            short = res[:900]
-                            more = "\n…(截斷)" if len(res) > 900 else ""
-                            yield chunk({"content":
-                                f"<details><summary>↳ 結果</summary>\n\n```\n{short}{more}\n```\n\n</details>\n"})
-                    elif kind == "perm":
-                        yield chunk({"content": f"\n› 🔐 自動允許 **{val}**\n"})
-                    elif kind == "usage":
-                        last_usage = val                     # {used, size} — emitted in final chunk
-                    elif kind == "error":
-                        if not got_text:                     # ACP failed cold → fall back
-                            try:
-                                yield chunk({"content": await run_hermes(model, prompt)})
-                            except Exception as e2:          # noqa: BLE001
-                                yield chunk({"content": f"⚠️ {e2}"})
-                        else:
-                            yield chunk({"content": f"\n\n⚠️ 串流中斷:{val}"})
-                    else:  # end
-                        completed = True
-                        break
-                ft = flush_thought()                         # thinking but no answer text
-                if ft:
-                    yield chunk({"content": ft})
-            finally:
-                if not completed:
-                    # client disconnected mid-turn → interrupt the agent (Esc).
-                    asyncio.create_task(session.cancel())
-
+            async for k, v in _persona_content_stream(model, prompt):
+                if k == "content":
+                    yield chunk({"content": v})
+                elif k == "keepalive":
+                    yield ": keepalive\n\n"
+                elif k == "usage":
+                    last_usage = v
             final = {"index": 0, "delta": {}, "finish_reason": "stop"}
             payload = {"id": cid, "object": "chat.completion.chunk", "created": created,
                        "model": model, "choices": [final]}
@@ -954,6 +1016,101 @@ async def cron_toggle(job_id: str, action: str, request: Request):
 async def reports(request: Request, limit: int = 20):
     _check_auth(request)
     return {"reports": _reports(max(1, min(limit, 50)))}
+
+
+# ───────────────────────── versioned app API (M20) ─────────────────────────
+# The app's stable contract. Wraps the Hermes internals (state.db, cron JSON,
+# ACP) so the client never depends on them directly.
+
+@app.get("/capabilities")
+async def capabilities(request: Request):
+    _check_auth(request)
+    return {"api": "app/v1",
+            "features": ["canonical_messages", "reports", "notifications",
+                         "cc_sessions", "attachments", "vision"],
+            "endpoints": ["/app/v1/sessions", "/app/v1/messages", "/reports",
+                          "/cron/jobs", "/ccsessions"]}
+
+
+@app.get("/app/v1/sessions")
+async def app_sessions(request: Request):
+    return await list_sessions(request)
+
+
+@app.get("/app/v1/messages")
+async def app_get_messages(session: str, request: Request, limit: int = 200):
+    """Canonical history for a persona: app turns (bridge canonical store) merged
+    with the Telegram history (Hermes state.db), ordered by time — so every
+    device sees the same interleaved conversation."""
+    _check_auth(request)
+    out = _canon_messages(session, limit)
+    if session in PERSONAS:
+        _, home = PERSONAS[session]
+        for m in _persona_history(home, limit):
+            out.append({"id": f"tg-{m['ts']}", "role": m["role"], "content": m["content"],
+                        "attachments": [], "ts": m["ts"], "status": "done", "source": "telegram"})
+    out.sort(key=lambda m: m.get("ts") or 0)
+    return {"messages": out[-limit:]}
+
+
+@app.post("/app/v1/messages")
+async def app_post_message(request: Request):
+    """Send a turn: record the user message canonically, run the persona turn,
+    stream the reply (OpenAI-style SSE), and record the reply canonically too."""
+    _check_auth(request)
+    body = await request.json()
+    session = body.get("session") or "xcash"
+    if session not in PERSONAS:
+        session = "xcash"
+    content = (body.get("content") or "").strip()
+    attachments = body.get("attachments") or []   # [{kind,filename,mime,data(dataURI)}]
+
+    parts = []
+    if content:
+        parts.append({"type": "text", "text": content})
+    for a in attachments:
+        if a.get("kind") == "image":
+            parts.append({"type": "image_url", "image_url": {"url": a.get("data")}})
+        else:
+            parts.append({"type": "file", "file": {"filename": a.get("filename"),
+                          "mime_type": a.get("mime"), "file_data": a.get("data")}})
+    prompt = await _resolve_persona_prompt([{"role": "user", "content": parts or content}])
+
+    att_meta = [{"kind": a.get("kind"), "filename": a.get("filename"), "mime": a.get("mime")}
+                for a in attachments]
+    _canon_add(session, "user", content, att_meta)
+
+    cid = "appmsg-" + uuid.uuid4().hex[:20]
+    created = int(time.time())
+
+    def chunk(delta, finish=None):
+        payload = {"id": cid, "object": "chat.completion.chunk", "created": created,
+                   "model": session, "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}
+        return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+    async def agen():
+        yield chunk({"role": "assistant", "content": ""})
+        acc = ""
+        last_usage = None
+        async for k, v in _persona_content_stream(session, prompt):
+            if k == "content":
+                acc += v
+                yield chunk({"content": v})
+            elif k == "keepalive":
+                yield ": keepalive\n\n"
+            elif k == "usage":
+                last_usage = v
+        _canon_add(session, "assistant", acc)
+        final = {"index": 0, "delta": {}, "finish_reason": "stop"}
+        payload = {"id": cid, "object": "chat.completion.chunk", "created": created,
+                   "model": session, "choices": [final]}
+        if last_usage and last_usage.get("size"):
+            payload["usage"] = {"context_used": last_usage.get("used"),
+                                "context_size": last_usage.get("size")}
+        yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+        yield "data: [DONE]\n\n"
+
+    return StreamingResponse(agen(), media_type="text/event-stream")
 
 
 @app.post("/dispatch")
