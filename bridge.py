@@ -777,6 +777,41 @@ async def cc_session_stream(name: str, request: Request, replay: int = 80):
     return StreamingResponse(gen(), media_type="text/event-stream")
 
 
+def _cc_format_lines(lines):
+    parts = []
+    for line in lines:
+        if not line.strip():
+            continue
+        try:
+            c = _fmt_cc_event(json.loads(line))
+        except Exception:  # noqa: BLE001
+            continue
+        if c:
+            parts.append(c)
+    return "".join(parts)
+
+
+@app.get("/ccsessions/{name}/history")
+async def cc_session_history(name: str, request: Request, offset: int = 0, limit: int = 150):
+    """A page of older transcript events for scroll-back: the `limit` events that
+    end `offset` events from the newest. `more` is true if older events remain."""
+    _check_auth(request)
+    row = next((r for r in _cc_conf_rows() if r[0] == name), None)
+    if not row:
+        raise HTTPException(status_code=404, detail="unknown session")
+    jsonl = _cc_latest_jsonl(row[1])
+    if not jsonl or not os.path.exists(jsonl):
+        return {"text": "", "more": False}
+    try:
+        lines = open(jsonl, encoding="utf-8", errors="replace").read().splitlines()
+    except Exception:  # noqa: BLE001
+        return {"text": "", "more": False}
+    total = len(lines)
+    end = max(0, total - max(0, offset))
+    start = max(0, end - max(1, min(limit, 500)))
+    return {"text": _cc_format_lines(lines[start:end]), "more": start > 0}
+
+
 @app.post("/ccsessions/{name}/input")
 async def cc_session_input(name: str, request: Request):
     """Type a line into the live Claude Code session (tmux send-keys), exactly
