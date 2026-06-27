@@ -10,10 +10,13 @@ memory (the same MEMORY.md / state.db the Telegram gateway uses).
 Run:  uvicorn bridge:app --host 0.0.0.0 --port 8081
 """
 import asyncio
+import base64
 import json
 import os
+import re
 import time
 import uuid
+from pathlib import Path
 
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -111,13 +114,71 @@ async def run_hermes(model: str, prompt: str) -> str:
     return text
 
 
+# Where inbound attachments (images/files from the app's composer) land on the
+# Studio box. We persist bytes here and hand the agent the path — every backend
+# (Hermes persona / Claude Code / Codex) can Read a file, so this works across
+# all three AND fixes the old "Claude sees the inline image but can't get the
+# bytes" bug (HANDOFF known-issue #3).
+UPLOAD_DIR = Path(os.path.expanduser("~/apps/hermes-agent/home/uploads"))
+
+_MIME_EXT = {"image/jpeg": ".jpg", "image/png": ".png", "image/gif": ".gif",
+             "image/webp": ".webp", "image/heic": ".heic", "application/pdf": ".pdf"}
+
+
+def _save_data_uri(data_uri: str, filename: str = "") -> str | None:
+    """Decode a `data:<mime>;base64,<...>` URI to UPLOAD_DIR; return the path."""
+    m = re.match(r"data:([^;]+);base64,(.*)$", data_uri or "", re.DOTALL)
+    if not m:
+        return None
+    mime, b64 = m.group(1), m.group(2)
+    try:
+        raw = base64.b64decode(b64)
+    except Exception:  # noqa: BLE001
+        return None
+    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    safe = re.sub(r"[^\w.\-]", "_", os.path.basename(filename or "")) or "file"
+    if "." not in safe:
+        safe += _MIME_EXT.get(mime, "")
+    path = UPLOAD_DIR / f"{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}-{safe}"
+    try:
+        path.write_bytes(raw)
+    except Exception:  # noqa: BLE001
+        return None
+    return str(path)
+
+
 def _last_user_message(messages: list) -> str:
     for m in reversed(messages or []):
         if m.get("role") == "user":
             c = m.get("content")
-            if isinstance(c, list):  # OpenAI vision-style content parts
-                c = " ".join(p.get("text", "") for p in c if isinstance(p, dict))
-            return (c or "").strip()
+            if not isinstance(c, list):
+                return (c or "").strip()
+            # OpenAI vision-style parts: keep text, persist image/file parts and
+            # append their on-disk paths so the agent can Read them.
+            texts, saved = [], []
+            for p in c:
+                if not isinstance(p, dict):
+                    continue
+                t = p.get("type")
+                if t == "text" and p.get("text"):
+                    texts.append(p["text"])
+                elif t == "image_url":
+                    url = (p.get("image_url") or {}).get("url", "")
+                    path = _save_data_uri(url, "image.jpg")
+                    if path:
+                        saved.append(("圖片", path))
+                elif t == "file":
+                    f = p.get("file") or {}
+                    path = _save_data_uri(f.get("file_data", ""), f.get("filename", "file"))
+                    if path:
+                        saved.append((f.get("filename") or "檔案", path))
+            text = " ".join(texts).strip()
+            if saved:
+                lines = "\n".join(f"- {label}:{path}" for label, path in saved)
+                note = ("\n\n[使用者附了以下檔案,已存到本機。請先用 Read/檔案工具讀取再回答]\n"
+                        + lines)
+                text = (text + note).strip()
+            return text
     return ""
 
 
