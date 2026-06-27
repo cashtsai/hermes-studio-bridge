@@ -1052,6 +1052,13 @@ async def app_get_messages(session: str, request: Request, limit: int = 200):
         for m in _persona_history(home, limit):
             out.append({"id": f"tg-{m['ts']}", "role": m["role"], "content": m["content"],
                         "attachments": [], "ts": m["ts"], "status": "done", "source": "telegram"})
+    # 袁方 owns the daily briefs (cron) — surface them IN 袁方's conversation, like
+    # Telegram does, not only in the separate Reports tab.
+    if session == "yuanfang":
+        for r in _reports(20):
+            out.append({"id": f"rep-{r['ts']}", "role": "assistant",
+                        "content": f"📰 **{r['label']}**\n\n{r['content']}",
+                        "attachments": [], "ts": r["ts"], "status": "done", "source": "report"})
     out.sort(key=lambda m: m.get("ts") or 0)
     return {"messages": out[-limit:]}
 
