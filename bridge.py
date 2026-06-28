@@ -127,7 +127,10 @@ async def run_hermes(model: str, prompt: str) -> str:
 UPLOAD_DIR = Path(os.path.expanduser("~/apps/hermes-agent/home/uploads"))
 
 _MIME_EXT = {"image/jpeg": ".jpg", "image/png": ".png", "image/gif": ".gif",
-             "image/webp": ".webp", "image/heic": ".heic", "application/pdf": ".pdf"}
+             "image/webp": ".webp", "image/heic": ".heic", "application/pdf": ".pdf",
+             "audio/m4a": ".m4a", "audio/mp4": ".m4a", "audio/x-m4a": ".m4a",
+             "audio/aac": ".m4a", "audio/mpeg": ".mp3", "audio/wav": ".wav",
+             "audio/x-wav": ".wav", "audio/webm": ".webm"}
 
 
 def _save_data_uri(data_uri: str, filename: str = "") -> str | None:
@@ -150,6 +153,59 @@ def _save_data_uri(data_uri: str, filename: str = "") -> str | None:
     except Exception:  # noqa: BLE001
         return None
     return str(path)
+
+
+# ───────────────────────── voice transcription (語音訊息) ───────────────────
+# LINE-style voice messages: the app sends the audio file, the bridge transcribes
+# it, and the transcript becomes the turn text (the audio still shows in-chat).
+# Uses OpenAI whisper-1 (the stt.openai provider Hermes is already configured
+# with) — faster-whisper isn't installed on the box.
+_OPENAI_CLIENT = None
+
+
+def _openai_key() -> str:
+    try:
+        for line in open(os.path.expanduser("~/apps/hermes-agent/home/.env")):
+            if line.startswith("OPENAI_API_KEY="):
+                return line.split("=", 1)[1].strip()
+    except Exception:  # noqa: BLE001
+        pass
+    return os.environ.get("OPENAI_API_KEY", "")
+
+
+def _openai_client():
+    global _OPENAI_CLIENT
+    if _OPENAI_CLIENT is None:
+        from openai import OpenAI
+        _OPENAI_CLIENT = OpenAI(api_key=_openai_key())
+    return _OPENAI_CLIENT
+
+
+def _transcribe(path: str) -> str:
+    """Audio file path → transcript (best-effort; '' on failure)."""
+    try:
+        with open(path, "rb") as f:
+            r = _openai_client().audio.transcriptions.create(model="whisper-1", file=f)
+        return (r.text or "").strip()
+    except Exception as e:  # noqa: BLE001
+        print(f"[voice] transcription failed: {e}", flush=True)
+        return ""
+
+
+async def _transcribe_attachments(attachments: list) -> str:
+    """Save + transcribe every audio attachment; return the joined transcript.
+    Runs the blocking whisper call off the event loop."""
+    texts = []
+    for a in (attachments or []):
+        if a.get("kind") != "audio":
+            continue
+        path = _save_data_uri(a.get("data", ""), a.get("filename", "voice.m4a"))
+        if not path:
+            continue
+        t = await asyncio.to_thread(_transcribe, path)
+        if t:
+            texts.append(t)
+    return " ".join(texts).strip()
 
 
 def _extract_user_parts(messages: list):
@@ -1028,11 +1084,21 @@ async def cc_session_input(name: str, request: Request):
     # Relay layer (like the persona attachment path): persist any attachments and
     # inject their on-disk paths into the typed line. Claude Code can Read files
     # (and sees images natively), so a bare path is enough — no vision pre-pass.
+    # Audio attachments are transcribed (voice message → typed command).
     saved = []
+    voice_lines = []
     for a in (body.get("attachments") or []):
         path = _save_data_uri(a.get("data", ""), a.get("filename", "file"))
-        if path:
+        if not path:
+            continue
+        if a.get("kind") == "audio":
+            t = await asyncio.to_thread(_transcribe, path)
+            if t:
+                voice_lines.append(t)
+        else:
             saved.append(path)
+    if voice_lines:
+        text = (text + " " + " ".join(voice_lines)).strip()
     if saved:
         text = (text + "\n\n[附件已存到本機,請用 Read 讀取]\n"
                 + "\n".join(f"- {p}" for p in saved)).strip()
@@ -1352,12 +1418,21 @@ async def app_post_message(request: Request):
             yield "data: [DONE]\n\n"
         return StreamingResponse(dry_agen(), media_type="text/event-stream")
 
+    # Voice messages: transcribe any audio attachment and fold the transcript
+    # into the turn text. The audio still rides along as an attachment so the
+    # conversation shows the voice bubble; the model gets the words.
+    voice_text = await _transcribe_attachments(attachments)
+    if voice_text:
+        content = (content + "\n" + voice_text).strip() if content else voice_text
+
     parts = []
     if content:
         parts.append({"type": "text", "text": content})
     for a in attachments:
         if a.get("kind") == "image":
             parts.append({"type": "image_url", "image_url": {"url": a.get("data")}})
+        elif a.get("kind") == "audio":
+            continue                       # transcript already in `content`
         else:
             parts.append({"type": "file", "file": {"filename": a.get("filename"),
                           "mime_type": a.get("mime"), "file_data": a.get("data")}})
@@ -1365,6 +1440,8 @@ async def app_post_message(request: Request):
 
     att_meta = [{"kind": a.get("kind"), "filename": a.get("filename"), "mime": a.get("mime")}
                 for a in attachments]
+    # Record the transcript as the canonical text (so other devices see what was
+    # said even without the audio bytes), tagged so the app can show 🎤.
     _canon_add(session, "user", content, att_meta, client_id=client_id)
 
     async def agen():
