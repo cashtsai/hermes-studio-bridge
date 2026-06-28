@@ -1100,30 +1100,40 @@ async def cc_session_input(name: str, request: Request):
     if voice_lines:
         text = (text + " " + " ".join(voice_lines)).strip()
     if saved:
-        text = (text + "\n\n[附件已存到本機,請用 Read 讀取]\n"
-                + "\n".join(f"- {p}" for p in saved)).strip()
+        # SINGLE-LINE reference (no embedded newlines — a newline in send-keys/
+        # paste submits the prompt early). Claude Code's Read tool handles image
+        # files too, so a bare path is enough.
+        refs = " ".join(saved)
+        text = (text + f"  [附件已存到本機,請用 Read 讀取/檢視: {refs}]").strip()
     if not text:
         raise HTTPException(status_code=400, detail="empty")
     if not await _tmux_alive(name):
         raise HTTPException(status_code=409, detail="session not running")
     target = "=" + name
 
-    async def _sk(*args):
+    async def _tmux(*args):
         p = await asyncio.create_subprocess_exec(
-            TMUX_BIN, "send-keys", "-t", target, *args,
+            TMUX_BIN, *args,
             stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE)
         _, err = await p.communicate()
         return p.returncode, (err or b"").decode("utf-8", "replace").strip()
 
+    # Deliver via tmux bracketed paste (set-buffer → paste-buffer -p) instead of
+    # `send-keys -l`. This is how Claude Code receives a pasted prompt: the whole
+    # block (incl. multi-line text + an image path) lands as ONE input, so a
+    # newline no longer submits the command half-typed — the old 502 cause.
+    buf = "pa-" + uuid.uuid4().hex[:8]
     try:
-        await _sk("C-u")                                   # clear any residual input
-        rc1, err1 = await _sk("-l", text)                  # type the line literally
-        await asyncio.sleep(0.2)
-        rc2, err2 = await _sk("Enter")                     # submit
+        await _tmux("send-keys", "-t", target, "C-u")          # clear residual input
+        rc_set, e_set = await _tmux("set-buffer", "-b", buf, text)
+        rc_paste, e_paste = await _tmux("paste-buffer", "-t", target, "-b", buf, "-p", "-d")
+        await asyncio.sleep(0.25)                               # let the editor settle
+        rc_enter, e_enter = await _tmux("send-keys", "-t", target, "Enter")
     except Exception as e:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=str(e))
-    if rc1 != 0 or rc2 != 0:                               # don't false-report success
-        raise HTTPException(status_code=502, detail=(err1 or err2 or "send-keys failed")[:200])
+    if rc_set or rc_paste or rc_enter:                         # don't false-report success
+        detail = (e_set or e_paste or e_enter or "tmux paste failed")[:200]
+        raise HTTPException(status_code=502, detail=detail)
     return {"ok": True}
 
 
