@@ -59,6 +59,10 @@ class ACPSession:
             env = dict(os.environ)
             env["HERMES_HOME"] = self.home
             env["HERMES_ACCEPT_HOOKS"] = "1"
+            # Allow loading cross-source sessions (e.g. Telegram sessions in
+            # acp context). Without this, acp_adapter/_restore silently skips
+            # any session whose source != "acp", so the TG history is invisible.
+            env["HERMES_ACP_ALLOW_CROSS_SOURCE"] = "1"
             self.proc = await asyncio.create_subprocess_exec(
                 HERMES_BIN, "acp", "--accept-hooks",
                 env=env, stdin=asyncio.subprocess.PIPE,
@@ -102,10 +106,23 @@ class ACPSession:
             return None
         try:
             con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=5)
+            # Pick the richest session: prefer the one with the most messages
+            # from any real interaction source (telegram, hermes, acp).
+            # Excludes cron/subagent sessions which are ephemeral task runs,
+            # not the persona's canonical conversation context.
             cur = con.execute(
-                "SELECT id FROM sessions WHERE source='telegram' AND message_count > 0 "
-                "ORDER BY started_at DESC LIMIT 1")
+                "SELECT id FROM sessions "
+                "WHERE message_count > 5 "
+                "  AND source NOT IN ('cron', 'subagent') "
+                "ORDER BY message_count DESC LIMIT 1")
             row = cur.fetchone()
+            if not row:
+                # fallback: any non-cron session with messages
+                cur = con.execute(
+                    "SELECT id FROM sessions "
+                    "WHERE message_count > 0 AND source != 'cron' "
+                    "ORDER BY started_at DESC LIMIT 1")
+                row = cur.fetchone()
             con.close()
             return row[0] if row else None
         except Exception:
