@@ -1080,6 +1080,21 @@ NOTIFY_LABELS = {
     "memory-consolidation-2200": "晚間三省",
 }
 
+# Per-persona daily notification jobs (cron job *name* -> in-chat label) that
+# should appear INSIDE that persona's conversation, like Telegram shows them —
+# not only in the separate Reports tab. Each persona reads its OWN home's
+# state.db + cron/jobs.json, so adding a new daily job (e.g. a 潘天晴 "今日精選"
+# / 限動 cron) here is all it takes for it to surface in-chat automatically.
+PERSONA_REPORTS = {
+    "yuanfang": NOTIFY_LABELS,
+    "pantianqing": {
+        "fliper-editorial-brief-0715": "編輯台晨報",
+        # ↓ wire these the moment the matching FLiPER crons exist:
+        # "fliper-today-pick-...": "今日精選",
+        # "fliper-story-...":      "限動",
+    },
+}
+
 
 def _cron_jobs():
     try:
@@ -1114,16 +1129,17 @@ _REPORT_START = re.compile(r"(🌅|🌙|☀️|🌇|🌃|📊|🗓️|善彰[，
 
 def _clean_report(s: str) -> str:
     """Trim a leading English working-note preamble some cron runs leak before
-    the actual brief (the SKILL says not to emit it, but it sneaks in)."""
-    m = _REPORT_START.search(s)
-    if m and 0 < m.start() < 600:
-        return s[m.start():].strip()
-    # Fallback (e.g. 午報): drop leading non-CJK working-note lines before the
-    # first line that actually contains Chinese.
+    the actual brief ("I have all the data… Now composing…"), WITHOUT eating the
+    real title. Keep from the first line that carries real content: any CJK, a
+    markdown header, or one of the known report openers (🌅/善彰早安…)."""
     lines = s.split("\n")
     for i, line in enumerate(lines):
-        if any("一" <= c <= "鿿" for c in line):
-            return "\n".join(lines[i:]).strip() if i > 0 else s.strip()
+        t = line.strip()
+        if not t:
+            continue
+        has_cjk = any("一" <= c <= "鿿" for c in t)
+        if has_cjk or t.startswith("#") or _REPORT_START.match(t):
+            return "\n".join(lines[i:]).strip()
     return s.strip()
 
 
@@ -1154,6 +1170,58 @@ def _reports(limit: int = 20):
                 out.append({"label": job.get("label") or job.get("name"),
                             "name": job.get("name"), "content": _clean_report(last[0]),
                             "ts": last[1]})
+            if len(out) >= limit:
+                break
+        con.close()
+        return out
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def _cron_names_for(home: str) -> dict:
+    """job_id -> job name, from a given persona home's own cron/jobs.json."""
+    try:
+        data = json.load(open(os.path.join(home, "cron", "jobs.json"), encoding="utf-8"))
+        jobs = data.get("jobs", data) if isinstance(data, dict) else data
+        return {j.get("id"): j.get("name", "") for j in jobs}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _persona_reports(persona: str, limit: int = 20):
+    """Daily notification reports for ANY persona, read from that persona's OWN
+    home state.db + cron/jobs.json (not just the main 袁方 home). Mirrors
+    _reports but generalised so 潘天晴's 編輯台晨報 (and future 今日精選 / 限動)
+    surface in-conversation too. Returns newest-first cleaned briefs."""
+    import sqlite3
+    labels = PERSONA_REPORTS.get(persona)
+    if not labels:
+        return []
+    home = home_for(persona)
+    db = os.path.join(home, "state.db")
+    if not os.path.exists(db):
+        return []
+    idname = _cron_names_for(home)
+    try:
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=5)
+        sids = con.execute(
+            "SELECT m.session_id, MAX(m.timestamp) ts FROM messages m "
+            "JOIN sessions s ON s.id = m.session_id WHERE s.source='cron' "
+            "GROUP BY m.session_id ORDER BY ts DESC LIMIT ?", (limit * 3,)).fetchall()
+        out = []
+        for sid, _ts in sids:
+            mobj = re.search(r"cron_([0-9a-f]+)_", str(sid))
+            name = idname.get(mobj.group(1)) if mobj else None
+            label = labels.get(name)
+            if not label:
+                continue                       # not a user-facing daily job
+            last = con.execute(
+                "SELECT content, timestamp FROM messages WHERE session_id=? "
+                "AND role='assistant' AND content IS NOT NULL AND content!='' "
+                "ORDER BY timestamp DESC LIMIT 1", (sid,)).fetchone()
+            if last and last[0]:
+                out.append({"label": label, "name": name,
+                            "content": _clean_report(last[0]), "ts": last[1]})
             if len(out) >= limit:
                 break
         con.close()
@@ -1221,13 +1289,14 @@ async def app_get_messages(session: str, request: Request, limit: int = 200):
     for m in _persona_history(home, limit):
         out.append({"id": f"tg-{m['ts']}", "role": m["role"], "content": m["content"],
                     "attachments": [], "ts": m["ts"], "status": "done", "source": "telegram"})
-    # 袁方 owns the daily briefs (cron) — surface them IN 袁方's conversation, like
-    # Telegram does, not only in the separate Reports tab.
-    if session == "yuanfang":
-        for r in _reports(20):
-            out.append({"id": f"rep-{r['ts']}", "role": "assistant",
-                        "content": f"📰 **{r['label']}**\n\n{r['content']}",
-                        "attachments": [], "ts": r["ts"], "status": "done", "source": "report"})
+    # Surface each persona's daily briefs (cron-delivered) IN its conversation,
+    # like Telegram does — not only in the separate Reports tab. 袁方's 晨報/午報
+    # etc. and 潘天晴's 編輯台晨報 (+ future 今日精選/限動) read from each persona's
+    # OWN home, so the app thread matches what TG received this morning.
+    for r in _persona_reports(session, 20):
+        out.append({"id": f"rep-{r['ts']}", "role": "assistant",
+                    "content": f"📰 **{r['label']}**\n\n{r['content']}",
+                    "attachments": [], "ts": r["ts"], "status": "done", "source": "report"})
     out.sort(key=lambda m: m.get("ts") or 0)
     return {"messages": out[-limit:]}
 
