@@ -243,6 +243,8 @@ def _canon_init():
     con.execute("""CREATE TABLE IF NOT EXISTS approvals(
         id TEXT PRIMARY KEY, title TEXT, source TEXT, risk TEXT, detail TEXT,
         created_at REAL, expires_at REAL, status TEXT, decided_at REAL, result TEXT)""")
+    con.execute("""CREATE TABLE IF NOT EXISTS devices(
+        token TEXT PRIMARY KEY, platform TEXT, created_at REAL)""")
     con.commit()
     con.close()
 
@@ -277,6 +279,96 @@ def _canon_messages(session: str, limit: int = 200):
     return [{"id": r[0], "role": r[1], "content": r[2],
              "attachments": json.loads(r[3] or "[]"), "ts": r[4],
              "status": r[5], "source": "app"} for r in rows]
+
+
+# ───────────────────────── APNs push (M23) ─────────────────────────────────
+# Token-based (.p8) auth. The key lives UNDER Hermes management:
+#   ~/apps/hermes-agent/home/credentials/AuthKey_86FF9D976T.p8  (chmod 600)
+# See docs/HANDOFF_CREDENTIALS.md for the rotation procedure / inventory.
+APNS_KEY_PATH = os.path.expanduser(
+    "~/apps/hermes-agent/home/credentials/AuthKey_86FF9D976T.p8")
+APNS_KEY_ID = "86FF9D976T"
+APNS_TEAM_ID = "4F8B93R3SH"
+APNS_BUNDLE_ID = "com.scarfgo.app.4F8B93R3SH"
+APNS_HOST = "https://api.push.apple.com"   # production (TestFlight + App Store)
+_apns_jwt_cache: list = [None, 0.0]        # [token, issued_at]
+
+
+def _apns_jwt() -> str:
+    """ES256 JWT for APNs, cached ~50 min (Apple requires < 60 min)."""
+    import jwt as pyjwt
+    now = time.time()
+    if _apns_jwt_cache[0] and now - _apns_jwt_cache[1] < 3000:
+        return _apns_jwt_cache[0]
+    with open(APNS_KEY_PATH) as f:
+        key = f.read()
+    tok = pyjwt.encode({"iss": APNS_TEAM_ID, "iat": int(now)}, key,
+                       algorithm="ES256", headers={"kid": APNS_KEY_ID})
+    _apns_jwt_cache[0], _apns_jwt_cache[1] = tok, now
+    return tok
+
+
+def _devices() -> list:
+    import sqlite3
+    try:
+        con = sqlite3.connect(f"file:{CANON_DB}?mode=ro", uri=True, timeout=5)
+        rows = con.execute("SELECT token FROM devices").fetchall()
+        con.close()
+        return [r[0] for r in rows]
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def _device_add(token: str, platform: str = "ios") -> None:
+    import sqlite3
+    try:
+        con = sqlite3.connect(CANON_DB)
+        con.execute("INSERT OR REPLACE INTO devices(token,platform,created_at) "
+                    "VALUES(?,?,?)", (token, platform, time.time()))
+        con.commit()
+        con.close()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _device_remove(token: str) -> None:
+    import sqlite3
+    try:
+        con = sqlite3.connect(CANON_DB)
+        con.execute("DELETE FROM devices WHERE token=?", (token,))
+        con.commit()
+        con.close()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+async def _apns_send(token: str, title: str, body: str, data: dict | None = None):
+    import httpx
+    headers = {"authorization": f"bearer {_apns_jwt()}",
+               "apns-topic": APNS_BUNDLE_ID,
+               "apns-push-type": "alert", "apns-priority": "10"}
+    payload = {"aps": {"alert": {"title": title, "body": body}, "sound": "default"}}
+    if data:
+        payload.update(data)
+    async with httpx.AsyncClient(http2=True, timeout=10) as client:
+        r = await client.post(f"{APNS_HOST}/3/device/{token}",
+                              headers=headers, json=payload)
+        return r.status_code, r.text
+
+
+async def push_notify(title: str, body: str, data: dict | None = None) -> int:
+    """Fan a push to every registered device; prune dead tokens (410/BadToken)."""
+    sent = 0
+    for tok in _devices():
+        try:
+            code, text = await _apns_send(tok, title, body, data)
+            if code == 200:
+                sent += 1
+            elif code == 410 or "BadDeviceToken" in text or "Unregistered" in text:
+                _device_remove(tok)
+        except Exception:  # noqa: BLE001
+            pass
+    return sent
 
 
 _canon_init()
@@ -1074,9 +1166,10 @@ async def capabilities(request: Request):
     return {"api": "app/v1",
             "features": ["canonical_messages", "reports", "notifications",
                          "approvals", "cc_sessions", "attachments", "vision",
-                         "message_dry_run"],
+                         "message_dry_run", "apns_push"],
             "endpoints": ["/app/v1/sessions", "/app/v1/messages", "/reports",
-                          "/cron/jobs", "/ccsessions", "/app/v1/approvals"]}
+                          "/cron/jobs", "/ccsessions", "/app/v1/approvals",
+                          "/app/v1/devices", "/app/v1/push/test"]}
 
 
 @app.get("/app/v1/sessions")
@@ -1214,7 +1307,40 @@ async def approval_create(request: Request):
                  b.get("detail") or "", now, (now + ttl) if ttl else None, "pending", None, None))
     con.commit()
     con.close()
+    title = b.get("title") or "需要核准"
+    body = (b.get("detail") or b.get("source") or "點開查看並決定")[:120]
+    asyncio.create_task(push_notify(f"🔐 {title}", body,
+                                    {"kind": "approval", "id": aid}))
     return {"id": aid, "status": "pending"}
+
+
+@app.post("/app/v1/devices")
+async def register_device(request: Request):
+    """App registers its APNs device token here on launch / token refresh."""
+    _check_auth(request)
+    b = await request.json()
+    token = (b.get("token") or "").strip()
+    if not token:
+        raise HTTPException(status_code=400, detail="missing token")
+    _device_add(token, b.get("platform") or "ios")
+    return {"ok": True, "devices": len(_devices())}
+
+
+@app.get("/app/v1/devices")
+async def list_devices(request: Request):
+    _check_auth(request)
+    return {"count": len(_devices())}
+
+
+@app.post("/app/v1/push/test")
+async def push_test(request: Request):
+    """Send a test push to every registered device — verifies APNs auth end-to-end."""
+    _check_auth(request)
+    b = await request.json() if await request.body() else {}
+    n = await push_notify(b.get("title") or "Pocket Agent",
+                          b.get("body") or "測試推播 ✅ M23 已接上",
+                          {"kind": "test"})
+    return {"sent": n, "devices": len(_devices())}
 
 
 @app.get("/app/v1/approvals")

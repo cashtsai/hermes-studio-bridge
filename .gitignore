@@ -4,3 +4,5 @@ bridge.err.log
 .env
 __pycache__/
 *.pyc
+*.p8
+credentials/
