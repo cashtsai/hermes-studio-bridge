@@ -11,10 +11,13 @@ Run:  uvicorn bridge:app --host 0.0.0.0 --port 8081
 """
 import asyncio
 import base64
+import collections
 import glob
+import hmac
 import json
 import os
 import re
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -42,12 +45,33 @@ _BG_TASKS: set = set()
 # OpenAI API key. Override via the BRIDGE_TOKEN env var.
 BRIDGE_TOKEN = os.environ.get("BRIDGE_TOKEN", "CHANGE-ME")  # real value injected via LaunchAgent env
 
+# Brute-force guard for the token gate. Once the bridge is reachable from the
+# public internet (Tailscale Funnel), the only thing between an attacker and a
+# tool-executing agent is this token, so failed attempts are rate-limited. A
+# VALID token is never throttled — only wrong guesses accrue, so a flood of bad
+# tokens can't lock out the real client (no self-inflicted DoS). With a long
+# random token, brute force is already infeasible; this mainly stops scanning
+# and log spam, and signals abuse via 429.
+_AUTH_FAILS: collections.deque = collections.deque()
+_AUTH_FAIL_WINDOW = 60.0  # seconds
+_AUTH_FAIL_MAX = 12       # wrong guesses per window before 429
+_AUTH_LOCK = threading.Lock()
+
 
 def _check_auth(request: Request) -> None:
     auth = request.headers.get("authorization", "")
     token = auth[7:].strip() if auth.lower().startswith("bearer ") else ""
-    if token != BRIDGE_TOKEN:
-        raise HTTPException(status_code=401, detail="invalid bridge token")
+    if hmac.compare_digest(token, BRIDGE_TOKEN):
+        return  # constant-time match; valid token always allowed
+    now = time.monotonic()
+    with _AUTH_LOCK:
+        while _AUTH_FAILS and now - _AUTH_FAILS[0] > _AUTH_FAIL_WINDOW:
+            _AUTH_FAILS.popleft()
+        _AUTH_FAILS.append(now)
+        over = len(_AUTH_FAILS) > _AUTH_FAIL_MAX
+    if over:
+        raise HTTPException(status_code=429, detail="too many failed auth attempts; slow down")
+    raise HTTPException(status_code=401, detail="invalid bridge token")
 
 HERMES_BIN = "/Users/xcash/apps/hermes-agent/runtime/venv/bin/hermes"
 HOME_ROOT = "/Users/xcash/apps/hermes-agent/home"
