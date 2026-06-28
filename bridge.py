@@ -1048,9 +1048,10 @@ async def capabilities(request: Request):
     _check_auth(request)
     return {"api": "app/v1",
             "features": ["canonical_messages", "reports", "notifications",
-                         "cc_sessions", "attachments", "vision"],
+                         "approvals", "cc_sessions", "attachments", "vision",
+                         "message_dry_run"],
             "endpoints": ["/app/v1/sessions", "/app/v1/messages", "/reports",
-                          "/cron/jobs", "/ccsessions"]}
+                          "/cron/jobs", "/ccsessions", "/app/v1/approvals"]}
 
 
 @app.get("/app/v1/sessions")
@@ -1064,12 +1065,13 @@ async def app_get_messages(session: str, request: Request, limit: int = 200):
     with the Telegram history (Hermes state.db), ordered by time — so every
     device sees the same interleaved conversation."""
     _check_auth(request)
+    if session not in PERSONAS:
+        raise HTTPException(status_code=400, detail="unknown session")
     out = _canon_messages(session, limit)
-    if session in PERSONAS:
-        _, home = PERSONAS[session]
-        for m in _persona_history(home, limit):
-            out.append({"id": f"tg-{m['ts']}", "role": m["role"], "content": m["content"],
-                        "attachments": [], "ts": m["ts"], "status": "done", "source": "telegram"})
+    _, home = PERSONAS[session]
+    for m in _persona_history(home, limit):
+        out.append({"id": f"tg-{m['ts']}", "role": m["role"], "content": m["content"],
+                    "attachments": [], "ts": m["ts"], "status": "done", "source": "telegram"})
     # 袁方 owns the daily briefs (cron) — surface them IN 袁方's conversation, like
     # Telegram does, not only in the separate Reports tab.
     if session == "yuanfang":
@@ -1089,9 +1091,30 @@ async def app_post_message(request: Request):
     body = await request.json()
     session = body.get("session") or "xcash"
     if session not in PERSONAS:
-        session = "xcash"
+        raise HTTPException(status_code=400, detail="unknown session")
     content = (body.get("content") or "").strip()
     attachments = body.get("attachments") or []   # [{kind,filename,mime,data(dataURI)}]
+    dry_run = bool(body.get("dry_run"))
+
+    cid = "appmsg-" + uuid.uuid4().hex[:20]
+    created = int(time.time())
+
+    def chunk(delta, finish=None):
+        payload = {"id": cid, "object": "chat.completion.chunk", "created": created,
+                   "model": session, "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}
+        return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+    if dry_run:
+        async def dry_agen():
+            yield chunk({"role": "assistant", "content": ""})
+            text = f"✅ dry-run ok: {session} message path is reachable; nothing was persisted."
+            yield chunk({"content": text})
+            payload = {"id": cid, "object": "chat.completion.chunk", "created": created,
+                       "model": session,
+                       "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
+            yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+            yield "data: [DONE]\n\n"
+        return StreamingResponse(dry_agen(), media_type="text/event-stream")
 
     parts = []
     if content:
@@ -1107,14 +1130,6 @@ async def app_post_message(request: Request):
     att_meta = [{"kind": a.get("kind"), "filename": a.get("filename"), "mime": a.get("mime")}
                 for a in attachments]
     _canon_add(session, "user", content, att_meta)
-
-    cid = "appmsg-" + uuid.uuid4().hex[:20]
-    created = int(time.time())
-
-    def chunk(delta, finish=None):
-        payload = {"id": cid, "object": "chat.completion.chunk", "created": created,
-                   "model": session, "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}
-        return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
     async def agen():
         yield chunk({"role": "assistant", "content": ""})
