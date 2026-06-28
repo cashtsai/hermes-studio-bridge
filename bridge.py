@@ -33,6 +33,10 @@ POOL = ACPPool()
 # and continuable like a persona. Keyed by an opaque session id.
 SUBSESSIONS: dict = {}
 
+# Strong refs to detached turn tasks so they finish (and record the reply) even
+# if the client's network drops mid-stream. Without this they could be GC'd.
+_BG_TASKS: set = set()
+
 # Bearer token gate. The bridge fronts a tool-executing agent, so it must not
 # be an open control surface even on the tailnet. Open WebUI sends this as its
 # OpenAI API key. Override via the BRIDGE_TOKEN env var.
@@ -240,6 +244,12 @@ def _canon_init():
         id TEXT PRIMARY KEY, session TEXT NOT NULL, role TEXT NOT NULL,
         content TEXT, attachments TEXT, created_at REAL NOT NULL, status TEXT)""")
     con.execute("CREATE INDEX IF NOT EXISTS idx_msg_session_time ON messages(session, created_at)")
+    # client_id: stable per-logical-send id so a retry after a dropped network
+    # connection replays the recorded reply instead of re-running the turn.
+    cols = [r[1] for r in con.execute("PRAGMA table_info(messages)").fetchall()]
+    if "client_id" not in cols:
+        con.execute("ALTER TABLE messages ADD COLUMN client_id TEXT")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_msg_client ON messages(session, client_id)")
     con.execute("""CREATE TABLE IF NOT EXISTS approvals(
         id TEXT PRIMARY KEY, title TEXT, source TEXT, risk TEXT, detail TEXT,
         created_at REAL, expires_at REAL, status TEXT, decided_at REAL, result TEXT)""")
@@ -250,20 +260,41 @@ def _canon_init():
 
 
 def _canon_add(session: str, role: str, content: str, attachments=None,
-               mid: str | None = None, status: str = "done") -> str:
+               mid: str | None = None, status: str = "done",
+               client_id: str | None = None) -> str:
     import sqlite3
     mid = mid or uuid.uuid4().hex
     try:
         con = sqlite3.connect(CANON_DB)
         con.execute("INSERT OR REPLACE INTO messages"
-                    "(id,session,role,content,attachments,created_at,status) VALUES(?,?,?,?,?,?,?)",
+                    "(id,session,role,content,attachments,created_at,status,client_id) "
+                    "VALUES(?,?,?,?,?,?,?,?)",
                     (mid, session, role, content, json.dumps(attachments or [], ensure_ascii=False),
-                     time.time(), status))
+                     time.time(), status, client_id))
         con.commit()
         con.close()
     except Exception:  # noqa: BLE001
         pass
     return mid
+
+
+def _canon_reply_for_client(session: str, client_id: str):
+    """If this logical send already produced a recorded assistant reply (e.g. the
+    first attempt succeeded server-side but the client's network dropped), return
+    it so a retry replays it instead of re-running the turn."""
+    import sqlite3
+    if not client_id:
+        return None
+    try:
+        con = sqlite3.connect(f"file:{CANON_DB}?mode=ro", uri=True, timeout=5)
+        row = con.execute(
+            "SELECT content FROM messages WHERE session=? AND client_id=? "
+            "AND role='assistant' AND status='done' AND content IS NOT NULL AND content!='' "
+            "ORDER BY created_at DESC LIMIT 1", (session, client_id)).fetchone()
+        con.close()
+        return row[0] if row else None
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def _canon_messages(session: str, limit: int = 200):
@@ -1214,6 +1245,7 @@ async def app_post_message(request: Request):
     attachments = body.get("attachments") or []   # [{kind,filename,mime,data(dataURI)}]
     dry_run = bool(body.get("dry_run"))
 
+    client_id = body.get("client_id")    # stable across retries; enables idempotency
     cid = "appmsg-" + uuid.uuid4().hex[:20]
     created = int(time.time())
 
@@ -1221,6 +1253,23 @@ async def app_post_message(request: Request):
         payload = {"id": cid, "object": "chat.completion.chunk", "created": created,
                    "model": session, "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}
         return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+    # Retry idempotency: if this exact logical send already produced a recorded
+    # reply (first attempt completed server-side but the app's network dropped
+    # before it saw the reply), replay that reply — do NOT re-run the turn or
+    # repeat its side effects (e.g. creating the calendar event twice).
+    if not dry_run and client_id:
+        prior = _canon_reply_for_client(session, client_id)
+        if prior is not None:
+            async def replay_agen():
+                yield chunk({"role": "assistant", "content": ""})
+                yield chunk({"content": prior})
+                payload = {"id": cid, "object": "chat.completion.chunk", "created": created,
+                           "model": session, "replayed": True,
+                           "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
+                yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+                yield "data: [DONE]\n\n"
+            return StreamingResponse(replay_agen(), media_type="text/event-stream")
 
     if dry_run:
         async def dry_agen():
@@ -1247,27 +1296,51 @@ async def app_post_message(request: Request):
 
     att_meta = [{"kind": a.get("kind"), "filename": a.get("filename"), "mime": a.get("mime")}
                 for a in attachments]
-    _canon_add(session, "user", content, att_meta)
+    _canon_add(session, "user", content, att_meta, client_id=client_id)
 
     async def agen():
         yield chunk({"role": "assistant", "content": ""})
-        acc = ""
-        last_usage = None
-        async for k, v in _persona_content_stream(session, prompt):
+        q: asyncio.Queue = asyncio.Queue()
+        state = {"acc": "", "usage": None}
+
+        async def run_turn():
+            # Drains the persona turn to completion INDEPENDENTLY of the client
+            # connection. If the app's network drops mid-stream this task keeps
+            # going and records the reply, so the canonical store always reflects
+            # what actually happened server-side (the tool ran, the calendar was
+            # created) — a reload then shows the real reply instead of losing it.
+            try:
+                async for k, v in _persona_content_stream(session, prompt):
+                    if k == "content":
+                        state["acc"] += v
+                    elif k == "usage":
+                        state["usage"] = v
+                    await q.put((k, v))
+            except Exception as e:  # noqa: BLE001
+                await q.put(("error", str(e)))
+            finally:
+                if state["acc"]:
+                    _canon_add(session, "assistant", state["acc"], client_id=client_id)
+                await q.put((None, None))
+
+        task = asyncio.create_task(run_turn())
+        _BG_TASKS.add(task)
+        task.add_done_callback(_BG_TASKS.discard)
+
+        while True:
+            k, v = await q.get()
+            if k is None:
+                break
             if k == "content":
-                acc += v
                 yield chunk({"content": v})
             elif k == "keepalive":
                 yield ": keepalive\n\n"
-            elif k == "usage":
-                last_usage = v
-        _canon_add(session, "assistant", acc)
         final = {"index": 0, "delta": {}, "finish_reason": "stop"}
         payload = {"id": cid, "object": "chat.completion.chunk", "created": created,
                    "model": session, "choices": [final]}
-        if last_usage and last_usage.get("size"):
-            payload["usage"] = {"context_used": last_usage.get("used"),
-                                "context_size": last_usage.get("size")}
+        if state["usage"] and state["usage"].get("size"):
+            payload["usage"] = {"context_used": state["usage"].get("used"),
+                                "context_size": state["usage"].get("size")}
         yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
         yield "data: [DONE]\n\n"
 
