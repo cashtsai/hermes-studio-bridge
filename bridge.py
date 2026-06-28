@@ -740,6 +740,10 @@ def _fmt_cc_event(d: dict) -> str:
     if t == "user":
         content = msg.get("content")
         if isinstance(content, str):
+            head = content.lstrip()[:80]
+            if any(tag in head for tag in ("<task-notification>", "<system-reminder>",
+                                           "[Internal", "<command-name>", "<local-command")):
+                return ""           # harness/system plumbing, not something 善彰 typed
             ts = _cc_time(d.get("timestamp"))
             stamp = f" _{ts}_" if ts else ""
             return f"\n\n**🧑 你:**{stamp} {content}\n\n"
@@ -898,18 +902,39 @@ async def cc_session_input(name: str, request: Request):
         raise HTTPException(status_code=404, detail="unknown session")
     body = await request.json()
     text = (body.get("text") or "").strip()
+    # Relay layer (like the persona attachment path): persist any attachments and
+    # inject their on-disk paths into the typed line. Claude Code can Read files
+    # (and sees images natively), so a bare path is enough — no vision pre-pass.
+    saved = []
+    for a in (body.get("attachments") or []):
+        path = _save_data_uri(a.get("data", ""), a.get("filename", "file"))
+        if path:
+            saved.append(path)
+    if saved:
+        text = (text + "\n\n[附件已存到本機,請用 Read 讀取]\n"
+                + "\n".join(f"- {p}" for p in saved)).strip()
     if not text:
         raise HTTPException(status_code=400, detail="empty")
     if not await _tmux_alive(name):
         raise HTTPException(status_code=409, detail="session not running")
+    target = "=" + name
+
+    async def _sk(*args):
+        p = await asyncio.create_subprocess_exec(
+            TMUX_BIN, "send-keys", "-t", target, *args,
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE)
+        _, err = await p.communicate()
+        return p.returncode, (err or b"").decode("utf-8", "replace").strip()
+
     try:
-        p = await asyncio.create_subprocess_exec(TMUX_BIN, "send-keys", "-t", "=" + name, "-l", text)
-        await p.wait()
-        await asyncio.sleep(0.15)
-        p2 = await asyncio.create_subprocess_exec(TMUX_BIN, "send-keys", "-t", "=" + name, "Enter")
-        await p2.wait()
+        await _sk("C-u")                                   # clear any residual input
+        rc1, err1 = await _sk("-l", text)                  # type the line literally
+        await asyncio.sleep(0.2)
+        rc2, err2 = await _sk("Enter")                     # submit
     except Exception as e:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=str(e))
+    if rc1 != 0 or rc2 != 0:                               # don't false-report success
+        raise HTTPException(status_code=502, detail=(err1 or err2 or "send-keys failed")[:200])
     return {"ok": True}
 
 
