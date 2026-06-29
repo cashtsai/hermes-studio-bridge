@@ -13,6 +13,7 @@ import asyncio
 import base64
 import collections
 import glob
+import hashlib
 import hmac
 import json
 import os
@@ -56,6 +57,54 @@ _AUTH_FAILS: collections.deque = collections.deque()
 _AUTH_FAIL_WINDOW = 60.0  # seconds
 _AUTH_FAIL_MAX = 12       # wrong guesses per window before 429
 _AUTH_LOCK = threading.Lock()
+_AUTH_FAIL_AGG: dict = {}
+
+
+def _log_event(event: str, **fields) -> None:
+    payload = {
+        "event": event,
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        **fields,
+    }
+    print("[bridge-event] " + json.dumps(payload, ensure_ascii=False, sort_keys=True), flush=True)
+
+
+def _client_host(request: Request) -> str:
+    return request.client.host if request.client else ""
+
+
+def _short_hash(value: str | None) -> str:
+    if not value:
+        return ""
+    return hashlib.sha256(value.encode("utf-8", "replace")).hexdigest()[:12]
+
+
+def _attachment_stats(attachments: list) -> dict:
+    kinds = collections.Counter((a or {}).get("kind") or "unknown" for a in (attachments or []))
+    return {
+        "attachment_count": len(attachments or []),
+        "image_count": kinds.get("image", 0),
+        "audio_count": kinds.get("audio", 0),
+        "file_count": sum(v for k, v in kinds.items() if k not in ("image", "audio")),
+    }
+
+
+def _auth_fail_summary_locked(request: Request, status: int, now: float) -> dict | None:
+    key = (_client_host(request), request.url.path, status)
+    item = _AUTH_FAIL_AGG.setdefault(key, {"count": 0, "last_log": 0.0})
+    item["count"] += 1
+    count = item["count"]
+    should_log = count in (1, 10, 50, 100) or now - item["last_log"] >= 60.0
+    if not should_log:
+        return None
+    item["last_log"] = now
+    return {
+        "client": key[0],
+        "path": key[1],
+        "status": status,
+        "count": count,
+        "window_seconds": int(_AUTH_FAIL_WINDOW),
+    }
 
 
 def _check_auth(request: Request) -> None:
@@ -69,6 +118,9 @@ def _check_auth(request: Request) -> None:
             _AUTH_FAILS.popleft()
         _AUTH_FAILS.append(now)
         over = len(_AUTH_FAILS) > _AUTH_FAIL_MAX
+        summary = _auth_fail_summary_locked(request, 429 if over else 401, now)
+    if summary:
+        _log_event("auth_failure", **summary)
     if over:
         raise HTTPException(status_code=429, detail="too many failed auth attempts; slow down")
     raise HTTPException(status_code=401, detail="invalid bridge token")
@@ -341,7 +393,7 @@ def _canon_init():
 
 def _canon_add(session: str, role: str, content: str, attachments=None,
                mid: str | None = None, status: str = "done",
-               client_id: str | None = None) -> str:
+               client_id: str | None = None) -> tuple[str, bool]:
     import sqlite3
     mid = mid or uuid.uuid4().hex
     try:
@@ -353,9 +405,15 @@ def _canon_add(session: str, role: str, content: str, attachments=None,
                      time.time(), status, client_id))
         con.commit()
         con.close()
-    except Exception:  # noqa: BLE001
-        pass
-    return mid
+        return mid, True
+    except Exception as e:  # noqa: BLE001
+        _log_event("canonical_write_failed",
+                   session=session, role=role, status=status,
+                   client_id_hash=_short_hash(client_id),
+                   content_chars=len(content or ""),
+                   attachment_count=len(attachments or []),
+                   error=type(e).__name__, error_message=str(e)[:160])
+    return mid, False
 
 
 def _canon_reply_for_client(session: str, client_id: str):
@@ -682,6 +740,621 @@ async def chat_completions(request: Request):
 
 CLAUDE_BIN = "/Users/xcash/.local/bin/claude"
 CODEX_BIN = "/Users/xcash/.local/bin/codex"
+
+
+class CodexAppServerError(RuntimeError):
+    def __init__(self, message: str, code=None):
+        super().__init__(message)
+        self.code = code
+
+
+class CodexAppServerClient:
+    """Small JSON-RPC client for `codex app-server --stdio`.
+
+    The bridge keeps one app-server connection warm and exposes Codex threads as
+    PocketAgent-controllable sessions. This is the correct sync surface for
+    Codex App/CLI threads; `codex exec` remains only a fallback path.
+    """
+
+    def __init__(self):
+        self.proc = None
+        self._lock = asyncio.Lock()
+        self._next_id = 1
+        self._pending = {}
+        self._reader_task = None
+        self._stderr_task = None
+        self.thread_events = collections.defaultdict(list)
+        self.active_turns = {}
+        self.loaded_threads = set()
+        self.remote_status = None
+        self._streamed_item_ids = set()
+
+    async def call(self, method: str, params: dict | None = None, timeout: float = 30.0):
+        async with self._lock:
+            await self._ensure_started_locked()
+            rid = self._next_id
+            self._next_id += 1
+            fut = asyncio.get_running_loop().create_future()
+            self._pending[rid] = fut
+            await self._write_locked({"jsonrpc": "2.0", "id": rid,
+                                      "method": method, "params": params or {}})
+        try:
+            return await asyncio.wait_for(fut, timeout=timeout)
+        except asyncio.TimeoutError as e:
+            self._pending.pop(rid, None)
+            raise CodexAppServerError(f"{method} timed out") from e
+
+    async def notify(self, method: str, params: dict | None = None):
+        async with self._lock:
+            await self._ensure_started_locked()
+            msg = {"jsonrpc": "2.0", "method": method}
+            if params is not None:
+                msg["params"] = params
+            await self._write_locked(msg)
+
+    async def _ensure_started_locked(self):
+        if self.proc and self.proc.returncode is None:
+            return
+        self._pending.clear()
+        self.proc = await asyncio.create_subprocess_exec(
+            CODEX_BIN, "app-server", "--stdio",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            stdin=asyncio.subprocess.PIPE,
+            cwd=HOME_ROOT,
+            limit=8 * 1024 * 1024,
+        )
+        self._reader_task = asyncio.create_task(self._read_stdout())
+        self._stderr_task = asyncio.create_task(self._read_stderr())
+        init = await self._call_started_locked(
+            "initialize",
+            {
+                "clientInfo": {
+                    "name": "pocketagent-bridge",
+                    "title": "PocketAgent Bridge",
+                    "version": "0.1",
+                },
+                "capabilities": {"experimentalApi": True},
+            },
+            timeout=10.0,
+        )
+        await self._write_locked({"jsonrpc": "2.0", "method": "initialized"})
+        _log_event("codex_app_server_started",
+                   user_agent=(init or {}).get("userAgent", ""),
+                   codex_home=(init or {}).get("codexHome", ""))
+
+    async def _call_started_locked(self, method: str, params: dict, timeout: float):
+        rid = self._next_id
+        self._next_id += 1
+        fut = asyncio.get_running_loop().create_future()
+        self._pending[rid] = fut
+        await self._write_locked({"jsonrpc": "2.0", "id": rid,
+                                  "method": method, "params": params})
+        try:
+            return await asyncio.wait_for(fut, timeout=timeout)
+        except asyncio.TimeoutError as e:
+            self._pending.pop(rid, None)
+            raise CodexAppServerError(f"{method} timed out") from e
+
+    async def _write_locked(self, msg: dict):
+        if not self.proc or not self.proc.stdin:
+            raise CodexAppServerError("codex app-server is not running")
+        raw = (json.dumps(msg, ensure_ascii=False, separators=(",", ":")) + "\n").encode()
+        self.proc.stdin.write(raw)
+        await self.proc.stdin.drain()
+
+    async def _read_stdout(self):
+        try:
+            while self.proc and self.proc.stdout:
+                raw = await self.proc.stdout.readline()
+                if not raw:
+                    break
+                try:
+                    msg = json.loads(raw.decode("utf-8", "replace"))
+                except Exception:  # noqa: BLE001
+                    continue
+                if "id" in msg:
+                    fut = self._pending.pop(msg.get("id"), None)
+                    if not fut or fut.done():
+                        continue
+                    if "error" in msg:
+                        err = msg.get("error") or {}
+                        fut.set_exception(CodexAppServerError(
+                            err.get("message") or "codex app-server error",
+                            err.get("code")))
+                    else:
+                        fut.set_result(msg.get("result"))
+                else:
+                    self._handle_notification(msg)
+        except Exception as e:  # noqa: BLE001
+            _log_event("codex_app_server_reader_failed", error=type(e).__name__,
+                       error_message=str(e)[:160])
+        finally:
+            for fut in list(self._pending.values()):
+                if not fut.done():
+                    fut.set_exception(CodexAppServerError("codex app-server stopped"))
+            self._pending.clear()
+
+    async def _read_stderr(self):
+        try:
+            while self.proc and self.proc.stderr:
+                raw = await self.proc.stderr.readline()
+                if not raw:
+                    break
+                text = raw.decode("utf-8", "replace").strip()
+                if text and "WARNING: proceeding" not in text:
+                    _log_event("codex_app_server_stderr", message=text[:240])
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _append(self, thread_id: str, item):
+        if not thread_id:
+            return
+        buf = self.thread_events[thread_id]
+        buf.append(item)
+        if len(buf) > 2000:
+            del buf[:500]
+
+    def _handle_notification(self, msg: dict):
+        method = msg.get("method")
+        params = msg.get("params") or {}
+        if method == "remoteControl/status/changed":
+            self.remote_status = params
+            return
+        if method == "thread/started":
+            thread = params.get("thread") or {}
+            tid = thread.get("id")
+            if tid:
+                self.loaded_threads.add(tid)
+            return
+        tid = params.get("threadId")
+        if method == "turn/started" and tid:
+            turn = params.get("turn") or {}
+            self.active_turns[tid] = turn.get("id") or True
+            return
+        if method == "turn/completed" and tid:
+            self.active_turns.pop(tid, None)
+            turn = params.get("turn") or {}
+            err = turn.get("error") if isinstance(turn, dict) else None
+            if err:
+                self._append(tid, ("text", f"\n⚠️ Codex turn failed: {err.get('message', err)}\n"))
+            return
+        if method == "error":
+            _log_event("codex_app_server_error",
+                       message=str(params.get("message") or params)[:240])
+            return
+        if not tid:
+            return
+        if method == "item/agentMessage/delta":
+            item_id = params.get("itemId")
+            if item_id:
+                self._streamed_item_ids.add(item_id)
+            self._append(tid, ("text", params.get("delta") or ""))
+            return
+        if method == "item/started":
+            item = params.get("item") or {}
+            if item.get("type") == "userMessage":
+                return
+            c = _codex_format_item(item, phase="started",
+                                   skip_agent_ids=self._streamed_item_ids)
+            if c:
+                self._append(tid, ("text", c))
+            return
+        if method == "item/completed":
+            item = params.get("item") or {}
+            c = _codex_format_item(item, phase="completed",
+                                   skip_agent_ids=self._streamed_item_ids)
+            if c:
+                self._append(tid, ("text", c))
+            return
+        if method == "item/fileChange/patchUpdated":
+            changes = params.get("changes") or []
+            c = _codex_format_file_changes(changes, "inProgress")
+            if c:
+                self._append(tid, ("text", c))
+
+    async def ensure_thread_loaded(self, thread_id: str, cwd: str | None = None):
+        if thread_id in self.loaded_threads:
+            return
+        params = {"threadId": thread_id, "excludeTurns": True}
+        if cwd:
+            params["cwd"] = cwd
+        await self.call("thread/resume", params, timeout=30.0)
+        self.loaded_threads.add(thread_id)
+
+    async def start_turn(self, thread_id: str, input_items: list, client_id: str | None = None,
+                         cwd: str | None = None):
+        self.thread_events[thread_id].clear()
+        await self.ensure_thread_loaded(thread_id, cwd=cwd)
+        params = {"threadId": thread_id, "input": input_items}
+        if client_id:
+            params["clientUserMessageId"] = client_id
+        if cwd:
+            params["cwd"] = cwd
+        res = await self.call("turn/start", params, timeout=30.0)
+        turn = (res or {}).get("turn") or {}
+        self.active_turns[thread_id] = turn.get("id") or True
+        return res
+
+    async def interrupt_turn(self, thread_id: str):
+        turn_id = self.active_turns.get(thread_id)
+        if not isinstance(turn_id, str) or not turn_id:
+            raise CodexAppServerError("no active Codex turn to interrupt", code=-32600)
+        return await self.call("turn/interrupt", {
+            "threadId": thread_id,
+            "turnId": turn_id,
+        }, timeout=15.0)
+
+    def events_for(self, thread_id: str) -> list:
+        return self.thread_events.get(thread_id, [])
+
+    def is_active(self, thread_id: str) -> bool:
+        return thread_id in self.active_turns
+
+
+CODEX_APP = CodexAppServerClient()
+
+
+def _codex_status_type(status) -> str:
+    if isinstance(status, dict):
+        return status.get("type") or "unknown"
+    if isinstance(status, str):
+        return status
+    return "unknown"
+
+
+def _codex_source_label(source) -> str:
+    if isinstance(source, str):
+        return source
+    if isinstance(source, dict):
+        if "custom" in source:
+            return str(source.get("custom") or "custom")
+        if "subAgent" in source:
+            return "subAgent"
+    return "unknown"
+
+
+def _codex_session_summary(thread: dict) -> dict:
+    tid = thread.get("id") or ""
+    preview = (thread.get("preview") or "").strip()
+    return {
+        "name": tid[:12] or "codex",
+        "thread_id": tid,
+        "session_id": thread.get("sessionId") or "",
+        "workdir": thread.get("cwd") or "",
+        "preview": preview[:180],
+        "status": _codex_status_type(thread.get("status")),
+        "source": _codex_source_label(thread.get("source")),
+        "updatedAt": thread.get("updatedAt"),
+        "modelProvider": thread.get("modelProvider") or "",
+    }
+
+
+def _codex_user_input_text(content: list) -> str:
+    parts = []
+    for item in content or []:
+        if not isinstance(item, dict):
+            continue
+        t = item.get("type")
+        if t == "text" and item.get("text"):
+            parts.append(item["text"])
+        elif t == "localImage" and item.get("path"):
+            parts.append(f"[圖片: {item['path']}]")
+        elif t == "image" and item.get("url"):
+            parts.append(f"[圖片: {item['url']}]")
+        elif item.get("path"):
+            parts.append(f"[{t or 'file'}: {item['path']}]")
+    return "\n".join(parts).strip()
+
+
+def _codex_format_file_changes(changes: list, status: str = "") -> str:
+    if not changes:
+        return ""
+    rows = []
+    for c in changes[:8]:
+        if not isinstance(c, dict):
+            continue
+        kind = c.get("kind") or {}
+        k = kind.get("type") if isinstance(kind, dict) else str(kind)
+        rows.append(f"- {k or 'change'} `{c.get('path', '')}`")
+    more = f"\n- ...and {len(changes) - 8} more" if len(changes) > 8 else ""
+    label = f"fileChange {status}".strip()
+    return f"\n› 📝 **{label}**\n" + "\n".join(rows) + more + "\n"
+
+
+def _codex_format_tool_result(text: str) -> str:
+    text = (text or "").strip()
+    if not text:
+        return ""
+    short = text[:1200]
+    more = "\n...(truncated)" if len(text) > 1200 else ""
+    return f"<details><summary>↳ result</summary>\n\n```\n{short}{more}\n```\n\n</details>\n"
+
+
+def _codex_format_item(item: dict, phase: str = "completed", skip_agent_ids=None) -> str:
+    if not isinstance(item, dict):
+        return ""
+    skip_agent_ids = skip_agent_ids or set()
+    t = item.get("type")
+    if t == "userMessage":
+        text = _codex_user_input_text(item.get("content") or [])
+        return f"\n\n**你:** {text}\n\n" if text else ""
+    if t == "agentMessage":
+        if item.get("id") in skip_agent_ids:
+            return ""
+        text = item.get("text") or ""
+        return text if text else ""
+    if t == "plan":
+        text = item.get("text") or ""
+        return f"\n<details><summary>Plan</summary>\n\n{text}\n\n</details>\n" if text else ""
+    if t == "reasoning":
+        summary = "\n".join(item.get("summary") or []).strip()
+        return f"\n<details><summary>Reasoning</summary>\n\n{summary}\n\n</details>\n" if summary else ""
+    if t == "commandExecution":
+        cmd = (item.get("command") or "").strip().splitlines()
+        cmd1 = (cmd[0] if cmd else "")[:160]
+        status = item.get("status") or phase
+        head = f"\n› 🔧 **command** `{cmd1}` [{status}]\n" if cmd1 else f"\n› 🔧 **command** [{status}]\n"
+        return head + _codex_format_tool_result(item.get("aggregatedOutput") or "")
+    if t == "fileChange":
+        return _codex_format_file_changes(item.get("changes") or [], item.get("status") or phase)
+    if t == "mcpToolCall":
+        label = f"{item.get('server', 'mcp')}.{item.get('tool', 'tool')}"
+        status = item.get("status") or phase
+        err = item.get("error") or {}
+        out = f"\n› 🔧 **{label}** [{status}]\n"
+        if err.get("message"):
+            out += f"⚠️ {err['message']}\n"
+        return out
+    if t == "dynamicToolCall":
+        label = item.get("tool") or "tool"
+        ns = item.get("namespace")
+        if ns:
+            label = f"{ns}.{label}"
+        return f"\n› 🔧 **{label}** [{item.get('status') or phase}]\n"
+    if t == "webSearch":
+        return f"\n› 🔎 **webSearch** `{str(item.get('query') or '')[:160]}`\n"
+    if t == "imageGeneration":
+        return f"\n› 🖼 **imageGeneration** [{item.get('status') or phase}]\n"
+    return ""
+
+
+def _codex_format_turns(turns: list) -> str:
+    parts = []
+    for turn in turns or []:
+        for item in (turn.get("items") or []):
+            c = _codex_format_item(item)
+            if c:
+                parts.append(c)
+    return "".join(parts)
+
+
+async def _codex_input_items(text: str, attachments: list) -> list:
+    text = (text or "").strip()
+    note_paths = []
+    images = []
+    voice_lines = []
+    for a in (attachments or []):
+        path = _save_data_uri(a.get("data", ""), a.get("filename", "file"))
+        if not path:
+            continue
+        if a.get("kind") == "audio":
+            t = await asyncio.to_thread(_transcribe, path)
+            if t:
+                voice_lines.append(t)
+        elif a.get("kind") == "image":
+            images.append({"type": "localImage", "path": path})
+        else:
+            note_paths.append(path)
+    if voice_lines:
+        text = (text + " " + " ".join(voice_lines)).strip()
+    if note_paths:
+        text = (text + "\n\n[附件已存到本機,請讀取: "
+                + " ".join(note_paths) + "]").strip()
+    items = []
+    if text:
+        items.append({"type": "text", "text": text})
+    items.extend(images)
+    return items
+
+
+def _codex_http_error(e: Exception):
+    if isinstance(e, CodexAppServerError):
+        code = 409 if e.code == -32600 else 502
+        raise HTTPException(status_code=code, detail=str(e))
+    raise HTTPException(status_code=502, detail=str(e))
+
+
+@app.get("/codex/status")
+async def codex_status(request: Request):
+    _check_auth(request)
+    try:
+        status = await CODEX_APP.call("remoteControl/status/read", {}, timeout=15.0)
+        return {"ok": True, "remoteControl": status}
+    except Exception as e:  # noqa: BLE001
+        _codex_http_error(e)
+
+
+@app.get("/codexsessions")
+async def codex_sessions(request: Request, limit: int = 40, cwd: str | None = None):
+    _check_auth(request)
+    params = {
+        "limit": max(1, min(limit, 100)),
+        "archived": False,
+        "sourceKinds": ["cli", "vscode", "exec", "appServer"],
+        "sortKey": "updated_at",
+        "sortDirection": "desc",
+        "useStateDbOnly": False,
+    }
+    if cwd:
+        params["cwd"] = cwd
+    try:
+        res = await CODEX_APP.call("thread/list", params, timeout=45.0)
+        return {
+            "sessions": [_codex_session_summary(t) for t in (res or {}).get("data", [])],
+            "nextCursor": (res or {}).get("nextCursor"),
+        }
+    except Exception as e:  # noqa: BLE001
+        _codex_http_error(e)
+
+
+@app.get("/codexsessions/{thread_id}/status")
+async def codex_session_status(thread_id: str, request: Request):
+    _check_auth(request)
+    try:
+        res = await CODEX_APP.call("thread/read", {
+            "threadId": thread_id,
+            "includeTurns": False,
+        }, timeout=20.0)
+        thread = (res or {}).get("thread") or {}
+        summary = _codex_session_summary(thread)
+        summary["activeTurn"] = CODEX_APP.is_active(thread_id)
+        return {"session": summary}
+    except Exception as e:  # noqa: BLE001
+        _codex_http_error(e)
+
+
+@app.post("/codexsessions")
+async def codex_session_create(request: Request):
+    _check_auth(request)
+    body = await request.json()
+    text = (body.get("text") or body.get("task") or "").strip()
+    attachments = body.get("attachments") or []
+    input_items = await _codex_input_items(text, attachments)
+    if not input_items:
+        raise HTTPException(status_code=400, detail="text or attachment required")
+    cwd = body.get("cwd") or HOME_ROOT
+    params = {
+        "cwd": cwd,
+        "ephemeral": False,
+        "threadSource": "user",
+    }
+    if body.get("model"):
+        params["model"] = body.get("model")
+    try:
+        res = await CODEX_APP.call("thread/start", params, timeout=30.0)
+        thread = (res or {}).get("thread") or {}
+        thread_id = thread.get("id")
+        if not thread_id:
+            raise CodexAppServerError("thread/start returned no thread id")
+        CODEX_APP.loaded_threads.add(thread_id)
+        await CODEX_APP.start_turn(thread_id, input_items,
+                                   client_id=body.get("client_id"), cwd=cwd)
+        return {"ok": True, "thread_id": thread_id,
+                "session": _codex_session_summary(thread)}
+    except Exception as e:  # noqa: BLE001
+        _codex_http_error(e)
+
+
+@app.post("/codexsessions/{thread_id}/input")
+async def codex_session_input(thread_id: str, request: Request):
+    _check_auth(request)
+    body = await request.json()
+    input_items = await _codex_input_items((body.get("text") or "").strip(),
+                                           body.get("attachments") or [])
+    if not input_items:
+        raise HTTPException(status_code=400, detail="empty")
+    try:
+        res = await CODEX_APP.start_turn(thread_id, input_items,
+                                         client_id=body.get("client_id"),
+                                         cwd=body.get("cwd"))
+        return {"ok": True, "thread_id": thread_id, "turn": (res or {}).get("turn")}
+    except Exception as e:  # noqa: BLE001
+        _codex_http_error(e)
+
+
+@app.post("/codexsessions/{thread_id}/interrupt")
+async def codex_session_interrupt(thread_id: str, request: Request):
+    _check_auth(request)
+    try:
+        await CODEX_APP.interrupt_turn(thread_id)
+        return {"ok": True, "thread_id": thread_id}
+    except Exception as e:  # noqa: BLE001
+        _codex_http_error(e)
+
+
+@app.get("/codexsessions/{thread_id}/history")
+async def codex_session_history(thread_id: str, request: Request, limit: int = 40):
+    _check_auth(request)
+    try:
+        res = await CODEX_APP.call("thread/turns/list", {
+            "threadId": thread_id,
+            "limit": max(1, min(limit, 100)),
+            "itemsView": "full",
+            "sortDirection": "desc",
+        }, timeout=45.0)
+        turns = list((res or {}).get("data", []))
+        turns.reverse()
+        return {"text": _codex_format_turns(turns),
+                "more": bool((res or {}).get("nextCursor"))}
+    except Exception as e:  # noqa: BLE001
+        _codex_http_error(e)
+
+
+@app.get("/codexsessions/{thread_id}/stream")
+async def codex_session_stream(thread_id: str, request: Request, replay: int = 20,
+                               follow: bool = False):
+    _check_auth(request)
+    cid = "codexsess-" + uuid.uuid4().hex[:16]
+
+    def chunk(delta, finish=None):
+        payload = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()),
+                   "model": thread_id, "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}
+        return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+    async def gen():
+        yield chunk({"role": "assistant", "content": ""})
+        try:
+            await CODEX_APP.ensure_thread_loaded(thread_id)
+        except Exception as e:  # noqa: BLE001
+            yield chunk({"content": f"\n⚠️ thread load failed: {e}\n"})
+        if replay > 0:
+            try:
+                res = await CODEX_APP.call("thread/turns/list", {
+                    "threadId": thread_id,
+                    "limit": max(1, min(replay, 50)),
+                    "itemsView": "full",
+                    "sortDirection": "desc",
+                }, timeout=30.0)
+                turns = list((res or {}).get("data", []))
+                turns.reverse()
+                text = _codex_format_turns(turns)
+                if text:
+                    yield chunk({"content": text})
+            except Exception as e:  # noqa: BLE001
+                yield chunk({"content": f"\n⚠️ history failed: {e}\n"})
+        idx = 0
+        if replay <= 0 and not CODEX_APP.is_active(thread_id):
+            idx = len(CODEX_APP.events_for(thread_id))
+        idle = 0
+        idle_limit = 120 if follow else 0
+        while True:
+            if await request.is_disconnected():
+                break
+            events = CODEX_APP.events_for(thread_id)
+            while idx < len(events):
+                kind, val = events[idx]
+                idx += 1
+                c = _fmt_item(kind, val)
+                if c:
+                    yield chunk({"content": c})
+            if not CODEX_APP.is_active(thread_id) and idx >= len(events) and not follow:
+                break
+            await asyncio.sleep(0.5)
+            idle += 1
+            if idle >= 20:
+                idle = 0
+                yield ": keepalive\n\n"
+            if follow and idle_limit > 0 and not CODEX_APP.is_active(thread_id):
+                idle_limit -= 1
+                if idle_limit <= 0:
+                    break
+            elif follow and CODEX_APP.is_active(thread_id):
+                idle_limit = 120
+        yield chunk({}, finish="stop")
+        yield "data: [DONE]\n\n"
+
+    return StreamingResponse(gen(), media_type="text/event-stream")
 
 
 def _claude_argv(parent: str, prompt: str, resume: str | None = None):
@@ -1417,6 +2090,17 @@ async def app_post_message(request: Request):
     client_id = body.get("client_id")    # stable across retries; enables idempotency
     cid = "appmsg-" + uuid.uuid4().hex[:20]
     created = int(time.time())
+    turn_started = time.monotonic()
+    common_log = {
+        "cid": cid,
+        "session": session,
+        "client_id_hash": _short_hash(client_id),
+        "client": _client_host(request),
+        "dry_run": dry_run,
+        "input_chars": len(content),
+        **_attachment_stats(attachments),
+    }
+    _log_event("app_turn_received", **common_log)
 
     def chunk(delta, finish=None):
         payload = {"id": cid, "object": "chat.completion.chunk", "created": created,
@@ -1431,25 +2115,43 @@ async def app_post_message(request: Request):
         prior = _canon_reply_for_client(session, client_id)
         if prior is not None:
             async def replay_agen():
-                yield chunk({"role": "assistant", "content": ""})
-                yield chunk({"content": prior})
-                payload = {"id": cid, "object": "chat.completion.chunk", "created": created,
-                           "model": session, "replayed": True,
-                           "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
-                yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
-                yield "data: [DONE]\n\n"
+                done_sent = False
+                try:
+                    yield chunk({"role": "assistant", "content": ""})
+                    yield chunk({"content": prior})
+                    payload = {"id": cid, "object": "chat.completion.chunk", "created": created,
+                               "model": session, "replayed": True,
+                               "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
+                    yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+                    yield "data: [DONE]\n\n"
+                    done_sent = True
+                finally:
+                    _log_event("app_turn_stream_done", **common_log,
+                               replayed=True, output_chars=len(prior),
+                               done_sent=done_sent,
+                               duration_ms=int((time.monotonic() - turn_started) * 1000),
+                               canonical_user_ok=None, canonical_reply_ok=True)
             return StreamingResponse(replay_agen(), media_type="text/event-stream")
 
     if dry_run:
         async def dry_agen():
-            yield chunk({"role": "assistant", "content": ""})
+            done_sent = False
             text = f"✅ dry-run ok: {session} message path is reachable; nothing was persisted."
-            yield chunk({"content": text})
-            payload = {"id": cid, "object": "chat.completion.chunk", "created": created,
-                       "model": session,
-                       "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
-            yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
-            yield "data: [DONE]\n\n"
+            try:
+                yield chunk({"role": "assistant", "content": ""})
+                yield chunk({"content": text})
+                payload = {"id": cid, "object": "chat.completion.chunk", "created": created,
+                           "model": session,
+                           "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
+                yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+                yield "data: [DONE]\n\n"
+                done_sent = True
+            finally:
+                _log_event("app_turn_stream_done", **common_log,
+                           replayed=False, output_chars=len(text),
+                           done_sent=done_sent,
+                           duration_ms=int((time.monotonic() - turn_started) * 1000),
+                           canonical_user_ok=None, canonical_reply_ok=None)
         return StreamingResponse(dry_agen(), media_type="text/event-stream")
 
     # Voice messages: transcribe any audio attachment and fold the transcript
@@ -1476,12 +2178,15 @@ async def app_post_message(request: Request):
                 for a in attachments]
     # Record the transcript as the canonical text (so other devices see what was
     # said even without the audio bytes), tagged so the app can show 🎤.
-    _canon_add(session, "user", content, att_meta, client_id=client_id)
+    _user_mid, canonical_user_ok = _canon_add(session, "user", content, att_meta, client_id=client_id)
 
     async def agen():
-        yield chunk({"role": "assistant", "content": ""})
+        _log_event("app_turn_model_start", **common_log,
+                   prompt_chars=len(prompt), canonical_user_ok=canonical_user_ok)
         q: asyncio.Queue = asyncio.Queue()
-        state = {"acc": "", "usage": None}
+        state = {"acc": "", "usage": None, "content_chunks": 0, "keepalives": 0,
+                 "runner_error": "", "stream_error": "", "canonical_reply_ok": None,
+                 "done_sent": False}
 
         async def run_turn():
             # Drains the persona turn to completion INDEPENDENTLY of the client
@@ -1493,36 +2198,66 @@ async def app_post_message(request: Request):
                 async for k, v in _persona_content_stream(session, prompt):
                     if k == "content":
                         state["acc"] += v
+                        state["content_chunks"] += 1
                     elif k == "usage":
                         state["usage"] = v
                     await q.put((k, v))
             except Exception as e:  # noqa: BLE001
+                state["runner_error"] = f"{type(e).__name__}: {str(e)[:180]}"
                 await q.put(("error", str(e)))
             finally:
                 if state["acc"]:
-                    _canon_add(session, "assistant", state["acc"], client_id=client_id)
+                    _reply_mid, reply_ok = _canon_add(session, "assistant", state["acc"],
+                                                      client_id=client_id)
+                    state["canonical_reply_ok"] = reply_ok
+                _log_event("app_turn_background_done", **common_log,
+                           output_chars=len(state["acc"]),
+                           content_chunks=state["content_chunks"],
+                           usage_used=(state["usage"] or {}).get("used"),
+                           usage_size=(state["usage"] or {}).get("size"),
+                           canonical_user_ok=canonical_user_ok,
+                           canonical_reply_ok=state["canonical_reply_ok"],
+                           runner_error=state["runner_error"] or None,
+                           duration_ms=int((time.monotonic() - turn_started) * 1000))
                 await q.put((None, None))
 
         task = asyncio.create_task(run_turn())
         _BG_TASKS.add(task)
         task.add_done_callback(_BG_TASKS.discard)
 
-        while True:
-            k, v = await q.get()
-            if k is None:
-                break
-            if k == "content":
-                yield chunk({"content": v})
-            elif k == "keepalive":
-                yield ": keepalive\n\n"
-        final = {"index": 0, "delta": {}, "finish_reason": "stop"}
-        payload = {"id": cid, "object": "chat.completion.chunk", "created": created,
-                   "model": session, "choices": [final]}
-        if state["usage"] and state["usage"].get("size"):
-            payload["usage"] = {"context_used": state["usage"].get("used"),
-                                "context_size": state["usage"].get("size")}
-        yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
-        yield "data: [DONE]\n\n"
+        try:
+            yield chunk({"role": "assistant", "content": ""})
+            while True:
+                k, v = await q.get()
+                if k is None:
+                    break
+                if k == "content":
+                    yield chunk({"content": v})
+                elif k == "keepalive":
+                    state["keepalives"] += 1
+                    yield ": keepalive\n\n"
+                elif k == "error":
+                    state["stream_error"] = str(v)[:180]
+            final = {"index": 0, "delta": {}, "finish_reason": "stop"}
+            payload = {"id": cid, "object": "chat.completion.chunk", "created": created,
+                       "model": session, "choices": [final]}
+            if state["usage"] and state["usage"].get("size"):
+                payload["usage"] = {"context_used": state["usage"].get("used"),
+                                    "context_size": state["usage"].get("size")}
+            yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+            yield "data: [DONE]\n\n"
+            state["done_sent"] = True
+        finally:
+            _log_event("app_turn_stream_done", **common_log,
+                       replayed=False,
+                       output_chars=len(state["acc"]),
+                       content_chunks=state["content_chunks"],
+                       keepalives=state["keepalives"],
+                       done_sent=state["done_sent"],
+                       canonical_user_ok=canonical_user_ok,
+                       canonical_reply_ok=state["canonical_reply_ok"],
+                       stream_error=state["stream_error"] or None,
+                       duration_ms=int((time.monotonic() - turn_started) * 1000))
 
     return StreamingResponse(agen(), media_type="text/event-stream")
 
