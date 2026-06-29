@@ -1572,7 +1572,7 @@ def _cc_conf_rows():
 async def _tmux_alive(name: str) -> bool:
     try:
         p = await asyncio.create_subprocess_exec(
-            TMUX_BIN, "has-session", "-t", "=" + name,
+            TMUX_BIN, "has-session", "-t", name,
             stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
         return (await p.wait()) == 0
     except Exception:  # noqa: BLE001
@@ -1806,7 +1806,7 @@ async def cc_session_input(name: str, request: Request):
         raise HTTPException(status_code=400, detail="empty")
     if not await _tmux_alive(name):
         raise HTTPException(status_code=409, detail="session not running")
-    target = "=" + name
+    target = name
 
     async def _tmux(*args):
         p = await asyncio.create_subprocess_exec(
@@ -1846,7 +1846,7 @@ async def cc_session_interrupt(name: str, request: Request):
     if not await _tmux_alive(name):
         raise HTTPException(status_code=409, detail="session not running")
     p = await asyncio.create_subprocess_exec(
-        TMUX_BIN, "send-keys", "-t", "=" + name, "Escape",
+        TMUX_BIN, "send-keys", "-t", name, "Escape",
         stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE)
     _, err = await p.communicate()
     if p.returncode:
@@ -1869,7 +1869,7 @@ async def cc_session_status(name: str, request: Request):
     if not await _tmux_alive(name):
         return {"busy": False, "running": False}
     p = await asyncio.create_subprocess_exec(
-        TMUX_BIN, "capture-pane", "-p", "-t", "=" + name,
+        TMUX_BIN, "capture-pane", "-p", "-t", name,
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
     out, _ = await p.communicate()
     pane = (out or b"").decode("utf-8", "replace")
