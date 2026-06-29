@@ -1707,7 +1707,11 @@ async def cc_session_stream(name: str, request: Request, replay: int = 80):
                 lines = open(jsonl, encoding="utf-8", errors="replace").read().splitlines()
             except Exception:  # noqa: BLE001
                 lines = []
-            for line in lines[-replay:]:
+            # replay=0 means "follow only" (reconnect). Guard against Python's
+            # lines[-0:] == lines[0:] which would replay the ENTIRE file on every
+            # reconnect — that ballooned the app's buffer and made it scroll
+            # forever after an idle stream drop.
+            for line in (lines[-replay:] if replay > 0 else []):
                 try:
                     c = _fmt_cc_event(json.loads(line))
                 except Exception:  # noqa: BLE001
