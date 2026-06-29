@@ -1884,6 +1884,45 @@ async def cc_session_status(name: str, request: Request):
     return {"busy": busy, "running": True}
 
 
+# Send a single control key into the live TUI (arrows / Enter / Esc / Tab /
+# Shift-Tab / y / n / digits) so interactive prompts, menus and plan-mode toggle
+# can be driven from the phone — closing the gap vs the desktop Claude Code app.
+_CC_KEYS = {
+    "up": "Up", "down": "Down", "left": "Left", "right": "Right",
+    "enter": "Enter", "escape": "Escape", "esc": "Escape",
+    "tab": "Tab", "btab": "BTab", "shift-tab": "BTab", "space": "Space",
+}
+
+
+@app.post("/ccsessions/{name}/key")
+async def cc_session_key(name: str, request: Request):
+    _check_auth(request)
+    if not any(r[0] == name for r in _cc_conf_rows()):
+        raise HTTPException(status_code=404, detail="unknown session")
+    if not await _tmux_alive(name):
+        raise HTTPException(status_code=409, detail="session not running")
+    body = await request.json()
+    raw = str(body.get("key") or "").strip()
+    if not raw:
+        raise HTTPException(status_code=400, detail="key required")
+    args = ["send-keys", "-t", name]
+    mapped = _CC_KEYS.get(raw.lower())
+    if mapped:
+        args.append(mapped)                  # named control key
+    elif len(raw) == 1 and raw.isprintable():
+        args += ["-l", raw]                  # literal single char (y / n / 1-3)
+    else:
+        raise HTTPException(status_code=400, detail="unsupported key")
+    p = await asyncio.create_subprocess_exec(
+        TMUX_BIN, *args,
+        stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE)
+    _, err = await p.communicate()
+    if p.returncode:
+        raise HTTPException(status_code=502,
+            detail=(err or b"").decode("utf-8", "replace")[:200] or "send-keys failed")
+    return {"ok": True}
+
+
 # ───────────────────────── scheduled reports + notification toggles ─────────
 # Hermes runs the daily briefs via cron (jobs.json); each job already has an
 # enabled/paused state the scheduler honours, and `hermes cron pause/resume`
