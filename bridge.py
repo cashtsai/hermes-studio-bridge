@@ -1878,6 +1878,41 @@ async def cc_session_interrupt(name: str, request: Request):
 # tokens)" while a turn runs — capture the pane and look for it. Covers long,
 # silent commands (the spinner stays up), which a stream-silence heuristic misses.
 _CC_BUSY_RE = re.compile(r"\((?:\d+m\s*)?\d+(?:\.\d+)?s\s*·.*tokens", re.IGNORECASE)
+_CC_OPT_NUM_RE = re.compile(r"^(\d+)[.)]\s+(.{1,60})$")
+_CC_OPT_LABEL_RE = re.compile(r"^(allow once|always allow|don.t allow|allow|deny|yes,|yes\b|no,|no\b)", re.IGNORECASE)
+
+
+def _cc_prompt(pane: str):
+    """Detect a Claude Code interactive choice prompt (permission / yes-no) so the
+    app can render real buttons instead of plain text. Returns {kind, title,
+    options:[{key,label}]} or None. Only when NOT working."""
+    low = pane.lower()
+    if "esc to interrupt" in low or _CC_BUSY_RE.search(pane):
+        return None
+    lines = pane.splitlines()
+    opts = []
+    for ln in lines:
+        s = ln.strip().lstrip("❯>•· ").strip()
+        m = _CC_OPT_NUM_RE.match(s)
+        if m:
+            opts.append({"key": m.group(1), "label": m.group(2).strip()})
+    if not opts:                                   # menu without visible numbers
+        labelled = [ln.strip().lstrip("❯>•· ").strip() for ln in lines]
+        labelled = [s for s in labelled if _CC_OPT_LABEL_RE.match(s)]
+        if labelled:
+            opts = [{"key": str(i + 1), "label": s[:60]} for i, s in enumerate(labelled[:5])]
+    if not opts:
+        if re.search(r"\(y/n\)|press y\b|y to (confirm|continue|proceed)", low):
+            return {"kind": "yesno", "title": "",
+                    "options": [{"key": "y", "label": "是"}, {"key": "n", "label": "否"}]}
+        return None
+    title = ""
+    for ln in lines:
+        l = ln.lower()
+        if "wants to" in l or "do you want" in l or "wants to access" in l or "proceed" in l:
+            title = ln.strip()[:140]
+            break
+    return {"kind": "menu", "title": title, "options": opts[:5]}
 
 
 @app.get("/ccsessions/{name}/status")
@@ -1900,7 +1935,7 @@ async def cc_session_status(name: str, request: Request):
         mode = "auto"
     else:
         mode = "normal"
-    return {"busy": busy, "running": True, "mode": mode}
+    return {"busy": busy, "running": True, "mode": mode, "prompt": _cc_prompt(pane)}
 
 
 # Send a single control key into the live TUI (arrows / Enter / Esc / Tab /
