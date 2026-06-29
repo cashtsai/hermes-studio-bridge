@@ -1881,7 +1881,14 @@ async def cc_session_status(name: str, request: Request):
     out, _ = await p.communicate()
     pane = (out or b"").decode("utf-8", "replace")
     busy = bool(_CC_BUSY_RE.search(pane)) or ("esc to interrupt" in pane.lower())
-    return {"busy": busy, "running": True}
+    low = pane.lower()
+    if "plan mode on" in low:
+        mode = "plan"
+    elif "auto mode on" in low or "accept edits on" in low or "bypass" in low:
+        mode = "auto"
+    else:
+        mode = "normal"
+    return {"busy": busy, "running": True, "mode": mode}
 
 
 # Send a single control key into the live TUI (arrows / Enter / Esc / Tab /
