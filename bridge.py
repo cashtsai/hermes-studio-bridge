@@ -1407,6 +1407,13 @@ async def _stream_agent(sid: str, argv: list, cwd: str, fail_label: str):
     finally:
         sub["status"] = "done"
         sub["lastAt"] = time.time()
+        # M23: push when a dispatched CC/Codex task finishes, so the app surfaces
+        # it even when backgrounded (Telegram is the fallback now, not the primary
+        # signal). Fire-and-forget; failures are swallowed inside push_notify.
+        _label = sub.get("name") or sub.get("tool") or "任務"
+        asyncio.create_task(push_notify(
+            "✅ 任務完成", str(_label)[:120],
+            {"kind": "task_done", "session_id": sid}))
 
 
 async def _run_dispatch(sid: str, tool: str, task: str, cwd: str):
