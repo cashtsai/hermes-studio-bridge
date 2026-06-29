@@ -1884,35 +1884,33 @@ _CC_OPT_LABEL_RE = re.compile(r"^(allow once|always allow|don.t allow|allow|deny
 
 def _cc_prompt(pane: str):
     """Detect a Claude Code interactive choice prompt (permission / yes-no) so the
-    app can render real buttons instead of plain text. Returns {kind, title,
-    options:[{key,label}]} or None. Only when NOT working."""
+    app can render real buttons. Returns {kind,title,options:[{key,label}]} or None.
+    STRICT: only the bottom of the pane (the active prompt box) AND a permission
+    context (wants to / do you want / proceed) — so transcript numbered lists never
+    false-trigger. Never when working."""
     low = pane.lower()
     if "esc to interrupt" in low or _CC_BUSY_RE.search(pane):
         return None
-    lines = pane.splitlines()
-    opts = []
-    for ln in lines:
-        s = ln.strip().lstrip("❯>•· ").strip()
-        m = _CC_OPT_NUM_RE.match(s)
-        if m:
-            opts.append({"key": m.group(1), "label": m.group(2).strip()})
-    if not opts:                                   # menu without visible numbers
-        labelled = [ln.strip().lstrip("❯>•· ").strip() for ln in lines]
-        labelled = [s for s in labelled if _CC_OPT_LABEL_RE.match(s)]
-        if labelled:
-            opts = [{"key": str(i + 1), "label": s[:60]} for i, s in enumerate(labelled[:5])]
-    if not opts:
-        if re.search(r"\(y/n\)|press y\b|y to (confirm|continue|proceed)", low):
-            return {"kind": "yesno", "title": "",
-                    "options": [{"key": "y", "label": "是"}, {"key": "n", "label": "否"}]}
-        return None
-    title = ""
-    for ln in lines:
-        l = ln.lower()
-        if "wants to" in l or "do you want" in l or "wants to access" in l or "proceed" in l:
-            title = ln.strip()[:140]
-            break
-    return {"kind": "menu", "title": title, "options": opts[:5]}
+    tail = pane.splitlines()[-16:]                  # the prompt always sits at the bottom
+    tail_low = "\n".join(tail).lower()
+    has_context = any(k in tail_low for k in ("wants to", "do you want", "proceed?", "would you like"))
+    if has_context:
+        opts = []
+        for ln in tail:
+            s = ln.strip().lstrip("❯>•· ").strip()
+            m = _CC_OPT_NUM_RE.match(s)
+            if m and re.search(r"allow|deny|yes|no|proceed|don.t|reject|approve", s, re.IGNORECASE):
+                opts.append({"key": m.group(1), "label": m.group(2).strip()})
+            elif _CC_OPT_LABEL_RE.match(s):
+                opts.append({"key": str(len(opts) + 1), "label": s[:50]})
+        if opts:
+            title = next((ln.strip()[:140] for ln in tail
+                          if "wants to" in ln.lower() or "do you want" in ln.lower()), "")
+            return {"kind": "menu", "title": title, "options": opts[:5]}
+    if re.search(r"\(y/n\)|press y\b|y to (confirm|continue|proceed)", tail_low):
+        return {"kind": "yesno", "title": "",
+                "options": [{"key": "y", "label": "是"}, {"key": "n", "label": "否"}]}
+    return None
 
 
 @app.get("/ccsessions/{name}/status")
