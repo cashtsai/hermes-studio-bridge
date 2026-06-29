@@ -1834,6 +1834,49 @@ async def cc_session_input(name: str, request: Request):
     return {"ok": True}
 
 
+# CC interrupt + busy status (parity with Codex's stop/active). The app uses
+# these to offer a stop button and to detect a running turn reliably instead of
+# guessing from stream silence (which mis-fires on long, quiet commands).
+@app.post("/ccsessions/{name}/interrupt")
+async def cc_session_interrupt(name: str, request: Request):
+    """Send Escape to the live TUI — same as pressing Esc to interrupt."""
+    _check_auth(request)
+    if not any(r[0] == name for r in _cc_conf_rows()):
+        raise HTTPException(status_code=404, detail="unknown session")
+    if not await _tmux_alive(name):
+        raise HTTPException(status_code=409, detail="session not running")
+    p = await asyncio.create_subprocess_exec(
+        TMUX_BIN, "send-keys", "-t", "=" + name, "Escape",
+        stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE)
+    _, err = await p.communicate()
+    if p.returncode:
+        raise HTTPException(status_code=502,
+            detail=(err or b"").decode("utf-8", "replace")[:200] or "interrupt failed")
+    return {"ok": True}
+
+
+# Claude Code's TUI shows a working spinner like "· Fermenting… (1m 51s · ↓ 6.5k
+# tokens)" while a turn runs — capture the pane and look for it. Covers long,
+# silent commands (the spinner stays up), which a stream-silence heuristic misses.
+_CC_BUSY_RE = re.compile(r"\((?:\d+m\s*)?\d+(?:\.\d+)?s\s*·.*tokens", re.IGNORECASE)
+
+
+@app.get("/ccsessions/{name}/status")
+async def cc_session_status(name: str, request: Request):
+    _check_auth(request)
+    if not any(r[0] == name for r in _cc_conf_rows()):
+        raise HTTPException(status_code=404, detail="unknown session")
+    if not await _tmux_alive(name):
+        return {"busy": False, "running": False}
+    p = await asyncio.create_subprocess_exec(
+        TMUX_BIN, "capture-pane", "-p", "-t", "=" + name,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+    out, _ = await p.communicate()
+    pane = (out or b"").decode("utf-8", "replace")
+    busy = bool(_CC_BUSY_RE.search(pane)) or ("esc to interrupt" in pane.lower())
+    return {"busy": busy, "running": True}
+
+
 # ───────────────────────── scheduled reports + notification toggles ─────────
 # Hermes runs the daily briefs via cron (jobs.json); each job already has an
 # enabled/paused state the scheduler honours, and `hermes cron pause/resume`
