@@ -1977,6 +1977,78 @@ async def cc_session_key(name: str, request: Request):
     return {"ok": True}
 
 
+# ───────────────────────── /app/v2 control-plane facade ─────────────────────
+# Additive: aggregates claude_code / codex / hermes into one Session shape
+# (docs/CONTROL_PLANE_V2.md). CC sessions awaiting a permission prompt surface as
+# status=waiting_approval so the app can list them. v1/ccsessions/codexsessions
+# stay untouched.
+
+async def _v2_cc_state(name: str):
+    if not await _tmux_alive(name):
+        return ("failed", None)
+    p = await asyncio.create_subprocess_exec(
+        TMUX_BIN, "capture-pane", "-p", "-t", name,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+    out, _ = await p.communicate()
+    pane = (out or b"").decode("utf-8", "replace")
+    prompt = _cc_prompt(pane)
+    if prompt:
+        return ("waiting_approval", prompt)
+    busy = bool(_CC_BUSY_RE.search(pane)) or ("esc to interrupt" in pane.lower())
+    return ("running" if busy else "idle", None)
+
+
+@app.get("/app/v2/agents")
+async def v2_agents(request: Request):
+    _check_auth(request)
+    return {"agents": [
+        {"provider": "claude_code", "name": "Claude Code", "kind": "code_agent",
+         "status": "ready", "auth": {"connected": True, "account": None}, "can_create": False},
+        {"provider": "codex", "name": "Codex", "kind": "code_agent",
+         "status": "ready", "auth": {"connected": True, "account": None}, "can_create": True},
+        {"provider": "hermes", "name": "Hermes", "kind": "persona",
+         "status": "ready", "auth": {"connected": True, "account": None}, "can_create": False},
+    ]}
+
+
+@app.get("/app/v2/sessions")
+async def v2_sessions(request: Request, provider: str = "", status: str = ""):
+    _check_auth(request)
+    out = []
+    for name, workdir, enabled in _cc_conf_rows():
+        if enabled != "1":
+            continue
+        st, prompt = await _v2_cc_state(name)
+        caps = ["input", "interrupt", "keys", "attachments", "replay", "follow"]
+        if prompt:
+            caps.append("approve")
+        out.append({"id": f"claude_code:{name}", "provider": "claude_code", "title": name,
+                    "subtitle": workdir, "status": st, "last_event_at": None,
+                    "capabilities": caps, "meta": ({"prompt": prompt} if prompt else {})})
+    for mid, (disp, _home) in PERSONAS.items():
+        out.append({"id": f"hermes:{mid}", "provider": "hermes", "title": disp,
+                    "subtitle": None, "status": "idle", "last_event_at": None,
+                    "capabilities": ["input", "attachments", "replay", "follow", "approve"], "meta": {}})
+    try:
+        res = await CODEX_APP.call("thread/list",
+                                   {"limit": 20, "archived": False, "sortKey": "updated_at",
+                                    "sortDirection": "desc", "useStateDbOnly": False}, timeout=10.0)
+        for t in (res or {}).get("data", [])[:20]:
+            s = _codex_session_summary(t)
+            active = bool(s.get("activeTurn")) or s.get("status") in ("active", "running")
+            out.append({"id": f"codex:{s.get('thread_id') or s.get('id')}", "provider": "codex",
+                        "title": s.get("name") or "codex", "subtitle": s.get("workdir"),
+                        "status": "running" if active else "idle", "last_event_at": None,
+                        "capabilities": ["input", "interrupt", "attachments", "replay", "follow"], "meta": {}})
+    except Exception:  # noqa: BLE001
+        pass
+    if provider:
+        out = [s for s in out if s["provider"] == provider]
+    if status:
+        out = [s for s in out if s["status"] == status]
+    return {"sessions": out}
+
+
 # ───────────────────────── scheduled reports + notification toggles ─────────
 # Hermes runs the daily briefs via cron (jobs.json); each job already has an
 # enabled/paused state the scheduler honours, and `hermes cron pause/resume`
