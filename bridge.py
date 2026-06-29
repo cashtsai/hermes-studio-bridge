@@ -1610,7 +1610,7 @@ def _cc_time(ts) -> str:
         return ""
     try:
         from datetime import datetime
-        return datetime.fromisoformat(str(ts).replace("Z", "+00:00")).astimezone().strftime("%m/%d %H:%M")
+        return datetime.fromisoformat(str(ts).replace("Z", "+00:00")).astimezone().strftime("%m/%d %H:%M:%S")
     except Exception:  # noqa: BLE001
         return ""
 
@@ -1646,6 +1646,14 @@ def _fmt_cc_event(d: dict) -> str:
         if not isinstance(content, list):
             return ""
         out = []
+        # Stamp the reply time on assistant messages that carry visible text, so
+        # the app can show when each answer came back. App-only marker (CC
+        # sessions never go to Telegram); the app extracts and strips it.
+        has_text = any(isinstance(b, dict) and b.get("type") == "text" and b.get("text")
+                       for b in content)
+        ts = _cc_time(d.get("timestamp"))
+        if has_text and ts:
+            out.append(f"**🤖 助手:** _{ts}_")
         for b in content:
             if not isinstance(b, dict):
                 continue
