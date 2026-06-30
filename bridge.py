@@ -24,7 +24,7 @@ import uuid
 from pathlib import Path
 
 from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse, FileResponse
 
 from acp_client import ACPPool
 
@@ -1356,6 +1356,19 @@ async def codex_session_create(request: Request):
                 "session": _codex_session_summary(thread)}
     except Exception as e:  # noqa: BLE001
         _codex_http_error(e)
+
+
+@app.get("/file")
+async def serve_file(request: Request, path: str):
+    """Serve a local file (image/pdf) by path so the app can render image paths
+    that appear in transcripts (your attachments + files the agent references).
+    Restricted to under the user's home, must be a regular file."""
+    _check_auth(request)
+    p = os.path.realpath(os.path.expanduser(path))
+    home = os.path.realpath(os.path.expanduser("~"))
+    if not (p == home or p.startswith(home + os.sep)) or not os.path.isfile(p):
+        raise HTTPException(status_code=404, detail="not found")
+    return FileResponse(p)
 
 
 @app.post("/codexsessions/{thread_id}/input")
