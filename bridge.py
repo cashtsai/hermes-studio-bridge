@@ -2023,7 +2023,10 @@ async def cc_session_stream(name: str, request: Request, replay: int = 80):
                             yield chunk({"content": c})
                     idle = 0
             idle += 1
-            if idle >= 15:                        # ~15s quiet → keepalive comment
+            if idle >= 4:                         # ~4s quiet → keepalive comment.
+                # Frequent so any HTTP/tunnel buffering flushes the last data chunk
+                # promptly — an idle session shouldn't leave the transcript's tail
+                # held in a buffer (looked "stuck" on entry until something poked it).
                 idle = 0
                 yield ": keepalive\n\n"
 
