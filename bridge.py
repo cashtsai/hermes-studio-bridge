@@ -1326,6 +1326,31 @@ async def codex_session_set_name(thread_id: str, request: Request):
         _codex_http_error(e)
 
 
+@app.post("/codexsessions/{thread_id}/archive")
+async def codex_session_archive(thread_id: str, request: Request):
+    """Archive (or unarchive) a Codex thread."""
+    body = {}
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        pass
+    _check_auth(request)
+    archived = body.get("archived", True)
+    # Try the known method names in order (the app server build varies).
+    last = None
+    for method, params in (
+        ("thread/archive/set", {"threadId": thread_id, "archived": archived}),
+        ("thread/setArchived", {"threadId": thread_id, "archived": archived}),
+        ("thread/archive", {"threadId": thread_id}),
+    ):
+        try:
+            await CODEX_APP.call(method, params, timeout=15.0)
+            return {"ok": True, "method": method}
+        except Exception as e:  # noqa: BLE001
+            last = e
+    _codex_http_error(last or Exception("archive failed"))
+
+
 @app.post("/codexsessions")
 async def codex_session_create(request: Request):
     _check_auth(request)
@@ -1833,6 +1858,41 @@ async def cc_session_rename(name: str, request: Request):
         raise
     except Exception as e:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=str(e))
+
+
+async def _run_ccsess(*args):
+    p = await asyncio.create_subprocess_exec(
+        os.path.expanduser("~/.local/bin/ccsess"), *args,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+    out, err = await p.communicate()
+    if p.returncode != 0:
+        detail = (err or out or b"ccsess failed").decode("utf-8", "replace")[:300]
+        raise HTTPException(status_code=502, detail=detail)
+    return (out or b"").decode("utf-8", "replace")
+
+
+@app.post("/ccsessions/{name}/archive")
+async def cc_session_archive(name: str, request: Request):
+    """Archive a Claude Code session (saves scrollback, kills tmux, disables)."""
+    _check_auth(request)
+    await _run_ccsess("archive", name)
+    return {"ok": True}
+
+
+@app.post("/ccsessions")
+async def cc_session_create(request: Request):
+    """Create + start a new Claude Code session."""
+    _check_auth(request)
+    body = await request.json()
+    name = (body.get("name") or "").strip()
+    workdir = (body.get("workdir") or body.get("cwd") or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="name required")
+    if any(ch in name for ch in "/|:\n\r\t"):
+        raise HTTPException(status_code=400, detail="unsupported session name")
+    args = ["new", name] + ([os.path.expanduser(workdir)] if workdir else [])
+    await _run_ccsess(*args)
+    return {"ok": True, "session": {"name": name, "workdir": workdir, "status": "running"}}
 
 
 @app.get("/ccsessions/{name}/stream")
