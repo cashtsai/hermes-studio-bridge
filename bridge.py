@@ -366,6 +366,13 @@ async def _resolve_persona_prompt(messages: list) -> str:
 # The app talks to it through the versioned /app/v1 API; it never touches the
 # Hermes state.db schema or cron JSON directly.
 CANON_DB = os.path.expanduser("~/.local/share/pocket-agent/canonical.db")
+REPORT_MEMORY_FILE = "REPORTS.md"
+REPORT_MEMORY_ITEMS = 20
+REPORT_MEMORY_CHARS = 2400
+REPORT_CONTEXT_DEFAULT = 3
+REPORT_CONTEXT_TRIGGERED = 8
+REPORT_CONTEXT_CHARS = 18000
+REPORT_CONTEXT_ITEM_CHARS = 5000
 
 
 def _canon_init():
@@ -387,6 +394,12 @@ def _canon_init():
         created_at REAL, expires_at REAL, status TEXT, decided_at REAL, result TEXT)""")
     con.execute("""CREATE TABLE IF NOT EXISTS devices(
         token TEXT PRIMARY KEY, platform TEXT, created_at REAL)""")
+    con.execute("""CREATE TABLE IF NOT EXISTS report_events(
+        id TEXT PRIMARY KEY, session TEXT NOT NULL, label TEXT, name TEXT,
+        content TEXT NOT NULL, ts REAL NOT NULL,
+        external_source TEXT, external_id TEXT UNIQUE, ingested_at REAL NOT NULL)""")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_report_session_time ON report_events(session, ts)")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_report_external ON report_events(external_source, external_id)")
     con.commit()
     con.close()
 
@@ -448,6 +461,79 @@ def _canon_messages(session: str, limit: int = 200):
     return [{"id": r[0], "role": r[1], "content": r[2],
              "attachments": json.loads(r[3] or "[]"), "ts": r[4],
              "status": r[5], "source": "app"} for r in rows]
+
+
+def _report_id(persona: str, name: str, sid: str, ts) -> str:
+    raw = f"cron:{persona}:{name}:{sid}:{ts}"
+    return hashlib.sha1(raw.encode("utf-8", "replace")).hexdigest()[:24]
+
+
+def _report_upsert(session: str, report: dict) -> str:
+    import sqlite3
+    rid = report.get("id") or _report_id(session, report.get("name") or "",
+                                         report.get("session_id") or "",
+                                         report.get("ts") or "")
+    external_id = report.get("external_id") or rid
+    content = report.get("content") or ""
+    ts = float(report.get("ts") or time.time())
+    label = report.get("label") or ""
+    name = report.get("name") or ""
+    con = sqlite3.connect(CANON_DB, timeout=10)
+    existing = con.execute(
+        "SELECT label,name,content,ts,external_id FROM report_events WHERE id=?",
+        (rid,)).fetchone()
+    if existing and existing == (label, name, content, ts, external_id):
+        con.close()
+        return ""
+    con.execute(
+        "INSERT OR REPLACE INTO report_events"
+        "(id,session,label,name,content,ts,external_source,external_id,ingested_at) "
+        "VALUES(?,?,?,?,?,?,?,?,?)",
+        (rid, session, label, name, content, ts,
+         report.get("external_source") or "hermes-cron", external_id, time.time()))
+    con.commit()
+    con.close()
+    return rid
+
+
+def _report_events(session: str, limit: int = 20, newest_first: bool = False):
+    import sqlite3
+    order = "DESC" if newest_first else "ASC"
+    try:
+        con = sqlite3.connect(f"file:{CANON_DB}?mode=ro", uri=True, timeout=5)
+        rows = con.execute(
+            f"SELECT id,label,name,content,ts,external_source,external_id "
+            f"FROM report_events WHERE session=? ORDER BY ts {order} LIMIT ?",
+            (session, limit)).fetchall()
+        con.close()
+    except Exception:  # noqa: BLE001
+        return []
+    return [{
+        "id": r[0], "label": r[1], "name": r[2], "content": r[3],
+        "ts": r[4], "external_source": r[5], "external_id": r[6],
+    } for r in rows]
+
+
+def _report_messages(session: str, limit: int = 100):
+    return [{
+        "id": f"rep-{r['id']}", "role": "assistant",
+        "content": f"📰 **{r['label']}**\n\n{r['content']}",
+        "attachments": [], "ts": r["ts"], "status": "done", "source": "report",
+    } for r in _report_events(session, limit)]
+
+
+def _clip_text(text: str, max_chars: int) -> str:
+    text = (text or "").strip()
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars].rstrip() + "\n...[截斷，完整內容保存在 report_events]"
+
+
+def _fmt_ts(ts) -> str:
+    try:
+        return time.strftime("%Y-%m-%d %H:%M", time.localtime(float(ts)))
+    except Exception:  # noqa: BLE001
+        return ""
 
 
 # ───────────────────────── APNs push (M23) ─────────────────────────────────
@@ -1016,9 +1102,10 @@ def _codex_source_label(source) -> str:
 
 def _codex_session_summary(thread: dict) -> dict:
     tid = thread.get("id") or ""
+    name = (thread.get("name") or "").strip()
     preview = (thread.get("preview") or "").strip()
     return {
-        "name": tid[:12] or "codex",
+        "name": name or preview[:180] or (tid[:12] or "codex"),
         "thread_id": tid,
         "session_id": thread.get("sessionId") or "",
         "workdir": thread.get("cwd") or "",
@@ -1176,11 +1263,12 @@ async def codex_status(request: Request):
 
 
 @app.get("/codexsessions")
-async def codex_sessions(request: Request, limit: int = 40, cwd: str | None = None):
+async def codex_sessions(request: Request, limit: int = 40, cwd: str | None = None,
+                         archived: bool = False):
     _check_auth(request)
     params = {
         "limit": max(1, min(limit, 100)),
-        "archived": False,
+        "archived": archived,
         "sourceKinds": ["cli", "vscode", "exec", "appServer"],
         "sortKey": "updated_at",
         "sortDirection": "desc",
@@ -1210,6 +1298,30 @@ async def codex_session_status(thread_id: str, request: Request):
         summary = _codex_session_summary(thread)
         summary["activeTurn"] = CODEX_APP.is_active(thread_id)
         return {"session": summary}
+    except Exception as e:  # noqa: BLE001
+        _codex_http_error(e)
+
+
+@app.post("/codexsessions/{thread_id}/name")
+async def codex_session_set_name(thread_id: str, request: Request):
+    _check_auth(request)
+    body = await request.json()
+    name = (body.get("name") or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="name required")
+    try:
+        await CODEX_APP.call("thread/name/set", {
+            "threadId": thread_id,
+            "name": name,
+        }, timeout=15.0)
+        res = await CODEX_APP.call("thread/read", {
+            "threadId": thread_id,
+            "includeTurns": False,
+        }, timeout=20.0)
+        thread = (res or {}).get("thread") or {}
+        summary = _codex_session_summary(thread)
+        summary["activeTurn"] = CODEX_APP.is_active(thread_id)
+        return {"ok": True, "session": summary}
     except Exception as e:  # noqa: BLE001
         _codex_http_error(e)
 
@@ -1681,6 +1793,35 @@ async def cc_list(request: Request):
     return {"sessions": await _cc_sessions()}
 
 
+@app.post("/ccsessions/{name}/rename")
+async def cc_session_rename(name: str, request: Request):
+    _check_auth(request)
+    body = await request.json()
+    new_name = (body.get("name") or "").strip()
+    if not new_name:
+        raise HTTPException(status_code=400, detail="name required")
+    if any(ch in new_name for ch in "/|:\n\r\t"):
+        raise HTTPException(status_code=400, detail="unsupported session name")
+    rows = _cc_conf_rows()
+    current = next((r for r in rows if r[0] == name), None)
+    if not current:
+        raise HTTPException(status_code=404, detail="unknown session")
+    try:
+        p = await asyncio.create_subprocess_exec(
+            os.path.expanduser("~/.local/bin/ccsess"), "rename", name, new_name,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        out, err = await p.communicate()
+        if p.returncode != 0:
+            detail = (err or out or b"rename failed").decode("utf-8", "replace")[:300]
+            raise HTTPException(status_code=502, detail=detail)
+        status = "running" if await _tmux_alive(new_name) else "down"
+        return {"ok": True, "session": {"name": new_name, "workdir": current[1], "status": status}}
+    except HTTPException:
+        raise
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=str(e))
+
+
 @app.get("/ccsessions/{name}/stream")
 async def cc_session_stream(name: str, request: Request, replay: int = 80):
     """Live transcript of a ccsess session: replay the recent tail of its
@@ -2075,9 +2216,13 @@ PERSONA_REPORTS = {
     "yuanfang": NOTIFY_LABELS,
     "pantianqing": {
         "fliper-editorial-brief-0715": "編輯台晨報",
-        # ↓ wire these the moment the matching FLiPER crons exist:
-        # "fliper-today-pick-...": "今日精選",
-        # "fliper-story-...":      "限動",
+        "TNH 名家觀點自動建稿": "台北文創名家觀點掃描",
+    },
+    "xcash": {
+        "xcash-morning-dev-brief-0730": "開發晨報",
+    },
+    "shuijing": {
+        "shuijing-sunrise-oracle": "水鏡晨卦",
     },
 }
 
@@ -2111,6 +2256,12 @@ async def _hermes_cron(action: str, job_id: str):
 
 
 _REPORT_START = re.compile(r"(🌅|🌙|☀️|🌇|🌃|📊|🗓️|善彰[，,、]?\s*(早安|午安|晚安)|早安|午安|晚安)")
+_REPORT_INLINE_START = re.compile(
+    r"(\*\*[^*\n]*(晨報|午報|晚間|速覽|掃描|晨卦)[^*\n]*\*\*|"
+    r"#{1,3}\s*[^\n]*(晨報|午報|晚間|速覽|掃描|晨卦)|"
+    r"(🌅|🌙|☀️|🌇|🌃|📊|🗓️)[^\n]*|"
+    r"善彰[，,、]?\s*(早安|午安|晚安))"
+)
 
 
 def _clean_report(s: str) -> str:
@@ -2118,7 +2269,11 @@ def _clean_report(s: str) -> str:
     the actual brief ("I have all the data… Now composing…"), WITHOUT eating the
     real title. Keep from the first line that carries real content: any CJK, a
     markdown header, or one of the known report openers (🌅/善彰早安…)."""
-    lines = s.split("\n")
+    text = s.strip()
+    inline = _REPORT_INLINE_START.search(text)
+    if inline and inline.start() > 0:
+        return text[inline.start():].lstrip(" -—\n").strip()
+    lines = text.split("\n")
     for i, line in enumerate(lines):
         t = line.strip()
         if not t:
@@ -2126,7 +2281,7 @@ def _clean_report(s: str) -> str:
         has_cjk = any("一" <= c <= "鿿" for c in t)
         if has_cjk or t.startswith("#") or _REPORT_START.match(t):
             return "\n".join(lines[i:]).strip()
-    return s.strip()
+    return text
 
 
 def _reports(limit: int = 20):
@@ -2206,7 +2361,11 @@ def _persona_reports(persona: str, limit: int = 20):
                 "AND role='assistant' AND content IS NOT NULL AND content!='' "
                 "ORDER BY timestamp DESC LIMIT 1", (sid,)).fetchone()
             if last and last[0]:
-                out.append({"label": label, "name": name,
+                external_id = f"cron:{persona}:{name}:{sid}"
+                out.append({"id": _report_id(persona, name or "", str(sid), last[1]),
+                            "external_id": external_id,
+                            "external_source": "hermes-cron",
+                            "session_id": sid, "label": label, "name": name,
                             "content": _clean_report(last[0]), "ts": last[1]})
             if len(out) >= limit:
                 break
@@ -2214,6 +2373,98 @@ def _persona_reports(persona: str, limit: int = 20):
         return out
     except Exception:  # noqa: BLE001
         return []
+
+
+def _write_report_memory(session: str, reports: list[dict]) -> None:
+    if session not in PERSONAS:
+        return
+    home = home_for(session)
+    memdir = os.path.join(home, "memories")
+    try:
+        os.makedirs(memdir, exist_ok=True)
+        latest = sorted(reports, key=lambda r: r.get("ts") or 0, reverse=True)[:REPORT_MEMORY_ITEMS]
+        lines = [
+            "# REPORTS.md",
+            "",
+            "PocketAgent/Hermes bridge 維護的近期報告索引。全文 canonical 存在",
+            "`~/.local/share/pocket-agent/canonical.db` 的 `report_events` 表；",
+            "此檔提供 persona / studio-memory 快速讀取最近報告脈絡。",
+            "",
+        ]
+        for r in latest:
+            lines += [
+                f"## {_fmt_ts(r.get('ts'))} {r.get('label') or r.get('name') or '報告'}",
+                f"- session: {session}",
+                f"- source: {r.get('external_source') or 'hermes-cron'}",
+                f"- external_id: {r.get('external_id') or r.get('id')}",
+                "",
+                _clip_text(r.get("content") or "", REPORT_MEMORY_CHARS),
+                "",
+            ]
+        tmp = os.path.join(memdir, f".{REPORT_MEMORY_FILE}.tmp")
+        final = os.path.join(memdir, REPORT_MEMORY_FILE)
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines).rstrip() + "\n")
+        os.replace(tmp, final)
+    except Exception as e:  # noqa: BLE001
+        _log_event("report_memory_write_failed", session=session,
+                   error=type(e).__name__, error_message=str(e)[:160])
+
+
+def _sync_persona_reports(session: str, limit: int = 50) -> list[dict]:
+    reports = _persona_reports(session, limit)
+    if not reports:
+        return _report_events(session, limit, newest_first=True)
+    upserted = 0
+    for r in reports:
+        try:
+            if _report_upsert(session, r):
+                upserted += 1
+        except Exception as e:  # noqa: BLE001
+            _log_event("report_event_write_failed", session=session,
+                       report_id=r.get("id"), label=r.get("label"),
+                       error=type(e).__name__, error_message=str(e)[:160])
+    latest = _report_events(session, max(limit, REPORT_MEMORY_ITEMS), newest_first=True)
+    _write_report_memory(session, latest)
+    if upserted:
+        _log_event("report_events_synced", session=session, count=upserted)
+    return latest
+
+
+_REPORT_QUERY_RE = re.compile(
+    r"(報告|晨報|午報|盤前|晚間|三省|晨卦|卦|速覽|編輯台|名家觀點|"
+    r"剛剛|今天|今日|第二點|第三點|上面|前面|剛才)"
+)
+
+
+def _report_context_for_prompt(session: str, user_text: str) -> str:
+    reports = _sync_persona_reports(session, 50)
+    if not reports:
+        return ""
+    want_more = bool(_REPORT_QUERY_RE.search(user_text or ""))
+    max_items = REPORT_CONTEXT_TRIGGERED if want_more else REPORT_CONTEXT_DEFAULT
+    selected = reports[:max_items]  # newest-first from _sync_persona_reports
+    budget = REPORT_CONTEXT_CHARS
+    blocks = []
+    for r in selected:
+        title = f"{_fmt_ts(r.get('ts'))} {r.get('label') or r.get('name') or '報告'}"
+        content = _clip_text(r.get("content") or "", min(REPORT_CONTEXT_ITEM_CHARS, budget))
+        block = f"### {title}\n{content}".strip()
+        if len(block) > budget:
+            block = _clip_text(block, budget)
+        blocks.append(block)
+        budget -= len(block)
+        if budget <= 1200:
+            break
+    if not blocks:
+        return ""
+    return (
+        "【PocketAgent 近期報告上下文】\n"
+        "以下是這個 persona 最近已投遞到 PocketAgent 對話窗的報告內容。"
+        "使用者若提到報告、晨報、午報、盤前、晚間、晨卦、剛剛、上面或第幾點，"
+        "必須優先以這些報告內容回答；若資訊不足，再明確說需要查原始來源。\n\n"
+        + "\n\n".join(blocks)
+    )
 
 
 @app.get("/cron/jobs")
@@ -2279,10 +2530,8 @@ async def app_get_messages(session: str, request: Request, limit: int = 200):
     # like Telegram does — not only in the separate Reports tab. 袁方's 晨報/午報
     # etc. and 潘天晴's 編輯台晨報 (+ future 今日精選/限動) read from each persona's
     # OWN home, so the app thread matches what TG received this morning.
-    for r in _persona_reports(session, 20):
-        out.append({"id": f"rep-{r['ts']}", "role": "assistant",
-                    "content": f"📰 **{r['label']}**\n\n{r['content']}",
-                    "attachments": [], "ts": r["ts"], "status": "done", "source": "report"})
+    _sync_persona_reports(session, 50)
+    out.extend(_report_messages(session, limit))
     out.sort(key=lambda m: m.get("ts") or 0)
     return {"messages": out[-limit:]}
 
@@ -2386,6 +2635,9 @@ async def app_post_message(request: Request):
             parts.append({"type": "file", "file": {"filename": a.get("filename"),
                           "mime_type": a.get("mime"), "file_data": a.get("data")}})
     prompt = await _resolve_persona_prompt([{"role": "user", "content": parts or content}])
+    report_context = _report_context_for_prompt(session, content)
+    if report_context:
+        prompt = f"{report_context}\n\n---\n【使用者現在的訊息】\n{prompt}"
 
     att_meta = [{"kind": a.get("kind"), "filename": a.get("filename"), "mime": a.get("mime")}
                 for a in attachments]
