@@ -1910,8 +1910,12 @@ def _fmt_cc_event(d: dict) -> str:
 
 
 @app.get("/ccsessions")
-async def cc_list(request: Request):
+async def cc_list(request: Request, archived: bool = False):
     _check_auth(request)
+    if archived:
+        # Archived = disabled (enabled != 1) in the ccsess config.
+        return {"sessions": [{"name": n, "workdir": w, "status": "archived", "busy": False}
+                             for n, w, e in _cc_conf_rows() if e != "1"]}
     return {"sessions": await _cc_sessions()}
 
 
@@ -1957,10 +1961,19 @@ async def _run_ccsess(*args):
 
 @app.post("/ccsessions/{name}/archive")
 async def cc_session_archive(name: str, request: Request):
-    """Archive a Claude Code session (saves scrollback, kills tmux, disables)."""
+    """Archive a Claude Code session (saves scrollback, kills tmux, disables), or
+    unarchive it when the body has {"archived": false} (re-enable + relaunch)."""
     _check_auth(request)
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        body = {}
+    if body.get("archived") is False:
+        await _run_ccsess("enable", name)
+        await _run_ccsess("ensure")          # relaunch the now-enabled session
+        return {"ok": True, "archived": False}
     await _run_ccsess("archive", name)
-    return {"ok": True}
+    return {"ok": True, "archived": True}
 
 
 def _pretrust_claude_dir(path: str):
