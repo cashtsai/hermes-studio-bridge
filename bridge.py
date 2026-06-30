@@ -1748,8 +1748,22 @@ async def _cc_sessions():
     for name, workdir, enabled in _cc_conf_rows():
         if enabled != "1":
             continue
+        alive = await _tmux_alive(name)
+        busy = False
+        if alive:
+            # Mid-turn? Capture the pane and look for the working spinner — so the
+            # home list can animate a running CC session (parity with Codex).
+            try:
+                p = await asyncio.create_subprocess_exec(
+                    TMUX_BIN, "capture-pane", "-p", "-t", name,
+                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+                paneb, _ = await p.communicate()
+                pane = (paneb or b"").decode("utf-8", "replace")
+                busy = bool(_CC_BUSY_RE.search(pane)) or ("esc to interrupt" in pane.lower())
+            except Exception:  # noqa: BLE001
+                busy = False
         out.append({"name": name, "workdir": workdir,
-                    "status": "running" if await _tmux_alive(name) else "down"})
+                    "status": "running" if alive else "down", "busy": busy})
     return out
 
 
