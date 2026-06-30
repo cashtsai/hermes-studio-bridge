@@ -1807,8 +1807,10 @@ async def _tmux_alive(name: str) -> bool:
 
 
 def _cc_last_activity(workdir: str):
-    """(mtime, last-user-command) for a CC session's transcript — drives home
-    recency sort + the "last command" row subtitle. Bounded tail read."""
+    """(mtime, last-message) for a CC session's transcript — drives home
+    recency sort + the row subtitle. Subtitle is the most recent message
+    CONTENT (user OR assistant), matching the Codex row behavior, rather than
+    just the last user command. Bounded tail read."""
     jsonl = _cc_latest_jsonl(workdir)
     if not jsonl or not os.path.exists(jsonl):
         return (0.0, "")
@@ -1823,10 +1825,11 @@ def _cc_last_activity(workdir: str):
                 d = json.loads(line)
             except Exception:  # noqa: BLE001
                 continue
-            if d.get("type") == "user":
+            if d.get("type") in ("user", "assistant"):
                 content = (d.get("message") or {}).get("content")
                 txt = content if isinstance(content, str) else _blocks_text(content)
                 txt = (txt or "").strip()
+                # skip empty / tool-only turns and system-ish markers (<...>)
                 if txt and not txt.startswith("<"):
                     last = txt
         return (mtime, last.splitlines()[0][:100] if last else "")
