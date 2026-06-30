@@ -1841,6 +1841,7 @@ async def _cc_sessions():
             continue
         alive = await _tmux_alive(name)
         busy = False
+        awaiting = False
         if alive:
             # Mid-turn? Capture the pane and look for the working spinner — so the
             # home list can animate a running CC session (parity with Codex).
@@ -1851,12 +1852,16 @@ async def _cc_sessions():
                 paneb, _ = await p.communicate()
                 pane = (paneb or b"").decode("utf-8", "replace")
                 busy = bool(_CC_BUSY_RE.search(pane)) or ("esc to interrupt" in pane.lower())
+                # Parked on a permission / approval prompt → the home list flags it
+                # ("待放行") so a session waiting on you is never invisible.
+                if not busy and _cc_prompt(pane) is not None:
+                    awaiting = True
             except Exception:  # noqa: BLE001
                 busy = False
         mtime, preview = _cc_last_activity(workdir)
         out.append({"name": name, "workdir": workdir,
                     "status": "running" if alive else "down", "busy": busy,
-                    "updatedAt": mtime, "preview": preview})
+                    "awaiting": awaiting, "updatedAt": mtime, "preview": preview})
     return out
 
 
