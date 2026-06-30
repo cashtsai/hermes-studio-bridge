@@ -1387,11 +1387,18 @@ async def codex_session_create(request: Request):
 async def serve_file(request: Request, path: str):
     """Serve a local file (image/pdf) by path so the app can render image paths
     that appear in transcripts (your attachments + files the agent references).
-    Restricted to under the user's home, must be a regular file."""
+    Restricted to a small set of safe roots (home + the temp dirs agents write
+    scratch files to), must be a regular file."""
     _check_auth(request)
     p = os.path.realpath(os.path.expanduser(path))
-    home = os.path.realpath(os.path.expanduser("~"))
-    if not (p == home or p.startswith(home + os.sep)) or not os.path.isfile(p):
+    roots = [os.path.realpath(os.path.expanduser("~"))]
+    # Agents (incl. Claude Code's scratchpad) often emit files under the system
+    # temp dirs; allow those too so generated artifacts render instead of 404ing.
+    for t in ("/tmp", "/private/tmp", "/var/folders"):
+        rt = os.path.realpath(t)
+        if rt not in roots:
+            roots.append(rt)
+    if not any(p == r or p.startswith(r + os.sep) for r in roots) or not os.path.isfile(p):
         raise HTTPException(status_code=404, detail="not found")
     return FileResponse(p)
 
@@ -1879,6 +1886,46 @@ async def cc_session_archive(name: str, request: Request):
     return {"ok": True}
 
 
+def _pretrust_claude_dir(path: str):
+    """Mark a directory as trusted in ~/.claude.json so Claude Code doesn't open
+    a brand-new session on the "Do you trust the files in this folder?" dialog
+    (which the app would surface as an endless review prompt). Read-modify-write
+    preserves all existing config; atomic replace avoids torn writes."""
+    cfg = os.path.expanduser("~/.claude.json")
+    try:
+        with open(cfg) as f:
+            d = json.load(f)
+    except Exception:
+        d = {}
+    projs = d.setdefault("projects", {})
+    proj = projs.setdefault(path, {})
+    proj["hasTrustDialogAccepted"] = True
+    try:
+        tmp = cfg + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(d, f, indent=2)
+        os.replace(tmp, cfg)
+    except Exception:
+        pass
+
+
+async def _cc_wait_ready(name: str, timeout: float = 12.0):
+    """Poll until the new session's Claude TUI is actually up, so the app opens a
+    live session instead of flashing offline while it boots."""
+    deadline = asyncio.get_event_loop().time() + timeout
+    while asyncio.get_event_loop().time() < deadline:
+        if await _tmux_alive(name):
+            p = await asyncio.create_subprocess_exec(
+                TMUX_BIN, "capture-pane", "-p", "-t", name,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+            out, _ = await p.communicate()
+            pane = (out or b"").decode("utf-8", "replace").lower()
+            if "for shortcuts" in pane or "esc to interrupt" in pane or "❯" in pane:
+                return True
+        await asyncio.sleep(0.6)
+    return False
+
+
 @app.post("/ccsessions")
 async def cc_session_create(request: Request):
     """Create + start a new Claude Code session."""
@@ -1890,9 +1937,25 @@ async def cc_session_create(request: Request):
         raise HTTPException(status_code=400, detail="name required")
     if any(ch in name for ch in "/|:\n\r\t"):
         raise HTTPException(status_code=400, detail="unsupported session name")
-    args = ["new", name] + ([os.path.expanduser(workdir)] if workdir else [])
-    await _run_ccsess(*args)
-    return {"ok": True, "session": {"name": name, "workdir": workdir, "status": "running"}}
+    # Resolve + create the workdir. Without this, a non-existent path makes ccsess
+    # silently fall back to $HOME and (because $HOME has history) launch with
+    # --continue — hijacking the home conversation. So: require a real dir under
+    # home, create it, and pre-trust it so there's no startup review prompt.
+    home = os.path.realpath(os.path.expanduser("~"))
+    wd = os.path.realpath(os.path.expanduser(workdir)) if workdir else os.path.join(home, "apps", re.sub(r"[^A-Za-z0-9._-]+", "-", name).strip("-").lower() or "session")
+    if not (wd == home or wd.startswith(home + os.sep)):
+        raise HTTPException(status_code=400, detail="workdir must be under home")
+    if wd == home:
+        raise HTTPException(status_code=400, detail="pick a sub-folder, not your home directory")
+    try:
+        os.makedirs(wd, exist_ok=True)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"cannot create workdir: {e}")
+    _pretrust_claude_dir(wd)
+    await _run_ccsess("new", name, wd)
+    ready = await _cc_wait_ready(name)
+    return {"ok": True, "session": {"name": name, "workdir": wd,
+                                    "status": "running" if ready else "starting"}}
 
 
 @app.get("/ccsessions/{name}/stream")
