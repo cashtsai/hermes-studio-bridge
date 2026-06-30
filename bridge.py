@@ -21,6 +21,7 @@ import re
 import threading
 import time
 import uuid
+from datetime import datetime
 from pathlib import Path
 
 from fastapi import FastAPI, Request, HTTPException
@@ -1401,6 +1402,60 @@ async def serve_file(request: Request, path: str):
     if not any(p == r or p.startswith(r + os.sep) for r in roots) or not os.path.isfile(p):
         raise HTTPException(status_code=404, detail="not found")
     return FileResponse(p)
+
+
+# --- Client error log ------------------------------------------------------
+# The app ships every error it hits (failed send, dropped stream, crash, …) here
+# the moment it happens. We append to ONE file on the Mac so Claude can fetch +
+# review client-side bugs each session and confirm whether they're resolved.
+CLIENT_LOG = os.path.expanduser("~/.pocket/pocket-client.jsonl")
+
+
+@app.post("/clientlog")
+async def client_log_write(request: Request):
+    _check_auth(request)
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail="bad json")
+    os.makedirs(os.path.dirname(CLIENT_LOG), exist_ok=True)
+    entry = {
+        "server_ts": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "ts": body.get("ts"),
+        "level": str(body.get("level", "error"))[:16],
+        "build": str(body.get("build", "?"))[:16],
+        "context": str(body.get("context", ""))[:120],
+        "msg": str(body.get("msg", ""))[:1000],
+        "detail": str(body.get("detail", ""))[:4000],
+    }
+    with open(CLIENT_LOG, "a", encoding="utf-8") as f:
+        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    # Cap the file so it can't grow unbounded (keep newest ~3000 lines).
+    try:
+        lines = open(CLIENT_LOG, encoding="utf-8").read().splitlines()
+        if len(lines) > 3000:
+            with open(CLIENT_LOG, "w", encoding="utf-8") as f:
+                f.write("\n".join(lines[-3000:]) + "\n")
+    except Exception:  # noqa: BLE001
+        pass
+    return {"ok": True}
+
+
+@app.get("/clientlog")
+async def client_log_read(request: Request, limit: int = 100, level: str = ""):
+    _check_auth(request)
+    if not os.path.exists(CLIENT_LOG):
+        return {"entries": []}
+    out = []
+    for line in open(CLIENT_LOG, encoding="utf-8").read().splitlines()[-1000:]:
+        try:
+            e = json.loads(line)
+        except Exception:  # noqa: BLE001
+            continue
+        if level and e.get("level") != level:
+            continue
+        out.append(e)
+    return {"entries": out[-limit:]}
 
 
 @app.post("/codexsessions/{thread_id}/input")
