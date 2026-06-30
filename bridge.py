@@ -1806,6 +1806,34 @@ async def _tmux_alive(name: str) -> bool:
         return False
 
 
+def _cc_last_activity(workdir: str):
+    """(mtime, last-user-command) for a CC session's transcript — drives home
+    recency sort + the "last command" row subtitle. Bounded tail read."""
+    jsonl = _cc_latest_jsonl(workdir)
+    if not jsonl or not os.path.exists(jsonl):
+        return (0.0, "")
+    try:
+        mtime = os.path.getmtime(jsonl)
+        with open(jsonl, "rb") as f:
+            f.seek(0, 2); size = f.tell(); f.seek(max(0, size - 16384))
+            tail = f.read().decode("utf-8", "replace")
+        last = ""
+        for line in tail.splitlines():
+            try:
+                d = json.loads(line)
+            except Exception:  # noqa: BLE001
+                continue
+            if d.get("type") == "user":
+                content = (d.get("message") or {}).get("content")
+                txt = content if isinstance(content, str) else _blocks_text(content)
+                txt = (txt or "").strip()
+                if txt and not txt.startswith("<"):
+                    last = txt
+        return (mtime, last.splitlines()[0][:100] if last else "")
+    except Exception:  # noqa: BLE001
+        return (0.0, "")
+
+
 async def _cc_sessions():
     out = []
     for name, workdir, enabled in _cc_conf_rows():
@@ -1825,8 +1853,10 @@ async def _cc_sessions():
                 busy = bool(_CC_BUSY_RE.search(pane)) or ("esc to interrupt" in pane.lower())
             except Exception:  # noqa: BLE001
                 busy = False
+        mtime, preview = _cc_last_activity(workdir)
         out.append({"name": name, "workdir": workdir,
-                    "status": "running" if alive else "down", "busy": busy})
+                    "status": "running" if alive else "down", "busy": busy,
+                    "updatedAt": mtime, "preview": preview})
     return out
 
 
