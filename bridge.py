@@ -1628,14 +1628,22 @@ async def _stream_agent(sid: str, argv: list, cwd: str, fail_label: str):
             {"kind": "task_done", "session_id": sid}))
 
 
-async def _run_dispatch(sid: str, tool: str, task: str, cwd: str):
+async def _run_dispatch(sid: str, tool: str, task: str, cwd: str, isolate: bool = False):
     """Spawn a headless Claude Code / Codex sub-agent for the initial task."""
     sub = SUBSESSIONS[sid]
+    run_cwd = cwd
+    if isolate:
+        wt = await _make_worktree(cwd, sid)
+        if wt != cwd:
+            run_cwd = wt
+            sub["worktree"] = wt
+            sub["cwd"] = wt   # follow-ups stay in the same isolated tree
+            sub["output"].append(("text", f"_(隔離工作區 worktree:`{wt}` · 分支 `pocket/{sid}`)_\n\n"))
     if tool == "codex":
         argv = [CODEX_BIN, "exec", "--json", task]
     else:
         argv = _claude_argv(sub.get("parent", "yuanfang"), task)
-    await _stream_agent(sid, argv, cwd, "dispatch 失敗")
+    await _stream_agent(sid, argv, run_cwd, "dispatch 失敗")
 
 
 async def _run_resume(sid: str, prompt: str):
@@ -3065,16 +3073,40 @@ async def dispatch(request: Request):
     body = await request.json()
     tool = body.get("tool", "claude-code")
     task = (body.get("task") or "").strip()
-    cwd = body.get("cwd") or HOME_ROOT
+    cwd = os.path.expanduser(body.get("cwd") or HOME_ROOT)
     parent = body.get("parent", "yuanfang")
+    isolate = bool(body.get("isolate"))
     if not task:
         raise HTTPException(status_code=400, detail="task required")
     sid = "sub-" + uuid.uuid4().hex[:16]
     SUBSESSIONS[sid] = {"name": task[:40], "parent": parent, "tool": tool,
                         "status": "running", "lastAt": time.time(), "cwd": cwd,
                         "proc": None, "output": [("text", f"**任務:** {task}\n\n")]}
-    asyncio.create_task(_run_dispatch(sid, tool, task, cwd))
+    asyncio.create_task(_run_dispatch(sid, tool, task, cwd, isolate))
     return {"session_id": sid, "type": "subprocess", "tool": tool, "parent": parent}
+
+
+async def _make_worktree(base: str, sid: str):
+    """Isolate a worker in its own git worktree (like a branch) so parallel
+    dispatches don't clobber each other's edits. Returns the worktree path, or
+    the original base if it isn't a git repo / the command fails."""
+    try:
+        chk = await asyncio.create_subprocess_exec(
+            "git", "-C", base, "rev-parse", "--show-toplevel",
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+        out, _ = await chk.communicate()
+        if chk.returncode != 0:
+            return base
+        top = out.decode().strip() or base
+        wt = os.path.expanduser(f"~/.pocket/worktrees/{sid}")
+        os.makedirs(os.path.dirname(wt), exist_ok=True)
+        add = await asyncio.create_subprocess_exec(
+            "git", "-C", top, "worktree", "add", "-b", f"pocket/{sid}", wt, "HEAD",
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
+        await add.communicate()
+        return wt if add.returncode == 0 and os.path.isdir(wt) else base
+    except Exception:  # noqa: BLE001
+        return base
 
 
 def _fmt_item(kind, val):
