@@ -1251,7 +1251,7 @@ APNS_KEY_PATH = os.path.expanduser(
     "~/apps/hermes-agent/home/credentials/AuthKey_86FF9D976T.p8")
 APNS_KEY_ID = "86FF9D976T"
 APNS_TEAM_ID = "4F8B93R3SH"
-APNS_BUNDLE_ID = "com.scarfgo.app.4F8B93R3SH"
+APNS_BUNDLE_ID = "com.pocketagent.ios"
 APNS_HOST = "https://api.push.apple.com"   # production (TestFlight + App Store)
 _apns_jwt_cache: list = [None, 0.0]        # [token, issued_at]
 
