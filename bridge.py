@@ -2208,9 +2208,9 @@ async def pair_claim(request: Request):
         if not code or not meta["expiry"] or meta["expiry"] < now:
             _pair_code_reject(request)
     bound_user_id = meta.get("apple_user_id")
-    required_account = bool(bound_user_id) or request.url.path.startswith("/app/v1/")
-    user = _account_user_from_request(request, body, required=required_account)
-    if request.url.path.startswith("/app/v1/") and not bound_user_id:
+    is_app_pair_claim = request.url.path.startswith("/app/v1/")
+    user = _account_user_from_request(request, body, required=False)
+    if is_app_pair_claim and not bound_user_id:
         raise HTTPException(status_code=400, detail="pairing code is not account-bound")
     if bound_user_id and user and user.get("apple_user_id") != bound_user_id:
         _log_event("pair_claim_account_mismatch",
@@ -2218,6 +2218,7 @@ async def pair_claim(request: Request):
                    expected_user_hash=_short_hash(bound_user_id),
                    actual_user_hash=_short_hash(user.get("apple_user_id")))
         raise HTTPException(status_code=403, detail="pairing code belongs to another account")
+    claim_user_id = bound_user_id or (user or {}).get("apple_user_id")
 
     with _PAIR_LOCK:
         meta = _pair_code_meta(_PAIR_CODES.get(code))
@@ -2226,26 +2227,26 @@ async def pair_claim(request: Request):
         _PAIR_CODES.pop(code, None)           # one-time
         token = "pdev-" + secrets.token_urlsafe(32)
         device = None
-        if user:
-            device = _account_device_put(user["apple_user_id"], token, platform=platform, label=name)
+        if claim_user_id:
+            device = _account_device_put(claim_user_id, token, platform=platform, label=name)
         _DEVICE_TOKENS[token] = {
             "name": name,
             "platform": platform,
             "created": time.time(),
             "last_seen": time.time(),
-            "apple_user_id": (user or {}).get("apple_user_id"),
+            "apple_user_id": claim_user_id,
             "device_id": (device or {}).get("device_id"),
         }
         _save_device_tokens(_DEVICE_TOKENS)
     _log_event("pair_claim",
                device=name,
                platform=platform,
-               account_bound=bool(user),
-               apple_user_hash=_short_hash((user or {}).get("apple_user_id")),
+               account_bound=bool(claim_user_id),
+               apple_user_hash=_short_hash(claim_user_id),
                token_hash=_short_hash(token))
     return {"token": token,
             "device_id": (device or {}).get("device_id"),
-            "account_bound": bool(user)}
+            "account_bound": bool(claim_user_id)}
 
 
 @app.get("/pair/devices")
