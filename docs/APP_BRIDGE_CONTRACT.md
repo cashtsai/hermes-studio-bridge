@@ -36,6 +36,62 @@ Required features:
 - `attachments`
 - `vision`
 - `message_dry_run`
+- `accounts`
+- `apple_auth`
+- `account_pairing`
+
+### `POST /app/v1/auth/apple`
+
+Verifies a Sign in with Apple identity token and upserts the durable account row.
+This endpoint is authenticated by the Apple JWT itself, not by the bridge bearer
+token.
+
+Request fields:
+
+- `apple_user_id`: required, must match the verified JWT `sub`.
+- `identityToken`: required Apple identity token.
+- `email`: optional; Apple may only provide it on first authorization.
+- `display_name`: optional.
+
+Rules:
+
+- JWT signature must validate against Apple's JWKS.
+- `iss` must be `https://appleid.apple.com`.
+- `aud` must match configured `APPLE_ID_AUDIENCES` (`com.pocketagent.ios` for M1).
+- Invalid tokens return `401`.
+- The response includes an account session token for account-scoped endpoints.
+
+### `GET /app/v1/account`
+
+Returns the current Apple account and its non-revoked paired devices. Requires an
+account session from `POST /app/v1/auth/apple`, sent as
+`X-Pocket-Account-Session: <session>` or as `Authorization: Bearer <session>`.
+
+Rules:
+
+- Device bearer tokens are never returned; only a short token hash may be shown.
+- `include_revoked=true` may be used for account-management views.
+
+### `POST /app/v1/pair/new` and `POST /app/v1/pair/claim`
+
+Account-bound pairing flow. The desktop calls `pair/new` with both a bridge
+bearer token and an account session; the phone calls `pair/claim` with the code
+and its own account session. The Apple user id on both sides must match.
+
+Rules:
+
+- Pairing codes are single-use and expire after five minutes.
+- `pair/new` returns `{code, ttl, account_bound}` and never returns a bearer
+  token.
+- `pair/claim` returns the new per-device bearer token once, plus `device_id`.
+- Existing legacy `/pair/*` endpoints remain for compatibility, but new app
+  flows should use `/app/v1/pair/*`.
+
+### `POST /app/v1/devices/{id}/revoke`
+
+Revokes one account-bound device for the current Apple user. Requires an account
+session. Revoked device tokens must no longer authenticate app-facing bridge
+endpoints.
 
 ### `GET /app/v1/sessions`
 

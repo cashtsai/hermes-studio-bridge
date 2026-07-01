@@ -58,8 +58,17 @@ BRIDGE_TOKEN = os.environ.get("BRIDGE_TOKEN", "CHANGE-ME")  # real value injecte
 _POCKET_DIR = os.path.expanduser("~/.pocket")
 _DEVICE_TOKENS_PATH = os.path.join(_POCKET_DIR, "device-tokens.json")
 _PAIR_LOCK = threading.Lock()
-_PAIR_CODES: dict = {}          # code -> expiry (monotonic)
+_PAIR_CODES: dict = {}          # code -> {expiry, apple_user_id} or legacy expiry
 _PAIR_CODE_TTL = 300.0          # a pairing code is valid for 5 minutes
+APPLE_JWKS_URL = "https://appleid.apple.com/auth/keys"
+APPLE_ID_ISSUER = "https://appleid.apple.com"
+APPLE_ID_AUDIENCES = tuple(
+    a.strip() for a in os.environ.get("APPLE_ID_AUDIENCES", "com.pocketagent.ios").split(",")
+    if a.strip()
+)
+ACCOUNT_SESSION_PREFIX = "paacct."
+ACCOUNT_SESSION_TTL = 60 * 60 * 24 * 90
+_APPLE_JWK_CLIENT = None
 
 
 def _load_device_tokens() -> dict:
@@ -153,8 +162,11 @@ def _check_auth(request: Request) -> None:
         with _PAIR_LOCK:
             dev = _DEVICE_TOKENS.get(token)
             if dev is not None:
-                dev["last_seen"] = time.time()
-                return
+                if not dev.get("apple_user_id") or _account_device_for_token(token) is not None:
+                    dev["last_seen"] = time.time()
+                    return
+        if _account_device_for_token(token) is not None:
+            return
     now = time.monotonic()
     with _AUTH_LOCK:
         while _AUTH_FAILS and now - _AUTH_FAILS[0] > _AUTH_FAIL_WINDOW:
@@ -409,6 +421,7 @@ async def _resolve_persona_prompt(messages: list) -> str:
 # The app talks to it through the versioned /app/v1 API; it never touches the
 # Hermes state.db schema or cron JSON directly.
 CANON_DB = os.path.expanduser("~/.local/share/pocket-agent/canonical.db")
+ACCOUNTS_DB = os.path.expanduser("~/.local/share/pocket-agent/accounts.db")
 REPORT_MEMORY_FILE = "REPORTS.md"
 REPORT_MEMORY_ITEMS = 20
 REPORT_MEMORY_CHARS = 2400
@@ -445,6 +458,300 @@ def _canon_init():
     con.execute("CREATE INDEX IF NOT EXISTS idx_report_external ON report_events(external_source, external_id)")
     con.commit()
     con.close()
+
+
+ACCOUNT_USER_COLUMNS = ("apple_user_id", "email", "display_name", "created_at", "last_seen_at")
+ACCOUNT_DEVICE_COLUMNS = (
+    "device_id", "apple_user_id", "device_token", "platform", "label",
+    "paired_at", "last_seen_at", "revoked",
+)
+
+
+def _accounts_init():
+    import sqlite3
+    os.makedirs(os.path.dirname(ACCOUNTS_DB), exist_ok=True)
+    con = sqlite3.connect(ACCOUNTS_DB, timeout=10)
+    con.execute("PRAGMA foreign_keys=ON")
+    con.execute("""CREATE TABLE IF NOT EXISTS users(
+        apple_user_id TEXT PRIMARY KEY,
+        email TEXT,
+        display_name TEXT,
+        created_at REAL NOT NULL,
+        last_seen_at REAL NOT NULL)""")
+    con.execute("""CREATE TABLE IF NOT EXISTS devices(
+        device_id TEXT PRIMARY KEY,
+        apple_user_id TEXT NOT NULL,
+        device_token TEXT NOT NULL UNIQUE,
+        platform TEXT,
+        label TEXT,
+        paired_at REAL NOT NULL,
+        last_seen_at REAL,
+        revoked INTEGER DEFAULT 0,
+        FOREIGN KEY(apple_user_id) REFERENCES users(apple_user_id)
+            ON UPDATE CASCADE ON DELETE CASCADE)""")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_account_devices_user ON devices(apple_user_id, revoked)")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_account_devices_token ON devices(device_token)")
+    con.commit()
+    con.close()
+
+
+def _account_user_row(row):
+    return dict(zip(ACCOUNT_USER_COLUMNS, row)) if row else None
+
+
+def _account_device_row(row):
+    return dict(zip(ACCOUNT_DEVICE_COLUMNS, row)) if row else None
+
+
+def _account_public_user(user: dict | None):
+    if not user:
+        return None
+    return {
+        "apple_user_id": user.get("apple_user_id"),
+        "email": user.get("email"),
+        "display_name": user.get("display_name"),
+        "created_at": user.get("created_at"),
+        "last_seen_at": user.get("last_seen_at"),
+    }
+
+
+def _account_public_device(device: dict | None):
+    if not device:
+        return None
+    token = device.get("device_token")
+    return {
+        "device_id": device.get("device_id"),
+        "apple_user_id": device.get("apple_user_id"),
+        "platform": device.get("platform"),
+        "label": device.get("label"),
+        "paired_at": device.get("paired_at"),
+        "last_seen_at": device.get("last_seen_at"),
+        "revoked": bool(device.get("revoked")),
+        "token_hash": _short_hash(token),
+    }
+
+
+def _account_upsert_user(apple_user_id: str, email: str | None = None,
+                         display_name: str | None = None):
+    import sqlite3
+    now = time.time()
+    con = sqlite3.connect(ACCOUNTS_DB, timeout=10)
+    con.execute(
+        """INSERT INTO users(apple_user_id,email,display_name,created_at,last_seen_at)
+           VALUES(?,?,?,?,?)
+           ON CONFLICT(apple_user_id) DO UPDATE SET
+             email=COALESCE(excluded.email, users.email),
+             display_name=COALESCE(excluded.display_name, users.display_name),
+             last_seen_at=excluded.last_seen_at""",
+        (apple_user_id, email or None, display_name or None, now, now))
+    row = con.execute(
+        f"SELECT {','.join(ACCOUNT_USER_COLUMNS)} FROM users WHERE apple_user_id=?",
+        (apple_user_id,)).fetchone()
+    con.commit()
+    con.close()
+    return _account_user_row(row)
+
+
+def _account_get_user(apple_user_id: str, touch: bool = False):
+    import sqlite3
+    if not apple_user_id:
+        return None
+    con = sqlite3.connect(ACCOUNTS_DB, timeout=10)
+    if touch:
+        con.execute("UPDATE users SET last_seen_at=? WHERE apple_user_id=?",
+                    (time.time(), apple_user_id))
+        con.commit()
+    row = con.execute(
+        f"SELECT {','.join(ACCOUNT_USER_COLUMNS)} FROM users WHERE apple_user_id=?",
+        (apple_user_id,)).fetchone()
+    con.close()
+    return _account_user_row(row)
+
+
+def _account_devices_for_user(apple_user_id: str, include_revoked: bool = False):
+    import sqlite3
+    con = sqlite3.connect(f"file:{ACCOUNTS_DB}?mode=ro", uri=True, timeout=5)
+    if include_revoked:
+        rows = con.execute(
+            f"SELECT {','.join(ACCOUNT_DEVICE_COLUMNS)} FROM devices "
+            "WHERE apple_user_id=? ORDER BY paired_at DESC",
+            (apple_user_id,)).fetchall()
+    else:
+        rows = con.execute(
+            f"SELECT {','.join(ACCOUNT_DEVICE_COLUMNS)} FROM devices "
+            "WHERE apple_user_id=? AND revoked=0 ORDER BY paired_at DESC",
+            (apple_user_id,)).fetchall()
+    con.close()
+    return [_account_device_row(r) for r in rows]
+
+
+def _account_device_put(apple_user_id: str, device_token: str, platform: str = "ios",
+                        label: str = "device", device_id: str | None = None):
+    import sqlite3
+    now = time.time()
+    device_id = device_id or "dev-" + uuid.uuid4().hex
+    con = sqlite3.connect(ACCOUNTS_DB, timeout=10)
+    con.execute("PRAGMA foreign_keys=ON")
+    con.execute(
+        """INSERT INTO devices(device_id,apple_user_id,device_token,platform,label,
+                               paired_at,last_seen_at,revoked)
+           VALUES(?,?,?,?,?,?,?,0)
+           ON CONFLICT(device_token) DO UPDATE SET
+             apple_user_id=excluded.apple_user_id,
+             platform=excluded.platform,
+             label=excluded.label,
+             last_seen_at=excluded.last_seen_at,
+             revoked=0""",
+        (device_id, apple_user_id, device_token, platform or "ios",
+         (label or "device")[:80], now, now))
+    row = con.execute(
+        f"SELECT {','.join(ACCOUNT_DEVICE_COLUMNS)} FROM devices WHERE device_token=?",
+        (device_token,)).fetchone()
+    con.commit()
+    con.close()
+    return _account_device_row(row)
+
+
+def _account_device_for_token(device_token: str, touch: bool = True):
+    import sqlite3
+    if not device_token:
+        return None
+    try:
+        con = sqlite3.connect(ACCOUNTS_DB, timeout=10)
+        row = con.execute(
+            f"SELECT {','.join(ACCOUNT_DEVICE_COLUMNS)} FROM devices "
+            "WHERE device_token=? AND revoked=0",
+            (device_token,)).fetchone()
+        if row and touch:
+            con.execute("UPDATE devices SET last_seen_at=? WHERE device_token=?",
+                        (time.time(), device_token))
+            con.commit()
+        con.close()
+        return _account_device_row(row)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _account_device_by_id(apple_user_id: str, device_id: str):
+    import sqlite3
+    if not apple_user_id or not device_id:
+        return None
+    con = sqlite3.connect(f"file:{ACCOUNTS_DB}?mode=ro", uri=True, timeout=5)
+    row = con.execute(
+        f"SELECT {','.join(ACCOUNT_DEVICE_COLUMNS)} FROM devices "
+        "WHERE apple_user_id=? AND device_id=?",
+        (apple_user_id, device_id)).fetchone()
+    con.close()
+    return _account_device_row(row)
+
+
+def _account_device_revoke(apple_user_id: str, device_id: str):
+    import sqlite3
+    con = sqlite3.connect(ACCOUNTS_DB, timeout=10)
+    cur = con.execute(
+        "UPDATE devices SET revoked=1, last_seen_at=? "
+        "WHERE apple_user_id=? AND device_id=? AND revoked=0",
+        (time.time(), apple_user_id, device_id))
+    con.commit()
+    revoked = cur.rowcount
+    con.close()
+    return revoked
+
+
+def _b64u(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
+
+
+def _b64u_decode(s: str) -> bytes:
+    return base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
+
+
+def _account_session_create(apple_user_id: str):
+    now = int(time.time())
+    exp = now + ACCOUNT_SESSION_TTL
+    payload = {"sub": apple_user_id, "iat": now, "exp": exp}
+    body = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    sig = hmac.new(BRIDGE_TOKEN.encode("utf-8"), body, hashlib.sha256).digest()
+    return ACCOUNT_SESSION_PREFIX + _b64u(body) + "." + _b64u(sig), exp
+
+
+def _account_session_payload(token: str):
+    if not token or not token.startswith(ACCOUNT_SESSION_PREFIX):
+        raise HTTPException(status_code=401, detail="missing account session")
+    try:
+        body_part, sig_part = token[len(ACCOUNT_SESSION_PREFIX):].split(".", 1)
+        body = _b64u_decode(body_part)
+        sig = _b64u_decode(sig_part)
+        expected = hmac.new(BRIDGE_TOKEN.encode("utf-8"), body, hashlib.sha256).digest()
+        if not hmac.compare_digest(sig, expected):
+            raise ValueError("bad signature")
+        payload = json.loads(body.decode("utf-8"))
+    except Exception:  # noqa: BLE001
+        raise HTTPException(status_code=401, detail="invalid account session")
+    if int(payload.get("exp") or 0) < int(time.time()):
+        raise HTTPException(status_code=401, detail="account session expired")
+    if not payload.get("sub"):
+        raise HTTPException(status_code=401, detail="invalid account session")
+    return payload
+
+
+def _account_session_token_from_request(request: Request, body: dict | None = None):
+    token = (request.headers.get("x-pocket-account-session")
+             or request.headers.get("x-account-session") or "").strip()
+    if not token and body:
+        token = str(body.get("account_session") or body.get("accountSession") or "").strip()
+    if not token:
+        auth = request.headers.get("authorization", "")
+        bearer = auth[7:].strip() if auth.lower().startswith("bearer ") else ""
+        if bearer.startswith(ACCOUNT_SESSION_PREFIX):
+            token = bearer
+    return token
+
+
+def _account_user_from_request(request: Request, body: dict | None = None,
+                               required: bool = True):
+    token = _account_session_token_from_request(request, body)
+    if not token:
+        if required:
+            raise HTTPException(status_code=401, detail="missing account session")
+        return None
+    payload = _account_session_payload(token)
+    user = _account_get_user(payload.get("sub") or "", touch=True)
+    if not user:
+        raise HTTPException(status_code=401, detail="unknown account session")
+    return user
+
+
+def _apple_jwk_client():
+    global _APPLE_JWK_CLIENT
+    if _APPLE_JWK_CLIENT is None:
+        import jwt as pyjwt
+        _APPLE_JWK_CLIENT = pyjwt.PyJWKClient(APPLE_JWKS_URL, cache_keys=True)
+    return _APPLE_JWK_CLIENT
+
+
+def _apple_verify_identity_token(identity_token: str):
+    import jwt as pyjwt
+    if not APPLE_ID_AUDIENCES:
+        raise HTTPException(status_code=500, detail="APPLE_ID_AUDIENCES is not configured")
+    try:
+        header = pyjwt.get_unverified_header(identity_token)
+        if header.get("alg") != "RS256" or not header.get("kid"):
+            raise ValueError("unexpected jwt header")
+        signing_key = _apple_jwk_client().get_signing_key_from_jwt(identity_token)
+        return pyjwt.decode(
+            identity_token,
+            signing_key.key,
+            algorithms=["RS256"],
+            audience=list(APPLE_ID_AUDIENCES),
+            issuer=APPLE_ID_ISSUER,
+            options={"require": ["exp", "iat", "iss", "aud", "sub"]},
+        )
+    except HTTPException:
+        raise
+    except Exception as e:  # noqa: BLE001
+        _log_event("apple_auth_invalid_token", error=type(e).__name__)
+        raise HTTPException(status_code=401, detail="invalid apple identity token")
 
 
 def _canon_add(session: str, role: str, content: str, attachments=None,
@@ -670,6 +977,7 @@ async def push_notify(title: str, body: str, data: dict | None = None) -> int:
 
 
 _canon_init()
+_accounts_init()
 
 
 async def _persona_content_stream(model: str, prompt: str):
@@ -1472,20 +1780,58 @@ async def serve_file(request: Request, path: str):
 CLIENT_LOG = os.path.expanduser("~/.pocket/pocket-client.jsonl")
 
 
+def _pair_code_meta(value):
+    if isinstance(value, dict):
+        return {
+            "expiry": float(value.get("expiry") or 0),
+            "apple_user_id": value.get("apple_user_id"),
+        }
+    try:
+        return {"expiry": float(value), "apple_user_id": None}
+    except Exception:  # noqa: BLE001
+        return {"expiry": 0.0, "apple_user_id": None}
+
+
+def _pair_code_reject(request: Request):
+    with _AUTH_LOCK:
+        now = time.monotonic()
+        while _AUTH_FAILS and now - _AUTH_FAILS[0] > _AUTH_FAIL_WINDOW:
+            _AUTH_FAILS.popleft()
+        _AUTH_FAILS.append(now)
+        over = len(_AUTH_FAILS) > _AUTH_FAIL_MAX
+        summary = _auth_fail_summary_locked(request, 429 if over else 400, now)
+    if summary:
+        _log_event("pair_claim_failure", **summary)
+    raise HTTPException(status_code=429 if over else 400,
+                        detail="invalid or expired pairing code")
+
+
+@app.post("/app/v1/pair/new")
 @app.post("/pair/new")
 async def pair_new(request: Request):
     """Desktop-only (needs the master token): mint a one-time pairing code that
     the QR embeds. The phone exchanges it at /pair/claim. Never returns the token."""
     _check_auth(request)
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        body = {}
+    required_account = request.url.path.startswith("/app/v1/")
+    user = _account_user_from_request(request, body, required=required_account)
     now = time.monotonic()
     code = secrets.token_urlsafe(9)
     with _PAIR_LOCK:
-        for c in [c for c, exp in _PAIR_CODES.items() if exp < now]:
+        for c in [c for c, v in _PAIR_CODES.items() if _pair_code_meta(v)["expiry"] < now]:
             _PAIR_CODES.pop(c, None)          # prune expired
-        _PAIR_CODES[code] = now + _PAIR_CODE_TTL
-    return {"code": code, "ttl": int(_PAIR_CODE_TTL)}
+        _PAIR_CODES[code] = {
+            "expiry": now + _PAIR_CODE_TTL,
+            "apple_user_id": (user or {}).get("apple_user_id"),
+        }
+    return {"code": code, "ttl": int(_PAIR_CODE_TTL),
+            "account_bound": bool(user)}
 
 
+@app.post("/app/v1/pair/claim")
 @app.post("/pair/claim")
 async def pair_claim(request: Request):
     """Phone exchanges a one-time code for its OWN device token. The code IS the
@@ -1496,24 +1842,51 @@ async def pair_claim(request: Request):
         body = {}
     code = (body.get("code") or "").strip()
     name = (str(body.get("device_name") or "iPhone"))[:60]
+    platform = (str(body.get("platform") or "ios"))[:32]
     now = time.monotonic()
     with _PAIR_LOCK:
-        exp = _PAIR_CODES.get(code)
-        if not code or exp is None or exp < now:
-            # Reuse the auth-fail throttle so guessing codes is rate-limited too.
-            with _AUTH_LOCK:
-                while _AUTH_FAILS and time.monotonic() - _AUTH_FAILS[0] > _AUTH_FAIL_WINDOW:
-                    _AUTH_FAILS.popleft()
-                _AUTH_FAILS.append(time.monotonic())
-                over = len(_AUTH_FAILS) > _AUTH_FAIL_MAX
-            raise HTTPException(status_code=429 if over else 400,
-                                detail="invalid or expired pairing code")
+        meta = _pair_code_meta(_PAIR_CODES.get(code))
+        if not code or not meta["expiry"] or meta["expiry"] < now:
+            _pair_code_reject(request)
+    bound_user_id = meta.get("apple_user_id")
+    required_account = bool(bound_user_id) or request.url.path.startswith("/app/v1/")
+    user = _account_user_from_request(request, body, required=required_account)
+    if request.url.path.startswith("/app/v1/") and not bound_user_id:
+        raise HTTPException(status_code=400, detail="pairing code is not account-bound")
+    if bound_user_id and user and user.get("apple_user_id") != bound_user_id:
+        _log_event("pair_claim_account_mismatch",
+                   code_hash=_short_hash(code),
+                   expected_user_hash=_short_hash(bound_user_id),
+                   actual_user_hash=_short_hash(user.get("apple_user_id")))
+        raise HTTPException(status_code=403, detail="pairing code belongs to another account")
+
+    with _PAIR_LOCK:
+        meta = _pair_code_meta(_PAIR_CODES.get(code))
+        if not code or not meta["expiry"] or meta["expiry"] < time.monotonic():
+            _pair_code_reject(request)
         _PAIR_CODES.pop(code, None)           # one-time
         token = "pdev-" + secrets.token_urlsafe(32)
-        _DEVICE_TOKENS[token] = {"name": name, "created": time.time(), "last_seen": time.time()}
+        device = None
+        if user:
+            device = _account_device_put(user["apple_user_id"], token, platform=platform, label=name)
+        _DEVICE_TOKENS[token] = {
+            "name": name,
+            "platform": platform,
+            "created": time.time(),
+            "last_seen": time.time(),
+            "apple_user_id": (user or {}).get("apple_user_id"),
+            "device_id": (device or {}).get("device_id"),
+        }
         _save_device_tokens(_DEVICE_TOKENS)
-    _log_event("pair_claim", device=name, token_hash=_short_hash(token))
-    return {"token": token}
+    _log_event("pair_claim",
+               device=name,
+               platform=platform,
+               account_bound=bool(user),
+               apple_user_hash=_short_hash((user or {}).get("apple_user_id")),
+               token_hash=_short_hash(token))
+    return {"token": token,
+            "device_id": (device or {}).get("device_id"),
+            "account_bound": bool(user)}
 
 
 @app.get("/pair/devices")
@@ -1523,6 +1896,8 @@ async def pair_devices(request: Request):
     with _PAIR_LOCK:
         out = [
             {"id": _short_hash(t), "name": d.get("name", "device"),
+             "platform": d.get("platform"), "device_id": d.get("device_id"),
+             "account_bound": bool(d.get("apple_user_id")),
              "created": d.get("created"), "last_seen": d.get("last_seen")}
             for t, d in _DEVICE_TOKENS.items()
         ]
@@ -1541,7 +1916,10 @@ async def pair_revoke(request: Request):
     removed = 0
     with _PAIR_LOCK:
         for t in [t for t in _DEVICE_TOKENS if _short_hash(t) == dev_id]:
-            _DEVICE_TOKENS.pop(t, None); removed += 1
+            dev = _DEVICE_TOKENS.pop(t, None)
+            if dev and dev.get("apple_user_id") and dev.get("device_id"):
+                _account_device_revoke(dev.get("apple_user_id"), dev.get("device_id"))
+            removed += 1
         if removed:
             _save_device_tokens(_DEVICE_TOKENS)
     return {"revoked": removed}
@@ -2892,10 +3270,87 @@ async def capabilities(request: Request):
     return {"api": "app/v1",
             "features": ["canonical_messages", "reports", "notifications",
                          "approvals", "cc_sessions", "attachments", "vision",
-                         "message_dry_run", "apns_push"],
+                         "message_dry_run", "apns_push", "accounts",
+                         "apple_auth", "account_pairing"],
             "endpoints": ["/app/v1/sessions", "/app/v1/messages", "/reports",
                           "/cron/jobs", "/ccsessions", "/app/v1/approvals",
-                          "/app/v1/devices", "/app/v1/push/test"]}
+                          "/app/v1/devices", "/app/v1/push/test",
+                          "/app/v1/auth/apple", "/app/v1/account",
+                          "/app/v1/pair/new", "/app/v1/pair/claim",
+                          "/app/v1/devices/{id}/revoke"]}
+
+
+@app.post("/app/v1/auth/apple")
+async def app_auth_apple(request: Request):
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail="bad json")
+    apple_user_id = str(body.get("apple_user_id") or body.get("appleUserID") or "").strip()
+    identity_token = str(body.get("identityToken") or body.get("identity_token") or "").strip()
+    if not apple_user_id:
+        raise HTTPException(status_code=400, detail="apple_user_id required")
+    if not identity_token:
+        raise HTTPException(status_code=400, detail="identityToken required")
+    claims = await asyncio.to_thread(_apple_verify_identity_token, identity_token)
+    if claims.get("sub") != apple_user_id:
+        _log_event("apple_auth_subject_mismatch",
+                   apple_user_hash=_short_hash(apple_user_id),
+                   token_subject_hash=_short_hash(claims.get("sub")))
+        raise HTTPException(status_code=401, detail="apple user id mismatch")
+
+    display_name = body.get("display_name") or body.get("displayName") or body.get("name")
+    if isinstance(display_name, dict):
+        display_name = " ".join(
+            str(display_name.get(k) or "").strip()
+            for k in ("givenName", "familyName") if display_name.get(k)
+        ).strip()
+    display_name = str(display_name or "").strip() or None
+    email = str(body.get("email") or claims.get("email") or "").strip() or None
+    user = _account_upsert_user(apple_user_id, email=email, display_name=display_name)
+    session_token, expires_at = _account_session_create(apple_user_id)
+    _log_event("apple_auth_success",
+               apple_user_hash=_short_hash(apple_user_id),
+               audience=str(claims.get("aud") or ""))
+    return {
+        "ok": True,
+        "user": _account_public_user(user),
+        "session": {
+            "type": "account",
+            "token": session_token,
+            "expires_at": expires_at,
+        },
+    }
+
+
+@app.get("/app/v1/account")
+async def app_account(request: Request, include_revoked: bool = False):
+    user = _account_user_from_request(request)
+    devices = _account_devices_for_user(user["apple_user_id"], include_revoked=include_revoked)
+    return {
+        "user": _account_public_user(user),
+        "devices": [_account_public_device(d) for d in devices],
+    }
+
+
+@app.post("/app/v1/devices/{device_id}/revoke")
+async def app_revoke_account_device(device_id: str, request: Request):
+    user = _account_user_from_request(request)
+    device = _account_device_by_id(user["apple_user_id"], device_id)
+    if not device:
+        raise HTTPException(status_code=404, detail="unknown device")
+    revoked = _account_device_revoke(user["apple_user_id"], device_id)
+    token = device.get("device_token")
+    if revoked and token:
+        with _PAIR_LOCK:
+            if token in _DEVICE_TOKENS:
+                _DEVICE_TOKENS.pop(token, None)
+                _save_device_tokens(_DEVICE_TOKENS)
+    _log_event("account_device_revoked",
+               apple_user_hash=_short_hash(user.get("apple_user_id")),
+               device_id=device_id,
+               token_hash=_short_hash(token))
+    return {"revoked": revoked}
 
 
 @app.get("/app/v1/sessions")
