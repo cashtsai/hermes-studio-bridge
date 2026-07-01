@@ -473,7 +473,9 @@ def _canon_init():
         created_at REAL,
         updated_at REAL,
         last_error TEXT,
-        meta TEXT)""")
+        meta TEXT,
+        task_code TEXT,
+        subtask_code TEXT)""")
     delegation_cols = [r[1] for r in con.execute("PRAGMA table_info(delegations)").fetchall()]
     for name, ddl in {
         "provider_session_id": "ALTER TABLE delegations ADD COLUMN provider_session_id TEXT",
@@ -481,11 +483,14 @@ def _canon_init():
         "cc_session_name": "ALTER TABLE delegations ADD COLUMN cc_session_name TEXT",
         "last_error": "ALTER TABLE delegations ADD COLUMN last_error TEXT",
         "meta": "ALTER TABLE delegations ADD COLUMN meta TEXT",
+        "task_code": "ALTER TABLE delegations ADD COLUMN task_code TEXT",
+        "subtask_code": "ALTER TABLE delegations ADD COLUMN subtask_code TEXT",
     }.items():
         if name not in delegation_cols:
             con.execute(ddl)
     con.execute("CREATE INDEX IF NOT EXISTS idx_delegation_parent ON delegations(parent_persona, updated_at)")
     con.execute("CREATE INDEX IF NOT EXISTS idx_delegation_provider ON delegations(provider, provider_session_id)")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_delegation_task ON delegations(task_code, subtask_code)")
     con.commit()
     con.close()
 
@@ -870,10 +875,38 @@ def _normalise_provider(raw: str | None) -> str:
     return provider
 
 
-def _new_work_order(parent_persona: str) -> str:
+def _new_work_order(parent_persona: str, task_code: str = "", subtask_code: str = "") -> str:
+    """Work order v2: AGENT-TASK-SUBTASK-YYYYMMDD-ID4
+
+    AGENT    : persona prefix (XW/PT/SJ/YF), same as v1.
+    TASK     : project/task code, shared across every delegation under the
+               same initiative (e.g. POCKETCONN) so `grep`/filter by prefix
+               finds the whole thread of work, including retries.
+    SUBTASK  : this specific delegation's concrete deliverable (e.g.
+               APPLELOGIN). Different subtasks under the same task share the
+               TASK segment but not the SUBTASK segment.
+    YYYYMMDD : full 8-digit date (v1 only had MMDD, which collides across
+               years — fixed here).
+    ID4      : 4 hex chars, collision guard.
+
+    Falls back to a generic TASK/SUBTASK of "GEN" if the caller doesn't supply
+    one (keeps the endpoint usable without breaking older callers), but new
+    callers should always pass both — see docs/DELEGATION_CONTROL_PLANE.md.
+    """
     prefix = _WORK_ORDER_PREFIX.get(parent_persona, "HW")
-    day = datetime.now().astimezone().strftime("%m%d")
-    return f"{prefix}-{day}-{secrets.token_hex(3).upper()}"
+    day = datetime.now().astimezone().strftime("%Y%m%d")
+    task = _work_order_segment(task_code, fallback="GEN", max_len=16)
+    subtask = _work_order_segment(subtask_code, fallback="TASK", max_len=20)
+    return f"{prefix}-{task}-{subtask}-{day}-{secrets.token_hex(2).upper()}"
+
+
+def _work_order_segment(text: str, fallback: str, max_len: int) -> str:
+    """Slugify a work-order TASK/SUBTASK segment: uppercase alnum only, no
+    separators (the segment boundaries are the dashes between fields, so an
+    embedded dash would silently shift field parsing for anyone splitting on
+    '-')."""
+    slug = re.sub(r"[^A-Za-z0-9]+", "", (text or "")).upper()
+    return (slug or fallback)[:max_len]
 
 
 def _delegation_display_title(row: dict) -> str:
@@ -985,7 +1018,8 @@ def _delegation_public(row, runtime_status: str | None = None) -> dict:
     return d
 
 
-def _delegation_rows(limit: int = 50, parent_persona: str = "", status: str = "") -> list:
+def _delegation_rows(limit: int = 50, parent_persona: str = "", status: str = "",
+                      task_code: str = "") -> list:
     import sqlite3
     try:
         con = sqlite3.connect(f"file:{CANON_DB}?mode=ro", uri=True, timeout=5)
@@ -997,6 +1031,9 @@ def _delegation_rows(limit: int = 50, parent_persona: str = "", status: str = ""
         if status:
             where.append("status=?")
             args.append(status)
+        if task_code:
+            where.append("task_code=?")
+            args.append(task_code.strip().upper())
         sql = "SELECT * FROM delegations"
         if where:
             sql += " WHERE " + " AND ".join(where)
@@ -1025,14 +1062,16 @@ def _delegation_insert(row: dict) -> None:
     con.execute("""INSERT INTO delegations
         (id, work_order, parent_persona, parent_session, created_via, provider,
          title, objective, cwd, status, provider_session_id, codex_thread_id,
-         cc_session_name, created_at, updated_at, last_error, meta)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+         cc_session_name, created_at, updated_at, last_error, meta,
+         task_code, subtask_code)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (row.get("id"), row.get("work_order"), row.get("parent_persona"),
          row.get("parent_session"), row.get("created_via"), row.get("provider"),
          row.get("title"), row.get("objective"), row.get("cwd"), row.get("status"),
          row.get("provider_session_id"), row.get("codex_thread_id"),
          row.get("cc_session_name"), row.get("created_at"), row.get("updated_at"),
-         row.get("last_error"), json.dumps(row.get("meta") or {}, ensure_ascii=False)))
+         row.get("last_error"), json.dumps(row.get("meta") or {}, ensure_ascii=False),
+         row.get("task_code"), row.get("subtask_code")))
     con.commit()
     con.close()
 
@@ -3709,9 +3748,10 @@ async def app_sessions(request: Request):
 
 @app.get("/app/v1/delegations")
 async def app_delegations(request: Request, parent_persona: str = "",
-                          status: str = "", limit: int = 50):
+                          status: str = "", task_code: str = "", limit: int = 50):
     _check_auth(request)
-    rows = _delegation_rows(limit=limit, parent_persona=parent_persona, status=status)
+    rows = _delegation_rows(limit=limit, parent_persona=parent_persona,
+                             status=status, task_code=task_code)
     out = []
     for row in rows:
         out.append(_delegation_public(row, await _delegation_runtime_status(row)))
@@ -3802,8 +3842,21 @@ async def app_delegation_create(request: Request):
     title = (body.get("title") or objective.splitlines()[0]).strip()[:120]
     cwd = _normalise_workdir(body.get("cwd") or body.get("workdir") or HOME_ROOT,
                              create=(provider == "claude_code"))
-    work_order = (body.get("work_order") or _new_work_order(parent)).strip().upper()
-    if not re.match(r"^[A-Z0-9][A-Z0-9._-]{2,40}$", work_order):
+
+    task_code_raw = (body.get("task_code") or body.get("task_id") or "").strip()
+    subtask_code_raw = (body.get("subtask_code") or body.get("subtask_id") or "").strip()
+    explicit_work_order = (body.get("work_order") or "").strip()
+    if not explicit_work_order and not (task_code_raw and subtask_code_raw):
+        raise HTTPException(
+            status_code=400,
+            detail="task_code and subtask_code are required (e.g. task_code=POCKETCONN, "
+                   "subtask_code=APPLELOGIN) so work orders stay filterable by project/"
+                   "subtask; pass an explicit work_order instead only for one-off cases")
+    task_code = _work_order_segment(task_code_raw, fallback="GEN", max_len=16)
+    subtask_code = _work_order_segment(subtask_code_raw, fallback="TASK", max_len=20)
+    work_order = (explicit_work_order or
+                  _new_work_order(parent, task_code, subtask_code)).strip().upper()
+    if not re.match(r"^[A-Z0-9][A-Z0-9._-]{2,60}$", work_order):
         raise HTTPException(status_code=400, detail="unsupported work_order")
     did = "dlg-" + uuid.uuid4().hex[:16]
     now = time.time()
@@ -3845,7 +3898,10 @@ async def app_delegation_create(request: Request):
             _codex_http_error(e)
     else:
         requested = (body.get("session_name") or body.get("name") or "").strip()
-        cc_session_name = requested or f"{work_order.lower()}-{_safe_session_slug(title)}"
+        # work_order 本身已含 task/subtask 資訊，直接當 session 名稱即可，不再
+        # 額外拼 title slug（新格式比 v1 長，拼上去容易變成過長又重複的 tmux
+        # session 名稱）。
+        cc_session_name = requested or work_order.lower()
         if any(ch in cc_session_name for ch in "/|:\n\r\t"):
             raise HTTPException(status_code=400, detail="unsupported session_name")
         _pretrust_claude_dir(cwd)
@@ -3890,6 +3946,8 @@ async def app_delegation_create(request: Request):
         "updated_at": now,
         "last_error": "",
         "meta": meta,
+        "task_code": task_code,
+        "subtask_code": subtask_code,
     }
     try:
         _delegation_insert(row)
