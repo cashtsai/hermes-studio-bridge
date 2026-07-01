@@ -36,6 +36,8 @@ Required features:
 - `attachments`
 - `vision`
 - `message_dry_run`
+- `delegations`
+- `control_plane_v2`
 
 ### `GET /app/v1/sessions`
 
@@ -48,6 +50,38 @@ Persona sessions must include:
 - `name`
 - `preview`
 - `status`
+
+Delegation sessions also include `work_order`, `provider_session_id`, and
+`takeover` so Pocket can continue work started from Telegram or another app
+surface.
+
+### `GET /app/v1/delegations`
+
+Returns durable CC/CX work-order sessions created by any Hermes persona.
+
+### `POST /app/v1/delegations`
+
+Creates a provider-native child session and records its Hermes ownership.
+
+Required fields:
+
+- `parent_persona`: `xcash`, `pantianqing`, `shuijing`, or `yuanfang`.
+- `provider`: `codex`/`cx` or `claude_code`/`cc`.
+- `objective`: the task.
+- `cwd`: the local project path.
+
+The response includes a `work_order` and `takeover` metadata. Pocket should show
+the work order in the session list and may continue via the unified endpoint:
+
+`POST /app/v1/delegations/{id-or-work_order}/input`
+
+See `docs/DELEGATION_CONTROL_PLANE.md` for the full contract.
+
+### `GET /app/v2/sessions`
+
+Aggregates Hermes personas, durable delegations, Claude Code sessions, and Codex
+threads into one control-plane list. Delegations are first-class rows and include
+`meta.work_order` plus `meta.takeover`.
 
 ### `GET /app/v1/messages?session=<persona>&limit=<n>`
 
@@ -103,6 +137,8 @@ app and Telegram delivery.
 - `/health` returns `ok: true`.
 - `/capabilities` includes all required features.
 - `/app/v1/sessions` returns all four personas.
+- `/app/v1/delegations` returns a JSON object with `delegations`.
+- `/app/v2/sessions` returns a JSON object with `sessions`.
 - Bad session message read returns `400`.
 - `POST /app/v1/messages` with `dry_run: true` returns an SSE response and does
   not increase canonical DB message counts.
