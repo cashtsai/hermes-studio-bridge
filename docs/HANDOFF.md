@@ -60,11 +60,12 @@ neither restarts or reconfigures the other.
 2. **HTTPS** via Tailscale Serve; drop the iOS `NSAllowsArbitraryLoads`.
 3. Per-conversation sessions (currently one `--continue owui-<persona>` per persona).
 
-## M3 — CC/Codex 調度(dispatch)
+## M3 — CC/Codex 調度(delegations; `/dispatch` is legacy)
 
-- **bridge `POST /dispatch`** `{tool:claude-code|codex, task, cwd, parent}` → spawn headless 子 agent(`claude -p --output-format stream-json --permission-mode bypassPermissions` / `codex exec`),註冊成子會話,串流轉錄。子會話用 `model=<session_id>` 經 `/v1/chat/completions` 重播。
-- **`deploy/studio-dispatch`** → `~/.local/bin/studio-dispatch`(token 讀 `~/.config/studio/token`)。Hermes persona 經 skill `studio-dispatch`(在各 home 的 skills)呼叫它派工。
-- 權限:子 agent 走 `bypassPermissions`(善彰已授權),轉錄全攤在 App、可中斷。
+- **bridge `POST /app/v1/delegations`** `{parent_persona, provider, title, objective, cwd}` → create a durable work-order session with `work_order`, parent ownership, and takeover metadata.
+- Codex/CX uses the Codex app-server native thread id; Claude Code/CC uses a named ccsess remote-control session.
+- Pocket reads `/app/v1/delegations` or `/app/v2/sessions`; provider-native surfaces resume by Codex thread id or Claude Code session name.
+- **`POST /dispatch` and `deploy/studio-dispatch` are legacy only**. Do not use them for formal persona dispatch because they are not the durable cross-surface contract.
 
 ## M4 — MCP memory(CC/Codex 共享 Hermes 記憶)
 

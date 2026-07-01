@@ -456,6 +456,36 @@ def _canon_init():
         external_source TEXT, external_id TEXT UNIQUE, ingested_at REAL NOT NULL)""")
     con.execute("CREATE INDEX IF NOT EXISTS idx_report_session_time ON report_events(session, ts)")
     con.execute("CREATE INDEX IF NOT EXISTS idx_report_external ON report_events(external_source, external_id)")
+    con.execute("""CREATE TABLE IF NOT EXISTS delegations(
+        id TEXT PRIMARY KEY,
+        work_order TEXT UNIQUE,
+        parent_persona TEXT NOT NULL,
+        parent_session TEXT,
+        created_via TEXT,
+        provider TEXT NOT NULL,
+        title TEXT,
+        objective TEXT,
+        cwd TEXT,
+        status TEXT,
+        provider_session_id TEXT,
+        codex_thread_id TEXT,
+        cc_session_name TEXT,
+        created_at REAL,
+        updated_at REAL,
+        last_error TEXT,
+        meta TEXT)""")
+    delegation_cols = [r[1] for r in con.execute("PRAGMA table_info(delegations)").fetchall()]
+    for name, ddl in {
+        "provider_session_id": "ALTER TABLE delegations ADD COLUMN provider_session_id TEXT",
+        "codex_thread_id": "ALTER TABLE delegations ADD COLUMN codex_thread_id TEXT",
+        "cc_session_name": "ALTER TABLE delegations ADD COLUMN cc_session_name TEXT",
+        "last_error": "ALTER TABLE delegations ADD COLUMN last_error TEXT",
+        "meta": "ALTER TABLE delegations ADD COLUMN meta TEXT",
+    }.items():
+        if name not in delegation_cols:
+            con.execute(ddl)
+    con.execute("CREATE INDEX IF NOT EXISTS idx_delegation_parent ON delegations(parent_persona, updated_at)")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_delegation_provider ON delegations(provider, provider_session_id)")
     con.commit()
     con.close()
 
@@ -811,6 +841,294 @@ def _canon_messages(session: str, limit: int = 200):
     return [{"id": r[0], "role": r[1], "content": r[2],
              "attachments": json.loads(r[3] or "[]"), "ts": r[4],
              "status": r[5], "source": "app"} for r in rows]
+
+
+_WORK_ORDER_PREFIX = {
+    "xcash": "XW",
+    "pantianqing": "PT",
+    "shuijing": "SJ",
+    "yuanfang": "YF",
+}
+
+_PROVIDER_ALIASES = {
+    "codex": "codex",
+    "cx": "codex",
+    "codex-app": "codex",
+    "codex_app": "codex",
+    "claude": "claude_code",
+    "claude-code": "claude_code",
+    "claude_code": "claude_code",
+    "cc": "claude_code",
+}
+
+
+def _normalise_provider(raw: str | None) -> str:
+    key = (raw or "codex").strip().lower()
+    provider = _PROVIDER_ALIASES.get(key)
+    if not provider:
+        raise HTTPException(status_code=400, detail="provider must be codex/cx or claude_code/cc")
+    return provider
+
+
+def _new_work_order(parent_persona: str) -> str:
+    prefix = _WORK_ORDER_PREFIX.get(parent_persona, "HW")
+    day = datetime.now().astimezone().strftime("%m%d")
+    return f"{prefix}-{day}-{secrets.token_hex(3).upper()}"
+
+
+def _delegation_display_title(row: dict) -> str:
+    wo = row.get("work_order") or "WORK"
+    title = (row.get("title") or row.get("objective") or "").strip()
+    return f"{wo} - {title[:80]}" if title else wo
+
+
+def _safe_session_slug(text: str, fallback: str = "task") -> str:
+    slug = re.sub(r"[^a-z0-9._-]+", "-", (text or "").lower()).strip("-")
+    return (slug or fallback)[:48]
+
+
+def _normalise_workdir(raw: str | None, *, create: bool = False) -> str:
+    home = os.path.realpath(os.path.expanduser("~"))
+    wd = os.path.realpath(os.path.expanduser(raw or HOME_ROOT))
+    if not (wd == home or wd.startswith(home + os.sep)):
+        raise HTTPException(status_code=400, detail="cwd must be under home")
+    if wd == home:
+        raise HTTPException(status_code=400, detail="pick a sub-folder, not your home directory")
+    if create:
+        try:
+            os.makedirs(wd, exist_ok=True)
+        except Exception as e:  # noqa: BLE001
+            raise HTTPException(status_code=400, detail=f"cannot create cwd: {e}")
+    elif not os.path.isdir(wd):
+        raise HTTPException(status_code=400, detail="cwd does not exist")
+    return wd
+
+
+def _delegation_prompt(work_order: str, parent_persona: str, title: str,
+                       objective: str, cwd: str, body: dict) -> str:
+    lines = [
+        f"[工號 {work_order}] {title}",
+        "",
+        "你是由 Hermes delegation control plane 派出的開發子程序。",
+        f"- 父人格: {parent_persona}",
+        f"- 工作目錄: {cwd}",
+        f"- 目標: {objective}",
+        "",
+        "運作規則:",
+        "- 每次回覆第一行保留工號，方便 Telegram、Pocket、官方 app 三邊對照。",
+        "- 先提出可驗收計畫，再實作；不要改無關檔案。",
+        "- 若涉及 production 寫入、正式通知、正式發文或真實使用者狀態變更，先停下等放行。",
+        "- 完成時回報修改檔案、驗證命令與輸出、殘餘風險、下一步。",
+    ]
+    for label, key in (("規格文件", "spec_path"), ("限制", "constraints"),
+                       ("驗收方式", "acceptance"), ("交接資訊", "handoff")):
+        val = (body.get(key) or "").strip() if isinstance(body.get(key), str) else body.get(key)
+        if val:
+            lines.append(f"- {label}: {val}")
+    return "\n".join(lines).strip()
+
+
+def _delegation_takeover(row: dict) -> dict:
+    provider = row.get("provider") or ""
+    if provider == "codex":
+        thread_id = row.get("codex_thread_id") or row.get("provider_session_id") or ""
+        return {
+            "pocket": {
+                "surface": "bridge",
+                "session_id": f"codex:{thread_id}" if thread_id else "",
+                "input_endpoint": f"/codexsessions/{thread_id}/input" if thread_id else "",
+                "stream_endpoint": f"/codexsessions/{thread_id}/stream" if thread_id else "",
+                "history_endpoint": f"/codexsessions/{thread_id}/history" if thread_id else "",
+                "status_endpoint": f"/codexsessions/{thread_id}/status" if thread_id else "",
+                "interrupt_endpoint": f"/codexsessions/{thread_id}/interrupt" if thread_id else "",
+            },
+            "official": {
+                "surface": "codex_app_server_thread",
+                "thread_id": thread_id,
+                "title": _delegation_display_title(row),
+                "resume_hint": "Codex official surfaces should resume the native thread id/title created by codex app-server.",
+            },
+        }
+    if provider == "claude_code":
+        name = row.get("cc_session_name") or row.get("provider_session_id") or ""
+        return {
+            "pocket": {
+                "surface": "bridge",
+                "session_id": f"claude_code:{name}" if name else "",
+                "input_endpoint": f"/ccsessions/{name}/input" if name else "",
+                "stream_endpoint": f"/ccsessions/{name}/stream" if name else "",
+                "history_endpoint": f"/ccsessions/{name}/history" if name else "",
+                "status_endpoint": f"/ccsessions/{name}/status" if name else "",
+                "interrupt_endpoint": f"/ccsessions/{name}/interrupt" if name else "",
+                "key_endpoint": f"/ccsessions/{name}/key" if name else "",
+            },
+            "official": {
+                "surface": "claude_code_remote_control",
+                "session_name": name,
+                "workdir": row.get("cwd") or "",
+                "resume_hint": "Open/attach the same Claude Code remote-control session name or ccsess tmux session.",
+            },
+        }
+    return {"pocket": {}, "official": {}}
+
+
+def _delegation_public(row, runtime_status: str | None = None) -> dict:
+    d = dict(row)
+    try:
+        meta = json.loads(d.get("meta") or "{}")
+    except Exception:  # noqa: BLE001
+        meta = {}
+    d["display_title"] = _delegation_display_title(d)
+    d["status"] = runtime_status or d.get("status") or "created"
+    d["meta"] = meta
+    d["takeover"] = _delegation_takeover(d)
+    return d
+
+
+def _delegation_rows(limit: int = 50, parent_persona: str = "", status: str = "") -> list:
+    import sqlite3
+    try:
+        con = sqlite3.connect(f"file:{CANON_DB}?mode=ro", uri=True, timeout=5)
+        con.row_factory = sqlite3.Row
+        where, args = [], []
+        if parent_persona:
+            where.append("parent_persona=?")
+            args.append(parent_persona)
+        if status:
+            where.append("status=?")
+            args.append(status)
+        sql = "SELECT * FROM delegations"
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        sql += " ORDER BY updated_at DESC LIMIT ?"
+        args.append(max(1, min(limit, 200)))
+        rows = con.execute(sql, args).fetchall()
+        con.close()
+        return rows
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def _delegation_get(delegation_id: str):
+    import sqlite3
+    con = sqlite3.connect(f"file:{CANON_DB}?mode=ro", uri=True, timeout=5)
+    con.row_factory = sqlite3.Row
+    row = con.execute("SELECT * FROM delegations WHERE id=? OR work_order=?",
+                      (delegation_id, delegation_id)).fetchone()
+    con.close()
+    return row
+
+
+def _delegation_insert(row: dict) -> None:
+    import sqlite3
+    con = sqlite3.connect(CANON_DB, timeout=10)
+    con.execute("""INSERT INTO delegations
+        (id, work_order, parent_persona, parent_session, created_via, provider,
+         title, objective, cwd, status, provider_session_id, codex_thread_id,
+         cc_session_name, created_at, updated_at, last_error, meta)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (row.get("id"), row.get("work_order"), row.get("parent_persona"),
+         row.get("parent_session"), row.get("created_via"), row.get("provider"),
+         row.get("title"), row.get("objective"), row.get("cwd"), row.get("status"),
+         row.get("provider_session_id"), row.get("codex_thread_id"),
+         row.get("cc_session_name"), row.get("created_at"), row.get("updated_at"),
+         row.get("last_error"), json.dumps(row.get("meta") or {}, ensure_ascii=False)))
+    con.commit()
+    con.close()
+
+
+def _delegation_update(delegation_id: str, **fields) -> None:
+    if not fields:
+        return
+    import sqlite3
+    allowed = {"status", "updated_at", "last_error", "provider_session_id",
+               "codex_thread_id", "cc_session_name", "meta"}
+    sets, args = [], []
+    for key, val in fields.items():
+        if key not in allowed:
+            continue
+        sets.append(f"{key}=?")
+        if key == "meta" and not isinstance(val, str):
+            val = json.dumps(val or {}, ensure_ascii=False)
+        args.append(val)
+    if not sets:
+        return
+    args.append(delegation_id)
+    con = sqlite3.connect(CANON_DB, timeout=10)
+    con.execute(f"UPDATE delegations SET {', '.join(sets)} WHERE id=?", args)
+    con.commit()
+    con.close()
+
+
+async def _delegation_runtime_status(row) -> str:
+    d = dict(row)
+    provider = d.get("provider") or ""
+    if provider == "codex":
+        tid = d.get("codex_thread_id") or d.get("provider_session_id") or ""
+        if tid and CODEX_APP.is_active(tid):
+            return "running"
+        if d.get("status") in ("failed", "archived"):
+            return d.get("status")
+        return "idle"
+    if provider == "claude_code":
+        name = d.get("cc_session_name") or d.get("provider_session_id") or ""
+        if name:
+            st, _prompt = await _v2_cc_state(name)
+            return st
+    return d.get("status") or "created"
+
+
+async def _delegation_app_sessions() -> list:
+    out = []
+    for row in _delegation_rows(limit=50):
+        st = await _delegation_runtime_status(row)
+        d = _delegation_public(row, st)
+        out.append({
+            "id": f"delegation:{d['id']}",
+            "type": "delegation",
+            "name": d["display_title"],
+            "parent": d.get("parent_persona"),
+            "tool": d.get("provider"),
+            "preview": (d.get("objective") or "")[:160],
+            "lastAt": d.get("updated_at"),
+            "status": d.get("status"),
+            "work_order": d.get("work_order"),
+            "provider_session_id": d.get("provider_session_id"),
+            "takeover": d.get("takeover"),
+        })
+    return out
+
+
+async def _delegation_v2_sessions() -> list:
+    out = []
+    for row in _delegation_rows(limit=50):
+        st = await _delegation_runtime_status(row)
+        d = _delegation_public(row, st)
+        caps = ["input", "attachments", "replay", "follow"]
+        if d.get("provider") in ("codex", "claude_code"):
+            caps.append("interrupt")
+        if d.get("provider") == "claude_code" and st == "waiting_approval":
+            caps.append("approve")
+        out.append({
+            "id": f"delegation:{d['id']}",
+            "provider": d.get("provider"),
+            "title": d["display_title"],
+            "subtitle": f"{d.get('parent_persona')} · {d.get('cwd')}",
+            "status": d.get("status"),
+            "last_event_at": d.get("updated_at"),
+            "capabilities": caps,
+            "meta": {"delegation": d, "work_order": d.get("work_order"),
+                     "takeover": d.get("takeover")},
+        })
+    return out
+
+
+def _delegated_codex_thread_ids() -> set:
+    return {
+        (dict(r).get("codex_thread_id") or dict(r).get("provider_session_id"))
+        for r in _delegation_rows(limit=200)
+        if dict(r).get("provider") == "codex"
+    } - {""}
 
 
 def _report_id(persona: str, name: str, sid: str, ts) -> str:
@@ -2264,6 +2582,7 @@ async def list_sessions(request: Request):
         text, ts = _persona_preview(home)
         out.append({"id": mid, "type": "persona", "name": disp,
                     "preview": text, "lastAt": ts, "status": "idle"})
+    out.extend(await _delegation_app_sessions())
     for key, s in SUBSESSIONS.items():
         out.append({"id": key, "type": "subprocess", "name": s.get("name"),
                     "parent": s.get("parent"), "tool": s.get("tool"),
@@ -2764,6 +3083,28 @@ async def cc_session_input(name: str, request: Request):
     return {"ok": True}
 
 
+async def _cc_paste_text(name: str, text: str) -> None:
+    if not await _tmux_alive(name):
+        raise HTTPException(status_code=409, detail="session not running")
+
+    async def _tmux(*args):
+        p = await asyncio.create_subprocess_exec(
+            TMUX_BIN, *args,
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE)
+        _, err = await p.communicate()
+        return p.returncode, (err or b"").decode("utf-8", "replace").strip()
+
+    buf = "pa-" + uuid.uuid4().hex[:8]
+    await _tmux("send-keys", "-t", name, "C-u")
+    rc_set, e_set = await _tmux("set-buffer", "-b", buf, text)
+    rc_paste, e_paste = await _tmux("paste-buffer", "-t", name, "-b", buf, "-p", "-d")
+    await asyncio.sleep(0.25)
+    rc_enter, e_enter = await _tmux("send-keys", "-t", name, "Enter")
+    if rc_set or rc_paste or rc_enter:
+        detail = (e_set or e_paste or e_enter or "tmux paste failed")[:200]
+        raise HTTPException(status_code=502, detail=detail)
+
+
 # CC interrupt + busy status (parity with Codex's stop/active). The app uses
 # these to offer a stop button and to detect a running turn reliably instead of
 # guessing from stream silence (which mis-fires on long, quiet commands).
@@ -2924,6 +3265,7 @@ async def v2_agents(request: Request):
 async def v2_sessions(request: Request, provider: str = "", status: str = ""):
     _check_auth(request)
     out = []
+    out.extend(await _delegation_v2_sessions())
     for name, workdir, enabled in _cc_conf_rows():
         if enabled != "1":
             continue
@@ -2938,12 +3280,15 @@ async def v2_sessions(request: Request, provider: str = "", status: str = ""):
         out.append({"id": f"hermes:{mid}", "provider": "hermes", "title": disp,
                     "subtitle": None, "status": "idle", "last_event_at": None,
                     "capabilities": ["input", "attachments", "replay", "follow", "approve"], "meta": {}})
+    delegated_codex_ids = _delegated_codex_thread_ids()
     try:
         res = await CODEX_APP.call("thread/list",
                                    {"limit": 20, "archived": False, "sortKey": "updated_at",
                                     "sortDirection": "desc", "useStateDbOnly": False}, timeout=10.0)
         for t in (res or {}).get("data", [])[:20]:
             s = _codex_enrich_summary(_codex_session_summary(t))
+            if (s.get("thread_id") or s.get("id")) in delegated_codex_ids:
+                continue
             active = bool(s.get("activeTurn")) or s.get("status") in ("active", "running")
             out.append({"id": f"codex:{s.get('thread_id') or s.get('id')}", "provider": "codex",
                         "title": s.get("name") or "codex", "subtitle": s.get("workdir"),
@@ -3273,13 +3618,15 @@ async def capabilities(request: Request):
             "features": ["canonical_messages", "reports", "notifications",
                          "approvals", "cc_sessions", "attachments", "vision",
                          "message_dry_run", "apns_push", "accounts",
-                         "apple_auth", "account_pairing"],
+                         "apple_auth", "account_pairing",
+                         "delegations", "control_plane_v2"],
             "endpoints": ["/app/v1/sessions", "/app/v1/messages", "/reports",
                           "/cron/jobs", "/ccsessions", "/app/v1/approvals",
                           "/app/v1/devices", "/app/v1/push/test",
                           "/app/v1/auth/apple", "/app/v1/account",
                           "/app/v1/pair/new", "/app/v1/pair/claim",
-                          "/app/v1/devices/{id}/revoke"]}
+                          "/app/v1/devices/{id}/revoke",
+                          "/app/v1/delegations", "/app/v2/sessions"]}
 
 
 @app.post("/app/v1/auth/apple")
@@ -3358,6 +3705,204 @@ async def app_revoke_account_device(device_id: str, request: Request):
 @app.get("/app/v1/sessions")
 async def app_sessions(request: Request):
     return await list_sessions(request)
+
+
+@app.get("/app/v1/delegations")
+async def app_delegations(request: Request, parent_persona: str = "",
+                          status: str = "", limit: int = 50):
+    _check_auth(request)
+    rows = _delegation_rows(limit=limit, parent_persona=parent_persona, status=status)
+    out = []
+    for row in rows:
+        out.append(_delegation_public(row, await _delegation_runtime_status(row)))
+    return {"delegations": out}
+
+
+@app.get("/app/v1/delegations/{delegation_id}")
+async def app_delegation_get(delegation_id: str, request: Request):
+    _check_auth(request)
+    row = _delegation_get(delegation_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="unknown delegation")
+    return {"delegation": _delegation_public(row, await _delegation_runtime_status(row))}
+
+
+@app.post("/app/v1/delegations/{delegation_id}/input")
+async def app_delegation_input(delegation_id: str, request: Request):
+    _check_auth(request)
+    row = _delegation_get(delegation_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="unknown delegation")
+    d = dict(row)
+    body = await request.json()
+    text = (body.get("content") or body.get("text") or body.get("message") or "").strip()
+    if not text and not body.get("attachments"):
+        raise HTTPException(status_code=400, detail="content or attachments required")
+    text = f"[工號 {d.get('work_order')}] {text}".strip()
+    if d.get("provider") == "codex":
+        thread_id = d.get("codex_thread_id") or d.get("provider_session_id") or ""
+        if not thread_id:
+            raise HTTPException(status_code=409, detail="delegation has no codex thread")
+        input_items = await _codex_input_items(text, body.get("attachments") or [])
+        try:
+            res = await CODEX_APP.start_turn(thread_id, input_items,
+                                             client_id=body.get("client_id"),
+                                             cwd=d.get("cwd"))
+        except Exception as e:  # noqa: BLE001
+            _codex_http_error(e)
+        _delegation_update(d["id"], status="running", updated_at=time.time(), last_error="")
+        return {"ok": True, "delegation_id": d["id"], "work_order": d.get("work_order"),
+                "provider": "codex", "thread_id": thread_id,
+                "turn": (res or {}).get("turn")}
+    if d.get("provider") == "claude_code":
+        name = d.get("cc_session_name") or d.get("provider_session_id") or ""
+        if not name:
+            raise HTTPException(status_code=409, detail="delegation has no cc session")
+        saved = []
+        voice_lines = []
+        for a in (body.get("attachments") or []):
+            path = _save_data_uri(a.get("data", ""), a.get("filename", "file"))
+            if not path:
+                continue
+            if a.get("kind") == "audio":
+                t = await asyncio.to_thread(_transcribe, path)
+                if t:
+                    voice_lines.append(t)
+            else:
+                saved.append(path)
+        if voice_lines:
+            text += "\n\n[語音附件轉寫]\n" + " ".join(voice_lines)
+        if saved:
+            text += "\n\n[附件已存到本機,請用 Read 讀取/檢視]\n" + "\n".join(saved)
+        await _cc_paste_text(name, text)
+        _delegation_update(d["id"], status="running", updated_at=time.time(), last_error="")
+        return {"ok": True, "delegation_id": d["id"], "work_order": d.get("work_order"),
+                "provider": "claude_code", "session_name": name}
+    raise HTTPException(status_code=400, detail="unsupported delegation provider")
+
+
+@app.post("/app/v1/delegations")
+async def app_delegation_create(request: Request):
+    """Create a durable CC/Codex work-order session.
+
+    This is the shared dispatch surface for every Hermes persona. It creates a
+    provider-native session first (Codex app-server thread or ccsess Claude Code
+    session), then stores the parent persona + work_order mapping so Pocket,
+    Telegram, and official provider surfaces can all point to the same work.
+    """
+    _check_auth(request)
+    body = await request.json()
+    parent = (body.get("parent_persona") or body.get("parent") or "xcash").strip()
+    if parent not in PERSONAS:
+        raise HTTPException(status_code=400, detail="unknown parent_persona")
+    provider = _normalise_provider(body.get("provider") or body.get("tool") or "codex")
+    objective = (body.get("objective") or body.get("task") or body.get("text") or "").strip()
+    if not objective:
+        raise HTTPException(status_code=400, detail="objective required")
+    title = (body.get("title") or objective.splitlines()[0]).strip()[:120]
+    cwd = _normalise_workdir(body.get("cwd") or body.get("workdir") or HOME_ROOT,
+                             create=(provider == "claude_code"))
+    work_order = (body.get("work_order") or _new_work_order(parent)).strip().upper()
+    if not re.match(r"^[A-Z0-9][A-Z0-9._-]{2,40}$", work_order):
+        raise HTTPException(status_code=400, detail="unsupported work_order")
+    did = "dlg-" + uuid.uuid4().hex[:16]
+    now = time.time()
+    prompt = _delegation_prompt(work_order, parent, title, objective, cwd, body)
+    provider_session_id = ""
+    codex_thread_id = ""
+    cc_session_name = ""
+    status = "created"
+    meta = {
+        "parent_display": PERSONAS[parent][0],
+        "created_by": "bridge",
+        "created_via": body.get("created_via") or "bridge",
+    }
+
+    if provider == "codex":
+        input_items = await _codex_input_items(prompt, body.get("attachments") or [])
+        params = {"cwd": cwd, "ephemeral": False, "threadSource": "user"}
+        if body.get("model"):
+            params["model"] = body.get("model")
+        try:
+            res = await CODEX_APP.call("thread/start", params, timeout=30.0)
+            thread = (res or {}).get("thread") or {}
+            codex_thread_id = thread.get("id") or ""
+            if not codex_thread_id:
+                raise CodexAppServerError("thread/start returned no thread id")
+            provider_session_id = codex_thread_id
+            CODEX_APP.loaded_threads.add(codex_thread_id)
+            try:
+                await CODEX_APP.call("thread/name/set", {
+                    "threadId": codex_thread_id,
+                    "name": f"{work_order} - {title[:80]}",
+                }, timeout=15.0)
+            except Exception:  # noqa: BLE001
+                pass
+            await CODEX_APP.start_turn(codex_thread_id, input_items,
+                                       client_id=f"delegation-{did}", cwd=cwd)
+            status = "running"
+        except Exception as e:  # noqa: BLE001
+            _codex_http_error(e)
+    else:
+        requested = (body.get("session_name") or body.get("name") or "").strip()
+        cc_session_name = requested or f"{work_order.lower()}-{_safe_session_slug(title)}"
+        if any(ch in cc_session_name for ch in "/|:\n\r\t"):
+            raise HTTPException(status_code=400, detail="unsupported session_name")
+        _pretrust_claude_dir(cwd)
+        await _run_ccsess("new", cc_session_name, cwd)
+        ready = await _cc_wait_ready(cc_session_name)
+        cc_prompt = prompt
+        saved = []
+        voice_lines = []
+        for a in (body.get("attachments") or []):
+            path = _save_data_uri(a.get("data", ""), a.get("filename", "file"))
+            if not path:
+                continue
+            if a.get("kind") == "audio":
+                t = await asyncio.to_thread(_transcribe, path)
+                if t:
+                    voice_lines.append(t)
+            else:
+                saved.append(path)
+        if voice_lines:
+            cc_prompt += "\n\n[語音附件轉寫]\n" + " ".join(voice_lines)
+        if saved:
+            cc_prompt += "\n\n[附件已存到本機,請用 Read 讀取/檢視]\n" + "\n".join(saved)
+        await _cc_paste_text(cc_session_name, cc_prompt)
+        provider_session_id = cc_session_name
+        status = "running" if ready else "starting"
+
+    row = {
+        "id": did,
+        "work_order": work_order,
+        "parent_persona": parent,
+        "parent_session": body.get("parent_session") or "",
+        "created_via": body.get("created_via") or "bridge",
+        "provider": provider,
+        "title": title,
+        "objective": objective,
+        "cwd": cwd,
+        "status": status,
+        "provider_session_id": provider_session_id,
+        "codex_thread_id": codex_thread_id,
+        "cc_session_name": cc_session_name,
+        "created_at": now,
+        "updated_at": now,
+        "last_error": "",
+        "meta": meta,
+    }
+    try:
+        _delegation_insert(row)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"delegation registry write failed: {e}")
+    _log_event("delegation_created",
+               work_order=work_order,
+               parent_persona=parent,
+               provider=provider,
+               provider_session_hash=_short_hash(provider_session_id),
+               objective_chars=len(objective),
+               attachment_count=len(body.get("attachments") or []))
+    return {"ok": True, "delegation": _delegation_public(row, status)}
 
 
 @app.get("/app/v1/messages")
