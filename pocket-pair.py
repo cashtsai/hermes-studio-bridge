@@ -14,10 +14,12 @@ network — the token never leaves this machine except inside the QR you scan.
 """
 import os
 import sys
+import json
 import plistlib
 import tempfile
 import subprocess
 import urllib.parse
+import urllib.request
 
 PLIST = os.path.expanduser("~/Library/LaunchAgents/ai.studio.hermes-bridge.plist")
 # Public Tailscale Funnel surface (works on any network, no Tailscale on phone).
@@ -44,17 +46,38 @@ def ensure_qrcode():
         subprocess.run([sys.executable, "-m", "pip", "install", "-q", "qrcode"], check=False)
 
 
+def mint_code(token: str) -> str | None:
+    """Ask the LOCAL bridge for a one-time pairing code (master token → code).
+    Returns None if the bridge isn't reachable or lacks /pair/new."""
+    try:
+        req = urllib.request.Request(
+            "http://127.0.0.1:8081/pair/new", method="POST",
+            headers={"Authorization": "Bearer %s" % token},
+        )
+        with urllib.request.urlopen(req, timeout=3) as r:
+            return (json.load(r) or {}).get("code")
+    except Exception:
+        return None
+
+
 def main() -> int:
     token = read_token().strip()
     if not token or token.lower().startswith("change-me"):
         print("✗ 找不到有效的 BRIDGE_TOKEN(檢查 %s)。" % PLIST, file=sys.stderr)
         return 1
 
-    url = "pocket://pair?scheme=%s&host=%s&token=%s" % (
-        urllib.parse.quote(SCHEME),
-        urllib.parse.quote(HOST),
-        urllib.parse.quote(token),
-    )
+    # Prefer a one-time pairing code (the master token never leaves this Mac).
+    code = mint_code(token)
+    if code:
+        payload = "pocket://pair?scheme=%s&host=%s&code=%s" % (
+            urllib.parse.quote(SCHEME), urllib.parse.quote(HOST), urllib.parse.quote(code))
+        note = "一次性配對碼(5 分鐘有效),master token 不外流。"
+    else:
+        # Fallback: bridge not running / older bridge → embed the token directly.
+        payload = "pocket://pair?scheme=%s&host=%s&token=%s" % (
+            urllib.parse.quote(SCHEME), urllib.parse.quote(HOST), urllib.parse.quote(token))
+        note = "⚠ bridge 未回應,改用直接 token(請確認 bridge 執行中以取得一次性碼)。"
+    url = payload
 
     ensure_qrcode()
     import qrcode
@@ -78,8 +101,9 @@ def main() -> int:
     except Exception:
         pass
 
+    print("  %s" % note)
     print("  桌面 = 金庫+執行,手機 = 遙控。CC/Codex 登入都在桌面,手機零重登。")
-    print("  連線:%s://%s(token 已編進 QR,未顯示)\n" % (SCHEME, HOST))
+    print("  連線:%s://%s\n" % (SCHEME, HOST))
     return 0
 
 

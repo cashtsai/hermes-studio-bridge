@@ -5,7 +5,8 @@ Open WebUI (or any OpenAI-compatible client) points its API base at this
 server. Each Hermes persona is exposed as a "model"; a chat completion runs
 `hermes -z <last user msg> --continue <persona-session>` with the persona's
 HERMES_HOME, so the reply comes from that persona WITH its shared long-term
-memory (the same MEMORY.md / state.db the Telegram gateway uses).
+memory. PocketAgent/ACP is the primary app surface; Telegram gateways are
+legacy ingress/fallback surfaces.
 
 Run:  uvicorn bridge:app --host 0.0.0.0 --port 8081
 """
@@ -18,6 +19,7 @@ import hmac
 import json
 import os
 import re
+import secrets
 import threading
 import time
 import uuid
@@ -46,6 +48,38 @@ _BG_TASKS: set = set()
 # be an open control surface even on the tailnet. Open WebUI sends this as its
 # OpenAI API key. Override via the BRIDGE_TOKEN env var.
 BRIDGE_TOKEN = os.environ.get("BRIDGE_TOKEN", "CHANGE-ME")  # real value injected via LaunchAgent env
+
+# --- Per-device tokens + one-time pairing codes -------------------------------
+# Hardened pairing: the QR carries a short-lived ONE-TIME CODE, never the master
+# BRIDGE_TOKEN. The desktop (which holds the master token) mints a code via
+# /pair/new; the phone exchanges it at /pair/claim for its OWN device token,
+# which is stored server-side and can be revoked per device. The master token
+# keeps working (desktop + any already-connected client), so this is additive.
+_POCKET_DIR = os.path.expanduser("~/.pocket")
+_DEVICE_TOKENS_PATH = os.path.join(_POCKET_DIR, "device-tokens.json")
+_PAIR_LOCK = threading.Lock()
+_PAIR_CODES: dict = {}          # code -> expiry (monotonic)
+_PAIR_CODE_TTL = 300.0          # a pairing code is valid for 5 minutes
+
+
+def _load_device_tokens() -> dict:
+    try:
+        with open(_DEVICE_TOKENS_PATH, "r", encoding="utf-8") as f:
+            d = json.load(f)
+            return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_device_tokens(d: dict) -> None:
+    os.makedirs(_POCKET_DIR, exist_ok=True)
+    tmp = _DEVICE_TOKENS_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(d, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, _DEVICE_TOKENS_PATH)
+
+
+_DEVICE_TOKENS: dict = _load_device_tokens()
 
 # Brute-force guard for the token gate. Once the bridge is reachable from the
 # public internet (Tailscale Funnel), the only thing between an attacker and a
@@ -112,7 +146,15 @@ def _check_auth(request: Request) -> None:
     auth = request.headers.get("authorization", "")
     token = auth[7:].strip() if auth.lower().startswith("bearer ") else ""
     if hmac.compare_digest(token, BRIDGE_TOKEN):
-        return  # constant-time match; valid token always allowed
+        return  # constant-time match; master token always allowed
+    if token:
+        # Per-device token (issued via /pair/claim). Membership check + refresh
+        # last_seen in memory only (no disk write per request).
+        with _PAIR_LOCK:
+            dev = _DEVICE_TOKENS.get(token)
+            if dev is not None:
+                dev["last_seen"] = time.time()
+                return
     now = time.monotonic()
     with _AUTH_LOCK:
         while _AUTH_FAILS and now - _AUTH_FAILS[0] > _AUTH_FAIL_WINDOW:
@@ -133,7 +175,7 @@ HOME_ROOT = "/Users/xcash/apps/hermes-agent/home"
 PERSONAS = {
     "yuanfang":    ("袁方 (幕僚長/main)", HOME_ROOT),
     "pantianqing": ("潘天晴 (FLiPER)",    f"{HOME_ROOT}/profiles/fliper"),
-    "xcash":       ("XCash (善彰)",       f"{HOME_ROOT}/profiles/xcash"),
+    "xcash":       ("XCash (PocketAgent 協調)", f"{HOME_ROOT}/profiles/xcash"),
     "shuijing":    ("水鏡 (shuijing)",    f"{HOME_ROOT}/profiles/shuijing"),
 }
 
@@ -1428,6 +1470,81 @@ async def serve_file(request: Request, path: str):
 # the moment it happens. We append to ONE file on the Mac so Claude can fetch +
 # review client-side bugs each session and confirm whether they're resolved.
 CLIENT_LOG = os.path.expanduser("~/.pocket/pocket-client.jsonl")
+
+
+@app.post("/pair/new")
+async def pair_new(request: Request):
+    """Desktop-only (needs the master token): mint a one-time pairing code that
+    the QR embeds. The phone exchanges it at /pair/claim. Never returns the token."""
+    _check_auth(request)
+    now = time.monotonic()
+    code = secrets.token_urlsafe(9)
+    with _PAIR_LOCK:
+        for c in [c for c, exp in _PAIR_CODES.items() if exp < now]:
+            _PAIR_CODES.pop(c, None)          # prune expired
+        _PAIR_CODES[code] = now + _PAIR_CODE_TTL
+    return {"code": code, "ttl": int(_PAIR_CODE_TTL)}
+
+
+@app.post("/pair/claim")
+async def pair_claim(request: Request):
+    """Phone exchanges a one-time code for its OWN device token. The code IS the
+    credential (no bearer needed); it's single-use and expires in 5 minutes."""
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    code = (body.get("code") or "").strip()
+    name = (str(body.get("device_name") or "iPhone"))[:60]
+    now = time.monotonic()
+    with _PAIR_LOCK:
+        exp = _PAIR_CODES.get(code)
+        if not code or exp is None or exp < now:
+            # Reuse the auth-fail throttle so guessing codes is rate-limited too.
+            with _AUTH_LOCK:
+                while _AUTH_FAILS and time.monotonic() - _AUTH_FAILS[0] > _AUTH_FAIL_WINDOW:
+                    _AUTH_FAILS.popleft()
+                _AUTH_FAILS.append(time.monotonic())
+                over = len(_AUTH_FAILS) > _AUTH_FAIL_MAX
+            raise HTTPException(status_code=429 if over else 400,
+                                detail="invalid or expired pairing code")
+        _PAIR_CODES.pop(code, None)           # one-time
+        token = "pdev-" + secrets.token_urlsafe(32)
+        _DEVICE_TOKENS[token] = {"name": name, "created": time.time(), "last_seen": time.time()}
+        _save_device_tokens(_DEVICE_TOKENS)
+    _log_event("pair_claim", device=name, token_hash=_short_hash(token))
+    return {"token": token}
+
+
+@app.get("/pair/devices")
+async def pair_devices(request: Request):
+    """List paired devices (desktop only). Tokens are returned hashed, not raw."""
+    _check_auth(request)
+    with _PAIR_LOCK:
+        out = [
+            {"id": _short_hash(t), "name": d.get("name", "device"),
+             "created": d.get("created"), "last_seen": d.get("last_seen")}
+            for t, d in _DEVICE_TOKENS.items()
+        ]
+    return {"devices": out}
+
+
+@app.post("/pair/revoke")
+async def pair_revoke(request: Request):
+    """Revoke a paired device by its short id (from /pair/devices). Desktop only."""
+    _check_auth(request)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    dev_id = (body.get("id") or "").strip()
+    removed = 0
+    with _PAIR_LOCK:
+        for t in [t for t in _DEVICE_TOKENS if _short_hash(t) == dev_id]:
+            _DEVICE_TOKENS.pop(t, None); removed += 1
+        if removed:
+            _save_device_tokens(_DEVICE_TOKENS)
+    return {"revoked": removed}
 
 
 @app.post("/clientlog")
