@@ -77,8 +77,10 @@ Rules:
 ### `POST /app/v1/pair/new` and `POST /app/v1/pair/claim`
 
 Account-bound pairing flow. The desktop calls `pair/new` with both a bridge
-bearer token and an account session; the phone calls `pair/claim` with the code
-and its own account session. The Apple user id on both sides must match.
+bearer token and an account session; the phone calls `pair/claim` with the
+single-use code. The bound code is the phone-side credential, so the phone does
+not need its own account session. If the phone does send an account session, its
+Apple user id must match the code's bound Apple user id.
 
 Rules:
 
