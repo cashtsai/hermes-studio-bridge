@@ -852,6 +852,8 @@ class CodexAppServerClient:
         self._stderr_task = None
         self.thread_events = collections.defaultdict(list)
         self.active_turns = {}
+        self.last_event_at = {}
+        self.thread_errors = {}
         self.loaded_threads = set()
         self.remote_status = None
         self._streamed_item_ids = set()
@@ -977,6 +979,7 @@ class CodexAppServerClient:
     def _append(self, thread_id: str, item):
         if not thread_id:
             return
+        self.last_event_at[thread_id] = time.time()
         buf = self.thread_events[thread_id]
         buf.append(item)
         if len(buf) > 2000:
@@ -998,13 +1001,20 @@ class CodexAppServerClient:
         if method == "turn/started" and tid:
             turn = params.get("turn") or {}
             self.active_turns[tid] = turn.get("id") or True
+            self.last_event_at[tid] = time.time()
+            self.thread_errors.pop(tid, None)
             return
         if method == "turn/completed" and tid:
             self.active_turns.pop(tid, None)
+            self.last_event_at[tid] = time.time()
             turn = params.get("turn") or {}
             err = turn.get("error") if isinstance(turn, dict) else None
             if err:
-                self._append(tid, ("text", f"\n⚠️ Codex turn failed: {err.get('message', err)}\n"))
+                msg = err.get("message", err)
+                self.thread_errors[tid] = str(msg)
+                self._append(tid, ("text", f"\n⚠️ Codex turn failed: {msg}\n"))
+            else:
+                self.thread_errors.pop(tid, None)
             return
         if method == "error":
             _log_event("codex_app_server_error",
@@ -1080,6 +1090,16 @@ class CodexAppServerClient:
 
 
 CODEX_APP = CodexAppServerClient()
+
+
+def _codex_enrich_summary(summary: dict) -> dict:
+    tid = summary.get("thread_id") or summary.get("id") or ""
+    summary["activeTurn"] = CODEX_APP.is_active(tid)
+    if tid in CODEX_APP.last_event_at:
+        summary["lastEventAt"] = CODEX_APP.last_event_at[tid]
+    if tid in CODEX_APP.thread_errors:
+        summary["error"] = CODEX_APP.thread_errors[tid]
+    return summary
 
 
 def _codex_status_type(status) -> str:
@@ -1166,7 +1186,7 @@ def _codex_format_item(item: dict, phase: str = "completed", skip_agent_ids=None
     t = item.get("type")
     if t == "userMessage":
         text = _codex_user_input_text(item.get("content") or [])
-        return f"\n\n**你:** {text}\n\n" if text else ""
+        return f"\n\n**🧑 你:** {text}\n\n" if text else ""
     if t == "agentMessage":
         if item.get("id") in skip_agent_ids:
             return ""
@@ -1280,7 +1300,8 @@ async def codex_sessions(request: Request, limit: int = 40, cwd: str | None = No
     try:
         res = await CODEX_APP.call("thread/list", params, timeout=45.0)
         return {
-            "sessions": [_codex_session_summary(t) for t in (res or {}).get("data", [])],
+            "sessions": [_codex_enrich_summary(_codex_session_summary(t))
+                         for t in (res or {}).get("data", [])],
             "nextCursor": (res or {}).get("nextCursor"),
         }
     except Exception as e:  # noqa: BLE001
@@ -1296,8 +1317,7 @@ async def codex_session_status(thread_id: str, request: Request):
             "includeTurns": False,
         }, timeout=20.0)
         thread = (res or {}).get("thread") or {}
-        summary = _codex_session_summary(thread)
-        summary["activeTurn"] = CODEX_APP.is_active(thread_id)
+        summary = _codex_enrich_summary(_codex_session_summary(thread))
         return {"session": summary}
     except Exception as e:  # noqa: BLE001
         _codex_http_error(e)
@@ -1320,8 +1340,7 @@ async def codex_session_set_name(thread_id: str, request: Request):
             "includeTurns": False,
         }, timeout=20.0)
         thread = (res or {}).get("thread") or {}
-        summary = _codex_session_summary(thread)
-        summary["activeTurn"] = CODEX_APP.is_active(thread_id)
+        summary = _codex_enrich_summary(_codex_session_summary(thread))
         return {"ok": True, "session": summary}
     except Exception as e:  # noqa: BLE001
         _codex_http_error(e)
@@ -1379,7 +1398,7 @@ async def codex_session_create(request: Request):
         await CODEX_APP.start_turn(thread_id, input_items,
                                    client_id=body.get("client_id"), cwd=cwd)
         return {"ok": True, "thread_id": thread_id,
-                "session": _codex_session_summary(thread)}
+                "session": _codex_enrich_summary(_codex_session_summary(thread))}
     except Exception as e:  # noqa: BLE001
         _codex_http_error(e)
 
@@ -1486,19 +1505,24 @@ async def codex_session_interrupt(thread_id: str, request: Request):
 
 
 @app.get("/codexsessions/{thread_id}/history")
-async def codex_session_history(thread_id: str, request: Request, limit: int = 40):
+async def codex_session_history(thread_id: str, request: Request, limit: int = 40,
+                                cursor: str | None = None):
     _check_auth(request)
     try:
-        res = await CODEX_APP.call("thread/turns/list", {
+        params = {
             "threadId": thread_id,
             "limit": max(1, min(limit, 100)),
             "itemsView": "full",
             "sortDirection": "desc",
-        }, timeout=45.0)
+        }
+        if cursor:
+            params["cursor"] = cursor
+        res = await CODEX_APP.call("thread/turns/list", params, timeout=45.0)
         turns = list((res or {}).get("data", []))
         turns.reverse()
         return {"text": _codex_format_turns(turns),
-                "more": bool((res or {}).get("nextCursor"))}
+                "more": bool((res or {}).get("nextCursor")),
+                "nextCursor": (res or {}).get("nextCursor")}
     except Exception as e:  # noqa: BLE001
         _codex_http_error(e)
 
@@ -1807,29 +1831,14 @@ async def _tmux_alive(name: str) -> bool:
 
 
 def _cc_last_activity(workdir: str):
-    """(mtime, last-user-command) for a CC session's transcript — drives home
-    recency sort + the "last command" row subtitle. Bounded tail read."""
+    """Transcript mtime for the home recency sort. Just os.path.getmtime — no file
+    read/parse (the app shows YOUR last sent command from its local SentLog, so the
+    server needn't extract a preview). Cheap enough to run per-poll."""
     jsonl = _cc_latest_jsonl(workdir)
-    if not jsonl or not os.path.exists(jsonl):
+    if not jsonl:
         return (0.0, "")
     try:
-        mtime = os.path.getmtime(jsonl)
-        with open(jsonl, "rb") as f:
-            f.seek(0, 2); size = f.tell(); f.seek(max(0, size - 16384))
-            tail = f.read().decode("utf-8", "replace")
-        last = ""
-        for line in tail.splitlines():
-            try:
-                d = json.loads(line)
-            except Exception:  # noqa: BLE001
-                continue
-            if d.get("type") == "user":
-                content = (d.get("message") or {}).get("content")
-                txt = content if isinstance(content, str) else _blocks_text(content)
-                txt = (txt or "").strip()
-                if txt and not txt.startswith("<"):
-                    last = txt
-        return (mtime, last.splitlines()[0][:100] if last else "")
+        return (os.path.getmtime(jsonl), "")
     except Exception:  # noqa: BLE001
         return (0.0, "")
 
@@ -2437,7 +2446,7 @@ async def v2_sessions(request: Request, provider: str = "", status: str = ""):
                                    {"limit": 20, "archived": False, "sortKey": "updated_at",
                                     "sortDirection": "desc", "useStateDbOnly": False}, timeout=10.0)
         for t in (res or {}).get("data", [])[:20]:
-            s = _codex_session_summary(t)
+            s = _codex_enrich_summary(_codex_session_summary(t))
             active = bool(s.get("activeTurn")) or s.get("status") in ("active", "running")
             out.append({"id": f"codex:{s.get('thread_id') or s.get('id')}", "provider": "codex",
                         "title": s.get("name") or "codex", "subtitle": s.get("workdir"),
