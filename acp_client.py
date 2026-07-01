@@ -35,6 +35,10 @@ class ACPSession:
         self._loaded_session = False      # True if session came from session/load
         self._proved_alive = False        # True once any turn produced output
 
+    def is_busy(self) -> bool:
+        """True while this persona is already running or queued inside a turn."""
+        return self._lock.locked()
+
     def _next_id(self) -> int:
         self._id += 1
         return self._id
@@ -254,6 +258,7 @@ class ACPSession:
         but no longer respond)."""
         async with self._lock:
             await self.ensure_started()
+            yield ("status", {"state": "running", "label": "Hermes 開始處理"})
             produced = 0
             async for item in self._attempt(text):
                 produced += 1

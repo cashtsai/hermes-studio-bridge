@@ -743,6 +743,8 @@ async def _persona_content_stream(model: str, prompt: str):
                     yield ("content", f"<details><summary>↳ 結果</summary>\n\n```\n{short}{more}\n```\n\n</details>\n")
             elif kind == "perm":
                 yield ("content", f"\n› 🔐 自動允許 **{val}**\n")
+            elif kind == "status":
+                yield ("status", val)
             elif kind == "usage":
                 yield ("usage", val)
             elif kind == "error":
@@ -2959,6 +2961,13 @@ async def app_post_message(request: Request):
                    "model": session, "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}
         return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
+    def status_chunk(state: str, label: str):
+        payload = {"id": cid, "object": "chat.completion.chunk", "created": created,
+                   "model": session,
+                   "status": {"state": state, "label": label},
+                   "choices": [{"index": 0, "delta": {}, "finish_reason": None}]}
+        return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
     # Retry idempotency: if this exact logical send already produced a recorded
     # reply (first attempt completed server-side but the app's network dropped
     # before it saw the reply), replay that reply — do NOT re-run the turn or
@@ -2970,6 +2979,7 @@ async def app_post_message(request: Request):
                 done_sent = False
                 try:
                     yield chunk({"role": "assistant", "content": ""})
+                    yield status_chunk("replayed", "已找到上一輪完成回覆，正在重播。")
                     yield chunk({"content": prior})
                     payload = {"id": cid, "object": "chat.completion.chunk", "created": created,
                                "model": session, "replayed": True,
@@ -2991,6 +3001,7 @@ async def app_post_message(request: Request):
             text = f"✅ dry-run ok: {session} message path is reachable; nothing was persisted."
             try:
                 yield chunk({"role": "assistant", "content": ""})
+                yield status_chunk("accepted", "dry-run 已送達 bridge。")
                 yield chunk({"content": text})
                 payload = {"id": cid, "object": "chat.completion.chunk", "created": created,
                            "model": session,
@@ -3029,6 +3040,9 @@ async def app_post_message(request: Request):
     if report_context:
         prompt = f"{report_context}\n\n---\n【使用者現在的訊息】\n{prompt}"
 
+    acp_session = await POOL.get(session, home_for(session))
+    queued_at_accept = acp_session.is_busy()
+
     att_meta = [{"kind": a.get("kind"), "filename": a.get("filename"), "mime": a.get("mime")}
                 for a in attachments]
     # Record the transcript as the canonical text (so other devices see what was
@@ -3056,6 +3070,8 @@ async def app_post_message(request: Request):
                         state["content_chunks"] += 1
                     elif k == "usage":
                         state["usage"] = v
+                    elif k == "status":
+                        pass
                     await q.put((k, v))
             except Exception as e:  # noqa: BLE001
                 state["runner_error"] = f"{type(e).__name__}: {str(e)[:180]}"
@@ -3082,6 +3098,10 @@ async def app_post_message(request: Request):
 
         try:
             yield chunk({"role": "assistant", "content": ""})
+            if queued_at_accept:
+                yield status_chunk("queued", "已收到 · 上一輪還在跑，這則會排隊處理。")
+            else:
+                yield status_chunk("accepted", "已送達 Hermes，等待回覆。")
             while True:
                 k, v = await q.get()
                 if k is None:
@@ -3091,6 +3111,10 @@ async def app_post_message(request: Request):
                 elif k == "keepalive":
                     state["keepalives"] += 1
                     yield ": keepalive\n\n"
+                elif k == "status":
+                    if isinstance(v, dict):
+                        yield status_chunk(v.get("state") or "running",
+                                           v.get("label") or "Hermes 開始處理")
                 elif k == "error":
                     state["stream_error"] = str(v)[:180]
             final = {"index": 0, "delta": {}, "finish_reason": "stop"}
