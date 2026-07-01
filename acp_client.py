@@ -21,6 +21,35 @@ import uuid
 HERMES_BIN = "/Users/xcash/apps/hermes-agent/runtime/venv/bin/hermes"
 
 
+def canonical_telegram_session(home: str):
+    """The session id the TG gateway is CURRENTLY driving for this persona.
+
+    sessions.json is the gateway's own session_key → session_id map, updated
+    every time it rotates (auto-reset / new day). It beats any state.db
+    heuristic: the richest session is often a rotated-OUT one — stale history —
+    and writing the app's turns there means Telegram never sees them.
+    Returns None when the map is missing/empty (caller falls back).
+    """
+    try:
+        with open(os.path.join(home, "sessions", "sessions.json")) as f:
+            data = json.load(f)
+        best = None
+        for key, ent in (data or {}).items():
+            if not isinstance(ent, dict):
+                continue
+            if (ent.get("platform") or "") != "telegram" and ":telegram:" not in key:
+                continue
+            sid = ent.get("session_id")
+            if not sid:
+                continue
+            upd = ent.get("updated_at") or ""          # ISO strings sort lexically
+            if best is None or upd > best[0]:
+                best = (upd, sid)
+        return best[1] if best else None
+    except Exception:
+        return None
+
+
 class ACPSession:
     def __init__(self, home: str):
         self.home = home
@@ -34,6 +63,7 @@ class ACPSession:
         self._start_lock = asyncio.Lock()
         self._loaded_session = False      # True if session came from session/load
         self._proved_alive = False        # True once any turn produced output
+        self._last_canonical_sid = None   # last mapping sid we attempted to load (flap guard)
 
     def is_busy(self) -> bool:
         """True while this persona is already running or queued inside a turn."""
@@ -83,6 +113,7 @@ class ACPSession:
             # projects, people — is present, instead of a blank session/new.
             sid = self._latest_telegram_session()
             if sid:
+                self._last_canonical_sid = sid   # one attempt per sid (flap guard)
                 try:
                     await self._request("session/load",
                                         {"cwd": self.home, "sessionId": sid, "mcpServers": []},
@@ -104,20 +135,23 @@ class ACPSession:
         self._loaded_session = False
 
     def _latest_telegram_session(self):
+        # The gateway's own mapping is authoritative — the state.db heuristics
+        # below are reachable only when sessions.json is missing (fresh home).
+        sid = canonical_telegram_session(self.home)
+        if sid:
+            return sid
         import sqlite3
         db = os.path.join(self.home, "state.db")
         if not os.path.exists(db):
             return None
         try:
             con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=5)
-            # Pick the richest session: prefer the one with the most messages
-            # from any real interaction source (telegram, hermes, acp).
-            # Excludes cron/subagent sessions which are ephemeral task runs,
-            # not the persona's canonical conversation context.
+            # Richest TELEGRAM session. Restricted by source: the old any-source
+            # variant could pick a fat acp/cli session, which is exactly the
+            # wrong place to write the persona's canonical conversation.
             cur = con.execute(
                 "SELECT id FROM sessions "
-                "WHERE message_count > 5 "
-                "  AND source NOT IN ('cron', 'subagent') "
+                "WHERE message_count > 5 AND source = 'telegram' "
                 "ORDER BY message_count DESC LIMIT 1")
             row = cur.fetchone()
             if not row:
@@ -131,6 +165,28 @@ class ACPSession:
             return row[0] if row else None
         except Exception:
             return None
+
+    async def _sync_canonical_session(self):
+        """Re-check the gateway's session mapping at each turn and reload when
+        it moved. The TG gateway rotates its session (auto-reset / new day); a
+        warm ACP process would otherwise keep writing to the rotated-out
+        session forever — the app's turns land where Telegram never looks.
+        One load attempt per new sid (`_last_canonical_sid`): a failed or inert
+        load must not flap between reload and the self-heal below.
+        """
+        sid = canonical_telegram_session(self.home)
+        if not sid or sid == self.session_id or sid == self._last_canonical_sid:
+            return
+        self._last_canonical_sid = sid
+        try:
+            await self._request("session/load",
+                                {"cwd": self.home, "sessionId": sid, "mcpServers": []},
+                                timeout=120)
+            self.session_id = sid
+            self._loaded_session = True
+            self._proved_alive = False       # new load → unproven again
+        except Exception:
+            pass                             # keep the current working session
 
     async def _read_loop(self):
         proc = self.proc
@@ -258,6 +314,7 @@ class ACPSession:
         but no longer respond)."""
         async with self._lock:
             await self.ensure_started()
+            await self._sync_canonical_session()   # gateway rotated? follow it
             yield ("status", {"state": "running", "label": "Hermes 開始處理"})
             produced = 0
             async for item in self._attempt(text):

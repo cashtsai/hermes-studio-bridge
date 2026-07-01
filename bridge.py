@@ -29,7 +29,7 @@ from pathlib import Path
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse, FileResponse
 
-from acp_client import ACPPool
+from acp_client import ACPPool, canonical_telegram_session
 
 # Persistent warm ACP process per persona — removes the ~5s `hermes -z`
 # cold start per message and streams output live. Cold `hermes -z` stays as a
@@ -233,8 +233,14 @@ async def run_hermes(model: str, prompt: str) -> str:
     home = PERSONAS.get(model, (None, HOME_ROOT))[1]
     env = dict(os.environ)
     env["HERMES_HOME"] = home
+    # Cold fallback targets the SAME canonical Telegram session as the warm ACP
+    # path (--resume takes a session id), so a fallback turn still lands where
+    # the TG gateway looks — instead of a private owui-<persona> session the
+    # phone/TG never see. Only without a mapping do we keep the old behaviour.
+    sid = canonical_telegram_session(home)
+    cont = ["--resume", sid] if sid else ["--continue", session_name(model)]
     proc = await asyncio.create_subprocess_exec(
-        HERMES_BIN, "-z", prompt, "--continue", session_name(model),
+        HERMES_BIN, "-z", prompt, *cont,
         env=env,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
