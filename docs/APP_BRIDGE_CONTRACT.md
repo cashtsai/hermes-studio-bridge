@@ -135,6 +135,9 @@ Rules:
 - Unknown `session` returns `400`.
 - `dry_run` must not write canonical user or assistant messages.
 - Normal successful turns should persist the user message and assistant reply.
+- The stream may include additive top-level `status` metadata chunks, for
+  example `accepted`, `queued`, `running`, or `replayed`; clients should use
+  them for delivery/working UI and must not persist them as assistant text.
 - The stream ends with `data: [DONE]`.
 
 ### `GET /app/v1/approvals`
