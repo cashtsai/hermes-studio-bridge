@@ -3058,6 +3058,152 @@ async def cc_session_history(name: str, request: Request, offset: int = 0, limit
     return {"text": _cc_format_lines(lines[start:end]), "more": start > 0}
 
 
+# ---- CC history (S1, pocketagent#37): browse ALL past sessions & resume ----
+# ~/.claude/projects/<slug>/<session-uuid>.jsonl is Claude Code's own store —
+# one file per session, the true `cwd` recorded inside (no lossy slug
+# reversal). We surface them read-only, and resume by spawning
+# `claude --resume <id>` in a fresh tmux session registered in CCSESS_CONF —
+# it then IS a normal live ccsession, so the app's existing live view / send /
+# interrupt / status all apply unchanged.
+
+CC_PROJECTS_DIR = os.path.expanduser("~/.claude/projects")
+_cchist_meta_cache: dict = {}   # path -> (mtime, meta); title needs a file read
+
+
+def _cchist_meta(path: str):
+    try:
+        mtime = os.path.getmtime(path)
+    except Exception:  # noqa: BLE001
+        return None
+    cached = _cchist_meta_cache.get(path)
+    if cached and cached[0] == mtime:
+        return cached[1]
+    sid = os.path.basename(path)[:-len(".jsonl")]
+    title, cwd, events = "", "", 0
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                events += 1
+                if title and cwd:
+                    continue
+                try:
+                    d = json.loads(line)
+                except Exception:  # noqa: BLE001
+                    continue
+                if not cwd and d.get("cwd"):
+                    cwd = d["cwd"]
+                if not title and d.get("type") == "user":
+                    c = (d.get("message") or {}).get("content")
+                    if isinstance(c, list):
+                        c = next((x.get("text") for x in c
+                                  if isinstance(x, dict) and x.get("type") == "text"), "")
+                    if isinstance(c, str):
+                        t = c.strip()
+                        # skip harness noise (<local-command…>, Caveat banners)
+                        if t and not t.startswith("<") and not t.startswith("Caveat:"):
+                            title = t[:120]
+    except Exception:  # noqa: BLE001
+        return None
+    meta = {"id": sid, "title": title or "(無標題)", "cwd": cwd,
+            "project": os.path.basename(os.path.dirname(path)),
+            "last_at": mtime, "events": events}
+    _cchist_meta_cache[path] = (mtime, meta)
+    return meta
+
+
+def _cchist_find(sid: str):
+    """jsonl path for a session id — id is validated so it can't traverse."""
+    if not re.fullmatch(r"[0-9a-fA-F-]{8,64}", sid or ""):
+        return None
+    hits = glob.glob(os.path.join(CC_PROJECTS_DIR, "*", sid + ".jsonl"))
+    return hits[0] if hits else None
+
+
+@app.get("/cchistory")
+async def cc_history_list(request: Request, limit: int = 50, offset: int = 0, q: str = ""):
+    """All past Claude Code sessions across every project, newest first.
+    `q` filters on title/project. Metas are cached by (path, mtime)."""
+    _check_auth(request)
+    files = glob.glob(os.path.join(CC_PROJECTS_DIR, "*", "*.jsonl"))
+
+    def _mt(p):
+        try:
+            return os.path.getmtime(p)
+        except Exception:  # noqa: BLE001
+            return 0.0
+    files.sort(key=_mt, reverse=True)
+    needle = (q or "").strip().lower()
+    out = []
+    for p in files:
+        m = _cchist_meta(p)
+        if not m:
+            continue
+        if needle and needle not in m["title"].lower() and needle not in m["project"].lower():
+            continue
+        out.append(m)
+    lim = max(1, min(limit, 200))
+    page = out[max(0, offset): max(0, offset) + lim]
+    return {"sessions": page, "total": len(out), "more": max(0, offset) + len(page) < len(out)}
+
+
+@app.get("/cchistory/{sid}/transcript")
+async def cc_history_transcript(sid: str, request: Request, limit: int = 200):
+    """Read-only tail of a past session, in the SAME transcript text format as
+    the live view (**🧑 你:** markers) so the app renders it with zero new code."""
+    _check_auth(request)
+    path = _cchist_find(sid)
+    if not path:
+        raise HTTPException(status_code=404, detail="unknown history session")
+    try:
+        lines = open(path, encoding="utf-8", errors="replace").read().splitlines()
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=str(e)[:200])
+    take = lines[-max(1, min(limit, 1000)):]
+    meta = _cchist_meta(path) or {}
+    return {"text": _cc_format_lines(take), "more": len(lines) > len(take),
+            "cwd": meta.get("cwd", ""), "title": meta.get("title", "")}
+
+
+@app.post("/cchistory/{sid}/resume")
+async def cc_history_resume(sid: str, request: Request):
+    """Resume a past session: `claude --resume <id>` in a new tmux session at
+    the session's own cwd, registered in CCSESS_CONF → it becomes a normal live
+    ccsession the app can talk to immediately. Returns its name."""
+    _check_auth(request)
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        body = {}
+    path = _cchist_find(sid)
+    if not path:
+        raise HTTPException(status_code=404, detail="unknown history session")
+    meta = _cchist_meta(path) or {}
+    cwd = meta.get("cwd") or ""
+    if not cwd or not os.path.isdir(cwd):
+        raise HTTPException(status_code=409, detail=f"workdir missing: {cwd or '(none)'}")
+    # Unique tmux/conf name (user-suggested or cc-<id8>), never clobbering.
+    base = re.sub(r"[^A-Za-z0-9_-]", "-", (body.get("name") or "").strip()) or f"cc-{sid[:8]}"
+    existing = {r[0] for r in _cc_conf_rows()}
+    name, i = base, 2
+    while name in existing or await _tmux_alive(name):
+        name, i = f"{base}-{i}", i + 1
+    p = await asyncio.create_subprocess_exec(
+        TMUX_BIN, "new-session", "-d", "-s", name, "-c", cwd,
+        CLAUDE_BIN, "--resume", sid,
+        stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE)
+    _, err = await p.communicate()
+    if p.returncode != 0:
+        raise HTTPException(status_code=502,
+                            detail=(err or b"tmux new-session failed").decode("utf-8", "replace")[:200])
+    try:
+        with open(CCSESS_CONF, "a") as f:
+            f.write(f"{name}|{cwd}|1\n")
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"registered tmux but conf write failed: {e}")
+    _log_event("cc_history_resume", session_id=sid, name=name, cwd=cwd)
+    return {"ok": True, "name": name, "cwd": cwd}
+
+
 @app.post("/ccsessions/{name}/input")
 async def cc_session_input(name: str, request: Request):
     """Type a line into the live Claude Code session (tmux send-keys), exactly
