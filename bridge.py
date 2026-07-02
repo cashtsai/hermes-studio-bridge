@@ -48,6 +48,14 @@ _BG_TASKS: set = set()
 # 2s / 4s / 10s across chat, ccsessions and codexsessions for no reason).
 SSE_KEEPALIVE_SECS = 2.0
 
+# In-flight app-turn dedup (issue #9): (session, client_id) -> {ts, task, state}.
+# A duplicate POST with the same client_id while the first run is STILL RUNNING
+# attaches to it instead of re-running the turn (side effects must not replay).
+# Entries expire after 600s; cleanup happens on each access so the dict can't leak.
+_APP_TURN_INFLIGHT: dict = {}
+_APP_TURN_INFLIGHT_TTL = 600.0
+_APP_TURN_INFLIGHT_LOCK = asyncio.Lock()
+
 # Bearer token gate. The bridge fronts a tool-executing agent, so it must not
 # be an open control surface even on the tailnet. Open WebUI sends this as its
 # OpenAI API key. Override via the BRIDGE_TOKEN env var.
@@ -895,6 +903,21 @@ def _canon_add(session: str, role: str, content: str, attachments=None,
                    attachment_count=len(attachments or []),
                    error=type(e).__name__, error_message=str(e)[:160])
     return mid, False
+
+
+def _canon_add_retry(session: str, role: str, content: str, attachments=None,
+                     mid: str | None = None, status: str = "done",
+                     client_id: str | None = None) -> tuple[str, bool]:
+    """_canon_add + one retry (issue #9): a dropped canonical write makes the
+    turn invisible to replay/idempotency, so it's worth a second attempt."""
+    mid, ok = _canon_add(session, role, content, attachments, mid=mid,
+                         status=status, client_id=client_id)
+    if not ok:
+        _log_event("canonical_write_retry", session=session, role=role,
+                   client_id_hash=_short_hash(client_id))
+        mid, ok = _canon_add(session, role, content, attachments, mid=mid,
+                             status=status, client_id=client_id)
+    return mid, ok
 
 
 def _canon_reply_for_client(session: str, client_id: str):
@@ -4569,6 +4592,60 @@ async def app_post_message(request: Request):
                                canonical_user_ok=None, canonical_reply_ok=True)
             return StreamingResponse(replay_agen(), media_type="text/event-stream")
 
+    # In-flight idempotency (issue #9): the canonical replay above only covers
+    # turns that already FINISHED. A duplicate POST while the first run is still
+    # going must not start a second run — it attaches to the in-flight one.
+    inflight_key = (session, client_id) if client_id else None
+    inflight_entry = None
+    attached = None
+    if not dry_run and inflight_key:
+        async with _APP_TURN_INFLIGHT_LOCK:
+            _now = time.monotonic()
+            for k in [k for k, e in _APP_TURN_INFLIGHT.items()
+                      if _now - e["ts"] > _APP_TURN_INFLIGHT_TTL]:
+                _APP_TURN_INFLIGHT.pop(k, None)   # TTL cleanup on each access
+            attached = _APP_TURN_INFLIGHT.get(inflight_key)
+            if attached is None:
+                inflight_entry = {"ts": _now, "task": None, "state": None}
+                _APP_TURN_INFLIGHT[inflight_key] = inflight_entry
+
+    if attached is not None:
+        _log_event("app_turn_attach", **common_log)
+
+        async def attach_agen():
+            done_sent = False
+            acc = ""
+            try:
+                yield chunk({"role": "assistant", "content": ""})
+                yield status_chunk("attached", "同一則訊息已在處理中，附掛原回合等待結果。")
+                t0 = time.monotonic()
+                while True:
+                    _task = attached.get("task")
+                    if _task is not None and _task.done():
+                        break
+                    if _task is None and time.monotonic() - t0 > 30:
+                        break   # original request died before starting its turn
+                    if time.monotonic() - t0 > _APP_TURN_INFLIGHT_TTL:
+                        break
+                    await asyncio.sleep(SSE_KEEPALIVE_SECS)
+                    yield ": keepalive\n\n"
+                st = attached.get("state") or {}
+                acc = st.get("acc") or ""
+                yield chunk({"content": acc or "(原回合沒有產出回覆)"})
+                payload = {"id": cid, "object": "chat.completion.chunk", "created": created,
+                           "model": session, "replayed": True,
+                           "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
+                yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+                yield "data: [DONE]\n\n"
+                done_sent = True
+            finally:
+                _log_event("app_turn_stream_done", **common_log,
+                           replayed=True, attached=True, output_chars=len(acc),
+                           done_sent=done_sent,
+                           duration_ms=int((time.monotonic() - turn_started) * 1000),
+                           canonical_user_ok=None, canonical_reply_ok=None)
+        return StreamingResponse(attach_agen(), media_type="text/event-stream")
+
     if dry_run:
         async def dry_agen():
             done_sent = False
@@ -4621,55 +4698,62 @@ async def app_post_message(request: Request):
                 for a in attachments]
     # Record the transcript as the canonical text (so other devices see what was
     # said even without the audio bytes), tagged so the app can show 🎤.
-    _user_mid, canonical_user_ok = _canon_add(session, "user", content, att_meta, client_id=client_id)
+    _user_mid, canonical_user_ok = _canon_add_retry(session, "user", content, att_meta,
+                                                    client_id=client_id)
+
+    q: asyncio.Queue = asyncio.Queue()
+    state = {"acc": "", "usage": None, "content_chunks": 0, "keepalives": 0,
+             "runner_error": "", "stream_error": "", "canonical_reply_ok": None,
+             "done_sent": False}
+
+    async def run_turn():
+        # Drains the persona turn to completion INDEPENDENTLY of the client
+        # connection. If the app's network drops mid-stream this task keeps
+        # going and records the reply, so the canonical store always reflects
+        # what actually happened server-side (the tool ran, the calendar was
+        # created) — a reload then shows the real reply instead of losing it.
+        try:
+            async for k, v in _persona_content_stream(session, prompt):
+                if k == "content":
+                    state["acc"] += v
+                    state["content_chunks"] += 1
+                elif k == "usage":
+                    state["usage"] = v
+                elif k == "status":
+                    pass
+                await q.put((k, v))
+        except Exception as e:  # noqa: BLE001
+            state["runner_error"] = f"{type(e).__name__}: {str(e)[:180]}"
+            await q.put(("error", str(e)))
+        finally:
+            if state["acc"]:
+                _reply_mid, reply_ok = _canon_add_retry(session, "assistant", state["acc"],
+                                                        client_id=client_id)
+                state["canonical_reply_ok"] = reply_ok
+            _log_event("app_turn_background_done", **common_log,
+                       output_chars=len(state["acc"]),
+                       content_chunks=state["content_chunks"],
+                       usage_used=(state["usage"] or {}).get("used"),
+                       usage_size=(state["usage"] or {}).get("size"),
+                       canonical_user_ok=canonical_user_ok,
+                       canonical_reply_ok=state["canonical_reply_ok"],
+                       runner_error=state["runner_error"] or None,
+                       duration_ms=int((time.monotonic() - turn_started) * 1000))
+            await q.put((None, None))
+
+    _log_event("app_turn_model_start", **common_log,
+               prompt_chars=len(prompt), canonical_user_ok=canonical_user_ok)
+    # The turn runs as a handler-scope task (not inside the generator) so a
+    # duplicate POST can attach to it via _APP_TURN_INFLIGHT before the client
+    # even starts reading this response.
+    task = asyncio.create_task(run_turn())
+    _BG_TASKS.add(task)
+    task.add_done_callback(_BG_TASKS.discard)
+    if inflight_entry is not None:
+        inflight_entry["task"] = task
+        inflight_entry["state"] = state
 
     async def agen():
-        _log_event("app_turn_model_start", **common_log,
-                   prompt_chars=len(prompt), canonical_user_ok=canonical_user_ok)
-        q: asyncio.Queue = asyncio.Queue()
-        state = {"acc": "", "usage": None, "content_chunks": 0, "keepalives": 0,
-                 "runner_error": "", "stream_error": "", "canonical_reply_ok": None,
-                 "done_sent": False}
-
-        async def run_turn():
-            # Drains the persona turn to completion INDEPENDENTLY of the client
-            # connection. If the app's network drops mid-stream this task keeps
-            # going and records the reply, so the canonical store always reflects
-            # what actually happened server-side (the tool ran, the calendar was
-            # created) — a reload then shows the real reply instead of losing it.
-            try:
-                async for k, v in _persona_content_stream(session, prompt):
-                    if k == "content":
-                        state["acc"] += v
-                        state["content_chunks"] += 1
-                    elif k == "usage":
-                        state["usage"] = v
-                    elif k == "status":
-                        pass
-                    await q.put((k, v))
-            except Exception as e:  # noqa: BLE001
-                state["runner_error"] = f"{type(e).__name__}: {str(e)[:180]}"
-                await q.put(("error", str(e)))
-            finally:
-                if state["acc"]:
-                    _reply_mid, reply_ok = _canon_add(session, "assistant", state["acc"],
-                                                      client_id=client_id)
-                    state["canonical_reply_ok"] = reply_ok
-                _log_event("app_turn_background_done", **common_log,
-                           output_chars=len(state["acc"]),
-                           content_chunks=state["content_chunks"],
-                           usage_used=(state["usage"] or {}).get("used"),
-                           usage_size=(state["usage"] or {}).get("size"),
-                           canonical_user_ok=canonical_user_ok,
-                           canonical_reply_ok=state["canonical_reply_ok"],
-                           runner_error=state["runner_error"] or None,
-                           duration_ms=int((time.monotonic() - turn_started) * 1000))
-                await q.put((None, None))
-
-        task = asyncio.create_task(run_turn())
-        _BG_TASKS.add(task)
-        task.add_done_callback(_BG_TASKS.discard)
-
         try:
             yield chunk({"role": "assistant", "content": ""})
             if queued_at_accept:
