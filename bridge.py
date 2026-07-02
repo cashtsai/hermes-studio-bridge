@@ -3353,25 +3353,52 @@ async def _cc_paste_text(name: str, text: str) -> None:
         raise HTTPException(status_code=502, detail=detail)
 
 
+async def _cc_capture_pane_fresh(name: str) -> str:
+    """Capture the tmux pane RIGHT NOW (no cache) — used where staleness would
+    lie, e.g. verifying an interrupt actually landed."""
+    p = await asyncio.create_subprocess_exec(
+        TMUX_BIN, "capture-pane", "-p", "-t", name,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+    out, _ = await p.communicate()
+    return (out or b"").decode("utf-8", "replace")
+
+
+def _cc_pane_busy(pane: str) -> bool:
+    return bool(_CC_BUSY_RE.search(pane)) or ("esc to interrupt" in pane.lower())
+
+
 # CC interrupt + busy status (parity with Codex's stop/active). The app uses
 # these to offer a stop button and to detect a running turn reliably instead of
 # guessing from stream silence (which mis-fires on long, quiet commands).
 @app.post("/ccsessions/{name}/interrupt")
 async def cc_session_interrupt(name: str, request: Request):
-    """Send Escape to the live TUI — same as pressing Esc to interrupt."""
+    """Send Escape to the live TUI — same as pressing Esc to interrupt — then
+    VERIFY via the pane's busy spinner that the turn actually stopped, retrying
+    up to 3 Escapes. Previously this blind-fired one Escape and returned ok,
+    so the app's stop button could 200 six times while the turn kept running."""
     _check_auth(request)
     if not any(r[0] == name for r in _cc_conf_rows()):
         raise HTTPException(status_code=404, detail="unknown session")
     if not await _tmux_alive(name):
         raise HTTPException(status_code=409, detail="session not running")
-    p = await asyncio.create_subprocess_exec(
-        TMUX_BIN, "send-keys", "-t", name, "Escape",
-        stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE)
-    _, err = await p.communicate()
-    if p.returncode:
-        raise HTTPException(status_code=502,
-            detail=(err or b"").decode("utf-8", "replace")[:200] or "interrupt failed")
-    return {"ok": True}
+    attempts = 0
+    interrupted = False
+    for _ in range(3):
+        attempts += 1
+        p = await asyncio.create_subprocess_exec(
+            TMUX_BIN, "send-keys", "-t", name, "Escape",
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE)
+        _, err = await p.communicate()
+        if p.returncode:
+            raise HTTPException(status_code=502,
+                detail=(err or b"").decode("utf-8", "replace")[:200] or "interrupt failed")
+        await asyncio.sleep(0.7)                 # let the TUI react before checking
+        pane = await _cc_capture_pane_fresh(name)
+        if not _cc_pane_busy(pane):
+            interrupted = True
+            break
+    _log_event("cc_interrupt", session=name, interrupted=interrupted, attempts=attempts)
+    return {"ok": True, "interrupted": interrupted, "attempts": attempts}
 
 
 # Claude Code's TUI shows a working spinner like "· Fermenting… (1m 51s · ↓ 6.5k
@@ -4465,8 +4492,21 @@ async def app_message_interrupt(request: Request):
     acp_session = await POOL.get(session, home_for(session))
     if not acp_session.is_busy():
         raise HTTPException(status_code=409, detail="no active turn")
-    await acp_session.cancel()
-    return {"ok": True, "session": session}
+    # Same verify-and-retry contract as /ccsessions/{name}/interrupt: don't
+    # report ok on a cancel that didn't land — check busy and retry up to 3×.
+    attempts = 0
+    interrupted = False
+    for _ in range(3):
+        attempts += 1
+        await acp_session.cancel()
+        await asyncio.sleep(0.7)
+        if not acp_session.is_busy():
+            interrupted = True
+            break
+    _log_event("persona_interrupt", session=session,
+               interrupted=interrupted, attempts=attempts)
+    return {"ok": True, "session": session,
+            "interrupted": interrupted, "attempts": attempts}
 
 
 # ───────────────────────── Approval Center (M21) ───────────────────────────
