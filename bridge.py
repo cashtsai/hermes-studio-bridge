@@ -328,7 +328,9 @@ def _save_data_uri(data_uri: str, filename: str = "") -> str | None:
     mime, b64 = m.group(1), m.group(2)
     try:
         raw = base64.b64decode(b64)
-    except Exception:  # noqa: BLE001
+    except Exception as e:  # noqa: BLE001
+        _log_event("save_data_uri_failed", stage="b64decode", mime=mime,
+                   filename=(filename or "")[:80], error=type(e).__name__)
         return None
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
     safe = re.sub(r"[^\w.\-]", "_", os.path.basename(filename or "")) or "file"
@@ -337,7 +339,10 @@ def _save_data_uri(data_uri: str, filename: str = "") -> str | None:
     path = UPLOAD_DIR / f"{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}-{safe}"
     try:
         path.write_bytes(raw)
-    except Exception:  # noqa: BLE001
+    except Exception as e:  # noqa: BLE001
+        _log_event("save_data_uri_failed", stage="write", mime=mime,
+                   path=str(path), bytes=len(raw),
+                   error=type(e).__name__, error_message=str(e)[:160])
         return None
     return str(path)
 
@@ -448,7 +453,9 @@ async def _describe_image(path: str) -> str:
             *argv, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
         out, _ = await asyncio.wait_for(proc.communicate(), timeout=90)
         return (out or b"").decode("utf-8", "replace").strip()
-    except Exception:  # noqa: BLE001
+    except Exception as e:  # noqa: BLE001
+        _log_event("describe_image_failed", path=path,
+                   error=type(e).__name__, error_message=str(e)[:160])
         if proc:
             try:
                 proc.kill()
@@ -490,7 +497,11 @@ REPORT_CONTEXT_ITEM_CHARS = 5000
 def _canon_init():
     import sqlite3
     os.makedirs(os.path.dirname(CANON_DB), exist_ok=True)
-    con = sqlite3.connect(CANON_DB)
+    con = sqlite3.connect(CANON_DB, timeout=30)
+    # WAL: concurrent handlers no longer serialize writers against readers;
+    # busy_timeout waits out short lock contention instead of erroring.
+    con.execute("PRAGMA journal_mode=WAL")
+    con.execute("PRAGMA busy_timeout=30000")
     con.execute("""CREATE TABLE IF NOT EXISTS messages(
         id TEXT PRIMARY KEY, session TEXT NOT NULL, role TEXT NOT NULL,
         content TEXT, attachments TEXT, created_at REAL NOT NULL, status TEXT)""")
@@ -566,7 +577,7 @@ ACCOUNT_DEVICE_COLUMNS = (
 def _accounts_init():
     import sqlite3
     os.makedirs(os.path.dirname(ACCOUNTS_DB), exist_ok=True)
-    con = sqlite3.connect(ACCOUNTS_DB, timeout=10)
+    con = sqlite3.connect(ACCOUNTS_DB, timeout=30)
     con.execute("PRAGMA foreign_keys=ON")
     con.execute("""CREATE TABLE IF NOT EXISTS users(
         apple_user_id TEXT PRIMARY KEY,
@@ -631,7 +642,7 @@ def _account_upsert_user(apple_user_id: str, email: str | None = None,
                          display_name: str | None = None):
     import sqlite3
     now = time.time()
-    con = sqlite3.connect(ACCOUNTS_DB, timeout=10)
+    con = sqlite3.connect(ACCOUNTS_DB, timeout=30)
     con.execute(
         """INSERT INTO users(apple_user_id,email,display_name,created_at,last_seen_at)
            VALUES(?,?,?,?,?)
@@ -652,7 +663,7 @@ def _account_get_user(apple_user_id: str, touch: bool = False):
     import sqlite3
     if not apple_user_id:
         return None
-    con = sqlite3.connect(ACCOUNTS_DB, timeout=10)
+    con = sqlite3.connect(ACCOUNTS_DB, timeout=30)
     if touch:
         con.execute("UPDATE users SET last_seen_at=? WHERE apple_user_id=?",
                     (time.time(), apple_user_id))
@@ -686,7 +697,7 @@ def _account_device_put(apple_user_id: str, device_token: str, platform: str = "
     import sqlite3
     now = time.time()
     device_id = device_id or "dev-" + uuid.uuid4().hex
-    con = sqlite3.connect(ACCOUNTS_DB, timeout=10)
+    con = sqlite3.connect(ACCOUNTS_DB, timeout=30)
     con.execute("PRAGMA foreign_keys=ON")
     con.execute(
         """INSERT INTO devices(device_id,apple_user_id,device_token,platform,label,
@@ -713,7 +724,7 @@ def _account_device_for_token(device_token: str, touch: bool = True):
     if not device_token:
         return None
     try:
-        con = sqlite3.connect(ACCOUNTS_DB, timeout=10)
+        con = sqlite3.connect(ACCOUNTS_DB, timeout=30)
         row = con.execute(
             f"SELECT {','.join(ACCOUNT_DEVICE_COLUMNS)} FROM devices "
             "WHERE device_token=? AND revoked=0",
@@ -743,7 +754,7 @@ def _account_device_by_id(apple_user_id: str, device_id: str):
 
 def _account_device_revoke(apple_user_id: str, device_id: str):
     import sqlite3
-    con = sqlite3.connect(ACCOUNTS_DB, timeout=10)
+    con = sqlite3.connect(ACCOUNTS_DB, timeout=30)
     cur = con.execute(
         "UPDATE devices SET revoked=1, last_seen_at=? "
         "WHERE apple_user_id=? AND device_id=? AND revoked=0",
@@ -1119,7 +1130,7 @@ def _delegation_get(delegation_id: str):
 
 def _delegation_insert(row: dict) -> None:
     import sqlite3
-    con = sqlite3.connect(CANON_DB, timeout=10)
+    con = sqlite3.connect(CANON_DB, timeout=30)
     con.execute("""INSERT INTO delegations
         (id, work_order, parent_persona, parent_session, created_via, provider,
          title, objective, cwd, status, provider_session_id, codex_thread_id,
@@ -1154,7 +1165,7 @@ def _delegation_update(delegation_id: str, **fields) -> None:
     if not sets:
         return
     args.append(delegation_id)
-    con = sqlite3.connect(CANON_DB, timeout=10)
+    con = sqlite3.connect(CANON_DB, timeout=30)
     con.execute(f"UPDATE delegations SET {', '.join(sets)} WHERE id=?", args)
     con.commit()
     con.close()
@@ -1246,7 +1257,7 @@ def _report_upsert(session: str, report: dict) -> str:
     ts = float(report.get("ts") or time.time())
     label = report.get("label") or ""
     name = report.get("name") or ""
-    con = sqlite3.connect(CANON_DB, timeout=10)
+    con = sqlite3.connect(CANON_DB, timeout=30)
     existing = con.execute(
         "SELECT label,name,content,ts,external_id FROM report_events WHERE id=?",
         (rid,)).fetchone()
@@ -1710,7 +1721,10 @@ class CodexAppServerClient:
                     break
                 try:
                     msg = json.loads(raw.decode("utf-8", "replace"))
-                except Exception:  # noqa: BLE001
+                except Exception as e:  # noqa: BLE001
+                    _log_event("codex_app_server_bad_json",
+                               error=type(e).__name__,
+                               line=raw.decode("utf-8", "replace")[:160])
                     continue
                 if "id" in msg:
                     fut = self._pending.pop(msg.get("id"), None)
@@ -2037,6 +2051,9 @@ async def _codex_input_items(text: str, attachments: list) -> list:
 
 
 def _codex_http_error(e: Exception):
+    _log_event("codex_provider_error", error=type(e).__name__,
+               error_message=str(e)[:200],
+               code=getattr(e, "code", None))
     if isinstance(e, (asyncio.TimeoutError, TimeoutError)):
         raise http_err(504, "PROVIDER_TIMEOUT", "codex app-server timeout", str(e))
     if isinstance(e, CodexAppServerError):
@@ -2581,24 +2598,54 @@ def _claude_argv(parent: str, prompt: str, resume: str | None = None):
     return argv
 
 
+# A follow stream that has sent ZERO data (keepalives don't count) for this
+# long gets disconnected — a client that hangs without reading otherwise pins
+# the generator forever.
+_STREAM_IDLE_CUTOFF_SECS = 1800.0
+
+# A sub-agent that produces NOTHING on stdout for this long is stalled: kill it
+# so its _BG_TASKS entry finishes instead of leaking a forever-pending task.
+_AGENT_STALL_SECS = 1800.0
+
+
 async def _stream_agent(sid: str, argv: list, cwd: str, fail_label: str):
     """Run a sub-agent subprocess, append its transcript to the sub's output
     buffer, capture the Claude Code session id (for later --resume), and mark
     the sub done when it exits."""
     sub = SUBSESSIONS[sid]
     out = sub["output"]
+    proc = None
     try:
         proc = await asyncio.create_subprocess_exec(
             *argv, cwd=cwd, stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL)
         sub["proc"] = proc
-        async for raw in proc.stdout:
+        while True:
+            # No-progress watchdog: a wedged provider (network black-hole, dead
+            # MCP…) otherwise streams nothing forever.
+            try:
+                raw = await asyncio.wait_for(proc.stdout.readline(),
+                                             timeout=_AGENT_STALL_SECS)
+            except asyncio.TimeoutError:
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+                sub["status"] = "stalled"
+                out.append(("text", "\n⚠️ (超過 30 分鐘無輸出,已強制中止子代理行程)"))
+                _log_event("subagent_stalled", sid=sid, cwd=cwd,
+                           tool=sub.get("tool"))
+                break
+            if not raw:
+                break
             line = raw.decode("utf-8", "replace").strip()
             if not line:
                 continue
             try:
                 ev = json.loads(line)
-            except Exception:
+            except Exception as e:  # noqa: BLE001
+                _log_event("subagent_bad_json", sid=sid,
+                           error=type(e).__name__, line=line[:160])
                 continue
             sess = ev.get("session_id") if isinstance(ev, dict) else None
             if sess:
@@ -2609,9 +2656,15 @@ async def _stream_agent(sid: str, argv: list, cwd: str, fail_label: str):
         await proc.wait()
     except Exception as e:                                  # noqa: BLE001
         out.append(("text", f"\n⚠️ {fail_label}:{e}"))
+        _log_event("subagent_stream_failed", sid=sid,
+                   error=type(e).__name__, error_message=str(e)[:160])
     finally:
-        sub["status"] = "done"
+        if sub.get("status") != "stalled":
+            sub["status"] = "done"
         sub["lastAt"] = time.time()
+        # Isolated dispatch: reclaim the worktree if the agent left it clean.
+        if sub.get("worktree"):
+            await _cleanup_worktree(sid, sub)
         # M23: push when a dispatched CC/Codex task finishes, so the app surfaces
         # it even when backgrounded (Telegram is the fallback now, not the primary
         # signal). Fire-and-forget; failures are swallowed inside push_notify.
@@ -2630,6 +2683,7 @@ async def _run_dispatch(sid: str, tool: str, task: str, cwd: str, isolate: bool 
         if wt != cwd:
             run_cwd = wt
             sub["worktree"] = wt
+            sub["base_cwd"] = cwd   # fall back here if the worktree is reclaimed
             sub["cwd"] = wt   # follow-ups stay in the same isolated tree
             sub["output"].append(("text", f"_(隔離工作區 worktree:`{wt}` · 分支 `pocket/{sid}`)_\n\n"))
     if tool == "codex":
@@ -2764,6 +2818,31 @@ async def persona_messages(persona: str, request: Request, limit: int = 100):
 CCSESS_CONF = os.path.expanduser("~/.config/ccsess/sessions.conf")
 TMUX_BIN = "/opt/homebrew/bin/tmux" if os.path.exists("/opt/homebrew/bin/tmux") else "tmux"
 
+# Hard ceiling for any single tmux invocation. tmux normally answers in ms; a
+# hung tmux server used to hang the handler (and its _BG_TASKS entry) forever.
+_TMUX_TIMEOUT = 15.0
+
+
+async def _tmux_run(*args, timeout: float = _TMUX_TIMEOUT):
+    """Run one tmux command with a kill-on-timeout guard.
+    Returns (rc, stdout_str, stderr_str); rc=124 on timeout."""
+    p = await asyncio.create_subprocess_exec(
+        TMUX_BIN, *args,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+    try:
+        out, err = await asyncio.wait_for(p.communicate(), timeout)
+    except asyncio.TimeoutError:
+        try:
+            p.kill()
+        except ProcessLookupError:
+            pass
+        _log_event("tmux_timeout", args=" ".join(str(a) for a in args[:4]),
+                   timeout_s=timeout)
+        return 124, "", "tmux timed out"
+    return (p.returncode,
+            (out or b"").decode("utf-8", "replace"),
+            (err or b"").decode("utf-8", "replace").strip())
+
 
 def _cc_project_dir(workdir: str) -> str:
     return os.path.expanduser("~/.claude/projects/" + workdir.replace("/", "-"))
@@ -2792,10 +2871,8 @@ def _cc_conf_rows():
 
 async def _tmux_alive(name: str) -> bool:
     try:
-        p = await asyncio.create_subprocess_exec(
-            TMUX_BIN, "has-session", "-t", name,
-            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
-        return (await p.wait()) == 0
+        rc, _, _ = await _tmux_run("has-session", "-t", name)
+        return rc == 0
     except Exception:  # noqa: BLE001
         return False
 
@@ -2825,11 +2902,7 @@ async def _cc_sessions():
             # Mid-turn? Capture the pane and look for the working spinner — so the
             # home list can animate a running CC session (parity with Codex).
             try:
-                p = await asyncio.create_subprocess_exec(
-                    TMUX_BIN, "capture-pane", "-p", "-t", name,
-                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
-                paneb, _ = await p.communicate()
-                pane = (paneb or b"").decode("utf-8", "replace")
+                _, pane, _ = await _tmux_run("capture-pane", "-p", "-t", name)
                 busy = bool(_CC_BUSY_RE.search(pane)) or ("esc to interrupt" in pane.lower())
                 # Parked on a permission / approval prompt → the home list flags it
                 # ("待放行") so a session waiting on you is never invisible.
@@ -2966,7 +3039,15 @@ async def _run_ccsess(*args):
     p = await asyncio.create_subprocess_exec(
         os.path.expanduser("~/.local/bin/ccsess"), *args,
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-    out, err = await p.communicate()
+    try:
+        out, err = await asyncio.wait_for(p.communicate(), 30)
+    except asyncio.TimeoutError:
+        try:
+            p.kill()
+        except ProcessLookupError:
+            pass
+        _log_event("ccsess_timeout", args=" ".join(str(a) for a in args[:3]))
+        raise http_err(502, "TMUX_FAILED", "ccsess timed out", "ccsess timed out (30s)")
     if p.returncode != 0:
         detail = (err or out or b"ccsess failed").decode("utf-8", "replace")[:300]
         raise http_err(502, "TMUX_FAILED", "ccsess failed", detail)
@@ -3019,11 +3100,8 @@ async def _cc_wait_ready(name: str, timeout: float = 12.0):
     deadline = asyncio.get_event_loop().time() + timeout
     while asyncio.get_event_loop().time() < deadline:
         if await _tmux_alive(name):
-            p = await asyncio.create_subprocess_exec(
-                TMUX_BIN, "capture-pane", "-p", "-t", name,
-                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
-            out, _ = await p.communicate()
-            pane = (out or b"").decode("utf-8", "replace").lower()
+            _, pane, _ = await _tmux_run("capture-pane", "-p", "-t", name)
+            pane = pane.lower()
             if "for shortcuts" in pane or "esc to interrupt" in pane or "❯" in pane:
                 return True
         await asyncio.sleep(0.6)
@@ -3102,8 +3180,16 @@ async def cc_session_stream(name: str, request: Request, replay: int = 80):
             pos = os.path.getsize(jsonl)
         # follow
         idle = 0
+        last_data = time.monotonic()
         while True:
             if await request.is_disconnected():
+                break
+            if time.monotonic() - last_data >= _STREAM_IDLE_CUTOFF_SECS:
+                # 30min without a single data chunk → cut the stream cleanly
+                # (keepalive comments don't count as data).
+                _log_event("cc_stream_idle_cutoff", session=name)
+                yield chunk({}, finish="stop")
+                yield "data: [DONE]\n\n"
                 break
             await asyncio.sleep(1.0)
             cur = _cc_latest_jsonl(workdir)
@@ -3125,6 +3211,7 @@ async def cc_session_stream(name: str, request: Request, replay: int = 80):
                             continue
                         if c:
                             yield chunk({"content": c})
+                            last_data = time.monotonic()
                     idle = 0
             idle += 1
             if idle >= 4:                         # ~4s quiet → keepalive comment.
@@ -3301,14 +3388,11 @@ async def cc_history_resume(sid: str, request: Request):
     name, i = base, 2
     while name in existing or await _tmux_alive(name):
         name, i = f"{base}-{i}", i + 1
-    p = await asyncio.create_subprocess_exec(
-        TMUX_BIN, "new-session", "-d", "-s", name, "-c", cwd,
-        CLAUDE_BIN, "--resume", sid,
-        stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE)
-    _, err = await p.communicate()
-    if p.returncode != 0:
+    rc, _, err = await _tmux_run("new-session", "-d", "-s", name, "-c", cwd,
+                                 CLAUDE_BIN, "--resume", sid)
+    if rc != 0:
         raise http_err(502, "TMUX_FAILED", "tmux new-session failed",
-                       (err or b"tmux new-session failed").decode("utf-8", "replace")[:200])
+                       (err or "tmux new-session failed")[:200])
     try:
         with open(CCSESS_CONF, "a") as f:
             f.write(f"{name}|{cwd}|1\n")
@@ -3358,11 +3442,8 @@ async def cc_session_input(name: str, request: Request):
     target = name
 
     async def _tmux(*args):
-        p = await asyncio.create_subprocess_exec(
-            TMUX_BIN, *args,
-            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE)
-        _, err = await p.communicate()
-        return p.returncode, (err or b"").decode("utf-8", "replace").strip()
+        rc, _, err = await _tmux_run(*args)
+        return rc, err
 
     # Deliver via tmux bracketed paste (set-buffer → paste-buffer -p) instead of
     # `send-keys -l`. This is how Claude Code receives a pasted prompt: the whole
@@ -3388,11 +3469,8 @@ async def _cc_paste_text(name: str, text: str) -> None:
         raise http_err(409, "SESSION_NOT_RUNNING", "session not running")
 
     async def _tmux(*args):
-        p = await asyncio.create_subprocess_exec(
-            TMUX_BIN, *args,
-            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE)
-        _, err = await p.communicate()
-        return p.returncode, (err or b"").decode("utf-8", "replace").strip()
+        rc, _, err = await _tmux_run(*args)
+        return rc, err
 
     buf = "pa-" + uuid.uuid4().hex[:8]
     await _tmux("send-keys", "-t", name, "C-u")
@@ -3408,11 +3486,8 @@ async def _cc_paste_text(name: str, text: str) -> None:
 async def _cc_capture_pane_fresh(name: str) -> str:
     """Capture the tmux pane RIGHT NOW (no cache) — used where staleness would
     lie, e.g. verifying an interrupt actually landed."""
-    p = await asyncio.create_subprocess_exec(
-        TMUX_BIN, "capture-pane", "-p", "-t", name,
-        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
-    out, _ = await p.communicate()
-    return (out or b"").decode("utf-8", "replace")
+    _, pane, _ = await _tmux_run("capture-pane", "-p", "-t", name)
+    return pane
 
 
 def _cc_pane_busy(pane: str) -> bool:
@@ -3437,13 +3512,10 @@ async def cc_session_interrupt(name: str, request: Request):
     interrupted = False
     for _ in range(3):
         attempts += 1
-        p = await asyncio.create_subprocess_exec(
-            TMUX_BIN, "send-keys", "-t", name, "Escape",
-            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE)
-        _, err = await p.communicate()
-        if p.returncode:
+        rc, _, err = await _tmux_run("send-keys", "-t", name, "Escape")
+        if rc:
             raise http_err(502, "TMUX_FAILED", "tmux send-keys failed",
-                (err or b"").decode("utf-8", "replace")[:200] or "interrupt failed")
+                           err[:200] or "interrupt failed")
         await asyncio.sleep(0.7)                 # let the TUI react before checking
         pane = await _cc_capture_pane_fresh(name)
         if not _cc_pane_busy(pane):
@@ -3499,11 +3571,7 @@ async def cc_session_status(name: str, request: Request):
         raise http_err(404, "SESSION_NOT_FOUND", "unknown session")
     if not await _tmux_alive(name):
         return {"busy": False, "running": False}
-    p = await asyncio.create_subprocess_exec(
-        TMUX_BIN, "capture-pane", "-p", "-t", name,
-        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
-    out, _ = await p.communicate()
-    pane = (out or b"").decode("utf-8", "replace")
+    _, pane, _ = await _tmux_run("capture-pane", "-p", "-t", name)
     busy = bool(_CC_BUSY_RE.search(pane)) or ("esc to interrupt" in pane.lower())
     low = pane.lower()
     if "plan mode on" in low:
@@ -3544,13 +3612,10 @@ async def cc_session_key(name: str, request: Request):
         args += ["-l", raw]                  # literal single char (y / n / 1-3)
     else:
         raise HTTPException(status_code=400, detail="unsupported key")
-    p = await asyncio.create_subprocess_exec(
-        TMUX_BIN, *args,
-        stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE)
-    _, err = await p.communicate()
-    if p.returncode:
+    rc, _, err = await _tmux_run(*args)
+    if rc:
         raise http_err(502, "TMUX_FAILED", "tmux send-keys failed",
-            (err or b"").decode("utf-8", "replace")[:200] or "send-keys failed")
+                       err[:200] or "send-keys failed")
     return {"ok": True}
 
 
@@ -3563,11 +3628,7 @@ async def cc_session_key(name: str, request: Request):
 async def _v2_cc_state(name: str):
     if not await _tmux_alive(name):
         return ("failed", None)
-    p = await asyncio.create_subprocess_exec(
-        TMUX_BIN, "capture-pane", "-p", "-t", name,
-        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
-    out, _ = await p.communicate()
-    pane = (out or b"").decode("utf-8", "replace")
+    _, pane, _ = await _tmux_run("capture-pane", "-p", "-t", name)
     prompt = _cc_prompt(pane)
     if prompt:
         return ("waiting_approval", prompt)
@@ -4725,6 +4786,59 @@ async def _make_worktree(base: str, sid: str):
         return wt if add.returncode == 0 and os.path.isdir(wt) else base
     except Exception:  # noqa: BLE001
         return base
+
+
+async def _git_out(*args, timeout: float = 15.0):
+    """Run git, return (rc, stdout_str). Kill-on-timeout like _tmux_run."""
+    p = await asyncio.create_subprocess_exec(
+        "git", *args,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+    try:
+        out, _ = await asyncio.wait_for(p.communicate(), timeout)
+    except asyncio.TimeoutError:
+        try:
+            p.kill()
+        except ProcessLookupError:
+            pass
+        return 124, ""
+    return p.returncode, (out or b"").decode("utf-8", "replace")
+
+
+async def _cleanup_worktree(sid: str, sub: dict):
+    """After an isolated sub finishes: remove its worktree IF it's clean
+    (`git status --porcelain` empty). Dirty trees are kept — someone's
+    uncommitted work lives there — and logged. ~/.pocket/worktrees no longer
+    grows without bound (issue #7)."""
+    wt = sub.get("worktree")
+    if not wt or not os.path.isdir(wt):
+        return
+    try:
+        rc, dirty = await _git_out("-C", wt, "status", "--porcelain")
+        if rc != 0 or dirty.strip():
+            _log_event("worktree_kept", sid=sid, worktree=wt,
+                       reason="status-failed" if rc != 0 else "dirty")
+            return
+        # `worktree remove` must run from the MAIN repo (git refuses to remove
+        # the tree it's currently -C'd into), so resolve the common dir first.
+        rc, common = await _git_out("-C", wt, "rev-parse", "--git-common-dir")
+        common = common.strip()
+        if rc != 0 or not common:
+            _log_event("worktree_kept", sid=sid, worktree=wt, reason="no-common-dir")
+            return
+        if not os.path.isabs(common):
+            common = os.path.abspath(os.path.join(wt, common))
+        main_root = os.path.dirname(common)
+        rc, _ = await _git_out("-C", main_root, "worktree", "remove", wt, timeout=30)
+        if rc == 0:
+            sub["worktree"] = None
+            if sub.get("base_cwd"):
+                sub["cwd"] = sub["base_cwd"]   # follow-ups run in the main tree
+            _log_event("worktree_removed", sid=sid, worktree=wt)
+        else:
+            _log_event("worktree_remove_failed", sid=sid, worktree=wt, rc=rc)
+    except Exception as e:  # noqa: BLE001
+        _log_event("worktree_cleanup_error", sid=sid, worktree=wt,
+                   error=type(e).__name__, error_message=str(e)[:160])
 
 
 def _fmt_item(kind, val):
