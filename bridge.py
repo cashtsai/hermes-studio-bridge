@@ -3657,10 +3657,11 @@ async def capabilities(request: Request):
     return {"api": "app/v1",
             "features": ["canonical_messages", "reports", "notifications",
                          "approvals", "cc_sessions", "attachments", "vision",
-                         "message_dry_run", "apns_push", "accounts",
+                         "message_dry_run", "message_interrupt", "apns_push", "accounts",
                          "apple_auth", "account_pairing",
                          "delegations", "control_plane_v2"],
             "endpoints": ["/app/v1/sessions", "/app/v1/messages", "/reports",
+                          "/app/v1/messages/interrupt",
                           "/cron/jobs", "/ccsessions", "/app/v1/approvals",
                           "/app/v1/devices", "/app/v1/push/test",
                           "/app/v1/auth/apple", "/app/v1/account",
@@ -4198,6 +4199,20 @@ async def app_post_message(request: Request):
                        duration_ms=int((time.monotonic() - turn_started) * 1000))
 
     return StreamingResponse(agen(), media_type="text/event-stream")
+
+
+@app.post("/app/v1/messages/interrupt")
+async def app_message_interrupt(request: Request):
+    _check_auth(request)
+    body = await request.json()
+    session = body.get("session") or "xcash"
+    if session not in PERSONAS:
+        raise HTTPException(status_code=400, detail="unknown session")
+    acp_session = await POOL.get(session, home_for(session))
+    if not acp_session.is_busy():
+        raise HTTPException(status_code=409, detail="no active turn")
+    await acp_session.cancel()
+    return {"ok": True, "session": session}
 
 
 # ───────────────────────── Approval Center (M21) ───────────────────────────
