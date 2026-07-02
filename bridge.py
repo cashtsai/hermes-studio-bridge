@@ -44,6 +44,18 @@ SUBSESSIONS: dict = {}
 # if the client's network drops mid-stream. Without this they could be GC'd.
 _BG_TASKS: set = set()
 
+# One SSE keepalive cadence for every streaming endpoint (issue #8: it was
+# 2s / 4s / 10s across chat, ccsessions and codexsessions for no reason).
+SSE_KEEPALIVE_SECS = 2.0
+
+# In-flight app-turn dedup (issue #9): (session, client_id) -> {ts, task, state}.
+# A duplicate POST with the same client_id while the first run is STILL RUNNING
+# attaches to it instead of re-running the turn (side effects must not replay).
+# Entries expire after 600s; cleanup happens on each access so the dict can't leak.
+_APP_TURN_INFLIGHT: dict = {}
+_APP_TURN_INFLIGHT_TTL = 600.0
+_APP_TURN_INFLIGHT_LOCK = asyncio.Lock()
+
 # Bearer token gate. The bridge fronts a tool-executing agent, so it must not
 # be an open control surface even on the tailnet. Open WebUI sends this as its
 # OpenAI API key. Override via the BRIDGE_TOKEN env var.
@@ -178,7 +190,7 @@ def _check_auth(request: Request) -> None:
         _log_event("auth_failure", **summary)
     if over:
         raise HTTPException(status_code=429, detail="too many failed auth attempts; slow down")
-    raise HTTPException(status_code=401, detail="invalid bridge token")
+    raise http_err(401, "AUTH_INVALID_TOKEN", "invalid bridge token")
 
 HERMES_BIN = "/Users/xcash/apps/hermes-agent/runtime/venv/bin/hermes"
 HOME_ROOT = "/Users/xcash/apps/hermes-agent/home"
@@ -213,6 +225,56 @@ async def acp_full(model: str, prompt: str) -> str:
 
 
 app = FastAPI(title="Hermes ↔ OpenAI bridge")
+
+
+# ───────────────────────── structured error codes (issue #6) ────────────────
+# Every HTTP error carries a machine-readable code so the app can localize
+# (pocketagent#44) instead of string-matching English detail text. The legacy
+# top-level `detail` field is PRESERVED for old clients.
+class BridgeError(HTTPException):
+    def __init__(self, status: int, code: str, message: str, detail: str = ""):
+        super().__init__(status_code=status, detail=detail or message)
+        self.code = code
+        self.message = message
+
+
+def http_err(status: int, code: str, message: str, detail: str = "") -> BridgeError:
+    """Build a coded HTTP error: raise http_err(404, "SESSION_NOT_FOUND", ...)."""
+    return BridgeError(status, code, message, detail)
+
+
+# Fallback codes for plain HTTPException raises that haven't adopted http_err.
+_GENERIC_ERROR_CODES = {
+    400: "BAD_REQUEST", 401: "AUTH_INVALID_TOKEN", 403: "FORBIDDEN",
+    404: "NOT_FOUND", 409: "CONFLICT", 413: "PAYLOAD_TOO_LARGE",
+    429: "RATE_LIMITED", 500: "INTERNAL_ERROR", 502: "UPSTREAM_FAILED",
+    504: "PROVIDER_TIMEOUT",
+}
+
+from starlette.exceptions import HTTPException as StarletteHTTPException  # noqa: E402
+
+
+@app.exception_handler(StarletteHTTPException)
+async def _bridge_http_exception_handler(request: Request, exc: StarletteHTTPException):
+    detail = exc.detail if isinstance(exc.detail, str) else json.dumps(exc.detail, ensure_ascii=False)
+    code = getattr(exc, "code", "") or _GENERIC_ERROR_CODES.get(exc.status_code, "HTTP_ERROR")
+    message = getattr(exc, "message", "") or detail
+    body = {
+        "detail": exc.detail,   # backward compat: old clients read this
+        "error": {"code": code, "message": message, "detail": detail},
+    }
+    headers = dict(getattr(exc, "headers", None) or {})
+    headers["X-Error-Code"] = code
+    return JSONResponse(status_code=exc.status_code, content=body, headers=headers)
+
+
+@app.get("/")
+async def root():
+    """Unauthenticated liveness probe. The app/monitors hit GET / to decide
+    "bridge up?" — a 404 here was read as bridge-down and fueled an endless
+    reconnect banner loop on the phone (11,936 404s in one log). Cheap, no
+    secrets, no auth."""
+    return {"ok": True, "service": "pocket-bridge", "ts": int(time.time())}
 
 
 @app.get("/v1/models")
@@ -278,7 +340,9 @@ def _save_data_uri(data_uri: str, filename: str = "") -> str | None:
     mime, b64 = m.group(1), m.group(2)
     try:
         raw = base64.b64decode(b64)
-    except Exception:  # noqa: BLE001
+    except Exception as e:  # noqa: BLE001
+        _log_event("save_data_uri_failed", stage="b64decode", mime=mime,
+                   filename=(filename or "")[:80], error=type(e).__name__)
         return None
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
     safe = re.sub(r"[^\w.\-]", "_", os.path.basename(filename or "")) or "file"
@@ -287,7 +351,10 @@ def _save_data_uri(data_uri: str, filename: str = "") -> str | None:
     path = UPLOAD_DIR / f"{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}-{safe}"
     try:
         path.write_bytes(raw)
-    except Exception:  # noqa: BLE001
+    except Exception as e:  # noqa: BLE001
+        _log_event("save_data_uri_failed", stage="write", mime=mime,
+                   path=str(path), bytes=len(raw),
+                   error=type(e).__name__, error_message=str(e)[:160])
         return None
     return str(path)
 
@@ -398,7 +465,9 @@ async def _describe_image(path: str) -> str:
             *argv, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
         out, _ = await asyncio.wait_for(proc.communicate(), timeout=90)
         return (out or b"").decode("utf-8", "replace").strip()
-    except Exception:  # noqa: BLE001
+    except Exception as e:  # noqa: BLE001
+        _log_event("describe_image_failed", path=path,
+                   error=type(e).__name__, error_message=str(e)[:160])
         if proc:
             try:
                 proc.kill()
@@ -440,7 +509,11 @@ REPORT_CONTEXT_ITEM_CHARS = 5000
 def _canon_init():
     import sqlite3
     os.makedirs(os.path.dirname(CANON_DB), exist_ok=True)
-    con = sqlite3.connect(CANON_DB)
+    con = sqlite3.connect(CANON_DB, timeout=30)
+    # WAL: concurrent handlers no longer serialize writers against readers;
+    # busy_timeout waits out short lock contention instead of erroring.
+    con.execute("PRAGMA journal_mode=WAL")
+    con.execute("PRAGMA busy_timeout=30000")
     con.execute("""CREATE TABLE IF NOT EXISTS messages(
         id TEXT PRIMARY KEY, session TEXT NOT NULL, role TEXT NOT NULL,
         content TEXT, attachments TEXT, created_at REAL NOT NULL, status TEXT)""")
@@ -502,6 +575,13 @@ def _canon_init():
     con.execute("CREATE INDEX IF NOT EXISTS idx_delegation_parent ON delegations(parent_persona, updated_at)")
     con.execute("CREATE INDEX IF NOT EXISTS idx_delegation_provider ON delegations(provider, provider_session_id)")
     con.execute("CREATE INDEX IF NOT EXISTS idx_delegation_task ON delegations(task_code, subtask_code)")
+    # SUBSESSIONS persistence (issue #5, plan A): /dispatch sub-sessions used to
+    # live only in the in-memory dict, so a bridge restart wiped them all —
+    # transcript, resume target (cc_session) and isolate cwd included.
+    con.execute("""CREATE TABLE IF NOT EXISTS subsessions(
+        sid TEXT PRIMARY KEY, name TEXT, parent TEXT, tool TEXT, status TEXT,
+        cwd TEXT, worktree TEXT, cc_session TEXT, last_user TEXT,
+        last_at REAL, output_json TEXT)""")
     con.commit()
     con.close()
 
@@ -516,7 +596,7 @@ ACCOUNT_DEVICE_COLUMNS = (
 def _accounts_init():
     import sqlite3
     os.makedirs(os.path.dirname(ACCOUNTS_DB), exist_ok=True)
-    con = sqlite3.connect(ACCOUNTS_DB, timeout=10)
+    con = sqlite3.connect(ACCOUNTS_DB, timeout=30)
     con.execute("PRAGMA foreign_keys=ON")
     con.execute("""CREATE TABLE IF NOT EXISTS users(
         apple_user_id TEXT PRIMARY KEY,
@@ -581,7 +661,7 @@ def _account_upsert_user(apple_user_id: str, email: str | None = None,
                          display_name: str | None = None):
     import sqlite3
     now = time.time()
-    con = sqlite3.connect(ACCOUNTS_DB, timeout=10)
+    con = sqlite3.connect(ACCOUNTS_DB, timeout=30)
     con.execute(
         """INSERT INTO users(apple_user_id,email,display_name,created_at,last_seen_at)
            VALUES(?,?,?,?,?)
@@ -602,7 +682,7 @@ def _account_get_user(apple_user_id: str, touch: bool = False):
     import sqlite3
     if not apple_user_id:
         return None
-    con = sqlite3.connect(ACCOUNTS_DB, timeout=10)
+    con = sqlite3.connect(ACCOUNTS_DB, timeout=30)
     if touch:
         con.execute("UPDATE users SET last_seen_at=? WHERE apple_user_id=?",
                     (time.time(), apple_user_id))
@@ -636,7 +716,7 @@ def _account_device_put(apple_user_id: str, device_token: str, platform: str = "
     import sqlite3
     now = time.time()
     device_id = device_id or "dev-" + uuid.uuid4().hex
-    con = sqlite3.connect(ACCOUNTS_DB, timeout=10)
+    con = sqlite3.connect(ACCOUNTS_DB, timeout=30)
     con.execute("PRAGMA foreign_keys=ON")
     con.execute(
         """INSERT INTO devices(device_id,apple_user_id,device_token,platform,label,
@@ -663,7 +743,7 @@ def _account_device_for_token(device_token: str, touch: bool = True):
     if not device_token:
         return None
     try:
-        con = sqlite3.connect(ACCOUNTS_DB, timeout=10)
+        con = sqlite3.connect(ACCOUNTS_DB, timeout=30)
         row = con.execute(
             f"SELECT {','.join(ACCOUNT_DEVICE_COLUMNS)} FROM devices "
             "WHERE device_token=? AND revoked=0",
@@ -693,7 +773,7 @@ def _account_device_by_id(apple_user_id: str, device_id: str):
 
 def _account_device_revoke(apple_user_id: str, device_id: str):
     import sqlite3
-    con = sqlite3.connect(ACCOUNTS_DB, timeout=10)
+    con = sqlite3.connect(ACCOUNTS_DB, timeout=30)
     cur = con.execute(
         "UPDATE devices SET revoked=1, last_seen_at=? "
         "WHERE apple_user_id=? AND device_id=? AND revoked=0",
@@ -825,6 +905,21 @@ def _canon_add(session: str, role: str, content: str, attachments=None,
     return mid, False
 
 
+def _canon_add_retry(session: str, role: str, content: str, attachments=None,
+                     mid: str | None = None, status: str = "done",
+                     client_id: str | None = None) -> tuple[str, bool]:
+    """_canon_add + one retry (issue #9): a dropped canonical write makes the
+    turn invisible to replay/idempotency, so it's worth a second attempt."""
+    mid, ok = _canon_add(session, role, content, attachments, mid=mid,
+                         status=status, client_id=client_id)
+    if not ok:
+        _log_event("canonical_write_retry", session=session, role=role,
+                   client_id_hash=_short_hash(client_id))
+        mid, ok = _canon_add(session, role, content, attachments, mid=mid,
+                             status=status, client_id=client_id)
+    return mid, ok
+
+
 def _canon_reply_for_client(session: str, client_id: str):
     """If this logical send already produced a recorded assistant reply (e.g. the
     first attempt succeeded server-side but the client's network dropped), return
@@ -857,6 +952,91 @@ def _canon_messages(session: str, limit: int = 200):
     return [{"id": r[0], "role": r[1], "content": r[2],
              "attachments": json.loads(r[3] or "[]"), "ts": r[4],
              "status": r[5], "source": "app"} for r in rows]
+
+
+# ───────────────────── SUBSESSIONS persistence (issue #5) ───────────────────
+_SUB_OUTPUT_JSON_CAP = 2 * 1024 * 1024   # ~2MB persisted transcript per sub
+_SUB_TRUNC_MARKER = ("text", "_(前段已截斷)_\n\n")
+
+
+def _sub_output_json(output: list) -> str:
+    """Serialize a sub's transcript, truncating OLDEST items to stay ≤ ~2MB."""
+    items = [[k, v] for k, v in (output or [])]
+    js = json.dumps(items, ensure_ascii=False)
+    if len(js) <= _SUB_OUTPUT_JSON_CAP:
+        return js
+    while items and len(js) > _SUB_OUTPUT_JSON_CAP:
+        drop = max(1, len(items) // 10)      # shed in chunks, not one-by-one
+        items = items[drop:]
+        js = json.dumps([list(_SUB_TRUNC_MARKER)] + items, ensure_ascii=False)
+    return js
+
+
+def _subsession_persist(sid: str) -> bool:
+    """Flush one SUBSESSIONS entry to canonical.db (insert-or-replace)."""
+    import sqlite3
+    sub = SUBSESSIONS.get(sid)
+    if not sub:
+        return False
+    try:
+        con = sqlite3.connect(CANON_DB, timeout=30)
+        con.execute("INSERT OR REPLACE INTO subsessions"
+                    "(sid,name,parent,tool,status,cwd,worktree,cc_session,"
+                    "last_user,last_at,output_json) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                    (sid, sub.get("name"), sub.get("parent"), sub.get("tool"),
+                     sub.get("status"), sub.get("cwd"), sub.get("worktree"),
+                     sub.get("cc_session"), sub.get("last_user"),
+                     sub.get("lastAt") or time.time(),
+                     _sub_output_json(sub.get("output"))))
+        con.commit()
+        con.close()
+        return True
+    except Exception as e:  # noqa: BLE001
+        _log_event("subsession_persist_failed", sid=sid,
+                   error=type(e).__name__, error_message=str(e)[:160])
+        return False
+
+
+def _subsessions_load():
+    """Rebuild SUBSESSIONS from canonical.db on startup. Anything that was
+    status=running when the bridge died is marked interrupted, with a
+    transcript note, so the app shows an honest state instead of a dead row."""
+    import sqlite3
+    try:
+        con = sqlite3.connect(CANON_DB, timeout=30)
+        rows = con.execute(
+            "SELECT sid,name,parent,tool,status,cwd,worktree,cc_session,"
+            "last_user,last_at,output_json FROM subsessions").fetchall()
+        interrupted = [r[0] for r in rows if r[4] == "running"]
+        if interrupted:
+            con.executemany("UPDATE subsessions SET status='interrupted' WHERE sid=?",
+                            [(sid,) for sid in interrupted])
+            con.commit()
+        con.close()
+    except Exception as e:  # noqa: BLE001
+        _log_event("subsessions_load_failed",
+                   error=type(e).__name__, error_message=str(e)[:160])
+        return
+    loaded = 0
+    for (sid, name, parent, tool, status, cwd, worktree, cc_session,
+         last_user, last_at, output_json) in rows:
+        try:
+            output = [(k, v) for k, v in json.loads(output_json or "[]")]
+        except Exception:  # noqa: BLE001
+            output = []
+        if status == "running":
+            status = "interrupted"
+            output.append(("text", "\n\n_(bridge 重啟,行程已中斷,可追問續跑)_\n"))
+        SUBSESSIONS[sid] = {
+            "name": name, "parent": parent, "tool": tool, "status": status,
+            "cwd": cwd, "worktree": worktree, "cc_session": cc_session,
+            "last_user": last_user, "lastAt": last_at, "proc": None,
+            "output": output,
+        }
+        loaded += 1
+    if loaded:
+        _log_event("subsessions_loaded", count=loaded,
+                   interrupted=len(interrupted))
 
 
 _WORK_ORDER_PREFIX = {
@@ -1069,7 +1249,7 @@ def _delegation_get(delegation_id: str):
 
 def _delegation_insert(row: dict) -> None:
     import sqlite3
-    con = sqlite3.connect(CANON_DB, timeout=10)
+    con = sqlite3.connect(CANON_DB, timeout=30)
     con.execute("""INSERT INTO delegations
         (id, work_order, parent_persona, parent_session, created_via, provider,
          title, objective, cwd, status, provider_session_id, codex_thread_id,
@@ -1104,7 +1284,7 @@ def _delegation_update(delegation_id: str, **fields) -> None:
     if not sets:
         return
     args.append(delegation_id)
-    con = sqlite3.connect(CANON_DB, timeout=10)
+    con = sqlite3.connect(CANON_DB, timeout=30)
     con.execute(f"UPDATE delegations SET {', '.join(sets)} WHERE id=?", args)
     con.commit()
     con.close()
@@ -1196,7 +1376,7 @@ def _report_upsert(session: str, report: dict) -> str:
     ts = float(report.get("ts") or time.time())
     label = report.get("label") or ""
     name = report.get("name") or ""
-    con = sqlite3.connect(CANON_DB, timeout=10)
+    con = sqlite3.connect(CANON_DB, timeout=30)
     existing = con.execute(
         "SELECT label,name,content,ts,external_id FROM report_events WHERE id=?",
         (rid,)).fetchone()
@@ -1346,6 +1526,7 @@ async def push_notify(title: str, body: str, data: dict | None = None) -> int:
 
 _canon_init()
 _accounts_init()
+_subsessions_load()   # issue #5: rebuild /dispatch subs after restart
 
 
 async def _persona_content_stream(model: str, prompt: str):
@@ -1387,7 +1568,7 @@ async def _persona_content_stream(model: str, prompt: str):
     try:
         while True:
             try:
-                kind, val = await asyncio.wait_for(q.get(), timeout=2.0)
+                kind, val = await asyncio.wait_for(q.get(), timeout=SSE_KEEPALIVE_SECS)
                 last_event = _t.monotonic()
             except asyncio.TimeoutError:
                 if _t.monotonic() - last_event > STALL_LIMIT:
@@ -1475,6 +1656,7 @@ async def chat_completions(request: Request):
         async def sgen():
             yield schunk({"role": "assistant", "content": ""})
             idx = start_idx
+            quiet = 0.0
             while True:
                 while idx < len(sub["output"]):
                     kind, val = sub["output"][idx]
@@ -1482,10 +1664,14 @@ async def chat_completions(request: Request):
                     c = _fmt_item(kind, val)
                     if c:
                         yield schunk({"content": c})
-                if sub.get("status") == "done" and idx >= len(sub["output"]):
+                        quiet = 0.0
+                if sub.get("status") != "running" and idx >= len(sub["output"]):
                     break
                 await asyncio.sleep(0.4)
-                yield ": keepalive\n\n"
+                quiet += 0.4
+                if quiet >= SSE_KEEPALIVE_SECS:
+                    quiet = 0.0
+                    yield ": keepalive\n\n"
             yield schunk({}, finish="stop")
             yield "data: [DONE]\n\n"
 
@@ -1660,7 +1846,10 @@ class CodexAppServerClient:
                     break
                 try:
                     msg = json.loads(raw.decode("utf-8", "replace"))
-                except Exception:  # noqa: BLE001
+                except Exception as e:  # noqa: BLE001
+                    _log_event("codex_app_server_bad_json",
+                               error=type(e).__name__,
+                               line=raw.decode("utf-8", "replace")[:160])
                     continue
                 if "id" in msg:
                     fut = self._pending.pop(msg.get("id"), None)
@@ -1987,6 +2176,11 @@ async def _codex_input_items(text: str, attachments: list) -> list:
 
 
 def _codex_http_error(e: Exception):
+    _log_event("codex_provider_error", error=type(e).__name__,
+               error_message=str(e)[:200],
+               code=getattr(e, "code", None))
+    if isinstance(e, (asyncio.TimeoutError, TimeoutError)):
+        raise http_err(504, "PROVIDER_TIMEOUT", "codex app-server timeout", str(e))
     if isinstance(e, CodexAppServerError):
         code = 409 if e.code == -32600 else 502
         raise HTTPException(status_code=code, detail=str(e))
@@ -2495,7 +2689,7 @@ async def codex_session_stream(thread_id: str, request: Request, replay: int = 2
                 break
             await asyncio.sleep(0.5)
             idle += 1
-            if idle >= 20:
+            if idle >= max(1, int(SSE_KEEPALIVE_SECS / 0.5)):
                 idle = 0
                 yield ": keepalive\n\n"
             if follow and idle_limit > 0 and not CODEX_APP.is_active(thread_id):
@@ -2529,24 +2723,54 @@ def _claude_argv(parent: str, prompt: str, resume: str | None = None):
     return argv
 
 
+# A follow stream that has sent ZERO data (keepalives don't count) for this
+# long gets disconnected — a client that hangs without reading otherwise pins
+# the generator forever.
+_STREAM_IDLE_CUTOFF_SECS = 1800.0
+
+# A sub-agent that produces NOTHING on stdout for this long is stalled: kill it
+# so its _BG_TASKS entry finishes instead of leaking a forever-pending task.
+_AGENT_STALL_SECS = 1800.0
+
+
 async def _stream_agent(sid: str, argv: list, cwd: str, fail_label: str):
     """Run a sub-agent subprocess, append its transcript to the sub's output
     buffer, capture the Claude Code session id (for later --resume), and mark
     the sub done when it exits."""
     sub = SUBSESSIONS[sid]
     out = sub["output"]
+    proc = None
     try:
         proc = await asyncio.create_subprocess_exec(
             *argv, cwd=cwd, stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL)
         sub["proc"] = proc
-        async for raw in proc.stdout:
+        while True:
+            # No-progress watchdog: a wedged provider (network black-hole, dead
+            # MCP…) otherwise streams nothing forever.
+            try:
+                raw = await asyncio.wait_for(proc.stdout.readline(),
+                                             timeout=_AGENT_STALL_SECS)
+            except asyncio.TimeoutError:
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+                sub["status"] = "stalled"
+                out.append(("text", "\n⚠️ (超過 30 分鐘無輸出,已強制中止子代理行程)"))
+                _log_event("subagent_stalled", sid=sid, cwd=cwd,
+                           tool=sub.get("tool"))
+                break
+            if not raw:
+                break
             line = raw.decode("utf-8", "replace").strip()
             if not line:
                 continue
             try:
                 ev = json.loads(line)
-            except Exception:
+            except Exception as e:  # noqa: BLE001
+                _log_event("subagent_bad_json", sid=sid,
+                           error=type(e).__name__, line=line[:160])
                 continue
             sess = ev.get("session_id") if isinstance(ev, dict) else None
             if sess:
@@ -2557,9 +2781,16 @@ async def _stream_agent(sid: str, argv: list, cwd: str, fail_label: str):
         await proc.wait()
     except Exception as e:                                  # noqa: BLE001
         out.append(("text", f"\n⚠️ {fail_label}:{e}"))
+        _log_event("subagent_stream_failed", sid=sid,
+                   error=type(e).__name__, error_message=str(e)[:160])
     finally:
-        sub["status"] = "done"
+        if sub.get("status") != "stalled":
+            sub["status"] = "done"
         sub["lastAt"] = time.time()
+        # Isolated dispatch: reclaim the worktree if the agent left it clean.
+        if sub.get("worktree"):
+            await _cleanup_worktree(sid, sub)
+        _subsession_persist(sid)   # issue #5: flush transcript + resume target
         # M23: push when a dispatched CC/Codex task finishes, so the app surfaces
         # it even when backgrounded (Telegram is the fallback now, not the primary
         # signal). Fire-and-forget; failures are swallowed inside push_notify.
@@ -2578,6 +2809,7 @@ async def _run_dispatch(sid: str, tool: str, task: str, cwd: str, isolate: bool 
         if wt != cwd:
             run_cwd = wt
             sub["worktree"] = wt
+            sub["base_cwd"] = cwd   # fall back here if the worktree is reclaimed
             sub["cwd"] = wt   # follow-ups stay in the same isolated tree
             sub["output"].append(("text", f"_(隔離工作區 worktree:`{wt}` · 分支 `pocket/{sid}`)_\n\n"))
     if tool == "codex":
@@ -2714,6 +2946,47 @@ TMUX_BIN = "/opt/homebrew/bin/tmux" if os.path.exists("/opt/homebrew/bin/tmux") 
 _CC_HOOK_STATE: dict[str, dict] = {}
 _CC_HOOK_TTL = 600.0
 
+# Hard ceiling for any single tmux invocation. tmux normally answers in ms; a
+# hung tmux server used to hang the handler (and its _BG_TASKS entry) forever.
+_TMUX_TIMEOUT = 15.0
+
+
+async def _tmux_run(*args, timeout: float = _TMUX_TIMEOUT):
+    """Run one tmux command with a kill-on-timeout guard.
+    Returns (rc, stdout_str, stderr_str); rc=124 on timeout."""
+    p = await asyncio.create_subprocess_exec(
+        TMUX_BIN, *args,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+    try:
+        out, err = await asyncio.wait_for(p.communicate(), timeout)
+    except asyncio.TimeoutError:
+        try:
+            p.kill()
+        except ProcessLookupError:
+            pass
+        _log_event("tmux_timeout", args=" ".join(str(a) for a in args[:4]),
+                   timeout_s=timeout)
+        return 124, "", "tmux timed out"
+    return (p.returncode,
+            (out or b"").decode("utf-8", "replace"),
+            (err or b"").decode("utf-8", "replace").strip())
+
+
+# TTL cache for capture-pane (issue #8): the home list polls every session on
+# every request — 50 sessions used to mean 50 subprocess spawns per poll.
+_PANE_CACHE_TTL = 5.0
+_PANE_CACHE: dict = {}   # name -> (cached_at_monotonic, pane_text)
+
+
+async def _tmux_capture_cached(name: str) -> str:
+    now = time.monotonic()
+    hit = _PANE_CACHE.get(name)
+    if hit and now - hit[0] < _PANE_CACHE_TTL:
+        return hit[1]
+    _, pane, _ = await _tmux_run("capture-pane", "-p", "-t", name)
+    _PANE_CACHE[name] = (now, pane)
+    return pane
+
 
 def _cc_project_dir(workdir: str) -> str:
     return os.path.expanduser("~/.claude/projects/" + workdir.replace("/", "-"))
@@ -2768,10 +3041,8 @@ def _cc_fresh_hook_state(name: str):
 
 async def _tmux_alive(name: str) -> bool:
     try:
-        p = await asyncio.create_subprocess_exec(
-            TMUX_BIN, "has-session", "-t", name,
-            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
-        return (await p.wait()) == 0
+        rc, _, _ = await _tmux_run("has-session", "-t", name)
+        return rc == 0
     except Exception:  # noqa: BLE001
         return False
 
@@ -2802,11 +3073,7 @@ async def _cc_sessions():
             # Mid-turn? Capture the pane and look for the working spinner — so the
             # home list can animate a running CC session (parity with Codex).
             try:
-                p = await asyncio.create_subprocess_exec(
-                    TMUX_BIN, "capture-pane", "-p", "-t", name,
-                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
-                paneb, _ = await p.communicate()
-                pane = (paneb or b"").decode("utf-8", "replace")
+                pane = await _tmux_capture_cached(name)
                 if hook_state:
                     busy = bool(hook_state.get("busy"))
                 else:
@@ -2925,7 +3192,7 @@ async def cc_session_rename(name: str, request: Request):
     rows = _cc_conf_rows()
     current = next((r for r in rows if r[0] == name), None)
     if not current:
-        raise HTTPException(status_code=404, detail="unknown session")
+        raise http_err(404, "SESSION_NOT_FOUND", "unknown session")
     try:
         p = await asyncio.create_subprocess_exec(
             os.path.expanduser("~/.local/bin/ccsess"), "rename", name, new_name,
@@ -2946,10 +3213,18 @@ async def _run_ccsess(*args):
     p = await asyncio.create_subprocess_exec(
         os.path.expanduser("~/.local/bin/ccsess"), *args,
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-    out, err = await p.communicate()
+    try:
+        out, err = await asyncio.wait_for(p.communicate(), 30)
+    except asyncio.TimeoutError:
+        try:
+            p.kill()
+        except ProcessLookupError:
+            pass
+        _log_event("ccsess_timeout", args=" ".join(str(a) for a in args[:3]))
+        raise http_err(502, "TMUX_FAILED", "ccsess timed out", "ccsess timed out (30s)")
     if p.returncode != 0:
         detail = (err or out or b"ccsess failed").decode("utf-8", "replace")[:300]
-        raise HTTPException(status_code=502, detail=detail)
+        raise http_err(502, "TMUX_FAILED", "ccsess failed", detail)
     return (out or b"").decode("utf-8", "replace")
 
 
@@ -2999,11 +3274,8 @@ async def _cc_wait_ready(name: str, timeout: float = 12.0):
     deadline = asyncio.get_event_loop().time() + timeout
     while asyncio.get_event_loop().time() < deadline:
         if await _tmux_alive(name):
-            p = await asyncio.create_subprocess_exec(
-                TMUX_BIN, "capture-pane", "-p", "-t", name,
-                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
-            out, _ = await p.communicate()
-            pane = (out or b"").decode("utf-8", "replace").lower()
+            _, pane, _ = await _tmux_run("capture-pane", "-p", "-t", name)
+            pane = pane.lower()
             if "for shortcuts" in pane or "esc to interrupt" in pane or "❯" in pane:
                 return True
         await asyncio.sleep(0.6)
@@ -3050,7 +3322,7 @@ async def cc_session_stream(name: str, request: Request, replay: int = 80):
     _check_auth(request)
     row = next((r for r in _cc_conf_rows() if r[0] == name), None)
     if not row:
-        raise HTTPException(status_code=404, detail="unknown session")
+        raise http_err(404, "SESSION_NOT_FOUND", "unknown session")
     workdir = row[1]
     cid = "ccsess-" + uuid.uuid4().hex[:16]
 
@@ -3082,8 +3354,16 @@ async def cc_session_stream(name: str, request: Request, replay: int = 80):
             pos = os.path.getsize(jsonl)
         # follow
         idle = 0
+        last_data = time.monotonic()
         while True:
             if await request.is_disconnected():
+                break
+            if time.monotonic() - last_data >= _STREAM_IDLE_CUTOFF_SECS:
+                # 30min without a single data chunk → cut the stream cleanly
+                # (keepalive comments don't count as data).
+                _log_event("cc_stream_idle_cutoff", session=name)
+                yield chunk({}, finish="stop")
+                yield "data: [DONE]\n\n"
                 break
             await asyncio.sleep(1.0)
             cur = _cc_latest_jsonl(workdir)
@@ -3105,9 +3385,10 @@ async def cc_session_stream(name: str, request: Request, replay: int = 80):
                             continue
                         if c:
                             yield chunk({"content": c})
+                            last_data = time.monotonic()
                     idle = 0
             idle += 1
-            if idle >= 4:                         # ~4s quiet → keepalive comment.
+            if idle >= max(1, int(SSE_KEEPALIVE_SECS)):   # quiet → keepalive comment.
                 # Frequent so any HTTP/tunnel buffering flushes the last data chunk
                 # promptly — an idle session shouldn't leave the transcript's tail
                 # held in a buffer (looked "stuck" on entry until something poked it).
@@ -3138,7 +3419,7 @@ async def cc_session_history(name: str, request: Request, offset: int = 0, limit
     _check_auth(request)
     row = next((r for r in _cc_conf_rows() if r[0] == name), None)
     if not row:
-        raise HTTPException(status_code=404, detail="unknown session")
+        raise http_err(404, "SESSION_NOT_FOUND", "unknown session")
     jsonl = _cc_latest_jsonl(row[1])
     if not jsonl or not os.path.exists(jsonl):
         return {"text": "", "more": False}
@@ -3281,14 +3562,11 @@ async def cc_history_resume(sid: str, request: Request):
     name, i = base, 2
     while name in existing or await _tmux_alive(name):
         name, i = f"{base}-{i}", i + 1
-    p = await asyncio.create_subprocess_exec(
-        TMUX_BIN, "new-session", "-d", "-s", name, "-c", cwd,
-        CLAUDE_BIN, "--resume", sid,
-        stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE)
-    _, err = await p.communicate()
-    if p.returncode != 0:
-        raise HTTPException(status_code=502,
-                            detail=(err or b"tmux new-session failed").decode("utf-8", "replace")[:200])
+    rc, _, err = await _tmux_run("new-session", "-d", "-s", name, "-c", cwd,
+                                 CLAUDE_BIN, "--resume", sid)
+    if rc != 0:
+        raise http_err(502, "TMUX_FAILED", "tmux new-session failed",
+                       (err or "tmux new-session failed")[:200])
     try:
         with open(CCSESS_CONF, "a") as f:
             f.write(f"{name}|{cwd}|1\n")
@@ -3304,7 +3582,7 @@ async def cc_session_input(name: str, request: Request):
     as if you SSH-attached and typed it. Sent literally, then Enter."""
     _check_auth(request)
     if not any(r[0] == name for r in _cc_conf_rows()):
-        raise HTTPException(status_code=404, detail="unknown session")
+        raise http_err(404, "SESSION_NOT_FOUND", "unknown session")
     body = await request.json()
     text = (body.get("text") or "").strip()
     # Relay layer (like the persona attachment path): persist any attachments and
@@ -3334,15 +3612,12 @@ async def cc_session_input(name: str, request: Request):
     if not text:
         raise HTTPException(status_code=400, detail="empty")
     if not await _tmux_alive(name):
-        raise HTTPException(status_code=409, detail="session not running")
+        raise http_err(409, "SESSION_NOT_RUNNING", "session not running")
     target = name
 
     async def _tmux(*args):
-        p = await asyncio.create_subprocess_exec(
-            TMUX_BIN, *args,
-            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE)
-        _, err = await p.communicate()
-        return p.returncode, (err or b"").decode("utf-8", "replace").strip()
+        rc, _, err = await _tmux_run(*args)
+        return rc, err
 
     # Deliver via tmux bracketed paste (set-buffer → paste-buffer -p) instead of
     # `send-keys -l`. This is how Claude Code receives a pasted prompt: the whole
@@ -3359,20 +3634,17 @@ async def cc_session_input(name: str, request: Request):
         raise HTTPException(status_code=500, detail=str(e))
     if rc_set or rc_paste or rc_enter:                         # don't false-report success
         detail = (e_set or e_paste or e_enter or "tmux paste failed")[:200]
-        raise HTTPException(status_code=502, detail=detail)
+        raise http_err(502, "TMUX_FAILED", "tmux paste failed", detail)
     return {"ok": True}
 
 
 async def _cc_paste_text(name: str, text: str) -> None:
     if not await _tmux_alive(name):
-        raise HTTPException(status_code=409, detail="session not running")
+        raise http_err(409, "SESSION_NOT_RUNNING", "session not running")
 
     async def _tmux(*args):
-        p = await asyncio.create_subprocess_exec(
-            TMUX_BIN, *args,
-            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE)
-        _, err = await p.communicate()
-        return p.returncode, (err or b"").decode("utf-8", "replace").strip()
+        rc, _, err = await _tmux_run(*args)
+        return rc, err
 
     buf = "pa-" + uuid.uuid4().hex[:8]
     await _tmux("send-keys", "-t", name, "C-u")
@@ -3382,7 +3654,18 @@ async def _cc_paste_text(name: str, text: str) -> None:
     rc_enter, e_enter = await _tmux("send-keys", "-t", name, "Enter")
     if rc_set or rc_paste or rc_enter:
         detail = (e_set or e_paste or e_enter or "tmux paste failed")[:200]
-        raise HTTPException(status_code=502, detail=detail)
+        raise http_err(502, "TMUX_FAILED", "tmux paste failed", detail)
+
+
+async def _cc_capture_pane_fresh(name: str) -> str:
+    """Capture the tmux pane RIGHT NOW (no cache) — used where staleness would
+    lie, e.g. verifying an interrupt actually landed."""
+    _, pane, _ = await _tmux_run("capture-pane", "-p", "-t", name)
+    return pane
+
+
+def _cc_pane_busy(pane: str) -> bool:
+    return bool(_CC_BUSY_RE.search(pane)) or ("esc to interrupt" in pane.lower())
 
 
 # CC interrupt + busy status (parity with Codex's stop/active). The app uses
@@ -3390,20 +3673,31 @@ async def _cc_paste_text(name: str, text: str) -> None:
 # guessing from stream silence (which mis-fires on long, quiet commands).
 @app.post("/ccsessions/{name}/interrupt")
 async def cc_session_interrupt(name: str, request: Request):
-    """Send Escape to the live TUI — same as pressing Esc to interrupt."""
+    """Send Escape to the live TUI — same as pressing Esc to interrupt — then
+    VERIFY via the pane's busy spinner that the turn actually stopped, retrying
+    up to 3 Escapes. Previously this blind-fired one Escape and returned ok,
+    so the app's stop button could 200 six times while the turn kept running."""
     _check_auth(request)
     if not any(r[0] == name for r in _cc_conf_rows()):
-        raise HTTPException(status_code=404, detail="unknown session")
+        raise http_err(404, "SESSION_NOT_FOUND", "unknown session")
     if not await _tmux_alive(name):
-        raise HTTPException(status_code=409, detail="session not running")
-    p = await asyncio.create_subprocess_exec(
-        TMUX_BIN, "send-keys", "-t", name, "Escape",
-        stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE)
-    _, err = await p.communicate()
-    if p.returncode:
-        raise HTTPException(status_code=502,
-            detail=(err or b"").decode("utf-8", "replace")[:200] or "interrupt failed")
-    return {"ok": True}
+        raise http_err(409, "SESSION_NOT_RUNNING", "session not running")
+    attempts = 0
+    interrupted = False
+    for _ in range(3):
+        attempts += 1
+        rc, _, err = await _tmux_run("send-keys", "-t", name, "Escape")
+        if rc:
+            raise http_err(502, "TMUX_FAILED", "tmux send-keys failed",
+                           err[:200] or "interrupt failed")
+        _PANE_CACHE.pop(name, None)              # the cached pane is now stale
+        await asyncio.sleep(0.7)                 # let the TUI react before checking
+        pane = await _cc_capture_pane_fresh(name)
+        if not _cc_pane_busy(pane):
+            interrupted = True
+            break
+    _log_event("cc_interrupt", session=name, interrupted=interrupted, attempts=attempts)
+    return {"ok": True, "interrupted": interrupted, "attempts": attempts}
 
 
 # Claude Code's TUI shows a working spinner like "· Fermenting… (1m 51s · ↓ 6.5k
@@ -3480,14 +3774,10 @@ async def cc_session_hook(request: Request):
 async def cc_session_status(name: str, request: Request):
     _check_auth(request)
     if not any(r[0] == name for r in _cc_conf_rows()):
-        raise HTTPException(status_code=404, detail="unknown session")
+        raise http_err(404, "SESSION_NOT_FOUND", "unknown session")
     if not await _tmux_alive(name):
         return {"busy": False, "running": False}
-    p = await asyncio.create_subprocess_exec(
-        TMUX_BIN, "capture-pane", "-p", "-t", name,
-        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
-    out, _ = await p.communicate()
-    pane = (out or b"").decode("utf-8", "replace")
+    pane = await _tmux_capture_cached(name)
     hook_state = _cc_fresh_hook_state(name)
     if hook_state:
         busy = bool(hook_state.get("busy"))
@@ -3498,6 +3788,11 @@ async def cc_session_status(name: str, request: Request):
         mode = "plan"
     elif "auto mode on" in low or "accept edits on" in low or "bypass" in low:
         mode = "auto"
+    elif busy:
+        # A running turn replaces the bottom bar with "esc to interrupt" — the
+        # mode marker is hidden, not absent. Claiming "normal" here made the app
+        # snap the user's pick back to 一般 on the next 1.2s reconcile.
+        mode = None
     else:
         mode = "normal"
     return {"busy": busy, "running": True, "mode": mode, "prompt": _cc_prompt(pane)}
@@ -3517,9 +3812,9 @@ _CC_KEYS = {
 async def cc_session_key(name: str, request: Request):
     _check_auth(request)
     if not any(r[0] == name for r in _cc_conf_rows()):
-        raise HTTPException(status_code=404, detail="unknown session")
+        raise http_err(404, "SESSION_NOT_FOUND", "unknown session")
     if not await _tmux_alive(name):
-        raise HTTPException(status_code=409, detail="session not running")
+        raise http_err(409, "SESSION_NOT_RUNNING", "session not running")
     body = await request.json()
     raw = str(body.get("key") or "").strip()
     if not raw:
@@ -3532,13 +3827,13 @@ async def cc_session_key(name: str, request: Request):
         args += ["-l", raw]                  # literal single char (y / n / 1-3)
     else:
         raise HTTPException(status_code=400, detail="unsupported key")
-    p = await asyncio.create_subprocess_exec(
-        TMUX_BIN, *args,
-        stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE)
-    _, err = await p.communicate()
-    if p.returncode:
-        raise HTTPException(status_code=502,
-            detail=(err or b"").decode("utf-8", "replace")[:200] or "send-keys failed")
+    rc, _, err = await _tmux_run(*args)
+    if rc:
+        raise http_err(502, "TMUX_FAILED", "tmux send-keys failed",
+                       err[:200] or "send-keys failed")
+    # The key just changed the TUI (mode toggle, menu pick) — a cached pane
+    # would feed the app a pre-keystroke mode/prompt for up to TTL seconds.
+    _PANE_CACHE.pop(name, None)
     return {"ok": True}
 
 
@@ -3551,11 +3846,7 @@ async def cc_session_key(name: str, request: Request):
 async def _v2_cc_state(name: str):
     if not await _tmux_alive(name):
         return ("failed", None)
-    p = await asyncio.create_subprocess_exec(
-        TMUX_BIN, "capture-pane", "-p", "-t", name,
-        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
-    out, _ = await p.communicate()
-    pane = (out or b"").decode("utf-8", "replace")
+    _, pane, _ = await _tmux_run("capture-pane", "-p", "-t", name)
     prompt = _cc_prompt(pane)
     if prompt:
         return ("waiting_approval", prompt)
@@ -4247,7 +4538,7 @@ async def app_get_messages(session: str, request: Request, limit: int = 200):
     device sees the same interleaved conversation."""
     _check_auth(request)
     if session not in PERSONAS:
-        raise HTTPException(status_code=400, detail="unknown session")
+        raise http_err(400, "SESSION_NOT_FOUND", "unknown session")
     out = _canon_messages(session, limit)
     _, home = PERSONAS[session]
     for m in _persona_history(home, limit):
@@ -4290,7 +4581,7 @@ async def app_set_reaction(mid: str, request: Request):
     body = await request.json()
     session = (body.get("session") or "").strip()
     if session not in PERSONAS:
-        raise HTTPException(status_code=400, detail="unknown session")
+        raise http_err(400, "SESSION_NOT_FOUND", "unknown session")
     reaction = (body.get("reaction") or "").strip()[:8]   # one emoji, not an essay
     import sqlite3
     try:
@@ -4317,7 +4608,7 @@ async def app_post_message(request: Request):
     body = await request.json()
     session = body.get("session") or "xcash"
     if session not in PERSONAS:
-        raise HTTPException(status_code=400, detail="unknown session")
+        raise http_err(400, "SESSION_NOT_FOUND", "unknown session")
     content = (body.get("content") or "").strip()
     attachments = body.get("attachments") or []   # [{kind,filename,mime,data(dataURI)}]
     dry_run = bool(body.get("dry_run"))
@@ -4376,6 +4667,60 @@ async def app_post_message(request: Request):
                                canonical_user_ok=None, canonical_reply_ok=True)
             return StreamingResponse(replay_agen(), media_type="text/event-stream")
 
+    # In-flight idempotency (issue #9): the canonical replay above only covers
+    # turns that already FINISHED. A duplicate POST while the first run is still
+    # going must not start a second run — it attaches to the in-flight one.
+    inflight_key = (session, client_id) if client_id else None
+    inflight_entry = None
+    attached = None
+    if not dry_run and inflight_key:
+        async with _APP_TURN_INFLIGHT_LOCK:
+            _now = time.monotonic()
+            for k in [k for k, e in _APP_TURN_INFLIGHT.items()
+                      if _now - e["ts"] > _APP_TURN_INFLIGHT_TTL]:
+                _APP_TURN_INFLIGHT.pop(k, None)   # TTL cleanup on each access
+            attached = _APP_TURN_INFLIGHT.get(inflight_key)
+            if attached is None:
+                inflight_entry = {"ts": _now, "task": None, "state": None}
+                _APP_TURN_INFLIGHT[inflight_key] = inflight_entry
+
+    if attached is not None:
+        _log_event("app_turn_attach", **common_log)
+
+        async def attach_agen():
+            done_sent = False
+            acc = ""
+            try:
+                yield chunk({"role": "assistant", "content": ""})
+                yield status_chunk("attached", "同一則訊息已在處理中，附掛原回合等待結果。")
+                t0 = time.monotonic()
+                while True:
+                    _task = attached.get("task")
+                    if _task is not None and _task.done():
+                        break
+                    if _task is None and time.monotonic() - t0 > 30:
+                        break   # original request died before starting its turn
+                    if time.monotonic() - t0 > _APP_TURN_INFLIGHT_TTL:
+                        break
+                    await asyncio.sleep(SSE_KEEPALIVE_SECS)
+                    yield ": keepalive\n\n"
+                st = attached.get("state") or {}
+                acc = st.get("acc") or ""
+                yield chunk({"content": acc or "(原回合沒有產出回覆)"})
+                payload = {"id": cid, "object": "chat.completion.chunk", "created": created,
+                           "model": session, "replayed": True,
+                           "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
+                yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+                yield "data: [DONE]\n\n"
+                done_sent = True
+            finally:
+                _log_event("app_turn_stream_done", **common_log,
+                           replayed=True, attached=True, output_chars=len(acc),
+                           done_sent=done_sent,
+                           duration_ms=int((time.monotonic() - turn_started) * 1000),
+                           canonical_user_ok=None, canonical_reply_ok=None)
+        return StreamingResponse(attach_agen(), media_type="text/event-stream")
+
     if dry_run:
         async def dry_agen():
             done_sent = False
@@ -4428,55 +4773,62 @@ async def app_post_message(request: Request):
                 for a in attachments]
     # Record the transcript as the canonical text (so other devices see what was
     # said even without the audio bytes), tagged so the app can show 🎤.
-    _user_mid, canonical_user_ok = _canon_add(session, "user", content, att_meta, client_id=client_id)
+    _user_mid, canonical_user_ok = _canon_add_retry(session, "user", content, att_meta,
+                                                    client_id=client_id)
+
+    q: asyncio.Queue = asyncio.Queue()
+    state = {"acc": "", "usage": None, "content_chunks": 0, "keepalives": 0,
+             "runner_error": "", "stream_error": "", "canonical_reply_ok": None,
+             "done_sent": False}
+
+    async def run_turn():
+        # Drains the persona turn to completion INDEPENDENTLY of the client
+        # connection. If the app's network drops mid-stream this task keeps
+        # going and records the reply, so the canonical store always reflects
+        # what actually happened server-side (the tool ran, the calendar was
+        # created) — a reload then shows the real reply instead of losing it.
+        try:
+            async for k, v in _persona_content_stream(session, prompt):
+                if k == "content":
+                    state["acc"] += v
+                    state["content_chunks"] += 1
+                elif k == "usage":
+                    state["usage"] = v
+                elif k == "status":
+                    pass
+                await q.put((k, v))
+        except Exception as e:  # noqa: BLE001
+            state["runner_error"] = f"{type(e).__name__}: {str(e)[:180]}"
+            await q.put(("error", str(e)))
+        finally:
+            if state["acc"]:
+                _reply_mid, reply_ok = _canon_add_retry(session, "assistant", state["acc"],
+                                                        client_id=client_id)
+                state["canonical_reply_ok"] = reply_ok
+            _log_event("app_turn_background_done", **common_log,
+                       output_chars=len(state["acc"]),
+                       content_chunks=state["content_chunks"],
+                       usage_used=(state["usage"] or {}).get("used"),
+                       usage_size=(state["usage"] or {}).get("size"),
+                       canonical_user_ok=canonical_user_ok,
+                       canonical_reply_ok=state["canonical_reply_ok"],
+                       runner_error=state["runner_error"] or None,
+                       duration_ms=int((time.monotonic() - turn_started) * 1000))
+            await q.put((None, None))
+
+    _log_event("app_turn_model_start", **common_log,
+               prompt_chars=len(prompt), canonical_user_ok=canonical_user_ok)
+    # The turn runs as a handler-scope task (not inside the generator) so a
+    # duplicate POST can attach to it via _APP_TURN_INFLIGHT before the client
+    # even starts reading this response.
+    task = asyncio.create_task(run_turn())
+    _BG_TASKS.add(task)
+    task.add_done_callback(_BG_TASKS.discard)
+    if inflight_entry is not None:
+        inflight_entry["task"] = task
+        inflight_entry["state"] = state
 
     async def agen():
-        _log_event("app_turn_model_start", **common_log,
-                   prompt_chars=len(prompt), canonical_user_ok=canonical_user_ok)
-        q: asyncio.Queue = asyncio.Queue()
-        state = {"acc": "", "usage": None, "content_chunks": 0, "keepalives": 0,
-                 "runner_error": "", "stream_error": "", "canonical_reply_ok": None,
-                 "done_sent": False}
-
-        async def run_turn():
-            # Drains the persona turn to completion INDEPENDENTLY of the client
-            # connection. If the app's network drops mid-stream this task keeps
-            # going and records the reply, so the canonical store always reflects
-            # what actually happened server-side (the tool ran, the calendar was
-            # created) — a reload then shows the real reply instead of losing it.
-            try:
-                async for k, v in _persona_content_stream(session, prompt):
-                    if k == "content":
-                        state["acc"] += v
-                        state["content_chunks"] += 1
-                    elif k == "usage":
-                        state["usage"] = v
-                    elif k == "status":
-                        pass
-                    await q.put((k, v))
-            except Exception as e:  # noqa: BLE001
-                state["runner_error"] = f"{type(e).__name__}: {str(e)[:180]}"
-                await q.put(("error", str(e)))
-            finally:
-                if state["acc"]:
-                    _reply_mid, reply_ok = _canon_add(session, "assistant", state["acc"],
-                                                      client_id=client_id)
-                    state["canonical_reply_ok"] = reply_ok
-                _log_event("app_turn_background_done", **common_log,
-                           output_chars=len(state["acc"]),
-                           content_chunks=state["content_chunks"],
-                           usage_used=(state["usage"] or {}).get("used"),
-                           usage_size=(state["usage"] or {}).get("size"),
-                           canonical_user_ok=canonical_user_ok,
-                           canonical_reply_ok=state["canonical_reply_ok"],
-                           runner_error=state["runner_error"] or None,
-                           duration_ms=int((time.monotonic() - turn_started) * 1000))
-                await q.put((None, None))
-
-        task = asyncio.create_task(run_turn())
-        _BG_TASKS.add(task)
-        task.add_done_callback(_BG_TASKS.discard)
-
         try:
             yield chunk({"role": "assistant", "content": ""})
             if queued_at_accept:
@@ -4528,12 +4880,25 @@ async def app_message_interrupt(request: Request):
     body = await request.json()
     session = body.get("session") or "xcash"
     if session not in PERSONAS:
-        raise HTTPException(status_code=400, detail="unknown session")
+        raise http_err(400, "SESSION_NOT_FOUND", "unknown session")
     acp_session = await POOL.get(session, home_for(session))
     if not acp_session.is_busy():
         raise HTTPException(status_code=409, detail="no active turn")
-    await acp_session.cancel()
-    return {"ok": True, "session": session}
+    # Same verify-and-retry contract as /ccsessions/{name}/interrupt: don't
+    # report ok on a cancel that didn't land — check busy and retry up to 3×.
+    attempts = 0
+    interrupted = False
+    for _ in range(3):
+        attempts += 1
+        await acp_session.cancel()
+        await asyncio.sleep(0.7)
+        if not acp_session.is_busy():
+            interrupted = True
+            break
+    _log_event("persona_interrupt", session=session,
+               interrupted=interrupted, attempts=attempts)
+    return {"ok": True, "session": session,
+            "interrupted": interrupted, "attempts": attempts}
 
 
 # ───────────────────────── Approval Center (M21) ───────────────────────────
@@ -4635,7 +5000,7 @@ async def approval_get(aid: str, request: Request):
                     "FROM approvals WHERE id=?", (aid,)).fetchone()
     con.close()
     if not r:
-        raise HTTPException(status_code=404, detail="unknown approval")
+        raise http_err(404, "APPROVAL_NOT_FOUND", "unknown approval")
     return _approval_row(r)
 
 
@@ -4670,11 +5035,12 @@ async def dispatch(request: Request):
     parent = body.get("parent", "yuanfang")
     isolate = bool(body.get("isolate"))
     if not task:
-        raise HTTPException(status_code=400, detail="task required")
+        raise http_err(400, "TASK_REQUIRED", "task required")
     sid = "sub-" + uuid.uuid4().hex[:16]
     SUBSESSIONS[sid] = {"name": task[:40], "parent": parent, "tool": tool,
                         "status": "running", "lastAt": time.time(), "cwd": cwd,
                         "proc": None, "output": [("text", f"**任務:** {task}\n\n")]}
+    _subsession_persist(sid)   # issue #5: registered rows survive a restart
     asyncio.create_task(_run_dispatch(sid, tool, task, cwd, isolate))
     return {"session_id": sid, "type": "subprocess", "tool": tool, "parent": parent}
 
@@ -4702,6 +5068,59 @@ async def _make_worktree(base: str, sid: str):
         return base
 
 
+async def _git_out(*args, timeout: float = 15.0):
+    """Run git, return (rc, stdout_str). Kill-on-timeout like _tmux_run."""
+    p = await asyncio.create_subprocess_exec(
+        "git", *args,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+    try:
+        out, _ = await asyncio.wait_for(p.communicate(), timeout)
+    except asyncio.TimeoutError:
+        try:
+            p.kill()
+        except ProcessLookupError:
+            pass
+        return 124, ""
+    return p.returncode, (out or b"").decode("utf-8", "replace")
+
+
+async def _cleanup_worktree(sid: str, sub: dict):
+    """After an isolated sub finishes: remove its worktree IF it's clean
+    (`git status --porcelain` empty). Dirty trees are kept — someone's
+    uncommitted work lives there — and logged. ~/.pocket/worktrees no longer
+    grows without bound (issue #7)."""
+    wt = sub.get("worktree")
+    if not wt or not os.path.isdir(wt):
+        return
+    try:
+        rc, dirty = await _git_out("-C", wt, "status", "--porcelain")
+        if rc != 0 or dirty.strip():
+            _log_event("worktree_kept", sid=sid, worktree=wt,
+                       reason="status-failed" if rc != 0 else "dirty")
+            return
+        # `worktree remove` must run from the MAIN repo (git refuses to remove
+        # the tree it's currently -C'd into), so resolve the common dir first.
+        rc, common = await _git_out("-C", wt, "rev-parse", "--git-common-dir")
+        common = common.strip()
+        if rc != 0 or not common:
+            _log_event("worktree_kept", sid=sid, worktree=wt, reason="no-common-dir")
+            return
+        if not os.path.isabs(common):
+            common = os.path.abspath(os.path.join(wt, common))
+        main_root = os.path.dirname(common)
+        rc, _ = await _git_out("-C", main_root, "worktree", "remove", wt, timeout=30)
+        if rc == 0:
+            sub["worktree"] = None
+            if sub.get("base_cwd"):
+                sub["cwd"] = sub["base_cwd"]   # follow-ups run in the main tree
+            _log_event("worktree_removed", sid=sid, worktree=wt)
+        else:
+            _log_event("worktree_remove_failed", sid=sid, worktree=wt, rc=rc)
+    except Exception as e:  # noqa: BLE001
+        _log_event("worktree_cleanup_error", sid=sid, worktree=wt,
+                   error=type(e).__name__, error_message=str(e)[:160])
+
+
 def _fmt_item(kind, val):
     """Format one transcript item (text/tool/result/perm) → SSE content string."""
     if kind == "text":
@@ -4725,4 +5144,6 @@ def _fmt_item(kind, val):
 
 @app.get("/health")
 async def health():
-    return {"ok": True, "personas": list(PERSONAS), "subsessions": len(SUBSESSIONS)}
+    return {"ok": True, "personas": list(PERSONAS),
+            "subsessions": len(SUBSESSIONS),
+            "bg_tasks": len(_BG_TASKS)}
