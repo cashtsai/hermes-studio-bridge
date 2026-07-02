@@ -44,6 +44,10 @@ SUBSESSIONS: dict = {}
 # if the client's network drops mid-stream. Without this they could be GC'd.
 _BG_TASKS: set = set()
 
+# One SSE keepalive cadence for every streaming endpoint (issue #8: it was
+# 2s / 4s / 10s across chat, ccsessions and codexsessions for no reason).
+SSE_KEEPALIVE_SECS = 2.0
+
 # Bearer token gate. The bridge fronts a tool-executing agent, so it must not
 # be an open control surface even on the tailnet. Open WebUI sends this as its
 # OpenAI API key. Override via the BRIDGE_TOKEN env var.
@@ -1541,7 +1545,7 @@ async def _persona_content_stream(model: str, prompt: str):
     try:
         while True:
             try:
-                kind, val = await asyncio.wait_for(q.get(), timeout=2.0)
+                kind, val = await asyncio.wait_for(q.get(), timeout=SSE_KEEPALIVE_SECS)
                 last_event = _t.monotonic()
             except asyncio.TimeoutError:
                 if _t.monotonic() - last_event > STALL_LIMIT:
@@ -1629,6 +1633,7 @@ async def chat_completions(request: Request):
         async def sgen():
             yield schunk({"role": "assistant", "content": ""})
             idx = start_idx
+            quiet = 0.0
             while True:
                 while idx < len(sub["output"]):
                     kind, val = sub["output"][idx]
@@ -1636,10 +1641,14 @@ async def chat_completions(request: Request):
                     c = _fmt_item(kind, val)
                     if c:
                         yield schunk({"content": c})
-                if sub.get("status") == "done" and idx >= len(sub["output"]):
+                        quiet = 0.0
+                if sub.get("status") != "running" and idx >= len(sub["output"]):
                     break
                 await asyncio.sleep(0.4)
-                yield ": keepalive\n\n"
+                quiet += 0.4
+                if quiet >= SSE_KEEPALIVE_SECS:
+                    quiet = 0.0
+                    yield ": keepalive\n\n"
             yield schunk({}, finish="stop")
             yield "data: [DONE]\n\n"
 
@@ -2657,7 +2666,7 @@ async def codex_session_stream(thread_id: str, request: Request, replay: int = 2
                 break
             await asyncio.sleep(0.5)
             idle += 1
-            if idle >= 20:
+            if idle >= max(1, int(SSE_KEEPALIVE_SECS / 0.5)):
                 idle = 0
                 yield ": keepalive\n\n"
             if follow and idle_limit > 0 and not CODEX_APP.is_active(thread_id):
@@ -2938,6 +2947,22 @@ async def _tmux_run(*args, timeout: float = _TMUX_TIMEOUT):
             (err or b"").decode("utf-8", "replace").strip())
 
 
+# TTL cache for capture-pane (issue #8): the home list polls every session on
+# every request — 50 sessions used to mean 50 subprocess spawns per poll.
+_PANE_CACHE_TTL = 5.0
+_PANE_CACHE: dict = {}   # name -> (cached_at_monotonic, pane_text)
+
+
+async def _tmux_capture_cached(name: str) -> str:
+    now = time.monotonic()
+    hit = _PANE_CACHE.get(name)
+    if hit and now - hit[0] < _PANE_CACHE_TTL:
+        return hit[1]
+    _, pane, _ = await _tmux_run("capture-pane", "-p", "-t", name)
+    _PANE_CACHE[name] = (now, pane)
+    return pane
+
+
 def _cc_project_dir(workdir: str) -> str:
     return os.path.expanduser("~/.claude/projects/" + workdir.replace("/", "-"))
 
@@ -2996,7 +3021,7 @@ async def _cc_sessions():
             # Mid-turn? Capture the pane and look for the working spinner — so the
             # home list can animate a running CC session (parity with Codex).
             try:
-                _, pane, _ = await _tmux_run("capture-pane", "-p", "-t", name)
+                pane = await _tmux_capture_cached(name)
                 busy = bool(_CC_BUSY_RE.search(pane)) or ("esc to interrupt" in pane.lower())
                 # Parked on a permission / approval prompt → the home list flags it
                 # ("待放行") so a session waiting on you is never invisible.
@@ -3308,7 +3333,7 @@ async def cc_session_stream(name: str, request: Request, replay: int = 80):
                             last_data = time.monotonic()
                     idle = 0
             idle += 1
-            if idle >= 4:                         # ~4s quiet → keepalive comment.
+            if idle >= max(1, int(SSE_KEEPALIVE_SECS)):   # quiet → keepalive comment.
                 # Frequent so any HTTP/tunnel buffering flushes the last data chunk
                 # promptly — an idle session shouldn't leave the transcript's tail
                 # held in a buffer (looked "stuck" on entry until something poked it).
@@ -3610,6 +3635,7 @@ async def cc_session_interrupt(name: str, request: Request):
         if rc:
             raise http_err(502, "TMUX_FAILED", "tmux send-keys failed",
                            err[:200] or "interrupt failed")
+        _PANE_CACHE.pop(name, None)              # the cached pane is now stale
         await asyncio.sleep(0.7)                 # let the TUI react before checking
         pane = await _cc_capture_pane_fresh(name)
         if not _cc_pane_busy(pane):
@@ -3665,7 +3691,7 @@ async def cc_session_status(name: str, request: Request):
         raise http_err(404, "SESSION_NOT_FOUND", "unknown session")
     if not await _tmux_alive(name):
         return {"busy": False, "running": False}
-    _, pane, _ = await _tmux_run("capture-pane", "-p", "-t", name)
+    pane = await _tmux_capture_cached(name)
     busy = bool(_CC_BUSY_RE.search(pane)) or ("esc to interrupt" in pane.lower())
     low = pane.lower()
     if "plan mode on" in low:
@@ -4959,4 +4985,6 @@ def _fmt_item(kind, val):
 
 @app.get("/health")
 async def health():
-    return {"ok": True, "personas": list(PERSONAS), "subsessions": len(SUBSESSIONS)}
+    return {"ok": True, "personas": list(PERSONAS),
+            "subsessions": len(SUBSESSIONS),
+            "bg_tasks": len(_BG_TASKS)}
