@@ -2484,7 +2484,13 @@ def _codex_format_item(item: dict, phase: str = "completed", skip_agent_ids=None
         if item.get("id") in skip_agent_ids:
             return ""
         text = item.get("text") or ""
-        return text if text else ""
+        # Must carry the same **🤖 助手:** marker CC's _fmt_cc_event already emits.
+        # Without it, conversationTurns() (app-side, splits on **🧑 你:**) can't
+        # tell where the user's turn ends and the reply begins, so the whole
+        # agent reply gets folded into the SAME turn as the preceding userMessage
+        # and renders inside the user's (right-aligned, brand-coloured) bubble
+        # instead of its own left-aligned assistant block.
+        return f"\n\n**🤖 助手:** {text}\n\n" if text else ""
     if t == "plan":
         text = item.get("text") or ""
         return f"\n<details><summary>Plan</summary>\n\n{text}\n\n</details>\n" if text else ""
