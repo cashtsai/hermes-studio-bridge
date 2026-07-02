@@ -445,6 +445,11 @@ def _canon_init():
     if "client_id" not in cols:
         con.execute("ALTER TABLE messages ADD COLUMN client_id TEXT")
     con.execute("CREATE INDEX IF NOT EXISTS idx_msg_client ON messages(session, client_id)")
+    # Reaction overlay (G2, pocketagent#39): keyed by the message id the app
+    # sees in GET /app/v1/messages — canonical mids AND tg-<ts> ids alike — so
+    # one table syncs reactions on both app-sent and Telegram-side messages.
+    con.execute("""CREATE TABLE IF NOT EXISTS reactions(
+        msg_id TEXT PRIMARY KEY, session TEXT, reaction TEXT, updated_at REAL)""")
     con.execute("""CREATE TABLE IF NOT EXISTS approvals(
         id TEXT PRIMARY KEY, title TEXT, source TEXT, risk TEXT, detail TEXT,
         created_at REAL, expires_at REAL, status TEXT, decided_at REAL, result TEXT)""")
@@ -3984,7 +3989,53 @@ async def app_get_messages(session: str, request: Request, limit: int = 200):
     _sync_persona_reports(session, 50)
     out.extend(_report_messages(session, limit))
     out.sort(key=lambda m: m.get("ts") or 0)
-    return {"messages": out[-limit:]}
+    out = out[-limit:]
+    # Reaction overlay (G2/#39) — one lookup for the whole page, ids as-is
+    # (canonical mids and tg-<ts> alike), so reactions survive reinstall and
+    # show identically on every device.
+    try:
+        import sqlite3
+        con = sqlite3.connect(f"file:{CANON_DB}?mode=ro", uri=True, timeout=5)
+        rows = con.execute("SELECT msg_id, reaction FROM reactions WHERE session=?",
+                           (session,)).fetchall()
+        con.close()
+        overlay = {r[0]: r[1] for r in rows if r[1]}
+        if overlay:
+            for m in out:
+                r = overlay.get(str(m.get("id")))
+                if r:
+                    m["reaction"] = r
+    except Exception:  # noqa: BLE001
+        pass
+    return {"messages": out}
+
+
+@app.post("/app/v1/messages/{mid}/reaction")
+async def app_set_reaction(mid: str, request: Request):
+    """Set / clear one emoji reaction on a message (G2/#39). Works for both
+    app-sent turns (canonical mid) and Telegram-side rows (tg-<ts> id) — the
+    overlay table doesn't care where the message lives."""
+    _check_auth(request)
+    body = await request.json()
+    session = (body.get("session") or "").strip()
+    if session not in PERSONAS:
+        raise HTTPException(status_code=400, detail="unknown session")
+    reaction = (body.get("reaction") or "").strip()[:8]   # one emoji, not an essay
+    import sqlite3
+    try:
+        con = sqlite3.connect(CANON_DB, timeout=5)
+        if reaction:
+            con.execute("INSERT INTO reactions(msg_id, session, reaction, updated_at) "
+                        "VALUES(?,?,?,?) ON CONFLICT(msg_id) DO UPDATE SET "
+                        "reaction=excluded.reaction, updated_at=excluded.updated_at",
+                        (mid, session, reaction, time.time()))
+        else:
+            con.execute("DELETE FROM reactions WHERE msg_id=?", (mid,))
+        con.commit()
+        con.close()
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=str(e)[:200])
+    return {"ok": True, "reaction": reaction or None}
 
 
 @app.post("/app/v1/messages")
