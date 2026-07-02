@@ -2941,8 +2941,10 @@ async def persona_messages(persona: str, request: Request, limit: int = 100):
 # in tmux). The app reads each session's live transcript jsonl directly and can
 # type into it via tmux send-keys — same live view/control as SSH-ing in.
 
-CCSESS_CONF = os.path.expanduser("~/.config/ccsess/sessions.conf")
+CCSESS_CONF = os.path.expanduser(os.environ.get("CCSESS_CONF", "~/.config/ccsess/sessions.conf"))
 TMUX_BIN = "/opt/homebrew/bin/tmux" if os.path.exists("/opt/homebrew/bin/tmux") else "tmux"
+_CC_HOOK_STATE: dict[str, dict] = {}
+_CC_HOOK_TTL = 600.0
 
 # Hard ceiling for any single tmux invocation. tmux normally answers in ms; a
 # hung tmux server used to hang the handler (and its _BG_TASKS entry) forever.
@@ -3011,6 +3013,32 @@ def _cc_conf_rows():
     return rows
 
 
+def _norm_cc_workdir(path: str) -> str:
+    return os.path.realpath(os.path.abspath(os.path.expanduser(path or "")))
+
+
+def _cc_name_for_cwd(cwd: str | None):
+    if not cwd:
+        return None
+    target = _norm_cc_workdir(cwd)
+    for name, workdir, _enabled in _cc_conf_rows():
+        if _norm_cc_workdir(workdir) == target:
+            return name
+    return None
+
+
+def _cc_fresh_hook_state(name: str):
+    state = _CC_HOOK_STATE.get(name)
+    if not state:
+        return None
+    try:
+        if time.time() - float(state.get("updated_at") or 0) <= _CC_HOOK_TTL:
+            return state
+    except Exception:  # noqa: BLE001
+        return None
+    return None
+
+
 async def _tmux_alive(name: str) -> bool:
     try:
         rc, _, _ = await _tmux_run("has-session", "-t", name)
@@ -3041,11 +3069,15 @@ async def _cc_sessions():
         busy = False
         awaiting = False
         if alive:
+            hook_state = _cc_fresh_hook_state(name)
             # Mid-turn? Capture the pane and look for the working spinner — so the
             # home list can animate a running CC session (parity with Codex).
             try:
                 pane = await _tmux_capture_cached(name)
-                busy = bool(_CC_BUSY_RE.search(pane)) or ("esc to interrupt" in pane.lower())
+                if hook_state:
+                    busy = bool(hook_state.get("busy"))
+                else:
+                    busy = bool(_CC_BUSY_RE.search(pane)) or ("esc to interrupt" in pane.lower())
                 # Parked on a permission / approval prompt → the home list flags it
                 # ("待放行") so a session waiting on you is never invisible.
                 if not busy and _cc_prompt(pane) is not None:
@@ -3707,6 +3739,37 @@ def _cc_prompt(pane: str):
     return None
 
 
+@app.post("/ccsessions/_hook")
+async def cc_session_hook(request: Request):
+    host = _client_host(request)
+    if host not in ("127.0.0.1", "::1", "localhost"):
+        _check_auth(request)
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        return {"ok": True, "ignored": True}
+    if not isinstance(body, dict):
+        return {"ok": True, "ignored": True}
+    event = body.get("hook_event_name")
+    if event not in ("UserPromptSubmit", "Stop"):
+        return {"ok": True, "ignored": True}
+    name = _cc_name_for_cwd(body.get("cwd"))
+    if not name:
+        return {"ok": True, "ignored": True}
+    now = time.time()
+    state = {"busy": event == "UserPromptSubmit", "updated_at": now, "source": "hook"}
+    if event == "Stop":
+        state["last_assistant_message"] = body.get("last_assistant_message")
+    _CC_HOOK_STATE[name] = state
+    _log_event("cc_hook_state",
+               name=name,
+               hook_event_name=event,
+               busy=state["busy"],
+               cwd_hash=_short_hash(str(body.get("cwd") or "")),
+               last_assistant_message_chars=len(str(body.get("last_assistant_message") or "")))
+    return {"ok": True, "session": name, "busy": state["busy"], "source": "hook"}
+
+
 @app.get("/ccsessions/{name}/status")
 async def cc_session_status(name: str, request: Request):
     _check_auth(request)
@@ -3715,7 +3778,11 @@ async def cc_session_status(name: str, request: Request):
     if not await _tmux_alive(name):
         return {"busy": False, "running": False}
     pane = await _tmux_capture_cached(name)
-    busy = bool(_CC_BUSY_RE.search(pane)) or ("esc to interrupt" in pane.lower())
+    hook_state = _cc_fresh_hook_state(name)
+    if hook_state:
+        busy = bool(hook_state.get("busy"))
+    else:
+        busy = bool(_CC_BUSY_RE.search(pane)) or ("esc to interrupt" in pane.lower())
     low = pane.lower()
     if "plan mode on" in low:
         mode = "plan"
