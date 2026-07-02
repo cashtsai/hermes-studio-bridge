@@ -215,6 +215,15 @@ async def acp_full(model: str, prompt: str) -> str:
 app = FastAPI(title="Hermes ↔ OpenAI bridge")
 
 
+@app.get("/")
+async def root():
+    """Unauthenticated liveness probe. The app/monitors hit GET / to decide
+    "bridge up?" — a 404 here was read as bridge-down and fueled an endless
+    reconnect banner loop on the phone (11,936 404s in one log). Cheap, no
+    secrets, no auth."""
+    return {"ok": True, "service": "pocket-bridge", "ts": int(time.time())}
+
+
 @app.get("/v1/models")
 async def list_models(request: Request):
     _check_auth(request)
