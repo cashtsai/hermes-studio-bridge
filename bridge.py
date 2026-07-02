@@ -2132,6 +2132,57 @@ async def serve_file(request: Request, path: str):
     return FileResponse(p)
 
 
+@app.get("/filediff")
+async def serve_filediff(request: Request, path: str):
+    """Diff/content for a file an agent touched (S2, pocketagent#38). Finds the
+    enclosing git repo from the file's own location, returns `git diff HEAD`
+    for it; a file with no pending diff (or outside any repo) falls back to its
+    current content, so the app always has something to show. Same safe-root
+    policy as /file."""
+    _check_auth(request)
+    p = os.path.realpath(os.path.expanduser(path))
+    roots = [os.path.realpath(os.path.expanduser("~"))]
+    for t in ("/tmp", "/private/tmp", "/var/folders"):
+        rt = os.path.realpath(t)
+        if rt not in roots:
+            roots.append(rt)
+    if not any(p == r or p.startswith(r + os.sep) for r in roots) or not os.path.isfile(p):
+        raise HTTPException(status_code=404, detail="not found")
+
+    async def _run(*args, cwd=None):
+        proc = await asyncio.create_subprocess_exec(
+            *args, cwd=cwd,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+        out, _ = await proc.communicate()
+        return proc.returncode, (out or b"").decode("utf-8", "replace")
+
+    d = os.path.dirname(p)
+    rc, top = await _run("git", "-C", d, "rev-parse", "--show-toplevel")
+    diff = ""
+    if rc == 0 and top.strip():
+        # HEAD..worktree for this file — covers staged + unstaged edits.
+        rc2, out = await _run("git", "-C", top.strip(), "diff", "HEAD", "--", p)
+        if rc2 == 0:
+            diff = out
+    if diff:
+        if len(diff) > 200_000:
+            diff = diff[:200_000] + "\n...(truncated)"
+        return {"kind": "diff", "path": p, "text": diff}
+    # No pending diff (already committed / untracked / not a repo) → current
+    # content so "看檔案" still works. Reject binaries by a NUL sniff.
+    try:
+        with open(p, "rb") as f:
+            head = f.read(200_000)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=str(e)[:200])
+    if b"\x00" in head:
+        raise HTTPException(status_code=415, detail="binary file")
+    text = head.decode("utf-8", "replace")
+    if len(head) == 200_000:
+        text += "\n...(truncated)"
+    return {"kind": "content", "path": p, "text": text}
+
+
 # --- Client error log ------------------------------------------------------
 # The app ships every error it hits (failed send, dropped stream, crash, …) here
 # the moment it happens. We append to ONE file on the Mac so Claude can fetch +
