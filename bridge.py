@@ -178,7 +178,7 @@ def _check_auth(request: Request) -> None:
         _log_event("auth_failure", **summary)
     if over:
         raise HTTPException(status_code=429, detail="too many failed auth attempts; slow down")
-    raise HTTPException(status_code=401, detail="invalid bridge token")
+    raise http_err(401, "AUTH_INVALID_TOKEN", "invalid bridge token")
 
 HERMES_BIN = "/Users/xcash/apps/hermes-agent/runtime/venv/bin/hermes"
 HOME_ROOT = "/Users/xcash/apps/hermes-agent/home"
@@ -213,6 +213,47 @@ async def acp_full(model: str, prompt: str) -> str:
 
 
 app = FastAPI(title="Hermes ↔ OpenAI bridge")
+
+
+# ───────────────────────── structured error codes (issue #6) ────────────────
+# Every HTTP error carries a machine-readable code so the app can localize
+# (pocketagent#44) instead of string-matching English detail text. The legacy
+# top-level `detail` field is PRESERVED for old clients.
+class BridgeError(HTTPException):
+    def __init__(self, status: int, code: str, message: str, detail: str = ""):
+        super().__init__(status_code=status, detail=detail or message)
+        self.code = code
+        self.message = message
+
+
+def http_err(status: int, code: str, message: str, detail: str = "") -> BridgeError:
+    """Build a coded HTTP error: raise http_err(404, "SESSION_NOT_FOUND", ...)."""
+    return BridgeError(status, code, message, detail)
+
+
+# Fallback codes for plain HTTPException raises that haven't adopted http_err.
+_GENERIC_ERROR_CODES = {
+    400: "BAD_REQUEST", 401: "AUTH_INVALID_TOKEN", 403: "FORBIDDEN",
+    404: "NOT_FOUND", 409: "CONFLICT", 413: "PAYLOAD_TOO_LARGE",
+    429: "RATE_LIMITED", 500: "INTERNAL_ERROR", 502: "UPSTREAM_FAILED",
+    504: "PROVIDER_TIMEOUT",
+}
+
+from starlette.exceptions import HTTPException as StarletteHTTPException  # noqa: E402
+
+
+@app.exception_handler(StarletteHTTPException)
+async def _bridge_http_exception_handler(request: Request, exc: StarletteHTTPException):
+    detail = exc.detail if isinstance(exc.detail, str) else json.dumps(exc.detail, ensure_ascii=False)
+    code = getattr(exc, "code", "") or _GENERIC_ERROR_CODES.get(exc.status_code, "HTTP_ERROR")
+    message = getattr(exc, "message", "") or detail
+    body = {
+        "detail": exc.detail,   # backward compat: old clients read this
+        "error": {"code": code, "message": message, "detail": detail},
+    }
+    headers = dict(getattr(exc, "headers", None) or {})
+    headers["X-Error-Code"] = code
+    return JSONResponse(status_code=exc.status_code, content=body, headers=headers)
 
 
 @app.get("/")
@@ -1996,6 +2037,8 @@ async def _codex_input_items(text: str, attachments: list) -> list:
 
 
 def _codex_http_error(e: Exception):
+    if isinstance(e, (asyncio.TimeoutError, TimeoutError)):
+        raise http_err(504, "PROVIDER_TIMEOUT", "codex app-server timeout", str(e))
     if isinstance(e, CodexAppServerError):
         code = 409 if e.code == -32600 else 502
         raise HTTPException(status_code=code, detail=str(e))
@@ -2902,7 +2945,7 @@ async def cc_session_rename(name: str, request: Request):
     rows = _cc_conf_rows()
     current = next((r for r in rows if r[0] == name), None)
     if not current:
-        raise HTTPException(status_code=404, detail="unknown session")
+        raise http_err(404, "SESSION_NOT_FOUND", "unknown session")
     try:
         p = await asyncio.create_subprocess_exec(
             os.path.expanduser("~/.local/bin/ccsess"), "rename", name, new_name,
@@ -2926,7 +2969,7 @@ async def _run_ccsess(*args):
     out, err = await p.communicate()
     if p.returncode != 0:
         detail = (err or out or b"ccsess failed").decode("utf-8", "replace")[:300]
-        raise HTTPException(status_code=502, detail=detail)
+        raise http_err(502, "TMUX_FAILED", "ccsess failed", detail)
     return (out or b"").decode("utf-8", "replace")
 
 
@@ -3027,7 +3070,7 @@ async def cc_session_stream(name: str, request: Request, replay: int = 80):
     _check_auth(request)
     row = next((r for r in _cc_conf_rows() if r[0] == name), None)
     if not row:
-        raise HTTPException(status_code=404, detail="unknown session")
+        raise http_err(404, "SESSION_NOT_FOUND", "unknown session")
     workdir = row[1]
     cid = "ccsess-" + uuid.uuid4().hex[:16]
 
@@ -3115,7 +3158,7 @@ async def cc_session_history(name: str, request: Request, offset: int = 0, limit
     _check_auth(request)
     row = next((r for r in _cc_conf_rows() if r[0] == name), None)
     if not row:
-        raise HTTPException(status_code=404, detail="unknown session")
+        raise http_err(404, "SESSION_NOT_FOUND", "unknown session")
     jsonl = _cc_latest_jsonl(row[1])
     if not jsonl or not os.path.exists(jsonl):
         return {"text": "", "more": False}
@@ -3264,8 +3307,8 @@ async def cc_history_resume(sid: str, request: Request):
         stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE)
     _, err = await p.communicate()
     if p.returncode != 0:
-        raise HTTPException(status_code=502,
-                            detail=(err or b"tmux new-session failed").decode("utf-8", "replace")[:200])
+        raise http_err(502, "TMUX_FAILED", "tmux new-session failed",
+                       (err or b"tmux new-session failed").decode("utf-8", "replace")[:200])
     try:
         with open(CCSESS_CONF, "a") as f:
             f.write(f"{name}|{cwd}|1\n")
@@ -3281,7 +3324,7 @@ async def cc_session_input(name: str, request: Request):
     as if you SSH-attached and typed it. Sent literally, then Enter."""
     _check_auth(request)
     if not any(r[0] == name for r in _cc_conf_rows()):
-        raise HTTPException(status_code=404, detail="unknown session")
+        raise http_err(404, "SESSION_NOT_FOUND", "unknown session")
     body = await request.json()
     text = (body.get("text") or "").strip()
     # Relay layer (like the persona attachment path): persist any attachments and
@@ -3311,7 +3354,7 @@ async def cc_session_input(name: str, request: Request):
     if not text:
         raise HTTPException(status_code=400, detail="empty")
     if not await _tmux_alive(name):
-        raise HTTPException(status_code=409, detail="session not running")
+        raise http_err(409, "SESSION_NOT_RUNNING", "session not running")
     target = name
 
     async def _tmux(*args):
@@ -3336,13 +3379,13 @@ async def cc_session_input(name: str, request: Request):
         raise HTTPException(status_code=500, detail=str(e))
     if rc_set or rc_paste or rc_enter:                         # don't false-report success
         detail = (e_set or e_paste or e_enter or "tmux paste failed")[:200]
-        raise HTTPException(status_code=502, detail=detail)
+        raise http_err(502, "TMUX_FAILED", "tmux paste failed", detail)
     return {"ok": True}
 
 
 async def _cc_paste_text(name: str, text: str) -> None:
     if not await _tmux_alive(name):
-        raise HTTPException(status_code=409, detail="session not running")
+        raise http_err(409, "SESSION_NOT_RUNNING", "session not running")
 
     async def _tmux(*args):
         p = await asyncio.create_subprocess_exec(
@@ -3359,7 +3402,7 @@ async def _cc_paste_text(name: str, text: str) -> None:
     rc_enter, e_enter = await _tmux("send-keys", "-t", name, "Enter")
     if rc_set or rc_paste or rc_enter:
         detail = (e_set or e_paste or e_enter or "tmux paste failed")[:200]
-        raise HTTPException(status_code=502, detail=detail)
+        raise http_err(502, "TMUX_FAILED", "tmux paste failed", detail)
 
 
 async def _cc_capture_pane_fresh(name: str) -> str:
@@ -3387,9 +3430,9 @@ async def cc_session_interrupt(name: str, request: Request):
     so the app's stop button could 200 six times while the turn kept running."""
     _check_auth(request)
     if not any(r[0] == name for r in _cc_conf_rows()):
-        raise HTTPException(status_code=404, detail="unknown session")
+        raise http_err(404, "SESSION_NOT_FOUND", "unknown session")
     if not await _tmux_alive(name):
-        raise HTTPException(status_code=409, detail="session not running")
+        raise http_err(409, "SESSION_NOT_RUNNING", "session not running")
     attempts = 0
     interrupted = False
     for _ in range(3):
@@ -3399,8 +3442,8 @@ async def cc_session_interrupt(name: str, request: Request):
             stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE)
         _, err = await p.communicate()
         if p.returncode:
-            raise HTTPException(status_code=502,
-                detail=(err or b"").decode("utf-8", "replace")[:200] or "interrupt failed")
+            raise http_err(502, "TMUX_FAILED", "tmux send-keys failed",
+                (err or b"").decode("utf-8", "replace")[:200] or "interrupt failed")
         await asyncio.sleep(0.7)                 # let the TUI react before checking
         pane = await _cc_capture_pane_fresh(name)
         if not _cc_pane_busy(pane):
@@ -3453,7 +3496,7 @@ def _cc_prompt(pane: str):
 async def cc_session_status(name: str, request: Request):
     _check_auth(request)
     if not any(r[0] == name for r in _cc_conf_rows()):
-        raise HTTPException(status_code=404, detail="unknown session")
+        raise http_err(404, "SESSION_NOT_FOUND", "unknown session")
     if not await _tmux_alive(name):
         return {"busy": False, "running": False}
     p = await asyncio.create_subprocess_exec(
@@ -3486,9 +3529,9 @@ _CC_KEYS = {
 async def cc_session_key(name: str, request: Request):
     _check_auth(request)
     if not any(r[0] == name for r in _cc_conf_rows()):
-        raise HTTPException(status_code=404, detail="unknown session")
+        raise http_err(404, "SESSION_NOT_FOUND", "unknown session")
     if not await _tmux_alive(name):
-        raise HTTPException(status_code=409, detail="session not running")
+        raise http_err(409, "SESSION_NOT_RUNNING", "session not running")
     body = await request.json()
     raw = str(body.get("key") or "").strip()
     if not raw:
@@ -3506,8 +3549,8 @@ async def cc_session_key(name: str, request: Request):
         stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE)
     _, err = await p.communicate()
     if p.returncode:
-        raise HTTPException(status_code=502,
-            detail=(err or b"").decode("utf-8", "replace")[:200] or "send-keys failed")
+        raise http_err(502, "TMUX_FAILED", "tmux send-keys failed",
+            (err or b"").decode("utf-8", "replace")[:200] or "send-keys failed")
     return {"ok": True}
 
 
@@ -4216,7 +4259,7 @@ async def app_get_messages(session: str, request: Request, limit: int = 200):
     device sees the same interleaved conversation."""
     _check_auth(request)
     if session not in PERSONAS:
-        raise HTTPException(status_code=400, detail="unknown session")
+        raise http_err(400, "SESSION_NOT_FOUND", "unknown session")
     out = _canon_messages(session, limit)
     _, home = PERSONAS[session]
     for m in _persona_history(home, limit):
@@ -4259,7 +4302,7 @@ async def app_set_reaction(mid: str, request: Request):
     body = await request.json()
     session = (body.get("session") or "").strip()
     if session not in PERSONAS:
-        raise HTTPException(status_code=400, detail="unknown session")
+        raise http_err(400, "SESSION_NOT_FOUND", "unknown session")
     reaction = (body.get("reaction") or "").strip()[:8]   # one emoji, not an essay
     import sqlite3
     try:
@@ -4286,7 +4329,7 @@ async def app_post_message(request: Request):
     body = await request.json()
     session = body.get("session") or "xcash"
     if session not in PERSONAS:
-        raise HTTPException(status_code=400, detail="unknown session")
+        raise http_err(400, "SESSION_NOT_FOUND", "unknown session")
     content = (body.get("content") or "").strip()
     attachments = body.get("attachments") or []   # [{kind,filename,mime,data(dataURI)}]
     dry_run = bool(body.get("dry_run"))
@@ -4497,7 +4540,7 @@ async def app_message_interrupt(request: Request):
     body = await request.json()
     session = body.get("session") or "xcash"
     if session not in PERSONAS:
-        raise HTTPException(status_code=400, detail="unknown session")
+        raise http_err(400, "SESSION_NOT_FOUND", "unknown session")
     acp_session = await POOL.get(session, home_for(session))
     if not acp_session.is_busy():
         raise HTTPException(status_code=409, detail="no active turn")
@@ -4617,7 +4660,7 @@ async def approval_get(aid: str, request: Request):
                     "FROM approvals WHERE id=?", (aid,)).fetchone()
     con.close()
     if not r:
-        raise HTTPException(status_code=404, detail="unknown approval")
+        raise http_err(404, "APPROVAL_NOT_FOUND", "unknown approval")
     return _approval_row(r)
 
 
@@ -4652,7 +4695,7 @@ async def dispatch(request: Request):
     parent = body.get("parent", "yuanfang")
     isolate = bool(body.get("isolate"))
     if not task:
-        raise HTTPException(status_code=400, detail="task required")
+        raise http_err(400, "TASK_REQUIRED", "task required")
     sid = "sub-" + uuid.uuid4().hex[:16]
     SUBSESSIONS[sid] = {"name": task[:40], "parent": parent, "tool": tool,
                         "status": "running", "lastAt": time.time(), "cwd": cwd,
