@@ -563,6 +563,13 @@ def _canon_init():
     con.execute("CREATE INDEX IF NOT EXISTS idx_delegation_parent ON delegations(parent_persona, updated_at)")
     con.execute("CREATE INDEX IF NOT EXISTS idx_delegation_provider ON delegations(provider, provider_session_id)")
     con.execute("CREATE INDEX IF NOT EXISTS idx_delegation_task ON delegations(task_code, subtask_code)")
+    # SUBSESSIONS persistence (issue #5, plan A): /dispatch sub-sessions used to
+    # live only in the in-memory dict, so a bridge restart wiped them all —
+    # transcript, resume target (cc_session) and isolate cwd included.
+    con.execute("""CREATE TABLE IF NOT EXISTS subsessions(
+        sid TEXT PRIMARY KEY, name TEXT, parent TEXT, tool TEXT, status TEXT,
+        cwd TEXT, worktree TEXT, cc_session TEXT, last_user TEXT,
+        last_at REAL, output_json TEXT)""")
     con.commit()
     con.close()
 
@@ -918,6 +925,91 @@ def _canon_messages(session: str, limit: int = 200):
     return [{"id": r[0], "role": r[1], "content": r[2],
              "attachments": json.loads(r[3] or "[]"), "ts": r[4],
              "status": r[5], "source": "app"} for r in rows]
+
+
+# ───────────────────── SUBSESSIONS persistence (issue #5) ───────────────────
+_SUB_OUTPUT_JSON_CAP = 2 * 1024 * 1024   # ~2MB persisted transcript per sub
+_SUB_TRUNC_MARKER = ("text", "_(前段已截斷)_\n\n")
+
+
+def _sub_output_json(output: list) -> str:
+    """Serialize a sub's transcript, truncating OLDEST items to stay ≤ ~2MB."""
+    items = [[k, v] for k, v in (output or [])]
+    js = json.dumps(items, ensure_ascii=False)
+    if len(js) <= _SUB_OUTPUT_JSON_CAP:
+        return js
+    while items and len(js) > _SUB_OUTPUT_JSON_CAP:
+        drop = max(1, len(items) // 10)      # shed in chunks, not one-by-one
+        items = items[drop:]
+        js = json.dumps([list(_SUB_TRUNC_MARKER)] + items, ensure_ascii=False)
+    return js
+
+
+def _subsession_persist(sid: str) -> bool:
+    """Flush one SUBSESSIONS entry to canonical.db (insert-or-replace)."""
+    import sqlite3
+    sub = SUBSESSIONS.get(sid)
+    if not sub:
+        return False
+    try:
+        con = sqlite3.connect(CANON_DB, timeout=30)
+        con.execute("INSERT OR REPLACE INTO subsessions"
+                    "(sid,name,parent,tool,status,cwd,worktree,cc_session,"
+                    "last_user,last_at,output_json) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                    (sid, sub.get("name"), sub.get("parent"), sub.get("tool"),
+                     sub.get("status"), sub.get("cwd"), sub.get("worktree"),
+                     sub.get("cc_session"), sub.get("last_user"),
+                     sub.get("lastAt") or time.time(),
+                     _sub_output_json(sub.get("output"))))
+        con.commit()
+        con.close()
+        return True
+    except Exception as e:  # noqa: BLE001
+        _log_event("subsession_persist_failed", sid=sid,
+                   error=type(e).__name__, error_message=str(e)[:160])
+        return False
+
+
+def _subsessions_load():
+    """Rebuild SUBSESSIONS from canonical.db on startup. Anything that was
+    status=running when the bridge died is marked interrupted, with a
+    transcript note, so the app shows an honest state instead of a dead row."""
+    import sqlite3
+    try:
+        con = sqlite3.connect(CANON_DB, timeout=30)
+        rows = con.execute(
+            "SELECT sid,name,parent,tool,status,cwd,worktree,cc_session,"
+            "last_user,last_at,output_json FROM subsessions").fetchall()
+        interrupted = [r[0] for r in rows if r[4] == "running"]
+        if interrupted:
+            con.executemany("UPDATE subsessions SET status='interrupted' WHERE sid=?",
+                            [(sid,) for sid in interrupted])
+            con.commit()
+        con.close()
+    except Exception as e:  # noqa: BLE001
+        _log_event("subsessions_load_failed",
+                   error=type(e).__name__, error_message=str(e)[:160])
+        return
+    loaded = 0
+    for (sid, name, parent, tool, status, cwd, worktree, cc_session,
+         last_user, last_at, output_json) in rows:
+        try:
+            output = [(k, v) for k, v in json.loads(output_json or "[]")]
+        except Exception:  # noqa: BLE001
+            output = []
+        if status == "running":
+            status = "interrupted"
+            output.append(("text", "\n\n_(bridge 重啟,行程已中斷,可追問續跑)_\n"))
+        SUBSESSIONS[sid] = {
+            "name": name, "parent": parent, "tool": tool, "status": status,
+            "cwd": cwd, "worktree": worktree, "cc_session": cc_session,
+            "last_user": last_user, "lastAt": last_at, "proc": None,
+            "output": output,
+        }
+        loaded += 1
+    if loaded:
+        _log_event("subsessions_loaded", count=loaded,
+                   interrupted=len(interrupted))
 
 
 _WORK_ORDER_PREFIX = {
@@ -1407,6 +1499,7 @@ async def push_notify(title: str, body: str, data: dict | None = None) -> int:
 
 _canon_init()
 _accounts_init()
+_subsessions_load()   # issue #5: rebuild /dispatch subs after restart
 
 
 async def _persona_content_stream(model: str, prompt: str):
@@ -2665,6 +2758,7 @@ async def _stream_agent(sid: str, argv: list, cwd: str, fail_label: str):
         # Isolated dispatch: reclaim the worktree if the agent left it clean.
         if sub.get("worktree"):
             await _cleanup_worktree(sid, sub)
+        _subsession_persist(sid)   # issue #5: flush transcript + resume target
         # M23: push when a dispatched CC/Codex task finishes, so the app surfaces
         # it even when backgrounded (Telegram is the fallback now, not the primary
         # signal). Fire-and-forget; failures are swallowed inside push_notify.
@@ -4761,6 +4855,7 @@ async def dispatch(request: Request):
     SUBSESSIONS[sid] = {"name": task[:40], "parent": parent, "tool": tool,
                         "status": "running", "lastAt": time.time(), "cwd": cwd,
                         "proc": None, "output": [("text", f"**任務:** {task}\n\n")]}
+    _subsession_persist(sid)   # issue #5: registered rows survive a restart
     asyncio.create_task(_run_dispatch(sid, tool, task, cwd, isolate))
     return {"session_id": sid, "type": "subprocess", "tool": tool, "parent": parent}
 
