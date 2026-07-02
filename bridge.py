@@ -3721,6 +3721,11 @@ async def cc_session_status(name: str, request: Request):
         mode = "plan"
     elif "auto mode on" in low or "accept edits on" in low or "bypass" in low:
         mode = "auto"
+    elif busy:
+        # A running turn replaces the bottom bar with "esc to interrupt" — the
+        # mode marker is hidden, not absent. Claiming "normal" here made the app
+        # snap the user's pick back to 一般 on the next 1.2s reconcile.
+        mode = None
     else:
         mode = "normal"
     return {"busy": busy, "running": True, "mode": mode, "prompt": _cc_prompt(pane)}
@@ -3759,6 +3764,9 @@ async def cc_session_key(name: str, request: Request):
     if rc:
         raise http_err(502, "TMUX_FAILED", "tmux send-keys failed",
                        err[:200] or "send-keys failed")
+    # The key just changed the TUI (mode toggle, menu pick) — a cached pane
+    # would feed the app a pre-keystroke mode/prompt for up to TTL seconds.
+    _PANE_CACHE.pop(name, None)
     return {"ok": True}
 
 
