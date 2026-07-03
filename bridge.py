@@ -593,6 +593,12 @@ def _canon_init():
     con.execute("""CREATE TABLE IF NOT EXISTS approvals(
         id TEXT PRIMARY KEY, title TEXT, source TEXT, risk TEXT, detail TEXT,
         created_at REAL, expires_at REAL, status TEXT, decided_at REAL, result TEXT)""")
+    # B4 (issue #9): decision push-back — the creating skill can register a
+    # callback URL that gets POSTed when the approval is decided/expired,
+    # instead of having to poll GET /app/v1/approvals/{id}.
+    approval_cols = [r[1] for r in con.execute("PRAGMA table_info(approvals)").fetchall()]
+    if "callback" not in approval_cols:
+        con.execute("ALTER TABLE approvals ADD COLUMN callback TEXT")
     con.execute("""CREATE TABLE IF NOT EXISTS devices(
         token TEXT PRIMARY KEY, platform TEXT, created_at REAL)""")
     con.execute("""CREATE TABLE IF NOT EXISTS report_events(
@@ -6109,6 +6115,27 @@ def _approvals_expire(con):
                 "AND expires_at IS NOT NULL AND expires_at < ?", (time.time(),))
 
 
+# B4 (issue #9): an approval that never expires pends forever if the phone
+# misses the push — default to 1h, clamp to [30s, 7d] so a typo'd ttl can't
+# create an immortal (or instantly-dead) row.
+_APPROVAL_TTL_DEFAULT = 3600.0
+_APPROVAL_TTL_MIN, _APPROVAL_TTL_MAX = 30.0, 7 * 86400.0
+
+
+async def _approval_fire_callback(aid: str, callback: str, status: str, result):
+    """POST the decision to the creator's callback URL (fire-and-forget)."""
+    try:
+        import httpx
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.post(callback, json={"id": aid, "status": status,
+                                                  "result": result})
+        _log_event("approval_callback_sent", id=aid, status=status,
+                   http_status=r.status_code)
+    except Exception as e:  # noqa: BLE001
+        _log_event("approval_callback_failed", id=aid, status=status,
+                   error=type(e).__name__, error_message=str(e)[:160])
+
+
 @app.post("/app/v1/approvals")
 async def approval_create(request: Request):
     """Create a pending approval (called by Hermes / a skill)."""
@@ -6116,21 +6143,28 @@ async def approval_create(request: Request):
     import sqlite3
     b = await request.json()
     aid = b.get("id") or uuid.uuid4().hex
-    ttl = b.get("ttl_seconds")
+    try:
+        ttl = float(b.get("ttl_seconds") or _APPROVAL_TTL_DEFAULT)
+    except (TypeError, ValueError):
+        ttl = _APPROVAL_TTL_DEFAULT
+    ttl = max(_APPROVAL_TTL_MIN, min(ttl, _APPROVAL_TTL_MAX))
+    callback = (str(b.get("callback_url") or "").strip() or None)
+    if callback and not callback.startswith(("http://", "https://")):
+        raise HTTPException(status_code=400, detail="callback_url must be http(s)")
     now = time.time()
     con = sqlite3.connect(CANON_DB)
     con.execute("INSERT OR REPLACE INTO approvals"
-                "(id,title,source,risk,detail,created_at,expires_at,status,decided_at,result) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?)",
+                "(id,title,source,risk,detail,created_at,expires_at,status,decided_at,result,callback) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                 (aid, b.get("title") or "需要核准", b.get("source") or "", b.get("risk") or "",
-                 b.get("detail") or "", now, (now + ttl) if ttl else None, "pending", None, None))
+                 b.get("detail") or "", now, now + ttl, "pending", None, None, callback))
     con.commit()
     con.close()
     title = b.get("title") or "需要核准"
     body = (b.get("detail") or b.get("source") or "點開查看並決定")[:120]
     asyncio.create_task(push_notify(f"🔐 {title}", body,
                                     {"kind": "approval", "id": aid}))
-    return {"id": aid, "status": "pending"}
+    return {"id": aid, "status": "pending", "expires_at": now + ttl}
 
 
 @app.post("/app/v1/devices")
@@ -6163,21 +6197,32 @@ async def push_test(request: Request):
 
 
 @app.get("/app/v1/approvals")
-async def approval_list(request: Request, status: str = "", limit: int = 50):
+async def approval_list(request: Request, status: str = "", limit: int = 50,
+                        offset: int = 0):
+    """List approvals. B4 (issue #9): paginated — limit is clamped, `offset`
+    pages back, `total` lets the app render 'N more'."""
     _check_auth(request)
     import sqlite3
+    lim = max(1, min(int(limit or 50), 200))
+    off = max(0, int(offset or 0))
     con = sqlite3.connect(CANON_DB)
     _approvals_expire(con)
     con.commit()
     if status:
+        total = con.execute("SELECT COUNT(*) FROM approvals WHERE status=?",
+                            (status,)).fetchone()[0]
         rows = con.execute("SELECT id,title,source,risk,detail,created_at,expires_at,status,decided_at,result "
-                           "FROM approvals WHERE status=? ORDER BY created_at DESC LIMIT ?",
-                           (status, limit)).fetchall()
+                           "FROM approvals WHERE status=? ORDER BY created_at DESC LIMIT ? OFFSET ?",
+                           (status, lim, off)).fetchall()
     else:
+        total = con.execute("SELECT COUNT(*) FROM approvals").fetchone()[0]
         rows = con.execute("SELECT id,title,source,risk,detail,created_at,expires_at,status,decided_at,result "
-                           "FROM approvals ORDER BY created_at DESC LIMIT ?", (limit,)).fetchall()
+                           "FROM approvals ORDER BY created_at DESC LIMIT ? OFFSET ?",
+                           (lim, off)).fetchall()
     con.close()
-    return {"approvals": [_approval_row(r) for r in rows]}
+    out = [_approval_row(r) for r in rows]
+    return {"approvals": out, "total": total,
+            "next_offset": (off + lim) if off + lim < total else None}
 
 
 @app.get("/app/v1/approvals/{aid}")
@@ -6225,9 +6270,15 @@ async def approval_decide(aid: str, request: Request):
                       (decision, time.time(), b.get("result") or "", aid))
     con.commit()
     changed = cur.rowcount
+    cb_row = con.execute("SELECT callback FROM approvals WHERE id=?", (aid,)).fetchone()
     con.close()
     if not changed:
         raise HTTPException(status_code=409, detail="already decided or expired")
+    # B4 (issue #9): push the decision back to the creator (Hermes skill / TG
+    # flow) so it doesn't have to poll GET /app/v1/approvals/{id}.
+    if cb_row and cb_row[0]:
+        asyncio.create_task(_approval_fire_callback(
+            aid, cb_row[0], decision, b.get("result") or ""))
     return {"id": aid, "status": decision}
 
 
