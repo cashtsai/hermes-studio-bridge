@@ -207,12 +207,43 @@ HERMES_BIN = "/Users/xcash/apps/hermes-agent/runtime/venv/bin/hermes"
 HOME_ROOT = "/Users/xcash/apps/hermes-agent/home"
 
 # model id -> (display name, HERMES_HOME). id stays ascii for client URLs.
-PERSONAS = {
+# G6 (wave 2): these four are the code-level BUILTINS; the personas table in
+# canonical.db overlays them (rename / disable / soft-delete) and adds custom
+# personas. PERSONAS itself stays a plain {id: (display, home)} dict mutated
+# in place by _personas_reload(), so every existing consumer keeps working and
+# CRUD takes effect without a restart.
+_PERSONAS_BUILTIN = {
     "yuanfang":    ("袁方 (幕僚長/main)", HOME_ROOT),
     "pantianqing": ("潘天晴 (FLiPER)",    f"{HOME_ROOT}/profiles/fliper"),
     "xcash":       ("XCash (PocketAgent 協調)", f"{HOME_ROOT}/profiles/xcash"),
     "shuijing":    ("水鏡 (shuijing)",    f"{HOME_ROOT}/profiles/shuijing"),
 }
+PERSONAS = dict(_PERSONAS_BUILTIN)
+
+
+def _personas_db_rows() -> list:
+    import sqlite3
+    try:
+        con = sqlite3.connect(f"file:{CANON_DB}?mode=ro", uri=True, timeout=5)
+        rows = con.execute("SELECT id,name,home,enabled,deleted FROM personas").fetchall()
+        con.close()
+        return rows
+    except Exception:  # noqa: BLE001
+        return []      # table not created yet (first boot) → builtins only
+
+
+def _personas_reload() -> None:
+    """Rebuild PERSONAS from builtins + the personas table. In-place mutation:
+    all lookups (home_for, /sessions, message endpoints) see changes at once."""
+    merged = dict(_PERSONAS_BUILTIN)
+    for pid, name, home, enabled, deleted in _personas_db_rows():
+        if deleted or not enabled:
+            merged.pop(pid, None)
+            continue
+        base = merged.get(pid, (pid, HOME_ROOT))
+        merged[pid] = (name or base[0], home or base[1])
+    PERSONAS.clear()
+    PERSONAS.update(merged)
 
 # Per-(persona, conversation) hermes session name. Open WebUI doesn't send a
 # stable conversation id in the OpenAI schema, so we key on persona only —
@@ -595,6 +626,12 @@ def _canon_init():
     meta_cols = [r[1] for r in con.execute("PRAGMA table_info(message_meta)").fetchall()]
     if "deleted" not in meta_cols:
         con.execute("ALTER TABLE message_meta ADD COLUMN deleted INTEGER")
+    # G6 (wave 2): persona registry — overlays/extends the code builtins so
+    # personas can be added / renamed / disabled without editing bridge.py.
+    con.execute("""CREATE TABLE IF NOT EXISTS personas(
+        id TEXT PRIMARY KEY, name TEXT, home TEXT,
+        enabled INTEGER NOT NULL DEFAULT 1, deleted INTEGER NOT NULL DEFAULT 0,
+        created_at REAL, updated_at REAL)""")
     con.execute("""CREATE TABLE IF NOT EXISTS approvals(
         id TEXT PRIMARY KEY, title TEXT, source TEXT, risk TEXT, detail TEXT,
         created_at REAL, expires_at REAL, status TEXT, decided_at REAL, result TEXT)""")
@@ -1665,6 +1702,7 @@ async def push_notify(title: str, body: str, data: dict | None = None) -> int:
 _canon_init()
 _accounts_init()
 _subsessions_load()   # issue #5: rebuild /dispatch subs after restart
+_personas_reload()    # G6: apply persona overrides/customs from canonical.db
 
 
 async def _persona_content_stream(model: str, prompt: str):
@@ -5810,6 +5848,158 @@ async def app_message_retract(request: Request):
         _log_event("message_meta_write_failed", kind="retract",
                    message_id=message_id, error=type(e).__name__)
         raise HTTPException(status_code=500, detail=str(e)[:200])
+    return {"ok": True}
+
+
+# ───────────────────────── personas CRUD (G6, wave 2) ──────────────────────
+_PERSONA_ID_RE = re.compile(r"^[a-z0-9_-]{1,32}$")
+
+
+def _persona_profile_of(home: str) -> str:
+    """Human-facing profile name for a home path (main / profiles/<x> tail)."""
+    if home == HOME_ROOT:
+        return "main"
+    prefix = f"{HOME_ROOT}/profiles/"
+    return home[len(prefix):] if home.startswith(prefix) else os.path.basename(home or "")
+
+
+def _persona_home_from_body(body: dict) -> str | None:
+    """Resolve home from body {home} or {profile}; None when neither given."""
+    home = str(body.get("home") or "").strip()
+    profile = str(body.get("profile") or "").strip()
+    if home:
+        return os.path.realpath(os.path.expanduser(home))
+    if profile:
+        return HOME_ROOT if profile == "main" else f"{HOME_ROOT}/profiles/{profile}"
+    return None
+
+
+def _persona_public(pid: str, name: str, home: str, enabled: bool,
+                    deleted: bool) -> dict:
+    return {"id": pid, "name": name, "profile": _persona_profile_of(home),
+            "home": home, "enabled": enabled, "deleted": deleted,
+            "builtin": pid in _PERSONAS_BUILTIN}
+
+
+def _persona_row_get(pid: str):
+    import sqlite3
+    con = sqlite3.connect(f"file:{CANON_DB}?mode=ro", uri=True, timeout=5)
+    r = con.execute("SELECT id,name,home,enabled,deleted FROM personas WHERE id=?",
+                    (pid,)).fetchone()
+    con.close()
+    return r
+
+
+def _persona_row_upsert(pid: str, name: str, home: str, enabled: int, deleted: int):
+    import sqlite3
+    con = sqlite3.connect(CANON_DB, timeout=30)
+    con.execute("PRAGMA busy_timeout=30000")
+    con.execute("INSERT INTO personas(id,name,home,enabled,deleted,created_at,updated_at) "
+                "VALUES(?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET "
+                "name=excluded.name, home=excluded.home, enabled=excluded.enabled, "
+                "deleted=excluded.deleted, updated_at=excluded.updated_at",
+                (pid, name, home, enabled, deleted, time.time(), time.time()))
+    con.commit()
+    con.close()
+
+
+@app.get("/app/v1/personas")
+async def personas_list(request: Request):
+    """Full persona registry (builtins + custom), including disabled/deleted
+    entries so the app can render a management list. What the conversation UI
+    should offer is exactly the entries with enabled && !deleted (== the live
+    PERSONAS routing table)."""
+    _check_auth(request)
+    rows = {r[0]: r for r in _personas_db_rows()}
+    out = []
+    for pid, (disp, home) in _PERSONAS_BUILTIN.items():
+        r = rows.pop(pid, None)
+        if r:
+            out.append(_persona_public(pid, r[1] or disp, r[2] or home,
+                                       bool(r[3]) and not r[4], bool(r[4])))
+        else:
+            out.append(_persona_public(pid, disp, home, True, False))
+    for pid, r in rows.items():
+        out.append(_persona_public(pid, r[1] or pid, r[2] or HOME_ROOT,
+                                   bool(r[3]) and not r[4], bool(r[4])))
+    return {"personas": out}
+
+
+@app.post("/app/v1/personas")
+async def personas_create(request: Request):
+    """Add a persona without touching bridge.py. The home (or profile) must
+    already exist on disk — a Hermes profile is provisioned outside the bridge;
+    this endpoint only registers it for routing."""
+    _check_auth(request)
+    body = await request.json()
+    pid = str(body.get("id") or "").strip().lower()
+    name = str(body.get("name") or "").strip()
+    if not pid and name:
+        pid = re.sub(r"[^a-z0-9_-]", "", name.lower())[:32]
+    if not _PERSONA_ID_RE.match(pid or ""):
+        raise HTTPException(status_code=400,
+                            detail="id required: 1-32 chars of a-z 0-9 _ -")
+    if not name:
+        raise HTTPException(status_code=400, detail="name required")
+    home = _persona_home_from_body(body)
+    if not home:
+        raise HTTPException(status_code=400, detail="profile or home required")
+    if not os.path.isdir(home):
+        raise HTTPException(status_code=400,
+                            detail=f"persona home not found: {home}")
+    existing = _persona_row_get(pid)
+    if pid in PERSONAS or (existing and not existing[4]):
+        raise http_err(409, "PERSONA_EXISTS", "persona id already in use")
+    _persona_row_upsert(pid, name, home, 1, 0)
+    _personas_reload()
+    _log_event("persona_created", id=pid, home=home)
+    return _persona_public(pid, name, home, True, False)
+
+
+@app.patch("/app/v1/personas/{pid}")
+async def personas_patch(pid: str, request: Request):
+    """Rename / re-home / enable / disable a persona (builtin or custom).
+    enabled=true also un-deletes, so DELETE is reversible from the app."""
+    _check_auth(request)
+    body = await request.json()
+    row = _persona_row_get(pid)
+    builtin = _PERSONAS_BUILTIN.get(pid)
+    if row is None and builtin is None:
+        raise http_err(404, "PERSONA_NOT_FOUND", "unknown persona")
+    cur_name = (row[1] if row else None) or (builtin[0] if builtin else pid)
+    cur_home = (row[2] if row else None) or (builtin[1] if builtin else HOME_ROOT)
+    cur_enabled = bool(row[3]) if row else True
+    cur_deleted = bool(row[4]) if row else False
+    name = str(body.get("name") or "").strip() or cur_name
+    home = _persona_home_from_body(body) or cur_home
+    if not os.path.isdir(home):
+        raise HTTPException(status_code=400,
+                            detail=f"persona home not found: {home}")
+    if "enabled" in body:
+        enabled = bool(body.get("enabled"))
+        deleted = False if enabled else cur_deleted
+    else:
+        enabled, deleted = cur_enabled, cur_deleted
+    _persona_row_upsert(pid, name, home, 1 if enabled else 0, 1 if deleted else 0)
+    _personas_reload()
+    _log_event("persona_patched", id=pid, enabled=enabled, deleted=deleted)
+    return _persona_public(pid, name, home, enabled and not deleted, deleted)
+
+
+@app.delete("/app/v1/personas/{pid}")
+async def personas_delete(pid: str, request: Request):
+    """Soft delete: the row is kept (deleted=1, enabled=0) and the persona
+    drops out of routing; PATCH {"enabled": true} restores it."""
+    _check_auth(request)
+    row = _persona_row_get(pid)
+    builtin = _PERSONAS_BUILTIN.get(pid)
+    if row is None and builtin is None:
+        raise http_err(404, "PERSONA_NOT_FOUND", "unknown persona")
+    name = (row[1] if row else None) or (builtin[0] if builtin else pid)
+    home = (row[2] if row else None) or (builtin[1] if builtin else HOME_ROOT)
+    _persona_row_upsert(pid, name, home, 0, 1)
+    _personas_reload()
+    _log_event("persona_deleted", id=pid)
     return {"ok": True}
 
 
