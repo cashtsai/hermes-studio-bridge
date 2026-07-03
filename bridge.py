@@ -20,6 +20,7 @@ import json
 import os
 import re
 import secrets
+import shlex
 import threading
 import time
 import uuid
@@ -1295,6 +1296,8 @@ async def _delegation_runtime_status(row) -> str:
     provider = d.get("provider") or ""
     if provider == "codex":
         tid = d.get("codex_thread_id") or d.get("provider_session_id") or ""
+        if tid and CODEX_APP.pending_approval_for_thread(tid):
+            return "waiting_approval"
         if tid and CODEX_APP.is_active(tid):
             return "running"
         if d.get("status") in ("failed", "archived"):
@@ -1337,8 +1340,12 @@ async def _delegation_v2_sessions() -> list:
         caps = ["input", "attachments", "replay", "follow"]
         if d.get("provider") in ("codex", "claude_code"):
             caps.append("interrupt")
-        if d.get("provider") == "claude_code" and st == "waiting_approval":
+        if d.get("provider") in ("codex", "claude_code") and st == "waiting_approval":
             caps.append("approve")
+        approval = None
+        if d.get("provider") == "codex":
+            tid = d.get("codex_thread_id") or d.get("provider_session_id") or ""
+            approval = CODEX_APP._approval_public(CODEX_APP.pending_approval_for_thread(tid))
         out.append({
             "id": f"delegation:{d['id']}",
             "provider": d.get("provider"),
@@ -1348,7 +1355,7 @@ async def _delegation_v2_sessions() -> list:
             "last_event_at": d.get("updated_at"),
             "capabilities": caps,
             "meta": {"delegation": d, "work_order": d.get("work_order"),
-                     "takeover": d.get("takeover")},
+                     "takeover": d.get("takeover"), "approval": approval},
         })
     return out
 
@@ -1763,6 +1770,8 @@ class CodexAppServerClient:
         self.loaded_threads = set()
         self.remote_status = None
         self._streamed_item_ids = set()
+        self.pending_approvals = {}
+        self.pending_approvals_by_thread = collections.defaultdict(dict)
 
     async def call(self, method: str, params: dict | None = None, timeout: float = 30.0):
         async with self._lock:
@@ -1791,6 +1800,9 @@ class CodexAppServerClient:
         if self.proc and self.proc.returncode is None:
             return
         self._pending.clear()
+        self.pending_approvals.clear()
+        self.pending_approvals_by_thread.clear()
+        self._expire_stale_codex_approvals()
         self.proc = await asyncio.create_subprocess_exec(
             CODEX_BIN, "app-server", "--stdio",
             stdout=asyncio.subprocess.PIPE,
@@ -1817,6 +1829,24 @@ class CodexAppServerClient:
         _log_event("codex_app_server_started",
                    user_agent=(init or {}).get("userAgent", ""),
                    codex_home=(init or {}).get("codexHome", ""))
+
+    def _expire_stale_codex_approvals(self):
+        import sqlite3
+        try:
+            con = sqlite3.connect(CANON_DB, timeout=30)
+            cur = con.execute(
+                "UPDATE approvals SET status='expired', decided_at=?, result=? "
+                "WHERE status='pending' AND source LIKE 'codex%'",
+                (time.time(), json.dumps({"reason": "codex app-server restarted"},
+                                         ensure_ascii=False)))
+            con.commit()
+            changed = cur.rowcount
+            con.close()
+            if changed:
+                _log_event("codex_approval_stale_expired", count=changed)
+        except Exception as e:  # noqa: BLE001
+            _log_event("codex_approval_stale_expire_failed",
+                       error=type(e).__name__, error_message=str(e)[:160])
 
     async def _call_started_locked(self, method: str, params: dict, timeout: float):
         rid = self._next_id
@@ -1851,9 +1881,13 @@ class CodexAppServerClient:
                                error=type(e).__name__,
                                line=raw.decode("utf-8", "replace")[:160])
                     continue
-                if "id" in msg:
+                if msg.get("method"):
+                    await self._handle_server_message(msg)
+                elif "id" in msg:
                     fut = self._pending.pop(msg.get("id"), None)
                     if not fut or fut.done():
+                        _log_event("codex_app_server_unmatched_response",
+                                   id_hash=_short_hash(str(msg.get("id"))))
                         continue
                     if "error" in msg:
                         err = msg.get("error") or {}
@@ -1863,7 +1897,8 @@ class CodexAppServerClient:
                     else:
                         fut.set_result(msg.get("result"))
                 else:
-                    self._handle_notification(msg)
+                    _log_event("codex_app_server_unknown_message",
+                               keys=",".join(sorted(str(k) for k in msg.keys()))[:120])
         except Exception as e:  # noqa: BLE001
             _log_event("codex_app_server_reader_failed", error=type(e).__name__,
                        error_message=str(e)[:160])
@@ -1894,6 +1929,253 @@ class CodexAppServerClient:
         if len(buf) > 2000:
             del buf[:500]
 
+    async def _handle_server_message(self, msg: dict):
+        method = msg.get("method")
+        if "id" in msg:
+            if method in (
+                "execCommandApproval",
+                "applyPatchApproval",
+                "item/commandExecution/requestApproval",
+                "item/fileChange/requestApproval",
+            ):
+                self._handle_approval_request(msg)
+                return
+            _log_event("codex_app_server_unhandled_request",
+                       method=str(method or "")[:120],
+                       id_hash=_short_hash(str(msg.get("id"))))
+            await self._write_server_error(msg.get("id"), -32601,
+                                           f"server request not implemented: {method}")
+            return
+        self._handle_notification(msg)
+
+    async def _write_server_error(self, request_id, code: int, message: str):
+        try:
+            async with self._lock:
+                if not self.proc or self.proc.returncode is not None:
+                    return
+                await self._write_locked({
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "error": {"code": code, "message": message},
+                })
+        except Exception as e:  # noqa: BLE001
+            _log_event("codex_app_server_error_response_failed",
+                       error=type(e).__name__, error_message=str(e)[:160])
+
+    async def _write_server_result(self, request_id, result: dict):
+        async with self._lock:
+            if not self.proc or self.proc.returncode is not None:
+                raise CodexAppServerError("codex app-server is not running")
+            await self._write_locked({"jsonrpc": "2.0", "id": request_id,
+                                      "result": result})
+
+    def _approval_thread_id(self, method: str, params: dict) -> str:
+        if method in ("execCommandApproval", "applyPatchApproval"):
+            return str(params.get("conversationId") or "")
+        return str(params.get("threadId") or "")
+
+    def _approval_title(self, method: str, params: dict) -> str:
+        if method in ("execCommandApproval", "item/commandExecution/requestApproval"):
+            return "Codex command approval"
+        return "Codex file-change approval"
+
+    def _approval_command_text(self, params: dict) -> str:
+        cmd = params.get("command")
+        if isinstance(cmd, list):
+            return shlex.join(str(x) for x in cmd)
+        if isinstance(cmd, str):
+            return cmd
+        return ""
+
+    def _approval_detail(self, method: str, params: dict) -> str:
+        lines = [self._approval_title(method, params)]
+        reason = params.get("reason")
+        cwd = params.get("cwd")
+        if cwd:
+            lines.append(f"cwd: {cwd}")
+        if reason:
+            lines.append(f"reason: {reason}")
+        command = self._approval_command_text(params)
+        if command:
+            lines.append("")
+            lines.append("command:")
+            lines.append(command)
+        file_changes = params.get("fileChanges")
+        if isinstance(file_changes, dict) and file_changes:
+            lines.append("")
+            lines.append("files:")
+            for path, change in list(file_changes.items())[:30]:
+                kind = ""
+                if isinstance(change, dict):
+                    kind_obj = change.get("kind")
+                    kind = kind_obj.get("type") if isinstance(kind_obj, dict) else str(kind_obj or "")
+                lines.append(f"- {path}" + (f" ({kind})" if kind else ""))
+            if len(file_changes) > 30:
+                lines.append(f"- ...and {len(file_changes) - 30} more")
+        grant_root = params.get("grantRoot")
+        if grant_root:
+            lines.append(f"grant_root: {grant_root}")
+        return "\n".join(lines).strip()
+
+    def _approval_public(self, record: dict | None) -> dict | None:
+        if not record:
+            return None
+        return {
+            "id": record.get("id"),
+            "method": record.get("method"),
+            "title": record.get("title"),
+            "detail": record.get("detail"),
+            "risk": record.get("risk"),
+            "created_at": record.get("created_at"),
+            "thread_id": record.get("thread_id"),
+        }
+
+    def _approval_db_upsert(self, record: dict) -> None:
+        import sqlite3
+        con = sqlite3.connect(CANON_DB, timeout=30)
+        now = record.get("created_at") or time.time()
+        con.execute("INSERT OR REPLACE INTO approvals"
+                    "(id,title,source,risk,detail,created_at,expires_at,status,decided_at,result) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?)",
+                    (record["id"], record["title"], record["source"], record["risk"],
+                     record["detail"], now, now + 3600, "pending", None, None))
+        con.commit()
+        con.close()
+
+    def _approval_db_decide(self, approval_id: str, status: str, result: dict | str) -> None:
+        import sqlite3
+        if not isinstance(result, str):
+            result = json.dumps(result or {}, ensure_ascii=False)
+        con = sqlite3.connect(CANON_DB, timeout=30)
+        con.execute("UPDATE approvals SET status=?, decided_at=?, result=? WHERE id=?",
+                    (status, time.time(), result, approval_id))
+        con.commit()
+        con.close()
+
+    def _handle_approval_request(self, msg: dict) -> None:
+        method = msg.get("method") or ""
+        params = msg.get("params") or {}
+        request_id = msg.get("id")
+        thread_id = self._approval_thread_id(method, params)
+        created = time.time()
+        stable = json.dumps([thread_id, method, request_id], sort_keys=True,
+                            ensure_ascii=False, default=str)
+        approval_id = "codex-" + hashlib.sha1(stable.encode("utf-8", "replace")).hexdigest()[:24]
+        record = {
+            "id": approval_id,
+            "request_id": request_id,
+            "method": method,
+            "params": params,
+            "thread_id": thread_id,
+            "title": self._approval_title(method, params),
+            "source": f"codex:{thread_id}" if thread_id else "codex",
+            "risk": "high" if "command" in method.lower() or method == "execCommandApproval" else "medium",
+            "detail": self._approval_detail(method, params),
+            "created_at": created,
+        }
+        self.pending_approvals[approval_id] = record
+        if thread_id:
+            self.pending_approvals_by_thread[thread_id][approval_id] = record
+            self.last_event_at[thread_id] = created
+        try:
+            self._approval_db_upsert(record)
+        except Exception as e:  # noqa: BLE001
+            _log_event("codex_approval_db_upsert_failed",
+                       approval_id=approval_id,
+                       error=type(e).__name__, error_message=str(e)[:160])
+        _log_event("codex_approval_request",
+                   approval_id=approval_id,
+                   method=method,
+                   thread_id_hash=_short_hash(thread_id),
+                   request_id_hash=_short_hash(str(request_id)))
+
+    def pending_approval_for_thread(self, thread_id: str) -> dict | None:
+        if not thread_id:
+            return None
+        pending = self.pending_approvals_by_thread.get(thread_id) or {}
+        for aid, record in list(pending.items()):
+            if aid in self.pending_approvals:
+                return record
+            pending.pop(aid, None)
+        return None
+
+    def _drop_approval(self, approval_id: str, status: str = "expired") -> dict | None:
+        record = self.pending_approvals.pop(approval_id, None)
+        if not record:
+            return None
+        thread_id = record.get("thread_id") or ""
+        if thread_id:
+            self.pending_approvals_by_thread.get(thread_id, {}).pop(approval_id, None)
+        try:
+            self._approval_db_decide(approval_id, status, {"reason": "server request no longer live"})
+        except Exception as e:  # noqa: BLE001
+            _log_event("codex_approval_db_decide_failed",
+                       approval_id=approval_id,
+                       error=type(e).__name__, error_message=str(e)[:160])
+        return record
+
+    def _drop_approval_by_request(self, request_id) -> None:
+        for aid, record in list(self.pending_approvals.items()):
+            if record.get("request_id") == request_id:
+                self._drop_approval(aid, status="expired")
+                return
+
+    def _drop_thread_approvals(self, thread_id: str) -> None:
+        for aid in list((self.pending_approvals_by_thread.get(thread_id) or {}).keys()):
+            self._drop_approval(aid, status="expired")
+
+    def _approval_response_result(self, record: dict, approved: bool,
+                                  for_session: bool = False) -> dict:
+        method = record.get("method")
+        if method in ("item/commandExecution/requestApproval",
+                      "item/fileChange/requestApproval"):
+            if approved:
+                decision = "acceptForSession" if for_session else "accept"
+            else:
+                decision = "decline"
+            return {"decision": decision}
+        if approved:
+            decision = "approved_for_session" if for_session else "approved"
+        else:
+            decision = "denied"
+        return {"decision": decision}
+
+    async def decide_approval(self, approval_id: str, approved: bool,
+                              for_session: bool = False) -> dict:
+        record = self.pending_approvals.get(approval_id)
+        if not record:
+            raise CodexAppServerError("codex approval is no longer pending", code=404)
+        result = self._approval_response_result(record, approved, for_session=for_session)
+        await self._write_server_result(record.get("request_id"), result)
+        self.pending_approvals.pop(approval_id, None)
+        thread_id = record.get("thread_id") or ""
+        if thread_id:
+            self.pending_approvals_by_thread.get(thread_id, {}).pop(approval_id, None)
+            self.last_event_at[thread_id] = time.time()
+        status = "approved" if approved else "rejected"
+        try:
+            self._approval_db_decide(approval_id, status, result)
+        except Exception as e:  # noqa: BLE001
+            _log_event("codex_approval_db_decide_failed",
+                       approval_id=approval_id,
+                       error=type(e).__name__, error_message=str(e)[:160])
+        _log_event("codex_approval_decision",
+                   approval_id=approval_id,
+                   status=status,
+                   method=record.get("method"),
+                   thread_id_hash=_short_hash(thread_id),
+                   request_id_hash=_short_hash(str(record.get("request_id"))))
+        return {"id": approval_id, "status": status, "result": result,
+                "thread_id": thread_id, "method": record.get("method")}
+
+    async def decide_thread_approval(self, thread_id: str, approved: bool,
+                                     for_session: bool = False) -> dict:
+        record = self.pending_approval_for_thread(thread_id)
+        if not record:
+            raise CodexAppServerError("no pending Codex approval for thread", code=404)
+        return await self.decide_approval(record["id"], approved,
+                                          for_session=for_session)
+
     def _handle_notification(self, msg: dict):
         method = msg.get("method")
         params = msg.get("params") or {}
@@ -1916,6 +2198,7 @@ class CodexAppServerClient:
         if method == "turn/completed" and tid:
             self.active_turns.pop(tid, None)
             self.last_event_at[tid] = time.time()
+            self._drop_thread_approvals(tid)
             turn = params.get("turn") or {}
             err = turn.get("error") if isinstance(turn, dict) else None
             if err:
@@ -1928,6 +2211,9 @@ class CodexAppServerClient:
         if method == "error":
             _log_event("codex_app_server_error",
                        message=str(params.get("message") or params)[:240])
+            return
+        if method == "serverRequest/resolved":
+            self._drop_approval_by_request(params.get("requestId"))
             return
         if not tid:
             return
@@ -2004,6 +2290,11 @@ CODEX_APP = CodexAppServerClient()
 def _codex_enrich_summary(summary: dict) -> dict:
     tid = summary.get("thread_id") or summary.get("id") or ""
     summary["activeTurn"] = CODEX_APP.is_active(tid)
+    approval = CODEX_APP.pending_approval_for_thread(tid)
+    if approval:
+        summary["awaitingApproval"] = True
+        summary["status"] = "waiting_approval"
+        summary["approval"] = CODEX_APP._approval_public(approval)
     if tid in CODEX_APP.last_event_at:
         summary["lastEventAt"] = CODEX_APP.last_event_at[tid]
     if tid in CODEX_APP.thread_errors:
@@ -3895,11 +4186,18 @@ async def v2_sessions(request: Request, provider: str = "", status: str = ""):
             s = _codex_enrich_summary(_codex_session_summary(t))
             if (s.get("thread_id") or s.get("id")) in delegated_codex_ids:
                 continue
+            thread_id = s.get("thread_id") or s.get("id")
+            approval = CODEX_APP.pending_approval_for_thread(thread_id)
             active = bool(s.get("activeTurn")) or s.get("status") in ("active", "running")
-            out.append({"id": f"codex:{s.get('thread_id') or s.get('id')}", "provider": "codex",
+            caps = ["input", "interrupt", "attachments", "replay", "follow"]
+            if approval:
+                caps.append("approve")
+            out.append({"id": f"codex:{thread_id}", "provider": "codex",
                         "title": s.get("name") or "codex", "subtitle": s.get("workdir"),
-                        "status": "running" if active else "idle", "last_event_at": None,
-                        "capabilities": ["input", "interrupt", "attachments", "replay", "follow"], "meta": {}})
+                        "status": "waiting_approval" if approval else ("running" if active else "idle"),
+                        "last_event_at": s.get("lastEventAt"),
+                        "capabilities": caps,
+                        "meta": {"approval": CODEX_APP._approval_public(approval) if approval else None}})
     except Exception:  # noqa: BLE001
         pass
     if provider:
@@ -3907,6 +4205,56 @@ async def v2_sessions(request: Request, provider: str = "", status: str = ""):
     if status:
         out = [s for s in out if s["status"] == status]
     return {"sessions": out}
+
+
+def _approval_bool_from_body(body: dict) -> bool:
+    if "approve" in body:
+        return bool(body.get("approve"))
+    raw = str(body.get("decision") or body.get("status") or body.get("action") or "").strip().lower()
+    if raw in ("approve", "approved", "accept", "accepted", "allow", "yes", "true"):
+        return True
+    if raw in ("reject", "rejected", "deny", "denied", "decline", "cancel", "no", "false"):
+        return False
+    raise HTTPException(status_code=400, detail="approve boolean or decision required")
+
+
+def _codex_thread_from_v2_session_id(session_id: str) -> str:
+    if session_id.startswith("codex:"):
+        return session_id.split(":", 1)[1]
+    if session_id.startswith("delegation:"):
+        row = _delegation_get(session_id.split(":", 1)[1])
+        if not row:
+            raise HTTPException(status_code=404, detail="unknown delegation")
+        d = dict(row)
+        if d.get("provider") != "codex":
+            raise HTTPException(status_code=400, detail="session is not a Codex session")
+        thread_id = d.get("codex_thread_id") or d.get("provider_session_id") or ""
+        if not thread_id:
+            raise HTTPException(status_code=409, detail="delegation has no Codex thread")
+        return thread_id
+    raise HTTPException(status_code=400, detail="unsupported session id")
+
+
+@app.post("/app/v2/sessions/{session_id}/approve")
+async def v2_session_approve(session_id: str, request: Request):
+    _check_auth(request)
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        body = {}
+    approved = _approval_bool_from_body(body)
+    for_session = bool(body.get("for_session") or body.get("approve_for_session") or
+                       body.get("remember"))
+    thread_id = _codex_thread_from_v2_session_id(session_id)
+    try:
+        result = await CODEX_APP.decide_thread_approval(thread_id, approved,
+                                                        for_session=for_session)
+        return {"ok": True, "session_id": session_id, "thread_id": thread_id, **result}
+    except CodexAppServerError as e:
+        if e.code == 404:
+            raise http_err(409, "APPROVAL_NOT_PENDING",
+                           "no pending Codex approval for this session")
+        _codex_http_error(e)
 
 
 # ───────────────────────── scheduled reports + notification toggles ─────────
@@ -4233,7 +4581,8 @@ async def capabilities(request: Request):
                           "/app/v1/auth/apple", "/app/v1/account",
                           "/app/v1/pair/new", "/app/v1/pair/claim",
                           "/app/v1/devices/{id}/revoke",
-                          "/app/v1/delegations", "/app/v2/sessions"]}
+                          "/app/v1/delegations", "/app/v2/sessions",
+                          "/app/v2/sessions/{id}/approve"]}
 
 
 @app.post("/app/v1/auth/apple")
@@ -5012,6 +5361,22 @@ async def approval_decide(aid: str, request: Request):
     b = await request.json()
     decision = "approved" if b.get("approve") else "rejected"
     con = sqlite3.connect(CANON_DB)
+    row = con.execute("SELECT source FROM approvals WHERE id=?", (aid,)).fetchone()
+    if row and str(row[0] or "").startswith("codex"):
+        con.close()
+        try:
+            result = await CODEX_APP.decide_approval(
+                aid,
+                decision == "approved",
+                for_session=bool(b.get("for_session") or b.get("approve_for_session") or
+                                 b.get("remember")),
+            )
+            return {"id": aid, "status": result["status"], "result": result["result"]}
+        except CodexAppServerError as e:
+            if e.code == 404:
+                raise http_err(409, "APPROVAL_NOT_PENDING",
+                               "Codex approval is no longer live")
+            _codex_http_error(e)
     cur = con.execute("UPDATE approvals SET status=?, decided_at=?, result=? "
                       "WHERE id=? AND status='pending'",
                       (decision, time.time(), b.get("result") or "", aid))
