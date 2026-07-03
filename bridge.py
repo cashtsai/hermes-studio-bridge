@@ -1033,7 +1033,7 @@ def _app_turn_status(session: str, client_id: str | None = None,
         turn_state, label = "done", "已同步"
     elif in_flight:
         turn_state = "streaming" if acc else ("queued" if acp_busy else "running")
-        label = "思考中" if acc else "處理中"
+        label = (state or {}).get("step_label") or ("思考中" if acc else "處理中")
     elif task is not None and task.done():
         turn_state, label = ("done", "已同步") if acc else ("stream_detached", "處理中")
     elif acp_busy:
@@ -1654,6 +1654,7 @@ async def _persona_content_stream(model: str, prompt: str):
     got_text = False
     completed = False
     thought_buf: list[str] = []
+    steps: list[dict] = []          # 工具步驟 — 不進正文,收尾摺疊附錄
 
     def flush_thought():
         if thought_buf:
@@ -1662,6 +1663,24 @@ async def _persona_content_stream(model: str, prompt: str):
             if t:
                 return f"\n<details><summary>💭 思考</summary>\n\n{t}\n\n</details>\n\n"
         return None
+
+    def flush_steps():
+        """收尾一次性附上摺疊的步驟清單(預設看不到,點開才展開)——
+        對話正文只留人話;canonical/歷史也存這個形狀。"""
+        if not steps:
+            return None
+        lines = []
+        for i, s in enumerate(steps, 1):
+            head = f"{i}. **{s['name']}**" + (f" `{s['cmd']}`" if s["cmd"] else "")
+            if s.get("note"):
+                head += f" — {s['note']}"
+            lines.append(head)
+            if s.get("result"):
+                lines.append(f"\n   ```\n{s['result']}\n   ```\n")
+        body = "\n".join(lines)[:6000]
+        n = len(steps)
+        steps.clear()
+        return f"\n\n<details><summary>🔧 執行步驟 ({n})</summary>\n\n{body}\n\n</details>\n"
 
     import time as _t
     last_event = _t.monotonic()
@@ -1689,18 +1708,28 @@ async def _persona_content_stream(model: str, prompt: str):
             elif kind == "thought":
                 thought_buf.append(val)
             elif kind == "tool_start":
+                # 工具步驟不再內聯進正文(使用者回報:指令洗版、跑完消失又
+                # 湧一批)。改走 status label(app 底部 working bar 原樣顯示
+                # 「執行步驟 N:工具」),細節收進收尾的摺疊附錄。
                 name = val.get("name", "tool")
                 cmd = (val.get("cmd") or "").strip().splitlines()
                 cmd1 = (cmd[0] if cmd else "")[:140]
-                yield ("content", f"\n› 🔧 **{name}**" + (f" `{cmd1}`" if cmd1 else "") + "\n")
+                steps.append({"name": name, "cmd": cmd1, "result": "", "note": ""})
+                yield ("status", {"state": "running",
+                                  "label": f"執行步驟 {len(steps)}:{name}"})
             elif kind == "tool_result":
                 res = (val.get("text") or "").strip()
-                if res:
-                    short = res[:900]
-                    more = "\n…(截斷)" if len(res) > 900 else ""
-                    yield ("content", f"<details><summary>↳ 結果</summary>\n\n```\n{short}{more}\n```\n\n</details>\n")
+                if res and steps:
+                    short = res[:400]
+                    if len(res) > 400:
+                        short += "\n…(截斷)"
+                    steps[-1]["result"] = short
             elif kind == "perm":
-                yield ("content", f"\n› 🔐 自動允許 **{val}**\n")
+                if steps:
+                    steps[-1]["note"] = f"🔐 自動允許 {val}"
+                else:
+                    steps.append({"name": str(val), "cmd": "", "result": "",
+                                  "note": "🔐 自動允許"})
             elif kind == "status":
                 yield ("status", val)
             elif kind == "usage":
@@ -1719,6 +1748,9 @@ async def _persona_content_stream(model: str, prompt: str):
         ft = flush_thought()
         if ft:
             yield ("content", ft)
+        fs = flush_steps()
+        if fs:
+            yield ("content", fs)
     finally:
         if not completed:
             asyncio.create_task(session.cancel())
@@ -5594,10 +5626,13 @@ async def app_post_message(request: Request):
                 if k == "content":
                     state["acc"] += v
                     state["content_chunks"] += 1
+                    state["step_label"] = ""     # 正文恢復 → 步驟 label 讓位
                 elif k == "usage":
                     state["usage"] = v
                 elif k == "status":
-                    pass
+                    # 步驟進度(執行步驟 N:工具)— 讓輪詢的 /messages/status
+                    # 也能給 working bar 同一句人話。
+                    state["step_label"] = (v or {}).get("label") or ""
                 await q.put((k, v))
         except Exception as e:  # noqa: BLE001
             state["runner_error"] = f"{type(e).__name__}: {str(e)[:180]}"
