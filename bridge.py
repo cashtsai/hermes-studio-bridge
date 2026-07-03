@@ -2312,9 +2312,17 @@ class CodexAppServerClient:
             return
         if method == "item/agentMessage/delta":
             item_id = params.get("itemId")
+            delta = params.get("delta") or ""
             if item_id:
+                # First delta of a NEW agent message carries the **🤖 助手:**
+                # marker (same as _codex_format_item's non-streamed path) — the
+                # app splits turns on it; without it streamed replies fold into
+                # the user's bubble (issue #16). Later deltas of the same item
+                # append bare.
+                if item_id not in self._streamed_item_ids and delta:
+                    delta = f"\n\n**🤖 助手:** {delta}"
                 self._streamed_item_ids.add(item_id)
-            self._append(tid, ("text", params.get("delta") or ""))
+            self._append(tid, ("text", delta))
             return
         if method == "item/started":
             item = params.get("item") or {}
