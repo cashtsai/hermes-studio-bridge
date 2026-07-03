@@ -360,6 +360,48 @@ def _save_data_uri(data_uri: str, filename: str = "") -> str | None:
     return str(path)
 
 
+def _upload_ref_path(value: str | None) -> str | None:
+    """Accept only previously uploaded local files under UPLOAD_DIR."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    raw = value.strip()
+    if raw.startswith("data:"):
+        return None
+    if raw.startswith("file://"):
+        raw = raw[7:]
+    try:
+        root = UPLOAD_DIR.expanduser().resolve()
+        path = Path(os.path.expanduser(raw)).resolve()
+    except Exception:  # noqa: BLE001
+        return None
+    if not (path == root or root in path.parents):
+        return None
+    try:
+        return str(path) if path.is_file() else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _save_attachment(a: dict, default_filename: str = "file") -> str | None:
+    """Return an uploaded attachment path, saving legacy dataURI payloads if needed."""
+    if not isinstance(a, dict):
+        return None
+    for key in ("path", "local_path", "file_path"):
+        path = _upload_ref_path(a.get(key))
+        if path:
+            return path
+    url_path = _upload_ref_path(a.get("url"))
+    if url_path:
+        return url_path
+    filename = a.get("filename") or default_filename
+    data_uri = a.get("data") or a.get("data_uri") or ""
+    return _save_data_uri(data_uri, filename)
+
+
+def _save_part_payload(value: str | None, filename: str) -> str | None:
+    return _upload_ref_path(value) or _save_data_uri(value or "", filename)
+
+
 # ───────────────────────── voice transcription (語音訊息) ───────────────────
 # LINE-style voice messages: the app sends the audio file, the bridge transcribes
 # it, and the transcript becomes the turn text (the audio still shows in-chat).
@@ -404,7 +446,7 @@ async def _transcribe_attachments(attachments: list) -> str:
     for a in (attachments or []):
         if a.get("kind") != "audio":
             continue
-        path = _save_data_uri(a.get("data", ""), a.get("filename", "voice.m4a"))
+        path = _save_attachment(a, a.get("filename") or "voice.m4a")
         if not path:
             continue
         t = await asyncio.to_thread(_transcribe, path)
@@ -429,12 +471,13 @@ def _extract_user_parts(messages: list):
                 if t == "text" and p.get("text"):
                     texts.append(p["text"])
                 elif t == "image_url":
-                    path = _save_data_uri((p.get("image_url") or {}).get("url", ""), "image.jpg")
+                    path = _save_part_payload((p.get("image_url") or {}).get("url", ""), "image.jpg")
                     if path:
                         images.append(path)
                 elif t == "file":
                     f = p.get("file") or {}
-                    path = _save_data_uri(f.get("file_data", ""), f.get("filename", "file"))
+                    path = _save_part_payload(f.get("file_data") or f.get("path") or f.get("url"),
+                                              f.get("filename", "file"))
                     if path:
                         files.append((f.get("filename") or "檔案", path))
             return (" ".join(texts).strip(), images, files)
@@ -2493,7 +2536,7 @@ async def _codex_input_items(text: str, attachments: list) -> list:
     images = []
     voice_lines = []
     for a in (attachments or []):
-        path = _save_data_uri(a.get("data", ""), a.get("filename", "file"))
+        path = _save_attachment(a, a.get("filename") or "file")
         if not path:
             continue
         if a.get("kind") == "audio":
@@ -3933,7 +3976,7 @@ async def cc_session_input(name: str, request: Request):
     saved = []
     voice_lines = []
     for a in (body.get("attachments") or []):
-        path = _save_data_uri(a.get("data", ""), a.get("filename", "file"))
+        path = _save_attachment(a, a.get("filename") or "file")
         if not path:
             continue
         if a.get("kind") == "audio":
@@ -4639,6 +4682,44 @@ async def reports(request: Request, limit: int = 20):
 # The app's stable contract. Wraps the Hermes internals (state.db, cron JSON,
 # ACP) so the client never depends on them directly.
 
+@app.post("/app/v1/uploads")
+async def app_uploads(request: Request):
+    """Pre-upload composer attachments and return stable local file references.
+
+    Mobile clients should call this before sending a turn with images/files, then
+    submit the lightweight returned `path` fields to persona/CC/Codex endpoints.
+    Legacy clients can still send `data` directly to those endpoints.
+    """
+    _check_auth(request)
+    body = await request.json()
+    attachments = body.get("attachments") or []
+    if not isinstance(attachments, list):
+        raise HTTPException(status_code=400, detail="attachments must be a list")
+    if len(attachments) > 12:
+        raise HTTPException(status_code=413, detail="too many attachments")
+    saved = []
+    for idx, a in enumerate(attachments):
+        if not isinstance(a, dict):
+            raise HTTPException(status_code=400, detail=f"attachment {idx} must be an object")
+        path = _save_attachment(a, a.get("filename") or "file")
+        if not path:
+            raise HTTPException(status_code=400, detail=f"attachment {idx} upload failed")
+        try:
+            size = Path(path).stat().st_size
+        except Exception:  # noqa: BLE001
+            size = 0
+        saved.append({
+            "kind": a.get("kind") or "file",
+            "filename": a.get("filename") or Path(path).name,
+            "mime": a.get("mime") or "application/octet-stream",
+            "path": path,
+            "size": size,
+        })
+    _log_event("app_uploads_saved", attachment_count=len(saved),
+               bytes=sum(int(a.get("size") or 0) for a in saved),
+               client=_client_host(request))
+    return {"ok": True, "attachments": saved}
+
 @app.get("/capabilities")
 async def capabilities(request: Request):
     _check_auth(request)
@@ -4648,8 +4729,9 @@ async def capabilities(request: Request):
                          "message_dry_run", "message_interrupt", "message_status",
                          "message_events", "apns_push", "accounts",
                          "apple_auth", "account_pairing",
-                         "delegations", "control_plane_v2"],
+                         "delegations", "control_plane_v2", "attachment_uploads"],
             "endpoints": ["/app/v1/sessions", "/app/v1/messages", "/reports",
+                          "/app/v1/uploads",
                           "/app/v1/messages/status", "/app/v1/messages/events",
                           "/app/v1/messages/interrupt",
                           "/cron/jobs", "/ccsessions", "/app/v1/approvals",
@@ -4794,7 +4876,7 @@ async def app_delegation_input(delegation_id: str, request: Request):
         saved = []
         voice_lines = []
         for a in (body.get("attachments") or []):
-            path = _save_data_uri(a.get("data", ""), a.get("filename", "file"))
+            path = _save_attachment(a, a.get("filename") or "file")
             if not path:
                 continue
             if a.get("kind") == "audio":
@@ -4904,7 +4986,7 @@ async def app_delegation_create(request: Request):
         saved = []
         voice_lines = []
         for a in (body.get("attachments") or []):
-            path = _save_data_uri(a.get("data", ""), a.get("filename", "file"))
+            path = _save_attachment(a, a.get("filename") or "file")
             if not path:
                 continue
             if a.get("kind") == "audio":
@@ -5090,7 +5172,7 @@ async def app_post_message(request: Request):
     if session not in PERSONAS:
         raise http_err(400, "SESSION_NOT_FOUND", "unknown session")
     content = (body.get("content") or "").strip()
-    attachments = body.get("attachments") or []   # [{kind,filename,mime,data(dataURI)}]
+    attachments = body.get("attachments") or []   # [{kind,filename,mime,data(dataURI)|path}]
     dry_run = bool(body.get("dry_run"))
 
     client_id = body.get("client_id")    # stable across retries; enables idempotency
@@ -5223,6 +5305,19 @@ async def app_post_message(request: Request):
                            canonical_user_ok=None, canonical_reply_ok=None)
         return StreamingResponse(dry_agen(), media_type="text/event-stream")
 
+    normalized_attachments = []
+    for a in attachments:
+        if not isinstance(a, dict):
+            continue
+        na = dict(a)
+        path = _save_attachment(na, na.get("filename") or "file")
+        if path:
+            na["path"] = path
+            na.pop("data", None)       # keep the persona turn body lightweight
+            na.pop("data_uri", None)
+        normalized_attachments.append(na)
+    attachments = normalized_attachments
+
     # Voice messages: transcribe any audio attachment and fold the transcript
     # into the turn text. The audio still rides along as an attachment so the
     # conversation shows the voice bubble; the model gets the words.
@@ -5235,12 +5330,17 @@ async def app_post_message(request: Request):
         parts.append({"type": "text", "text": content})
     for a in attachments:
         if a.get("kind") == "image":
-            parts.append({"type": "image_url", "image_url": {"url": a.get("data")}})
+            path = _upload_ref_path(a.get("path")) or _save_attachment(a, a.get("filename") or "image.jpg")
+            if path:
+                parts.append({"type": "image_url", "image_url": {"url": path}})
         elif a.get("kind") == "audio":
             continue                       # transcript already in `content`
         else:
+            path = _upload_ref_path(a.get("path")) or _save_attachment(a, a.get("filename") or "file")
+            if not path:
+                continue
             parts.append({"type": "file", "file": {"filename": a.get("filename"),
-                          "mime_type": a.get("mime"), "file_data": a.get("data")}})
+                          "mime_type": a.get("mime"), "file_data": path}})
     prompt = await _resolve_persona_prompt([{"role": "user", "content": parts or content}])
     report_context = _report_context_for_prompt(session, content)
     if report_context:
@@ -5249,7 +5349,8 @@ async def app_post_message(request: Request):
     acp_session = await POOL.get(session, home_for(session))
     queued_at_accept = acp_session.is_busy()
 
-    att_meta = [{"kind": a.get("kind"), "filename": a.get("filename"), "mime": a.get("mime")}
+    att_meta = [{"kind": a.get("kind"), "filename": a.get("filename"),
+                 "mime": a.get("mime"), "path": _upload_ref_path(a.get("path"))}
                 for a in attachments]
     # Record the transcript as the canonical text (so other devices see what was
     # said even without the audio bytes), tagged so the app can show 🎤.
