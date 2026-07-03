@@ -2312,9 +2312,17 @@ class CodexAppServerClient:
             return
         if method == "item/agentMessage/delta":
             item_id = params.get("itemId")
+            delta = params.get("delta") or ""
             if item_id:
+                # First delta of a NEW agent message carries the **🤖 助手:**
+                # marker (same as _codex_format_item's non-streamed path) — the
+                # app splits turns on it; without it streamed replies fold into
+                # the user's bubble (issue #16). Later deltas of the same item
+                # append bare.
+                if item_id not in self._streamed_item_ids and delta:
+                    delta = f"\n\n**🤖 助手:** {delta}"
                 self._streamed_item_ids.add(item_id)
-            self._append(tid, ("text", params.get("delta") or ""))
+            self._append(tid, ("text", delta))
             return
         if method == "item/started":
             item = params.get("item") or {}
@@ -2484,7 +2492,13 @@ def _codex_format_item(item: dict, phase: str = "completed", skip_agent_ids=None
         if item.get("id") in skip_agent_ids:
             return ""
         text = item.get("text") or ""
-        return text if text else ""
+        # Must carry the same **🤖 助手:** marker CC's _fmt_cc_event already emits.
+        # Without it, conversationTurns() (app-side, splits on **🧑 你:**) can't
+        # tell where the user's turn ends and the reply begins, so the whole
+        # agent reply gets folded into the SAME turn as the preceding userMessage
+        # and renders inside the user's (right-aligned, brand-coloured) bubble
+        # instead of its own left-aligned assistant block.
+        return f"\n\n**🤖 助手:** {text}\n\n" if text else ""
     if t == "plan":
         text = item.get("text") or ""
         return f"\n<details><summary>Plan</summary>\n\n{text}\n\n</details>\n" if text else ""
