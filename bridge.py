@@ -12,6 +12,7 @@ Run:  uvicorn bridge:app --host 0.0.0.0 --port 8081
 """
 import asyncio
 import base64
+import carddigest
 import collections
 import glob
 import hashlib
@@ -4192,13 +4193,11 @@ async def cc_session_hook(request: Request):
     return {"ok": True, "session": name, "busy": state["busy"], "source": "hook"}
 
 
-@app.get("/ccsessions/{name}/status")
-async def cc_session_status(name: str, request: Request):
-    _check_auth(request)
-    if not any(r[0] == name for r in _cc_conf_rows()):
-        raise http_err(404, "SESSION_NOT_FOUND", "unknown session")
+async def _cc_status_core(name: str) -> dict:
+    """CC session 的 busy/mode/prompt 判讀 — /ccsessions status 端點與
+    Phase 0 卡片 follower 共用同一份真相。"""
     if not await _tmux_alive(name):
-        return {"busy": False, "running": False}
+        return {"busy": False, "running": False, "mode": None, "prompt": None}
     pane = await _tmux_capture_cached(name)
     hook_state = _cc_fresh_hook_state(name)
     if hook_state:
@@ -4218,6 +4217,17 @@ async def cc_session_status(name: str, request: Request):
     else:
         mode = "normal"
     return {"busy": busy, "running": True, "mode": mode, "prompt": _cc_prompt(pane)}
+
+
+@app.get("/ccsessions/{name}/status")
+async def cc_session_status(name: str, request: Request):
+    _check_auth(request)
+    if not any(r[0] == name for r in _cc_conf_rows()):
+        raise http_err(404, "SESSION_NOT_FOUND", "unknown session")
+    st = await _cc_status_core(name)
+    if not st["running"]:
+        return {"busy": False, "running": False}
+    return st
 
 
 # Send a single control key into the live TUI (arrows / Enter / Esc / Tab /
@@ -4386,6 +4396,203 @@ async def v2_session_approve(session_id: str, request: Request):
             raise http_err(409, "APPROVAL_NOT_PENDING",
                            "no pending Codex approval for this session")
         _codex_http_error(e)
+
+
+# ─────────── Phase 0 S1：CC 卡片事件流 / snapshot（契約 §1-§3, issue #15）───────────
+# digest 本體在 carddigest.py（單一模組,S2 codex / S3 persona / 衛星終端共用）;
+# 這裡只做 CC jsonl 的 tail-follow 接線與兩個 v2 端點。
+
+_CC_CARD_STORES: dict = {}      # name -> carddigest.SessionCardStore
+_CC_CARD_FOLLOWERS: dict = {}   # name -> asyncio.Task
+_CC_CARD_SEED_LINES = 200       # 冷載種子:最新 jsonl 的尾端行數
+
+
+def _cc_card_store(name: str):
+    store = _CC_CARD_STORES.get(name)
+    if store is None:
+        store = _CC_CARD_STORES[name] = carddigest.SessionCardStore()
+    return store
+
+
+def _cc_card_uid(d: dict, jsonl_path: str, lineno: int) -> str:
+    u = d.get("uuid")
+    if u:
+        return str(u)[:32]
+    fh = hashlib.md5((jsonl_path or "").encode()).hexdigest()[:6]
+    return f"{fh}-L{lineno}"
+
+
+def _cc_digest_lines(store, lines, jsonl_path: str, start_lineno: int) -> int:
+    """把 jsonl 行灌進卡片庫;回傳新增/更新的卡數。順手維護人話 label 素材。"""
+    n = 0
+    for off, line in enumerate(lines):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            d = json.loads(line)
+        except Exception:  # noqa: BLE001
+            continue
+        uid = _cc_card_uid(d, jsonl_path, start_lineno + off)
+        for card in carddigest.cc_event_to_cards(d, uid, turn_id=store.turn_id):
+            store.upsert_card(card)
+            n += 1
+            if card["kind"] == "tool_call":
+                store.last_tool = card["body"].get("tool") or ""
+            elif card["kind"] == "markdown":
+                store.saw_output = True
+                store.last_tool = ""
+    return n
+
+
+async def _cc_card_seed(store, name: str, workdir: str):
+    """冷載種子(冪等):最新 jsonl 尾端 → 卡片庫,並設好 tail 游標。"""
+    if store.seeded:
+        return
+    store.seeded = True
+    jsonl = _cc_latest_jsonl(workdir)
+    if not jsonl or not os.path.exists(jsonl):
+        return
+    try:
+        text = await asyncio.to_thread(
+            lambda: open(jsonl, encoding="utf-8", errors="replace").read())
+    except Exception as e:  # noqa: BLE001
+        _log_event("cc_card_seed_error", session=name, error=str(e)[:200])
+        return
+    lines = text.splitlines()
+    seed = lines[-_CC_CARD_SEED_LINES:]
+    _cc_digest_lines(store, seed, jsonl, len(lines) - len(seed))
+    store.tail_file = jsonl
+    store.tail_pos = len(text.encode("utf-8", errors="replace"))
+    store.tail_lineno = len(lines)
+
+
+async def _cc_card_follower(name: str, workdir: str):
+    """每秒 tail 該 session 的 jsonl → digest 進卡片庫;有訂閱者時再巡
+    busy/mode/prompt(tmux capture 有成本)發 session.status / turn 事件。"""
+    store = _cc_card_store(name)
+    await _cc_card_seed(store, name, workdir)
+    prev_busy = None
+    while True:
+        await asyncio.sleep(1.0)
+        try:
+            cur = _cc_latest_jsonl(workdir)
+            if cur != store.tail_file:               # session 換了新 jsonl
+                store.tail_file, store.tail_pos, store.tail_lineno = cur or "", 0, 0
+            j = store.tail_file
+            if j and os.path.exists(j):
+                size = os.path.getsize(j)
+                if size > store.tail_pos:
+                    def _read_new():
+                        with open(j, encoding="utf-8", errors="replace") as f:
+                            f.seek(store.tail_pos)
+                            return f.read(), f.tell()
+                    new, store.tail_pos = await asyncio.to_thread(_read_new)
+                    nl = new.splitlines()
+                    _cc_digest_lines(store, nl, j, store.tail_lineno)
+                    store.tail_lineno += len(nl)
+            if store.subscribers > 0:
+                st = await _cc_status_core(name)
+                busy = bool(st.get("busy"))
+                if prev_busy is not None and busy != prev_busy:
+                    if busy:
+                        store.turn_id = "turn-" + uuid.uuid4().hex[:12]
+                        store.saw_output = False
+                        store.last_tool = ""
+                        store.push_turn("begin", store.turn_id)
+                    else:
+                        store.push_turn("end", store.turn_id)
+                        store.turn_id = ""
+                prev_busy = busy
+                label = carddigest.cc_status_label(busy, st.get("prompt"),
+                                                   store.last_tool, store.saw_output)
+                store.set_status({"busy": busy, "mode": st.get("mode"),
+                                  "prompt": st.get("prompt"),
+                                  "phase": "run" if busy else "idle",
+                                  "label": label})
+        except Exception as e:  # noqa: BLE001
+            _log_event("cc_card_follower_error", session=name, error=str(e)[:200])
+            await asyncio.sleep(2.0)
+
+
+def _ensure_cc_card_follower(name: str, workdir: str):
+    t = _CC_CARD_FOLLOWERS.get(name)
+    if t and not t.done():
+        return
+    _CC_CARD_FOLLOWERS[name] = asyncio.create_task(_cc_card_follower(name, workdir))
+
+
+def _cc_from_v2_session_id(session_id: str) -> tuple:
+    """S1 只吃 CC:接受 'claude_code:{name}' 或裸 CC session 名 → (name, workdir)。"""
+    if ":" in session_id:
+        prov, _, rest = session_id.partition(":")
+        if prov != "claude_code":
+            raise http_err(400, "UNSUPPORTED_PROVIDER",
+                           f"Phase0 S1 僅支援 claude_code(得到 {prov});codex/persona 待 S2/S3")
+        session_id = rest
+    row = next((r for r in _cc_conf_rows() if r[0] == session_id), None)
+    if not row:
+        raise http_err(404, "SESSION_NOT_FOUND", "unknown session")
+    return row[0], row[1]
+
+
+@app.get("/app/v2/sessions/{session_id}/cards")
+async def v2_session_cards(session_id: str, request: Request, limit: int = 100,
+                           before_seq: int | None = None):
+    """契約 §3 冷載 snapshot:{cards, latest_seq} → app 渲染後從 since_seq 接流。"""
+    _check_auth(request)
+    name, workdir = _cc_from_v2_session_id(session_id)
+    store = _cc_card_store(name)
+    await _cc_card_seed(store, name, workdir)
+    _ensure_cc_card_follower(name, workdir)
+    return store.snapshot(limit=max(1, min(limit, 500)), before_seq=before_seq)
+
+
+@app.get("/app/v2/sessions/{session_id}/events")
+async def v2_session_events(session_id: str, request: Request, since_seq: int = 0,
+                            profile: str = "phone"):
+    """契約 §1 SSE 事件流:信封 {seq,ts,type,data};since_seq 補洞;超範圍 410。"""
+    _check_auth(request)
+    if profile != "phone":
+        raise http_err(400, "UNSUPPORTED_PROFILE", "v0 只實作 profile=phone(契約 §4)")
+    name, workdir = _cc_from_v2_session_id(session_id)
+    store = _cc_card_store(name)
+    await _cc_card_seed(store, name, workdir)
+    _ensure_cc_card_follower(name, workdir)
+    backlog = store.since(since_seq)
+    if backlog is None:
+        raise http_err(410, "SEQ_GONE",
+                       "since_seq 超出 ring buffer 範圍,請走 snapshot 冷載")
+
+    async def gen():
+        cursor = since_seq
+        store.subscribers += 1
+        try:
+            for ev in backlog:
+                yield f"data: {json.dumps(ev, ensure_ascii=False)}\n\n"
+                cursor = ev["seq"]
+            idle = 0.0
+            while True:
+                if await request.is_disconnected():
+                    break
+                if store.seq > cursor:
+                    fresh = store.since(cursor)
+                    if fresh is None:      # ring 已滾過游標(理論上不會) → 斷線重載
+                        break
+                    for ev in fresh:
+                        yield f"data: {json.dumps(ev, ensure_ascii=False)}\n\n"
+                        cursor = ev["seq"]
+                    idle = 0.0
+                else:
+                    await asyncio.sleep(0.5)
+                    idle += 0.5
+                    if idle >= max(1.0, float(SSE_KEEPALIVE_SECS)):
+                        idle = 0.0
+                        yield f"data: {json.dumps(store.ping(), ensure_ascii=False)}\n\n"
+        finally:
+            store.subscribers -= 1
+
+    return StreamingResponse(gen(), media_type="text/event-stream")
 
 
 # ───────────────────────── scheduled reports + notification toggles ─────────
