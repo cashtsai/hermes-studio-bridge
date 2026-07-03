@@ -590,6 +590,11 @@ def _canon_init():
     con.execute("""CREATE TABLE IF NOT EXISTS message_meta(
         message_id TEXT PRIMARY KEY, reactions TEXT, pinned INTEGER,
         updated_at REAL)""")
+    # G4 tombstone (wave 2): deleted messages stay in the list, flagged. The
+    # table may pre-date this column, so ALTER idempotently.
+    meta_cols = [r[1] for r in con.execute("PRAGMA table_info(message_meta)").fetchall()]
+    if "deleted" not in meta_cols:
+        con.execute("ALTER TABLE message_meta ADD COLUMN deleted INTEGER")
     con.execute("""CREATE TABLE IF NOT EXISTS approvals(
         id TEXT PRIMARY KEY, title TEXT, source TEXT, risk TEXT, detail TEXT,
         created_at REAL, expires_at REAL, status TEXT, decided_at REAL, result TEXT)""")
@@ -5240,6 +5245,7 @@ async def capabilities(request: Request):
             "endpoints": ["/app/v1/sessions", "/app/v1/messages", "/reports",
                           "/app/v1/uploads",
                           "/app/v1/reactions", "/app/v1/pins",
+                          "/app/v1/messages/retract", "/app/v1/personas",
                           "/app/v1/messages/status", "/app/v1/messages/events",
                           "/app/v1/messages/interrupt",
                           "/cron/jobs", "/ccsessions", "/app/v1/approvals",
@@ -5580,27 +5586,29 @@ async def app_get_messages(session: str, request: Request, limit: int = 200):
         # Canonical multi-emoji reactions + pins (G2/#39 final contract). Both
         # fields are optional in the payload: omitted when there's no data.
         meta_rows = con.execute(
-            "SELECT message_id, reactions, pinned FROM message_meta").fetchall()
+            "SELECT message_id, reactions, pinned, deleted FROM message_meta").fetchall()
         con.close()
         meta = {}
-        for mid_, rx, pn in meta_rows:
+        for mid_, rx, pn, dl in meta_rows:
             try:
                 lst = json.loads(rx) if rx else []
             except Exception:  # noqa: BLE001
                 lst = []
             meta[mid_] = ([str(r) for r in lst if r] if isinstance(lst, list) else [],
-                          bool(pn))
+                          bool(pn), bool(dl))
         for m in out:
             mid_ = str(m.get("id"))
             legacy = overlay.get(mid_)
             if legacy:
                 m["reaction"] = legacy
             if mid_ in meta:
-                reactions, pinned = meta[mid_]
+                reactions, pinned, deleted = meta[mid_]
                 if reactions:
                     m["reactions"] = reactions
                 if pinned:
                     m["pinned"] = True
+                if deleted:
+                    m["deleted"] = True    # G4 tombstone: row stays, flagged
             elif legacy:
                 # Older builds wrote the single-reaction overlay only; surface
                 # it in the new list field too so nothing disappears mid-migration.
@@ -5771,6 +5779,35 @@ async def app_pins(request: Request):
         con.close()
     except Exception as e:  # noqa: BLE001
         _log_event("message_meta_write_failed", kind="pin",
+                   message_id=message_id, error=type(e).__name__)
+        raise HTTPException(status_code=500, detail=str(e)[:200])
+    return {"ok": True}
+
+
+@app.post("/app/v1/messages/retract")
+async def app_message_retract(request: Request):
+    """G4 tombstone: mark a message deleted. The row stays in
+    GET /app/v1/messages with "deleted": true — every device renders the same
+    tombstone instead of the messages silently diverging."""
+    _check_auth(request)
+    body = await request.json()
+    message_id = str(body.get("message_id") or "").strip()
+    if not message_id:
+        raise HTTPException(status_code=400, detail="message_id required")
+    import sqlite3
+    try:
+        con = sqlite3.connect(CANON_DB, timeout=30)
+        con.execute("PRAGMA busy_timeout=30000")
+        reactions, pinned = _message_meta_load(con, message_id)
+        con.execute("INSERT INTO message_meta(message_id, reactions, pinned, deleted, updated_at) "
+                    "VALUES(?,?,?,1,?) ON CONFLICT(message_id) DO UPDATE SET "
+                    "deleted=1, updated_at=excluded.updated_at",
+                    (message_id, json.dumps(reactions, ensure_ascii=False),
+                     pinned, time.time()))
+        con.commit()
+        con.close()
+    except Exception as e:  # noqa: BLE001
+        _log_event("message_meta_write_failed", kind="retract",
                    message_id=message_id, error=type(e).__name__)
         raise HTTPException(status_code=500, detail=str(e)[:200])
     return {"ok": True}
