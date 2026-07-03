@@ -944,7 +944,7 @@ def _canon_messages(session: str, limit: int = 200):
     import sqlite3
     try:
         con = sqlite3.connect(f"file:{CANON_DB}?mode=ro", uri=True, timeout=5)
-        rows = con.execute("SELECT id,role,content,attachments,created_at,status FROM messages "
+        rows = con.execute("SELECT id,role,content,attachments,created_at,status,client_id FROM messages "
                            "WHERE session=? ORDER BY created_at DESC LIMIT ?", (session, limit)).fetchall()
         con.close()
     except Exception:  # noqa: BLE001
@@ -952,7 +952,57 @@ def _canon_messages(session: str, limit: int = 200):
     rows.reverse()
     return [{"id": r[0], "role": r[1], "content": r[2],
              "attachments": json.loads(r[3] or "[]"), "ts": r[4],
-             "status": r[5], "source": "app"} for r in rows]
+             "status": r[5], "client_id": r[6], "source": "app"} for r in rows]
+
+
+def _app_message_seq(m: dict) -> int:
+    try:
+        return int(float(m.get("ts") or 0) * 1000)
+    except Exception:  # noqa: BLE001
+        return int(time.time() * 1000)
+
+
+def _app_message_event(m: dict) -> dict:
+    return {"seq": _app_message_seq(m), "type": "message.upsert",
+            "message_id": m.get("id"), "payload": {"message": m}}
+
+
+def _app_turn_status(session: str, client_id: str | None = None,
+                     acp_busy: bool = False) -> dict:
+    """Current app-turn recovery status for the mobile client.
+
+    The POST /app/v1/messages stream can legitimately be detached by a mobile
+    network drop. This status surface lets Pocket recover by stable client_id
+    without re-running the persona turn.
+    """
+    now = time.monotonic()
+    entry = None
+    if client_id:
+        entry = _APP_TURN_INFLIGHT.get((session, client_id))
+    state = entry.get("state") if entry else {}
+    task = entry.get("task") if entry else None
+    acc = (state or {}).get("acc") or ""
+    canonical_reply = _canon_reply_for_client(session, client_id) if client_id else None
+    runner_error = (state or {}).get("runner_error") or (state or {}).get("stream_error") or ""
+    in_flight = bool(task is not None and not task.done())
+    if canonical_reply:
+        turn_state, label = "done", "已同步"
+    elif in_flight:
+        turn_state = "streaming" if acc else ("queued" if acp_busy else "running")
+        label = "思考中" if acc else "處理中"
+    elif task is not None and task.done():
+        turn_state, label = ("done", "已同步") if acc else ("stream_detached", "處理中")
+    elif acp_busy:
+        turn_state, label = "running", "處理中"
+    else:
+        turn_state, label = "idle", "閒置"
+    elapsed = int(now - entry["ts"]) if entry and entry.get("ts") else None
+    return {"session": session, "state": turn_state, "label": label,
+            "in_flight": in_flight, "acp_busy": acp_busy,
+            "elapsed_seconds": elapsed, "stale_seconds": elapsed,
+            "output_chars": len(acc), "canonical_reply": bool(canonical_reply),
+            "canonical_reply_chars": len(canonical_reply or ""),
+            "error": runner_error or None}
 
 
 # ───────────────────── SUBSESSIONS persistence (issue #5) ───────────────────
@@ -4595,10 +4645,12 @@ async def capabilities(request: Request):
     return {"api": "app/v1",
             "features": ["canonical_messages", "reports", "notifications",
                          "approvals", "cc_sessions", "attachments", "vision",
-                         "message_dry_run", "message_interrupt", "apns_push", "accounts",
+                         "message_dry_run", "message_interrupt", "message_status",
+                         "message_events", "apns_push", "accounts",
                          "apple_auth", "account_pairing",
                          "delegations", "control_plane_v2"],
             "endpoints": ["/app/v1/sessions", "/app/v1/messages", "/reports",
+                          "/app/v1/messages/status", "/app/v1/messages/events",
                           "/app/v1/messages/interrupt",
                           "/cron/jobs", "/ccsessions", "/app/v1/approvals",
                           "/app/v1/devices", "/app/v1/push/test",
@@ -4943,6 +4995,61 @@ async def app_get_messages(session: str, request: Request, limit: int = 200):
     except Exception:  # noqa: BLE001
         pass
     return {"messages": out}
+
+
+@app.get("/app/v1/messages/status")
+async def app_get_message_status(session: str, request: Request,
+                                 client_id: str = ""):
+    """Recovery status for a persona turn started by /app/v1/messages.
+
+    Pocket polls this when a mobile upload/stream detaches. Returning an honest
+    state here lets the app show delivered/running/done and avoids re-running
+    image-heavy turns just because the phone lost its SSE connection.
+    """
+    _check_auth(request)
+    if session not in PERSONAS:
+        raise http_err(400, "SESSION_NOT_FOUND", "unknown session")
+    acp = await POOL.get(session, home_for(session))
+    return _app_turn_status(session, client_id or None, acp_busy=acp.is_busy())
+
+
+@app.get("/app/v1/messages/events")
+async def app_get_message_events(session: str, request: Request,
+                                 since: int = 0, follow: bool = True):
+    """SSE feed for canonical persona messages.
+
+    This is intentionally backed by the canonical store instead of an in-memory
+    queue, so it survives bridge restarts and covers turns that completed after
+    the client disconnected.
+    """
+    _check_auth(request)
+    if session not in PERSONAS:
+        raise http_err(400, "SESSION_NOT_FOUND", "unknown session")
+
+    async def gen():
+        cursor = int(since or 0)
+        deadline = time.monotonic() + (120.0 if follow else 0.0)
+        while True:
+            sent = False
+            for msg in _canon_messages(session, 80):
+                seq = _app_message_seq(msg)
+                if seq <= cursor:
+                    continue
+                event = _app_message_event(msg)
+                cursor = max(cursor, int(event["seq"]))
+                yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+                sent = True
+            if not follow:
+                yield "data: [DONE]\n\n"
+                return
+            if not sent:
+                yield ": keepalive\n\n"
+            if time.monotonic() >= deadline:
+                yield "data: [DONE]\n\n"
+                return
+            await asyncio.sleep(SSE_KEEPALIVE_SECS)
+
+    return StreamingResponse(gen(), media_type="text/event-stream")
 
 
 @app.post("/app/v1/messages/{mid}/reaction")
