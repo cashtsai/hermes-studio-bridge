@@ -4000,16 +4000,40 @@ _CC_OPT_LABEL_RE = re.compile(r"^(allow once|always allow|don.t allow|allow|deny
 
 
 def _cc_prompt(pane: str):
-    """Detect a Claude Code interactive choice prompt (permission / yes-no) so the
-    app can render real buttons. Returns {kind,title,options:[{key,label}]} or None.
-    STRICT: only the bottom of the pane (the active prompt box) AND a permission
-    context (wants to / do you want / proceed) — so transcript numbered lists never
-    false-trigger. Never when working."""
+    """Detect a Claude Code interactive choice prompt so the app can render real
+    buttons. Returns {kind,title,options:[{key,label}]} or None.
+    Two shapes: (1) AskUserQuestion / generic numbered menu — anchored on the
+    "Enter to select" footer, labels can be ANY language (a keyword filter here
+    made every Chinese question invisible to the app); (2) permission prompts —
+    the original STRICT keyword path, kept as fallback for older layouts.
+    Never when working."""
     low = pane.lower()
     if "esc to interrupt" in low or _CC_BUSY_RE.search(pane):
         return None
-    tail = pane.splitlines()[-16:]                  # the prompt always sits at the bottom
+    lines = pane.splitlines()
+    tail = lines[-16:]                  # the prompt always sits at the bottom
     tail_low = "\n".join(tail).lower()
+    # (1) generic choice menu: the selection footer only exists while a menu is
+    # live, so numbered lines above it ARE the options — no keyword gate needed.
+    if "enter to select" in tail_low:
+        wide = lines[-28:]              # room for options with description lines
+        opts, first_opt_at = [], None
+        for i, ln in enumerate(wide):
+            s = ln.strip().lstrip("❯>•· ").strip()
+            m = _CC_OPT_NUM_RE.match(s)
+            if m:
+                if first_opt_at is None:
+                    first_opt_at = i
+                opts.append({"key": m.group(1), "label": m.group(2).strip()})
+        if len(opts) >= 2:
+            title = ""
+            for ln in reversed(wide[:first_opt_at or 0]):
+                s = ln.strip()
+                if not s or set(s) <= {"─", "-", "═"} or s[0] in "☐☑":
+                    continue
+                title = s[:140]
+                break
+            return {"kind": "menu", "title": title, "options": opts[:6]}
     has_context = any(k in tail_low for k in ("wants to", "do you want", "proceed?", "would you like"))
     if has_context:
         opts = []
