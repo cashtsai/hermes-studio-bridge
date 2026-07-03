@@ -3378,7 +3378,9 @@ def _parse_agent_event(ev: dict):
 
 
 def _persona_preview(home: str):
-    """Latest message of the persona's canonical Telegram session → (text, ts)."""
+    """Latest user-visible message of the persona's canonical Telegram session
+    → (text, ts). Walks back past rows that are pure runtime injection so the
+    conversation list never previews machine-facing preamble."""
     import sqlite3
     db = os.path.join(home, "state.db")
     if not os.path.exists(db):
@@ -3386,15 +3388,21 @@ def _persona_preview(home: str):
     try:
         con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=5)
         cur = con.execute(
-            "SELECT m.content, m.timestamp FROM messages m "
+            "SELECT m.role, m.content, m.timestamp FROM messages m "
             "JOIN sessions s ON s.id = m.session_id "
             "WHERE s.source='telegram' AND m.role IN ('user','assistant') "
             "AND m.content IS NOT NULL AND m.content != '' "
-            "ORDER BY m.timestamp DESC LIMIT 1")
-        row = cur.fetchone()
+            "ORDER BY m.timestamp DESC LIMIT 10")
+        rows = cur.fetchall()
         con.close()
-        if row:
-            return (str(row[0])[:80], row[1])
+        for role, content, ts in rows:
+            text, _atts = _tg_extract_attachments(str(content))
+            if role == "user":
+                text = _tg_clean_content(text)
+                if text is None:
+                    continue
+            if text:
+                return (text[:80], ts)
     except Exception:
         pass
     return (None, None)
@@ -3406,6 +3414,9 @@ def _persona_preview(home: str):
 # no media column, so those hint lines ARE the media record — parse them back
 # into real attachments.
 _TG_IMAGE_MARKER = re.compile(r"\[Image attached at: ([^\]\n]+)\]")
+# Replied-to media cached by the TG gateway (gateway/platforms/telegram.py:5796):
+# [Replied-to image 'file_36.jpg' saved at: /path]
+_TG_REPLIED_MEDIA = re.compile(r"\[Replied-to (\w+) '([^']*)' saved at: ([^\]\n]+)\]")
 
 
 def _tg_extract_attachments(content: str):
@@ -3415,8 +3426,8 @@ def _tg_extract_attachments(content: str):
     ({kind, filename, mime, path} — see att_meta in POST /app/v1/messages);
     the app fetches `path` through the existing GET /file endpoint, so no new
     media endpoint and no app-side decoding change is needed. Markers whose
-    file has since been pruned from image_cache stay in the text as-is (the
-    path hint is better than silently dropping the message's context)."""
+    file has since been pruned from image_cache become a short human-readable
+    note — the raw path marker is engineering language the app must not show."""
     attachments: list = []
 
     def _repl(m):
@@ -3429,14 +3440,111 @@ def _tg_extract_attachments(content: str):
                 "path": path,
             })
             return ""
-        return m.group(0)
+        return "（附件圖片已失效）"
+
+    def _repl_replied(m):
+        kind, name, path = m.group(1), m.group(2).strip(), m.group(3).strip()
+        if kind == "image" and path and os.path.isfile(path):
+            attachments.append({
+                "kind": "image",
+                "filename": name or os.path.basename(path),
+                "mime": mimetypes.guess_type(path)[0] or "image/jpeg",
+                "path": path,
+            })
+        return ""      # engineering note either way — never shown as text
 
     text = _TG_IMAGE_MARKER.sub(_repl, content or "")
-    if attachments:
+    text = _TG_REPLIED_MEDIA.sub(_repl_replied, text)
+    if text != (content or ""):     # something was extracted or replaced
         # Collapse the blank lines the removed hint lines leave behind.
         text = re.sub(r"\n{3,}", "\n\n", text).strip()
         return text, attachments
     return content, attachments
+
+
+# ── persona message de-noising ──────────────────────────────────────────────
+# Hermes (gateway/run.py, acp_adapter/server.py, tools/process_registry.py) and
+# this bridge itself wrap the user's actual words in machine-facing preambles
+# before storing them in state.db. The app must show ONLY what the user really
+# said. Every rule below is anchored to the exact producer format found in the
+# Hermes source; anything unrecognized passes through UNCHANGED (better to leak
+# a wrapper than to eat a user's words).
+
+# Block wrappers: (open marker, end-of-preamble marker). The user text is what
+# follows the end marker.
+_TG_TEMPORAL_OPEN = "[Internal runtime time context"          # gateway/run.py:727, acp_adapter/server.py:143
+_TG_TEMPORAL_CLOSE = "[/Internal runtime time context]"
+_TG_TEMPORAL_BLOCK = re.compile(
+    re.escape(_TG_TEMPORAL_OPEN) + r"(?s:.*?)" + re.escape(_TG_TEMPORAL_CLOSE))
+_TG_REPORT_OPEN = "【PocketAgent 近期報告上下文】"                 # bridge _report_context_for_prompt
+_TG_REPORT_USER = "【使用者現在的訊息】"
+_TG_REPORT_BLOCK = re.compile(
+    re.escape(_TG_REPORT_OPEN) + r"(?s:.*?)" + re.escape(_TG_REPORT_USER) + r"\n?")
+_TG_OBSERVED_OPEN = "[Observed Telegram group context - context only, not requests]"   # gateway/run.py:691
+_TG_OBSERVED_USER = ("[Current addressed message - answer only this unless it "
+                     "explicitly asks you to use the observed context]")               # gateway/run.py:692
+
+# Inline / whole-message patterns.
+_TG_VOICE_TRANSCRIPT = re.compile(                    # gateway/run.py:12812
+    r'\[The user sent a voice message~\s*Here\'s what they said: "((?s:.*?))"\]')
+_TG_VOICE_NOTE = re.compile(                          # path/duration + failure variants, run.py:12786-12843
+    r"\[The user sent a voice message(?: but |: )(?s:[^\]]*)\]")
+_TG_REPLY_QUOTE = re.compile(                         # gateway/run.py:8713, whatsapp.py:1154
+    r'\[Replying to: "(?s:.*?)"\][ \t]*\n*')          # unanchored: merged rows carry it mid-text
+_TG_BG_PROCESS_OPEN = "[IMPORTANT: Background process "   # tools/process_registry.py:1637/1668
+_TG_TIMESTAMP_PREFIX = re.compile(                    # gateway/message_timestamps.py:85 (config-gated)
+    r"^\[(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun) \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} [^\]]{1,12}\]\s*")
+# Header lines left behind once a block wrapper is stripped, and the image
+# placeholder Hermes stores in place of raw pixels (run_agent.py:1632).
+_TG_NOISE_LINES = {"[User message]", "[User message and attachments follow]",
+                   "[screenshot]"}
+
+
+def _tg_clean_content(text: str):
+    """Strip machine-facing wrappers from a TG-side USER message.
+
+    Returns the user's actual words, or None when the whole row is internal
+    (pure runtime injection with no user content). Unrecognized formats are
+    returned unchanged — this function may under-clean, never over-delete."""
+    if not text:
+        return None
+    out = text
+    # Temporal-context blocks: removed WHEREVER they sit — normally a prefix,
+    # but queued/merged turns leave them mid-text and some rows carry them as
+    # a suffix after the user's words. An open marker without its close is an
+    # unknown format → left untouched.
+    out = _TG_TEMPORAL_BLOCK.sub("\n\n", out)
+    # Bridge report-context injections: each block runs from its exact header
+    # to the 【使用者現在的訊息】 marker; merged multi-turn rows carry SEVERAL
+    # such blocks with real user text between them, so remove every pair and
+    # keep all the text segments. A trailing header with no marker after it
+    # (older append-style prompt) is cut to end-of-text.
+    out = _TG_REPORT_BLOCK.sub("\n\n", out)
+    i = out.find(_TG_REPORT_OPEN)
+    if i != -1 and _TG_REPORT_USER not in out[i:]:
+        out = out[:i]
+    # Observed-group-context preamble (prefix-anchored, per producer).
+    s = out.lstrip()
+    if s.startswith(_TG_OBSERVED_OPEN):
+        i = s.find(_TG_OBSERVED_USER)
+        if i != -1:
+            out = s[i + len(_TG_OBSERVED_USER):]
+    s = out.lstrip()
+    # Whole-row internal notification (tool → agent, zero user content).
+    if s.startswith(_TG_BG_PROCESS_OPEN):
+        return None
+    # Voice: keep the transcript (that IS what the user said), drop the frame;
+    # untranscribable-voice notes are agent-facing → noise.
+    out = _TG_VOICE_TRANSCRIPT.sub(r"\1", out)
+    out = _TG_VOICE_NOTE.sub("", out)
+    # Reply-quote preamble (the quoted snippet is the OTHER side's text).
+    out = _TG_REPLY_QUOTE.sub("", out.lstrip())
+    # Optional per-message timestamp prefix (config-gated, default off).
+    out = _TG_TIMESTAMP_PREFIX.sub("", out)
+    # Line-level scrub of leftover header/placeholder lines.
+    lines = [ln for ln in out.splitlines() if ln.strip() not in _TG_NOISE_LINES]
+    out = re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()
+    return out or None
 
 
 def _persona_history(home: str, limit: int = 100):
@@ -3461,7 +3569,13 @@ def _persona_history(home: str, limit: int = 100):
         out = []
         for r in rows:
             text, atts = _tg_extract_attachments(r[1])
-            out.append({"role": r[0], "content": text, "ts": r[2],
+            if r[0] == "user":
+                # 前台只呈現使用者真正說的話:剝掉 runtime context 等機器面
+                # 包裹;整條都是內部注入(剝完全空)且無附件 → 不出現。
+                text = _tg_clean_content(text)
+                if text is None and not atts:
+                    continue
+            out.append({"role": r[0], "content": text or "", "ts": r[2],
                         "attachments": atts})
         return out
     except Exception as e:  # noqa: BLE001
