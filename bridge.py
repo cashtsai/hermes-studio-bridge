@@ -91,7 +91,13 @@ def _load_device_tokens() -> dict:
         with open(_DEVICE_TOKENS_PATH, "r", encoding="utf-8") as f:
             d = json.load(f)
             return d if isinstance(d, dict) else {}
-    except Exception:
+    except FileNotFoundError:
+        return {}          # first run — nothing paired yet, not an error
+    except Exception as e:  # noqa: BLE001
+        # A corrupt tokens file silently logs every paired device out; that
+        # must be visible in the log, not swallowed (issue #7).
+        _log_event("device_tokens_load_failed", path=_DEVICE_TOKENS_PATH,
+                   error=type(e).__name__, error_message=str(e)[:160])
         return {}
 
 
@@ -102,8 +108,6 @@ def _save_device_tokens(d: dict) -> None:
         json.dump(d, f, ensure_ascii=False, indent=2)
     os.replace(tmp, _DEVICE_TOKENS_PATH)
 
-
-_DEVICE_TOKENS: dict = _load_device_tokens()
 
 # Brute-force guard for the token gate. Once the bridge is reachable from the
 # public internet (Tailscale Funnel), the only thing between an attacker and a
@@ -126,6 +130,10 @@ def _log_event(event: str, **fields) -> None:
         **fields,
     }
     print("[bridge-event] " + json.dumps(payload, ensure_ascii=False, sort_keys=True), flush=True)
+
+
+# Loaded after _log_event exists so a corrupt tokens file gets logged.
+_DEVICE_TOKENS: dict = _load_device_tokens()
 
 
 def _client_host(request: Request) -> str:
@@ -650,6 +658,10 @@ def _accounts_init():
     import sqlite3
     os.makedirs(os.path.dirname(ACCOUNTS_DB), exist_ok=True)
     con = sqlite3.connect(ACCOUNTS_DB, timeout=30)
+    # Same WAL rationale as canonical.db (issue #7): auth reads happen on every
+    # request, so writers (pair/claim, last_seen) must not lock readers out.
+    con.execute("PRAGMA journal_mode=WAL")
+    con.execute("PRAGMA busy_timeout=30000")
     con.execute("PRAGMA foreign_keys=ON")
     con.execute("""CREATE TABLE IF NOT EXISTS users(
         apple_user_id TEXT PRIMARY KEY,
@@ -1577,7 +1589,11 @@ def _devices() -> list:
         rows = con.execute("SELECT token FROM devices").fetchall()
         con.close()
         return [r[0] for r in rows]
-    except Exception:  # noqa: BLE001
+    except Exception as e:  # noqa: BLE001
+        # An unreadable devices table means "push notifications silently off" —
+        # log it so the failure is diagnosable (issue #7).
+        _log_event("devices_read_failed", error=type(e).__name__,
+                   error_message=str(e)[:160])
         return []
 
 
@@ -1589,8 +1605,9 @@ def _device_add(token: str, platform: str = "ios") -> None:
                     "VALUES(?,?,?)", (token, platform, time.time()))
         con.commit()
         con.close()
-    except Exception:  # noqa: BLE001
-        pass
+    except Exception as e:  # noqa: BLE001
+        _log_event("device_add_failed", platform=platform,
+                   error=type(e).__name__, error_message=str(e)[:160])
 
 
 def _device_remove(token: str) -> None:
@@ -1600,8 +1617,9 @@ def _device_remove(token: str) -> None:
         con.execute("DELETE FROM devices WHERE token=?", (token,))
         con.commit()
         con.close()
-    except Exception:  # noqa: BLE001
-        pass
+    except Exception as e:  # noqa: BLE001
+        _log_event("device_remove_failed", error=type(e).__name__,
+                   error_message=str(e)[:160])
 
 
 async def _apns_send(token: str, title: str, body: str, data: dict | None = None):
@@ -2833,11 +2851,21 @@ async def serve_filediff(request: Request, path: str):
     if not any(p == r or p.startswith(r + os.sep) for r in roots) or not os.path.isfile(p):
         raise HTTPException(status_code=404, detail="not found")
 
-    async def _run(*args, cwd=None):
+    async def _run(*args, cwd=None, timeout: float = 20.0):
         proc = await asyncio.create_subprocess_exec(
             *args, cwd=cwd,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
-        out, _ = await proc.communicate()
+        try:
+            out, _ = await asyncio.wait_for(proc.communicate(), timeout)
+        except asyncio.TimeoutError:
+            # git on a wedged repo/mount must not hang the handler (issue #7).
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            _log_event("filediff_git_timeout", args=" ".join(args[:4]),
+                       timeout_s=timeout)
+            return 124, ""
         return proc.returncode, (out or b"").decode("utf-8", "replace")
 
     d = os.path.dirname(p)
@@ -3436,7 +3464,11 @@ def _persona_history(home: str, limit: int = 100):
             out.append({"role": r[0], "content": text, "ts": r[2],
                         "attachments": atts})
         return out
-    except Exception:  # noqa: BLE001
+    except Exception as e:  # noqa: BLE001
+        # A broken state.db read renders the persona thread empty on every
+        # device; that deserves a log line, not silence (issue #7).
+        _log_event("persona_history_read_failed", home=home,
+                   error=type(e).__name__, error_message=str(e)[:160])
         return []
 
 
@@ -5453,8 +5485,11 @@ async def app_get_messages(session: str, request: Request, limit: int = 200):
                 # Older builds wrote the single-reaction overlay only; surface
                 # it in the new list field too so nothing disappears mid-migration.
                 m["reactions"] = [legacy]
-    except Exception:  # noqa: BLE001
-        pass
+    except Exception as e:  # noqa: BLE001
+        # Failing open (messages without reactions/pins) is right, but silent
+        # failure made it undiagnosable (issue #7).
+        _log_event("reaction_overlay_read_failed", session=session,
+                   error=type(e).__name__, error_message=str(e)[:160])
     return {"messages": out}
 
 
@@ -6109,21 +6144,20 @@ async def _make_worktree(base: str, sid: str):
     dispatches don't clobber each other's edits. Returns the worktree path, or
     the original base if it isn't a git repo / the command fails."""
     try:
-        chk = await asyncio.create_subprocess_exec(
-            "git", "-C", base, "rev-parse", "--show-toplevel",
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
-        out, _ = await chk.communicate()
-        if chk.returncode != 0:
+        # _git_out gives both calls a kill-on-timeout guard (issue #7): a git
+        # hung on a dead network mount used to hang the dispatch handler.
+        rc, out = await _git_out("-C", base, "rev-parse", "--show-toplevel")
+        if rc != 0:
             return base
-        top = out.decode().strip() or base
+        top = out.strip() or base
         wt = os.path.expanduser(f"~/.pocket/worktrees/{sid}")
         os.makedirs(os.path.dirname(wt), exist_ok=True)
-        add = await asyncio.create_subprocess_exec(
-            "git", "-C", top, "worktree", "add", "-b", f"pocket/{sid}", wt, "HEAD",
-            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
-        await add.communicate()
-        return wt if add.returncode == 0 and os.path.isdir(wt) else base
-    except Exception:  # noqa: BLE001
+        rc, _ = await _git_out("-C", top, "worktree", "add",
+                               "-b", f"pocket/{sid}", wt, "HEAD", timeout=60)
+        return wt if rc == 0 and os.path.isdir(wt) else base
+    except Exception as e:  # noqa: BLE001
+        _log_event("make_worktree_failed", sid=sid, base=base,
+                   error=type(e).__name__, error_message=str(e)[:160])
         return base
 
 
@@ -6206,3 +6240,49 @@ async def health():
     return {"ok": True, "personas": list(PERSONAS),
             "subsessions": len(SUBSESSIONS),
             "bg_tasks": len(_BG_TASKS)}
+
+
+# ───────────────────────── log rotation (issue #7 item 6) ──────────────────
+# launchd redirects stdout/stderr to bridge.out.log / bridge.err.log and never
+# rotates them, so a long-running bridge grows them toward GBs. launchd keeps
+# the fd open, so rename-rotation would keep writing into the renamed file;
+# copy-then-truncate is safe here because launchd opens the logs with O_APPEND
+# (verified on the live process) — every write seeks to the new EOF.
+_LOG_ROTATE_MAX_BYTES = int(os.environ.get("BRIDGE_LOG_MAX_BYTES", 64 * 1024 * 1024))
+_LOG_ROTATE_CHECK_SECS = 900.0
+
+
+def _rotate_log_file(path: str) -> None:
+    try:
+        if os.path.getsize(path) < _LOG_ROTATE_MAX_BYTES:
+            return
+    except OSError:
+        return
+    try:
+        import shutil
+        shutil.copyfile(path, path + ".1")   # keep exactly one old generation
+        os.truncate(path, 0)
+        _log_event("log_rotated", path=path)
+    except Exception as e:  # noqa: BLE001
+        _log_event("log_rotate_failed", path=path,
+                   error=type(e).__name__, error_message=str(e)[:160])
+
+
+async def _log_rotation_loop():
+    base = os.path.dirname(os.path.abspath(__file__))
+    logs = [os.path.join(base, "bridge.out.log"),
+            os.path.join(base, "bridge.err.log")]
+    extra = os.environ.get("BRIDGE_LOG_ROTATE_PATHS", "")
+    logs.extend(p for p in (s.strip() for s in extra.split(":")) if p)
+    while True:
+        for p in logs:
+            if os.path.exists(p):
+                _rotate_log_file(p)
+        await asyncio.sleep(_LOG_ROTATE_CHECK_SECS)
+
+
+@app.on_event("startup")
+async def _start_log_rotation():
+    task = asyncio.create_task(_log_rotation_loop())
+    _BG_TASKS.add(task)
+    task.add_done_callback(_BG_TASKS.discard)
