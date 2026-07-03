@@ -3162,6 +3162,46 @@ async def codex_session_input(thread_id: str, request: Request):
         _codex_http_error(e)
 
 
+# S3 (wave 2): Codex-side model / approval-policy switching. The app-server
+# exposes `thread/settings/update` (needs the experimentalApi capability the
+# bridge already requests at initialize). Live-probed against codex-cli
+# 0.142.2: accepted fields include `model` and `approvalPolicy`; the policy
+# enum is validated server-side as below. No global setter exists — settings
+# are per-thread.
+_CODEX_APPROVAL_POLICIES = ("untrusted", "on-failure", "on-request",
+                            "granular", "never")
+
+
+@app.post("/codexsessions/{thread_id}/settings")
+async def codex_session_settings(thread_id: str, request: Request):
+    """Update per-thread Codex settings. body {"model": str?,
+    "approvalPolicy": "untrusted"|"on-failure"|"on-request"|"granular"|"never"}
+    — at least one field required."""
+    _check_auth(request)
+    body = await request.json()
+    params = {"threadId": thread_id}
+    model = str(body.get("model") or "").strip()
+    policy = str(body.get("approvalPolicy") or "").strip()
+    if model:
+        params["model"] = model
+    if policy:
+        if policy not in _CODEX_APPROVAL_POLICIES:
+            raise HTTPException(status_code=400,
+                                detail="approvalPolicy must be one of "
+                                       + "|".join(_CODEX_APPROVAL_POLICIES))
+        params["approvalPolicy"] = policy
+    if len(params) == 1:
+        raise HTTPException(status_code=400, detail="model or approvalPolicy required")
+    try:
+        await CODEX_APP.ensure_thread_loaded(thread_id)
+        await CODEX_APP.call("thread/settings/update", params, timeout=15.0)
+    except Exception as e:  # noqa: BLE001
+        _codex_http_error(e)
+    applied = {k: v for k, v in params.items() if k != "threadId"}
+    _log_event("codex_settings_update", thread=thread_id[:16], **applied)
+    return {"ok": True, "thread_id": thread_id, "applied": applied}
+
+
 @app.post("/codexsessions/{thread_id}/interrupt")
 async def codex_session_interrupt(thread_id: str, request: Request):
     _check_auth(request)
@@ -4534,9 +4574,16 @@ async def _cc_status_core(name: str) -> dict:
     else:
         busy = bool(_CC_BUSY_RE.search(pane)) or ("esc to interrupt" in pane.lower())
     low = pane.lower()
+    # S3 (wave 2): this box's Claude Code cycles FOUR states on shift+tab —
+    # normal → accept edits → plan → auto mode → normal. "accept edits" and
+    # "auto mode" used to both report as "auto", which made the app's mode
+    # picker snap back; they are distinct now (contract: normal|acceptEdits|
+    # plan|auto).
     if "plan mode on" in low:
         mode = "plan"
-    elif "auto mode on" in low or "accept edits on" in low or "bypass" in low:
+    elif "accept edits on" in low:
+        mode = "acceptEdits"
+    elif "auto mode on" in low or "bypass" in low:
         mode = "auto"
     elif busy:
         # A running turn replaces the bottom bar with "esc to interrupt" — the
@@ -4596,6 +4643,90 @@ async def cc_session_key(name: str, request: Request):
     # would feed the app a pre-keystroke mode/prompt for up to TTL seconds.
     _PANE_CACHE.pop(name, None)
     return {"ok": True}
+
+
+# S3 (wave 2): one-tap CC permission-mode / model switching. shift+tab cycles
+# FOUR states on this box (normal → accept edits → plan → auto mode → normal),
+# so instead of blind-counting presses we close the loop: press → fresh pane →
+# check, up to 6 presses. Immune to cycle-order drift across CC versions.
+_CC_MODES = ("normal", "acceptEdits", "plan", "auto")
+_CC_MODE_ALIASES = {"default": "normal"}   # older app builds say "default"
+_CC_MODE_MAX_PRESSES = 6
+
+
+async def _cc_mode_fresh(name: str) -> str | None:
+    _PANE_CACHE.pop(name, None)
+    st = await _cc_status_core(name)
+    return st.get("mode")
+
+
+@app.post("/ccsessions/{name}/mode")
+async def cc_session_mode(name: str, request: Request):
+    """Switch the CC permission mode. body {"mode": "normal"|"acceptEdits"|
+    "plan"|"auto"}. Sends shift+tab (BTab) and VERIFIES via the pane's bottom
+    bar after each press; replies with the mode actually reached."""
+    _check_auth(request)
+    if not any(r[0] == name for r in _cc_conf_rows()):
+        raise http_err(404, "SESSION_NOT_FOUND", "unknown session")
+    if not await _tmux_alive(name):
+        raise http_err(409, "SESSION_NOT_RUNNING", "session not running")
+    body = await request.json()
+    raw = str(body.get("mode") or "").strip()
+    target = _CC_MODE_ALIASES.get(raw, raw)
+    if target not in _CC_MODES:
+        raise HTTPException(status_code=400,
+                            detail=f"mode must be one of {'|'.join(_CC_MODES)}")
+    mode = await _cc_mode_fresh(name)
+    if mode is None:
+        # A running turn hides the bottom-bar mode marker — a blind toggle
+        # could not be verified, so refuse instead of guessing.
+        raise http_err(409, "CC_BUSY", "turn running; mode bar hidden — retry when idle")
+    presses = 0
+    while mode != target and presses < _CC_MODE_MAX_PRESSES:
+        rc, _, err = await _tmux_run("send-keys", "-t", name, "BTab")
+        if rc:
+            raise http_err(502, "TMUX_FAILED", "tmux send-keys failed",
+                           err[:200] or "send-keys failed")
+        presses += 1
+        await asyncio.sleep(0.35)          # let the TUI repaint the bottom bar
+        mode = await _cc_mode_fresh(name)
+    _log_event("cc_mode_switch", session=name, target=target,
+               reached=mode, presses=presses)
+    if mode != target:
+        raise http_err(502, "MODE_UNREACHED",
+                       f"sent {presses} shift+tab, pane reports {mode or 'unknown'}")
+    return {"ok": True, "mode": mode, "presses": presses}
+
+
+_CC_MODEL_RE = re.compile(r"^[A-Za-z0-9 ._/-]{1,60}$")
+
+
+@app.post("/ccsessions/{name}/model")
+async def cc_session_model(name: str, request: Request):
+    """Switch the CC model by typing the /model slash command into the live
+    TUI. body {"model": "opus"|"sonnet"|full model name}. Confirmation is
+    best-effort: we re-capture the pane and report whether the requested name
+    shows up (confirmed), but the command is sent either way."""
+    _check_auth(request)
+    if not any(r[0] == name for r in _cc_conf_rows()):
+        raise http_err(404, "SESSION_NOT_FOUND", "unknown session")
+    if not await _tmux_alive(name):
+        raise http_err(409, "SESSION_NOT_RUNNING", "session not running")
+    body = await request.json()
+    model = str(body.get("model") or "").strip()
+    if not _CC_MODEL_RE.match(model):
+        raise HTTPException(status_code=400, detail="invalid model name")
+    pane_before = await _cc_capture_pane_fresh(name)
+    if _cc_pane_busy(pane_before):
+        raise http_err(409, "CC_BUSY", "turn running; model switch needs an idle prompt")
+    await _cc_paste_text(name, f"/model {model}")
+    await asyncio.sleep(0.8)               # slash command feedback repaint
+    _PANE_CACHE.pop(name, None)
+    pane = await _cc_capture_pane_fresh(name)
+    tail = "\n".join(pane.strip().splitlines()[-12:])
+    confirmed = model.lower() in tail.lower()
+    _log_event("cc_model_switch", session=name, model=model, confirmed=confirmed)
+    return {"ok": True, "model": model, "confirmed": confirmed}
 
 
 # ───────────────────────── /app/v2 control-plane facade ─────────────────────
