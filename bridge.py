@@ -1973,6 +1973,9 @@ class CodexAppServerClient:
         self._streamed_item_ids = set()
         self.pending_approvals = {}
         self.pending_approvals_by_thread = collections.defaultdict(dict)
+        # wave 2: live token usage per thread (thread/tokenUsage/updated) —
+        # thread/list reports tokenUsage: null, so this is the only source.
+        self.token_usage = {}
 
     async def call(self, method: str, params: dict | None = None, timeout: float = 30.0):
         async with self._lock:
@@ -2390,6 +2393,9 @@ class CodexAppServerClient:
                 self.loaded_threads.add(tid)
             return
         tid = params.get("threadId")
+        if method == "thread/tokenUsage/updated" and tid:
+            self.token_usage[tid] = params.get("tokenUsage") or params
+            return
         if method == "turn/started" and tid:
             turn = params.get("turn") or {}
             self.active_turns[tid] = turn.get("id") or True
@@ -2498,9 +2504,40 @@ class CodexAppServerClient:
 CODEX_APP = CodexAppServerClient()
 
 
+def _codex_usage_map(tu) -> dict | None:
+    """app-server token usage (thread dict or tokenUsage/updated params) →
+    the app's {used, size} meter shape. Defensive: field names probed on
+    codex-cli 0.142.2 (totalTokens / inputTokens / cachedInputTokens /
+    outputTokens, window in modelContextWindow); unknown shapes → None."""
+    if not isinstance(tu, dict):
+        return None
+    inner = tu.get("tokenUsage") if isinstance(tu.get("tokenUsage"), dict) else tu
+    total = inner.get("totalTokens")
+    if total is None:
+        total = sum(int(inner.get(k) or 0)
+                    for k in ("inputTokens", "cachedInputTokens", "outputTokens"))
+    try:
+        total = int(total or 0)
+    except (TypeError, ValueError):
+        return None
+    if total <= 0:
+        return None
+    usage = {"used": total}
+    window = inner.get("modelContextWindow") or tu.get("modelContextWindow")
+    try:
+        if window:
+            usage["size"] = int(window)
+    except (TypeError, ValueError):
+        pass
+    return usage
+
+
 def _codex_enrich_summary(summary: dict) -> dict:
     tid = summary.get("thread_id") or summary.get("id") or ""
     summary["activeTurn"] = CODEX_APP.is_active(tid)
+    usage = _codex_usage_map(CODEX_APP.token_usage.get(tid))
+    if usage:
+        summary["usage"] = usage
     approval = CODEX_APP.pending_approval_for_thread(tid)
     if approval:
         summary["awaitingApproval"] = True
@@ -2536,7 +2573,7 @@ def _codex_session_summary(thread: dict) -> dict:
     tid = thread.get("id") or ""
     name = (thread.get("name") or "").strip()
     preview = (thread.get("preview") or "").strip()
-    return {
+    out = {
         "name": name or preview[:180] or (tid[:12] or "codex"),
         "thread_id": tid,
         "session_id": thread.get("sessionId") or "",
@@ -2547,6 +2584,13 @@ def _codex_session_summary(thread: dict) -> dict:
         "updatedAt": thread.get("updatedAt"),
         "modelProvider": thread.get("modelProvider") or "",
     }
+    # 0.142.2 returns tokenUsage: null from thread/list, but map it when a
+    # future version populates it; the live overlay in _codex_enrich_summary
+    # (thread/tokenUsage/updated) wins either way.
+    usage = _codex_usage_map(thread.get("tokenUsage"))
+    if usage:
+        out["usage"] = usage
+    return out
 
 
 def _codex_user_input_text(content: list) -> str:
@@ -3928,6 +3972,11 @@ def _fmt_cc_event(d: dict) -> str:
             elif bt == "tool_use":
                 name = b.get("name", "tool")
                 inp = b.get("input") or {}
+                if name == "ExitPlanMode" and isinstance(inp, dict) and inp.get("plan"):
+                    # wave 2: the plan IS the content — a 140-char one-liner
+                    # (the generic cmd path below) buried it. Full markdown.
+                    out.append(f"\n› 🔧 **ExitPlanMode**\n\n📋 **計畫**\n\n{inp['plan']}\n")
+                    continue
                 cmd = (inp.get("command") or inp.get("file_path") or inp.get("path")
                        or inp.get("pattern") or "")
                 if not cmd and isinstance(inp, dict):
@@ -3936,6 +3985,71 @@ def _fmt_cc_event(d: dict) -> str:
                 out.append(f"\n› 🔧 **{name}**" + (f" `{cmd}`" if cmd else "") + "\n")
         return "\n".join(out)
     return ""
+
+
+# wave 2: CC usage meter + full plan text, both read from the session's
+# transcript jsonl tail (last 256KB — a turn's final assistant event always
+# lands near EOF). mtime-keyed cache so the app's 1.2s status poll doesn't
+# re-scan an unchanged file.
+_CC_CONTEXT_WINDOW = 200_000
+_CC_JSONL_TAIL_BYTES = 262_144
+_CC_JSONL_SCAN_CACHE: dict = {}   # workdir -> (jsonl, mtime, usage, plan)
+
+
+def _cc_jsonl_tail_events(jsonl: str):
+    with open(jsonl, "rb") as f:
+        f.seek(0, 2)
+        size = f.tell()
+        f.seek(max(0, size - _CC_JSONL_TAIL_BYTES))
+        data = f.read().decode("utf-8", "replace")
+    events = []
+    for line in data.splitlines():
+        try:
+            events.append(json.loads(line))
+        except Exception:  # noqa: BLE001
+            continue
+    return events
+
+
+def _cc_scan_jsonl(workdir: str):
+    """→ (usage_dict_or_None, latest_plan_or_None) for the session's live jsonl."""
+    jsonl = _cc_latest_jsonl(workdir)
+    if not jsonl:
+        return (None, None)
+    try:
+        mt = os.path.getmtime(jsonl)
+    except OSError:
+        return (None, None)
+    hit = _CC_JSONL_SCAN_CACHE.get(workdir)
+    if hit and hit[0] == jsonl and hit[1] == mt:
+        return (hit[2], hit[3])
+    usage = plan = None
+    try:
+        for d in reversed(_cc_jsonl_tail_events(jsonl)):
+            if d.get("type") != "assistant":
+                continue
+            msg = d.get("message") or {}
+            if usage is None:
+                u = msg.get("usage") or {}
+                used = sum(int(u.get(k) or 0) for k in
+                           ("input_tokens", "cache_creation_input_tokens",
+                            "cache_read_input_tokens", "output_tokens"))
+                if used:
+                    usage = {"used": used, "size": _CC_CONTEXT_WINDOW}
+            if plan is None:
+                for b in (msg.get("content") or []):
+                    if (isinstance(b, dict) and b.get("type") == "tool_use"
+                            and b.get("name") == "ExitPlanMode"
+                            and (b.get("input") or {}).get("plan")):
+                        plan = str(b["input"]["plan"])
+                        break
+            if usage is not None and plan is not None:
+                break
+    except Exception as e:  # noqa: BLE001
+        _log_event("cc_jsonl_scan_failed", workdir=workdir,
+                   error=type(e).__name__, error_message=str(e)[:120])
+    _CC_JSONL_SCAN_CACHE[workdir] = (jsonl, mt, usage, plan)
+    return (usage, plan)
 
 
 @app.get("/ccsessions")
@@ -4592,7 +4706,19 @@ async def _cc_status_core(name: str) -> dict:
         mode = None
     else:
         mode = "normal"
-    return {"busy": busy, "running": True, "mode": mode, "prompt": _cc_prompt(pane)}
+    prompt = _cc_prompt(pane)
+    st = {"busy": busy, "running": True, "mode": mode, "prompt": prompt}
+    # wave 2: usage meter + full plan text from the transcript jsonl.
+    row = next((r for r in _cc_conf_rows() if r[0] == name), None)
+    if row:
+        usage, plan = _cc_scan_jsonl(row[1])
+        if usage:
+            st["usage"] = usage
+        if prompt and plan and "plan" in low:
+            # The live prompt is a plan approval — hand the app the COMPLETE
+            # plan markdown (the pane preview is truncated by the TUI).
+            prompt["plan"] = plan
+    return st
 
 
 @app.get("/ccsessions/{name}/status")
