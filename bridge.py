@@ -4035,7 +4035,12 @@ def _cc_scan_jsonl(workdir: str):
                            ("input_tokens", "cache_creation_input_tokens",
                             "cache_read_input_tokens", "output_tokens"))
                 if used:
-                    usage = {"used": used, "size": _CC_CONTEXT_WINDOW}
+                    # The jsonl doesn't state the context window. Default to
+                    # 200k; a session already past that is on a long-context
+                    # model (observed live: 224k used on this box) → report
+                    # the 1M window so the meter never reads >100%.
+                    size = 1_000_000 if used > _CC_CONTEXT_WINDOW else _CC_CONTEXT_WINDOW
+                    usage = {"used": used, "size": size}
             if plan is None:
                 for b in (msg.get("content") or []):
                     if (isinstance(b, dict) and b.get("type") == "tool_use"
