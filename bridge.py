@@ -2328,10 +2328,12 @@ class CodexAppServerClient:
             self.active_turns[tid] = turn.get("id") or True
             self.last_event_at[tid] = time.time()
             self.thread_errors.pop(tid, None)
+            _codex_history_invalidate(tid)   # cached /history page is now stale
             return
         if method == "turn/completed" and tid:
             self.active_turns.pop(tid, None)
             self.last_event_at[tid] = time.time()
+            _codex_history_invalidate(tid)   # cached /history page is now stale
             self._drop_thread_approvals(tid)
             turn = params.get("turn") or {}
             err = turn.get("error") if isinstance(turn, dict) else None
@@ -2636,6 +2638,36 @@ async def codex_status(request: Request):
         _codex_http_error(e)
 
 
+# Codex 進場延遲止血 (B1): /codexsessions/{id}/history is zero-cache and its
+# thread/turns/list itemsView:"full" call is expensive; the app fires it
+# several times while entering a session. A short TTL cache absorbs those
+# duplicates — same pattern as _PANE_CACHE for tmux capture-pane.
+_CODEX_HISTORY_TTL = 4.0
+_CODEX_HISTORY_CACHE: dict = {}   # (thread_id, limit, cursor) -> (cached_at_monotonic, payload)
+
+
+def _codex_history_invalidate(thread_id: str) -> None:
+    """Drop cached history pages for one thread (new input / turn activity)."""
+    for k in [k for k in _CODEX_HISTORY_CACHE if k[0] == thread_id]:
+        _CODEX_HISTORY_CACHE.pop(k, None)
+
+
+async def _codex_warm_threads(thread_ids: list) -> None:
+    """B3 light warmup: pre-run thread/resume for the sessions the user is most
+    likely to tap next, so entering one skips the cold load. Strictly
+    sequential and skip-if-loaded, so it never amplifies app-server queueing —
+    at most one warm call is in the single _lock queue at a time."""
+    for tid in thread_ids:
+        if not tid or tid in CODEX_APP.loaded_threads:
+            continue
+        try:
+            await CODEX_APP.ensure_thread_loaded(tid)
+            _log_event("codex_thread_warmed", thread=tid[:16])
+        except Exception as e:  # noqa: BLE001
+            _log_event("codex_thread_warm_failed", thread=tid[:16],
+                       error=type(e).__name__)
+
+
 @app.get("/codexsessions")
 async def codex_sessions(request: Request, limit: int = 40, cwd: str | None = None,
                          archived: bool = False):
@@ -2652,9 +2684,17 @@ async def codex_sessions(request: Request, limit: int = 40, cwd: str | None = No
         params["cwd"] = cwd
     try:
         res = await CODEX_APP.call("thread/list", params, timeout=45.0)
+        data = list((res or {}).get("data", []))
+        # B3: warm the few most-recent threads in the background (fire and
+        # forget — the list response is NOT delayed by this).
+        warm_ids = [t.get("id") for t in data[:4] if t.get("id")]
+        if warm_ids:
+            task = asyncio.create_task(_codex_warm_threads(warm_ids))
+            _BG_TASKS.add(task)
+            task.add_done_callback(_BG_TASKS.discard)
         return {
             "sessions": [_codex_enrich_summary(_codex_session_summary(t))
-                         for t in (res or {}).get("data", [])],
+                         for t in data],
             "nextCursor": (res or {}).get("nextCursor"),
         }
     except Exception as e:  # noqa: BLE001
@@ -3035,6 +3075,7 @@ async def codex_session_input(thread_id: str, request: Request):
                                            body.get("attachments") or [])
     if not input_items:
         raise HTTPException(status_code=400, detail="empty")
+    _codex_history_invalidate(thread_id)     # new user turn → history changed
     try:
         res = await CODEX_APP.start_turn(thread_id, input_items,
                                          client_id=body.get("client_id"),
@@ -3058,10 +3099,17 @@ async def codex_session_interrupt(thread_id: str, request: Request):
 async def codex_session_history(thread_id: str, request: Request, limit: int = 40,
                                 cursor: str | None = None):
     _check_auth(request)
+    lim = max(1, min(limit, 100))
+    key = (thread_id, lim, cursor or "")
+    hit = _CODEX_HISTORY_CACHE.get(key)
+    if hit and time.monotonic() - hit[0] < _CODEX_HISTORY_TTL:
+        _log_event("codex_history_cache_hit", thread=thread_id[:16],
+                   limit=lim, cursor=bool(cursor))
+        return hit[1]
     try:
         params = {
             "threadId": thread_id,
-            "limit": max(1, min(limit, 100)),
+            "limit": lim,
             "itemsView": "full",
             "sortDirection": "desc",
         }
@@ -3070,9 +3118,11 @@ async def codex_session_history(thread_id: str, request: Request, limit: int = 4
         res = await CODEX_APP.call("thread/turns/list", params, timeout=45.0)
         turns = list((res or {}).get("data", []))
         turns.reverse()
-        return {"text": _codex_format_turns(turns),
-                "more": bool((res or {}).get("nextCursor")),
-                "nextCursor": (res or {}).get("nextCursor")}
+        payload = {"text": _codex_format_turns(turns),
+                   "more": bool((res or {}).get("nextCursor")),
+                   "nextCursor": (res or {}).get("nextCursor")}
+        _CODEX_HISTORY_CACHE[key] = (time.monotonic(), payload)
+        return payload
     except Exception as e:  # noqa: BLE001
         _codex_http_error(e)
 
