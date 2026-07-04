@@ -207,12 +207,43 @@ HERMES_BIN = "/Users/xcash/apps/hermes-agent/runtime/venv/bin/hermes"
 HOME_ROOT = "/Users/xcash/apps/hermes-agent/home"
 
 # model id -> (display name, HERMES_HOME). id stays ascii for client URLs.
-PERSONAS = {
+# G6 (wave 2): these four are the code-level BUILTINS; the personas table in
+# canonical.db overlays them (rename / disable / soft-delete) and adds custom
+# personas. PERSONAS itself stays a plain {id: (display, home)} dict mutated
+# in place by _personas_reload(), so every existing consumer keeps working and
+# CRUD takes effect without a restart.
+_PERSONAS_BUILTIN = {
     "yuanfang":    ("袁方 (幕僚長/main)", HOME_ROOT),
     "pantianqing": ("潘天晴 (FLiPER)",    f"{HOME_ROOT}/profiles/fliper"),
     "xcash":       ("XCash (PocketAgent 協調)", f"{HOME_ROOT}/profiles/xcash"),
     "shuijing":    ("水鏡 (shuijing)",    f"{HOME_ROOT}/profiles/shuijing"),
 }
+PERSONAS = dict(_PERSONAS_BUILTIN)
+
+
+def _personas_db_rows() -> list:
+    import sqlite3
+    try:
+        con = sqlite3.connect(f"file:{CANON_DB}?mode=ro", uri=True, timeout=5)
+        rows = con.execute("SELECT id,name,home,enabled,deleted FROM personas").fetchall()
+        con.close()
+        return rows
+    except Exception:  # noqa: BLE001
+        return []      # table not created yet (first boot) → builtins only
+
+
+def _personas_reload() -> None:
+    """Rebuild PERSONAS from builtins + the personas table. In-place mutation:
+    all lookups (home_for, /sessions, message endpoints) see changes at once."""
+    merged = dict(_PERSONAS_BUILTIN)
+    for pid, name, home, enabled, deleted in _personas_db_rows():
+        if deleted or not enabled:
+            merged.pop(pid, None)
+            continue
+        base = merged.get(pid, (pid, HOME_ROOT))
+        merged[pid] = (name or base[0], home or base[1])
+    PERSONAS.clear()
+    PERSONAS.update(merged)
 
 # Per-(persona, conversation) hermes session name. Open WebUI doesn't send a
 # stable conversation id in the OpenAI schema, so we key on persona only —
@@ -590,9 +621,26 @@ def _canon_init():
     con.execute("""CREATE TABLE IF NOT EXISTS message_meta(
         message_id TEXT PRIMARY KEY, reactions TEXT, pinned INTEGER,
         updated_at REAL)""")
+    # G4 tombstone (wave 2): deleted messages stay in the list, flagged. The
+    # table may pre-date this column, so ALTER idempotently.
+    meta_cols = [r[1] for r in con.execute("PRAGMA table_info(message_meta)").fetchall()]
+    if "deleted" not in meta_cols:
+        con.execute("ALTER TABLE message_meta ADD COLUMN deleted INTEGER")
+    # G6 (wave 2): persona registry — overlays/extends the code builtins so
+    # personas can be added / renamed / disabled without editing bridge.py.
+    con.execute("""CREATE TABLE IF NOT EXISTS personas(
+        id TEXT PRIMARY KEY, name TEXT, home TEXT,
+        enabled INTEGER NOT NULL DEFAULT 1, deleted INTEGER NOT NULL DEFAULT 0,
+        created_at REAL, updated_at REAL)""")
     con.execute("""CREATE TABLE IF NOT EXISTS approvals(
         id TEXT PRIMARY KEY, title TEXT, source TEXT, risk TEXT, detail TEXT,
         created_at REAL, expires_at REAL, status TEXT, decided_at REAL, result TEXT)""")
+    # B4 (issue #9): decision push-back — the creating skill can register a
+    # callback URL that gets POSTed when the approval is decided/expired,
+    # instead of having to poll GET /app/v1/approvals/{id}.
+    approval_cols = [r[1] for r in con.execute("PRAGMA table_info(approvals)").fetchall()]
+    if "callback" not in approval_cols:
+        con.execute("ALTER TABLE approvals ADD COLUMN callback TEXT")
     con.execute("""CREATE TABLE IF NOT EXISTS devices(
         token TEXT PRIMARY KEY, platform TEXT, created_at REAL)""")
     con.execute("""CREATE TABLE IF NOT EXISTS report_events(
@@ -1654,6 +1702,7 @@ async def push_notify(title: str, body: str, data: dict | None = None) -> int:
 _canon_init()
 _accounts_init()
 _subsessions_load()   # issue #5: rebuild /dispatch subs after restart
+_personas_reload()    # G6: apply persona overrides/customs from canonical.db
 
 
 async def _persona_content_stream(model: str, prompt: str):
@@ -1924,6 +1973,9 @@ class CodexAppServerClient:
         self._streamed_item_ids = set()
         self.pending_approvals = {}
         self.pending_approvals_by_thread = collections.defaultdict(dict)
+        # wave 2: live token usage per thread (thread/tokenUsage/updated) —
+        # thread/list reports tokenUsage: null, so this is the only source.
+        self.token_usage = {}
 
     async def call(self, method: str, params: dict | None = None, timeout: float = 30.0):
         async with self._lock:
@@ -2341,6 +2393,9 @@ class CodexAppServerClient:
                 self.loaded_threads.add(tid)
             return
         tid = params.get("threadId")
+        if method == "thread/tokenUsage/updated" and tid:
+            self.token_usage[tid] = params.get("tokenUsage") or params
+            return
         if method == "turn/started" and tid:
             turn = params.get("turn") or {}
             self.active_turns[tid] = turn.get("id") or True
@@ -2449,9 +2504,40 @@ class CodexAppServerClient:
 CODEX_APP = CodexAppServerClient()
 
 
+def _codex_usage_map(tu) -> dict | None:
+    """app-server token usage (thread dict or tokenUsage/updated params) →
+    the app's {used, size} meter shape. Defensive: field names probed on
+    codex-cli 0.142.2 (totalTokens / inputTokens / cachedInputTokens /
+    outputTokens, window in modelContextWindow); unknown shapes → None."""
+    if not isinstance(tu, dict):
+        return None
+    inner = tu.get("tokenUsage") if isinstance(tu.get("tokenUsage"), dict) else tu
+    total = inner.get("totalTokens")
+    if total is None:
+        total = sum(int(inner.get(k) or 0)
+                    for k in ("inputTokens", "cachedInputTokens", "outputTokens"))
+    try:
+        total = int(total or 0)
+    except (TypeError, ValueError):
+        return None
+    if total <= 0:
+        return None
+    usage = {"used": total}
+    window = inner.get("modelContextWindow") or tu.get("modelContextWindow")
+    try:
+        if window:
+            usage["size"] = int(window)
+    except (TypeError, ValueError):
+        pass
+    return usage
+
+
 def _codex_enrich_summary(summary: dict) -> dict:
     tid = summary.get("thread_id") or summary.get("id") or ""
     summary["activeTurn"] = CODEX_APP.is_active(tid)
+    usage = _codex_usage_map(CODEX_APP.token_usage.get(tid))
+    if usage:
+        summary["usage"] = usage
     approval = CODEX_APP.pending_approval_for_thread(tid)
     if approval:
         summary["awaitingApproval"] = True
@@ -2487,7 +2573,7 @@ def _codex_session_summary(thread: dict) -> dict:
     tid = thread.get("id") or ""
     name = (thread.get("name") or "").strip()
     preview = (thread.get("preview") or "").strip()
-    return {
+    out = {
         "name": name or preview[:180] or (tid[:12] or "codex"),
         "thread_id": tid,
         "session_id": thread.get("sessionId") or "",
@@ -2498,6 +2584,13 @@ def _codex_session_summary(thread: dict) -> dict:
         "updatedAt": thread.get("updatedAt"),
         "modelProvider": thread.get("modelProvider") or "",
     }
+    # 0.142.2 returns tokenUsage: null from thread/list, but map it when a
+    # future version populates it; the live overlay in _codex_enrich_summary
+    # (thread/tokenUsage/updated) wins either way.
+    usage = _codex_usage_map(thread.get("tokenUsage"))
+    if usage:
+        out["usage"] = usage
+    return out
 
 
 def _codex_user_input_text(content: list) -> str:
@@ -3115,6 +3208,46 @@ async def codex_session_input(thread_id: str, request: Request):
         _codex_http_error(e)
 
 
+# S3 (wave 2): Codex-side model / approval-policy switching. The app-server
+# exposes `thread/settings/update` (needs the experimentalApi capability the
+# bridge already requests at initialize). Live-probed against codex-cli
+# 0.142.2: accepted fields include `model` and `approvalPolicy`; the policy
+# enum is validated server-side as below. No global setter exists — settings
+# are per-thread.
+_CODEX_APPROVAL_POLICIES = ("untrusted", "on-failure", "on-request",
+                            "granular", "never")
+
+
+@app.post("/codexsessions/{thread_id}/settings")
+async def codex_session_settings(thread_id: str, request: Request):
+    """Update per-thread Codex settings. body {"model": str?,
+    "approvalPolicy": "untrusted"|"on-failure"|"on-request"|"granular"|"never"}
+    — at least one field required."""
+    _check_auth(request)
+    body = await request.json()
+    params = {"threadId": thread_id}
+    model = str(body.get("model") or "").strip()
+    policy = str(body.get("approvalPolicy") or "").strip()
+    if model:
+        params["model"] = model
+    if policy:
+        if policy not in _CODEX_APPROVAL_POLICIES:
+            raise HTTPException(status_code=400,
+                                detail="approvalPolicy must be one of "
+                                       + "|".join(_CODEX_APPROVAL_POLICIES))
+        params["approvalPolicy"] = policy
+    if len(params) == 1:
+        raise HTTPException(status_code=400, detail="model or approvalPolicy required")
+    try:
+        await CODEX_APP.ensure_thread_loaded(thread_id)
+        await CODEX_APP.call("thread/settings/update", params, timeout=15.0)
+    except Exception as e:  # noqa: BLE001
+        _codex_http_error(e)
+    applied = {k: v for k, v in params.items() if k != "threadId"}
+    _log_event("codex_settings_update", thread=thread_id[:16], **applied)
+    return {"ok": True, "thread_id": thread_id, "applied": applied}
+
+
 @app.post("/codexsessions/{thread_id}/interrupt")
 async def codex_session_interrupt(thread_id: str, request: Request):
     _check_auth(request)
@@ -3380,7 +3513,9 @@ def _parse_agent_event(ev: dict):
 
 
 def _persona_preview(home: str):
-    """Latest message of the persona's canonical Telegram session → (text, ts)."""
+    """Latest user-visible message of the persona's canonical Telegram session
+    → (text, ts). Walks back past rows that are pure runtime injection so the
+    conversation list never previews machine-facing preamble."""
     import sqlite3
     db = os.path.join(home, "state.db")
     if not os.path.exists(db):
@@ -3388,15 +3523,21 @@ def _persona_preview(home: str):
     try:
         con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=5)
         cur = con.execute(
-            "SELECT m.content, m.timestamp FROM messages m "
+            "SELECT m.role, m.content, m.timestamp FROM messages m "
             "JOIN sessions s ON s.id = m.session_id "
             "WHERE s.source='telegram' AND m.role IN ('user','assistant') "
             "AND m.content IS NOT NULL AND m.content != '' "
-            "ORDER BY m.timestamp DESC LIMIT 1")
-        row = cur.fetchone()
+            "ORDER BY m.timestamp DESC LIMIT 10")
+        rows = cur.fetchall()
         con.close()
-        if row:
-            return (str(row[0])[:80], row[1])
+        for role, content, ts in rows:
+            text, _atts = _tg_extract_attachments(str(content))
+            if role == "user":
+                text = _tg_clean_content(text)
+                if text is None:
+                    continue
+            if text:
+                return (text[:80], ts)
     except Exception:
         pass
     return (None, None)
@@ -3408,6 +3549,9 @@ def _persona_preview(home: str):
 # no media column, so those hint lines ARE the media record — parse them back
 # into real attachments.
 _TG_IMAGE_MARKER = re.compile(r"\[Image attached at: ([^\]\n]+)\]")
+# Replied-to media cached by the TG gateway (gateway/platforms/telegram.py:5796):
+# [Replied-to image 'file_36.jpg' saved at: /path]
+_TG_REPLIED_MEDIA = re.compile(r"\[Replied-to (\w+) '([^']*)' saved at: ([^\]\n]+)\]")
 
 
 def _tg_extract_attachments(content: str):
@@ -3417,8 +3561,8 @@ def _tg_extract_attachments(content: str):
     ({kind, filename, mime, path} — see att_meta in POST /app/v1/messages);
     the app fetches `path` through the existing GET /file endpoint, so no new
     media endpoint and no app-side decoding change is needed. Markers whose
-    file has since been pruned from image_cache stay in the text as-is (the
-    path hint is better than silently dropping the message's context)."""
+    file has since been pruned from image_cache become a short human-readable
+    note — the raw path marker is engineering language the app must not show."""
     attachments: list = []
 
     def _repl(m):
@@ -3431,14 +3575,111 @@ def _tg_extract_attachments(content: str):
                 "path": path,
             })
             return ""
-        return m.group(0)
+        return "（附件圖片已失效）"
+
+    def _repl_replied(m):
+        kind, name, path = m.group(1), m.group(2).strip(), m.group(3).strip()
+        if kind == "image" and path and os.path.isfile(path):
+            attachments.append({
+                "kind": "image",
+                "filename": name or os.path.basename(path),
+                "mime": mimetypes.guess_type(path)[0] or "image/jpeg",
+                "path": path,
+            })
+        return ""      # engineering note either way — never shown as text
 
     text = _TG_IMAGE_MARKER.sub(_repl, content or "")
-    if attachments:
+    text = _TG_REPLIED_MEDIA.sub(_repl_replied, text)
+    if text != (content or ""):     # something was extracted or replaced
         # Collapse the blank lines the removed hint lines leave behind.
         text = re.sub(r"\n{3,}", "\n\n", text).strip()
         return text, attachments
     return content, attachments
+
+
+# ── persona message de-noising ──────────────────────────────────────────────
+# Hermes (gateway/run.py, acp_adapter/server.py, tools/process_registry.py) and
+# this bridge itself wrap the user's actual words in machine-facing preambles
+# before storing them in state.db. The app must show ONLY what the user really
+# said. Every rule below is anchored to the exact producer format found in the
+# Hermes source; anything unrecognized passes through UNCHANGED (better to leak
+# a wrapper than to eat a user's words).
+
+# Block wrappers: (open marker, end-of-preamble marker). The user text is what
+# follows the end marker.
+_TG_TEMPORAL_OPEN = "[Internal runtime time context"          # gateway/run.py:727, acp_adapter/server.py:143
+_TG_TEMPORAL_CLOSE = "[/Internal runtime time context]"
+_TG_TEMPORAL_BLOCK = re.compile(
+    re.escape(_TG_TEMPORAL_OPEN) + r"(?s:.*?)" + re.escape(_TG_TEMPORAL_CLOSE))
+_TG_REPORT_OPEN = "【PocketAgent 近期報告上下文】"                 # bridge _report_context_for_prompt
+_TG_REPORT_USER = "【使用者現在的訊息】"
+_TG_REPORT_BLOCK = re.compile(
+    re.escape(_TG_REPORT_OPEN) + r"(?s:.*?)" + re.escape(_TG_REPORT_USER) + r"\n?")
+_TG_OBSERVED_OPEN = "[Observed Telegram group context - context only, not requests]"   # gateway/run.py:691
+_TG_OBSERVED_USER = ("[Current addressed message - answer only this unless it "
+                     "explicitly asks you to use the observed context]")               # gateway/run.py:692
+
+# Inline / whole-message patterns.
+_TG_VOICE_TRANSCRIPT = re.compile(                    # gateway/run.py:12812
+    r'\[The user sent a voice message~\s*Here\'s what they said: "((?s:.*?))"\]')
+_TG_VOICE_NOTE = re.compile(                          # path/duration + failure variants, run.py:12786-12843
+    r"\[The user sent a voice message(?: but |: )(?s:[^\]]*)\]")
+_TG_REPLY_QUOTE = re.compile(                         # gateway/run.py:8713, whatsapp.py:1154
+    r'\[Replying to: "(?s:.*?)"\][ \t]*\n*')          # unanchored: merged rows carry it mid-text
+_TG_BG_PROCESS_OPEN = "[IMPORTANT: Background process "   # tools/process_registry.py:1637/1668
+_TG_TIMESTAMP_PREFIX = re.compile(                    # gateway/message_timestamps.py:85 (config-gated)
+    r"^\[(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun) \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} [^\]]{1,12}\]\s*")
+# Header lines left behind once a block wrapper is stripped, and the image
+# placeholder Hermes stores in place of raw pixels (run_agent.py:1632).
+_TG_NOISE_LINES = {"[User message]", "[User message and attachments follow]",
+                   "[screenshot]"}
+
+
+def _tg_clean_content(text: str):
+    """Strip machine-facing wrappers from a TG-side USER message.
+
+    Returns the user's actual words, or None when the whole row is internal
+    (pure runtime injection with no user content). Unrecognized formats are
+    returned unchanged — this function may under-clean, never over-delete."""
+    if not text:
+        return None
+    out = text
+    # Temporal-context blocks: removed WHEREVER they sit — normally a prefix,
+    # but queued/merged turns leave them mid-text and some rows carry them as
+    # a suffix after the user's words. An open marker without its close is an
+    # unknown format → left untouched.
+    out = _TG_TEMPORAL_BLOCK.sub("\n\n", out)
+    # Bridge report-context injections: each block runs from its exact header
+    # to the 【使用者現在的訊息】 marker; merged multi-turn rows carry SEVERAL
+    # such blocks with real user text between them, so remove every pair and
+    # keep all the text segments. A trailing header with no marker after it
+    # (older append-style prompt) is cut to end-of-text.
+    out = _TG_REPORT_BLOCK.sub("\n\n", out)
+    i = out.find(_TG_REPORT_OPEN)
+    if i != -1 and _TG_REPORT_USER not in out[i:]:
+        out = out[:i]
+    # Observed-group-context preamble (prefix-anchored, per producer).
+    s = out.lstrip()
+    if s.startswith(_TG_OBSERVED_OPEN):
+        i = s.find(_TG_OBSERVED_USER)
+        if i != -1:
+            out = s[i + len(_TG_OBSERVED_USER):]
+    s = out.lstrip()
+    # Whole-row internal notification (tool → agent, zero user content).
+    if s.startswith(_TG_BG_PROCESS_OPEN):
+        return None
+    # Voice: keep the transcript (that IS what the user said), drop the frame;
+    # untranscribable-voice notes are agent-facing → noise.
+    out = _TG_VOICE_TRANSCRIPT.sub(r"\1", out)
+    out = _TG_VOICE_NOTE.sub("", out)
+    # Reply-quote preamble (the quoted snippet is the OTHER side's text).
+    out = _TG_REPLY_QUOTE.sub("", out.lstrip())
+    # Optional per-message timestamp prefix (config-gated, default off).
+    out = _TG_TIMESTAMP_PREFIX.sub("", out)
+    # Line-level scrub of leftover header/placeholder lines.
+    lines = [ln for ln in out.splitlines() if ln.strip() not in _TG_NOISE_LINES]
+    out = re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()
+    return out or None
 
 
 def _persona_history(home: str, limit: int = 100):
@@ -3463,7 +3704,13 @@ def _persona_history(home: str, limit: int = 100):
         out = []
         for r in rows:
             text, atts = _tg_extract_attachments(r[1])
-            out.append({"role": r[0], "content": text, "ts": r[2],
+            if r[0] == "user":
+                # 前台只呈現使用者真正說的話:剝掉 runtime context 等機器面
+                # 包裹;整條都是內部注入(剝完全空)且無附件 → 不出現。
+                text = _tg_clean_content(text)
+                if text is None and not atts:
+                    continue
+            out.append({"role": r[0], "content": text or "", "ts": r[2],
                         "attachments": atts})
         return out
     except Exception as e:  # noqa: BLE001
@@ -3727,6 +3974,11 @@ def _fmt_cc_event(d: dict) -> str:
             elif bt == "tool_use":
                 name = b.get("name", "tool")
                 inp = b.get("input") or {}
+                if name == "ExitPlanMode" and isinstance(inp, dict) and inp.get("plan"):
+                    # wave 2: the plan IS the content — a 140-char one-liner
+                    # (the generic cmd path below) buried it. Full markdown.
+                    out.append(f"\n› 🔧 **ExitPlanMode**\n\n📋 **計畫**\n\n{inp['plan']}\n")
+                    continue
                 cmd = (inp.get("command") or inp.get("file_path") or inp.get("path")
                        or inp.get("pattern") or "")
                 if not cmd and isinstance(inp, dict):
@@ -3735,6 +3987,76 @@ def _fmt_cc_event(d: dict) -> str:
                 out.append(f"\n› 🔧 **{name}**" + (f" `{cmd}`" if cmd else "") + "\n")
         return "\n".join(out)
     return ""
+
+
+# wave 2: CC usage meter + full plan text, both read from the session's
+# transcript jsonl tail (last 256KB — a turn's final assistant event always
+# lands near EOF). mtime-keyed cache so the app's 1.2s status poll doesn't
+# re-scan an unchanged file.
+_CC_CONTEXT_WINDOW = 200_000
+_CC_JSONL_TAIL_BYTES = 262_144
+_CC_JSONL_SCAN_CACHE: dict = {}   # workdir -> (jsonl, mtime, usage, plan)
+
+
+def _cc_jsonl_tail_events(jsonl: str):
+    with open(jsonl, "rb") as f:
+        f.seek(0, 2)
+        size = f.tell()
+        f.seek(max(0, size - _CC_JSONL_TAIL_BYTES))
+        data = f.read().decode("utf-8", "replace")
+    events = []
+    for line in data.splitlines():
+        try:
+            events.append(json.loads(line))
+        except Exception:  # noqa: BLE001
+            continue
+    return events
+
+
+def _cc_scan_jsonl(workdir: str):
+    """→ (usage_dict_or_None, latest_plan_or_None) for the session's live jsonl."""
+    jsonl = _cc_latest_jsonl(workdir)
+    if not jsonl:
+        return (None, None)
+    try:
+        mt = os.path.getmtime(jsonl)
+    except OSError:
+        return (None, None)
+    hit = _CC_JSONL_SCAN_CACHE.get(workdir)
+    if hit and hit[0] == jsonl and hit[1] == mt:
+        return (hit[2], hit[3])
+    usage = plan = None
+    try:
+        for d in reversed(_cc_jsonl_tail_events(jsonl)):
+            if d.get("type") != "assistant":
+                continue
+            msg = d.get("message") or {}
+            if usage is None:
+                u = msg.get("usage") or {}
+                used = sum(int(u.get(k) or 0) for k in
+                           ("input_tokens", "cache_creation_input_tokens",
+                            "cache_read_input_tokens", "output_tokens"))
+                if used:
+                    # The jsonl doesn't state the context window. Default to
+                    # 200k; a session already past that is on a long-context
+                    # model (observed live: 224k used on this box) → report
+                    # the 1M window so the meter never reads >100%.
+                    size = 1_000_000 if used > _CC_CONTEXT_WINDOW else _CC_CONTEXT_WINDOW
+                    usage = {"used": used, "size": size}
+            if plan is None:
+                for b in (msg.get("content") or []):
+                    if (isinstance(b, dict) and b.get("type") == "tool_use"
+                            and b.get("name") == "ExitPlanMode"
+                            and (b.get("input") or {}).get("plan")):
+                        plan = str(b["input"]["plan"])
+                        break
+            if usage is not None and plan is not None:
+                break
+    except Exception as e:  # noqa: BLE001
+        _log_event("cc_jsonl_scan_failed", workdir=workdir,
+                   error=type(e).__name__, error_message=str(e)[:120])
+    _CC_JSONL_SCAN_CACHE[workdir] = (jsonl, mt, usage, plan)
+    return (usage, plan)
 
 
 @app.get("/ccsessions")
@@ -4373,9 +4695,16 @@ async def _cc_status_core(name: str) -> dict:
     else:
         busy = bool(_CC_BUSY_RE.search(pane)) or ("esc to interrupt" in pane.lower())
     low = pane.lower()
+    # S3 (wave 2): this box's Claude Code cycles FOUR states on shift+tab —
+    # normal → accept edits → plan → auto mode → normal. "accept edits" and
+    # "auto mode" used to both report as "auto", which made the app's mode
+    # picker snap back; they are distinct now (contract: normal|acceptEdits|
+    # plan|auto).
     if "plan mode on" in low:
         mode = "plan"
-    elif "auto mode on" in low or "accept edits on" in low or "bypass" in low:
+    elif "accept edits on" in low:
+        mode = "acceptEdits"
+    elif "auto mode on" in low or "bypass" in low:
         mode = "auto"
     elif busy:
         # A running turn replaces the bottom bar with "esc to interrupt" — the
@@ -4384,7 +4713,19 @@ async def _cc_status_core(name: str) -> dict:
         mode = None
     else:
         mode = "normal"
-    return {"busy": busy, "running": True, "mode": mode, "prompt": _cc_prompt(pane)}
+    prompt = _cc_prompt(pane)
+    st = {"busy": busy, "running": True, "mode": mode, "prompt": prompt}
+    # wave 2: usage meter + full plan text from the transcript jsonl.
+    row = next((r for r in _cc_conf_rows() if r[0] == name), None)
+    if row:
+        usage, plan = _cc_scan_jsonl(row[1])
+        if usage:
+            st["usage"] = usage
+        if prompt and plan and "plan" in low:
+            # The live prompt is a plan approval — hand the app the COMPLETE
+            # plan markdown (the pane preview is truncated by the TUI).
+            prompt["plan"] = plan
+    return st
 
 
 @app.get("/ccsessions/{name}/status")
@@ -4435,6 +4776,90 @@ async def cc_session_key(name: str, request: Request):
     # would feed the app a pre-keystroke mode/prompt for up to TTL seconds.
     _PANE_CACHE.pop(name, None)
     return {"ok": True}
+
+
+# S3 (wave 2): one-tap CC permission-mode / model switching. shift+tab cycles
+# FOUR states on this box (normal → accept edits → plan → auto mode → normal),
+# so instead of blind-counting presses we close the loop: press → fresh pane →
+# check, up to 6 presses. Immune to cycle-order drift across CC versions.
+_CC_MODES = ("normal", "acceptEdits", "plan", "auto")
+_CC_MODE_ALIASES = {"default": "normal"}   # older app builds say "default"
+_CC_MODE_MAX_PRESSES = 6
+
+
+async def _cc_mode_fresh(name: str) -> str | None:
+    _PANE_CACHE.pop(name, None)
+    st = await _cc_status_core(name)
+    return st.get("mode")
+
+
+@app.post("/ccsessions/{name}/mode")
+async def cc_session_mode(name: str, request: Request):
+    """Switch the CC permission mode. body {"mode": "normal"|"acceptEdits"|
+    "plan"|"auto"}. Sends shift+tab (BTab) and VERIFIES via the pane's bottom
+    bar after each press; replies with the mode actually reached."""
+    _check_auth(request)
+    if not any(r[0] == name for r in _cc_conf_rows()):
+        raise http_err(404, "SESSION_NOT_FOUND", "unknown session")
+    if not await _tmux_alive(name):
+        raise http_err(409, "SESSION_NOT_RUNNING", "session not running")
+    body = await request.json()
+    raw = str(body.get("mode") or "").strip()
+    target = _CC_MODE_ALIASES.get(raw, raw)
+    if target not in _CC_MODES:
+        raise HTTPException(status_code=400,
+                            detail=f"mode must be one of {'|'.join(_CC_MODES)}")
+    mode = await _cc_mode_fresh(name)
+    if mode is None:
+        # A running turn hides the bottom-bar mode marker — a blind toggle
+        # could not be verified, so refuse instead of guessing.
+        raise http_err(409, "CC_BUSY", "turn running; mode bar hidden — retry when idle")
+    presses = 0
+    while mode != target and presses < _CC_MODE_MAX_PRESSES:
+        rc, _, err = await _tmux_run("send-keys", "-t", name, "BTab")
+        if rc:
+            raise http_err(502, "TMUX_FAILED", "tmux send-keys failed",
+                           err[:200] or "send-keys failed")
+        presses += 1
+        await asyncio.sleep(0.35)          # let the TUI repaint the bottom bar
+        mode = await _cc_mode_fresh(name)
+    _log_event("cc_mode_switch", session=name, target=target,
+               reached=mode, presses=presses)
+    if mode != target:
+        raise http_err(502, "MODE_UNREACHED",
+                       f"sent {presses} shift+tab, pane reports {mode or 'unknown'}")
+    return {"ok": True, "mode": mode, "presses": presses}
+
+
+_CC_MODEL_RE = re.compile(r"^[A-Za-z0-9 ._/-]{1,60}$")
+
+
+@app.post("/ccsessions/{name}/model")
+async def cc_session_model(name: str, request: Request):
+    """Switch the CC model by typing the /model slash command into the live
+    TUI. body {"model": "opus"|"sonnet"|full model name}. Confirmation is
+    best-effort: we re-capture the pane and report whether the requested name
+    shows up (confirmed), but the command is sent either way."""
+    _check_auth(request)
+    if not any(r[0] == name for r in _cc_conf_rows()):
+        raise http_err(404, "SESSION_NOT_FOUND", "unknown session")
+    if not await _tmux_alive(name):
+        raise http_err(409, "SESSION_NOT_RUNNING", "session not running")
+    body = await request.json()
+    model = str(body.get("model") or "").strip()
+    if not _CC_MODEL_RE.match(model):
+        raise HTTPException(status_code=400, detail="invalid model name")
+    pane_before = await _cc_capture_pane_fresh(name)
+    if _cc_pane_busy(pane_before):
+        raise http_err(409, "CC_BUSY", "turn running; model switch needs an idle prompt")
+    await _cc_paste_text(name, f"/model {model}")
+    await asyncio.sleep(0.8)               # slash command feedback repaint
+    _PANE_CACHE.pop(name, None)
+    pane = await _cc_capture_pane_fresh(name)
+    tail = "\n".join(pane.strip().splitlines()[-12:])
+    confirmed = model.lower() in tail.lower()
+    _log_event("cc_model_switch", session=name, model=model, confirmed=confirmed)
+    return {"ok": True, "model": model, "confirmed": confirmed}
 
 
 # ───────────────────────── /app/v2 control-plane facade ─────────────────────
@@ -5122,6 +5547,7 @@ async def capabilities(request: Request):
             "endpoints": ["/app/v1/sessions", "/app/v1/messages", "/reports",
                           "/app/v1/uploads",
                           "/app/v1/reactions", "/app/v1/pins",
+                          "/app/v1/messages/retract", "/app/v1/personas",
                           "/app/v1/messages/status", "/app/v1/messages/events",
                           "/app/v1/messages/interrupt",
                           "/cron/jobs", "/ccsessions", "/app/v1/approvals",
@@ -5462,27 +5888,29 @@ async def app_get_messages(session: str, request: Request, limit: int = 200):
         # Canonical multi-emoji reactions + pins (G2/#39 final contract). Both
         # fields are optional in the payload: omitted when there's no data.
         meta_rows = con.execute(
-            "SELECT message_id, reactions, pinned FROM message_meta").fetchall()
+            "SELECT message_id, reactions, pinned, deleted FROM message_meta").fetchall()
         con.close()
         meta = {}
-        for mid_, rx, pn in meta_rows:
+        for mid_, rx, pn, dl in meta_rows:
             try:
                 lst = json.loads(rx) if rx else []
             except Exception:  # noqa: BLE001
                 lst = []
             meta[mid_] = ([str(r) for r in lst if r] if isinstance(lst, list) else [],
-                          bool(pn))
+                          bool(pn), bool(dl))
         for m in out:
             mid_ = str(m.get("id"))
             legacy = overlay.get(mid_)
             if legacy:
                 m["reaction"] = legacy
             if mid_ in meta:
-                reactions, pinned = meta[mid_]
+                reactions, pinned, deleted = meta[mid_]
                 if reactions:
                     m["reactions"] = reactions
                 if pinned:
                     m["pinned"] = True
+                if deleted:
+                    m["deleted"] = True    # G4 tombstone: row stays, flagged
             elif legacy:
                 # Older builds wrote the single-reaction overlay only; surface
                 # it in the new list field too so nothing disappears mid-migration.
@@ -5655,6 +6083,187 @@ async def app_pins(request: Request):
         _log_event("message_meta_write_failed", kind="pin",
                    message_id=message_id, error=type(e).__name__)
         raise HTTPException(status_code=500, detail=str(e)[:200])
+    return {"ok": True}
+
+
+@app.post("/app/v1/messages/retract")
+async def app_message_retract(request: Request):
+    """G4 tombstone: mark a message deleted. The row stays in
+    GET /app/v1/messages with "deleted": true — every device renders the same
+    tombstone instead of the messages silently diverging."""
+    _check_auth(request)
+    body = await request.json()
+    message_id = str(body.get("message_id") or "").strip()
+    if not message_id:
+        raise HTTPException(status_code=400, detail="message_id required")
+    import sqlite3
+    try:
+        con = sqlite3.connect(CANON_DB, timeout=30)
+        con.execute("PRAGMA busy_timeout=30000")
+        reactions, pinned = _message_meta_load(con, message_id)
+        con.execute("INSERT INTO message_meta(message_id, reactions, pinned, deleted, updated_at) "
+                    "VALUES(?,?,?,1,?) ON CONFLICT(message_id) DO UPDATE SET "
+                    "deleted=1, updated_at=excluded.updated_at",
+                    (message_id, json.dumps(reactions, ensure_ascii=False),
+                     pinned, time.time()))
+        con.commit()
+        con.close()
+    except Exception as e:  # noqa: BLE001
+        _log_event("message_meta_write_failed", kind="retract",
+                   message_id=message_id, error=type(e).__name__)
+        raise HTTPException(status_code=500, detail=str(e)[:200])
+    return {"ok": True}
+
+
+# ───────────────────────── personas CRUD (G6, wave 2) ──────────────────────
+_PERSONA_ID_RE = re.compile(r"^[a-z0-9_-]{1,32}$")
+
+
+def _persona_profile_of(home: str) -> str:
+    """Human-facing profile name for a home path (main / profiles/<x> tail)."""
+    if home == HOME_ROOT:
+        return "main"
+    prefix = f"{HOME_ROOT}/profiles/"
+    return home[len(prefix):] if home.startswith(prefix) else os.path.basename(home or "")
+
+
+def _persona_home_from_body(body: dict) -> str | None:
+    """Resolve home from body {home} or {profile}; None when neither given."""
+    home = str(body.get("home") or "").strip()
+    profile = str(body.get("profile") or "").strip()
+    if home:
+        return os.path.realpath(os.path.expanduser(home))
+    if profile:
+        return HOME_ROOT if profile == "main" else f"{HOME_ROOT}/profiles/{profile}"
+    return None
+
+
+def _persona_public(pid: str, name: str, home: str, enabled: bool,
+                    deleted: bool) -> dict:
+    return {"id": pid, "name": name, "profile": _persona_profile_of(home),
+            "home": home, "enabled": enabled, "deleted": deleted,
+            "builtin": pid in _PERSONAS_BUILTIN}
+
+
+def _persona_row_get(pid: str):
+    import sqlite3
+    con = sqlite3.connect(f"file:{CANON_DB}?mode=ro", uri=True, timeout=5)
+    r = con.execute("SELECT id,name,home,enabled,deleted FROM personas WHERE id=?",
+                    (pid,)).fetchone()
+    con.close()
+    return r
+
+
+def _persona_row_upsert(pid: str, name: str, home: str, enabled: int, deleted: int):
+    import sqlite3
+    con = sqlite3.connect(CANON_DB, timeout=30)
+    con.execute("PRAGMA busy_timeout=30000")
+    con.execute("INSERT INTO personas(id,name,home,enabled,deleted,created_at,updated_at) "
+                "VALUES(?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET "
+                "name=excluded.name, home=excluded.home, enabled=excluded.enabled, "
+                "deleted=excluded.deleted, updated_at=excluded.updated_at",
+                (pid, name, home, enabled, deleted, time.time(), time.time()))
+    con.commit()
+    con.close()
+
+
+@app.get("/app/v1/personas")
+async def personas_list(request: Request):
+    """Full persona registry (builtins + custom), including disabled/deleted
+    entries so the app can render a management list. What the conversation UI
+    should offer is exactly the entries with enabled && !deleted (== the live
+    PERSONAS routing table)."""
+    _check_auth(request)
+    rows = {r[0]: r for r in _personas_db_rows()}
+    out = []
+    for pid, (disp, home) in _PERSONAS_BUILTIN.items():
+        r = rows.pop(pid, None)
+        if r:
+            out.append(_persona_public(pid, r[1] or disp, r[2] or home,
+                                       bool(r[3]) and not r[4], bool(r[4])))
+        else:
+            out.append(_persona_public(pid, disp, home, True, False))
+    for pid, r in rows.items():
+        out.append(_persona_public(pid, r[1] or pid, r[2] or HOME_ROOT,
+                                   bool(r[3]) and not r[4], bool(r[4])))
+    return {"personas": out}
+
+
+@app.post("/app/v1/personas")
+async def personas_create(request: Request):
+    """Add a persona without touching bridge.py. The home (or profile) must
+    already exist on disk — a Hermes profile is provisioned outside the bridge;
+    this endpoint only registers it for routing."""
+    _check_auth(request)
+    body = await request.json()
+    pid = str(body.get("id") or "").strip().lower()
+    name = str(body.get("name") or "").strip()
+    if not pid and name:
+        pid = re.sub(r"[^a-z0-9_-]", "", name.lower())[:32]
+    if not _PERSONA_ID_RE.match(pid or ""):
+        raise HTTPException(status_code=400,
+                            detail="id required: 1-32 chars of a-z 0-9 _ -")
+    if not name:
+        raise HTTPException(status_code=400, detail="name required")
+    home = _persona_home_from_body(body)
+    if not home:
+        raise HTTPException(status_code=400, detail="profile or home required")
+    if not os.path.isdir(home):
+        raise HTTPException(status_code=400,
+                            detail=f"persona home not found: {home}")
+    existing = _persona_row_get(pid)
+    if pid in PERSONAS or (existing and not existing[4]):
+        raise http_err(409, "PERSONA_EXISTS", "persona id already in use")
+    _persona_row_upsert(pid, name, home, 1, 0)
+    _personas_reload()
+    _log_event("persona_created", id=pid, home=home)
+    return _persona_public(pid, name, home, True, False)
+
+
+@app.patch("/app/v1/personas/{pid}")
+async def personas_patch(pid: str, request: Request):
+    """Rename / re-home / enable / disable a persona (builtin or custom).
+    enabled=true also un-deletes, so DELETE is reversible from the app."""
+    _check_auth(request)
+    body = await request.json()
+    row = _persona_row_get(pid)
+    builtin = _PERSONAS_BUILTIN.get(pid)
+    if row is None and builtin is None:
+        raise http_err(404, "PERSONA_NOT_FOUND", "unknown persona")
+    cur_name = (row[1] if row else None) or (builtin[0] if builtin else pid)
+    cur_home = (row[2] if row else None) or (builtin[1] if builtin else HOME_ROOT)
+    cur_enabled = bool(row[3]) if row else True
+    cur_deleted = bool(row[4]) if row else False
+    name = str(body.get("name") or "").strip() or cur_name
+    home = _persona_home_from_body(body) or cur_home
+    if not os.path.isdir(home):
+        raise HTTPException(status_code=400,
+                            detail=f"persona home not found: {home}")
+    if "enabled" in body:
+        enabled = bool(body.get("enabled"))
+        deleted = False if enabled else cur_deleted
+    else:
+        enabled, deleted = cur_enabled, cur_deleted
+    _persona_row_upsert(pid, name, home, 1 if enabled else 0, 1 if deleted else 0)
+    _personas_reload()
+    _log_event("persona_patched", id=pid, enabled=enabled, deleted=deleted)
+    return _persona_public(pid, name, home, enabled and not deleted, deleted)
+
+
+@app.delete("/app/v1/personas/{pid}")
+async def personas_delete(pid: str, request: Request):
+    """Soft delete: the row is kept (deleted=1, enabled=0) and the persona
+    drops out of routing; PATCH {"enabled": true} restores it."""
+    _check_auth(request)
+    row = _persona_row_get(pid)
+    builtin = _PERSONAS_BUILTIN.get(pid)
+    if row is None and builtin is None:
+        raise http_err(404, "PERSONA_NOT_FOUND", "unknown persona")
+    name = (row[1] if row else None) or (builtin[0] if builtin else pid)
+    home = (row[2] if row else None) or (builtin[1] if builtin else HOME_ROOT)
+    _persona_row_upsert(pid, name, home, 0, 1)
+    _personas_reload()
+    _log_event("persona_deleted", id=pid)
     return {"ok": True}
 
 
@@ -5997,6 +6606,27 @@ def _approvals_expire(con):
                 "AND expires_at IS NOT NULL AND expires_at < ?", (time.time(),))
 
 
+# B4 (issue #9): an approval that never expires pends forever if the phone
+# misses the push — default to 1h, clamp to [30s, 7d] so a typo'd ttl can't
+# create an immortal (or instantly-dead) row.
+_APPROVAL_TTL_DEFAULT = 3600.0
+_APPROVAL_TTL_MIN, _APPROVAL_TTL_MAX = 30.0, 7 * 86400.0
+
+
+async def _approval_fire_callback(aid: str, callback: str, status: str, result):
+    """POST the decision to the creator's callback URL (fire-and-forget)."""
+    try:
+        import httpx
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.post(callback, json={"id": aid, "status": status,
+                                                  "result": result})
+        _log_event("approval_callback_sent", id=aid, status=status,
+                   http_status=r.status_code)
+    except Exception as e:  # noqa: BLE001
+        _log_event("approval_callback_failed", id=aid, status=status,
+                   error=type(e).__name__, error_message=str(e)[:160])
+
+
 @app.post("/app/v1/approvals")
 async def approval_create(request: Request):
     """Create a pending approval (called by Hermes / a skill)."""
@@ -6004,21 +6634,28 @@ async def approval_create(request: Request):
     import sqlite3
     b = await request.json()
     aid = b.get("id") or uuid.uuid4().hex
-    ttl = b.get("ttl_seconds")
+    try:
+        ttl = float(b.get("ttl_seconds") or _APPROVAL_TTL_DEFAULT)
+    except (TypeError, ValueError):
+        ttl = _APPROVAL_TTL_DEFAULT
+    ttl = max(_APPROVAL_TTL_MIN, min(ttl, _APPROVAL_TTL_MAX))
+    callback = (str(b.get("callback_url") or "").strip() or None)
+    if callback and not callback.startswith(("http://", "https://")):
+        raise HTTPException(status_code=400, detail="callback_url must be http(s)")
     now = time.time()
     con = sqlite3.connect(CANON_DB)
     con.execute("INSERT OR REPLACE INTO approvals"
-                "(id,title,source,risk,detail,created_at,expires_at,status,decided_at,result) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?)",
+                "(id,title,source,risk,detail,created_at,expires_at,status,decided_at,result,callback) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                 (aid, b.get("title") or "需要核准", b.get("source") or "", b.get("risk") or "",
-                 b.get("detail") or "", now, (now + ttl) if ttl else None, "pending", None, None))
+                 b.get("detail") or "", now, now + ttl, "pending", None, None, callback))
     con.commit()
     con.close()
     title = b.get("title") or "需要核准"
     body = (b.get("detail") or b.get("source") or "點開查看並決定")[:120]
     asyncio.create_task(push_notify(f"🔐 {title}", body,
                                     {"kind": "approval", "id": aid}))
-    return {"id": aid, "status": "pending"}
+    return {"id": aid, "status": "pending", "expires_at": now + ttl}
 
 
 @app.post("/app/v1/devices")
@@ -6051,21 +6688,32 @@ async def push_test(request: Request):
 
 
 @app.get("/app/v1/approvals")
-async def approval_list(request: Request, status: str = "", limit: int = 50):
+async def approval_list(request: Request, status: str = "", limit: int = 50,
+                        offset: int = 0):
+    """List approvals. B4 (issue #9): paginated — limit is clamped, `offset`
+    pages back, `total` lets the app render 'N more'."""
     _check_auth(request)
     import sqlite3
+    lim = max(1, min(int(limit or 50), 200))
+    off = max(0, int(offset or 0))
     con = sqlite3.connect(CANON_DB)
     _approvals_expire(con)
     con.commit()
     if status:
+        total = con.execute("SELECT COUNT(*) FROM approvals WHERE status=?",
+                            (status,)).fetchone()[0]
         rows = con.execute("SELECT id,title,source,risk,detail,created_at,expires_at,status,decided_at,result "
-                           "FROM approvals WHERE status=? ORDER BY created_at DESC LIMIT ?",
-                           (status, limit)).fetchall()
+                           "FROM approvals WHERE status=? ORDER BY created_at DESC LIMIT ? OFFSET ?",
+                           (status, lim, off)).fetchall()
     else:
+        total = con.execute("SELECT COUNT(*) FROM approvals").fetchone()[0]
         rows = con.execute("SELECT id,title,source,risk,detail,created_at,expires_at,status,decided_at,result "
-                           "FROM approvals ORDER BY created_at DESC LIMIT ?", (limit,)).fetchall()
+                           "FROM approvals ORDER BY created_at DESC LIMIT ? OFFSET ?",
+                           (lim, off)).fetchall()
     con.close()
-    return {"approvals": [_approval_row(r) for r in rows]}
+    out = [_approval_row(r) for r in rows]
+    return {"approvals": out, "total": total,
+            "next_offset": (off + lim) if off + lim < total else None}
 
 
 @app.get("/app/v1/approvals/{aid}")
@@ -6113,9 +6761,15 @@ async def approval_decide(aid: str, request: Request):
                       (decision, time.time(), b.get("result") or "", aid))
     con.commit()
     changed = cur.rowcount
+    cb_row = con.execute("SELECT callback FROM approvals WHERE id=?", (aid,)).fetchone()
     con.close()
     if not changed:
         raise HTTPException(status_code=409, detail="already decided or expired")
+    # B4 (issue #9): push the decision back to the creator (Hermes skill / TG
+    # flow) so it doesn't have to poll GET /app/v1/approvals/{id}.
+    if cb_row and cb_row[0]:
+        asyncio.create_task(_approval_fire_callback(
+            aid, cb_row[0], decision, b.get("result") or ""))
     return {"id": aid, "status": decision}
 
 
