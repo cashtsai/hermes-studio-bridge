@@ -51,6 +51,11 @@ _BG_TASKS: set = set()
 # 2s / 4s / 10s across chat, ccsessions and codexsessions for no reason).
 SSE_KEEPALIVE_SECS = 2.0
 
+# 工具步驟 cmd/路徑的截斷上限(#38 diff 卡缺口):140 會把深路徑攔腰砍斷,
+# app 的 diff chip 拿殘缺路徑去打 /filediff 就 404。所有 transcript/步驟
+# 格式化共用這一個值(carddigest._CMD_MAX 同步)。
+TOOL_CMD_MAX = 500
+
 # In-flight app-turn dedup (issue #9): (session, client_id) -> {ts, task, state}.
 # A duplicate POST with the same client_id while the first run is STILL RUNNING
 # attaches to it instead of re-running the turn (side effects must not replay).
@@ -1788,7 +1793,7 @@ async def _persona_content_stream(model: str, prompt: str):
                 # 「執行步驟 N:工具」),細節收進收尾的摺疊附錄。
                 name = val.get("name", "tool")
                 cmd = (val.get("cmd") or "").strip().splitlines()
-                cmd1 = (cmd[0] if cmd else "")[:140]
+                cmd1 = (cmd[0] if cmd else "")[:TOOL_CMD_MAX]
                 steps.append({"name": name, "cmd": cmd1, "result": "", "note": ""})
                 yield ("status", {"state": "running",
                                   "label": f"執行步驟 {len(steps)}:{name}"})
@@ -2661,7 +2666,7 @@ def _codex_format_item(item: dict, phase: str = "completed", skip_agent_ids=None
         return f"\n<details><summary>Reasoning</summary>\n\n{summary}\n\n</details>\n" if summary else ""
     if t == "commandExecution":
         cmd = (item.get("command") or "").strip().splitlines()
-        cmd1 = (cmd[0] if cmd else "")[:160]
+        cmd1 = (cmd[0] if cmd else "")[:TOOL_CMD_MAX]
         status = item.get("status") or phase
         head = f"\n› 🔧 **command** `{cmd1}` [{status}]\n" if cmd1 else f"\n› 🔧 **command** [{status}]\n"
         return head + _codex_format_tool_result(item.get("aggregatedOutput") or "")
@@ -2935,7 +2940,11 @@ async def serve_filediff(request: Request, path: str):
     enclosing git repo from the file's own location, returns `git diff HEAD`
     for it; a file with no pending diff (or outside any repo) falls back to its
     current content, so the app always has something to show. Same safe-root
-    policy as /file."""
+    policy as /file.
+
+    目錄模式（#38 缺口）：path 是目錄 → 整個目錄的 pending diff（合併
+    unified）＋ `files[]` 變更檔清單，app 的多檔選單直接吃；目錄乾淨或
+    不在 repo 裡 → 404 人話（目錄沒有「當前內容」可退）。"""
     _check_auth(request)
     p = os.path.realpath(os.path.expanduser(path))
     roots = [os.path.realpath(os.path.expanduser("~"))]
@@ -2943,7 +2952,8 @@ async def serve_filediff(request: Request, path: str):
         rt = os.path.realpath(t)
         if rt not in roots:
             roots.append(rt)
-    if not any(p == r or p.startswith(r + os.sep) for r in roots) or not os.path.isfile(p):
+    if (not any(p == r or p.startswith(r + os.sep) for r in roots)
+            or not (os.path.isfile(p) or os.path.isdir(p))):
         raise HTTPException(status_code=404, detail="not found")
 
     async def _run(*args, cwd=None, timeout: float = 20.0):
@@ -2962,6 +2972,29 @@ async def serve_filediff(request: Request, path: str):
                        timeout_s=timeout)
             return 124, ""
         return proc.returncode, (out or b"").decode("utf-8", "replace")
+
+    if os.path.isdir(p):
+        rc, top = await _run("git", "-C", p, "rev-parse", "--show-toplevel")
+        if rc != 0 or not top.strip():
+            raise HTTPException(status_code=404, detail="目錄不在 git repo 裡，沒有 diff 可看")
+        top = top.strip()
+        rc2, out = await _run("git", "-C", top, "diff", "HEAD", "--", p)
+        diff = out if rc2 == 0 else ""
+        if not diff:
+            raise HTTPException(status_code=404, detail="目錄內沒有待提交的變更")
+        files = []
+        rc3, names = await _run("git", "-C", top, "diff", "HEAD",
+                                "--name-status", "--", p)
+        if rc3 == 0:
+            for line in names.splitlines():
+                parts = line.split("\t")
+                if len(parts) >= 2 and parts[0]:
+                    # rename 列是「R100\told\tnew」— 取最後一欄（現名）。
+                    files.append({"status": parts[0][:1],
+                                  "path": os.path.join(top, parts[-1])})
+        if len(diff) > 200_000:
+            diff = diff[:200_000] + "\n...(truncated)"
+        return {"kind": "diff", "path": p, "text": diff, "files": files}
 
     d = os.path.dirname(p)
     rc, top = await _run("git", "-C", d, "rev-parse", "--show-toplevel")
@@ -3983,7 +4016,7 @@ def _fmt_cc_event(d: dict) -> str:
                        or inp.get("pattern") or "")
                 if not cmd and isinstance(inp, dict):
                     cmd = next((str(v) for v in inp.values() if isinstance(v, (str, int))), "")
-                cmd = str(cmd).splitlines()[0][:140] if cmd else ""
+                cmd = str(cmd).splitlines()[0][:TOOL_CMD_MAX] if cmd else ""
                 out.append(f"\n› 🔧 **{name}**" + (f" `{cmd}`" if cmd else "") + "\n")
         return "\n".join(out)
     return ""
@@ -6877,7 +6910,7 @@ def _fmt_item(kind, val):
     if kind == "tool_start":
         name = val.get("name", "tool")
         cmd = (val.get("cmd") or "").strip().splitlines()
-        cmd1 = (cmd[0] if cmd else "")[:140]
+        cmd1 = (cmd[0] if cmd else "")[:TOOL_CMD_MAX]
         return f"\n› 🔧 **{name}**" + (f" `{cmd1}`" if cmd1 else "") + "\n"
     if kind == "tool_result":
         res = (val.get("text") or "").strip()
