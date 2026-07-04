@@ -208,6 +208,16 @@ def _check_auth(request: Request) -> None:
         raise HTTPException(status_code=429, detail="too many failed auth attempts; slow down")
     raise http_err(401, "AUTH_INVALID_TOKEN", "invalid bridge token")
 
+
+async def _json_body(request: Request) -> dict:
+    """Body-as-dict with empty/malformed JSON tolerated as {} — handlers then
+    hit their own field validation (400) instead of the parser's 500."""
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        return {}
+    return body if isinstance(body, dict) else {}
+
 HERMES_BIN = "/Users/xcash/apps/hermes-agent/runtime/venv/bin/hermes"
 HOME_ROOT = "/Users/xcash/apps/hermes-agent/home"
 
@@ -3299,7 +3309,7 @@ async def client_log_read(request: Request, limit: int = 100, level: str = ""):
 @app.post("/codexsessions/{thread_id}/input")
 async def codex_session_input(thread_id: str, request: Request):
     _check_auth(request)
-    body = await request.json()
+    body = await _json_body(request)
     input_items = await _codex_input_items((body.get("text") or "").strip(),
                                            body.get("attachments") or [])
     if not input_items:
@@ -5256,7 +5266,7 @@ async def v2_session_input(session_id: str, request: Request):
     hermes=fire-and-forget 回合(回覆走 S3 卡片事件流,不在此串流)。
     body {content|text, attachments?, client_id?}。"""
     _check_auth(request)
-    body = await request.json()
+    body = await _json_body(request)
     src = _v2_card_source(session_id)
     if src[0] == "cc":
         res = await _cc_input_core(src[1], body)
