@@ -4542,7 +4542,13 @@ async def cc_session_input(name: str, request: Request):
     if not any(r[0] == name for r in _cc_conf_rows()):
         raise http_err(404, "SESSION_NOT_FOUND", "unknown session")
     body = await request.json()
-    text = (body.get("text") or "").strip()
+    return await _cc_input_core(name, body)
+
+
+async def _cc_input_core(name: str, body: dict) -> dict:
+    """cc 輸入核心 — /ccsessions/{name}/input 與 v2 統一路由 input 共用。
+    附件轉存＋語音轉寫＋tmux bracketed paste。"""
+    text = (body.get("text") or body.get("content") or "").strip()
     # Relay layer (like the persona attachment path): persist any attachments and
     # inject their on-disk paths into the typed line. Claude Code can Read files
     # (and sees images natively), so a bare path is enough — no vision pre-pass.
@@ -4638,6 +4644,11 @@ async def cc_session_interrupt(name: str, request: Request):
     _check_auth(request)
     if not any(r[0] == name for r in _cc_conf_rows()):
         raise http_err(404, "SESSION_NOT_FOUND", "unknown session")
+    return await _cc_interrupt_core(name)
+
+
+async def _cc_interrupt_core(name: str) -> dict:
+    """cc 中斷核心(Esc + 驗證重試 3 次)— v1 與 v2 統一路由共用。"""
     if not await _tmux_alive(name):
         raise http_err(409, "SESSION_NOT_RUNNING", "session not running")
     attempts = 0
@@ -4823,12 +4834,17 @@ async def cc_session_key(name: str, request: Request):
     _check_auth(request)
     if not any(r[0] == name for r in _cc_conf_rows()):
         raise http_err(404, "SESSION_NOT_FOUND", "unknown session")
-    if not await _tmux_alive(name):
-        raise http_err(409, "SESSION_NOT_RUNNING", "session not running")
     body = await request.json()
     raw = str(body.get("key") or "").strip()
     if not raw:
         raise HTTPException(status_code=400, detail="key required")
+    return await _cc_key_core(name, raw)
+
+
+async def _cc_key_core(name: str, raw: str) -> dict:
+    """cc 控制鍵核心 — v1 與 v2 統一路由(key/approve)共用。"""
+    if not await _tmux_alive(name):
+        raise http_err(409, "SESSION_NOT_RUNNING", "session not running")
     args = ["send-keys", "-t", name]
     mapped = _CC_KEYS.get(raw.lower())
     if mapped:
@@ -5040,15 +5056,33 @@ def _codex_thread_from_v2_session_id(session_id: str) -> str:
 
 @app.post("/app/v2/sessions/{session_id}/approve")
 async def v2_session_approve(session_id: str, request: Request):
+    """統一路由 approve(契約 §4.4):cx=app-server 決議、cc=TUI 鍵(body
+    {key},即 approval/prompt 的 option key)、hermes=Approval Center 決議
+    (body {approval_id, approve})。"""
     _check_auth(request)
     try:
         body = await request.json()
     except Exception:  # noqa: BLE001
         body = {}
+    src = _v2_card_source(session_id)
+    if src[0] == "cc":
+        key = str(body.get("key") or "").strip()
+        if not key:
+            raise http_err(400, "KEY_REQUIRED",
+                           "cc approve 需要 key(approval 卡/prompt 的 option key)")
+        res = await _cc_key_core(src[1], key)
+        return {"ok": True, "session_id": session_id, **res}
+    if src[0] == "hp":
+        aid = str(body.get("approval_id") or "").strip()
+        if not aid:
+            raise http_err(400, "APPROVAL_ID_REQUIRED",
+                           "hermes approve 需要 approval_id(approval 卡或 GET /app/v1/approvals)")
+        result = await _approval_decide_core(aid, body)
+        return {"ok": True, "session_id": session_id, **result}
     approved = _approval_bool_from_body(body)
     for_session = bool(body.get("for_session") or body.get("approve_for_session") or
                        body.get("remember"))
-    thread_id = _codex_thread_from_v2_session_id(session_id)
+    thread_id = src[1]
     try:
         result = await CODEX_APP.decide_thread_approval(thread_id, approved,
                                                         for_session=for_session)
@@ -5058,6 +5092,125 @@ async def v2_session_approve(session_id: str, request: Request):
             raise http_err(409, "APPROVAL_NOT_PENDING",
                            "no pending Codex approval for this session")
         _codex_http_error(e)
+
+
+@app.post("/app/v2/sessions/{session_id}/input")
+async def v2_session_input(session_id: str, request: Request):
+    """統一路由 input(契約 §4.4):cc=tmux bracketed paste、cx=turn/start、
+    hermes=fire-and-forget 回合(回覆走 S3 卡片事件流,不在此串流)。
+    body {content|text, attachments?, client_id?}。"""
+    _check_auth(request)
+    body = await request.json()
+    src = _v2_card_source(session_id)
+    if src[0] == "cc":
+        res = await _cc_input_core(src[1], body)
+        return {"session_id": session_id, **res}
+    if src[0] == "cx":
+        content = (body.get("content") or body.get("text") or "").strip()
+        attachments = body.get("attachments") or []
+        if not content and not attachments:
+            raise HTTPException(status_code=400, detail="empty")
+        items = await _codex_input_items(content, attachments)
+        try:
+            await CODEX_APP.start_turn(src[1], items,
+                                       client_id=body.get("client_id"))
+        except CodexAppServerError as e:
+            _codex_http_error(e)
+        return {"ok": True, "session_id": session_id, "accepted": True}
+    return await _v2_persona_input(src[1], session_id, body, request)
+
+
+async def _v2_persona_input(session: str, session_id: str, body: dict,
+                            request: Request):
+    """hermes input:與 v1 POST /app/v1/messages 同一套前置/冪等/回合機器,
+    差別只在回應——不開 SSE,立即回 {accepted};deltas/收尾全走 S3 卡片
+    事件流(進行中裝置與其他裝置看到同一份)。"""
+    content = (body.get("content") or body.get("text") or "").strip()
+    attachments = body.get("attachments") or []
+    if not content and not attachments:
+        raise HTTPException(status_code=400, detail="empty")
+    client_id = body.get("client_id")
+    cid = "appmsg-" + uuid.uuid4().hex[:20]
+    turn_started = time.monotonic()
+    common_log = {
+        "cid": cid,
+        "session": session,
+        "client_id_hash": _short_hash(client_id),
+        "client": _client_host(request),
+        "dry_run": False,
+        "input_chars": len(content),
+        **_attachment_stats(attachments),
+        "via": "v2_input",
+    }
+    _log_event("app_turn_received", **common_log)
+
+    inflight_entry = None
+    if client_id:
+        # 冪等(與 v1 同款):已完成 → replayed;進行中 → in_flight,不重跑。
+        prior = _canon_reply_for_client(session, client_id)
+        if prior is not None:
+            return {"ok": True, "session_id": session_id, "replayed": True}
+        async with _APP_TURN_INFLIGHT_LOCK:
+            _now = time.monotonic()
+            for k in [k for k, e in _APP_TURN_INFLIGHT.items()
+                      if _now - e["ts"] > _APP_TURN_INFLIGHT_TTL]:
+                _APP_TURN_INFLIGHT.pop(k, None)
+            if _APP_TURN_INFLIGHT.get((session, client_id)) is not None:
+                return {"ok": True, "session_id": session_id, "in_flight": True}
+            inflight_entry = {"ts": _now, "task": None, "state": None}
+            _APP_TURN_INFLIGHT[(session, client_id)] = inflight_entry
+
+    content, att_meta, prompt = await _persona_prepare_turn(session, content,
+                                                            attachments)
+    acp_session = await POOL.get(session, home_for(session))
+    queued = acp_session.is_busy()
+    user_mid, canonical_user_ok = _canon_add_retry(session, "user", content,
+                                                   att_meta, client_id=client_id)
+    _hp_cards_turn_start(session, cid, user_mid, content, att_meta)
+    task, state, _q = _persona_launch_turn(session, prompt, client_id, common_log,
+                                           turn_started, canonical_user_ok, cid)
+    if inflight_entry is not None:
+        inflight_entry["task"] = task
+        inflight_entry["state"] = state
+    return {"ok": True, "session_id": session_id, "accepted": True,
+            "queued": queued, "message_id": user_mid}
+
+
+@app.post("/app/v2/sessions/{session_id}/interrupt")
+async def v2_session_interrupt(session_id: str, request: Request):
+    """統一路由 interrupt(契約 §4.4):cc=Esc 驗證重試、cx=turn/interrupt、
+    hermes=ACP cancel 驗證重試。無活躍 turn 一律 409。"""
+    _check_auth(request)
+    src = _v2_card_source(session_id)
+    if src[0] == "cc":
+        res = await _cc_interrupt_core(src[1])
+        return {"session_id": session_id, **res}
+    if src[0] == "hp":
+        res = await _persona_interrupt_core(src[1])
+        return {"session_id": session_id, **res}
+    try:
+        await CODEX_APP.interrupt_turn(src[1])
+    except CodexAppServerError as e:
+        if "no active" in str(e).lower():
+            raise http_err(409, "NO_ACTIVE_TURN", "no active Codex turn")
+        _codex_http_error(e)
+    return {"ok": True, "session_id": session_id, "interrupted": True}
+
+
+@app.post("/app/v2/sessions/{session_id}/key")
+async def v2_session_key(session_id: str, request: Request):
+    """統一路由 key(契約 §4.4,capability keys):僅 claude_code。"""
+    _check_auth(request)
+    body = await request.json()
+    src = _v2_card_source(session_id)
+    if src[0] != "cc":
+        raise http_err(400, "UNSUPPORTED_PROVIDER",
+                       "key 僅支援 claude_code(capability: keys)")
+    raw = str(body.get("key") or "").strip()
+    if not raw:
+        raise HTTPException(status_code=400, detail="key required")
+    res = await _cc_key_core(src[1], raw)
+    return {"session_id": session_id, **res}
 
 
 # ─────────── Phase 0 S1：CC 卡片事件流 / snapshot（契約 §1-§3, issue #15）───────────
@@ -5185,10 +5338,11 @@ def _ensure_cc_card_follower(name: str, workdir: str):
 
 
 def _v2_card_source(session_id: str) -> tuple:
-    """v2 卡片端點的 session id 路由 → ('cc', name, workdir) 或 ('cx', thread_id)。
+    """v2 session id 路由 → ('cc', name, workdir) / ('cx', thread_id) /
+    ('hp', persona)。
 
     S1 = claude_code:{name}（或裸 CC session 名）；S2 = codex:{thread_id} 與
-    delegation:{id}(provider=codex)；hermes 待 S3。
+    delegation:{id}(provider=codex)；S3 = hermes:{persona}。
     """
     if ":" in session_id:
         prov, _, rest = session_id.partition(":")
@@ -5196,9 +5350,13 @@ def _v2_card_source(session_id: str) -> tuple:
             return ("cx", rest)
         if prov == "delegation":
             return ("cx", _codex_thread_from_v2_session_id(session_id))
+        if prov == "hermes":
+            if rest not in PERSONAS:
+                raise http_err(404, "SESSION_NOT_FOUND", "unknown persona")
+            return ("hp", rest)
         if prov != "claude_code":
             raise http_err(400, "UNSUPPORTED_PROVIDER",
-                           f"卡片流支援 claude_code/codex/delegation(得到 {prov});persona 待 S3")
+                           f"不支援的 provider: {prov}")
         session_id = rest
     row = next((r for r in _cc_conf_rows() if r[0] == session_id), None)
     if not row:
@@ -5259,11 +5417,88 @@ async def _cx_card_digest(thread_id: str):
     return d
 
 
+# ─────────── Phase 0 S3:persona 卡片事件流（canonical + live turn 掛鉤）─────
+
+_HP_CARD_DIGESTS: dict = {}     # persona -> carddigest.PersonaDigest
+_HP_CARD_FOLLOWERS: dict = {}   # persona -> asyncio.Task
+_HP_CARD_SEED_MSGS = 200        # 冷載種子:canonical 訊息數
+
+
+def _hp_digest_maybe(session: str):
+    """live turn 掛鉤用:有訂閱過才回 digest,否則 None(不建立)。"""
+    return _HP_CARD_DIGESTS.get(session)
+
+
+def _hp_cards_turn_start(session: str, cid: str, user_mid: str | None,
+                         content: str, att_meta: list):
+    """回合起點掛鉤:user 卡即時出(canonical mid → follower 不重出)+
+    turn begin。無訂閱者時 no-op。"""
+    d = _hp_digest_maybe(session)
+    if d is None:
+        return
+    try:
+        if user_mid:
+            d.message_card({"id": user_mid, "role": "user", "content": content,
+                            "attachments": att_meta, "ts": time.time()})
+        d.turn_begin(cid)
+    except Exception as e:  # noqa: BLE001
+        _log_event("hp_card_turn_error", session=session, error=str(e)[:160])
+
+
+async def _hp_canon_follower(session: str):
+    """canonical 寫入版本喚醒(#28 的 _canon_wait)→ 補掃出卡。known_mids
+    去重;30s 保險絲重掃與 v1 messages/events 同款。"""
+    d = _HP_CARD_DIGESTS[session]
+    ver = _CANON_VER.get(session, 0)
+    while True:
+        try:
+            await asyncio.wait_for(_canon_wait(session, ver), timeout=30.0)
+        except asyncio.TimeoutError:
+            pass
+        except Exception as e:  # noqa: BLE001
+            _log_event("hp_card_follower_error", session=session,
+                       error=str(e)[:200])
+            await asyncio.sleep(2.0)
+        ver = _CANON_VER.get(session, 0)
+        try:
+            d.seed_messages(_canon_messages(session, 80))
+        except Exception as e:  # noqa: BLE001
+            _log_event("hp_card_follower_error", session=session,
+                       error=str(e)[:200])
+
+
+def _ensure_hp_card_follower(session: str):
+    t = _HP_CARD_FOLLOWERS.get(session)
+    if t and not t.done():
+        return
+    _HP_CARD_FOLLOWERS[session] = asyncio.create_task(_hp_canon_follower(session))
+
+
+async def _hp_card_digest(session: str):
+    d = _HP_CARD_DIGESTS.get(session)
+    if d is None:
+        d = _HP_CARD_DIGESTS[session] = carddigest.PersonaDigest()
+    if not d.seeded:
+        d.seeded = True
+        try:
+            msgs = await asyncio.to_thread(_canon_messages, session,
+                                           _HP_CARD_SEED_MSGS)
+            d.seed_messages(msgs)
+        except Exception as e:  # noqa: BLE001
+            d.seeded = False
+            _log_event("hp_card_seed_error", session=session, error=str(e)[:200])
+            raise HTTPException(status_code=500, detail="persona card seed failed")
+    _ensure_hp_card_follower(session)
+    return d
+
+
 async def _v2_card_store(session_id: str):
     """cards/events 共用:session id → 已 seed 的 SessionCardStore。"""
     src = _v2_card_source(session_id)
     if src[0] == "cx":
         return (await _cx_card_digest(src[1])).store
+    if src[0] == "hp":
+        return (await _hp_card_digest(src[1])).store
     _, name, workdir = src
     store = _cc_card_store(name)
     await _cc_card_seed(store, name, workdir)
@@ -6417,6 +6652,137 @@ async def personas_delete(pid: str, request: Request):
     return {"ok": True}
 
 
+async def _persona_prepare_turn(session: str, content: str, attachments: list):
+    """persona 回合前置(附件轉存/語音轉寫/多模態 parts/prompt 組裝)→
+    (content, att_meta, prompt)。v1 POST /app/v1/messages 與 v2 統一路由
+    input 共用。"""
+    normalized_attachments = []
+    for a in attachments:
+        if not isinstance(a, dict):
+            continue
+        na = dict(a)
+        path = _save_attachment(na, na.get("filename") or "file")
+        if path:
+            na["path"] = path
+            na.pop("data", None)       # keep the persona turn body lightweight
+            na.pop("data_uri", None)
+        normalized_attachments.append(na)
+    attachments = normalized_attachments
+
+    # Voice messages: transcribe any audio attachment and fold the transcript
+    # into the turn text. The audio still rides along as an attachment so the
+    # conversation shows the voice bubble; the model gets the words.
+    voice_text = await _transcribe_attachments(attachments)
+    if voice_text:
+        content = (content + "\n" + voice_text).strip() if content else voice_text
+
+    parts = []
+    if content:
+        parts.append({"type": "text", "text": content})
+    for a in attachments:
+        if a.get("kind") == "image":
+            path = _upload_ref_path(a.get("path")) or _save_attachment(a, a.get("filename") or "image.jpg")
+            if path:
+                parts.append({"type": "image_url", "image_url": {"url": path}})
+        elif a.get("kind") == "audio":
+            continue                       # transcript already in `content`
+        else:
+            path = _upload_ref_path(a.get("path")) or _save_attachment(a, a.get("filename") or "file")
+            if not path:
+                continue
+            parts.append({"type": "file", "file": {"filename": a.get("filename"),
+                          "mime_type": a.get("mime"), "file_data": path}})
+    prompt = await _resolve_persona_prompt([{"role": "user", "content": parts or content}])
+    report_context = _report_context_for_prompt(session, content)
+    if report_context:
+        prompt = f"{report_context}\n\n---\n【使用者現在的訊息】\n{prompt}"
+
+    att_meta = [{"kind": a.get("kind"), "filename": a.get("filename"),
+                 "mime": a.get("mime"), "path": _upload_ref_path(a.get("path"))}
+                for a in attachments]
+    return content, att_meta, prompt
+
+
+def _persona_launch_turn(session: str, prompt: str, client_id, common_log: dict,
+                         turn_started: float, canonical_user_ok, cid: str):
+    """建 queue/state、把 persona 回合掛成獨立背景任務,回 (task, state, q)。
+
+    v1 POST /app/v1/messages 串流消費 q;v2 統一路由 input 不消費 q(回覆走
+    S3 卡片事件流)。回合獨立於 client 連線:斷網不斷回合,收尾一定落
+    canonical。S3 digest 掛鉤都在這裡——delta/status/收尾,單一實作兩邊共用。
+    """
+    q: asyncio.Queue = asyncio.Queue()
+    state = {"acc": "", "usage": None, "content_chunks": 0, "keepalives": 0,
+             "runner_error": "", "stream_error": "", "canonical_reply_ok": None,
+             "done_sent": False}
+
+    async def run_turn():
+        # Drains the persona turn to completion INDEPENDENTLY of the client
+        # connection. If the app's network drops mid-stream this task keeps
+        # going and records the reply, so the canonical store always reflects
+        # what actually happened server-side (the tool ran, the calendar was
+        # created) — a reload then shows the real reply instead of losing it.
+        digest = _hp_digest_maybe(session)
+        try:
+            async for k, v in _persona_content_stream(session, prompt):
+                if k == "content":
+                    state["acc"] += v
+                    state["content_chunks"] += 1
+                    state["step_label"] = ""     # 正文恢復 → 步驟 label 讓位
+                elif k == "usage":
+                    state["usage"] = v
+                elif k == "status":
+                    # 步驟進度(執行步驟 N:工具)— 讓輪詢的 /messages/status
+                    # 也能給 working bar 同一句人話。
+                    state["step_label"] = (v or {}).get("label") or ""
+                if digest is not None:
+                    try:
+                        if k == "content":
+                            digest.turn_delta(cid, v)
+                        elif k == "status":
+                            digest.turn_status((v or {}).get("label") or "")
+                    except Exception as e:  # noqa: BLE001
+                        _log_event("hp_card_turn_error", session=session,
+                                   error=str(e)[:160])
+                await q.put((k, v))
+        except Exception as e:  # noqa: BLE001
+            state["runner_error"] = f"{type(e).__name__}: {str(e)[:180]}"
+            await q.put(("error", str(e)))
+        finally:
+            reply_mid = ""
+            if state["acc"]:
+                reply_mid, reply_ok = _canon_add_retry(session, "assistant", state["acc"],
+                                                       client_id=client_id)
+                state["canonical_reply_ok"] = reply_ok
+            if digest is not None:
+                try:
+                    digest.turn_end(cid, state["acc"], reply_mid=reply_mid or "",
+                                    error=state["runner_error"])
+                except Exception as e:  # noqa: BLE001
+                    _log_event("hp_card_turn_error", session=session,
+                               error=str(e)[:160])
+            _log_event("app_turn_background_done", **common_log,
+                       output_chars=len(state["acc"]),
+                       content_chunks=state["content_chunks"],
+                       usage_used=(state["usage"] or {}).get("used"),
+                       usage_size=(state["usage"] or {}).get("size"),
+                       canonical_user_ok=canonical_user_ok,
+                       canonical_reply_ok=state["canonical_reply_ok"],
+                       runner_error=state["runner_error"] or None,
+                       duration_ms=int((time.monotonic() - turn_started) * 1000))
+            await q.put((None, None))
+
+    _log_event("app_turn_model_start", **common_log,
+               prompt_chars=len(prompt), canonical_user_ok=canonical_user_ok)
+    # The turn runs as a handler-scope task (not inside the generator) so a
+    # duplicate POST can attach to it via _APP_TURN_INFLIGHT before the client
+    # even starts reading this response.
+    task = asyncio.create_task(run_turn())
+    _BG_TASKS.add(task)
+    task.add_done_callback(_BG_TASKS.discard)
+    return task, state, q
+
+
 @app.post("/app/v1/messages")
 async def app_post_message(request: Request):
     """Send a turn: record the user message canonically, run the persona turn,
@@ -6560,109 +6926,19 @@ async def app_post_message(request: Request):
                            canonical_user_ok=None, canonical_reply_ok=None)
         return StreamingResponse(dry_agen(), media_type="text/event-stream")
 
-    normalized_attachments = []
-    for a in attachments:
-        if not isinstance(a, dict):
-            continue
-        na = dict(a)
-        path = _save_attachment(na, na.get("filename") or "file")
-        if path:
-            na["path"] = path
-            na.pop("data", None)       # keep the persona turn body lightweight
-            na.pop("data_uri", None)
-        normalized_attachments.append(na)
-    attachments = normalized_attachments
-
-    # Voice messages: transcribe any audio attachment and fold the transcript
-    # into the turn text. The audio still rides along as an attachment so the
-    # conversation shows the voice bubble; the model gets the words.
-    voice_text = await _transcribe_attachments(attachments)
-    if voice_text:
-        content = (content + "\n" + voice_text).strip() if content else voice_text
-
-    parts = []
-    if content:
-        parts.append({"type": "text", "text": content})
-    for a in attachments:
-        if a.get("kind") == "image":
-            path = _upload_ref_path(a.get("path")) or _save_attachment(a, a.get("filename") or "image.jpg")
-            if path:
-                parts.append({"type": "image_url", "image_url": {"url": path}})
-        elif a.get("kind") == "audio":
-            continue                       # transcript already in `content`
-        else:
-            path = _upload_ref_path(a.get("path")) or _save_attachment(a, a.get("filename") or "file")
-            if not path:
-                continue
-            parts.append({"type": "file", "file": {"filename": a.get("filename"),
-                          "mime_type": a.get("mime"), "file_data": path}})
-    prompt = await _resolve_persona_prompt([{"role": "user", "content": parts or content}])
-    report_context = _report_context_for_prompt(session, content)
-    if report_context:
-        prompt = f"{report_context}\n\n---\n【使用者現在的訊息】\n{prompt}"
-
+    content, att_meta, prompt = await _persona_prepare_turn(session, content,
+                                                            attachments)
     acp_session = await POOL.get(session, home_for(session))
     queued_at_accept = acp_session.is_busy()
 
-    att_meta = [{"kind": a.get("kind"), "filename": a.get("filename"),
-                 "mime": a.get("mime"), "path": _upload_ref_path(a.get("path"))}
-                for a in attachments]
     # Record the transcript as the canonical text (so other devices see what was
     # said even without the audio bytes), tagged so the app can show 🎤.
     _user_mid, canonical_user_ok = _canon_add_retry(session, "user", content, att_meta,
                                                     client_id=client_id)
+    _hp_cards_turn_start(session, cid, _user_mid, content, att_meta)
 
-    q: asyncio.Queue = asyncio.Queue()
-    state = {"acc": "", "usage": None, "content_chunks": 0, "keepalives": 0,
-             "runner_error": "", "stream_error": "", "canonical_reply_ok": None,
-             "done_sent": False}
-
-    async def run_turn():
-        # Drains the persona turn to completion INDEPENDENTLY of the client
-        # connection. If the app's network drops mid-stream this task keeps
-        # going and records the reply, so the canonical store always reflects
-        # what actually happened server-side (the tool ran, the calendar was
-        # created) — a reload then shows the real reply instead of losing it.
-        try:
-            async for k, v in _persona_content_stream(session, prompt):
-                if k == "content":
-                    state["acc"] += v
-                    state["content_chunks"] += 1
-                    state["step_label"] = ""     # 正文恢復 → 步驟 label 讓位
-                elif k == "usage":
-                    state["usage"] = v
-                elif k == "status":
-                    # 步驟進度(執行步驟 N:工具)— 讓輪詢的 /messages/status
-                    # 也能給 working bar 同一句人話。
-                    state["step_label"] = (v or {}).get("label") or ""
-                await q.put((k, v))
-        except Exception as e:  # noqa: BLE001
-            state["runner_error"] = f"{type(e).__name__}: {str(e)[:180]}"
-            await q.put(("error", str(e)))
-        finally:
-            if state["acc"]:
-                _reply_mid, reply_ok = _canon_add_retry(session, "assistant", state["acc"],
-                                                        client_id=client_id)
-                state["canonical_reply_ok"] = reply_ok
-            _log_event("app_turn_background_done", **common_log,
-                       output_chars=len(state["acc"]),
-                       content_chunks=state["content_chunks"],
-                       usage_used=(state["usage"] or {}).get("used"),
-                       usage_size=(state["usage"] or {}).get("size"),
-                       canonical_user_ok=canonical_user_ok,
-                       canonical_reply_ok=state["canonical_reply_ok"],
-                       runner_error=state["runner_error"] or None,
-                       duration_ms=int((time.monotonic() - turn_started) * 1000))
-            await q.put((None, None))
-
-    _log_event("app_turn_model_start", **common_log,
-               prompt_chars=len(prompt), canonical_user_ok=canonical_user_ok)
-    # The turn runs as a handler-scope task (not inside the generator) so a
-    # duplicate POST can attach to it via _APP_TURN_INFLIGHT before the client
-    # even starts reading this response.
-    task = asyncio.create_task(run_turn())
-    _BG_TASKS.add(task)
-    task.add_done_callback(_BG_TASKS.discard)
+    task, state, q = _persona_launch_turn(session, prompt, client_id, common_log,
+                                          turn_started, canonical_user_ok, cid)
     if inflight_entry is not None:
         inflight_entry["task"] = task
         inflight_entry["state"] = state
@@ -6720,11 +6996,16 @@ async def app_message_interrupt(request: Request):
     session = body.get("session") or "xcash"
     if session not in PERSONAS:
         raise http_err(400, "SESSION_NOT_FOUND", "unknown session")
+    return await _persona_interrupt_core(session)
+
+
+async def _persona_interrupt_core(session: str) -> dict:
+    """persona 中斷核心 — v1 與 v2 統一路由共用。
+    Same verify-and-retry contract as /ccsessions/{name}/interrupt: don't
+    report ok on a cancel that didn't land — check busy and retry up to 3×."""
     acp_session = await POOL.get(session, home_for(session))
     if not acp_session.is_busy():
         raise HTTPException(status_code=409, detail="no active turn")
-    # Same verify-and-retry contract as /ccsessions/{name}/interrupt: don't
-    # report ok on a cancel that didn't land — check busy and retry up to 3×.
     attempts = 0
     interrupted = False
     for _ in range(3):
@@ -6886,8 +7167,13 @@ async def approval_get(aid: str, request: Request):
 async def approval_decide(aid: str, request: Request):
     """Approve / reject (from the app)."""
     _check_auth(request)
-    import sqlite3
     b = await request.json()
+    return await _approval_decide_core(aid, b)
+
+
+async def _approval_decide_core(aid: str, b: dict) -> dict:
+    """Approval Center 決議核心 — v1 與 v2 統一路由 approve 共用。"""
+    import sqlite3
     decision = "approved" if b.get("approve") else "rejected"
     con = sqlite3.connect(CANON_DB)
     row = con.execute("SELECT source FROM approvals WHERE id=?", (aid,)).fetchone()
