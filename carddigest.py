@@ -12,6 +12,8 @@ S2（codex app-server 事件）/ S3（persona stream）之後各自加一個
 它，舊 client 永不壞。
 """
 
+import json
+import re
 import time
 
 
@@ -535,6 +537,79 @@ class SessionCardStore:
         return {"seq": self.seq, "ts": time.time(), "type": "ping", "data": {}}
 
 
+# ───────────────── B3:studio-card 圍欄協定(persona 結構化輸出)──────────────
+# persona/工具在回覆裡嵌 ```studio-card 圍欄 JSON(晨報表格、持倉 kv…),digest
+# 抽成獨立結構化卡,原文位置換成 fallback_text——手機原生渲染表格,舊 client
+# 看純文字,兩邊都不壞。這是 Hermes 拓撲下「persona 工具的正確呈現形態」。
+#
+# 圍欄格式:
+#   ```studio-card
+#   {"kind": "table", "title": "持倉", "columns": [...], "rows": [[...]],
+#    "fallback_text": "..."}
+#   ```
+# kind ∈ {table, kv, text, markdown};fallback_text 缺了由 digest 代生。
+# 壞 JSON / 不認得的 kind → 圍欄原文保留(不吞內容,fallback 鐵律)。
+
+_SC_FENCE_RE = re.compile(r"```studio-card[ \t]*\n(.*?)\n?```", re.DOTALL)
+_SC_KINDS = ("table", "kv", "text", "markdown")
+
+
+def _studio_card_fallback(payload: dict) -> str:
+    """缺 fallback_text 時的純文字代生。"""
+    title = str(payload.get("title") or "").strip()
+    kind = payload.get("kind")
+    if kind == "table":
+        lines = [title] if title else []
+        cols = payload.get("columns") or []
+        if cols:
+            lines.append(" | ".join(str(c) for c in cols))
+        rows = payload.get("rows") or []
+        for r in rows[:12]:
+            cells = r if isinstance(r, list) else [r]
+            lines.append(" | ".join(str(x) for x in cells))
+        if len(rows) > 12:
+            lines.append(f"…共 {len(rows)} 列")
+        return "\n".join(lines).strip() or "studio-card"
+    if kind == "kv":
+        items = payload.get("items")
+        if isinstance(items, dict):
+            pairs = list(items.items())
+        elif isinstance(items, list):
+            pairs = [(d.get("key"), d.get("value"))
+                     for d in items if isinstance(d, dict)]
+        else:
+            pairs = []
+        lines = ([title] if title else []) + \
+            [f"{k}: {v}" for k, v in pairs[:20]]
+        return "\n".join(lines).strip() or "studio-card"
+    text = str(payload.get("text") or "")
+    return (f"{title}\n{text}" if title else text).strip() or "studio-card"
+
+
+def extract_studio_cards(text: str) -> tuple:
+    """text → (圍欄換成 fallback_text 的乾淨文字, 結構化卡 body 清單)。
+    body 含 kind(呼叫端提出來當卡 kind)與 fallback_text(必附)。"""
+    if not text or "```studio-card" not in text:
+        return text, []
+    bodies: list[dict] = []
+
+    def _sub(m):
+        try:
+            payload = json.loads(m.group(1))
+        except Exception:  # noqa: BLE001
+            return m.group(0)
+        if not isinstance(payload, dict) or payload.get("kind") not in _SC_KINDS:
+            return m.group(0)
+        fb = str(payload.get("fallback_text") or "").strip() \
+            or _studio_card_fallback(payload)
+        body = dict(payload)
+        body["fallback_text"] = fb
+        bodies.append(body)
+        return fb
+
+    return _SC_FENCE_RE.sub(_sub, text), bodies
+
+
 # ───────────────────────── S3:persona 事件 → 卡片 ───────────────────────────
 
 
@@ -566,8 +641,17 @@ class PersonaDigest:
             "label": label or ("回覆中" if self.busy else "待命"),
         })
 
+    def _emit_studio_cards(self, base_cid: str, bodies: list, ts=None):
+        """B3:抽出的 studio-card bodies → 結構化卡(id 錨在母卡上,重放穩定)。"""
+        for i, body in enumerate(bodies):
+            body = dict(body)
+            kind = body.pop("kind")
+            self.store.upsert_card(make_card(f"{base_cid}-sc{i}", self.store.turn_id,
+                                             "assistant", kind, body, ts=ts))
+
     def message_card(self, m: dict):
-        """canonical message dict(_canon_messages 形狀)→ 卡;known 去重。"""
+        """canonical message dict(_canon_messages 形狀)→ 卡;known 去重。
+        assistant 內文先過 B3 studio-card 抽取(圍欄→結構化卡+fallback 文字)。"""
         mid = str(m.get("id") or "")
         if not mid or mid in self.known_mids:
             return
@@ -577,14 +661,19 @@ class PersonaDigest:
             return
         role = "user" if m.get("role") == "user" else "assistant"
         kind = "text" if role == "user" else "markdown"
+        sc_bodies = []
+        if role == "assistant":
+            text, sc_bodies = extract_studio_cards(text)
         body = {"text": text, "fallback_text": text}
         atts = m.get("attachments") or []
         if atts:
             body["attachments"] = [{"kind": a.get("kind"),
                                     "filename": a.get("filename")}
                                    for a in atts if isinstance(a, dict)]
+        ts = _epoch(m.get("ts"))
         self.store.upsert_card(make_card(f"card-hp-{mid}", "", role, kind,
-                                         body, ts=_epoch(m.get("ts"))))
+                                         body, ts=ts))
+        self._emit_studio_cards(f"card-hp-{mid}", sc_bodies, ts=ts)
 
     def seed_messages(self, msgs: list):
         for m in msgs or []:
@@ -622,9 +711,11 @@ class PersonaDigest:
         if reply_mid:
             self.known_mids.add(str(reply_mid))
         if full_text:
+            clean, sc_bodies = extract_studio_cards(full_text)
             self.store.upsert_card(make_card(
                 f"card-hp-turn-{cid}", self.store.turn_id, "assistant",
-                "markdown", {"text": full_text, "fallback_text": full_text}))
+                "markdown", {"text": clean, "fallback_text": clean}))
+            self._emit_studio_cards(f"card-hp-turn-{cid}", sc_bodies)
         if error:
             self.store.upsert_card(make_card(
                 f"card-hp-turn-{cid}-err", self.store.turn_id, "system", "text",

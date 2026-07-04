@@ -4612,50 +4612,64 @@ async def _cc_input_core(name: str, body: dict) -> dict:
         text = (text + f"  [附件已存到本機,請用 Read 讀取/檢視: {refs}]").strip()
     if not text:
         raise HTTPException(status_code=400, detail="empty")
-    if not await _tmux_alive(name):
-        raise http_err(409, "SESSION_NOT_RUNNING", "session not running")
-    target = name
-
-    async def _tmux(*args):
-        rc, _, err = await _tmux_run(*args)
-        return rc, err
-
-    # Deliver via tmux bracketed paste (set-buffer → paste-buffer -p) instead of
-    # `send-keys -l`. This is how Claude Code receives a pasted prompt: the whole
-    # block (incl. multi-line text + an image path) lands as ONE input, so a
-    # newline no longer submits the command half-typed — the old 502 cause.
-    buf = "pa-" + uuid.uuid4().hex[:8]
-    try:
-        await _tmux("send-keys", "-t", target, "C-u")          # clear residual input
-        rc_set, e_set = await _tmux("set-buffer", "-b", buf, text)
-        rc_paste, e_paste = await _tmux("paste-buffer", "-t", target, "-b", buf, "-p", "-d")
-        await asyncio.sleep(0.25)                               # let the editor settle
-        rc_enter, e_enter = await _tmux("send-keys", "-t", target, "Enter")
-    except Exception as e:  # noqa: BLE001
-        raise HTTPException(status_code=500, detail=str(e))
-    if rc_set or rc_paste or rc_enter:                         # don't false-report success
-        detail = (e_set or e_paste or e_enter or "tmux paste failed")[:200]
-        raise http_err(502, "TMUX_FAILED", "tmux paste failed", detail)
+    await _cc_paste_text(name, text)
     return {"ok": True}
 
 
+async def _tmux_run_stdin(args: list, data: bytes,
+                          timeout: float = _TMUX_TIMEOUT):
+    """同 _tmux_run,但把 data 餵進 stdin(load-buffer 用)。"""
+    p = await asyncio.create_subprocess_exec(
+        TMUX_BIN, *args,
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+    try:
+        out, err = await asyncio.wait_for(p.communicate(input=data), timeout)
+    except asyncio.TimeoutError:
+        try:
+            p.kill()
+        except ProcessLookupError:
+            pass
+        _log_event("tmux_timeout", args=" ".join(str(a) for a in args[:4]),
+                   timeout_s=timeout)
+        return 124, "", "tmux timed out"
+    return (p.returncode,
+            (out or b"").decode("utf-8", "replace"),
+            (err or b"").decode("utf-8", "replace").strip())
+
+
 async def _cc_paste_text(name: str, text: str) -> None:
+    """tmux 貼字唯一原語(B1):bracketed paste,buffer 內容改走 load-buffer
+    stdin——set-buffer 把整段文字放 argv,長貼文/特殊字元踩 exec 邊界就 502,
+    這一整類從此消失。每步 rc/stderr 失敗即進 log(502 先可觀測再談修)。"""
     if not await _tmux_alive(name):
         raise http_err(409, "SESSION_NOT_RUNNING", "session not running")
 
-    async def _tmux(*args):
-        rc, _, err = await _tmux_run(*args)
-        return rc, err
-
     buf = "pa-" + uuid.uuid4().hex[:8]
-    await _tmux("send-keys", "-t", name, "C-u")
-    rc_set, e_set = await _tmux("set-buffer", "-b", buf, text)
-    rc_paste, e_paste = await _tmux("paste-buffer", "-t", name, "-b", buf, "-p", "-d")
-    await asyncio.sleep(0.25)
-    rc_enter, e_enter = await _tmux("send-keys", "-t", name, "Enter")
-    if rc_set or rc_paste or rc_enter:
-        detail = (e_set or e_paste or e_enter or "tmux paste failed")[:200]
+    try:
+        rc_clear, _, e_clear = await _tmux_run("send-keys", "-t", name, "C-u")
+        rc_load, _, e_load = await _tmux_run_stdin(
+            ["load-buffer", "-b", buf, "-"],
+            text.encode("utf-8", "replace"))
+        rc_paste, _, e_paste = await _tmux_run("paste-buffer", "-t", name,
+                                               "-b", buf, "-p", "-d")
+        await asyncio.sleep(0.25)                    # let the editor settle
+        rc_enter, _, e_enter = await _tmux_run("send-keys", "-t", name, "Enter")
+    except Exception as e:  # noqa: BLE001
+        _log_event("cc_paste_failed", session=name, text_chars=len(text),
+                   step="exec", error=f"{type(e).__name__}: {str(e)[:160]}")
+        raise HTTPException(status_code=500, detail=str(e))
+    if rc_load or rc_paste or rc_enter:              # don't false-report success
+        _log_event("cc_paste_failed", session=name, text_chars=len(text),
+                   step=("load" if rc_load else "paste" if rc_paste else "enter"),
+                   rc_clear=rc_clear, rc_load=rc_load, rc_paste=rc_paste,
+                   rc_enter=rc_enter,
+                   stderr=(e_load or e_paste or e_enter or "")[:200])
+        detail = (e_load or e_paste or e_enter or "tmux paste failed")[:200]
         raise http_err(502, "TMUX_FAILED", "tmux paste failed", detail)
+    if rc_clear:
+        _log_event("cc_paste_clear_warn", session=name,
+                   rc=rc_clear, stderr=(e_clear or "")[:120])
 
 
 async def _cc_capture_pane_fresh(name: str) -> str:
