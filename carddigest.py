@@ -43,6 +43,49 @@ PLUMBING_TAGS = ("<task-notification>", "<system-reminder>", "[Internal",
 
 _TOOL_RESULT_MAX = 2000       # tool_result 卡上限（fallback 再截一半）
 _THINKING_MAX = 2000
+_CMD_MAX = 500                # 工具 cmd/路徑截斷上限 — 140 會把深路徑攔腰砍斷，
+                              # app 的 diff chip 拿殘缺路徑去打 /filediff 就 404（#38 缺口）
+_PATCH_MAX = 20_000           # tool_call.patch.text 上限（契約 §2）
+
+
+def _tool_patch(name: str, inp) -> dict | None:
+    """Edit/Write/MultiEdit/NotebookEdit 的 tool_use input → `tool_call.patch`
+    （契約 §2）。從事件自身合成——不回讀 worktree，步驟過後再 commit 也能
+    回看單步變更，replay 重放產同一份。事件裡沒有整檔上下文，故 hunk 用裸
+    `@@` 分隔、無行號。"""
+    if not isinstance(inp, dict):
+        return None
+    path = inp.get("file_path") or inp.get("notebook_path") or ""
+    if name == "Edit":
+        pairs = [(inp.get("old_string"), inp.get("new_string"))]
+    elif name == "MultiEdit":
+        pairs = [(e.get("old_string"), e.get("new_string"))
+                 for e in inp.get("edits") or [] if isinstance(e, dict)]
+    elif name == "Write":
+        pairs = [("", inp.get("content"))]
+    elif name == "NotebookEdit":
+        pairs = [("", inp.get("new_source"))]
+    else:
+        return None
+    if not path:
+        return None
+    hunks, adds, dels = [], 0, 0
+    for old, new in pairs:
+        lines = []
+        for ln in str(old or "").splitlines() if old else []:
+            lines.append("-" + ln)
+            dels += 1
+        for ln in str(new or "").splitlines() if new else []:
+            lines.append("+" + ln)
+            adds += 1
+        if lines:
+            hunks.append("@@\n" + "\n".join(lines))
+    if not hunks:
+        return None
+    text = f"--- {path}\n+++ {path}\n" + "\n".join(hunks)
+    if len(text) > _PATCH_MAX:
+        text = text[:_PATCH_MAX] + "\n…(截斷)"
+    return {"path": path, "text": text, "adds": adds, "dels": dels}
 
 
 def _blocks_text(content) -> str:
@@ -120,11 +163,14 @@ def cc_event_to_cards(d: dict, uid: str, turn_id: str = "") -> list[dict]:
                 if not cmd and isinstance(inp, dict):
                     cmd = next((str(v) for v in inp.values()
                                 if isinstance(v, (str, int))), "")
-                cmd = str(cmd).splitlines()[0][:140] if cmd else ""
+                cmd = str(cmd).splitlines()[0][:_CMD_MAX] if cmd else ""
                 fb = f"› 🔧 {name}" + (f" `{cmd}`" if cmd else "")
+                body = {"tool": name, "summary": cmd, "fallback_text": fb}
+                patch = _tool_patch(name, inp)
+                if patch:
+                    body["patch"] = patch
                 cards.append(make_card(cid(i), turn_id, "assistant", "tool_call",
-                                       {"tool": name, "summary": cmd,
-                                        "fallback_text": fb}, ts))
+                                       body, ts))
         return cards
 
     return []
