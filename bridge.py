@@ -18,6 +18,7 @@ import glob
 import hashlib
 import hmac
 import json
+import mimetypes
 import os
 import re
 import secrets
@@ -574,6 +575,13 @@ def _canon_init():
     # one table syncs reactions on both app-sent and Telegram-side messages.
     con.execute("""CREATE TABLE IF NOT EXISTS reactions(
         msg_id TEXT PRIMARY KEY, session TEXT, reaction TEXT, updated_at REAL)""")
+    # Canonical reactions/pins (G2, pocketagent#39 final contract): multi-emoji
+    # reactions (JSON list) + per-message pin, keyed by the id the app sees in
+    # GET /app/v1/messages. Supersedes the single-`reaction` overlay above,
+    # which is kept for backward compatibility with older app builds.
+    con.execute("""CREATE TABLE IF NOT EXISTS message_meta(
+        message_id TEXT PRIMARY KEY, reactions TEXT, pinned INTEGER,
+        updated_at REAL)""")
     con.execute("""CREATE TABLE IF NOT EXISTS approvals(
         id TEXT PRIMARY KEY, title TEXT, source TEXT, risk TEXT, detail TEXT,
         created_at REAL, expires_at REAL, status TEXT, decided_at REAL, result TEXT)""")
@@ -2320,10 +2328,12 @@ class CodexAppServerClient:
             self.active_turns[tid] = turn.get("id") or True
             self.last_event_at[tid] = time.time()
             self.thread_errors.pop(tid, None)
+            _codex_history_invalidate(tid)   # cached /history page is now stale
             return
         if method == "turn/completed" and tid:
             self.active_turns.pop(tid, None)
             self.last_event_at[tid] = time.time()
+            _codex_history_invalidate(tid)   # cached /history page is now stale
             self._drop_thread_approvals(tid)
             turn = params.get("turn") or {}
             err = turn.get("error") if isinstance(turn, dict) else None
@@ -2628,6 +2638,36 @@ async def codex_status(request: Request):
         _codex_http_error(e)
 
 
+# Codex 進場延遲止血 (B1): /codexsessions/{id}/history is zero-cache and its
+# thread/turns/list itemsView:"full" call is expensive; the app fires it
+# several times while entering a session. A short TTL cache absorbs those
+# duplicates — same pattern as _PANE_CACHE for tmux capture-pane.
+_CODEX_HISTORY_TTL = 4.0
+_CODEX_HISTORY_CACHE: dict = {}   # (thread_id, limit, cursor) -> (cached_at_monotonic, payload)
+
+
+def _codex_history_invalidate(thread_id: str) -> None:
+    """Drop cached history pages for one thread (new input / turn activity)."""
+    for k in [k for k in _CODEX_HISTORY_CACHE if k[0] == thread_id]:
+        _CODEX_HISTORY_CACHE.pop(k, None)
+
+
+async def _codex_warm_threads(thread_ids: list) -> None:
+    """B3 light warmup: pre-run thread/resume for the sessions the user is most
+    likely to tap next, so entering one skips the cold load. Strictly
+    sequential and skip-if-loaded, so it never amplifies app-server queueing —
+    at most one warm call is in the single _lock queue at a time."""
+    for tid in thread_ids:
+        if not tid or tid in CODEX_APP.loaded_threads:
+            continue
+        try:
+            await CODEX_APP.ensure_thread_loaded(tid)
+            _log_event("codex_thread_warmed", thread=tid[:16])
+        except Exception as e:  # noqa: BLE001
+            _log_event("codex_thread_warm_failed", thread=tid[:16],
+                       error=type(e).__name__)
+
+
 @app.get("/codexsessions")
 async def codex_sessions(request: Request, limit: int = 40, cwd: str | None = None,
                          archived: bool = False, cursor: str | None = None):
@@ -2646,9 +2686,17 @@ async def codex_sessions(request: Request, limit: int = 40, cwd: str | None = No
         params["cursor"] = cursor
     try:
         res = await CODEX_APP.call("thread/list", params, timeout=45.0)
+        data = list((res or {}).get("data", []))
+        # B3: warm the few most-recent threads in the background (fire and
+        # forget — the list response is NOT delayed by this).
+        warm_ids = [t.get("id") for t in data[:4] if t.get("id")]
+        if warm_ids:
+            task = asyncio.create_task(_codex_warm_threads(warm_ids))
+            _BG_TASKS.add(task)
+            task.add_done_callback(_BG_TASKS.discard)
         return {
             "sessions": [_codex_enrich_summary(_codex_session_summary(t))
-                         for t in (res or {}).get("data", [])],
+                         for t in data],
             "nextCursor": (res or {}).get("nextCursor"),
         }
     except Exception as e:  # noqa: BLE001
@@ -3029,6 +3077,7 @@ async def codex_session_input(thread_id: str, request: Request):
                                            body.get("attachments") or [])
     if not input_items:
         raise HTTPException(status_code=400, detail="empty")
+    _codex_history_invalidate(thread_id)     # new user turn → history changed
     try:
         res = await CODEX_APP.start_turn(thread_id, input_items,
                                          client_id=body.get("client_id"),
@@ -3052,10 +3101,17 @@ async def codex_session_interrupt(thread_id: str, request: Request):
 async def codex_session_history(thread_id: str, request: Request, limit: int = 40,
                                 cursor: str | None = None):
     _check_auth(request)
+    lim = max(1, min(limit, 100))
+    key = (thread_id, lim, cursor or "")
+    hit = _CODEX_HISTORY_CACHE.get(key)
+    if hit and time.monotonic() - hit[0] < _CODEX_HISTORY_TTL:
+        _log_event("codex_history_cache_hit", thread=thread_id[:16],
+                   limit=lim, cursor=bool(cursor))
+        return hit[1]
     try:
         params = {
             "threadId": thread_id,
-            "limit": max(1, min(limit, 100)),
+            "limit": lim,
             "itemsView": "full",
             "sortDirection": "desc",
         }
@@ -3064,9 +3120,11 @@ async def codex_session_history(thread_id: str, request: Request, limit: int = 4
         res = await CODEX_APP.call("thread/turns/list", params, timeout=45.0)
         turns = list((res or {}).get("data", []))
         turns.reverse()
-        return {"text": _codex_format_turns(turns),
-                "more": bool((res or {}).get("nextCursor")),
-                "nextCursor": (res or {}).get("nextCursor")}
+        payload = {"text": _codex_format_turns(turns),
+                   "more": bool((res or {}).get("nextCursor")),
+                   "nextCursor": (res or {}).get("nextCursor")}
+        _CODEX_HISTORY_CACHE[key] = (time.monotonic(), payload)
+        return payload
     except Exception as e:  # noqa: BLE001
         _codex_http_error(e)
 
@@ -3316,10 +3374,49 @@ def _persona_preview(home: str):
     return (None, None)
 
 
+# TG→app media (N4, pocketagent#36): Hermes' image_routing appends a
+# `[Image attached at: /local/path]` hint line to the stored user text for
+# every photo the TG gateway downloads (into <home>/image_cache). state.db has
+# no media column, so those hint lines ARE the media record — parse them back
+# into real attachments.
+_TG_IMAGE_MARKER = re.compile(r"\[Image attached at: ([^\]\n]+)\]")
+
+
+def _tg_extract_attachments(content: str):
+    """Split a TG-side message into (display_text, attachments).
+
+    Attachments use the SAME shape the app already renders for app-sent turns
+    ({kind, filename, mime, path} — see att_meta in POST /app/v1/messages);
+    the app fetches `path` through the existing GET /file endpoint, so no new
+    media endpoint and no app-side decoding change is needed. Markers whose
+    file has since been pruned from image_cache stay in the text as-is (the
+    path hint is better than silently dropping the message's context)."""
+    attachments: list = []
+
+    def _repl(m):
+        path = m.group(1).strip()
+        if path and os.path.isfile(path):
+            attachments.append({
+                "kind": "image",
+                "filename": os.path.basename(path),
+                "mime": mimetypes.guess_type(path)[0] or "image/jpeg",
+                "path": path,
+            })
+            return ""
+        return m.group(0)
+
+    text = _TG_IMAGE_MARKER.sub(_repl, content or "")
+    if attachments:
+        # Collapse the blank lines the removed hint lines leave behind.
+        text = re.sub(r"\n{3,}", "\n\n", text).strip()
+        return text, attachments
+    return content, attachments
+
+
 def _persona_history(home: str, limit: int = 100):
     """Full recent transcript of the persona's canonical Telegram session, so a
     fresh app install / new device can render the conversation instead of a
-    blank thread. Returns oldest→newest [{role, content, ts}]."""
+    blank thread. Returns oldest→newest [{role, content, ts, attachments}]."""
     import sqlite3
     db = os.path.join(home, "state.db")
     if not os.path.exists(db):
@@ -3335,7 +3432,12 @@ def _persona_history(home: str, limit: int = 100):
         rows = cur.fetchall()
         con.close()
         rows.reverse()  # oldest → newest for natural top-to-bottom rendering
-        return [{"role": r[0], "content": r[1], "ts": r[2]} for r in rows]
+        out = []
+        for r in rows:
+            text, atts = _tg_extract_attachments(r[1])
+            out.append({"role": r[0], "content": text, "ts": r[2],
+                        "attachments": atts})
+        return out
     except Exception:  # noqa: BLE001
         return []
 
@@ -4987,6 +5089,7 @@ async def capabilities(request: Request):
                          "delegations", "control_plane_v2", "attachment_uploads"],
             "endpoints": ["/app/v1/sessions", "/app/v1/messages", "/reports",
                           "/app/v1/uploads",
+                          "/app/v1/reactions", "/app/v1/pins",
                           "/app/v1/messages/status", "/app/v1/messages/events",
                           "/app/v1/messages/interrupt",
                           "/cron/jobs", "/ccsessions", "/app/v1/approvals",
@@ -5305,7 +5408,8 @@ async def app_get_messages(session: str, request: Request, limit: int = 200):
     _, home = PERSONAS[session]
     for m in _persona_history(home, limit):
         out.append({"id": f"tg-{m['ts']}", "role": m["role"], "content": m["content"],
-                    "attachments": [], "ts": m["ts"], "status": "done", "source": "telegram"})
+                    "attachments": m.get("attachments") or [], "ts": m["ts"],
+                    "status": "done", "source": "telegram"})
     # Surface each persona's daily briefs (cron-delivered) IN its conversation,
     # like Telegram does — not only in the separate Reports tab. 袁方's 晨報/午報
     # etc. and 潘天晴's 編輯台晨報 (+ future 今日精選/限動) read from each persona's
@@ -5322,13 +5426,35 @@ async def app_get_messages(session: str, request: Request, limit: int = 200):
         con = sqlite3.connect(f"file:{CANON_DB}?mode=ro", uri=True, timeout=5)
         rows = con.execute("SELECT msg_id, reaction FROM reactions WHERE session=?",
                            (session,)).fetchall()
-        con.close()
         overlay = {r[0]: r[1] for r in rows if r[1]}
-        if overlay:
-            for m in out:
-                r = overlay.get(str(m.get("id")))
-                if r:
-                    m["reaction"] = r
+        # Canonical multi-emoji reactions + pins (G2/#39 final contract). Both
+        # fields are optional in the payload: omitted when there's no data.
+        meta_rows = con.execute(
+            "SELECT message_id, reactions, pinned FROM message_meta").fetchall()
+        con.close()
+        meta = {}
+        for mid_, rx, pn in meta_rows:
+            try:
+                lst = json.loads(rx) if rx else []
+            except Exception:  # noqa: BLE001
+                lst = []
+            meta[mid_] = ([str(r) for r in lst if r] if isinstance(lst, list) else [],
+                          bool(pn))
+        for m in out:
+            mid_ = str(m.get("id"))
+            legacy = overlay.get(mid_)
+            if legacy:
+                m["reaction"] = legacy
+            if mid_ in meta:
+                reactions, pinned = meta[mid_]
+                if reactions:
+                    m["reactions"] = reactions
+                if pinned:
+                    m["pinned"] = True
+            elif legacy:
+                # Older builds wrote the single-reaction overlay only; surface
+                # it in the new list field too so nothing disappears mid-migration.
+                m["reactions"] = [legacy]
     except Exception:  # noqa: BLE001
         pass
     return {"messages": out}
@@ -5415,6 +5541,86 @@ async def app_set_reaction(mid: str, request: Request):
     except Exception as e:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=str(e)[:200])
     return {"ok": True, "reaction": reaction or None}
+
+
+def _message_meta_load(con, message_id: str):
+    """→ (reactions_list, pinned_int) for one message; ([], 0) when no row."""
+    row = con.execute("SELECT reactions, pinned FROM message_meta WHERE message_id=?",
+                      (message_id,)).fetchone()
+    reactions: list = []
+    if row and row[0]:
+        try:
+            parsed = json.loads(row[0])
+            if isinstance(parsed, list):
+                reactions = [str(r) for r in parsed if r]
+        except Exception:  # noqa: BLE001
+            reactions = []
+    return reactions, (int(row[1] or 0) if row else 0)
+
+
+@app.post("/app/v1/reactions")
+async def app_reactions(request: Request):
+    """Canonical reactions (G2/#39): add/remove one emoji on a message and
+    return the message's full current emoji list. Works for canonical mids and
+    tg-<ts> ids alike — the overlay doesn't care where the message lives."""
+    _check_auth(request)
+    body = await request.json()
+    message_id = str(body.get("message_id") or "").strip()
+    emoji = str(body.get("emoji") or "").strip()[:16]
+    action = str(body.get("action") or "add").strip().lower()
+    if not message_id or not emoji or action not in ("add", "remove"):
+        raise HTTPException(status_code=400,
+                            detail="message_id, emoji and action=add|remove required")
+    import sqlite3
+    try:
+        con = sqlite3.connect(CANON_DB, timeout=30)
+        con.execute("PRAGMA busy_timeout=30000")
+        reactions, pinned = _message_meta_load(con, message_id)
+        if action == "add":
+            if emoji not in reactions:
+                reactions.append(emoji)
+        else:
+            reactions = [r for r in reactions if r != emoji]
+        con.execute("INSERT INTO message_meta(message_id, reactions, pinned, updated_at) "
+                    "VALUES(?,?,?,?) ON CONFLICT(message_id) DO UPDATE SET "
+                    "reactions=excluded.reactions, updated_at=excluded.updated_at",
+                    (message_id, json.dumps(reactions, ensure_ascii=False),
+                     pinned, time.time()))
+        con.commit()
+        con.close()
+    except Exception as e:  # noqa: BLE001
+        _log_event("message_meta_write_failed", kind="reaction",
+                   message_id=message_id, error=type(e).__name__)
+        raise HTTPException(status_code=500, detail=str(e)[:200])
+    return {"ok": True, "reactions": reactions}
+
+
+@app.post("/app/v1/pins")
+async def app_pins(request: Request):
+    """Canonical per-message pin (G2/#39) — cross-device, survives reinstall."""
+    _check_auth(request)
+    body = await request.json()
+    message_id = str(body.get("message_id") or "").strip()
+    if not message_id:
+        raise HTTPException(status_code=400, detail="message_id required")
+    pinned = 1 if body.get("pinned") else 0
+    import sqlite3
+    try:
+        con = sqlite3.connect(CANON_DB, timeout=30)
+        con.execute("PRAGMA busy_timeout=30000")
+        reactions, _old = _message_meta_load(con, message_id)
+        con.execute("INSERT INTO message_meta(message_id, reactions, pinned, updated_at) "
+                    "VALUES(?,?,?,?) ON CONFLICT(message_id) DO UPDATE SET "
+                    "pinned=excluded.pinned, updated_at=excluded.updated_at",
+                    (message_id, json.dumps(reactions, ensure_ascii=False),
+                     pinned, time.time()))
+        con.commit()
+        con.close()
+    except Exception as e:  # noqa: BLE001
+        _log_event("message_meta_write_failed", kind="pin",
+                   message_id=message_id, error=type(e).__name__)
+        raise HTTPException(status_code=500, detail=str(e)[:200])
+    return {"ok": True}
 
 
 @app.post("/app/v1/messages")
