@@ -993,6 +993,25 @@ def _apple_verify_identity_token(identity_token: str):
         raise HTTPException(status_code=401, detail="invalid apple identity token")
 
 
+# canonical messages 的寫入版本計數(真事件推送,取代 SSE 每 2 秒重掃):
+# _canon_add 成功寫入就 +1,followers 用 _canon_wait 盯版本、變了才重掃 DB。
+# 純 int 比較、無鎖 — 就算極端併發丟失一次遞增,值仍有變化,喚醒不漏。
+_CANON_VER: dict[str, int] = {}
+
+
+def _canon_notify(session: str) -> None:
+    _CANON_VER[session] = _CANON_VER.get(session, 0) + 1
+
+
+async def _canon_wait(session: str, seen_ver: int) -> None:
+    """等到該 session 的 canonical 版本離開 seen_ver(有新寫入)。0.2s 粒度
+    的純記憶體輪詢 — 不碰 DB、不用 Condition(避開取消時的鎖重取競態);
+    推送延遲 ≤0.2s,配合外層 wait_for(timeout=SSE_KEEPALIVE_SECS) 保持
+    keepalive 節奏。"""
+    while _CANON_VER.get(session, 0) == seen_ver:
+        await asyncio.sleep(0.2)
+
+
 def _canon_add(session: str, role: str, content: str, attachments=None,
                mid: str | None = None, status: str = "done",
                client_id: str | None = None) -> tuple[str, bool]:
@@ -1007,6 +1026,7 @@ def _canon_add(session: str, role: str, content: str, attachments=None,
                      time.time(), status, client_id))
         con.commit()
         con.close()
+        _canon_notify(session)
         return mid, True
     except Exception as e:  # noqa: BLE001
         _log_event("canonical_write_failed",
@@ -5955,16 +5975,26 @@ async def app_get_message_events(session: str, request: Request,
     async def gen():
         cursor = int(since or 0)
         deadline = time.monotonic() + (120.0 if follow else 0.0)
+        last_ver = -1    # 首輪必掃(補客戶端斷線期間的積壓)
+        last_scan = 0.0  # 保險絲:就算沒收到信號,至少每 30s 重掃一次
+                         # (防未來新增的 canonical 寫入點忘了掛 _canon_notify)
         while True:
             sent = False
-            for msg in _canon_messages(session, 80):
-                seq = _app_message_seq(msg)
-                if seq <= cursor:
-                    continue
-                event = _app_message_event(msg)
-                cursor = max(cursor, int(event["seq"]))
-                yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
-                sent = True
+            ver = _CANON_VER.get(session, 0)
+            if ver != last_ver or time.monotonic() - last_scan >= 30.0:
+                last_scan = time.monotonic()
+                # 真推送:只有 canonical 寫入過才重掃 DB。原本每 2 秒
+                # 每 follower 讀 80 則+JSON parse 的空轉,是 bridge 閒置
+                # 負載的大宗(N persona × M 裝置全天在跑)。
+                last_ver = ver
+                for msg in _canon_messages(session, 80):
+                    seq = _app_message_seq(msg)
+                    if seq <= cursor:
+                        continue
+                    event = _app_message_event(msg)
+                    cursor = max(cursor, int(event["seq"]))
+                    yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+                    sent = True
             if not follow:
                 yield "data: [DONE]\n\n"
                 return
@@ -5973,7 +6003,11 @@ async def app_get_message_events(session: str, request: Request,
             if time.monotonic() >= deadline:
                 yield "data: [DONE]\n\n"
                 return
-            await asyncio.sleep(SSE_KEEPALIVE_SECS)
+            try:
+                await asyncio.wait_for(_canon_wait(session, last_ver),
+                                       timeout=SSE_KEEPALIVE_SECS)
+            except asyncio.TimeoutError:
+                pass
 
     return StreamingResponse(gen(), media_type="text/event-stream")
 
