@@ -2630,7 +2630,7 @@ async def codex_status(request: Request):
 
 @app.get("/codexsessions")
 async def codex_sessions(request: Request, limit: int = 40, cwd: str | None = None,
-                         archived: bool = False):
+                         archived: bool = False, cursor: str | None = None):
     _check_auth(request)
     params = {
         "limit": max(1, min(limit, 100)),
@@ -2642,6 +2642,8 @@ async def codex_sessions(request: Request, limit: int = 40, cwd: str | None = No
     }
     if cwd:
         params["cwd"] = cwd
+    if cursor:
+        params["cursor"] = cursor
     try:
         res = await CODEX_APP.call("thread/list", params, timeout=45.0)
         return {
