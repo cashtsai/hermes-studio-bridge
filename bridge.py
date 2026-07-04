@@ -2312,6 +2312,10 @@ class CodexAppServerClient:
             _log_event("codex_approval_db_upsert_failed",
                        approval_id=approval_id,
                        error=type(e).__name__, error_message=str(e)[:160])
+        try:
+            _cx_cards_feed_approval(record)   # S2:approval 卡 + 等待核准 status
+        except Exception as e:  # noqa: BLE001
+            _log_event("cx_cards_feed_error", error=str(e)[:160])
         _log_event("codex_approval_request",
                    approval_id=approval_id,
                    method=method,
@@ -2341,6 +2345,10 @@ class CodexAppServerClient:
             _log_event("codex_approval_db_decide_failed",
                        approval_id=approval_id,
                        error=type(e).__name__, error_message=str(e)[:160])
+        try:
+            _cx_cards_feed_approval(record, resolved=status)   # S2:approval 卡收尾
+        except Exception as e:  # noqa: BLE001
+            _log_event("cx_cards_feed_error", error=str(e)[:160])
         return record
 
     def _drop_approval_by_request(self, request_id) -> None:
@@ -2388,6 +2396,10 @@ class CodexAppServerClient:
             _log_event("codex_approval_db_decide_failed",
                        approval_id=approval_id,
                        error=type(e).__name__, error_message=str(e)[:160])
+        try:
+            _cx_cards_feed_approval(record, resolved=status)   # S2:approval 卡收尾
+        except Exception as e:  # noqa: BLE001
+            _log_event("cx_cards_feed_error", error=str(e)[:160])
         _log_event("codex_approval_decision",
                    approval_id=approval_id,
                    status=status,
@@ -2408,6 +2420,10 @@ class CodexAppServerClient:
     def _handle_notification(self, msg: dict):
         method = msg.get("method")
         params = msg.get("params") or {}
+        try:
+            _cx_cards_feed(method, params)   # S2 卡片 digest(有訂閱的 thread 才有)
+        except Exception as e:  # noqa: BLE001
+            _log_event("cx_cards_feed_error", error=str(e)[:160])
         if method == "remoteControl/status/changed":
             self.remote_status = params
             return
@@ -5168,18 +5184,91 @@ def _ensure_cc_card_follower(name: str, workdir: str):
     _CC_CARD_FOLLOWERS[name] = asyncio.create_task(_cc_card_follower(name, workdir))
 
 
-def _cc_from_v2_session_id(session_id: str) -> tuple:
-    """S1 只吃 CC:接受 'claude_code:{name}' 或裸 CC session 名 → (name, workdir)。"""
+def _v2_card_source(session_id: str) -> tuple:
+    """v2 卡片端點的 session id 路由 → ('cc', name, workdir) 或 ('cx', thread_id)。
+
+    S1 = claude_code:{name}（或裸 CC session 名）；S2 = codex:{thread_id} 與
+    delegation:{id}(provider=codex)；hermes 待 S3。
+    """
     if ":" in session_id:
         prov, _, rest = session_id.partition(":")
+        if prov == "codex":
+            return ("cx", rest)
+        if prov == "delegation":
+            return ("cx", _codex_thread_from_v2_session_id(session_id))
         if prov != "claude_code":
             raise http_err(400, "UNSUPPORTED_PROVIDER",
-                           f"Phase0 S1 僅支援 claude_code(得到 {prov});codex/persona 待 S2/S3")
+                           f"卡片流支援 claude_code/codex/delegation(得到 {prov});persona 待 S3")
         session_id = rest
     row = next((r for r in _cc_conf_rows() if r[0] == session_id), None)
     if not row:
         raise http_err(404, "SESSION_NOT_FOUND", "unknown session")
-    return row[0], row[1]
+    return ("cc", row[0], row[1])
+
+
+# ─────────── Phase 0 S2:codex 卡片事件流（同兩端點,事件驅動無輪詢）────────
+
+_CX_CARD_DIGESTS: dict = {}     # thread_id -> carddigest.CodexThreadDigest
+_CX_CARD_SEED_TURNS = 50        # 冷載種子:thread/turns/list 的 turn 數
+
+
+def _cx_cards_feed(method: str, params: dict) -> None:
+    """CodexAppServerClient 通知 → 有訂閱過的 thread 餵進 digest。
+    digest 只在首次 cards/events 請求時建立,之前的歷史由 seed 補。"""
+    tid = str(params.get("threadId") or "")
+    d = _CX_CARD_DIGESTS.get(tid) if tid else None
+    if d:
+        d.handle(method, params)
+
+
+def _cx_cards_feed_approval(record: dict, resolved: str = "") -> None:
+    """approval 建立/決議 → 對應 thread 的 approval 卡。"""
+    d = _CX_CARD_DIGESTS.get(str(record.get("thread_id") or ""))
+    if not d:
+        return
+    if resolved:
+        d.resolve_approval(record, resolved)
+    else:
+        d.handle_approval(record)
+
+
+async def _cx_card_digest(thread_id: str):
+    """取得(必要時建立+seed)該 thread 的 digest。先註冊再 seed——seed 期間的
+    live 事件與 seed 產同一批卡 id,重疊只是 rev 遞增,不會漏也不會雙份。"""
+    d = _CX_CARD_DIGESTS.get(thread_id)
+    if d is None:
+        d = _CX_CARD_DIGESTS[thread_id] = carddigest.CodexThreadDigest()
+    if not d.seeded:
+        d.seeded = True
+        try:
+            await CODEX_APP.ensure_thread_loaded(thread_id)
+            res = await CODEX_APP.call("thread/turns/list", {
+                "threadId": thread_id, "limit": _CX_CARD_SEED_TURNS,
+                "itemsView": "full", "sortDirection": "desc"}, timeout=45.0)
+            turns = list((res or {}).get("data", []))
+            turns.reverse()
+            d.seed_turns(turns)
+            rec = CODEX_APP.pending_approval_for_thread(thread_id)
+            if rec:
+                d.handle_approval(rec)
+        except Exception as e:  # noqa: BLE001
+            d.seeded = False   # 下次請求重試 seed
+            _log_event("cx_card_seed_error", thread=thread_id[:16],
+                       error=str(e)[:200])
+            _codex_http_error(e)
+    return d
+
+
+async def _v2_card_store(session_id: str):
+    """cards/events 共用:session id → 已 seed 的 SessionCardStore。"""
+    src = _v2_card_source(session_id)
+    if src[0] == "cx":
+        return (await _cx_card_digest(src[1])).store
+    _, name, workdir = src
+    store = _cc_card_store(name)
+    await _cc_card_seed(store, name, workdir)
+    _ensure_cc_card_follower(name, workdir)
+    return store
 
 
 @app.get("/app/v2/sessions/{session_id}/cards")
@@ -5187,10 +5276,7 @@ async def v2_session_cards(session_id: str, request: Request, limit: int = 100,
                            before_seq: int | None = None):
     """契約 §3 冷載 snapshot:{cards, latest_seq} → app 渲染後從 since_seq 接流。"""
     _check_auth(request)
-    name, workdir = _cc_from_v2_session_id(session_id)
-    store = _cc_card_store(name)
-    await _cc_card_seed(store, name, workdir)
-    _ensure_cc_card_follower(name, workdir)
+    store = await _v2_card_store(session_id)
     return store.snapshot(limit=max(1, min(limit, 500)), before_seq=before_seq)
 
 
@@ -5201,10 +5287,7 @@ async def v2_session_events(session_id: str, request: Request, since_seq: int = 
     _check_auth(request)
     if profile != "phone":
         raise http_err(400, "UNSUPPORTED_PROFILE", "v0 只實作 profile=phone(契約 §4)")
-    name, workdir = _cc_from_v2_session_id(session_id)
-    store = _cc_card_store(name)
-    await _cc_card_seed(store, name, workdir)
-    _ensure_cc_card_follower(name, workdir)
+    store = await _v2_card_store(session_id)
     backlog = store.since(since_seq)
     if backlog is None:
         raise http_err(410, "SEQ_GONE",

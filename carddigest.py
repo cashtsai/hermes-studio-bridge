@@ -188,6 +188,264 @@ def cc_status_label(busy: bool, prompt, last_tool: str = "",
     return "回覆中" if saw_output else "思考中"
 
 
+# ───────────────────────── S2：codex app-server 事件 → 卡片 ─────────────────
+
+
+def _cx_user_text(content) -> str:
+    """codex userMessage 的 content blocks → 純文字（同 bridge._codex_user_input_text
+    的形狀，複製一小份讓本模組自包含）。"""
+    parts = []
+    for item in content or []:
+        if not isinstance(item, dict):
+            continue
+        t = item.get("type")
+        if t == "text" and item.get("text"):
+            parts.append(item["text"])
+        elif t == "localImage" and item.get("path"):
+            parts.append(f"[圖片: {item['path']}]")
+        elif t == "image" and item.get("url"):
+            parts.append(f"[圖片: {item['url']}]")
+        elif item.get("path"):
+            parts.append(f"[{t or 'file'}: {item['path']}]")
+    return "\n".join(parts).strip()
+
+
+def _cx_tool_label(item: dict) -> str:
+    """item → status label 用的短工具名（cc_status_label 的 last_tool 位）。"""
+    t = item.get("type")
+    if t == "commandExecution":
+        return "command"
+    if t == "fileChange":
+        return "fileChange"
+    if t == "mcpToolCall":
+        return f"{item.get('server', 'mcp')}.{item.get('tool', 'tool')}"
+    if t == "dynamicToolCall":
+        label = item.get("tool") or "tool"
+        ns = item.get("namespace")
+        return f"{ns}.{label}" if ns else label
+    if t == "webSearch":
+        return "webSearch"
+    if t == "imageGeneration":
+        return "imageGeneration"
+    return ""
+
+
+def codex_item_to_cards(item: dict, turn_id: str = "",
+                        phase: str = "completed") -> list[dict]:
+    """一個 codex app-server item → 0..n 張卡。
+
+    item id 是 app-server 的穩定識別 → 卡 id 由它衍生；同一 item 的
+    started/delta/completed 反覆 upsert 同一張卡（rev 遞增、final 收尾）——
+    這是契約 §2 rev/upsert 真串流的首個來源。started 階段 final=False，
+    completed 收 final=True。
+    """
+    if not isinstance(item, dict):
+        return []
+    iid = item.get("id")
+    if not iid:
+        return []
+    t = item.get("type")
+    final = phase == "completed"
+    cid = f"card-cx-{iid}"
+    cards: list[dict] = []
+
+    if t == "userMessage":
+        text = _cx_user_text(item.get("content") or [])
+        if text:
+            cards.append(make_card(cid, turn_id, "user", "text",
+                                   {"text": text, "fallback_text": text}))
+        return cards
+
+    if t == "agentMessage":
+        text = item.get("text") or ""
+        if text:
+            cards.append(make_card(cid, turn_id, "assistant", "markdown",
+                                   {"text": text, "fallback_text": text},
+                                   final=final))
+        return cards
+
+    if t == "reasoning":
+        summary = "\n".join(item.get("summary") or []).strip()
+        if summary:
+            think = summary[:_THINKING_MAX]
+            cards.append(make_card(cid, turn_id, "assistant", "text",
+                                   {"text": f"💭 {think}",
+                                    "fallback_text": f"💭 {think}"},
+                                   final=final))
+        return cards
+
+    if t == "plan":
+        text = item.get("text") or ""
+        if text:
+            cards.append(make_card(cid, turn_id, "assistant", "markdown",
+                                   {"text": text, "fallback_text": text},
+                                   final=final))
+        return cards
+
+    if t == "commandExecution":
+        cmd = (item.get("command") or "").strip()
+        cmd1 = cmd.splitlines()[0][:_CMD_MAX] if cmd else ""
+        fb = f"› 🔧 command" + (f" `{cmd1}`" if cmd1 else "")
+        cards.append(make_card(cid, turn_id, "assistant", "tool_call",
+                               {"tool": "command", "summary": cmd1,
+                                "fallback_text": fb}, final=final))
+        out = (item.get("aggregatedOutput") or "").strip()
+        if final and out:
+            short = out[:_TOOL_RESULT_MAX]
+            if len(out) > _TOOL_RESULT_MAX:
+                short += "\n…(截斷)"
+            cards.append(make_card(f"{cid}-r", turn_id, "assistant",
+                                   "tool_result",
+                                   {"text": short,
+                                    "fallback_text": f"↳ 結果\n{short[:1000]}"}))
+        return cards
+
+    if t == "fileChange":
+        rows = []
+        for c in (item.get("changes") or [])[:20]:
+            if not isinstance(c, dict):
+                continue
+            kind = c.get("kind") or {}
+            k = kind.get("type") if isinstance(kind, dict) else str(kind)
+            rows.append(f"{k or 'change'} {c.get('path', '')}")
+        n = len(item.get("changes") or [])
+        summary = rows[0] if len(rows) == 1 else f"{n} 檔變更"
+        detail = "\n".join(rows) + (f"\n…共 {n} 檔" if n > 20 else "")
+        cards.append(make_card(cid, turn_id, "assistant", "tool_call",
+                               {"tool": "fileChange", "summary": summary,
+                                "detail": detail,
+                                "fallback_text": f"› 📝 {summary}\n{detail}"},
+                               final=final))
+        return cards
+
+    if t in ("mcpToolCall", "dynamicToolCall", "webSearch", "imageGeneration"):
+        label = _cx_tool_label(item)
+        summary = str(item.get("query") or "")[:_CMD_MAX] if t == "webSearch" else ""
+        body = {"tool": label, "summary": summary,
+                "fallback_text": f"› 🔧 {label}" + (f" `{summary}`" if summary else "")}
+        err = item.get("error") or {}
+        if isinstance(err, dict) and err.get("message"):
+            body["detail"] = f"⚠️ {err['message']}"
+        cards.append(make_card(cid, turn_id, "assistant", "tool_call", body,
+                               final=final))
+        return cards
+
+    return []
+
+
+class CodexThreadDigest:
+    """S2：一個 codex thread 的事件驅動 digest（無輪詢——status/turn/卡片
+    全由 app-server 通知推進）。冷載 seed 走 thread/turns/list（舊→新），
+    item id 穩定 → seed 與 live 事件 upsert 同一批卡 id，重疊只是 rev 遞增。
+    """
+
+    def __init__(self):
+        self.store = SessionCardStore()
+        self.agent_text: dict[str, str] = {}   # itemId → delta 累積文字
+        self.busy = False
+        self.prompt = None                     # pending approval title（label 素材）
+        self.seeded = False
+
+    def _status(self):
+        self.store.set_status({
+            "busy": self.busy, "mode": None, "prompt": self.prompt,
+            "phase": "run" if self.busy else "idle",
+            "label": cc_status_label(self.busy, self.prompt,
+                                     self.store.last_tool, self.store.saw_output),
+        })
+
+    def seed_turns(self, turns: list):
+        """thread/turns/list 的 data（呼叫端先 reverse 成舊→新）→ 卡片庫。"""
+        for turn in turns or []:
+            tid = str(turn.get("id") or "")
+            for item in (turn.get("items") or []):
+                for card in codex_item_to_cards(item, turn_id=tid):
+                    self.store.upsert_card(card)
+
+    def handle(self, method: str, params: dict):
+        """一則 app-server 通知 → 卡片/turn/status 事件。"""
+        if method == "turn/started":
+            turn = params.get("turn") or {}
+            self.store.turn_id = str(turn.get("id") or "")
+            self.busy = True
+            self.store.saw_output = False
+            self.store.last_tool = ""
+            self.store.push_turn("begin", self.store.turn_id)
+            self._status()
+        elif method == "turn/completed":
+            turn = params.get("turn") or {}
+            err = turn.get("error") if isinstance(turn, dict) else None
+            self.busy = False
+            self.prompt = None
+            self.store.push_turn("end", self.store.turn_id or str(turn.get("id") or ""))
+            if err:
+                msg = str(err.get("message", err))
+                self.store.upsert_card(make_card(
+                    f"card-cx-err-{self.store.seq}", self.store.turn_id, "system",
+                    "text", {"text": f"⚠️ {msg}", "fallback_text": f"⚠️ {msg}"}))
+            self.store.turn_id = ""
+            self.store.last_tool = ""
+            self._status()
+        elif method == "item/agentMessage/delta":
+            iid = params.get("itemId")
+            delta = params.get("delta") or ""
+            if not iid or not delta:
+                return
+            text = self.agent_text.get(iid, "") + delta
+            self.agent_text[iid] = text
+            self.store.saw_output = True
+            self.store.last_tool = ""
+            self.store.upsert_card(make_card(
+                f"card-cx-{iid}", self.store.turn_id, "assistant", "markdown",
+                {"text": text, "fallback_text": text}, final=False))
+            self._status()
+        elif method in ("item/started", "item/completed"):
+            item = params.get("item") or {}
+            phase = "started" if method == "item/started" else "completed"
+            if item.get("type") == "agentMessage":
+                self.agent_text.pop(item.get("id"), None)
+                self.store.saw_output = True
+            else:
+                label = _cx_tool_label(item)
+                if label:
+                    self.store.last_tool = label if phase == "started" else ""
+            for card in codex_item_to_cards(item, self.store.turn_id, phase=phase):
+                self.store.upsert_card(card)
+            self._status()
+
+    def handle_approval(self, record: dict):
+        """pending approval record（bridge 的 _approval_public 形狀）→
+        approval 卡（契約 §2）＋「等待核准」status。"""
+        if not record or not record.get("id"):
+            return
+        title = record.get("title") or "Codex approval"
+        self.prompt = title
+        self.store.upsert_card(make_card(
+            f"card-cx-appr-{record['id']}", self.store.turn_id, "system",
+            "approval",
+            {"approval_id": record["id"], "title": title,
+             "detail": record.get("detail") or "",
+             "options": [{"key": "approve", "label": "允許", "style": "primary"},
+                         {"key": "deny", "label": "拒絕", "style": "danger"}],
+             "source": "codex",
+             "fallback_text": f"🔐 {title}"}, final=False))
+        self._status()
+
+    def resolve_approval(self, record: dict, status: str):
+        """核准已決/失效 → 同卡收尾（options 清空、resolved 註記）。"""
+        if not record or not record.get("id"):
+            return
+        title = record.get("title") or "Codex approval"
+        self.prompt = None
+        self.store.upsert_card(make_card(
+            f"card-cx-appr-{record['id']}", self.store.turn_id, "system",
+            "approval",
+            {"approval_id": record["id"], "title": title,
+             "options": [], "resolved": status, "source": "codex",
+             "fallback_text": f"🔐 {title} — {status}"}))
+        self._status()
+
+
 class SessionCardStore:
     """契約 §1/§3 的 per-session 卡片庫 + 事件 ring buffer。
 
