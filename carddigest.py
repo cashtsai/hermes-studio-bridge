@@ -533,3 +533,102 @@ class SessionCardStore:
     def ping(self) -> dict:
         """keepalive 信封 — 不進 ring、不佔 seq。"""
         return {"seq": self.seq, "ts": time.time(), "type": "ping", "data": {}}
+
+
+# ───────────────────────── S3:persona 事件 → 卡片 ───────────────────────────
+
+
+class PersonaDigest:
+    """S3:一個 persona 的卡片 digest。三個來源,一個卡片庫:
+
+    - seed:canonical messages(mid 穩定 → 卡 id,重放同 id)。
+    - live turn:bridge 發起的 persona 回合(POST /app/v1/messages 的
+      run_turn 掛鉤)——delta 累積同一張卡 rev 遞增(真串流),status 人話
+      label 原樣透傳,turn begin/end。
+    - canonical follower:寫入版本喚醒後補掃(其他路徑寫入的訊息;
+      known_mids 去重,live turn 已出過卡的 reply 不會再出一張)。
+
+    限制(v0,與 v1 messages/events 相同):只看 bridge canonical 寫入;
+    TG 端直跑的 persona 回合要等該輪訊息落 canonical 才會出卡。
+    """
+
+    def __init__(self):
+        self.store = SessionCardStore()
+        self.known_mids: set = set()
+        self.turn_text: dict[str, str] = {}   # 進行中 turn cid → 累積文字
+        self.busy = False
+        self.seeded = False
+
+    def _status(self, label: str = ""):
+        self.store.set_status({
+            "busy": self.busy, "mode": None, "prompt": None,
+            "phase": "run" if self.busy else "idle",
+            "label": label or ("回覆中" if self.busy else "待命"),
+        })
+
+    def message_card(self, m: dict):
+        """canonical message dict(_canon_messages 形狀)→ 卡;known 去重。"""
+        mid = str(m.get("id") or "")
+        if not mid or mid in self.known_mids:
+            return
+        self.known_mids.add(mid)
+        text = m.get("content") or ""
+        if not text:
+            return
+        role = "user" if m.get("role") == "user" else "assistant"
+        kind = "text" if role == "user" else "markdown"
+        body = {"text": text, "fallback_text": text}
+        atts = m.get("attachments") or []
+        if atts:
+            body["attachments"] = [{"kind": a.get("kind"),
+                                    "filename": a.get("filename")}
+                                   for a in atts if isinstance(a, dict)]
+        self.store.upsert_card(make_card(f"card-hp-{mid}", "", role, kind,
+                                         body, ts=_epoch(m.get("ts"))))
+
+    def seed_messages(self, msgs: list):
+        for m in msgs or []:
+            self.message_card(m)
+
+    # ── live turn 掛鉤(bridge 發起的回合)──
+
+    def turn_begin(self, cid: str, label: str = ""):
+        self.busy = True
+        self.turn_text[cid] = ""
+        self.store.turn_id = f"turn-{cid}"
+        self.store.push_turn("begin", self.store.turn_id)
+        self._status(label or "已送達 Hermes，等待回覆。")
+
+    def turn_delta(self, cid: str, delta: str):
+        if not delta:
+            return
+        text = self.turn_text.get(cid, "") + delta
+        self.turn_text[cid] = text
+        self.store.upsert_card(make_card(
+            f"card-hp-turn-{cid}", self.store.turn_id, "assistant", "markdown",
+            {"text": text, "fallback_text": text}, final=False))
+        self._status("回覆中")
+
+    def turn_status(self, label: str):
+        if label:
+            self._status(label)
+
+    def turn_end(self, cid: str, full_text: str, reply_mid: str = "",
+                 error: str = ""):
+        """回合收尾:同卡 final=True 全文覆蓋;reply 的 canonical mid 註記
+        known,follower 補掃時不會再出第二張。"""
+        self.busy = False
+        self.turn_text.pop(cid, None)
+        if reply_mid:
+            self.known_mids.add(str(reply_mid))
+        if full_text:
+            self.store.upsert_card(make_card(
+                f"card-hp-turn-{cid}", self.store.turn_id, "assistant",
+                "markdown", {"text": full_text, "fallback_text": full_text}))
+        if error:
+            self.store.upsert_card(make_card(
+                f"card-hp-turn-{cid}-err", self.store.turn_id, "system", "text",
+                {"text": f"⚠️ {error}", "fallback_text": f"⚠️ {error}"}))
+        self.store.push_turn("end", self.store.turn_id)
+        self.store.turn_id = ""
+        self._status()
