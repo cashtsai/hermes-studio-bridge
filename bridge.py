@@ -1695,12 +1695,20 @@ def _device_remove(token: str) -> None:
                    error_message=str(e)[:160])
 
 
-async def _apns_send(token: str, title: str, body: str, data: dict | None = None):
+async def _apns_send(token: str, title: str, body: str, data: dict | None = None,
+                     category: str | None = None, thread_id: str | None = None):
     import httpx
     headers = {"authorization": f"bearer {_apns_jwt()}",
                "apns-topic": APNS_BUNDLE_ID,
                "apns-push-type": "alert", "apns-priority": "10"}
-    payload = {"aps": {"alert": {"title": title, "body": body}, "sound": "default"}}
+    aps = {"alert": {"title": title, "body": body}, "sound": "default"}
+    if category:
+        # 批次 3 斷點①:category 才會讓 iOS/手錶顯示 UNNotificationAction
+        # 動作鈕(app 端已註冊同名 category)。
+        aps["category"] = category
+    if thread_id:
+        aps["thread-id"] = thread_id
+    payload = {"aps": aps}
     if data:
         payload.update(data)
     async with httpx.AsyncClient(http2=True, timeout=10) as client:
@@ -1709,12 +1717,15 @@ async def _apns_send(token: str, title: str, body: str, data: dict | None = None
         return r.status_code, r.text
 
 
-async def push_notify(title: str, body: str, data: dict | None = None) -> int:
+async def push_notify(title: str, body: str, data: dict | None = None,
+                      category: str | None = None,
+                      thread_id: str | None = None) -> int:
     """Fan a push to every registered device; prune dead tokens (410/BadToken)."""
     sent = 0
     for tok in _devices():
         try:
-            code, text = await _apns_send(tok, title, body, data)
+            code, text = await _apns_send(tok, title, body, data,
+                                          category=category, thread_id=thread_id)
             if code == 200:
                 sent += 1
             elif code == 410 or "BadDeviceToken" in text or "Unregistered" in text:
@@ -1722,6 +1733,24 @@ async def push_notify(title: str, body: str, data: dict | None = None) -> int:
         except Exception:  # noqa: BLE001
             pass
     return sent
+
+
+_APNS_APPROVAL_CATEGORY = "SCARF_PENDING_PERMISSION"
+
+
+def _approval_push(aid: str, title: str, body: str, session_id: str = ""):
+    """審核推播(批次 3 斷點①):category 出動作鈕、`scarf.{kind, approvalId,
+    sessionId}` 與 app 端約定對齊、thread-id 以 session 分串。舊鍵
+    {kind, id} 保留給既有 build。fire-and-forget,失敗吞在 push_notify。"""
+    data = {"kind": "approval", "id": aid,
+            "scarf": {"kind": "approval", "approvalId": aid,
+                      "sessionId": session_id}}
+    task = asyncio.create_task(push_notify(
+        f"🔐 {title}", body[:120], data,
+        category=_APNS_APPROVAL_CATEGORY,
+        thread_id=session_id or "approvals"))
+    _BG_TASKS.add(task)
+    task.add_done_callback(_BG_TASKS.discard)
 
 
 _canon_init()
@@ -2316,6 +2345,14 @@ class CodexAppServerClient:
             _cx_cards_feed_approval(record)   # S2:approval 卡 + 等待核准 status
         except Exception as e:  # noqa: BLE001
             _log_event("cx_cards_feed_error", error=str(e)[:160])
+        try:
+            # 批次 3 斷點③:CX 審核進推播管線(記錄本來就進 approvals DB,
+            # decide 走既有 codex 分支回流 app-server)。
+            _approval_push(approval_id, record["title"],
+                           record["detail"].splitlines()[0] if record["detail"] else "點開查看並決定",
+                           f"codex:{thread_id}" if thread_id else "codex")
+        except Exception as e:  # noqa: BLE001
+            _log_event("approval_push_error", error=str(e)[:160])
         _log_event("codex_approval_request",
                    approval_id=approval_id,
                    method=method,
@@ -4863,6 +4900,111 @@ async def _cc_key_core(name: str, raw: str) -> dict:
     return {"ok": True}
 
 
+# ─────────── 批次 3 斷點③:CC waiting_approval → approval feed + 推播 ────────
+# persona(Approval Center)/CX(app-server request)本來就有 approval 記錄;CC 的
+# 「審核」是 TUI prompt,這裡補一個常駐 watcher:prompt 出現 → 建記錄+推播,
+# prompt 消失 → 過期。decide 回流在 _approval_decide_core 的 claude_code 分支
+# (送 TUI 鍵),三線同一條 approval 管線(批次 3 完成判準)。
+
+_CC_APPROVAL_ACTIVE: dict = {}      # name -> {"aid": str, "sig": str}
+_CC_APPROVAL_POLL_SECS = 4.0
+_CC_APPROVAL_TTL = 900.0
+
+_CC_ALLOW_RE = re.compile(r"^(always allow|allow|yes)", re.IGNORECASE)
+_CC_DENY_RE = re.compile(r"^(don.t allow|deny|no)", re.IGNORECASE)
+
+
+def _cc_prompt_sig(prompt: dict) -> str:
+    """同一個 prompt 的穩定簽名 — watcher 每 tick 都看到它,不能重複建。"""
+    raw = json.dumps([prompt.get("title"),
+                      [(o.get("key"), o.get("label"))
+                       for o in prompt.get("options") or []]],
+                     ensure_ascii=False, sort_keys=True)
+    return hashlib.sha1(raw.encode("utf-8", "replace")).hexdigest()[:16]
+
+
+def _cc_choice_key(prompt: dict, approve: bool) -> str:
+    """approve 布林 → prompt option key。認得 allow/deny 字樣就精準選;
+    認不得時 approve=第一個選項、deny=Esc(TUI 的通用取消)。"""
+    options = prompt.get("options") or []
+    pat = _CC_ALLOW_RE if approve else _CC_DENY_RE
+    for o in options:
+        if pat.match(str(o.get("label") or "").strip()):
+            return str(o.get("key") or "")
+    if approve and options:
+        return str(options[0].get("key") or "")
+    return "esc"
+
+
+def _cc_approval_set_status(aid: str, status: str) -> bool:
+    import sqlite3
+    try:
+        con = sqlite3.connect(CANON_DB, timeout=30)
+        cur = con.execute("UPDATE approvals SET status=?, decided_at=? "
+                          "WHERE id=? AND status='pending'",
+                          (status, time.time(), aid))
+        con.commit()
+        con.close()
+        return bool(cur.rowcount)
+    except Exception as e:  # noqa: BLE001
+        _log_event("cc_approval_db_error", approval_id=aid, error=str(e)[:160])
+        return False
+
+
+def _cc_approval_create(name: str, prompt: dict) -> str:
+    import sqlite3
+    aid = "cc-" + uuid.uuid4().hex[:24]
+    title = (prompt.get("title") or "").strip() or f"{name} 等待核准"
+    opts = " / ".join(str(o.get("label") or "")[:30]
+                      for o in (prompt.get("options") or [])[:4])
+    detail = f"session: {name}\n{title}" + (f"\n選項: {opts}" if opts else "")
+    now = time.time()
+    con = sqlite3.connect(CANON_DB, timeout=30)
+    con.execute("INSERT OR REPLACE INTO approvals"
+                "(id,title,source,risk,detail,created_at,expires_at,status,decided_at,result,callback) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                (aid, title, f"claude_code:{name}", "high", detail,
+                 now, now + _CC_APPROVAL_TTL, "pending", None, None, None))
+    con.commit()
+    con.close()
+    return aid
+
+
+async def _cc_approval_watcher():
+    """常駐:每 4s 巡一輪 enabled CC sessions(pane 走快取,成本低)。"""
+    while True:
+        await asyncio.sleep(_CC_APPROVAL_POLL_SECS)
+        for name, _workdir, enabled in _cc_conf_rows():
+            if enabled != "1":
+                continue
+            try:
+                st = await _cc_status_core(name)
+                prompt = st.get("prompt")
+                active = _CC_APPROVAL_ACTIVE.get(name)
+                if prompt:
+                    sig = _cc_prompt_sig(prompt)
+                    if active and active["sig"] == sig:
+                        continue                     # 同一個 prompt,已建過
+                    if active:
+                        _cc_approval_set_status(active["aid"], "expired")
+                    aid = _cc_approval_create(name, prompt)
+                    _CC_APPROVAL_ACTIVE[name] = {"aid": aid, "sig": sig}
+                    opts = " / ".join(str(o.get("label") or "")[:20]
+                                      for o in (prompt.get("options") or [])[:3])
+                    _approval_push(aid, prompt.get("title") or f"{name} 等待核准",
+                                   f"{name}" + (f" · {opts}" if opts else ""),
+                                   f"claude_code:{name}")
+                    _log_event("cc_approval_created", session=name,
+                               approval_id=aid)
+                elif active:
+                    # prompt 消失(TUI 上被回掉/回合結束)→ 記錄過期,feed 不留殭屍
+                    _cc_approval_set_status(active["aid"], "expired")
+                    _CC_APPROVAL_ACTIVE.pop(name, None)
+            except Exception as e:  # noqa: BLE001
+                _log_event("cc_approval_watch_error", session=name,
+                           error=str(e)[:160])
+
+
 # S3 (wave 2): one-tap CC permission-mode / model switching. shift+tab cycles
 # FOUR states on this box (normal → accept edits → plan → auto mode → normal),
 # so instead of blind-counting presses we close the loop: press → fresh pane →
@@ -5914,7 +6056,8 @@ async def capabilities(request: Request):
                          "message_dry_run", "message_interrupt", "message_status",
                          "message_events", "apns_push", "accounts",
                          "apple_auth", "account_pairing",
-                         "delegations", "control_plane_v2", "attachment_uploads"],
+                         "delegations", "control_plane_v2", "attachment_uploads",
+                         "interactive_push"],
             "endpoints": ["/app/v1/sessions", "/app/v1/messages", "/reports",
                           "/app/v1/uploads",
                           "/app/v1/reactions", "/app/v1/pins",
@@ -7084,8 +7227,7 @@ async def approval_create(request: Request):
     con.close()
     title = b.get("title") or "需要核准"
     body = (b.get("detail") or b.get("source") or "點開查看並決定")[:120]
-    asyncio.create_task(push_notify(f"🔐 {title}", body,
-                                    {"kind": "approval", "id": aid}))
+    _approval_push(aid, title, body, str(b.get("source") or ""))
     return {"id": aid, "status": "pending", "expires_at": now + ttl}
 
 
@@ -7177,6 +7319,24 @@ async def _approval_decide_core(aid: str, b: dict) -> dict:
     decision = "approved" if b.get("approve") else "rejected"
     con = sqlite3.connect(CANON_DB)
     row = con.execute("SELECT source FROM approvals WHERE id=?", (aid,)).fetchone()
+    if row and str(row[0] or "").startswith("claude_code:"):
+        # 批次 3 斷點③:CC 審核決議 → 回流 TUI 鍵。以「當下 pane 的 prompt」
+        # 為準(推播到點按之間 prompt 可能已被回掉——過時就 409,不盲送鍵)。
+        con.close()
+        name = str(row[0]).split(":", 1)[1]
+        active = _CC_APPROVAL_ACTIVE.get(name)
+        st = await _cc_status_core(name)
+        prompt = st.get("prompt")
+        if not prompt or not active or active.get("aid") != aid:
+            _cc_approval_set_status(aid, "expired")
+            raise HTTPException(status_code=409, detail="already decided or expired")
+        key = str(b.get("key") or "").strip() or _cc_choice_key(prompt, bool(b.get("approve")))
+        await _cc_key_core(name, key)
+        _cc_approval_set_status(aid, decision)
+        _CC_APPROVAL_ACTIVE.pop(name, None)
+        _log_event("cc_approval_decision", session=name, approval_id=aid,
+                   status=decision, key=key)
+        return {"id": aid, "status": decision, "key": key}
     if row and str(row[0] or "").startswith("codex"):
         con.close()
         try:
@@ -7376,5 +7536,13 @@ async def _log_rotation_loop():
 @app.on_event("startup")
 async def _start_log_rotation():
     task = asyncio.create_task(_log_rotation_loop())
+    _BG_TASKS.add(task)
+    task.add_done_callback(_BG_TASKS.discard)
+
+
+@app.on_event("startup")
+async def _start_cc_approval_watcher():
+    # 批次 3 斷點③:CC waiting_approval → approval feed + 推播(常駐)
+    task = asyncio.create_task(_cc_approval_watcher())
     _BG_TASKS.add(task)
     task.add_done_callback(_BG_TASKS.discard)
