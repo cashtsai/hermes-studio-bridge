@@ -4623,6 +4623,14 @@ async def _cc_input_core(name: str, body: dict) -> dict:
     if not text:
         raise HTTPException(status_code=400, detail="empty")
     await _cc_paste_text(name, text)
+    # 排隊空窗回音:輸入落地「當下」就發 status 事件,不等 transcript digest。
+    # session 若正忙上一輪,pane 不會立即轉 busy,舊行為是 app 一路顯示
+    # 「待命」直到真正接手(可能好幾分鐘)——使用者看起來就是沒反應。
+    # follower 在 queued 寬限內不以 idle 蓋掉;真 busy 一出現即交還正常路徑。
+    store = _cc_card_store(name)
+    store.queued_until = time.time() + _CC_QUEUED_GRACE_SECS
+    store.set_status({"busy": True, "mode": None, "prompt": None,
+                      "phase": "queued", "label": "已排入佇列,等待接手…"})
     return {"ok": True}
 
 
@@ -5386,6 +5394,7 @@ async def v2_session_key(session_id: str, request: Request):
 _CC_CARD_STORES: dict = {}      # name -> carddigest.SessionCardStore
 _CC_CARD_FOLLOWERS: dict = {}   # name -> asyncio.Task
 _CC_CARD_SEED_LINES = 200       # 冷載種子:最新 jsonl 的尾端行數
+_CC_QUEUED_GRACE_SECS = 120     # input 送達後,「已排入佇列」狀態最長維持秒數
 
 
 def _cc_card_store(name: str):
@@ -5475,6 +5484,8 @@ async def _cc_card_follower(name: str, workdir: str):
             if store.subscribers > 0:
                 st = await _cc_status_core(name)
                 busy = bool(st.get("busy"))
+                if busy:
+                    store.queued_until = 0.0   # 真忙了 → 排隊寬限交還正常路徑
                 if prev_busy is not None and busy != prev_busy:
                     if busy:
                         store.turn_id = "turn-" + uuid.uuid4().hex[:12]
@@ -5485,12 +5496,20 @@ async def _cc_card_follower(name: str, workdir: str):
                         store.push_turn("end", store.turn_id)
                         store.turn_id = ""
                 prev_busy = busy
-                label = carddigest.cc_status_label(busy, st.get("prompt"),
-                                                   store.last_tool, store.saw_output)
-                store.set_status({"busy": busy, "mode": st.get("mode"),
-                                  "prompt": st.get("prompt"),
-                                  "phase": "run" if busy else "idle",
-                                  "label": label})
+                if not busy and time.time() < getattr(store, "queued_until", 0.0):
+                    # input 已送達但 session 還沒接手(忙上一輪/思考中):
+                    # 不用 idle 蓋掉「已排入佇列」,避免 UI 誤示「待命」死寂。
+                    store.set_status({"busy": True, "mode": st.get("mode"),
+                                      "prompt": st.get("prompt"),
+                                      "phase": "queued",
+                                      "label": "已排入佇列,等待接手…"})
+                else:
+                    label = carddigest.cc_status_label(busy, st.get("prompt"),
+                                                       store.last_tool, store.saw_output)
+                    store.set_status({"busy": busy, "mode": st.get("mode"),
+                                      "prompt": st.get("prompt"),
+                                      "phase": "run" if busy else "idle",
+                                      "label": label})
         except Exception as e:  # noqa: BLE001
             _log_event("cc_card_follower_error", session=name, error=str(e)[:200])
             await asyncio.sleep(2.0)
