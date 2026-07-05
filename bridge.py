@@ -486,9 +486,10 @@ def _openai_client():
 
 # 預設本地 faster-whisper(OSS 自架預設 = Mac Studio/mini,跑得動;與 hermes
 # 同 venv 共用安裝與模型快取)。POCKET_STT=openai 才走雲端;本地失敗且有 key
-# 時自動雲端備援。模型 POCKET_STT_MODEL(預設 medium,首次使用會下載)。
+# 時自動雲端備援。模型 POCKET_STT_MODEL(預設 large-v3-turbo:品質貼平
+# large-v3、速度同 medium 級;首次使用下載 ~1.6GB)。
 STT_PROVIDER = os.environ.get("POCKET_STT", "local")
-STT_MODEL = os.environ.get("POCKET_STT_MODEL", "medium")
+STT_MODEL = os.environ.get("POCKET_STT_MODEL", "large-v3-turbo")
 _WHISPER_MODEL = None
 
 # app 介面語言 → whisper 語言碼 + 繁/簡輸出偏置(Whisper 對中文預設常吐簡體,
