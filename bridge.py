@@ -1827,16 +1827,24 @@ async def push_notify(title: str, body: str, data: dict | None = None,
     return sent
 
 
-_APNS_APPROVAL_CATEGORY = "SCARF_PENDING_PERMISSION"
+# Scarf 契約遷移 Stage 1b(見 pocketagent/docs/SCARF_CONTRACT_MIGRATION_PLAN.md)。
+# ⚠️ GATE:本分支只在「接受新 category 的 app(Stage 1a,pocketagent PR)」已
+#    上架/普及後才可 merge+deploy。先翻 producer 會讓舊 app 收不到動作鈕。app
+#    側 1a 已雙接受 POCKET_/SCARF_ 兩個 category 與 pocket/scarf 兩巢,故翻新後
+#    舊 app 仍靠 scarf 巢運作,新 app 走 pocket 巢。
+_APNS_APPROVAL_CATEGORY = "POCKET_PENDING_PERMISSION"
 
 
 def _approval_push(aid: str, title: str, body: str, session_id: str = ""):
-    """審核推播(批次 3 斷點①):category 出動作鈕、`scarf.{kind, approvalId,
-    sessionId}` 與 app 端約定對齊、thread-id 以 session 分串。舊鍵
-    {kind, id} 保留給既有 build。fire-and-forget,失敗吞在 push_notify。"""
-    data = {"kind": "approval", "id": aid,
-            "scarf": {"kind": "approval", "approvalId": aid,
-                      "sessionId": session_id}}
+    """審核推播(批次 3 斷點①):category 出動作鈕、payload 巢與 app 端約定對齊、
+    thread-id 以 session 分串。Stage 1b 翻新:新 `pocket.{kind, approvalId,
+    sessionId}` 巢 + category;**相容期保留** 舊 `scarf` 巢與更舊頂層 {kind, id},
+    讓尚未更新的 app 仍可解析(app 側 pocket 巢優先)。fire-and-forget。"""
+    _approval_nest = {"kind": "approval", "approvalId": aid,
+                      "sessionId": session_id}
+    data = {"kind": "approval", "id": aid,   # 最舊頂層鍵(相容期保留)
+            "pocket": _approval_nest,        # 新巢(app 優先讀)
+            "scarf": _approval_nest}         # 舊巢(相容期保留;Stage 1c 移除)
     task = asyncio.create_task(push_notify(
         f"🔐 {title}", body[:120], data,
         category=_APNS_APPROVAL_CATEGORY,
