@@ -6402,7 +6402,26 @@ async def app_get_messages(session: str, request: Request, limit: int = 200):
         raise http_err(400, "SESSION_NOT_FOUND", "unknown session")
     out = _canon_messages(session, limit)
     _, home = PERSONAS[session]
+    # app 回合的 assistant 回覆會在兩個來源各留一份:canonical store(正文+
+    # 〈🔧 執行步驟〉摺疊附錄、帶 client_id)與 Hermes state.db(乾淨正文、
+    # tg-* id、無 client_id)。兩份文字不同 → app 端按文字去重必然失敗,同
+    # 一回覆畫面出現兩顆氣泡。在源頭壓掉 tg 側重複:剝附錄後正文相同、且
+    # 時間差 10 分鐘內,視為同一回合。純 TG 對話(canonical 無該回合)與
+    # 相隔久遠的同文回覆不受影響。
+    def _steps_stripped(t: str) -> str:
+        return re.sub(r"<details>.*?</details>", "", t or "", flags=re.S).strip()
+    canon_assist = [((m.get("ts") or 0), _steps_stripped(m.get("content") or ""))
+                    for m in out if m.get("role") == "assistant"]
+    def _tg_dup(m) -> bool:
+        if m["role"] != "assistant":
+            return False
+        body = _steps_stripped(m["content"])
+        ts = m["ts"] or 0
+        return bool(body) and any(c == body and abs(ts - cts) < 600
+                                  for cts, c in canon_assist)
     for m in _persona_history(home, limit):
+        if _tg_dup(m):
+            continue
         out.append({"id": f"tg-{m['ts']}", "role": m["role"], "content": m["content"],
                     "attachments": m.get("attachments") or [], "ts": m["ts"],
                     "status": "done", "source": "telegram"})
