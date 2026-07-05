@@ -235,6 +235,37 @@ _PERSONAS_BUILTIN = {
 }
 PERSONAS = dict(_PERSONAS_BUILTIN)
 
+# ── Persona 正典身分(TG 同源)─────────────────────────────────────────
+# HOME_ROOT/avatars/ 是四人格(+自訂)的視覺與命名正典:manifest.json 提供
+# name(TG bot 顯示名)/file(頭像檔)/tg(@username,可後補),圖檔供
+# /app/v1/personas/<id>/avatar 直接下發。manifest 缺漏/損壞一律安靜退回
+# 既有 builtins+db 行為(備援鐵律)。
+_AVATARS_DIR = f"{HOME_ROOT}/avatars"
+_avatar_manifest_cache = {"mtime": -1.0, "data": {}}
+
+
+def _avatar_manifest() -> dict:
+    path = os.path.join(_AVATARS_DIR, "manifest.json")
+    try:
+        mt = os.path.getmtime(path)
+        if mt != _avatar_manifest_cache["mtime"]:
+            with open(path, encoding="utf-8") as f:
+                _avatar_manifest_cache["data"] = json.load(f).get("personas") or {}
+            _avatar_manifest_cache["mtime"] = mt
+    except Exception:  # noqa: BLE001 — 無 manifest = 無 overlay
+        _avatar_manifest_cache["data"] = {}
+        _avatar_manifest_cache["mtime"] = -1.0
+    return _avatar_manifest_cache["data"]
+
+
+def _avatar_path(pid: str):
+    """頭像實檔路徑(manifest.file 優先,預設 <pid>.png);不存在/越界 → None。"""
+    ent = _avatar_manifest().get(pid) or {}
+    fn = ent.get("file") or f"{pid}.png"
+    p = os.path.realpath(os.path.join(_AVATARS_DIR, fn))
+    root = os.path.realpath(_AVATARS_DIR) + os.sep
+    return p if p.startswith(root) and os.path.isfile(p) else None
+
 
 def _personas_db_rows() -> list:
     import sqlite3
@@ -257,6 +288,10 @@ def _personas_reload() -> None:
             continue
         base = merged.get(pid, (pid, HOME_ROOT))
         merged[pid] = (name or base[0], home or base[1])
+    # TG 同源正典名 overlay(manifest 有名字就贏 — xcash 2026-07-05:同步是首要)
+    for pid, ent in _avatar_manifest().items():
+        if pid in merged and ent.get("name"):
+            merged[pid] = (ent["name"], merged[pid][1])
     PERSONAS.clear()
     PERSONAS.update(merged)
 
@@ -6730,9 +6765,16 @@ def _persona_home_from_body(body: dict) -> str | None:
 
 def _persona_public(pid: str, name: str, home: str, enabled: bool,
                     deleted: bool) -> dict:
-    return {"id": pid, "name": name, "profile": _persona_profile_of(home),
+    ent = _avatar_manifest().get(pid) or {}
+    ap = _avatar_path(pid)
+    return {"id": pid, "name": ent.get("name") or name,
+            "profile": _persona_profile_of(home),
             "home": home, "enabled": enabled, "deleted": deleted,
-            "builtin": pid in _PERSONAS_BUILTIN}
+            "builtin": pid in _PERSONAS_BUILTIN,
+            # TG 同源身分:@username(manifest.tg,可後補)與頭像版本
+            # (檔案 mtime;0=無圖,app 端以 rev 做快取失效)
+            "username": ent.get("tg") or "",
+            "avatar_rev": int(os.path.getmtime(ap)) if ap else 0}
 
 
 def _persona_row_get(pid: str):
@@ -6777,6 +6819,18 @@ async def personas_list(request: Request):
         out.append(_persona_public(pid, r[1] or pid, r[2] or HOME_ROOT,
                                    bool(r[3]) and not r[4], bool(r[4])))
     return {"personas": out}
+
+
+@app.get("/app/v1/personas/{pid}/avatar")
+async def personas_avatar(pid: str, request: Request):
+    """Persona 頭像 — TG 同源正典(HOME_ROOT/avatars)。無圖 404,app 退 glyph 圓盤。"""
+    _check_auth(request)
+    if not _PERSONA_ID_RE.match(pid):
+        raise HTTPException(status_code=400, detail="bad persona id")
+    p = _avatar_path(pid)
+    if not p:
+        raise HTTPException(status_code=404, detail="no avatar")
+    return FileResponse(p)
 
 
 @app.post("/app/v1/personas")
