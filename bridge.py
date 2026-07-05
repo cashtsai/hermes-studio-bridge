@@ -3703,6 +3703,15 @@ _TG_IMAGE_MARKER = re.compile(r"\[Image attached at: ([^\]\n]+)\]")
 # Replied-to media cached by the TG gateway (gateway/platforms/telegram.py:5796):
 # [Replied-to image 'file_36.jpg' saved at: /path]
 _TG_REPLIED_MEDIA = re.compile(r"\[Replied-to (\w+) '([^']*)' saved at: ([^\]\n]+)\]")
+# TG→app files (承 N4 思路,補齊照片以外的三類):gateway 對 document/audio/
+# video 各寫一種 saved-at 提示行(gateway/run.py:1838-1848/8646/8665),同樣
+# 「提示行即媒體記錄」— 解析回一等附件。app 端 Attachment.Kind 只有
+# image/file/audio:document/video → file(video 帶 video/* mime),audio → audio。
+_TG_TEXTDOC_NOTE = re.compile(
+    r"\[The user sent a text document: '([^']*)'\.(?s:.*?)also saved at: ([^\]\n]+)\]")
+_TG_FILE_NOTE = re.compile(
+    r"\[The user sent (a document|an audio file attachment|a video attachment): "
+    r"'([^']*)'\. It is saved at: (.+?)\.\s(?s:.*?)\]")
 
 
 def _tg_extract_attachments(content: str):
@@ -3730,17 +3739,41 @@ def _tg_extract_attachments(content: str):
 
     def _repl_replied(m):
         kind, name, path = m.group(1), m.group(2).strip(), m.group(3).strip()
-        if kind == "image" and path and os.path.isfile(path):
+        if path and os.path.isfile(path):
+            att_kind = {"image": "image", "audio": "audio", "voice": "audio"}.get(kind, "file")
             attachments.append({
-                "kind": "image",
+                "kind": att_kind,
                 "filename": name or os.path.basename(path),
-                "mime": mimetypes.guess_type(path)[0] or "image/jpeg",
+                "mime": mimetypes.guess_type(path)[0]
+                        or ("image/jpeg" if att_kind == "image" else "application/octet-stream"),
                 "path": path,
             })
         return ""      # engineering note either way — never shown as text
 
+    def _att_for(path: str, name: str, kind_hint: str) -> str:
+        """共用落點:檔案在就掛附件(回空字串),不在就人話註記。"""
+        if path and os.path.isfile(path):
+            mime = mimetypes.guess_type(path)[0] or "application/octet-stream"
+            kind = "audio" if kind_hint == "audio" else "file"
+            attachments.append({"kind": kind,
+                                "filename": name or os.path.basename(path),
+                                "mime": mime, "path": path})
+            return ""
+        return f"（附件『{name or os.path.basename(path or '')}』已失效）"
+
+    def _repl_textdoc(m):
+        # 內文已 inline 在下方 → 只把提示行變附件,正文保留。
+        return _att_for(m.group(2).strip(), m.group(1).strip(), "file")
+
+    def _repl_file(m):
+        what, name, path = m.group(1), m.group(2).strip(), m.group(3).strip()
+        hint = "audio" if what.startswith("an audio") else "file"
+        return _att_for(path, name, hint)
+
     text = _TG_IMAGE_MARKER.sub(_repl, content or "")
     text = _TG_REPLIED_MEDIA.sub(_repl_replied, text)
+    text = _TG_TEXTDOC_NOTE.sub(_repl_textdoc, text)
+    text = _TG_FILE_NOTE.sub(_repl_file, text)
     if text != (content or ""):     # something was extracted or replaced
         # Collapse the blank lines the removed hint lines leave behind.
         text = re.sub(r"\n{3,}", "\n\n", text).strip()
