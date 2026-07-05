@@ -519,18 +519,65 @@ def _openai_client():
     return _OPENAI_CLIENT
 
 
-def _transcribe(path: str) -> str:
-    """Audio file path → transcript (best-effort; '' on failure)."""
+# 預設本地 faster-whisper(OSS 自架預設 = Mac Studio/mini,跑得動;與 hermes
+# 同 venv 共用安裝與模型快取)。POCKET_STT=openai 才走雲端;本地失敗且有 key
+# 時自動雲端備援。模型 POCKET_STT_MODEL(預設 large-v3-turbo:品質貼平
+# large-v3、速度同 medium 級;首次使用下載 ~1.6GB)。
+STT_PROVIDER = os.environ.get("POCKET_STT", "local")
+STT_MODEL = os.environ.get("POCKET_STT_MODEL", "large-v3-turbo")
+_WHISPER_MODEL = None
+
+# app 介面語言 → whisper 語言碼 + 繁/簡輸出偏置(Whisper 對中文預設常吐簡體,
+# initial_prompt 是標準治法;en 鎖英文;未知/空 = 自動偵測)。
+_STT_LANG = {"zh-Hant": "zh", "zh-Hans": "zh", "zh": "zh", "en": "en"}
+_STT_PROMPT = {"zh-Hant": "以下是繁體中文的對話內容。", "zh-Hans": "以下是简体中文的对话内容。"}
+
+
+def _whisper_model():
+    global _WHISPER_MODEL
+    if _WHISPER_MODEL is None:
+        from faster_whisper import WhisperModel
+        _WHISPER_MODEL = WhisperModel(STT_MODEL, device="auto", compute_type="auto")
+    return _WHISPER_MODEL
+
+
+def _transcribe_openai(path: str, lang: str) -> str:
+    with open(path, "rb") as f:
+        kw = {}
+        if _STT_LANG.get(lang):
+            kw["language"] = _STT_LANG[lang]
+        if _STT_PROMPT.get(lang):
+            kw["prompt"] = _STT_PROMPT[lang]
+        r = _openai_client().audio.transcriptions.create(model="whisper-1", file=f, **kw)
+    return (r.text or "").strip()
+
+
+def _transcribe(path: str, lang: str = "") -> str:
+    """Audio file path → transcript (best-effort; '' on failure).
+    lang = app 介面語言(zh-Hant/zh-Hans/en/'' = 自動)。其餘呼叫端(CC/CX
+    語音流)不帶 lang = 自動偵測,行為不變。"""
+    if STT_PROVIDER == "openai":
+        try:
+            return _transcribe_openai(path, lang)
+        except Exception as e:  # noqa: BLE001
+            print(f"[voice] openai transcription failed: {e}", flush=True)
+            return ""
     try:
-        with open(path, "rb") as f:
-            r = _openai_client().audio.transcriptions.create(model="whisper-1", file=f)
-        return (r.text or "").strip()
+        segs, _info = _whisper_model().transcribe(
+            path, language=_STT_LANG.get(lang),
+            initial_prompt=_STT_PROMPT.get(lang), vad_filter=True)
+        return "".join(seg.text for seg in segs).strip()
     except Exception as e:  # noqa: BLE001
-        print(f"[voice] transcription failed: {e}", flush=True)
+        print(f"[voice] local transcription failed: {e}", flush=True)
+        if _openai_key():   # 本地掛了(模型下載中斷等)→ 有 key 就雲端備援
+            try:
+                return _transcribe_openai(path, lang)
+            except Exception as e2:  # noqa: BLE001
+                print(f"[voice] openai fallback failed: {e2}", flush=True)
         return ""
 
 
-async def _transcribe_attachments(attachments: list) -> str:
+async def _transcribe_attachments(attachments: list, lang: str = "") -> str:
     """Save + transcribe every audio attachment; return the joined transcript.
     Runs the blocking whisper call off the event loop."""
     texts = []
@@ -540,7 +587,7 @@ async def _transcribe_attachments(attachments: list) -> str:
         path = _save_attachment(a, a.get("filename") or "voice.m4a")
         if not path:
             continue
-        t = await asyncio.to_thread(_transcribe, path)
+        t = await asyncio.to_thread(_transcribe, path, lang)
         if t:
             texts.append(t)
     return " ".join(texts).strip()
@@ -5402,8 +5449,8 @@ async def _v2_persona_input(session: str, session_id: str, body: dict,
             inflight_entry = {"ts": _now, "task": None, "state": None}
             _APP_TURN_INFLIGHT[(session, client_id)] = inflight_entry
 
-    content, att_meta, prompt = await _persona_prepare_turn(session, content,
-                                                            attachments)
+    content, att_meta, prompt = await _persona_prepare_turn(
+        session, content, attachments, stt_lang=str(body.get("stt_lang") or ""))
     acp_session = await POOL.get(session, home_for(session))
     queued = acp_session.is_busy()
     user_mid, canonical_user_ok = _canon_add_retry(session, "user", content,
@@ -6944,7 +6991,8 @@ async def personas_delete(pid: str, request: Request):
     return {"ok": True}
 
 
-async def _persona_prepare_turn(session: str, content: str, attachments: list):
+async def _persona_prepare_turn(session: str, content: str, attachments: list,
+                                stt_lang: str = ""):
     """persona 回合前置(附件轉存/語音轉寫/多模態 parts/prompt 組裝)→
     (content, att_meta, prompt)。v1 POST /app/v1/messages 與 v2 統一路由
     input 共用。"""
@@ -6964,7 +7012,7 @@ async def _persona_prepare_turn(session: str, content: str, attachments: list):
     # Voice messages: transcribe any audio attachment and fold the transcript
     # into the turn text. The audio still rides along as an attachment so the
     # conversation shows the voice bubble; the model gets the words.
-    voice_text = await _transcribe_attachments(attachments)
+    voice_text = await _transcribe_attachments(attachments, stt_lang)
     if voice_text:
         content = (content + "\n" + voice_text).strip() if content else voice_text
 
@@ -7218,8 +7266,8 @@ async def app_post_message(request: Request):
                            canonical_user_ok=None, canonical_reply_ok=None)
         return StreamingResponse(dry_agen(), media_type="text/event-stream")
 
-    content, att_meta, prompt = await _persona_prepare_turn(session, content,
-                                                            attachments)
+    content, att_meta, prompt = await _persona_prepare_turn(
+        session, content, attachments, stt_lang=str(body.get("stt_lang") or ""))
     acp_session = await POOL.get(session, home_for(session))
     queued_at_accept = acp_session.is_busy()
 
