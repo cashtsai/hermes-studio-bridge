@@ -209,6 +209,41 @@ Returns scheduled reports for app reading surfaces.
 Exposes notification-producing jobs. Use this carefully because it affects both
 app and Telegram delivery.
 
+### `GET /app/v1/terminal` (WebSocket)
+
+In-app self-ops terminal. Authoritative spec:
+`studio-os/docs/TERMINAL_PTY_CONTRACT.md`; this section is the bridge-side
+summary kept in sync with it.
+
+- **Auth**: same device-token contract as every other `/app/v1/*` endpoint
+  (`Authorization: Bearer <token>`), plus a `?token=<device_token>` query
+  fallback for WS clients that can't set a header on the upgrade request.
+  An invalid/missing token gets the WS **accepted** and immediately **closed
+  with code 4401** (a real close frame, so the code survives) — not a
+  pre-accept reject, because uvicorn's ASGI websocket implementation
+  hardcodes HTTP 403 for any pre-accept close and discards the numeric code.
+- **Kill switch**: `POCKET_TERMINAL_ENABLED` env var, default `"1"`. Set to
+  `"0"` to refuse the handshake outright (pre-accept close → HTTP 403 on this
+  stack, matching the "端點回 403" requirement).
+- **Session model**: one WS = one local PTY running a login shell
+  (`$SHELL -l`, fallback `/bin/zsh -l`), `TERM=xterm-256color`, cwd = the
+  bridge process's own home directory, bridge's own execution identity (no
+  privilege escalation, no user switch). WS close/disconnect kills the whole
+  process group and reaps it — no zombies.
+- **Messages** (text JSON, UTF-8; PTY bytes decoded UTF-8 with
+  `errors="replace"`):
+  - Client → server: `{"type":"input","data":"<keystrokes>"}`,
+    `{"type":"resize","cols":<int>,"rows":<int>}`.
+  - Server → client: `{"type":"output","data":"<pty bytes as utf8>"}`,
+    `{"type":"exit","code":<int>}` (then the server closes the WS),
+    `{"type":"error","message":"<why>"}`.
+- **Logging**: `terminal_open` / `terminal_close` events carry `device_id`
+  and, on close, `duration_s` — never keystrokes or PTY output.
+- **Security note**: a paired device token equals full local shell access.
+  Acceptable for a self-hosted single-owner bridge; the kill switch above is
+  the escape hatch. Not gated behind `POCKET_KERNEL` — this is a
+  self-ops feature, available in OSS/kernel builds too.
+
 ## 3. v1 遷移備註（persona 事件）
 
 `GET /app/v1/messages/events`（persona SSE）與 `POST /app/v1/messages` 串流

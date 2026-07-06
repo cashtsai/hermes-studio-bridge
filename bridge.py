@@ -14,22 +14,28 @@ import asyncio
 import base64
 import carddigest
 import collections
+import fcntl
 import glob
 import hashlib
 import hmac
 import json
 import mimetypes
 import os
+import pty
 import re
 import secrets
 import shlex
+import signal
+import struct
+import subprocess
+import termios
 import threading
 import time
 import uuid
 from datetime import datetime
 from pathlib import Path
 
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, StreamingResponse, FileResponse
 
 from acp_client import ACPPool, canonical_telegram_session
@@ -220,6 +226,11 @@ async def _json_body(request: Request) -> dict:
 
 HERMES_BIN = "/Users/xcash/apps/hermes-agent/runtime/venv/bin/hermes"
 HOME_ROOT = "/Users/xcash/apps/hermes-agent/home"
+
+# In-app terminal kill switch (TERMINAL_PTY_CONTRACT.md §安全). Paired devices
+# get full shell access over /app/v1/terminal, so a self-hosted owner needs an
+# escape hatch; "0" makes the endpoint refuse every handshake.
+POCKET_TERMINAL_ENABLED = os.environ.get("POCKET_TERMINAL_ENABLED", "1") != "0"
 
 # model id -> (display name, HERMES_HOME). id stays ascii for client URLs.
 # G6 (wave 2): these four are the code-level BUILTINS; the personas table in
@@ -6205,6 +6216,293 @@ async def app_uploads(request: Request):
                client=_client_host(request))
     return {"ok": True, "attachments": saved}
 
+
+# ───────────────────────── in-app terminal (PTY over WS) ────────────────────
+# docs/TERMINAL_PTY_CONTRACT.md is the authority; keep this section in sync
+# with it. One WS = one local PTY login shell running as the bridge's own
+# execution identity (no privilege escalation, no user switch). A paired
+# device token therefore equals full shell access — see POCKET_TERMINAL_ENABLED
+# above for the kill switch, and §日誌 below for what never gets logged.
+
+def _terminal_token_from_ws(websocket: WebSocket) -> str:
+    """Same device-token contract as every other /app/v1/* endpoint
+    (`Authorization: Bearer <token>`), plus a `?token=` query fallback for
+    WS clients that can't set a header on the upgrade request."""
+    auth = websocket.headers.get("authorization", "")
+    token = auth[7:].strip() if auth.lower().startswith("bearer ") else ""
+    if not token:
+        token = (websocket.query_params.get("token") or "").strip()
+    return token
+
+
+def _terminal_device_id_for_token(token: str) -> str | None:
+    """Mirrors _check_auth's token membership checks (master token, per-device
+    token, account-bound device) but returns a device id for logging instead
+    of raising — a WS handshake rejects with a close code, not an
+    HTTPException."""
+    if not token:
+        return None
+    if hmac.compare_digest(token, BRIDGE_TOKEN):
+        return "master"
+    with _PAIR_LOCK:
+        dev = _DEVICE_TOKENS.get(token)
+        if dev is not None:
+            if not dev.get("apple_user_id") or _account_device_for_token(token) is not None:
+                dev["last_seen"] = time.time()
+                return dev.get("device_id") or _short_hash(token)
+    acct_dev = _account_device_for_token(token)
+    if acct_dev is not None:
+        return acct_dev.get("device_id") or _short_hash(token)
+    return None
+
+
+class _TerminalSession:
+    """One local PTY + login shell child process for one terminal WS."""
+
+    def __init__(self, loop: asyncio.AbstractEventLoop):
+        self._loop = loop
+        self.master_fd: int | None = None
+        self.proc: subprocess.Popen | None = None
+        self._write_buf = bytearray()
+
+    def start(self) -> None:
+        shell = os.environ.get("SHELL") or "/bin/zsh"
+        env = dict(os.environ)
+        env["TERM"] = "xterm-256color"
+        home = os.path.expanduser("~")
+        master_fd, slave_fd = pty.openpty()
+        try:
+            self.proc = subprocess.Popen(
+                [shell, "-l"],
+                stdin=slave_fd, stdout=slave_fd, stderr=slave_fd,
+                cwd=home, env=env,
+                preexec_fn=os.setsid,   # new session/process group → clean signal targeting
+                close_fds=True,
+            )
+        finally:
+            os.close(slave_fd)   # child already dup'd it; parent only needs master
+        flags = fcntl.fcntl(master_fd, fcntl.F_GETFL)
+        fcntl.fcntl(master_fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+        self.master_fd = master_fd
+
+    def resize(self, cols: int, rows: int) -> None:
+        if self.master_fd is None:
+            return
+        try:
+            packed = struct.pack("HHHH", rows, cols, 0, 0)
+            fcntl.ioctl(self.master_fd, termios.TIOCSWINSZ, packed)
+        except (OSError, ValueError, struct.error):
+            pass
+
+    def write(self, data: str) -> None:
+        """Queue client keystrokes for the PTY. Non-blocking: the master fd is
+        O_NONBLOCK, so a full PTY input buffer (e.g. a huge paste) falls back
+        to an event-loop writer instead of blocking the whole bridge."""
+        if self.master_fd is None or not data:
+            return
+        self._write_buf.extend(data.encode("utf-8", "replace"))
+        self._flush_write()
+
+    def _flush_write(self) -> None:
+        if self.master_fd is None:
+            self._write_buf.clear()
+            return
+        try:
+            while self._write_buf:
+                n = os.write(self.master_fd, bytes(self._write_buf))
+                del self._write_buf[:n]
+            try:
+                self._loop.remove_writer(self.master_fd)
+            except (ValueError, OSError):
+                pass
+        except BlockingIOError:
+            self._loop.add_writer(self.master_fd, self._flush_write)
+        except OSError:
+            self._write_buf.clear()
+
+    def read_nonblocking(self, size: int = 65536) -> bytes | None:
+        """None means EOF (shell exited); b"" means nothing was ready (kept
+        defensive — add_reader should only fire when data is available)."""
+        try:
+            data = os.read(self.master_fd, size)
+        except BlockingIOError:
+            return b""
+        except OSError:
+            return None
+        return data if data else None
+
+    def exit_code(self) -> int:
+        """Blocking (bounded); always call via run_in_executor, never inline
+        on the event loop."""
+        if self.proc is None:
+            return -1
+        try:
+            return self.proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            return self.proc.returncode if self.proc.returncode is not None else -1
+
+    def close(self) -> None:
+        """Blocking (bounded); always call via run_in_executor. Kills the
+        shell's whole process group and reaps it — no zombies, no fd leak."""
+        if self.proc is not None and self.proc.poll() is None:
+            try:
+                os.killpg(self.proc.pid, signal.SIGHUP)
+            except (ProcessLookupError, OSError):
+                pass
+            try:
+                self.proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(self.proc.pid, signal.SIGKILL)
+                except (ProcessLookupError, OSError):
+                    pass
+                try:
+                    self.proc.wait(timeout=2)
+                except Exception:  # noqa: BLE001
+                    pass
+        if self.master_fd is not None:
+            try:
+                os.close(self.master_fd)
+            except OSError:
+                pass
+            self.master_fd = None
+
+
+async def _terminal_recv_loop(websocket: WebSocket, session: "_TerminalSession") -> None:
+    """Client → server: {"type":"input"} and {"type":"resize"} only (contract
+    §訊息). Unknown message types/fields are ignored, not rejected, so the app
+    can add fields later without a bridge redeploy."""
+    while True:
+        try:
+            raw = await websocket.receive_text()
+        except (WebSocketDisconnect, RuntimeError):
+            return
+        try:
+            msg = json.loads(raw)
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(msg, dict):
+            continue
+        mtype = msg.get("type")
+        if mtype == "input":
+            data = msg.get("data")
+            if isinstance(data, str) and data:
+                session.write(data)
+        elif mtype == "resize":
+            try:
+                cols = int(msg.get("cols") or 0)
+                rows = int(msg.get("rows") or 0)
+            except (TypeError, ValueError):
+                continue
+            if cols > 0 and rows > 0:
+                session.resize(cols, rows)
+
+
+@app.websocket("/app/v1/terminal")
+async def terminal_ws(websocket: WebSocket) -> None:
+    if not POCKET_TERMINAL_ENABLED:
+        # Pre-accept reject. uvicorn's ASGI websocket implementation hardcodes
+        # HTTP 403 for any pre-accept `websocket.close` regardless of the code
+        # passed (it discards the numeric close code entirely for handshake
+        # rejections) — that happens to be exactly the "端點回 403" the
+        # contract asks for here, so no accept() round-trip is needed.
+        await websocket.close(code=1013)
+        return
+    token = _terminal_token_from_ws(websocket)
+    device_id = _terminal_device_id_for_token(token)
+    if not device_id:
+        # A pre-accept close would also flatten to plain HTTP 403 (see above),
+        # which loses the "4401" the contract asks for. Accept first so the
+        # rejection is a real WS close *frame*, whose code the client can read.
+        await websocket.accept()
+        try:
+            await websocket.send_json({"type": "error", "message": "invalid or missing device token"})
+        except Exception:  # noqa: BLE001
+            pass
+        await websocket.close(code=4401)
+        return
+
+    await websocket.accept()
+    loop = asyncio.get_running_loop()
+    session = _TerminalSession(loop)
+    try:
+        session.start()
+    except Exception as e:  # noqa: BLE001 — PTY/shell spawn failed
+        try:
+            await websocket.send_json({"type": "error",
+                                       "message": f"pty spawn failed: {type(e).__name__}"})
+        except Exception:  # noqa: BLE001
+            pass
+        await websocket.close(code=1011)
+        return
+
+    master_fd = session.master_fd
+    started_at = time.time()
+    exited = asyncio.Event()
+    output_q: asyncio.Queue = asyncio.Queue()
+    _EOF = object()
+
+    def _on_readable() -> None:
+        chunk = session.read_nonblocking()
+        if chunk is None:
+            try:
+                loop.remove_reader(master_fd)
+            except (ValueError, OSError):
+                pass
+            exited.set()
+            output_q.put_nowait(_EOF)
+            return
+        if chunk:
+            output_q.put_nowait(chunk)
+
+    loop.add_reader(master_fd, _on_readable)
+    _log_event("terminal_open", device_id=device_id)  # never log keystrokes/output
+
+    async def _writer_loop() -> None:
+        while True:
+            item = await output_q.get()
+            if item is _EOF:
+                return
+            try:
+                await websocket.send_json({"type": "output",
+                                           "data": item.decode("utf-8", "replace")})
+            except Exception:  # noqa: BLE001 — client gone; recv/exit path cleans up
+                return
+
+    recv_task = asyncio.create_task(_terminal_recv_loop(websocket, session))
+    writer_task = asyncio.create_task(_writer_loop())
+    exit_task = asyncio.create_task(exited.wait())
+    try:
+        await asyncio.wait({recv_task, exit_task}, return_when=asyncio.FIRST_COMPLETED)
+        if exit_task.done():
+            await writer_task  # drain any output queued before the EOF sentinel
+            code = await loop.run_in_executor(None, session.exit_code)
+            try:
+                await websocket.send_json({"type": "exit", "code": code})
+            except Exception:  # noqa: BLE001
+                pass
+    finally:
+        for t in (recv_task, writer_task, exit_task):
+            if not t.done():
+                t.cancel()
+        await asyncio.gather(recv_task, writer_task, exit_task, return_exceptions=True)
+        try:
+            loop.remove_reader(master_fd)
+        except (ValueError, OSError):
+            pass
+        try:
+            loop.remove_writer(master_fd)
+        except (ValueError, OSError):
+            pass
+        await loop.run_in_executor(None, session.close)
+        try:
+            await websocket.close(code=1000)
+        except Exception:  # noqa: BLE001
+            pass
+        _log_event("terminal_close", device_id=device_id,
+                   duration_s=round(time.time() - started_at, 3))
+
+
 @app.get("/capabilities")
 async def capabilities(request: Request):
     _check_auth(request)
@@ -6215,7 +6513,7 @@ async def capabilities(request: Request):
                          "message_events", "apns_push", "accounts",
                          "apple_auth", "account_pairing",
                          "delegations", "control_plane_v2", "attachment_uploads",
-                         "interactive_push"],
+                         "interactive_push"] + (["terminal"] if POCKET_TERMINAL_ENABLED else []),
             "endpoints": ["/app/v1/sessions", "/app/v1/messages", "/reports",
                           "/app/v1/uploads",
                           "/app/v1/reactions", "/app/v1/pins",
@@ -6228,7 +6526,7 @@ async def capabilities(request: Request):
                           "/app/v1/pair/new", "/app/v1/pair/claim",
                           "/app/v1/devices/{id}/revoke",
                           "/app/v1/delegations", "/app/v2/sessions",
-                          "/app/v2/sessions/{id}/approve"]}
+                          "/app/v2/sessions/{id}/approve", "/app/v1/terminal"]}
 
 
 @app.post("/app/v1/auth/apple")
