@@ -2101,7 +2101,21 @@ async def chat_completions(request: Request):
 
 
 CLAUDE_BIN = "/Users/xcash/.local/bin/claude"
-CODEX_BIN = "/Users/xcash/.local/bin/codex"
+# 用能讀「新版 thread」的 codex 當 app-server。VS Code 用 codex 0.142 建 thread,
+# 舊的 standalone 0.137(~/.local/bin/codex)一讀其 full turns(thread/turns/list
+# itemsView=full)就 crash → UPSTREAM_FAILED「codex app-server stopped」,整條 stdio
+# 卡死,app 端該 session 空白且送不出。優先挑 Codex.app 內建的 0.142(VS Code 同款、
+# 共用 ~/.codex 登入),對不上再退回 standalone。CODEX_BIN 環境變數可覆蓋。
+def _resolve_codex_bin() -> str:
+    for c in (os.environ.get("CODEX_BIN"),
+              "/Applications/Codex.app/Contents/Resources/codex",
+              os.path.expanduser("~/.local/bin/codex")):
+        if c and os.path.exists(c):
+            return c
+    return "/Users/xcash/.local/bin/codex"
+
+
+CODEX_BIN = _resolve_codex_bin()
 
 
 class CodexAppServerError(RuntimeError):
@@ -2174,7 +2188,12 @@ class CodexAppServerClient:
             stderr=asyncio.subprocess.PIPE,
             stdin=asyncio.subprocess.PIPE,
             cwd=HOME_ROOT,
-            limit=8 * 1024 * 1024,
+            # StreamReader 單行上限。codex app-server 把每個 JSON-RPC 回應當「一行」
+            # 送;thread/turns/list itemsView=full 若含 computer-use 截圖(base64)可能
+            # 單行破 8MB → asyncio 讀取器丟 LimitOverrunError(「Separator is not found,
+            # and chunk exceed the limit」)→ reader task 死 → app-server「stopped」→ 整條
+            # codex 卡死(XCash 就是這樣)。放大到 128MB 吃得下含圖的大回應。
+            limit=128 * 1024 * 1024,
         )
         self._reader_task = asyncio.create_task(self._read_stdout())
         self._stderr_task = asyncio.create_task(self._read_stderr())
@@ -6035,7 +6054,11 @@ async def _cx_card_digest(thread_id: str):
     if not d.seeded:
         d.seeded = True
         try:
-            await CODEX_APP.ensure_thread_loaded(thread_id)
+            # 只讀 seed 不做 thread/resume:resume 會「接管」該 thread,若它正被
+            # 別的 codex app-server(如 VS Code,thread source=vscode)持有就會卡死
+            # 整條 stdio → 之後所有 codex 呼叫一起 hang(XCash 就是這樣空白+送不出)。
+            # thread/turns/list 本來就不需 resume 也讀得到(/codexsessions/{id}/history
+            # 就是這樣讀的),所以這裡直接列 turns。
             res = await CODEX_APP.call("thread/turns/list", {
                 "threadId": thread_id, "limit": _CX_CARD_SEED_TURNS,
                 "itemsView": "full", "sortDirection": "desc"}, timeout=45.0)
