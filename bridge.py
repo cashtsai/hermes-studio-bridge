@@ -14,23 +14,30 @@ import asyncio
 import base64
 import carddigest
 import collections
+import fcntl
 import glob
 import hashlib
 import hmac
 import json
 import mimetypes
 import os
+import pty
 import re
 import secrets
 import shlex
+import signal
+import struct
+import subprocess
+import termios
 import threading
 import time
 import uuid
 from datetime import datetime
 from pathlib import Path
 
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, StreamingResponse, FileResponse
+from starlette.websockets import WebSocketState
 
 from acp_client import ACPPool, canonical_telegram_session
 
@@ -79,7 +86,7 @@ _POCKET_DIR = os.path.expanduser("~/.pocket")
 _DEVICE_TOKENS_PATH = os.path.join(_POCKET_DIR, "device-tokens.json")
 _PAIR_LOCK = threading.Lock()
 _PAIR_CODES: dict = {}          # code -> {expiry, apple_user_id} or legacy expiry
-_PAIR_CODE_TTL = 300.0          # a pairing code is valid for 5 minutes
+_PAIR_CODE_TTL = 600.0          # a pairing code is valid for 10 minutes
 APPLE_JWKS_URL = "https://appleid.apple.com/auth/keys"
 APPLE_ID_ISSUER = "https://appleid.apple.com"
 APPLE_ID_AUDIENCES = tuple(
@@ -2386,6 +2393,7 @@ class CodexAppServerClient:
             "risk": record.get("risk"),
             "created_at": record.get("created_at"),
             "thread_id": record.get("thread_id"),
+            "options": record.get("options"),   # 發起方宣告的選項(去二元);None → app 用二元預設
         }
 
     def _approval_db_upsert(self, record: dict) -> None:
@@ -2431,6 +2439,27 @@ class CodexAppServerClient:
             "detail": self._approval_detail(method, params),
             "created_at": created,
         }
+        # 選項由發起方宣告(method-aware),不再由 carddigest 寫死二元。允許鈕
+        # 依動作類型給語意標籤;style=="deny" 是唯一「拒絕」判準(app 依此送
+        # approve=false)。三態第三顆 = for_session(一律允許此類、本 session 不再
+        # 問)→ 對 command/fileChange 映射 Codex 原生 acceptForSession。
+        _mlow = method.lower()
+        _allow_label = ("允許執行" if "command" in _mlow
+                        else "允許修改" if "filechange" in _mlow.replace("_", "")
+                        else "允許")
+        record["options"] = [
+            {"key": "approve", "label": _allow_label, "style": "primary"},
+        ]
+        # 只有支援 acceptForSession 的 method 才給第三顆(見 _approval_response_result)。
+        # key 用 approve_for_session:非 deny-ish → 舊 App(build ≤44,只認 approve/
+        # deny)會安全退成「一般允許」,不會誤送拒絕;新 App 認得此 key → 送
+        # for_session=true。style=secondary(較軟的允許)。
+        if method in ("item/commandExecution/requestApproval",
+                      "item/fileChange/requestApproval"):
+            record["options"].append(
+                {"key": "approve_for_session", "label": "本次全允許", "style": "secondary"})
+        record["options"].append(
+            {"key": "deny", "label": "拒絕", "style": "deny"})
         self.pending_approvals[approval_id] = record
         if thread_id:
             self.pending_approvals_by_thread[thread_id][approval_id] = record
@@ -3349,6 +3378,188 @@ async def pair_revoke(request: Request):
     return {"revoked": removed}
 
 
+# --- In-app terminal (bridge PTY) --------------------------------------------
+# Contract: studio-os/docs/TERMINAL_PTY_CONTRACT.md v0. One WebSocket = one
+# local PTY shell on this Mac (the bridge already runs here — no SSH). Text
+# JSON both directions, UTF-8, no base64. Kernel/OSS feature too (self-serve
+# ops), so it is unconditionally present. Gated by POCKET_TERMINAL_ENABLED.
+
+def _terminal_enabled() -> bool:
+    """Default ON. POCKET_TERMINAL_ENABLED=0/false/no/off/'' → endpoint 403s."""
+    return os.environ.get("POCKET_TERMINAL_ENABLED", "1").strip().lower() \
+        not in ("0", "false", "no", "off", "")
+
+
+def _ws_bearer_token(websocket: WebSocket) -> str:
+    """Same token as every other /app/v1/* call: Authorization: Bearer <t>, or
+    ?token=<t> query fallback (the contract lets the bridge accept either, since
+    setting headers on a WS handshake isn't always convenient on the client)."""
+    auth = websocket.headers.get("authorization", "")
+    if auth.lower().startswith("bearer "):
+        return auth[7:].strip()
+    return (websocket.query_params.get("token") or "").strip()
+
+
+def _ws_token_authorized(token: str) -> bool:
+    """Accept branches mirror _check_auth: master token, a paired device token,
+    or an account-bound device token. No rate-limit bookkeeping here (the WS
+    handshake is not a brute-force surface the way the JSON gate is)."""
+    if not token:
+        return False
+    if hmac.compare_digest(token, BRIDGE_TOKEN):
+        return True
+    with _PAIR_LOCK:
+        dev = _DEVICE_TOKENS.get(token)
+        if dev is not None:
+            if not dev.get("apple_user_id") or _account_device_for_token(token) is not None:
+                dev["last_seen"] = time.time()
+                return True
+    if _account_device_for_token(token) is not None:
+        return True
+    return False
+
+
+@app.websocket("/app/v1/terminal")
+async def app_v1_terminal(websocket: WebSocket):
+    # Reject BEFORE accept() so Starlette answers the handshake with HTTP 403 —
+    # the iOS client keys "終端機已停用"/no-retry off that status code.
+    if not _terminal_enabled():
+        _log_event("terminal_rejected", reason="disabled")
+        await websocket.close(code=1008)
+        return
+    token = _ws_bearer_token(websocket)
+    if not _ws_token_authorized(token):
+        _log_event("terminal_rejected", reason="auth")
+        await websocket.close(code=1008)
+        return
+
+    await websocket.accept()
+
+    shell = os.environ.get("SHELL") or "/bin/zsh"
+    home = os.path.expanduser("~")
+    env = dict(os.environ)
+    env["TERM"] = "xterm-256color"
+    env.pop("POCKET_TERMINAL_ENABLED", None)  # bridge-internal, don't leak into the shell
+
+    # tmux-backed so the shell survives WS disconnects: reconnecting with the
+    # same ?session=<name> re-attaches the SAME live tmux session (running agents,
+    # state, scrollback all intact) instead of spawning a fresh shell. `-A` =
+    # attach-or-create. Killing the client (killpg below) only detaches — the tmux
+    # server keeps the session alive for the next attach. No ?session → a stable
+    # default, so even the current single-terminal UX becomes persistent.
+    raw_sess = (websocket.query_params.get("session") or "").strip()
+    if raw_sess and await _tmux_alive(raw_sess):
+        # 既有 tmux session(如 ccsess 的 "Ops"/"FLiPER")→ 直接 attach 進去,
+        # 讓 app 的 SSH 連線能接到那個跑著 Claude Code/Codex 的 session。
+        sess = raw_sess
+    elif raw_sess:
+        sess = "pocket-" + re.sub(r"[^A-Za-z0-9_-]", "_", raw_sess)[:60]
+    else:
+        sess = "pocket-term"
+
+    try:
+        master_fd, slave_fd = pty.openpty()
+    except OSError as e:
+        await websocket.send_text(json.dumps({"type": "error", "message": f"openpty failed: {e}"}))
+        await websocket.close()
+        return
+
+    try:
+        proc = subprocess.Popen(
+            [TMUX_BIN, "new-session", "-A", "-s", sess, "-c", home],
+            preexec_fn=os.setsid,               # own session+pgroup → killpg reaps only the client
+            stdin=slave_fd, stdout=slave_fd, stderr=slave_fd,
+            cwd=home, env=env, close_fds=True,
+        )
+    except Exception as e:  # noqa: BLE001
+        os.close(master_fd)
+        os.close(slave_fd)
+        await websocket.send_text(json.dumps({"type": "error", "message": f"spawn failed: {e}"}))
+        await websocket.close()
+        return
+    os.close(slave_fd)  # parent keeps only the master end
+    _log_event("terminal_open", device=_short_hash(token), shell=shell, tmux=sess)  # no keystrokes/output
+
+    loop = asyncio.get_running_loop()
+
+    def _read_master() -> bytes:
+        try:
+            return os.read(master_fd, 65536)
+        except OSError:
+            return b""                          # EIO on macOS when the child's side closes
+
+    async def pump_output():
+        """PTY → client. Ends (returns) on EOF, i.e. the shell exited."""
+        while True:
+            data = await loop.run_in_executor(None, _read_master)
+            if not data:
+                return
+            try:
+                await websocket.send_text(json.dumps(
+                    {"type": "output", "data": data.decode("utf-8", "replace")}))
+            except Exception:  # noqa: BLE001 — socket went away mid-send
+                return
+
+    async def pump_input():
+        """client → PTY. Ends (returns) when the socket closes/errors."""
+        while True:
+            try:
+                raw = await websocket.receive_text()
+            except (WebSocketDisconnect, RuntimeError):
+                return
+            try:
+                msg = json.loads(raw)
+            except Exception:  # noqa: BLE001
+                continue
+            mtype = msg.get("type")
+            if mtype == "input":
+                data = msg.get("data") or ""
+                if data:
+                    try:
+                        os.write(master_fd, data.encode("utf-8"))
+                    except OSError:
+                        return
+            elif mtype == "resize":
+                try:
+                    cols = max(1, min(int(msg.get("cols") or 80), 1000))
+                    rows = max(1, min(int(msg.get("rows") or 25), 1000))
+                    fcntl.ioctl(master_fd, termios.TIOCSWINSZ,
+                                struct.pack("HHHH", rows, cols, 0, 0))
+                except (OSError, ValueError, TypeError):
+                    pass
+
+    out_task = asyncio.create_task(pump_output())
+    in_task = asyncio.create_task(pump_input())
+    try:
+        done, pending = await asyncio.wait(
+            {out_task, in_task}, return_when=asyncio.FIRST_COMPLETED)
+        for t in pending:
+            t.cancel()
+        shell_exited = out_task in done
+    finally:
+        # Reap the shell + its process group; closing the master fd unblocks any
+        # os.read still parked in the executor thread.
+        try:
+            if proc.poll() is None:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                proc.wait(timeout=2)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            os.close(master_fd)
+        except OSError:
+            pass
+        _log_event("terminal_close", device=_short_hash(token))
+    # Tell the client the shell died (only meaningful if it, not the socket, ended).
+    if shell_exited and websocket.client_state == WebSocketState.CONNECTED:
+        try:
+            code = proc.returncode if proc.returncode is not None else 0
+            await websocket.send_text(json.dumps({"type": "exit", "code": code}))
+            await websocket.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+
 @app.post("/clientlog")
 async def client_log_write(request: Request):
     _check_auth(request)
@@ -3718,10 +3929,10 @@ def _parse_agent_event(ev: dict):
     return items
 
 
-def _persona_preview(home: str):
-    """Latest user-visible message of the persona's canonical Telegram session
-    → (text, ts). Walks back past rows that are pure runtime injection so the
-    conversation list never previews machine-facing preamble."""
+def _persona_preview_tg(home: str):
+    """Latest user-visible message of the persona's Telegram session → (text, ts).
+    Walks back past rows that are pure runtime injection so the conversation list
+    never previews machine-facing preamble."""
     import sqlite3
     db = os.path.join(home, "state.db")
     if not os.path.exists(db):
@@ -3747,6 +3958,49 @@ def _persona_preview(home: str):
     except Exception:
         pass
     return (None, None)
+
+
+def _persona_preview_canon(session: str):
+    """Latest user-visible message from the persona's CANONICAL store (app turns)
+    → (text, ts). studio-card fences collapse to their fallback text and the
+    folded 〈執行步驟〉 appendix is stripped, matching what the conversation view
+    shows — so the list preview never leaks a raw fence or tool log."""
+    try:
+        msgs = _canon_messages(session, 20)
+    except Exception:  # noqa: BLE001
+        return (None, None)
+    for m in reversed(msgs):
+        if m.get("role") not in ("user", "assistant"):
+            continue
+        content = (m.get("content") or "")
+        if not content.strip():
+            continue
+        clean, _bodies = carddigest.extract_studio_cards(content)
+        clean = re.sub(r"<details>.*?</details>", "", clean, flags=re.S).strip()
+        if clean:
+            return (clean[:80], m.get("ts"))
+    return (None, None)
+
+
+def _persona_preview(home: str, session: str | None = None):
+    """Conversation-list preview for a persona → (text, ts).
+
+    The list must mirror the merged conversation view (/app/v1/messages =
+    canonical ⊕ Telegram): reading TG only left app-side turns invisible, so the
+    preview stayed stale AND the app's preview-change unread detector never fired
+    for in-app messages. Take the newer of the two sources (both epoch seconds)."""
+    cands = []
+    tg_text, tg_ts = _persona_preview_tg(home)
+    if tg_text and tg_ts is not None:
+        cands.append((tg_ts, tg_text))
+    if session:
+        cn_text, cn_ts = _persona_preview_canon(session)
+        if cn_text and cn_ts is not None:
+            cands.append((cn_ts, cn_text))
+    if not cands:
+        return (None, None)
+    ts, text = max(cands, key=lambda x: x[0])
+    return (text, ts)
 
 
 # TG→app media (N4, pocketagent#36): Hermes' image_routing appends a
@@ -3966,7 +4220,7 @@ async def list_sessions(request: Request):
     _check_auth(request)
     out = []
     for mid, (disp, home) in PERSONAS.items():
-        text, ts = _persona_preview(home)
+        text, ts = _persona_preview(home, session=mid)
         out.append({"id": mid, "type": "persona", "name": disp,
                     "preview": text, "lastAt": ts, "status": "idle"})
     out.extend(await _delegation_app_sessions())
@@ -5609,6 +5863,12 @@ async def _cc_card_follower(name: str, workdir: str):
                 busy = bool(st.get("busy"))
                 if busy:
                     store.queued_until = 0.0   # 真忙了 → 排隊寬限交還正常路徑
+                # 新訂閱者(開啟/重連時可能在「忙碌中途」接入)→ 強制重發一次當前
+                # 狀態,否則 set_status「有變才發」會讓中途接入者停在舊的「待命」,
+                # 整段回覆期看起來像沒反應(snapshot 冷載不帶 status)。
+                if store.subscribers > getattr(store, "_last_subs", 0):
+                    store.status = None
+                store._last_subs = store.subscribers
                 if prev_busy is not None and busy != prev_busy:
                     if busy:
                         store.turn_id = "turn-" + uuid.uuid4().hex[:12]

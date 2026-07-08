@@ -427,8 +427,11 @@ class CodexThreadDigest:
             "approval",
             {"approval_id": record["id"], "title": title,
              "detail": record.get("detail") or "",
-             "options": [{"key": "approve", "label": "允許", "style": "primary"},
-                         {"key": "deny", "label": "拒絕", "style": "danger"}],
+             # 選項改由發起方宣告(record["options"]);沒宣告才退回二元預設。
+             # 不再把「允許/拒絕」寫死在這裡——見 CHOICE_GATEWAY_CONTRACT §1。
+             "options": record.get("options") or [
+                 {"key": "approve", "label": "允許", "style": "primary"},
+                 {"key": "deny", "label": "拒絕", "style": "danger"}],
              "source": "codex",
              "fallback_text": f"🔐 {title}"}, final=False))
         self._status()
