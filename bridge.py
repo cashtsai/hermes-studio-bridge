@@ -4728,6 +4728,37 @@ async def cc_session_create(request: Request):
                                     "status": "running" if ready else "starting"}}
 
 
+@app.put("/app/v1/owned-cc-sessions")
+async def cc_set_app_owned(request: Request):
+    """App 宣告「我 SSH 列表裡的 CC session」——覆寫 app-owned.txt 為權威清單。
+    _cc_approval_watcher 只推這些 session 的審核(hermes 另計),別處的 ccsess
+    (Culture Supply/FLiPER…)不外漏。app 端於 load 時用 sshStore 的 CC 記錄呼叫,
+    所以「審核中心 = 這台 app 的 SSH 清單 ⊕ hermes」恆等對齊(含之前接進來的 Ops)。"""
+    _check_auth(request)
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        body = {}
+    names = body.get("names") or body.get("sessions") or []
+    clean = []
+    seen = set()
+    for n in names if isinstance(names, list) else []:
+        s = str(n or "").strip()
+        # 容錯:傳 "claude_code:Ops" 也接受,取冒號後段當 ccsess 名。
+        if s.startswith("claude_code:"):
+            s = s.split(":", 1)[1]
+        if s and s not in seen:
+            seen.add(s); clean.append(s)
+    try:
+        os.makedirs(os.path.dirname(APP_OWNED_CC), exist_ok=True)
+        with open(APP_OWNED_CC, "w") as f:
+            f.write("".join(x + "\n" for x in clean))
+    except Exception as e:  # noqa: BLE001
+        raise http_err(500, "WRITE_FAILED", f"could not write app-owned list: {e}")
+    _log_event("cc_app_owned_set", count=len(clean))
+    return {"ok": True, "count": len(clean), "names": clean}
+
+
 @app.get("/ccsessions/{name}/stream")
 async def cc_session_stream(name: str, request: Request, replay: int = 80):
     """Live transcript of a ccsess session: replay the recent tail of its
