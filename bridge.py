@@ -4320,6 +4320,37 @@ def _cc_conf_rows():
     return rows
 
 
+# App-owned CC sessions registry. CCSESS_CONF is shared with the ccsess CLI
+# (daemon sessions like "Culture Supply"/"Ops"/"FLiPER" live there too), and its
+# `name|workdir|enabled` format is read by many 3-tuple callers — so instead of
+# adding a 4th field we keep a SEPARATE bridge-managed list of the CC sessions
+# THIS app created (via POST /ccsessions). The approval watcher only pushes for
+# these, so a foreign ccsess session's TUI prompt never reaches the app's審核中心
+# / push. One name per line.
+APP_OWNED_CC = os.path.join(os.path.dirname(CCSESS_CONF), "app-owned.txt")
+
+
+def _cc_app_owned_names() -> set:
+    try:
+        with open(APP_OWNED_CC) as f:
+            return {ln.strip() for ln in f if ln.strip() and not ln.startswith("#")}
+    except Exception:  # noqa: BLE001
+        return set()
+
+
+def _cc_mark_app_owned(name: str) -> None:
+    """Record that the app opened this CC session (idempotent append)."""
+    name = (name or "").strip()
+    if not name or name in _cc_app_owned_names():
+        return
+    try:
+        os.makedirs(os.path.dirname(APP_OWNED_CC), exist_ok=True)
+        with open(APP_OWNED_CC, "a") as f:
+            f.write(name + "\n")
+    except Exception as e:  # noqa: BLE001
+        _log_event("cc_app_owned_write_failed", session=name, error=str(e)[:160])
+
+
 def _norm_cc_workdir(path: str) -> str:
     return os.path.realpath(os.path.abspath(os.path.expanduser(path or "")))
 
@@ -4691,6 +4722,7 @@ async def cc_session_create(request: Request):
         raise HTTPException(status_code=400, detail=f"cannot create workdir: {e}")
     _pretrust_claude_dir(wd)
     await _run_ccsess("new", name, wd)
+    _cc_mark_app_owned(name)   # 這條是 app 開的 → 只有它的審核會進 app(見 _cc_approval_watcher)
     ready = await _cc_wait_ready(name)
     return {"ok": True, "session": {"name": name, "workdir": wd,
                                     "status": "running" if ready else "starting"}}
@@ -5383,8 +5415,13 @@ async def _cc_approval_watcher():
     """常駐:每 4s 巡一輪 enabled CC sessions(pane 走快取,成本低)。"""
     while True:
         await asyncio.sleep(_CC_APPROVAL_POLL_SECS)
+        owned = _cc_app_owned_names()   # 只推 app 自己開的 CC session 的審核
         for name, _workdir, enabled in _cc_conf_rows():
             if enabled != "1":
+                continue
+            # daemon / 別處開的 ccsess(Culture Supply、Ops、FLiPER…)不進 app 審核中心、
+            # 不發推播。它們照常在 ccsess 跑,只是審核通知不外漏到這台 app。
+            if name not in owned:
                 continue
             try:
                 st = await _cc_status_core(name)
