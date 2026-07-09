@@ -4417,6 +4417,50 @@ def _cc_last_activity(workdir: str):
         return (0.0, "")
 
 
+_cc_head_cache: dict = {}   # jsonl path -> (sessionId, title)
+
+
+def _cc_session_head(workdir: str):
+    """(sessionId, title) for the Claude session this remote is running, so the app
+    can map a Pocket remote ("Main") to its Claude-app session ("Session review…").
+    sessionId = jsonl basename (free). title = first real user message, read from the
+    top and stopped early. Cached BY PATH: both are stable for the life of the session
+    file, so even a huge actively-appended jsonl is read at most once (never re-read
+    per poll like _cchist_meta would)."""
+    jsonl = _cc_latest_jsonl(workdir)
+    if not jsonl:
+        return (None, None)
+    cached = _cc_head_cache.get(jsonl)
+    if cached:
+        return cached
+    sid = os.path.basename(jsonl)[:-len(".jsonl")]
+    title = ""
+    try:
+        with open(jsonl, encoding="utf-8", errors="replace") as f:
+            for i, line in enumerate(f):
+                if i > 200:            # first real user msg is near the top; bound the scan
+                    break
+                try:
+                    d = json.loads(line)
+                except Exception:  # noqa: BLE001
+                    continue
+                if d.get("type") == "user":
+                    c = (d.get("message") or {}).get("content")
+                    if isinstance(c, list):
+                        c = next((x.get("text") for x in c
+                                  if isinstance(x, dict) and x.get("type") == "text"), "")
+                    if isinstance(c, str):
+                        t = c.strip()
+                        if t and not t.startswith("<") and not t.startswith("Caveat:"):
+                            title = t[:120]
+                            break
+    except Exception:  # noqa: BLE001
+        pass
+    res = (sid, title or None)
+    _cc_head_cache[jsonl] = res
+    return res
+
+
 async def _cc_sessions():
     out = []
     for name, workdir, enabled in _cc_conf_rows():
@@ -4442,9 +4486,11 @@ async def _cc_sessions():
             except Exception:  # noqa: BLE001
                 busy = False
         mtime, preview = _cc_last_activity(workdir)
+        sid, stitle = _cc_session_head(workdir)
         out.append({"name": name, "workdir": workdir,
                     "status": "running" if alive else "down", "busy": busy,
-                    "awaiting": awaiting, "updatedAt": mtime, "preview": preview})
+                    "awaiting": awaiting, "updatedAt": mtime, "preview": preview,
+                    "sessionId": sid, "sessionTitle": stitle})
     return out
 
 
