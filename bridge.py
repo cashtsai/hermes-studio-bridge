@@ -4022,6 +4022,60 @@ def _persona_preview(home: str, session: str | None = None):
     return (text, ts)
 
 
+def _persona_preview_merged(session: str, home: str):
+    """Conversation-list preview drawn from the SAME merged source as the card
+    stream (canonical ⊕ Telegram ⊕ cron reports), PLUS who sent the latest line
+    and the last *inbound* (persona) line.
+
+    Returns (latest_text, latest_ts, sender, inbound_text, inbound_ts) where
+    `sender` is "persona" (assistant) | "user" | None.
+
+    Why the extra fields: in a two-sided TG-style chat the newest message is
+    often the user's own send. The client's bell/unread detector keys off
+    `inbound_ts` so a self-send never lights the dot, and the notification
+    subtitle shows `inbound_text` so it never echoes the user's own words.
+
+    Skips the report *sync* (`_sync_persona_reports`) — the 30s card follower
+    already keeps report_events fresh — so this is just a few cheap read-only
+    sqlite queries, safe to run on every /sessions poll."""
+    msgs = []
+    try:
+        msgs.extend(_canon_messages(session, 30))          # app turns (canonical.db)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        msgs.extend(_persona_history(home, 30))            # Telegram (state.db), user-cleaned
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        msgs.extend(_report_messages(session, 10))         # cron briefs (role=assistant)
+    except Exception:  # noqa: BLE001
+        pass
+
+    def _visible(m) -> str | None:
+        if m.get("role") not in ("user", "assistant"):
+            return None
+        clean, _bodies = carddigest.extract_studio_cards(m.get("content") or "")
+        clean = re.sub(r"<details>.*?</details>", "", clean, flags=re.S).strip()
+        return clean or None
+
+    msgs.sort(key=lambda m: m.get("ts") or 0)
+    latest_text = latest_ts = sender = None
+    inbound_text = inbound_ts = None
+    for m in reversed(msgs):
+        text = _visible(m)
+        if not text:
+            continue
+        if latest_text is None:
+            latest_text, latest_ts = text[:120], m.get("ts")
+            sender = "persona" if m.get("role") == "assistant" else "user"
+        if m.get("role") == "assistant" and inbound_text is None:
+            inbound_text, inbound_ts = text[:120], m.get("ts")
+        if latest_text is not None and inbound_text is not None:
+            break
+    return (latest_text, latest_ts, sender, inbound_text, inbound_ts)
+
+
 # TG→app media (N4, pocketagent#36): Hermes' image_routing appends a
 # `[Image attached at: /local/path]` hint line to the stored user text for
 # every photo the TG gateway downloads (into <home>/image_cache). state.db has
@@ -4239,9 +4293,13 @@ async def list_sessions(request: Request):
     _check_auth(request)
     out = []
     for mid, (disp, home) in PERSONAS.items():
-        text, ts = _persona_preview(home, session=mid)
+        text, ts, sender, in_text, in_ts = _persona_preview_merged(mid, home)
         out.append({"id": mid, "type": "persona", "name": disp,
-                    "preview": text, "lastAt": ts, "status": "idle"})
+                    "preview": text, "lastAt": ts, "status": "idle",
+                    # who sent `preview` (persona|user) + the last inbound line,
+                    # so the app's bell/unread + notification subtitle stay role-
+                    # aware instead of echoing the user's own last message.
+                    "sender": sender, "inboundPreview": in_text, "inboundAt": in_ts})
     out.extend(await _delegation_app_sessions())
     for key, s in SUBSESSIONS.items():
         out.append({"id": key, "type": "subprocess", "name": s.get("name"),
