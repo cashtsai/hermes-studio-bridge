@@ -6150,6 +6150,42 @@ def _hp_cards_turn_start(session: str, cid: str, user_mid: str | None,
         _log_event("hp_card_turn_error", session=session, error=str(e)[:160])
 
 
+def _hp_merged_messages(session: str, limit: int = 200):
+    """人格卡片流的訊息來源:canonical(app 回合)⊕ Telegram(state.db)⊕ cron 晨報,
+    與 /app/v1/messages 同一套合併/去重。之前卡片流只讀 canonical,所以你在 TG 講的
+    和晨報都不會進 Pocket 人格聊天(卡在最後一次 app 內回合 = 7/6)。改吃這個合併後,
+    TG 對話 + 晨報/午報都會出現。"""
+    out = _canon_messages(session, limit)
+    if session not in PERSONAS:
+        return out
+    _, home = PERSONAS[session]
+    def _steps_stripped(t: str) -> str:
+        return re.sub(r"<details>.*?</details>", "", t or "", flags=re.S).strip()
+    canon_assist = [((m.get("ts") or 0), _steps_stripped(m.get("content") or ""))
+                    for m in out if m.get("role") == "assistant"]
+    def _tg_dup(m) -> bool:
+        if m["role"] != "assistant":
+            return False
+        body = _steps_stripped(m["content"])
+        ts = m["ts"] or 0
+        return bool(body) and any(c == body and abs(ts - cts) < 600
+                                  for cts, c in canon_assist)
+    try:
+        for m in _persona_history(home, limit):
+            if _tg_dup(m):
+                continue
+            out.append({"id": f"tg-{m['ts']}", "role": m["role"], "content": m["content"],
+                        "attachments": m.get("attachments") or [], "ts": m["ts"],
+                        "status": "done", "source": "telegram"})
+        _sync_persona_reports(session, 50)
+        out.extend(_report_messages(session, limit))
+    except Exception as e:  # noqa: BLE001
+        # TG/cron 合併失敗不能拖垮卡片流 → 退回只有 canonical(至少不會壞掉整頁)。
+        _log_event("hp_merge_error", session=session, error=str(e)[:200])
+    out.sort(key=lambda m: m.get("ts") or 0)
+    return out[-limit:]
+
+
 async def _hp_canon_follower(session: str):
     """canonical 寫入版本喚醒(#28 的 _canon_wait)→ 補掃出卡。known_mids
     去重;30s 保險絲重掃與 v1 messages/events 同款。"""
@@ -6166,7 +6202,9 @@ async def _hp_canon_follower(session: str):
             await asyncio.sleep(2.0)
         ver = _CANON_VER.get(session, 0)
         try:
-            d.seed_messages(_canon_messages(session, 80))
+            # 30s 保險絲重掃:同時把 TG/state.db + cron 晨報合併進來(TG/cron 不寫
+            # canonical,不會觸發 _canon_wait,靠這條 timeout 週期補上,~30s 延遲)。
+            d.seed_messages(_hp_merged_messages(session, 80))
         except Exception as e:  # noqa: BLE001
             _log_event("hp_card_follower_error", session=session,
                        error=str(e)[:200])
@@ -6186,7 +6224,7 @@ async def _hp_card_digest(session: str):
     if not d.seeded:
         d.seeded = True
         try:
-            msgs = await asyncio.to_thread(_canon_messages, session,
+            msgs = await asyncio.to_thread(_hp_merged_messages, session,
                                            _HP_CARD_SEED_MSGS)
             d.seed_messages(msgs)
         except Exception as e:  # noqa: BLE001
