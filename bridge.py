@@ -6969,6 +6969,34 @@ async def app_delegation_create(request: Request):
     return {"ok": True, "delegation": _delegation_public(row, status)}
 
 
+@app.post("/app/v1/persona-report")
+async def app_post_persona_report(request: Request):
+    """外部內容線(FLiPER fed 的 today-pick / story 發佈)灌一則報告進某人格對話流。
+    寫進 report_events(external_source 自訂,不會被 cron 同步蓋掉),再由
+    _report_messages 併進 v1/v2 卡片流 → 出現在 Pocket 該人格聊天(卡片流 30s 保險絲
+    週期補掃)。fed 端在發佈 today-pick / story 時 POST 這裡即可。"""
+    _check_auth(request)
+    body = await request.json()
+    session = str(body.get("session") or "").strip()
+    if session not in PERSONAS:
+        raise http_err(400, "SESSION_NOT_FOUND", "unknown persona session")
+    content = str(body.get("content") or "").strip()
+    if not content:
+        raise http_err(400, "EMPTY_CONTENT", "content required")
+    ts = float(body.get("ts") or time.time())
+    report = {
+        "label": str(body.get("label") or "今日精選"),
+        "name": str(body.get("name") or "fed-today"),
+        "content": content,
+        "ts": ts,
+        "external_source": str(body.get("external_source") or "fed"),
+        "external_id": str(body.get("external_id") or "")
+                       or _report_id(session, "fed-today", "", ts),
+    }
+    rid = _report_upsert(session, report)
+    return {"ok": True, "id": rid}
+
+
 @app.get("/app/v1/messages")
 async def app_get_messages(session: str, request: Request, limit: int = 200):
     """Canonical history for a persona: app turns (bridge canonical store) merged
