@@ -1131,6 +1131,9 @@ def _canon_add(session: str, role: str, content: str, attachments=None,
         con.commit()
         con.close()
         _canon_notify(session)
+        # P1-3:人格完成一則回覆 → 推播把你叫回 app(前景由 app willPresent 抑制)。
+        if role == "assistant" and status == "done":
+            _push_persona_reply(session, content)
         return mid, True
     except Exception as e:  # noqa: BLE001
         _log_event("canonical_write_failed",
@@ -1735,7 +1738,11 @@ APNS_KEY_PATH = os.path.expanduser(
     "~/apps/hermes-agent/home/credentials/AuthKey_86FF9D976T.p8")
 APNS_KEY_ID = "86FF9D976T"
 APNS_TEAM_ID = "4F8B93R3SH"
-APNS_BUNDLE_ID = "com.pocketagent.ios"
+# 正式 app 是 Pocket kernel(com.pocketagent.kernel,見 ship-kernel.sh)。apns-topic
+# 必須對上 device token 所屬 app,否則 APNs 回 400 BadTopic / DeviceTokenNotForTopic
+# → 推播全滅(2026-07 之前寫成舊 SUN 的 com.pocketagent.ios,推播在正式版 100% 死)。
+# token-based(.p8)是 team 級,對同 team 任何 bundle 都有效,只要 topic 對。
+APNS_BUNDLE_ID = "com.pocketagent.kernel"
 APNS_HOST = "https://api.push.apple.com"   # production (TestFlight + App Store)
 _apns_jwt_cache: list = [None, 0.0]        # [token, issued_at]
 
@@ -1795,12 +1802,17 @@ def _device_remove(token: str) -> None:
 
 
 async def _apns_send(token: str, title: str, body: str, data: dict | None = None,
-                     category: str | None = None, thread_id: str | None = None):
+                     category: str | None = None, thread_id: str | None = None,
+                     content_available: bool = False):
     import httpx
     headers = {"authorization": f"bearer {_apns_jwt()}",
                "apns-topic": APNS_BUNDLE_ID,
                "apns-push-type": "alert", "apns-priority": "10"}
     aps = {"alert": {"title": title, "body": body}, "sound": "default"}
+    if content_available:
+        # 讓通知本體也能喚醒 app 在背景拉新訊息(通知本身已帶 title/body,
+        # 收到即最新;app 若在背景可順手 refresh 對話)。
+        aps["content-available"] = 1
     if category:
         # 批次 3 斷點①:category 才會讓 iOS/手錶顯示 UNNotificationAction
         # 動作鈕(app 端已註冊同名 category)。
@@ -1818,20 +1830,38 @@ async def _apns_send(token: str, title: str, body: str, data: dict | None = None
 
 async def push_notify(title: str, body: str, data: dict | None = None,
                       category: str | None = None,
-                      thread_id: str | None = None) -> int:
-    """Fan a push to every registered device; prune dead tokens (410/BadToken)."""
+                      thread_id: str | None = None,
+                      content_available: bool = False) -> dict:
+    """Fan a push to every registered device; prune dead tokens (410/BadToken).
+
+    Returns {sent, total, failures:[{code,detail}]}. **不再吞錯** —— 非 200/410 的
+    APNs 回應(400 BadTopic、403 bad key、429…)以前被靜默吃掉,推播死了好幾週都
+    查不到。現在一律 _log_event,`/push/test` 也回傳真實 code。"""
+    toks = _devices()
     sent = 0
-    for tok in _devices():
+    failures: list[dict] = []
+    for tok in toks:
         try:
             code, text = await _apns_send(tok, title, body, data,
-                                          category=category, thread_id=thread_id)
+                                          category=category, thread_id=thread_id,
+                                          content_available=content_available)
             if code == 200:
                 sent += 1
-            elif code == 410 or "BadDeviceToken" in text or "Unregistered" in text:
+            elif (code == 410 or "BadDeviceToken" in text or "Unregistered" in text
+                  or "DeviceTokenNotForTopic" in text):
+                # DeviceTokenNotForTopic = 舊 SUN(.ios)遺留 token,對 .kernel 永遠不合 → 清掉。
                 _device_remove(tok)
-        except Exception:  # noqa: BLE001
-            pass
-    return sent
+                failures.append({"code": code, "detail": "wrong-app/unregistered→pruned",
+                                 "token": tok[:8]})
+            else:
+                failures.append({"code": code, "detail": (text or "")[:160],
+                                 "token": tok[:8]})
+        except Exception as e:  # noqa: BLE001
+            failures.append({"code": "exc", "detail": str(e)[:160], "token": tok[:8]})
+    if failures:
+        _log_event("push_notify_failed", title=title[:48], sent=sent,
+                   total=len(toks), failures=str(failures)[:400])
+    return {"sent": sent, "total": len(toks), "failures": failures}
 
 
 # Scarf 契約遷移 Stage 1b(見 pocketagent/docs/SCARF_CONTRACT_MIGRATION_PLAN.md)。
@@ -1858,6 +1888,35 @@ def _approval_push(aid: str, title: str, body: str, session_id: str = ""):
         thread_id=session_id or "approvals"))
     _BG_TASKS.add(task)
     task.add_done_callback(_BG_TASKS.discard)
+
+
+def _push_persona_reply(session: str, content: str) -> None:
+    """P1-3 人格回訊推播:人格(assistant)在 canonical 落地一則『完成』的回覆時,推播
+    把你叫回 app。標題=人格顯示名,body=清過卡片/步驟的預覽。payload `pocket.kind=
+    message` + sessionId 供 app deep-link 進該人格對話。content-available 讓背景也能
+    順手刷新。app 前景時由 willPresent 抑制橫幅(你正在看,不吵);背景時系統自動顯示。
+    fire-and-forget;無執行中 event loop(純 sync 匯入期)則跳過。"""
+    if session not in PERSONAS:
+        return
+    disp = PERSONAS[session][0]
+    try:
+        clean, _bodies = carddigest.extract_studio_cards(content or "")
+    except Exception:  # noqa: BLE001
+        clean = content or ""
+    clean = re.sub(r"<details>.*?</details>", "", clean, flags=re.S).strip()
+    body = (clean or "傳了一則訊息")[:140]
+    # sessionId 用 deep-link wire 格式 hermes:{persona}(app 點通知直達該人格對話);
+    # app 的 willPresent 會剝前綴比對「正在看哪條」以決定前景是否彈橫幅。
+    data = {"kind": "message",
+            "pocket": {"kind": "message", "sessionId": f"hermes:{session}"}}
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    t = loop.create_task(push_notify(disp, body, data,
+                                     thread_id=session, content_available=True))
+    _BG_TASKS.add(t)
+    t.add_done_callback(_BG_TASKS.discard)
 
 
 _canon_init()
@@ -7980,10 +8039,12 @@ async def push_test(request: Request):
     """Send a test push to every registered device — verifies APNs auth end-to-end."""
     _check_auth(request)
     b = await request.json() if await request.body() else {}
-    n = await push_notify(b.get("title") or "Pocket Agent",
-                          b.get("body") or "測試推播 ✅ M23 已接上",
-                          {"kind": "test"})
-    return {"sent": n, "devices": len(_devices())}
+    res = await push_notify(b.get("title") or "Pocket Agent",
+                            b.get("body") or "測試推播 ✅ M23 已接上",
+                            {"kind": "test"})
+    # 回傳真實 APNs 結果(topic、每台裝置的 code/detail)—— 以前一律回 200 讓人盲測。
+    return {"sent": res["sent"], "devices": res["total"],
+            "apns_topic": APNS_BUNDLE_ID, "failures": res["failures"]}
 
 
 @app.get("/app/v1/approvals")
