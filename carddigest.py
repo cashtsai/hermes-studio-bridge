@@ -335,11 +335,85 @@ def codex_item_to_cards(item: dict, turn_id: str = "",
     return []
 
 
-class CodexThreadDigest:
+class ApprovalCardMixin:
+    """approval pending/resolved → 卡片（契約 §6），CC(tmux watcher) /
+    codex(app-server) / hermes(create 流程) 三 provider 共用同一套
+    upsert/resolve 邏輯 —— 不重寫三份（APPROVAL_HUB_SPEC.md §4/§6 A3）。
+
+    宿主只需要提供：
+    - `store`（卡片庫）——沒有這個屬性就代表宿主自己就是 store
+      （見 `_appr_store`；S1 的 `SessionCardStore` 直接掛這個 mixin，
+      不另外包一層 digest 物件）。
+    - 類屬性 `_appr_prefix`（卡 id 前綴）、`_appr_source`（卡 body.source）、
+      `_appr_default_title`（record 缺 title 時的預設，通常用不到——
+      approvals 的統一物件一定帶 title）。
+    - 選配 `prompt` 屬性 / `_status()` 方法——有就順手同步「等待核准」
+      人話 label（CodexThreadDigest/PersonaDigest 都有）；CC 的
+      SessionCardStore 沒有，因為它的 label 已由 `_cc_card_follower`
+      依 tmux prompt 另外算好，不需要這條路再插一手。
+    """
+    _appr_prefix = "card-appr-"
+    _appr_source = "hermes"
+    _appr_default_title = "需要核准"
+
+    def _appr_store(self):
+        return getattr(self, "store", self)
+
+    def handle_approval(self, record: dict) -> None:
+        """pending approval record（bridge 的統一 approval 物件，A1 wire
+        shape）→ approval 卡（契約 §6）＋（有 prompt/_status 才做的）
+        「等待核准」status。"""
+        if not record or not record.get("id"):
+            return
+        title = record.get("title") or self._appr_default_title
+        store = self._appr_store()
+        if hasattr(self, "prompt"):
+            self.prompt = title
+        body = {"approval_id": record["id"], "title": title,
+                "detail": record.get("detail") or "",
+                # 選項改由發起方宣告(record["options"]);沒宣告才退回二元預設。
+                # 不再把「允許/拒絕」寫死在這裡——見 CHOICE_GATEWAY_CONTRACT §1。
+                "options": record.get("options") or [
+                    {"key": "approve", "label": "允許", "style": "primary"},
+                    {"key": "deny", "label": "拒絕", "style": "danger"}],
+                "source": self._appr_source,
+                "fallback_text": f"🔐 {title}"}
+        if record.get("kind") in ("question", "notice"):
+            # A3:加值欄位 —— app 靠它做 question 直選/notice 單鍵;
+            # 不認得就忽略(fallback 原則)。
+            body["kind"] = record["kind"]
+        store.upsert_card(make_card(
+            f"{self._appr_prefix}{record['id']}", store.turn_id, "system",
+            "approval", body, final=False))
+        if hasattr(self, "_status"):
+            self._status()
+
+    def resolve_approval(self, record: dict, status: str) -> None:
+        """核准已決/失效 → 同卡收尾（options 清空、resolved 註記）。"""
+        if not record or not record.get("id"):
+            return
+        title = record.get("title") or self._appr_default_title
+        store = self._appr_store()
+        if hasattr(self, "prompt"):
+            self.prompt = None
+        store.upsert_card(make_card(
+            f"{self._appr_prefix}{record['id']}", store.turn_id, "system",
+            "approval",
+            {"approval_id": record["id"], "title": title,
+             "options": [], "resolved": status, "source": self._appr_source,
+             "fallback_text": f"🔐 {title} — {status}"}))
+        if hasattr(self, "_status"):
+            self._status()
+
+
+class CodexThreadDigest(ApprovalCardMixin):
     """S2：一個 codex thread 的事件驅動 digest（無輪詢——status/turn/卡片
     全由 app-server 通知推進）。冷載 seed 走 thread/turns/list（舊→新），
     item id 穩定 → seed 與 live 事件 upsert 同一批卡 id，重疊只是 rev 遞增。
     """
+    _appr_prefix = "card-cx-appr-"
+    _appr_source = "codex"
+    _appr_default_title = "Codex approval"
 
     def __init__(self):
         self.store = SessionCardStore()
@@ -415,49 +489,25 @@ class CodexThreadDigest:
                 self.store.upsert_card(card)
             self._status()
 
-    def handle_approval(self, record: dict):
-        """pending approval record（bridge 的 _approval_public 形狀）→
-        approval 卡（契約 §2）＋「等待核准」status。"""
-        if not record or not record.get("id"):
-            return
-        title = record.get("title") or "Codex approval"
-        self.prompt = title
-        self.store.upsert_card(make_card(
-            f"card-cx-appr-{record['id']}", self.store.turn_id, "system",
-            "approval",
-            {"approval_id": record["id"], "title": title,
-             "detail": record.get("detail") or "",
-             # 選項改由發起方宣告(record["options"]);沒宣告才退回二元預設。
-             # 不再把「允許/拒絕」寫死在這裡——見 CHOICE_GATEWAY_CONTRACT §1。
-             "options": record.get("options") or [
-                 {"key": "approve", "label": "允許", "style": "primary"},
-                 {"key": "deny", "label": "拒絕", "style": "danger"}],
-             "source": "codex",
-             "fallback_text": f"🔐 {title}"}, final=False))
-        self._status()
-
-    def resolve_approval(self, record: dict, status: str):
-        """核准已決/失效 → 同卡收尾（options 清空、resolved 註記）。"""
-        if not record or not record.get("id"):
-            return
-        title = record.get("title") or "Codex approval"
-        self.prompt = None
-        self.store.upsert_card(make_card(
-            f"card-cx-appr-{record['id']}", self.store.turn_id, "system",
-            "approval",
-            {"approval_id": record["id"], "title": title,
-             "options": [], "resolved": status, "source": "codex",
-             "fallback_text": f"🔐 {title} — {status}"}))
-        self._status()
+    # handle_approval / resolve_approval：見 ApprovalCardMixin（A3，三 provider 共用）。
 
 
-class SessionCardStore:
+class SessionCardStore(ApprovalCardMixin):
     """契約 §1/§3 的 per-session 卡片庫 + 事件 ring buffer。
 
     只在 asyncio 事件圈裡存取（bridge 全程單圈），不需要鎖。
     seq per-session 嚴格遞增；ring 滿了丟最舊；`since()` 補洞、超範圍回
     None（呼叫端回 410 → app 改走 snapshot 冷載）。ping 不進 ring、不佔 seq。
+
+    掛 `ApprovalCardMixin`：CC(S1) 沒有獨立 digest 物件，approval 卡
+    （`_cc_approval_watcher` 建立/過期時）直接對 store 本身 handle_approval/
+    resolve_approval（`_appr_store()` 偵測不到 `self.store` → 回傳 self）；
+    CC 沒有 `prompt`/`_status()`，mixin 用 hasattr 探測就會跳過那段，
+    label 仍由 `_cc_card_follower` 依 tmux prompt 另外算，不衝突。
     """
+    _appr_prefix = "card-cc-appr-"
+    _appr_source = "claude_code"
+    _appr_default_title = "Claude Code 等待核准"
 
     def __init__(self, ring_max: int = 2000, cards_max: int = 600):
         self.seq = 0
@@ -637,7 +687,7 @@ def extract_studio_cards(text: str) -> tuple:
 # ───────────────────────── S3:persona 事件 → 卡片 ───────────────────────────
 
 
-class PersonaDigest:
+class PersonaDigest(ApprovalCardMixin):
     """S3:一個 persona 的卡片 digest。三個來源,一個卡片庫:
 
     - seed:canonical messages(mid 穩定 → 卡 id,重放同 id)。
@@ -649,20 +699,30 @@ class PersonaDigest:
 
     限制(v0,與 v1 messages/events 相同):只看 bridge canonical 寫入;
     TG 端直跑的 persona 回合要等該輪訊息落 canonical 才會出卡。
+
+    A3:approval 卡走 `ApprovalCardMixin`(hermes create 流程掛鉤,見
+    bridge._hp_cards_feed_approval);`self.prompt` 兼作「有 pending
+    待審」旗標,`_status()` 沿用 CC/codex 同款「有 prompt → 等待核准」
+    人話 label 優先序。
     """
+    _appr_prefix = "card-hp-appr-"
+    _appr_source = "hermes"
+    _appr_default_title = "需要核准"
 
     def __init__(self):
         self.store = SessionCardStore()
         self.known_mids: set = set()
         self.turn_text: dict[str, str] = {}   # 進行中 turn cid → 累積文字
         self.busy = False
+        self.prompt = None                    # pending approval title(A3)
         self.seeded = False
 
     def _status(self, label: str = ""):
         self.store.set_status({
-            "busy": self.busy, "mode": None, "prompt": None,
+            "busy": self.busy, "mode": None, "prompt": self.prompt,
             "phase": "run" if self.busy else "idle",
-            "label": label or ("回覆中" if self.busy else "待命"),
+            "label": label or ("等待核准" if self.prompt else
+                               ("回覆中" if self.busy else "待命")),
         })
 
     def _emit_studio_cards(self, base_cid: str, bodies: list, ts=None):

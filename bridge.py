@@ -6096,6 +6096,12 @@ async def _cc_approval_watcher():
                         continue                     # 同一個 prompt,已建過
                     if active:
                         _cc_approval_set_status(active["aid"], "expired")
+                        try:
+                            _cc_cards_feed_approval(
+                                name, _approval_get_row(active["aid"]) or {},
+                                resolved="expired")
+                        except Exception as e:  # noqa: BLE001
+                            _log_event("cc_cards_feed_error", error=str(e)[:160])
                     aid = _cc_approval_create(name, prompt)
                     _CC_APPROVAL_ACTIVE[name] = {"aid": aid, "sig": sig}
                     opts = " / ".join(str(o.get("label") or "")[:20]
@@ -6103,11 +6109,22 @@ async def _cc_approval_watcher():
                     _approval_push(aid, prompt.get("title") or f"{name} 等待核准",
                                    f"{name}" + (f" · {opts}" if opts else ""),
                                    f"claude_code:{name}")
+                    try:
+                        # A3:CC 卡片流補齊 — pending → approval 卡(三 provider
+                        # 同一組 wire shape,見 carddigest.ApprovalCardMixin)。
+                        _cc_cards_feed_approval(name, _approval_get_row(aid) or {})
+                    except Exception as e:  # noqa: BLE001
+                        _log_event("cc_cards_feed_error", error=str(e)[:160])
                     _log_event("cc_approval_created", session=name,
                                approval_id=aid)
                 elif active:
                     # prompt 消失(TUI 上被回掉/回合結束)→ 記錄過期,feed 不留殭屍
+                    rec = _approval_get_row(active["aid"]) or {}
                     _cc_approval_set_status(active["aid"], "expired")
+                    try:
+                        _cc_cards_feed_approval(name, rec, resolved="expired")
+                    except Exception as e:  # noqa: BLE001
+                        _log_event("cc_cards_feed_error", error=str(e)[:160])
                     _CC_APPROVAL_ACTIVE.pop(name, None)
             except Exception as e:  # noqa: BLE001
                 _log_event("cc_approval_watch_error", session=name,
@@ -6521,6 +6538,21 @@ def _cc_card_store(name: str):
     return store
 
 
+def _cc_cards_feed_approval(name: str, record: dict, resolved: str = "") -> None:
+    """A3(APPROVAL_HUB_SPEC §4/§6):approval 建立/決議 → 對應 CC session 的
+    approval 卡。同 `_cx_cards_feed_approval` 的形狀,只是 CC 沒有獨立
+    digest 物件 —— 直接對 `SessionCardStore`(掛了 `ApprovalCardMixin`)呼叫。
+    只餵「已有人訂閱過」的 store(`_CC_CARD_STORES` 有登記);沒人在看的
+    session 不必為了一張卡片就建 store。"""
+    store = _CC_CARD_STORES.get(name)
+    if not store:
+        return
+    if resolved:
+        store.resolve_approval(record, resolved)
+    else:
+        store.handle_approval(record)
+
+
 def _cc_card_uid(d: dict, jsonl_path: str, lineno: int) -> str:
     u = d.get("uuid")
     if u:
@@ -6572,6 +6604,16 @@ async def _cc_card_seed(store, name: str, workdir: str):
     store.tail_file = jsonl
     store.tail_pos = len(text.encode("utf-8", errors="replace"))
     store.tail_lineno = len(lines)
+    # A3 冷載:pending approval 不在 jsonl 裡(它活在 watcher + DB),seed 時
+    # 從 DB 對回 —— 與 codex seed 補 pending_approval_for_thread 同一精神。
+    active = _CC_APPROVAL_ACTIVE.get(name)
+    if active:
+        try:
+            rec = _approval_get_row(str(active.get("aid") or ""))
+            if rec and rec.get("status") == "pending":
+                _cc_cards_feed_approval(name, rec)
+        except Exception as e:  # noqa: BLE001
+            _log_event("cc_cards_feed_error", error=str(e)[:160])
 
 
 async def _cc_card_follower(name: str, workdir: str):
@@ -6736,6 +6778,24 @@ _HP_CARD_FOLLOWERS: dict = {}   # persona -> asyncio.Task
 _HP_CARD_SEED_MSGS = 200        # 冷載種子:canonical 訊息數
 
 
+def _hp_cards_feed_approval(session_id: str, record: dict, resolved: str = "") -> None:
+    """A3(APPROVAL_HUB_SPEC §4/§6):hermes persona 的 approval 建立/決議 →
+    對應 persona 卡片流的 approval 卡。`session_id` 是統一物件的
+    `hermes:{persona}` 形狀(approval_create 落庫時已經這樣寫);只餵
+    「已有人訂閱過」的 digest(`_HP_CARD_DIGESTS` 有登記),沒訂閱的
+    persona 不必為了一張卡就建 digest。"""
+    if not session_id.startswith("hermes:"):
+        return
+    persona = session_id.split(":", 1)[1]
+    d = _HP_CARD_DIGESTS.get(persona)
+    if not d:
+        return
+    if resolved:
+        d.resolve_approval(record, resolved)
+    else:
+        d.handle_approval(record)
+
+
 def _hp_digest_maybe(session: str):
     """live turn 掛鉤用:有訂閱過才回 digest,否則 None(不建立)。"""
     return _HP_CARD_DIGESTS.get(session)
@@ -6834,6 +6894,11 @@ async def _hp_card_digest(session: str):
             msgs = await asyncio.to_thread(_hp_merged_messages, session,
                                            _HP_CARD_SEED_MSGS)
             d.seed_messages(msgs)
+            # A3 冷載:pending approval 從 DB 對回(與 cc/cx seed 同精神)——
+            # 卡誕生時沒人訂閱這條的話,feed 是 no-op,全靠這裡補。
+            pend = _hermes_pending_by_session().get(f"hermes:{session}")
+            if pend:
+                d.handle_approval(pend)
         except Exception as e:  # noqa: BLE001
             d.seeded = False
             _log_event("hp_card_seed_error", session=session, error=str(e)[:200])
@@ -8891,8 +8956,28 @@ def _hermes_pending_by_session() -> dict:
 
 
 def _approvals_expire(con):
+    now = time.time()
+    # A3:過期不只翻 DB 狀態,存在中的卡片流也要同卡收尾(不然 pending 卡
+    # 掛著可點,點了才吃 409)。先撈再改;卡片收尾是記憶體操作、冪等。
+    try:
+        stale = con.execute(
+            "SELECT id, title, session_id FROM approvals WHERE status='pending' "
+            "AND expires_at IS NOT NULL AND expires_at < ?", (now,)).fetchall()
+    except Exception:  # noqa: BLE001
+        stale = []
     con.execute("UPDATE approvals SET status='expired' WHERE status='pending' "
-                "AND expires_at IS NOT NULL AND expires_at < ?", (time.time(),))
+                "AND expires_at IS NOT NULL AND expires_at < ?", (now,))
+    for aid, title, sid in stale:
+        rec = {"id": aid, "title": title}
+        sid = str(sid or "")
+        try:
+            if sid.startswith("hermes:"):
+                _hp_cards_feed_approval(sid, rec, resolved="expired")
+            elif sid.startswith("claude_code:"):
+                _cc_cards_feed_approval(sid.split(":", 1)[1], rec,
+                                        resolved="expired")
+        except Exception as e:  # noqa: BLE001
+            _log_event("approval_expire_feed_error", id=aid, error=str(e)[:160])
 
 
 # B4 (issue #9): an approval that never expires pends forever if the phone
@@ -8902,18 +8987,73 @@ _APPROVAL_TTL_DEFAULT = 3600.0
 _APPROVAL_TTL_MIN, _APPROVAL_TTL_MAX = 30.0, 7 * 86400.0
 
 
-async def _approval_fire_callback(aid: str, callback: str, status: str, result):
-    """POST the decision to the creator's callback URL (fire-and-forget)."""
+async def _approval_fire_callback(aid: str, callback: str, status: str, result,
+                                  key: str = ""):
+    """POST the decision to the creator's callback URL (fire-and-forget).
+    A3:callback=="persona-relay:" 時不走 HTTP —— 把選中選項的 send 文字
+    (缺席退 label)注入該 persona 對話,由人格接手執行(FED 審稿等
+    「決定即指令」流)。"""
+    if callback == "persona-relay:":
+        try:
+            await _approval_persona_relay(aid, status, key or str(result or ""))
+        except Exception as e:  # noqa: BLE001
+            _log_event("approval_relay_failed", id=aid, status=status,
+                       error=type(e).__name__, error_message=str(e)[:160])
+        return
     try:
         import httpx
         async with httpx.AsyncClient(timeout=10) as client:
             r = await client.post(callback, json={"id": aid, "status": status,
-                                                  "result": result})
+                                                  "result": result, "key": key})
         _log_event("approval_callback_sent", id=aid, status=status,
                    http_status=r.status_code)
     except Exception as e:  # noqa: BLE001
         _log_event("approval_callback_failed", id=aid, status=status,
                    error=type(e).__name__, error_message=str(e)[:160])
+
+
+async def _approval_persona_relay(aid: str, status: str, key: str):
+    """決定 → persona 指令注入。expired/逾時不注入(沒人做決定就不該有動作)。"""
+    if status == "expired" or not key:
+        return
+    d = _approval_get_row(aid)
+    sid = str((d or {}).get("session_id") or "")
+    if not sid.startswith("hermes:"):
+        return
+    session = sid.split(":", 1)[1]
+    if session not in PERSONAS:
+        _log_event("approval_relay_skipped", id=aid, reason="unknown persona",
+                   session=session)
+        return
+    opt = next((o for o in (d.get("options") or [])
+                if str(o.get("key") or "") == key), None)
+    text = str((opt or {}).get("send") or (opt or {}).get("label") or "").strip()
+    if not text:
+        return
+    _log_event("approval_relay_inject", id=aid, session=session, key=key,
+               chars=len(text))
+    await _persona_inject_turn(
+        session,
+        f"【審核決定 · {d.get('title') or aid}】{text}",
+        via="approval_relay")
+
+
+async def _persona_inject_turn(session: str, content: str, via: str):
+    """內部發起的 persona 回合(approval persona-relay 等):與 v1/v2 input
+    同一套前置/canonical/卡片掛鉤,fire-and-forget —— 回覆走 S3 卡片事件流
+    與 canonical,不佔任何 client 連線。"""
+    cid = "appmsg-" + uuid.uuid4().hex[:20]
+    turn_started = time.monotonic()
+    common_log = {"cid": cid, "session": session, "client_id_hash": None,
+                  "client": "internal", "dry_run": False,
+                  "input_chars": len(content), "via": via}
+    _log_event("app_turn_received", **common_log)
+    content, att_meta, prompt = await _persona_prepare_turn(session, content, [])
+    user_mid, canonical_user_ok = _canon_add_retry(session, "user", content,
+                                                   att_meta)
+    _hp_cards_turn_start(session, cid, user_mid, content, att_meta)
+    _persona_launch_turn(session, prompt, None, common_log, turn_started,
+                         canonical_user_ok, cid)
 
 
 @app.post("/app/v1/approvals")
@@ -8932,9 +9072,18 @@ async def approval_create(request: Request):
         ttl = _APPROVAL_TTL_DEFAULT
     ttl = max(_APPROVAL_TTL_MIN, min(ttl, _APPROVAL_TTL_MAX))
     callback = (str(b.get("callback_url") or "").strip() or None)
-    if callback and not callback.startswith(("http://", "https://")):
-        raise HTTPException(status_code=400, detail="callback_url must be http(s)")
+    # A3:persona-relay: 為內部 callback 傳輸 —— 決定後把選中選項的 send
+    # 文字注入該 persona 對話(FED 審稿等「決定即指令」流),不走 HTTP。
+    if callback and callback != "persona-relay:" \
+            and not callback.startswith(("http://", "https://")):
+        raise HTTPException(status_code=400,
+                            detail="callback_url must be http(s) or persona-relay:")
     session_id = str(b.get("session_id") or b.get("source") or "").strip()
+    if callback == "persona-relay:" and not (
+            session_id.startswith("hermes:")
+            and session_id.split(":", 1)[1] in PERSONAS):
+        raise http_err(400, "INVALID_CALLBACK",
+                       "persona-relay: 需要 session_id=hermes:{persona}(已註冊人格)")
     kind = str(b.get("kind") or "permission").strip()
     if kind not in _APPROVAL_KINDS:
         raise http_err(400, "INVALID_KIND", f"kind 必須是 {'|'.join(_APPROVAL_KINDS)}")
@@ -8953,6 +9102,11 @@ async def approval_create(request: Request):
                 style = "danger"
             if style in ("primary", "secondary", "danger"):
                 ent["style"] = style
+            # A3:send = 建立方宣告「這鍵決定後要對 persona 說的話」
+            # (persona-relay 消費;app 不認得就忽略,fallback 原則)。
+            send = str(o.get("send") or "").strip()
+            if send:
+                ent["send"] = send[:200]
             norm.append(ent)
         options = norm
     now = time.time()
@@ -8968,6 +9122,17 @@ async def approval_create(request: Request):
     con.commit()
     con.close()
     title = b.get("title") or "需要核准"
+    try:
+        # A3:hermes create 流程補齊卡片流 — pending → approval 卡(與
+        # cc/codex 同一組 wire shape,見 carddigest.ApprovalCardMixin)。
+        _hp_cards_feed_approval(session_id, _approval_get_row(aid) or {})
+    except Exception as e:  # noqa: BLE001
+        _log_event("hp_cards_feed_error", error=str(e)[:160])
+    if b.get("push") is False:
+        # A3:建立方已用自己的通道通知過(例:cron 報告本體已推)→ 不疊
+        # 推播;待審列/卡片照常存在。
+        return {"id": aid, "status": "pending", "expires_at": now + ttl,
+                "kind": kind, "session_id": session_id}
     body = (b.get("detail") or session_id or "點開查看並決定")[:120]
     _approval_push(aid, title, body, session_id)
     return {"id": aid, "status": "pending", "expires_at": now + ttl,
@@ -9092,6 +9257,11 @@ async def _approval_decide_core(aid: str, b: dict) -> dict:
         await _cc_key_core(name, key)
         _cc_approval_set_status(aid, decision)
         _CC_APPROVAL_ACTIVE.pop(name, None)
+        try:
+            # A3:決定發生時也要收尾卡片流(同一決定路徑,三 provider 一致)。
+            _cc_cards_feed_approval(name, d, resolved=decision)
+        except Exception as e:  # noqa: BLE001
+            _log_event("cc_cards_feed_error", error=str(e)[:160])
         _log_event("cc_approval_decision", session=name, approval_id=aid,
                    status=decision, key=key)
         return {"id": aid, "status": decision, "key": key}
@@ -9145,11 +9315,19 @@ async def _approval_decide_core(aid: str, b: dict) -> dict:
     con.close()
     if not changed:
         raise HTTPException(status_code=409, detail="already decided or expired")
+    try:
+        # A3:hermes 決定發生時收尾卡片流(同一決定路徑,三 provider 一致)。
+        # _hp_cards_feed_approval 內部會篩 session_id 前綴,非 hermes: 的列
+        # (例如舊資料 session_id 空缺)在這裡是安全 no-op。
+        _hp_cards_feed_approval(str((d or {}).get("session_id") or ""),
+                               d or {}, resolved=status)
+    except Exception as e:  # noqa: BLE001
+        _log_event("hp_cards_feed_error", error=str(e)[:160])
     # B4 (issue #9): push the decision back to the creator (Hermes skill / TG
     # flow) so it doesn't have to poll GET /app/v1/approvals/{id}.
     if cb_row and cb_row[0]:
         asyncio.create_task(_approval_fire_callback(
-            aid, cb_row[0], status, result_val))
+            aid, cb_row[0], status, result_val, key=key))
     return {"id": aid, "status": status, "key": key}
 
 
