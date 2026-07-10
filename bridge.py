@@ -2166,15 +2166,20 @@ CLAUDE_BIN = "/Users/xcash/.local/bin/claude"
 # 卡死,app 端該 session 空白且送不出。優先挑 Codex.app 內建的 0.142(VS Code 同款、
 # 共用 ~/.codex 登入),對不上再退回 standalone。CODEX_BIN 環境變數可覆蓋。
 def _resolve_codex_bin() -> str:
+    # 2026-07-10 事故:ChatGPT.app 更新把 Codex Desktop 併入、/Applications/Codex.app
+    # 整個消失 → 舊首選路徑失效,fallback 到 0.137 又是「讀新 thread 會 crash」地雷,
+    # 手機 CX 全空數小時且無錯誤日誌。候選序補上 ChatGPT.app 的新家,且 spawn 時
+    # 每次重新解析(見 _ensure_started_locked),桌面 app 更新不再需要重啟 bridge。
     for c in (os.environ.get("CODEX_BIN"),
               "/Applications/Codex.app/Contents/Resources/codex",
+              "/Applications/ChatGPT.app/Contents/Resources/codex",
               os.path.expanduser("~/.local/bin/codex")):
         if c and os.path.exists(c):
             return c
     return "/Users/xcash/.local/bin/codex"
 
 
-CODEX_BIN = _resolve_codex_bin()
+CODEX_BIN = _resolve_codex_bin()   # 僅供顯示/預設;spawn 走 _resolve_codex_bin()
 
 
 class CodexAppServerError(RuntimeError):
@@ -2241,19 +2246,25 @@ class CodexAppServerClient:
         self.pending_approvals.clear()
         self.pending_approvals_by_thread.clear()
         self._expire_stale_codex_approvals()
-        self.proc = await asyncio.create_subprocess_exec(
-            CODEX_BIN, "app-server", "--stdio",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            stdin=asyncio.subprocess.PIPE,
-            cwd=HOME_ROOT,
-            # StreamReader 單行上限。codex app-server 把每個 JSON-RPC 回應當「一行」
-            # 送;thread/turns/list itemsView=full 若含 computer-use 截圖(base64)可能
-            # 單行破 8MB → asyncio 讀取器丟 LimitOverrunError(「Separator is not found,
-            # and chunk exceed the limit」)→ reader task 死 → app-server「stopped」→ 整條
-            # codex 卡死(XCash 就是這樣)。放大到 128MB 吃得下含圖的大回應。
-            limit=128 * 1024 * 1024,
-        )
+        codex_bin = _resolve_codex_bin()   # 每次 spawn 重新解析:桌面 app 更新後路徑會變
+        self.spawned_bin = codex_bin
+        try:
+            self.proc = await asyncio.create_subprocess_exec(
+                codex_bin, "app-server", "--stdio",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                stdin=asyncio.subprocess.PIPE,
+                cwd=HOME_ROOT,
+                # StreamReader 單行上限。codex app-server 把每個 JSON-RPC 回應當「一行」
+                # 送;thread/turns/list itemsView=full 若含 computer-use 截圖(base64)可能
+                # 單行破 8MB → asyncio 讀取器丟 LimitOverrunError(「Separator is not found,
+                # and chunk exceed the limit」)→ reader task 死 → app-server「stopped」→ 整條
+                # codex 卡死(XCash 就是這樣)。放大到 128MB 吃得下含圖的大回應。
+                limit=128 * 1024 * 1024,
+            )
+        except (FileNotFoundError, PermissionError) as e:
+            _log_event("codex_spawn_failed", bin=codex_bin, error=type(e).__name__)
+            raise CodexAppServerError(f"codex binary unavailable: {codex_bin}") from e
         self._reader_task = asyncio.create_task(self._read_stdout())
         self._stderr_task = asyncio.create_task(self._read_stderr())
         init = await self._call_started_locked(
@@ -2271,7 +2282,8 @@ class CodexAppServerClient:
         await self._write_locked({"jsonrpc": "2.0", "method": "initialized"})
         _log_event("codex_app_server_started",
                    user_agent=(init or {}).get("userAgent", ""),
-                   codex_home=(init or {}).get("codexHome", ""))
+                   codex_home=(init or {}).get("codexHome", ""),
+                   bin=codex_bin)
 
     def _expire_stale_codex_approvals(self):
         import sqlite3
@@ -3053,6 +3065,11 @@ async def _codex_warm_threads(thread_ids: list) -> None:
     likely to tap next, so entering one skips the cold load. Strictly
     sequential and skip-if-loaded, so it never amplifies app-server queueing —
     at most one warm call is in the single _lock queue at a time."""
+    # 風險控管:若 spawn 到的是 ~/.local/bin 的舊 standalone(0.137 地雷版),
+    # 停用 warmup 的 thread/resume —— 0.137 resume/讀 0.142+ 建的 thread 會
+    # 引爆 app-server crash 連鎖(下一次「CX 全空」最可能的引信)。
+    if str(getattr(CODEX_APP, "spawned_bin", "")).endswith("/.local/bin/codex"):
+        return
     for tid in thread_ids:
         if not tid or tid in CODEX_APP.loaded_threads:
             continue
@@ -3960,7 +3977,7 @@ async def _run_dispatch(sid: str, tool: str, task: str, cwd: str, isolate: bool 
             sub["cwd"] = wt   # follow-ups stay in the same isolated tree
             sub["output"].append(("text", f"_(隔離工作區 worktree:`{wt}` · 分支 `pocket/{sid}`)_\n\n"))
     if tool == "codex":
-        argv = [CODEX_BIN, "exec", "--json", task]
+        argv = [_resolve_codex_bin(), "exec", "--json", task]
     else:
         argv = _claude_argv(sub.get("parent", "yuanfang"), task)
     await _stream_agent(sid, argv, run_cwd, "dispatch 失敗")
@@ -3972,7 +3989,7 @@ async def _run_resume(sid: str, prompt: str):
     sub = SUBSESSIONS[sid]
     cwd = sub.get("cwd") or HOME_ROOT
     if sub.get("tool") == "codex":
-        argv = [CODEX_BIN, "exec", "--json", prompt]   # codex: new exec in same cwd
+        argv = [_resolve_codex_bin(), "exec", "--json", prompt]   # codex: new exec in same cwd
     else:
         argv = _claude_argv(sub.get("parent", "yuanfang"), prompt, resume=sub.get("cc_session"))
     await _stream_agent(sid, argv, cwd, "追問失敗")
@@ -4440,6 +4457,94 @@ def _cc_latest_jsonl(workdir: str):
     return max(files, key=os.path.getmtime) if files else None
 
 
+# ─── CC session 身分(per-session jsonl)────────────────────────────────────
+# 「session 身分 = 工作目錄」是身分混淆 bug 的根:同 workdir 的兩個 tmux session
+# (如 Main 與 cc-51a85f55)全被 dir-latest jsonl 代表,誰最後寫誰就是全目錄——
+# 清單/status/stream/卡片流全部混流。正解:從 tmux pane 的子行程樹找 claude 的
+# cmdline,parse --resume/--session-id 的 uuid → <projects>/<slug>/<uuid>.jsonl。
+# 實測本機 pgrep -P 對部分 pane 回空,所以用一次性 ps 快照(TTL 共用)。
+_CC_SID_RE = re.compile(r"--(?:resume|session-id)\s+([0-9a-fA-F][0-9a-fA-F-]{7,63})")
+_CC_SID_CACHE: dict = {}   # name -> (cached_at_monotonic, sid_or_None)
+_CC_SID_TTL = 30.0         # claude 行程在 session 生命週期內穩定;None 也快取避免狂掃
+_PS_SNAP = (0.0, {})       # (cached_at, {pid: (ppid, command)})
+_PS_SNAP_TTL = 5.0
+
+
+async def _ps_snapshot():
+    global _PS_SNAP
+    now = time.monotonic()
+    if now - _PS_SNAP[0] < _PS_SNAP_TTL:
+        return _PS_SNAP[1]
+    p = await asyncio.create_subprocess_exec(
+        "/bin/ps", "-axo", "pid=,ppid=,command=",
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+    try:
+        out, _ = await asyncio.wait_for(p.communicate(), 10.0)
+    except asyncio.TimeoutError:
+        try:
+            p.kill()
+        except ProcessLookupError:
+            pass
+        return _PS_SNAP[1]
+    procs = {}
+    for line in (out or b"").decode("utf-8", "replace").splitlines():
+        parts = line.strip().split(None, 2)
+        if len(parts) == 3 and parts[0].isdigit() and parts[1].isdigit():
+            procs[int(parts[0])] = (int(parts[1]), parts[2])
+    _PS_SNAP = (now, procs)
+    return procs
+
+
+async def _cc_pane_session_id(name: str):
+    """tmux pane 子行程樹裡 claude 的 --resume/--session-id uuid;失敗回 None。"""
+    now = time.monotonic()
+    hit = _CC_SID_CACHE.get(name)
+    if hit and now - hit[0] < _CC_SID_TTL:
+        return hit[1]
+    sid = None
+    try:
+        rc, out, _ = await _tmux_run("list-panes", "-t", name, "-F", "#{pane_pid}")
+        pane_pid = int(out.split()[0]) if rc == 0 and out.strip() else 0
+        if pane_pid:
+            procs = await _ps_snapshot()
+            kids: dict = {}
+            for pid, (ppid, _cmd) in procs.items():
+                kids.setdefault(ppid, []).append(pid)
+            stack, seen = [pane_pid], set()
+            while stack:                      # 走整棵子孫樹(claude 可能包在 zsh 下)
+                pid = stack.pop()
+                if pid in seen:
+                    continue
+                seen.add(pid)
+                cmd = procs.get(pid, (0, ""))[1]
+                if "claude" in cmd:
+                    m = _CC_SID_RE.search(cmd)
+                    if m:
+                        sid = m.group(1)
+                        break
+                stack.extend(kids.get(pid, []))
+    except Exception:  # noqa: BLE001
+        sid = None
+    _CC_SID_CACHE[name] = (now, sid)
+    return sid
+
+
+async def _cc_session_jsonl(name: str, workdir: str):
+    """這個 ccsess 的專屬 jsonl:pane 行程 sid 優先,失敗才 fallback dir-latest。
+    已知限制:TUI 內 /clear 或 /resume 會讓 cmdline 的 uuid 過期(行程不重啟、
+    實際寫新 jsonl)——hook(/ccsessions/_hook)帶的 session_id 會即時覆寫
+    _CC_SID_CACHE 來補這個洞(UserPromptSubmit 每回合都帶最新 sid,權威)。"""
+    sid = await _cc_pane_session_id(name)
+    if sid:
+        p = os.path.join(_cc_project_dir(workdir), sid + ".jsonl")
+        if os.path.exists(p):
+            return p
+        p = _cchist_find(sid)      # slug 正規化差異時跨 project glob
+        if p:
+            return p
+    return _cc_latest_jsonl(workdir)   # 向下相容:找不到行程/parse 失敗/裸 claude
+
+
 def _cc_conf_rows():
     rows = []
     try:
@@ -4501,6 +4606,14 @@ def _cc_name_for_cwd(cwd: str | None):
     return None
 
 
+def _cc_names_for_cwd(cwd: str | None) -> list:
+    """同 workdir 的所有 conf 名(撞 workdir 時 hook 需要用 session_id 消歧)。"""
+    if not cwd:
+        return []
+    target = _norm_cc_workdir(cwd)
+    return [n for n, w, _e in _cc_conf_rows() if _norm_cc_workdir(w) == target]
+
+
 def _cc_fresh_hook_state(name: str):
     state = _CC_HOOK_STATE.get(name)
     if not state:
@@ -4521,11 +4634,11 @@ async def _tmux_alive(name: str) -> bool:
         return False
 
 
-def _cc_last_activity(workdir: str):
+def _cc_last_activity(jsonl):
     """Transcript mtime for the home recency sort. Just os.path.getmtime — no file
     read/parse (the app shows YOUR last sent command from its local SentLog, so the
-    server needn't extract a preview). Cheap enough to run per-poll."""
-    jsonl = _cc_latest_jsonl(workdir)
+    server needn't extract a preview). Cheap enough to run per-poll.
+    收 per-session jsonl(_cc_session_jsonl 解析),不再吃 dir-latest。"""
     if not jsonl:
         return (0.0, "")
     try:
@@ -4537,14 +4650,14 @@ def _cc_last_activity(workdir: str):
 _cc_head_cache: dict = {}   # jsonl path -> (sessionId, title)
 
 
-def _cc_session_head(workdir: str):
+def _cc_session_head(jsonl):
     """(sessionId, title) for the Claude session this remote is running, so the app
     can map a Pocket remote ("Main") to its Claude-app session ("Session review…").
     sessionId = jsonl basename (free). title = first real user message, read from the
     top and stopped early. Cached BY PATH: both are stable for the life of the session
     file, so even a huge actively-appended jsonl is read at most once (never re-read
-    per poll like _cchist_meta would)."""
-    jsonl = _cc_latest_jsonl(workdir)
+    per poll like _cchist_meta would).
+    收 per-session jsonl(_cc_session_jsonl 解析),不再吃 dir-latest。"""
     if not jsonl:
         return (None, None)
     cached = _cc_head_cache.get(jsonl)
@@ -4602,8 +4715,9 @@ async def _cc_sessions():
                     awaiting = True
             except Exception:  # noqa: BLE001
                 busy = False
-        mtime, preview = _cc_last_activity(workdir)
-        sid, stitle = _cc_session_head(workdir)
+        jsonl = await _cc_session_jsonl(name, workdir)
+        mtime, preview = _cc_last_activity(jsonl)
+        sid, stitle = _cc_session_head(jsonl)
         out.append({"name": name, "workdir": workdir,
                     "status": "running" if alive else "down", "busy": busy,
                     "awaiting": awaiting, "updatedAt": mtime, "preview": preview,
@@ -4701,7 +4815,7 @@ def _fmt_cc_event(d: dict) -> str:
 # re-scan an unchanged file.
 _CC_CONTEXT_WINDOW = 200_000
 _CC_JSONL_TAIL_BYTES = 262_144
-_CC_JSONL_SCAN_CACHE: dict = {}   # workdir -> (jsonl, mtime, usage, plan)
+_CC_JSONL_SCAN_CACHE: dict = {}   # jsonl path -> (jsonl, mtime, usage, plan)
 
 
 def _cc_jsonl_tail_events(jsonl: str):
@@ -4719,16 +4833,17 @@ def _cc_jsonl_tail_events(jsonl: str):
     return events
 
 
-def _cc_scan_jsonl(workdir: str):
-    """→ (usage_dict_or_None, latest_plan_or_None) for the session's live jsonl."""
-    jsonl = _cc_latest_jsonl(workdir)
+def _cc_scan_jsonl(jsonl):
+    """→ (usage_dict_or_None, latest_plan_or_None) for the session's live jsonl.
+    收 per-session jsonl(_cc_session_jsonl 解析);快取以 jsonl path 為 key,
+    同 workdir 的兩個 session 不再共用同一筆(身分混淆 bug)。"""
     if not jsonl:
         return (None, None)
     try:
         mt = os.path.getmtime(jsonl)
     except OSError:
         return (None, None)
-    hit = _CC_JSONL_SCAN_CACHE.get(workdir)
+    hit = _CC_JSONL_SCAN_CACHE.get(jsonl)
     if hit and hit[0] == jsonl and hit[1] == mt:
         return (hit[2], hit[3])
     usage = plan = None
@@ -4759,9 +4874,9 @@ def _cc_scan_jsonl(workdir: str):
             if usage is not None and plan is not None:
                 break
     except Exception as e:  # noqa: BLE001
-        _log_event("cc_jsonl_scan_failed", workdir=workdir,
+        _log_event("cc_jsonl_scan_failed", jsonl=os.path.basename(jsonl or ""),
                    error=type(e).__name__, error_message=str(e)[:120])
-    _CC_JSONL_SCAN_CACHE[workdir] = (jsonl, mt, usage, plan)
+    _CC_JSONL_SCAN_CACHE[jsonl] = (jsonl, mt, usage, plan)
     return (usage, plan)
 
 
@@ -4960,7 +5075,7 @@ async def cc_session_stream(name: str, request: Request, replay: int = 80):
 
     async def gen():
         yield chunk({"role": "assistant", "content": ""})
-        jsonl = _cc_latest_jsonl(workdir)
+        jsonl = await _cc_session_jsonl(name, workdir)
         pos = 0
         if jsonl and os.path.exists(jsonl):
             try:
@@ -4993,7 +5108,7 @@ async def cc_session_stream(name: str, request: Request, replay: int = 80):
                 yield "data: [DONE]\n\n"
                 break
             await asyncio.sleep(1.0)
-            cur = _cc_latest_jsonl(workdir)
+            cur = await _cc_session_jsonl(name, workdir)
             if cur != jsonl:                      # session rotated to a new jsonl
                 jsonl, pos = cur, 0
             if jsonl and os.path.exists(jsonl):
@@ -5047,7 +5162,7 @@ async def cc_session_history(name: str, request: Request, offset: int = 0, limit
     row = next((r for r in _cc_conf_rows() if r[0] == name), None)
     if not row:
         raise http_err(404, "SESSION_NOT_FOUND", "unknown session")
-    jsonl = _cc_latest_jsonl(row[1])
+    jsonl = await _cc_session_jsonl(name, row[1])
     if not jsonl or not os.path.exists(jsonl):
         return {"text": "", "more": False}
     try:
@@ -5295,6 +5410,22 @@ async def _cc_paste_text(name: str, text: str) -> None:
                                                "-b", buf, "-p", "-d")
         await asyncio.sleep(0.25)                    # let the editor settle
         rc_enter, _, e_enter = await _tmux_run("send-keys", "-t", name, "Enter")
+        # Enter 落地驗證+重試:長貼文(尤其 CJK)0.25s 未必夠,TUI 還在消化
+        # 貼上時 Enter 會被吞——結果是 API 回 200 但訊息掛在輸入框沒送出,
+        # 使用者只看到「連線逾時」以為壞掉。送完 Enter 後檢查 composer 是否
+        # 真的清空(live ❯ 之後還看得到貼文開頭 = 沒送出),沒清就補 Enter,
+        # 最多三次。誤判補送的 Enter 對空 composer 是 no-op,安全。
+        probe = text[:24].strip()
+        if not rc_enter and probe:
+            for _ in range(3):
+                await asyncio.sleep(0.6)
+                pane_now = await _cc_capture_pane_fresh(name)
+                marker = pane_now.rfind("❯")
+                if marker < 0 or probe not in pane_now[marker:]:
+                    break                            # composer 已清空 → 已送出
+                _log_event("cc_paste_enter_retry", session=name,
+                           text_chars=len(text))
+                await _tmux_run("send-keys", "-t", name, "Enter")
     except Exception as e:  # noqa: BLE001
         _log_event("cc_paste_failed", session=name, text_chars=len(text),
                    step="exec", error=f"{type(e).__name__}: {str(e)[:160]}")
@@ -5437,9 +5568,21 @@ async def cc_session_hook(request: Request):
     event = body.get("hook_event_name")
     if event not in ("UserPromptSubmit", "Stop"):
         return {"ok": True, "ignored": True}
-    name = _cc_name_for_cwd(body.get("cwd"))
+    # 同 workdir 撞名時用 hook 原生帶的 session_id 消歧(身分混淆修正);
+    # 並順手把權威 sid 回寫 _CC_SID_CACHE —— 這同時補上「TUI 內 /clear 或
+    # /resume 後 cmdline uuid 過期」的洞:hook 每回合都帶最新 sid。
+    hook_sid = str(body.get("session_id") or "")
+    names = _cc_names_for_cwd(body.get("cwd"))
+    if len(names) > 1 and hook_sid:
+        matched = [n for n in names
+                   if (_CC_SID_CACHE.get(n) or (0, None))[1] == hook_sid]
+        names = matched or names[:1]
+    name = names[0] if names else None
     if not name:
         return {"ok": True, "ignored": True}
+    if hook_sid and len(_cc_names_for_cwd(body.get("cwd"))) == 1:
+        # workdir 唯一對應 → hook sid 就是這條 session 的權威身分,直接回寫。
+        _CC_SID_CACHE[name] = (time.monotonic(), hook_sid)
     now = time.time()
     state = {"busy": event == "UserPromptSubmit", "updated_at": now, "source": "hook"}
     if event == "Stop":
@@ -5489,7 +5632,7 @@ async def _cc_status_core(name: str) -> dict:
     # wave 2: usage meter + full plan text from the transcript jsonl.
     row = next((r for r in _cc_conf_rows() if r[0] == name), None)
     if row:
-        usage, plan = _cc_scan_jsonl(row[1])
+        usage, plan = _cc_scan_jsonl(await _cc_session_jsonl(name, row[1]))
         if usage:
             st["usage"] = usage
         if prompt and plan and "plan" in low:
@@ -5576,7 +5719,7 @@ async def _cc_key_core(name: str, raw: str) -> dict:
 # (送 TUI 鍵),三線同一條 approval 管線(批次 3 完成判準)。
 
 _CC_APPROVAL_ACTIVE: dict = {}      # name -> {"aid": str, "sig": str}
-_CC_APPROVAL_POLL_SECS = 4.0
+_CC_APPROVAL_POLL_SECS = 1.5   # 4.0→1.5:審核偵測延遲主項;只巡 app-owned,可負擔
 _CC_APPROVAL_TTL = 900.0
 
 _CC_ALLOW_RE = re.compile(r"^(always allow|allow|yes)", re.IGNORECASE)
@@ -5640,7 +5783,10 @@ def _cc_approval_create(name: str, prompt: dict) -> str:
 
 
 async def _cc_approval_watcher():
-    """常駐:每 4s 巡一輪 enabled CC sessions(pane 走快取,成本低)。"""
+    """常駐:每 1.5s 巡一輪 owned CC sessions,強制拿新 pane(不吃 5s 快取)。
+    舊配置(4s 間隔 + 5s 舊 pane)讓「prompt 出現→建 approval」最壞 ~9 秒;
+    現在 ≤1.5s。只巡 app-owned(通常 1-7 條),capture-pane 一次 ~10-20ms,
+    可負擔;順帶把新鮮 pane 回填快取給首頁清單用。"""
     while True:
         await asyncio.sleep(_CC_APPROVAL_POLL_SECS)
         owned = _cc_app_owned_names()   # 只推 app 自己開的 CC session 的審核
@@ -5652,6 +5798,7 @@ async def _cc_approval_watcher():
             if name not in owned:
                 continue
             try:
+                _PANE_CACHE.pop(name, None)   # 審核偵測不能吃舊畫面
                 st = await _cc_status_core(name)
                 prompt = st.get("prompt")
                 active = _CC_APPROVAL_ACTIVE.get(name)
@@ -5797,6 +5944,7 @@ async def v2_agents(request: Request):
 async def v2_sessions(request: Request, provider: str = "", status: str = ""):
     _check_auth(request)
     out = []
+    degraded = []   # 取清單失敗的 provider(目前只有 codex 分支會標)
     out.extend(await _delegation_v2_sessions())
     for name, workdir, enabled in _cc_conf_rows():
         if enabled != "1":
@@ -5833,13 +5981,19 @@ async def v2_sessions(request: Request, provider: str = "", status: str = ""):
                         "last_event_at": s.get("lastEventAt"),
                         "capabilities": caps,
                         "meta": {"approval": CODEX_APP._approval_public(approval) if approval else None}})
-    except Exception:  # noqa: BLE001
-        pass
+    except Exception as e:  # noqa: BLE001
+        # 不再無聲吞錯:codex app-server 掛掉時 CX 區直接消失、log 零痕跡,
+        # 「CX 全空」查不到原因(2026-07-10 ChatGPT.app 併購式更新事故)。
+        _log_event("v2_codex_list_failed", error=type(e).__name__,
+                   error_message=str(e)[:200])
+        degraded.append("codex")
     if provider:
         out = [s for s in out if s["provider"] == provider]
     if status:
         out = [s for s in out if s["status"] == status]
-    return {"sessions": out}
+    # degraded_providers:清單為空 ≠ 沒有 session,可能是 provider 暫時掛了。
+    # 舊 app 忽略新欄位,向後相容;新 app 可據此顯示「清單暫時無法取得」。
+    return {"sessions": out, "degraded_providers": degraded}
 
 
 def _approval_bool_from_body(body: dict) -> bool:
@@ -6082,7 +6236,7 @@ async def _cc_card_seed(store, name: str, workdir: str):
     if store.seeded:
         return
     store.seeded = True
-    jsonl = _cc_latest_jsonl(workdir)
+    jsonl = await _cc_session_jsonl(name, workdir)
     if not jsonl or not os.path.exists(jsonl):
         return
     try:
@@ -6108,7 +6262,7 @@ async def _cc_card_follower(name: str, workdir: str):
     while True:
         await asyncio.sleep(1.0)
         try:
-            cur = _cc_latest_jsonl(workdir)
+            cur = await _cc_session_jsonl(name, workdir)
             if cur != store.tail_file:               # session 換了新 jsonl
                 store.tail_file, store.tail_pos, store.tail_lineno = cur or "", 0, 0
             j = store.tail_file
