@@ -406,6 +406,91 @@ check("mixin kind=question 上卡", k1 is not None and k1["body"].get("kind") ==
 check("mixin kind=permission 不帶 kind 欄位", k2 is not None and "kind" not in k2["body"])
 
 
+# ─────────────── 8. A3-3:cron 報告 → kind=notice approval ──────────────────
+
+import hashlib  # noqa: E402
+
+
+def _ntc_aid(rid):
+    return "ntc-" + hashlib.sha1(rid.encode()).hexdigest()[:20]
+
+
+_orig_notice_jobs = bridge.NOTICE_REPORT_JOBS
+bridge.NOTICE_REPORT_JOBS = {"xcash": {"testjob-brief"}}
+
+_rp1 = {"id": "rp-ntc-1", "name": "testjob-brief", "label": "測試晨報",
+        "content": "內容" * 300, "ts": time.time()}
+try:
+    bridge._notice_for_report("xcash", _rp1)
+    row = bridge._approval_get_row(_ntc_aid("rp-ntc-1"))
+    check("notice:新報告建 pending notice", row is not None and
+          row["status"] == "pending" and row["kind"] == "notice" and
+          row["session_id"] == "hermes:xcash")
+    check("notice:detail 有截斷(200 + _clip_text 後綴)", row is not None and
+          len(row.get("detail") or "") <= 240)
+    check("notice:單鍵 ack 選項", row is not None and
+          [o["key"] for o in (row.get("options") or [])] == ["ack"])
+
+    # 冪等:ack 後重同步不翻回 pending
+    asyncio.run(bridge._approval_decide_core(_ntc_aid("rp-ntc-1"), {"key": "ack"}))
+    bridge._notice_for_report("xcash", _rp1)
+    row2 = bridge._approval_get_row(_ntc_aid("rp-ntc-1"))
+    check("notice:同 id 不重建(ack 不被翻回 pending)",
+          row2 is not None and row2["status"] == "acknowledged")
+
+    # 名單外 / 過舊 → 不建
+    bridge._notice_for_report("xcash", {"id": "rp-ntc-2", "name": "other-job",
+                                        "label": "x", "content": "y",
+                                        "ts": time.time()})
+    check("notice:名單外 job 不建", bridge._approval_get_row(_ntc_aid("rp-ntc-2")) is None)
+    bridge._notice_for_report("xcash", {"id": "rp-ntc-3", "name": "testjob-brief",
+                                        "label": "x", "content": "y",
+                                        "ts": time.time() - 13 * 3600})
+    check("notice:過舊報告不建(防回灌)",
+          bridge._approval_get_row(_ntc_aid("rp-ntc-3")) is None)
+
+    # 卡片 feed 排回主圈(_MAIN_LOOP + call_soon_threadsafe)
+    _ntc_feed_calls = []
+    _orig_hp_feed3 = bridge._hp_cards_feed_approval
+    bridge._hp_cards_feed_approval = (
+        lambda sid, record, resolved="": _ntc_feed_calls.append((sid, record["id"])))
+
+    async def _run_in_loop():
+        bridge._MAIN_LOOP = asyncio.get_running_loop()
+        bridge._notice_for_report("xcash", {"id": "rp-ntc-4", "name": "testjob-brief",
+                                            "label": "測試晨報", "content": "hi",
+                                            "ts": time.time()})
+        await asyncio.sleep(0.01)
+    try:
+        asyncio.run(_run_in_loop())
+        check("notice:卡片 feed 排回主圈執行",
+              _ntc_feed_calls == [("hermes:xcash", _ntc_aid("rp-ntc-4"))])
+    finally:
+        bridge._hp_cards_feed_approval = _orig_hp_feed3
+        bridge._MAIN_LOOP = None
+
+    # _sync_persona_reports 接線:新 upsert 觸發 notice
+    _orig_persona_reports = bridge._persona_reports
+    _orig_write_mem = bridge._write_report_memory
+    bridge._persona_reports = lambda session, limit=20: [
+        {"id": "rp-ntc-5", "external_id": "x:5", "external_source": "hermes-cron",
+         "session_id": "cron_ab_1", "name": "testjob-brief", "label": "測試晨報",
+         "content": "sync 內容", "ts": time.time()}]
+    bridge._write_report_memory = lambda session, reports: None
+    try:
+        bridge._sync_persona_reports("xcash", 50)
+        check("notice:_sync_persona_reports 新 upsert 觸發 notice",
+              bridge._approval_get_row(_ntc_aid("rp-ntc-5")) is not None)
+        bridge._sync_persona_reports("xcash", 50)   # 同內容重同步:無新 upsert
+        row5 = bridge._approval_get_row(_ntc_aid("rp-ntc-5"))
+        check("notice:重同步不重建", row5 is not None and row5["status"] == "pending")
+    finally:
+        bridge._persona_reports = _orig_persona_reports
+        bridge._write_report_memory = _orig_write_mem
+finally:
+    bridge.NOTICE_REPORT_JOBS = _orig_notice_jobs
+
+
 print()
 print("FAILED: " + ", ".join(fails) if fails else "ALL PASS")
 sys.exit(1 if fails else 0)

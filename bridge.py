@@ -53,6 +53,10 @@ SUBSESSIONS: dict = {}
 # Strong refs to detached turn tasks so they finish (and record the reply) even
 # if the client's network drops mid-stream. Without this they could be GC'd.
 _BG_TASKS: set = set()
+# A3-3:主事件圈把手 —— 讓 to_thread 裡的同步碼(報告同步的 notice 建立)
+# 能 call_soon_threadsafe 把卡片 feed 排回單圈(SessionCardStore 不上鎖)。
+# startup 時由 _start_log_rotation 填入。
+_MAIN_LOOP = None
 
 # One SSE keepalive cadence for every streaming endpoint (issue #8: it was
 # 2s / 4s / 10s across chat, ccsessions and codexsessions for no reason).
@@ -7012,6 +7016,65 @@ PERSONA_REPORTS = {
     },
 }
 
+# A3-3:哪些 cron 報告在同步進 report_events 時順手建 kind=notice approval
+# (app 通知中心的入口 + 已讀 ack)。先行兩個試跑,穩了再擴。
+NOTICE_REPORT_JOBS = {
+    "xcash": {"xcash-morning-dev-brief-0730"},
+    "shuijing": {"shuijing-sunrise-oracle"},
+}
+_NOTICE_REPORT_MAX_AGE = 12 * 3600.0   # 只通知 12h 內的報告(防冷庫回灌灌爆)
+_NOTICE_REPORT_TTL = 86400.0           # 晨報 ack 給一天;過期由掃描同卡收尾
+
+
+def _notice_for_report(session: str, report: dict) -> None:
+    """A3-3:新 cron 報告 → kind=notice approval(不推播 —— 報告本體已由
+    TG/推播管道送達;這裡補的是 app 通知中心的入口與已讀 ack)。
+    approval id 錨在 report id 上:同 id 已存在(不論狀態)就不重建,
+    報告內容修訂不會把已 ack 的通知翻回 pending。"""
+    import sqlite3
+    name = report.get("name") or ""
+    if name not in NOTICE_REPORT_JOBS.get(session, ()):
+        return
+    rid = str(report.get("id") or "")
+    if not rid:
+        return
+    if time.time() - float(report.get("ts") or 0) > _NOTICE_REPORT_MAX_AGE:
+        return
+    aid = "ntc-" + hashlib.sha1(rid.encode()).hexdigest()[:20]
+    sid = f"hermes:{session}"
+    title = report.get("label") or name or "報告"
+    detail = _clip_text(report.get("content") or "", 200)
+    options = [{"key": "ack", "label": "知道了", "style": "primary"}]
+    now = time.time()
+    con = sqlite3.connect(CANON_DB, timeout=30)
+    try:
+        if con.execute("SELECT 1 FROM approvals WHERE id=?", (aid,)).fetchone():
+            return
+        con.execute(
+            "INSERT INTO approvals"
+            "(id,title,source,risk,detail,created_at,expires_at,status,decided_at,result,callback,"
+            "session_id,provider,kind,options) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (aid, title, sid, "", detail, now, now + _NOTICE_REPORT_TTL,
+             "pending", None, None, None, sid, "hermes", "notice",
+             json.dumps(options, ensure_ascii=False)))
+        con.commit()
+    finally:
+        con.close()
+    _log_event("notice_created", id=aid, session=session, report=name)
+    rec = {"id": aid, "title": title, "detail": detail, "options": options,
+           "kind": "notice"}
+    loop = _MAIN_LOOP
+
+    def _feed():
+        try:
+            _hp_cards_feed_approval(sid, rec)
+        except Exception as e:  # noqa: BLE001
+            _log_event("hp_cards_feed_error", error=str(e)[:160])
+    if loop and loop.is_running():
+        # 報告同步常跑在 to_thread(卡片流 seed / v1 merge)—— 卡片庫不上鎖,
+        # 一律排回主圈做 feed(同圈呼叫也安全:排到下一輪跑)。
+        loop.call_soon_threadsafe(_feed)
+
 
 def _cron_jobs():
     try:
@@ -7206,6 +7269,9 @@ def _sync_persona_reports(session: str, limit: int = 50) -> list[dict]:
         try:
             if _report_upsert(session, r):
                 upserted += 1
+                # A3-3:名單內的新報告 → kind=notice approval(進通知中心/
+                # 卡片流;approval id 錨在 report id,重同步/改稿不重建)。
+                _notice_for_report(session, r)
         except Exception as e:  # noqa: BLE001
             _log_event("report_event_write_failed", session=session,
                        report_id=r.get("id"), label=r.get("label"),
@@ -9497,6 +9563,8 @@ async def _log_rotation_loop():
 
 @app.on_event("startup")
 async def _start_log_rotation():
+    global _MAIN_LOOP
+    _MAIN_LOOP = asyncio.get_running_loop()
     task = asyncio.create_task(_log_rotation_loop())
     _BG_TASKS.add(task)
     task.add_done_callback(_BG_TASKS.discard)
