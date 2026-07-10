@@ -441,3 +441,28 @@ app 端先行件（不等 bridge）：卡片渲染元件 + 傳輸層抽象
 - Bad session message read returns `400`.
 - `POST /app/v1/messages` with `dry_run: true` returns an SSE response and does
   not increase canonical DB message counts.
+
+## 12. 統一 Approval 物件(Approval Hub A1,2026-07-10 上線)
+
+> 完整設計見 APPROVAL_HUB_SPEC.md;本節是 app 可依賴的 wire 契約。
+
+- **物件形狀**(v1 list/get、v2 `meta.approval` 共用;舊欄位 `source/result/decided_at` 相容期保留):
+  `{id, session_id, provider: claude_code|codex|hermes, kind: permission|question|notice,
+  title, detail, risk, options: [{key,label[,style: primary|secondary|danger]}],
+  created_at, expires_at, status}`。
+  `options` 缺席時 bridge 給預設(permission→approve/deny、notice→單鍵 ack);
+  app 永不再用 label 猜語意,`style: danger` = 否決類。
+  codex 的 v2 `meta.approval` 相容期額外帶 `method/thread_id`,且其 options 暫仍用
+  舊 style 字彙 `deny`(app 現行判準),A4 收斂為 `danger`。
+- **決定**:`POST /app/v1/approvals/{id}/decision body {key}` 為唯一語彙;
+  `{approve: bool}` 為相容糖(approve→第一個 primary、deny→第一個 danger)。
+  v2 統一 body:`POST /app/v2/sessions/{id}/approve {approval_id, key}`;
+  三種舊 body(`{key}`/`{approve}`/`{approval_id}`)相容期照收。
+  409 語意不變(已決/失效);未知 key 回 400 `UNKNOWN_KEY`。
+- **status 字彙**:pending / approved / **denied**(新決議;歷史列 `rejected` 等價,
+  codex 線相容期仍寫 rejected)/ answered(question,result=key)/
+  acknowledged(notice)/ expired。
+- **建立**(hermes/skill):`POST /app/v1/approvals {title, session_id, kind?, risk?,
+  detail?, options?, ttl_seconds?, callback_url?}`;`source` 為 `session_id` 舊名。
+- **hermes waiting_approval**:persona 有 pending 時 v2 sessions 該列
+  `status=waiting_approval` + `meta.approval`(之前恆 idle)。

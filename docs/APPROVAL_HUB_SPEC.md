@@ -1,6 +1,6 @@
 # 統一待審核中心(Approval Hub)規範
 
-> 狀態:**設計稿(待拍板)**。拍板後依 APP_BRIDGE_CONTRACT.md §0 鐵律
+> 狀態:**A1 已實作上線(2026-07-10);A2-A4 待做**。拍板後依 APP_BRIDGE_CONTRACT.md §0 鐵律
 > 「任何 app 要消費的形狀,先寫進契約再上線」——本文件內容併入契約新 §12,
 > 實作切片進 §9 遷移表。
 >
@@ -151,7 +151,7 @@ body {title, session_id, kind, risk?, detail?, options?, ttl_seconds?, callback_
 
 | 切片 | 內容 | 依賴 |
 |---|---|---|
-| A1 | bridge:approvals 表加 `session_id/provider/kind/options` 欄(migration+回填),v1 list/decision 曝露新欄位;`{key}` 決定;v2 meta.approval 統一(含 hermes 補 waiting_approval) | 無 |
+| ✅A1 | bridge:approvals 表加 `session_id/provider/kind/options` 欄(migration+回填),v1 list/decision 曝露新欄位;`{key}` 決定;v2 meta.approval 統一(含 hermes 補 waiting_approval) | 無 |
 | A2 | app:中心單清單+單決定路徑;角標改同源 | A1 |
 | A3 | bridge:cc/hermes 補 approval 卡片流;hermes `kind=notice` 通知接入(挑 1–2 個 cron 報告先行) | A1 |
 | A4 | 相容期收尾:刪三種舊 v2 approve body、刪 `meta.prompt`、刪 app 舊三路輪詢 | A2+A3 全上線一版後 |
