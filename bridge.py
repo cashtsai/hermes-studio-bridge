@@ -5646,6 +5646,17 @@ async def _cc_interrupt_core(name: str) -> dict:
         if not _cc_pane_busy(pane):
             interrupted = True
             break
+    if interrupted:
+        # P0 修復(2026-07-10):interrupt 成功時 pane 已確認不忙,但 busy 的
+        # 權威真相來源是 _CC_HOOK_STATE(hook 沒發 Stop 事件就不會更新),
+        # 若這裡不主動同步,對外 busy 會維持 true 直到 600s TTL 到期才 fallback
+        # 去看 pane —— 這正是「interrupt 回真成功但 busy 卡好幾分鐘」的根因之一。
+        # 一併清掉可能殘留的 queued 提示文字,避免下次 status 誤讀成忙碌。
+        _CC_HOOK_STATE[name] = {
+            "busy": False,
+            "updated_at": time.time(),
+            "source": "interrupt",
+        }
     _log_event("cc_interrupt", session=name, interrupted=interrupted, attempts=attempts)
     return {"ok": True, "interrupted": interrupted, "attempts": attempts}
 
