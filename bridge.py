@@ -331,6 +331,22 @@ async def acp_full(model: str, prompt: str) -> str:
 app = FastAPI(title="Hermes ↔ OpenAI bridge")
 
 
+@app.middleware("http")
+async def _body_size_guard(request: Request, call_next):
+    """全域 request body 上限 — `await request.json()` 是整包進記憶體的,
+    沒有這道閥一個超大 base64 就能把 bridge 打爆(修復單「附件限制」)。
+    無 Content-Length(chunked)放行,由件數/單檔閥背書。"""
+    try:
+        cl = int(request.headers.get("content-length") or 0)
+    except ValueError:
+        cl = 0
+    if cl > _BODY_MAX_BYTES:
+        return JSONResponse(status_code=413,
+                            content={"error": {"code": "BODY_TOO_LARGE",
+                                               "message": f"body 上限 {_BODY_MAX_BYTES} bytes"}})
+    return await call_next(request)
+
+
 # ───────────────────────── structured error codes (issue #6) ────────────────
 # Every HTTP error carries a machine-readable code so the app can localize
 # (pocketagent#44) instead of string-matching English detail text. The legacy
@@ -436,12 +452,39 @@ _MIME_EXT = {"image/jpeg": ".jpg", "image/png": ".png", "image/gif": ".gif",
              "audio/x-wav": ".wav", "audio/webm": ".webm"}
 
 
+# 附件上限(修復單「附件限制」bridge 端):count 與 /app/v1/uploads 既有 12 件
+# 一致,推廣到所有直送口;單檔上限給 app 檔案路 8MB 的 4 倍餘裕;全域 body
+# 上限是記憶體防爆閥(12 檔 × 32MB 的 base64 膨脹仍在其下)。
+_ATT_MAX_COUNT = 12
+_ATT_MAX_FILE_BYTES = 32 * 1024 * 1024
+_BODY_MAX_BYTES = 768 * 1024 * 1024
+
+
+def _att_guard(attachments) -> None:
+    """直送 attachments 的件數守門 — 超過即 413(之前只有 uploads 有擋)。"""
+    if isinstance(attachments, list) and len(attachments) > _ATT_MAX_COUNT:
+        raise http_err(413, "TOO_MANY_ATTACHMENTS",
+                       f"attachments 最多 {_ATT_MAX_COUNT} 件")
+
+
+def _data_uri_estimated_bytes(data_uri: str) -> int:
+    """base64 內容的解碼後大小估算(不真的解碼)— uploads 預檢用。"""
+    i = (data_uri or "").find(";base64,")
+    return 0 if i < 0 else (len(data_uri) - i - 8) * 3 // 4
+
+
 def _save_data_uri(data_uri: str, filename: str = "") -> str | None:
     """Decode a `data:<mime>;base64,<...>` URI to UPLOAD_DIR; return the path."""
     m = re.match(r"data:([^;]+);base64,(.*)$", data_uri or "", re.DOTALL)
     if not m:
         return None
     mime, b64 = m.group(1), m.group(2)
+    # 單檔大小閥(所有 data-URI 落盤的唯一咽喉):超限不落盤,skip+log —
+    # 對齊 iOS 端「超過上限先略過」的行為,不炸整包請求。
+    if len(b64) * 3 // 4 > _ATT_MAX_FILE_BYTES:
+        _log_event("save_data_uri_rejected", reason="too_large", mime=mime,
+                   filename=(filename or "")[:80], est_bytes=len(b64) * 3 // 4)
+        return None
     try:
         raw = base64.b64decode(b64)
     except Exception as e:  # noqa: BLE001
@@ -3168,6 +3211,7 @@ def _codex_format_turns(turns: list) -> str:
 
 async def _codex_input_items(text: str, attachments: list) -> list:
     text = (text or "").strip()
+    _att_guard(attachments)   # 修復單「附件限制」:直送口件數閥
     note_paths = []
     images = []
     voice_lines = []
@@ -5516,6 +5560,7 @@ async def _cc_input_core(name: str, body: dict) -> dict:
     """cc 輸入核心 — /ccsessions/{name}/input 與 v2 統一路由 input 共用。
     附件轉存＋語音轉寫＋tmux bracketed paste。"""
     text = (body.get("text") or body.get("content") or "").strip()
+    _att_guard(body.get("attachments"))   # 修復單「附件限制」:直送口件數閥
     # Relay layer (like the persona attachment path): persist any attachments and
     # inject their on-disk paths into the typed line. Claude Code can Read files
     # (and sees images natively), so a bare path is enough — no vision pre-pass.
@@ -7168,8 +7213,22 @@ async def app_uploads(request: Request):
     attachments = body.get("attachments") or []
     if not isinstance(attachments, list):
         raise HTTPException(status_code=400, detail="attachments must be a list")
-    if len(attachments) > 12:
+    if len(attachments) > _ATT_MAX_COUNT:
         raise HTTPException(status_code=413, detail="too many attachments")
+    # 修復單「附件限制」:單檔/總量預檢(base64 長度估算,不先解碼)——
+    # 之前 size 只進 log,從不比對任何上限。
+    total_est = 0
+    for idx, a in enumerate(attachments):
+        if not isinstance(a, dict):
+            raise HTTPException(status_code=400, detail=f"attachment {idx} must be an object")
+        est = _data_uri_estimated_bytes(str(a.get("data") or ""))
+        total_est += est
+        if est > _ATT_MAX_FILE_BYTES:
+            raise HTTPException(status_code=413,
+                                detail=f"attachment {idx} ({a.get('filename') or 'file'}) "
+                                       f"超過單檔上限 {_ATT_MAX_FILE_BYTES} bytes")
+    if total_est > _ATT_MAX_COUNT * _ATT_MAX_FILE_BYTES:
+        raise HTTPException(status_code=413, detail="attachments 總量超過上限")
     saved = []
     for idx, a in enumerate(attachments):
         if not isinstance(a, dict):
@@ -8365,6 +8424,7 @@ async def _persona_prepare_turn(session: str, content: str, attachments: list,
     """persona 回合前置(附件轉存/語音轉寫/多模態 parts/prompt 組裝)→
     (content, att_meta, prompt)。v1 POST /app/v1/messages 與 v2 統一路由
     input 共用。"""
+    _att_guard(attachments)   # 修復單「附件限制」:直送口件數閥
     normalized_attachments = []
     for a in attachments:
         if not isinstance(a, dict):
