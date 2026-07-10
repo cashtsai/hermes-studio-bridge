@@ -5541,6 +5541,21 @@ async def _cc_key_core(name: str, raw: str) -> dict:
     if mapped:
         args.append(mapped)                  # named control key
     elif len(raw) == 1 and raw.isprintable():
+        # 選單/是否題的單字元答案(y/n/1-9)—— 送出前先拿「現在」的畫面重驗一次
+        # 是不是真的還有相符的選項在等。App 端的選單清單可能是稍早抓的:如果
+        # CLI 這段時間自己把提示解掉了(auto-accept、逾時、或已經被別的方式
+        # 回掉),畫面上其實已經沒有選單、focus 落在自由輸入框 —— 這時候盲送
+        # 字元只會變成打進聊天框的垃圾字(而且送不出去,因為沒送 Enter),使用
+        # 者會看到同一顆「核准」不斷冒出來、字元越疊越多卻永遠沒有真的解掉。
+        # 沒有相符選項就直接拒絕,好過默默打錯地方。
+        _PANE_CACHE.pop(name, None)           # 強制拿最新畫面,不吃快取
+        pane_now = await _tmux_capture_cached(name)
+        prompt_now = _cc_prompt(pane_now)
+        valid_keys = {str(o.get("key") or "").lower()
+                      for o in (prompt_now or {}).get("options", [])}
+        if not prompt_now or raw.lower() not in valid_keys:
+            raise http_err(409, "PROMPT_STALE", "no matching live prompt right now",
+                           "the on-screen menu may already be resolved — refresh and retry")
         args += ["-l", raw]                  # literal single char (y / n / 1-3)
     else:
         raise HTTPException(status_code=400, detail="unsupported key")
