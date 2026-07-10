@@ -5165,11 +5165,17 @@ async def cc_session_create(request: Request):
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"cannot create workdir: {e}")
     _pretrust_claude_dir(wd)
-    await _run_ccsess("new", name, wd)
+    # P0 派工分級(2026-07-10):model 參數對應 ccsess 的 per-session model
+    # pin(`ccsess model <name> <model>`),讓企劃/大局思考類任務可指定旗艦
+    # 模型、機械性任務指定輕量模型,不必全域切換 delegation.model。
+    cc_model = (body.get("model") or "").strip()
+    new_args = ["new", name, wd] + ([cc_model] if cc_model else [])
+    await _run_ccsess(*new_args)
     _cc_mark_app_owned(name)   # 這條是 app 開的 → 只有它的審核會進 app(見 _cc_approval_watcher)
     ready = await _cc_wait_ready(name)
     return {"ok": True, "session": {"name": name, "workdir": wd,
-                                    "status": "running" if ready else "starting"}}
+                                    "status": "running" if ready else "starting",
+                                    "model": cc_model or None}}
 
 
 @app.put("/app/v1/owned-cc-sessions")
@@ -7728,7 +7734,11 @@ async def app_delegation_create(request: Request):
         if any(ch in cc_session_name for ch in "/|:\n\r\t"):
             raise HTTPException(status_code=400, detail="unsupported session_name")
         _pretrust_claude_dir(cwd)
-        await _run_ccsess("new", cc_session_name, cwd)
+        # P0 派工分級(2026-07-10):正式派工端點也支援 model 參數(與 Codex
+        # 分支的 params["model"] 對齊),企劃/大局思考類任務可指定旗艦模型。
+        cc_model = (body.get("model") or "").strip()
+        cc_new_args = ["new", cc_session_name, cwd] + ([cc_model] if cc_model else [])
+        await _run_ccsess(*cc_new_args)
         ready = await _cc_wait_ready(cc_session_name)
         cc_prompt = prompt
         saved = []
