@@ -331,6 +331,22 @@ async def acp_full(model: str, prompt: str) -> str:
 app = FastAPI(title="Hermes ↔ OpenAI bridge")
 
 
+@app.middleware("http")
+async def _body_size_guard(request: Request, call_next):
+    """全域 request body 上限 — `await request.json()` 是整包進記憶體的,
+    沒有這道閥一個超大 base64 就能把 bridge 打爆(修復單「附件限制」)。
+    無 Content-Length(chunked)放行,由件數/單檔閥背書。"""
+    try:
+        cl = int(request.headers.get("content-length") or 0)
+    except ValueError:
+        cl = 0
+    if cl > _BODY_MAX_BYTES:
+        return JSONResponse(status_code=413,
+                            content={"error": {"code": "BODY_TOO_LARGE",
+                                               "message": f"body 上限 {_BODY_MAX_BYTES} bytes"}})
+    return await call_next(request)
+
+
 # ───────────────────────── structured error codes (issue #6) ────────────────
 # Every HTTP error carries a machine-readable code so the app can localize
 # (pocketagent#44) instead of string-matching English detail text. The legacy
@@ -436,12 +452,39 @@ _MIME_EXT = {"image/jpeg": ".jpg", "image/png": ".png", "image/gif": ".gif",
              "audio/x-wav": ".wav", "audio/webm": ".webm"}
 
 
+# 附件上限(修復單「附件限制」bridge 端):count 與 /app/v1/uploads 既有 12 件
+# 一致,推廣到所有直送口;單檔上限給 app 檔案路 8MB 的 4 倍餘裕;全域 body
+# 上限是記憶體防爆閥(12 檔 × 32MB 的 base64 膨脹仍在其下)。
+_ATT_MAX_COUNT = 12
+_ATT_MAX_FILE_BYTES = 32 * 1024 * 1024
+_BODY_MAX_BYTES = 768 * 1024 * 1024
+
+
+def _att_guard(attachments) -> None:
+    """直送 attachments 的件數守門 — 超過即 413(之前只有 uploads 有擋)。"""
+    if isinstance(attachments, list) and len(attachments) > _ATT_MAX_COUNT:
+        raise http_err(413, "TOO_MANY_ATTACHMENTS",
+                       f"attachments 最多 {_ATT_MAX_COUNT} 件")
+
+
+def _data_uri_estimated_bytes(data_uri: str) -> int:
+    """base64 內容的解碼後大小估算(不真的解碼)— uploads 預檢用。"""
+    i = (data_uri or "").find(";base64,")
+    return 0 if i < 0 else (len(data_uri) - i - 8) * 3 // 4
+
+
 def _save_data_uri(data_uri: str, filename: str = "") -> str | None:
     """Decode a `data:<mime>;base64,<...>` URI to UPLOAD_DIR; return the path."""
     m = re.match(r"data:([^;]+);base64,(.*)$", data_uri or "", re.DOTALL)
     if not m:
         return None
     mime, b64 = m.group(1), m.group(2)
+    # 單檔大小閥(所有 data-URI 落盤的唯一咽喉):超限不落盤,skip+log —
+    # 對齊 iOS 端「超過上限先略過」的行為,不炸整包請求。
+    if len(b64) * 3 // 4 > _ATT_MAX_FILE_BYTES:
+        _log_event("save_data_uri_rejected", reason="too_large", mime=mime,
+                   filename=(filename or "")[:80], est_bytes=len(b64) * 3 // 4)
+        return None
     try:
         raw = base64.b64decode(b64)
     except Exception as e:  # noqa: BLE001
@@ -689,7 +732,8 @@ async def _resolve_persona_prompt(messages: list) -> str:
 # — survives reinstall / new device and interleaves with the Telegram history.
 # The app talks to it through the versioned /app/v1 API; it never touches the
 # Hermes state.db schema or cron JSON directly.
-CANON_DB = os.path.expanduser("~/.local/share/pocket-agent/canonical.db")
+CANON_DB = os.environ.get("POCKET_CANON_DB") \
+    or os.path.expanduser("~/.local/share/pocket-agent/canonical.db")
 ACCOUNTS_DB = os.path.expanduser("~/.local/share/pocket-agent/accounts.db")
 REPORT_MEMORY_FILE = "REPORTS.md"
 REPORT_MEMORY_ITEMS = 20
@@ -750,6 +794,20 @@ def _canon_init():
     approval_cols = [r[1] for r in con.execute("PRAGMA table_info(approvals)").fetchall()]
     if "callback" not in approval_cols:
         con.execute("ALTER TABLE approvals ADD COLUMN callback TEXT")
+    # A1 (Approval Hub 遷移切片): 統一 approval 物件 — 新欄位 + 回填。
+    # session_id/provider/kind/options 與 source 並存(source 相容期保留原樣);
+    # options 存建立方宣告的鍵(JSON 文字)。回填帶 IS NULL 守門,冪等。
+    # hermes 舊列的 source 是自由字串 → session_id 不硬造(拍板:留 NULL)。
+    for _col in ("session_id", "provider", "kind", "options"):
+        if _col not in approval_cols:
+            con.execute(f"ALTER TABLE approvals ADD COLUMN {_col} TEXT")
+    con.execute("UPDATE approvals SET provider=CASE"
+                " WHEN source LIKE 'claude_code:%' THEN 'claude_code'"
+                " WHEN source LIKE 'codex%' THEN 'codex'"
+                " ELSE 'hermes' END WHERE provider IS NULL")
+    con.execute("UPDATE approvals SET session_id=source WHERE session_id IS NULL"
+                " AND (source LIKE 'claude_code:%' OR source LIKE 'codex:%')")
+    con.execute("UPDATE approvals SET kind='permission' WHERE kind IS NULL")
     con.execute("""CREATE TABLE IF NOT EXISTS devices(
         token TEXT PRIMARY KEY, platform TEXT, created_at REAL)""")
     con.execute("""CREATE TABLE IF NOT EXISTS report_events(
@@ -2628,11 +2686,20 @@ class CodexAppServerClient:
         import sqlite3
         con = sqlite3.connect(CANON_DB, timeout=30)
         now = record.get("created_at") or time.time()
+        # A1:統一欄位落庫。DB 的 options style 收斂為規範字彙(deny→danger);
+        # 記憶體 record 保持原樣 — 現行 app 以 style=="deny" 判拒絕鍵,既有
+        # 曝露面(v2 meta.approval、卡片流)相容期不動(A4 收斂)。
+        src = str(record.get("source") or "")
+        options = [({**o, "style": "danger"} if o.get("style") == "deny" else dict(o))
+                   for o in (record.get("options") or [])]
         con.execute("INSERT OR REPLACE INTO approvals"
-                    "(id,title,source,risk,detail,created_at,expires_at,status,decided_at,result) "
-                    "VALUES(?,?,?,?,?,?,?,?,?,?)",
+                    "(id,title,source,risk,detail,created_at,expires_at,status,decided_at,result,callback,"
+                    "session_id,provider,kind,options) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (record["id"], record["title"], record["source"], record["risk"],
-                     record["detail"], now, now + 3600, "pending", None, None))
+                     record["detail"], now, now + 3600, "pending", None, None, None,
+                     src if ":" in src else None, "codex", "permission",
+                     json.dumps(options, ensure_ascii=False) if options else None))
         con.commit()
         con.close()
 
@@ -3144,6 +3211,7 @@ def _codex_format_turns(turns: list) -> str:
 
 async def _codex_input_items(text: str, attachments: list) -> list:
     text = (text or "").strip()
+    _att_guard(attachments)   # 修復單「附件限制」:直送口件數閥
     note_paths = []
     images = []
     voice_lines = []
@@ -5498,6 +5566,7 @@ async def _cc_input_core(name: str, body: dict) -> dict:
     """cc 輸入核心 — /ccsessions/{name}/input 與 v2 統一路由 input 共用。
     附件轉存＋語音轉寫＋tmux bracketed paste。"""
     text = (body.get("text") or body.get("content") or "").strip()
+    _att_guard(body.get("attachments"))   # 修復單「附件限制」:直送口件數閥
     # Relay layer (like the persona attachment path): persist any attachments and
     # inject their on-disk paths into the typed line. Claude Code can Read files
     # (and sees images natively), so a bare path is enough — no vision pre-pass.
@@ -5709,7 +5778,11 @@ def _cc_prompt(pane: str):
                     continue
                 title = s[:140]
                 break
-            return {"kind": "menu", "title": title, "options": opts[:6]}
+            # A1 semantic:泛選單(AskUserQuestion 等)= Approval Hub 的 question,
+            # 不是 permission — app 端永不再用 label 猜語意。kind 欄位維持
+            # "menu"(app 現行相容),語意走新增的 semantic 欄位。
+            return {"kind": "menu", "semantic": "question", "title": title,
+                    "options": opts[:6]}
     has_context = any(k in tail_low for k in ("wants to", "do you want", "proceed?", "would you like"))
     if has_context:
         opts = []
@@ -5723,9 +5796,10 @@ def _cc_prompt(pane: str):
         if opts:
             title = next((ln.strip()[:140] for ln in tail
                           if "wants to" in ln.lower() or "do you want" in ln.lower()), "")
-            return {"kind": "menu", "title": title, "options": opts[:5]}
+            return {"kind": "menu", "semantic": "permission", "title": title,
+                    "options": opts[:5]}
     if re.search(r"\(y/n\)|press y\b|y to (confirm|continue|proceed)", tail_low):
-        return {"kind": "yesno", "title": "",
+        return {"kind": "yesno", "semantic": "permission", "title": "",
                 "options": [{"key": "y", "label": "是"}, {"key": "n", "label": "否"}]}
     return None
 
@@ -5958,16 +6032,39 @@ def _cc_approval_create(name: str, prompt: dict) -> str:
     import sqlite3
     aid = "cc-" + uuid.uuid4().hex[:24]
     title = (prompt.get("title") or "").strip() or f"{name} 等待核准"
-    opts = " / ".join(str(o.get("label") or "")[:30]
-                      for o in (prompt.get("options") or [])[:4])
-    detail = f"session: {name}\n{title}" + (f"\n選項: {opts}" if opts else "")
+    opts_txt = " / ".join(str(o.get("label") or "")[:30]
+                          for o in (prompt.get("options") or [])[:4])
+    detail = f"session: {name}\n{title}" + (f"\n選項: {opts_txt}" if opts_txt else "")
+    # A1:語意在誕生點標好 — _cc_prompt 的分支即分類(泛選單=question、
+    # 權限/yesno=permission);permission 的鍵由 bridge 標 style,app 只渲染,
+    # 不再用 label 猜「哪顆是拒絕」。question 無 danger 語意(spec §2)。
+    kind = "question" if prompt.get("semantic") == "question" else "permission"
+    options = []
+    for o in (prompt.get("options") or [])[:6]:
+        okey = str(o.get("key") or "").strip()
+        if not okey:
+            continue
+        ent = {"key": okey, "label": str(o.get("label") or "")[:80]}
+        if kind == "permission":
+            lab = ent["label"].strip()
+            if _CC_DENY_RE.match(lab):
+                ent["style"] = "danger"
+            elif _CC_ALLOW_RE.match(lab):
+                ent["style"] = "primary"
+            else:
+                ent["style"] = "secondary"
+        options.append(ent)
     now = time.time()
     con = sqlite3.connect(CANON_DB, timeout=30)
     con.execute("INSERT OR REPLACE INTO approvals"
-                "(id,title,source,risk,detail,created_at,expires_at,status,decided_at,result,callback) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                (aid, title, f"claude_code:{name}", "high", detail,
-                 now, now + _CC_APPROVAL_TTL, "pending", None, None, None))
+                "(id,title,source,risk,detail,created_at,expires_at,status,decided_at,result,callback,"
+                "session_id,provider,kind,options) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (aid, title, f"claude_code:{name}",
+                 "high" if kind == "permission" else "low", detail,
+                 now, now + _CC_APPROVAL_TTL, "pending", None, None, None,
+                 f"claude_code:{name}", "claude_code", kind,
+                 json.dumps(options, ensure_ascii=False) if options else None))
     con.commit()
     con.close()
     return aid
@@ -6144,13 +6241,29 @@ async def v2_sessions(request: Request, provider: str = "", status: str = ""):
         caps = ["input", "interrupt", "keys", "attachments", "replay", "follow"]
         if prompt:
             caps.append("approve")
+        meta = {}
+        if prompt:
+            meta["prompt"] = prompt   # 相容期保留(A4 刪),app 舊版仍讀這裡
+            # A1:meta.approval 統一物件 — 由 watcher 建的 DB 列對回。watcher
+            # 巡週期 1.5s,prompt 剛出現的窄縫可能還沒有列 → 只給 prompt。
+            active = _CC_APPROVAL_ACTIVE.get(name)
+            d = _approval_get_row(str(active.get("aid"))) if active else None
+            if d and d.get("status") == "pending":
+                meta["approval"] = d
         out.append({"id": f"claude_code:{name}", "provider": "claude_code", "title": name,
                     "subtitle": workdir, "status": st, "last_event_at": None,
-                    "capabilities": caps, "meta": ({"prompt": prompt} if prompt else {})})
+                    "capabilities": caps, "meta": meta})
+    # A1(spec §7-5):hermes persona 有 pending 待審 → waiting_approval +
+    # meta.approval 統一物件(之前恆 idle 是 spec 點名的缺口)。
+    hp_pending = _hermes_pending_by_session()
     for mid, (disp, _home) in PERSONAS.items():
+        pend = hp_pending.get(f"hermes:{mid}")
         out.append({"id": f"hermes:{mid}", "provider": "hermes", "title": disp,
-                    "subtitle": None, "status": "idle", "last_event_at": None,
-                    "capabilities": ["input", "attachments", "replay", "follow", "approve"], "meta": {}})
+                    "subtitle": None,
+                    "status": "waiting_approval" if pend else "idle",
+                    "last_event_at": pend.get("created_at") if pend else None,
+                    "capabilities": ["input", "attachments", "replay", "follow", "approve"],
+                    "meta": ({"approval": pend} if pend else {})})
     delegated_codex_ids = _delegated_codex_thread_ids()
     try:
         res = await CODEX_APP.call("thread/list",
@@ -6166,12 +6279,22 @@ async def v2_sessions(request: Request, provider: str = "", status: str = ""):
             caps = ["input", "interrupt", "attachments", "replay", "follow"]
             if approval:
                 caps.append("approve")
+            pub = CODEX_APP._approval_public(approval) if approval else None
+            if pub:
+                # A1:疊上統一欄位(session_id/provider/kind/status…)。options
+                # 相容期保留記憶體版 — 現行 app 以 style=="deny" 判拒絕鍵;
+                # method/thread_id 為 codex 專屬欄位,照舊(A4 收斂)。
+                drow = _approval_get_row(str(pub.get("id") or ""))
+                if drow:
+                    pub = {**drow,
+                           **{k: pub[k] for k in ("method", "thread_id") if k in pub},
+                           "options": pub.get("options") or drow.get("options")}
             out.append({"id": f"codex:{thread_id}", "provider": "codex",
                         "title": s.get("name") or "codex", "subtitle": s.get("workdir"),
                         "status": "waiting_approval" if approval else ("running" if active else "idle"),
                         "last_event_at": s.get("lastEventAt"),
                         "capabilities": caps,
-                        "meta": {"approval": CODEX_APP._approval_public(approval) if approval else None}})
+                        "meta": {"approval": pub}})
     except Exception as e:  # noqa: BLE001
         # 不再無聲吞錯:codex app-server 掛掉時 CX 區直接消失、log 零痕跡,
         # 「CX 全空」查不到原因(2026-07-10 ChatGPT.app 併購式更新事故)。
@@ -6225,6 +6348,13 @@ async def v2_session_approve(session_id: str, request: Request):
         body = await request.json()
     except Exception:  # noqa: BLE001
         body = {}
+    # A1(spec §3.3):統一 body {approval_id, key}(approve bool 相容糖)—
+    # 三 provider 一律轉呼 _approval_decide_core;三種舊 body({key}/{approve}/
+    # {approval_id})走下方原分支,相容期照收(A4 刪)。
+    uni_aid = str(body.get("approval_id") or "").strip()
+    if uni_aid and ("key" in body or "approve" in body):
+        result = await _approval_decide_core(uni_aid, body)
+        return {"ok": True, "session_id": session_id, **result}
     src = _v2_card_source(session_id)
     if src[0] == "cc":
         key = str(body.get("key") or "").strip()
@@ -7100,8 +7230,22 @@ async def app_uploads(request: Request):
     attachments = body.get("attachments") or []
     if not isinstance(attachments, list):
         raise HTTPException(status_code=400, detail="attachments must be a list")
-    if len(attachments) > 12:
+    if len(attachments) > _ATT_MAX_COUNT:
         raise HTTPException(status_code=413, detail="too many attachments")
+    # 修復單「附件限制」:單檔/總量預檢(base64 長度估算,不先解碼)——
+    # 之前 size 只進 log,從不比對任何上限。
+    total_est = 0
+    for idx, a in enumerate(attachments):
+        if not isinstance(a, dict):
+            raise HTTPException(status_code=400, detail=f"attachment {idx} must be an object")
+        est = _data_uri_estimated_bytes(str(a.get("data") or ""))
+        total_est += est
+        if est > _ATT_MAX_FILE_BYTES:
+            raise HTTPException(status_code=413,
+                                detail=f"attachment {idx} ({a.get('filename') or 'file'}) "
+                                       f"超過單檔上限 {_ATT_MAX_FILE_BYTES} bytes")
+    if total_est > _ATT_MAX_COUNT * _ATT_MAX_FILE_BYTES:
+        raise HTTPException(status_code=413, detail="attachments 總量超過上限")
     saved = []
     for idx, a in enumerate(attachments):
         if not isinstance(a, dict):
@@ -8301,6 +8445,7 @@ async def _persona_prepare_turn(session: str, content: str, attachments: list,
     """persona 回合前置(附件轉存/語音轉寫/多模態 parts/prompt 組裝)→
     (content, att_meta, prompt)。v1 POST /app/v1/messages 與 v2 統一路由
     input 共用。"""
+    _att_guard(attachments)   # 修復單「附件限制」:直送口件數閥
     normalized_attachments = []
     for a in attachments:
         if not isinstance(a, dict):
@@ -8671,10 +8816,78 @@ async def _persona_interrupt_core(session: str) -> dict:
 # approval here; the app shows a native approve/reject card with TTL + risk; the
 # skill polls the decision. Bridge owns the store (no Hermes internals exposed).
 
+# A1:讀取端共用的欄位序 — SELECT 一律用這一串,tuple 索引不漂移。
+_APPROVAL_COLS = ("id,title,source,risk,detail,created_at,expires_at,status,"
+                  "decided_at,result,session_id,provider,kind,options")
+_APPROVAL_KINDS = ("permission", "question", "notice")
+
+
+def _approval_default_options(kind: str) -> list:
+    """options 未宣告時的預設鍵(APPROVAL_HUB_SPEC §1/§2)。"""
+    if kind == "notice":
+        return [{"key": "ack", "label": "知道了", "style": "primary"}]
+    return [{"key": "approve", "label": "允許", "style": "primary"},
+            {"key": "deny", "label": "拒絕", "style": "danger"}]
+
+
+def _approval_provider_of(source: str) -> str:
+    if source.startswith("claude_code:"):
+        return "claude_code"
+    if source.startswith("codex"):
+        return "codex"
+    return "hermes"
+
+
 def _approval_row(r):
+    """DB tuple(_APPROVAL_COLS 序)→ 統一 approval 物件(spec §1)。
+    舊欄位全保留(相容期);新欄位缺值時由 source 推導 — 遷移前的舊列與
+    新列走同一條序列化,wire 形狀只有這一份。"""
+    src = str(r[2] or "")
+    kind = r[12] if r[12] in _APPROVAL_KINDS else "permission"
+    options = None
+    if r[13]:
+        try:
+            options = json.loads(r[13])
+        except (TypeError, ValueError):
+            options = None
     return {"id": r[0], "title": r[1], "source": r[2], "risk": r[3], "detail": r[4],
             "created_at": r[5], "expires_at": r[6], "status": r[7],
-            "decided_at": r[8], "result": r[9]}
+            "decided_at": r[8], "result": r[9],
+            "session_id": r[10] or (src if src.startswith(("claude_code:", "codex:")) else ""),
+            "provider": r[11] or _approval_provider_of(src),
+            "kind": kind,
+            "options": options or _approval_default_options(kind)}
+
+
+def _approval_get_row(aid: str):
+    """單筆統一物件(v2 meta.approval / 決定路由用);不存在回 None。"""
+    import sqlite3
+    con = sqlite3.connect(CANON_DB)
+    r = con.execute(f"SELECT {_APPROVAL_COLS} FROM approvals WHERE id=?",
+                    (aid,)).fetchone()
+    con.close()
+    return _approval_row(r) if r else None
+
+
+def _hermes_pending_by_session() -> dict:
+    """hermes persona 的 pending 待審(session_id='hermes:{mid}')→ 統一物件,
+    每 persona 取最早一筆。v2 sessions 補 waiting_approval 用(spec §7-5)。"""
+    import sqlite3
+    out = {}
+    try:
+        con = sqlite3.connect(CANON_DB)
+        _approvals_expire(con)
+        con.commit()
+        rows = con.execute(
+            f"SELECT {_APPROVAL_COLS} FROM approvals WHERE status='pending'"
+            " AND session_id LIKE 'hermes:%' ORDER BY created_at ASC").fetchall()
+        con.close()
+        for r in rows:
+            d = _approval_row(r)
+            out.setdefault(d["session_id"], d)
+    except Exception as e:  # noqa: BLE001
+        _log_event("hermes_pending_scan_failed", error=str(e)[:160])
+    return out
 
 
 def _approvals_expire(con):
@@ -8705,7 +8918,10 @@ async def _approval_fire_callback(aid: str, callback: str, status: str, result):
 
 @app.post("/app/v1/approvals")
 async def approval_create(request: Request):
-    """Create a pending approval (called by Hermes / a skill)."""
+    """Create a pending approval (called by Hermes / a skill).
+    A1(spec §3.4):`source` 升級為 `session_id`(舊名相容照收);新增
+    `kind`(permission|question|notice,預設 permission)與 `options`
+    (建立方宣告的鍵,bridge 驗形狀、收斂 style 字彙;缺席由讀取端給預設)。"""
     _check_auth(request)
     import sqlite3
     b = await request.json()
@@ -8718,19 +8934,44 @@ async def approval_create(request: Request):
     callback = (str(b.get("callback_url") or "").strip() or None)
     if callback and not callback.startswith(("http://", "https://")):
         raise HTTPException(status_code=400, detail="callback_url must be http(s)")
+    session_id = str(b.get("session_id") or b.get("source") or "").strip()
+    kind = str(b.get("kind") or "permission").strip()
+    if kind not in _APPROVAL_KINDS:
+        raise http_err(400, "INVALID_KIND", f"kind 必須是 {'|'.join(_APPROVAL_KINDS)}")
+    options = b.get("options")
+    if options is not None:
+        if (not isinstance(options, list) or not options
+                or not all(isinstance(o, dict) and str(o.get("key") or "").strip()
+                           and str(o.get("label") or "").strip() for o in options)):
+            raise http_err(400, "INVALID_OPTIONS",
+                           "options 需為 [{key,label[,style]}…] 且 key/label 非空")
+        norm = []
+        for o in options[:6]:
+            ent = {"key": str(o["key"]).strip()[:40], "label": str(o["label"]).strip()[:80]}
+            style = str(o.get("style") or "").strip()
+            if style == "deny":                     # 舊字彙收斂(spec §1 用 danger)
+                style = "danger"
+            if style in ("primary", "secondary", "danger"):
+                ent["style"] = style
+            norm.append(ent)
+        options = norm
     now = time.time()
     con = sqlite3.connect(CANON_DB)
     con.execute("INSERT OR REPLACE INTO approvals"
-                "(id,title,source,risk,detail,created_at,expires_at,status,decided_at,result,callback) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                (aid, b.get("title") or "需要核准", b.get("source") or "", b.get("risk") or "",
-                 b.get("detail") or "", now, now + ttl, "pending", None, None, callback))
+                "(id,title,source,risk,detail,created_at,expires_at,status,decided_at,result,callback,"
+                "session_id,provider,kind,options) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (aid, b.get("title") or "需要核准", session_id, b.get("risk") or "",
+                 b.get("detail") or "", now, now + ttl, "pending", None, None, callback,
+                 session_id or None, _approval_provider_of(session_id), kind,
+                 json.dumps(options, ensure_ascii=False) if options else None))
     con.commit()
     con.close()
     title = b.get("title") or "需要核准"
-    body = (b.get("detail") or b.get("source") or "點開查看並決定")[:120]
-    _approval_push(aid, title, body, str(b.get("source") or ""))
-    return {"id": aid, "status": "pending", "expires_at": now + ttl}
+    body = (b.get("detail") or session_id or "點開查看並決定")[:120]
+    _approval_push(aid, title, body, session_id)
+    return {"id": aid, "status": "pending", "expires_at": now + ttl,
+            "kind": kind, "session_id": session_id}
 
 
 @app.post("/app/v1/devices")
@@ -8779,12 +9020,12 @@ async def approval_list(request: Request, status: str = "", limit: int = 50,
     if status:
         total = con.execute("SELECT COUNT(*) FROM approvals WHERE status=?",
                             (status,)).fetchone()[0]
-        rows = con.execute("SELECT id,title,source,risk,detail,created_at,expires_at,status,decided_at,result "
+        rows = con.execute(f"SELECT {_APPROVAL_COLS} "
                            "FROM approvals WHERE status=? ORDER BY created_at DESC LIMIT ? OFFSET ?",
                            (status, lim, off)).fetchall()
     else:
         total = con.execute("SELECT COUNT(*) FROM approvals").fetchone()[0]
-        rows = con.execute("SELECT id,title,source,risk,detail,created_at,expires_at,status,decided_at,result "
+        rows = con.execute(f"SELECT {_APPROVAL_COLS} "
                            "FROM approvals ORDER BY created_at DESC LIMIT ? OFFSET ?",
                            (lim, off)).fetchall()
     con.close()
@@ -8801,7 +9042,7 @@ async def approval_get(aid: str, request: Request):
     con = sqlite3.connect(CANON_DB)
     _approvals_expire(con)
     con.commit()
-    r = con.execute("SELECT id,title,source,risk,detail,created_at,expires_at,status,decided_at,result "
+    r = con.execute(f"SELECT {_APPROVAL_COLS} "
                     "FROM approvals WHERE id=?", (aid,)).fetchone()
     con.close()
     if not r:
@@ -8818,47 +9059,86 @@ async def approval_decide(aid: str, request: Request):
 
 
 async def _approval_decide_core(aid: str, b: dict) -> dict:
-    """Approval Center 決議核心 — v1 與 v2 統一路由 approve 共用。"""
+    """Approval Center 決議核心 — v1 與 v2 統一路由 approve 共用。
+    A1(spec §3.2):`{key}` 為決定的第一公民;`{approve: bool}` 保留為相容糖
+    (approve→第一個 primary、deny→第一個 danger)。status 依 kind 落:
+    permission→approved|denied、question→answered(result=key)、
+    notice→acknowledged。新決議寫 `denied`(拍板);歷史列的 `rejected`
+    讀取端一律視為等價,A4 收斂。"""
     import sqlite3
-    decision = "approved" if b.get("approve") else "rejected"
-    con = sqlite3.connect(CANON_DB)
-    row = con.execute("SELECT source FROM approvals WHERE id=?", (aid,)).fetchone()
-    if row and str(row[0] or "").startswith("claude_code:"):
+    key = str(b.get("key") or "").strip()
+    d = _approval_get_row(aid)
+    src = str((d or {}).get("source") or "")
+    if d and src.startswith("claude_code:"):
         # 批次 3 斷點③:CC 審核決議 → 回流 TUI 鍵。以「當下 pane 的 prompt」
         # 為準(推播到點按之間 prompt 可能已被回掉——過時就 409,不盲送鍵)。
-        con.close()
-        name = str(row[0]).split(":", 1)[1]
+        name = src.split(":", 1)[1]
         active = _CC_APPROVAL_ACTIVE.get(name)
         st = await _cc_status_core(name)
         prompt = st.get("prompt")
         if not prompt or not active or active.get("aid") != aid:
             _cc_approval_set_status(aid, "expired")
             raise HTTPException(status_code=409, detail="already decided or expired")
-        key = str(b.get("key") or "").strip() or _cc_choice_key(prompt, bool(b.get("approve")))
+        key = key or _cc_choice_key(prompt, bool(b.get("approve")))
+        # 決議語意:帶 approve bool 用 bool;只給 {key} 時由該鍵的 style 判斷
+        # (danger/esc=否決)— 之前 {key} 決定一律被記成 rejected 是誤標。
+        if "approve" in b:
+            decision = "approved" if b.get("approve") else "denied"
+        else:
+            styles = {str(o.get("key") or ""): o.get("style")
+                      for o in (d.get("options") or [])}
+            decision = "denied" if (key == "esc" or styles.get(key) == "danger") \
+                else "approved"
         await _cc_key_core(name, key)
         _cc_approval_set_status(aid, decision)
         _CC_APPROVAL_ACTIVE.pop(name, None)
         _log_event("cc_approval_decision", session=name, approval_id=aid,
                    status=decision, key=key)
         return {"id": aid, "status": decision, "key": key}
-    if row and str(row[0] or "").startswith("codex"):
-        con.close()
+    if d and src.startswith("codex"):
+        # {key} → app-server 決議參數;approve_for_session 映射 Codex 原生
+        # acceptForSession(_approval_response_result 既有機制)。codex 線的
+        # 狀態字彙(approved/rejected)相容期不動 — 卡片流/記憶體 record 同源。
+        if key:
+            approved = key != "deny"
+            for_session = key == "approve_for_session"
+        else:
+            approved = bool(b.get("approve"))
+            for_session = bool(b.get("for_session") or b.get("approve_for_session") or
+                               b.get("remember"))
         try:
-            result = await CODEX_APP.decide_approval(
-                aid,
-                decision == "approved",
-                for_session=bool(b.get("for_session") or b.get("approve_for_session") or
-                                 b.get("remember")),
-            )
+            result = await CODEX_APP.decide_approval(aid, approved,
+                                                     for_session=for_session)
             return {"id": aid, "status": result["status"], "result": result["result"]}
         except CodexAppServerError as e:
             if e.code == 404:
                 raise http_err(409, "APPROVAL_NOT_PENDING",
                                "Codex approval is no longer live")
             _codex_http_error(e)
+    # hermes / 本地列(permission|question|notice):key 或相容糖決議
+    kind = (d or {}).get("kind") or "permission"
+    options = (d or {}).get("options") or _approval_default_options(kind)
+    okeys = [str(o.get("key") or "") for o in options]
+    if d and key and key not in okeys:
+        raise http_err(400, "UNKNOWN_KEY", f"key 必須是 {okeys} 之一")
+    if not key:
+        want = "primary" if b.get("approve") else "danger"
+        key = next((str(o.get("key")) for o in options if o.get("style") == want),
+                   "approve" if b.get("approve") else "deny")
+    if kind == "notice":
+        status = "acknowledged"
+    elif kind == "question":
+        status = "answered"
+    else:
+        styles = {str(o.get("key") or ""): o.get("style") for o in options}
+        status = "denied" if styles.get(key) == "danger" else "approved"
+    # result:question/notice 的答案就是 key(spec §2);permission 維持舊預設
+    # (建立方自帶 result 優先,否則空字串)以免驚動既有 callback 消費者。
+    result_val = str(b.get("result") or "") or (key if kind != "permission" else "")
+    con = sqlite3.connect(CANON_DB)
     cur = con.execute("UPDATE approvals SET status=?, decided_at=?, result=? "
                       "WHERE id=? AND status='pending'",
-                      (decision, time.time(), b.get("result") or "", aid))
+                      (status, time.time(), result_val, aid))
     con.commit()
     changed = cur.rowcount
     cb_row = con.execute("SELECT callback FROM approvals WHERE id=?", (aid,)).fetchone()
@@ -8869,8 +9149,8 @@ async def _approval_decide_core(aid: str, b: dict) -> dict:
     # flow) so it doesn't have to poll GET /app/v1/approvals/{id}.
     if cb_row and cb_row[0]:
         asyncio.create_task(_approval_fire_callback(
-            aid, cb_row[0], decision, b.get("result") or ""))
-    return {"id": aid, "status": decision}
+            aid, cb_row[0], status, result_val))
+    return {"id": aid, "status": status, "key": key}
 
 
 @app.post("/dispatch")
