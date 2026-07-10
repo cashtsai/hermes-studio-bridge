@@ -6096,6 +6096,12 @@ async def _cc_approval_watcher():
                         continue                     # 同一個 prompt,已建過
                     if active:
                         _cc_approval_set_status(active["aid"], "expired")
+                        try:
+                            _cc_cards_feed_approval(
+                                name, _approval_get_row(active["aid"]) or {},
+                                resolved="expired")
+                        except Exception as e:  # noqa: BLE001
+                            _log_event("cc_cards_feed_error", error=str(e)[:160])
                     aid = _cc_approval_create(name, prompt)
                     _CC_APPROVAL_ACTIVE[name] = {"aid": aid, "sig": sig}
                     opts = " / ".join(str(o.get("label") or "")[:20]
@@ -6103,11 +6109,22 @@ async def _cc_approval_watcher():
                     _approval_push(aid, prompt.get("title") or f"{name} 等待核准",
                                    f"{name}" + (f" · {opts}" if opts else ""),
                                    f"claude_code:{name}")
+                    try:
+                        # A3:CC 卡片流補齊 — pending → approval 卡(三 provider
+                        # 同一組 wire shape,見 carddigest.ApprovalCardMixin)。
+                        _cc_cards_feed_approval(name, _approval_get_row(aid) or {})
+                    except Exception as e:  # noqa: BLE001
+                        _log_event("cc_cards_feed_error", error=str(e)[:160])
                     _log_event("cc_approval_created", session=name,
                                approval_id=aid)
                 elif active:
                     # prompt 消失(TUI 上被回掉/回合結束)→ 記錄過期,feed 不留殭屍
+                    rec = _approval_get_row(active["aid"]) or {}
                     _cc_approval_set_status(active["aid"], "expired")
+                    try:
+                        _cc_cards_feed_approval(name, rec, resolved="expired")
+                    except Exception as e:  # noqa: BLE001
+                        _log_event("cc_cards_feed_error", error=str(e)[:160])
                     _CC_APPROVAL_ACTIVE.pop(name, None)
             except Exception as e:  # noqa: BLE001
                 _log_event("cc_approval_watch_error", session=name,
@@ -6521,6 +6538,21 @@ def _cc_card_store(name: str):
     return store
 
 
+def _cc_cards_feed_approval(name: str, record: dict, resolved: str = "") -> None:
+    """A3(APPROVAL_HUB_SPEC §4/§6):approval 建立/決議 → 對應 CC session 的
+    approval 卡。同 `_cx_cards_feed_approval` 的形狀,只是 CC 沒有獨立
+    digest 物件 —— 直接對 `SessionCardStore`(掛了 `ApprovalCardMixin`)呼叫。
+    只餵「已有人訂閱過」的 store(`_CC_CARD_STORES` 有登記);沒人在看的
+    session 不必為了一張卡片就建 store。"""
+    store = _CC_CARD_STORES.get(name)
+    if not store:
+        return
+    if resolved:
+        store.resolve_approval(record, resolved)
+    else:
+        store.handle_approval(record)
+
+
 def _cc_card_uid(d: dict, jsonl_path: str, lineno: int) -> str:
     u = d.get("uuid")
     if u:
@@ -6734,6 +6766,24 @@ async def _cx_card_digest(thread_id: str):
 _HP_CARD_DIGESTS: dict = {}     # persona -> carddigest.PersonaDigest
 _HP_CARD_FOLLOWERS: dict = {}   # persona -> asyncio.Task
 _HP_CARD_SEED_MSGS = 200        # 冷載種子:canonical 訊息數
+
+
+def _hp_cards_feed_approval(session_id: str, record: dict, resolved: str = "") -> None:
+    """A3(APPROVAL_HUB_SPEC §4/§6):hermes persona 的 approval 建立/決議 →
+    對應 persona 卡片流的 approval 卡。`session_id` 是統一物件的
+    `hermes:{persona}` 形狀(approval_create 落庫時已經這樣寫);只餵
+    「已有人訂閱過」的 digest(`_HP_CARD_DIGESTS` 有登記),沒訂閱的
+    persona 不必為了一張卡就建 digest。"""
+    if not session_id.startswith("hermes:"):
+        return
+    persona = session_id.split(":", 1)[1]
+    d = _HP_CARD_DIGESTS.get(persona)
+    if not d:
+        return
+    if resolved:
+        d.resolve_approval(record, resolved)
+    else:
+        d.handle_approval(record)
 
 
 def _hp_digest_maybe(session: str):
@@ -8970,6 +9020,12 @@ async def approval_create(request: Request):
     title = b.get("title") or "需要核准"
     body = (b.get("detail") or session_id or "點開查看並決定")[:120]
     _approval_push(aid, title, body, session_id)
+    try:
+        # A3:hermes create 流程補齊卡片流 — pending → approval 卡(與
+        # cc/codex 同一組 wire shape,見 carddigest.ApprovalCardMixin)。
+        _hp_cards_feed_approval(session_id, _approval_get_row(aid) or {})
+    except Exception as e:  # noqa: BLE001
+        _log_event("hp_cards_feed_error", error=str(e)[:160])
     return {"id": aid, "status": "pending", "expires_at": now + ttl,
             "kind": kind, "session_id": session_id}
 
@@ -9092,6 +9148,11 @@ async def _approval_decide_core(aid: str, b: dict) -> dict:
         await _cc_key_core(name, key)
         _cc_approval_set_status(aid, decision)
         _CC_APPROVAL_ACTIVE.pop(name, None)
+        try:
+            # A3:決定發生時也要收尾卡片流(同一決定路徑,三 provider 一致)。
+            _cc_cards_feed_approval(name, d, resolved=decision)
+        except Exception as e:  # noqa: BLE001
+            _log_event("cc_cards_feed_error", error=str(e)[:160])
         _log_event("cc_approval_decision", session=name, approval_id=aid,
                    status=decision, key=key)
         return {"id": aid, "status": decision, "key": key}
@@ -9145,6 +9206,14 @@ async def _approval_decide_core(aid: str, b: dict) -> dict:
     con.close()
     if not changed:
         raise HTTPException(status_code=409, detail="already decided or expired")
+    try:
+        # A3:hermes 決定發生時收尾卡片流(同一決定路徑,三 provider 一致)。
+        # _hp_cards_feed_approval 內部會篩 session_id 前綴,非 hermes: 的列
+        # (例如舊資料 session_id 空缺)在這裡是安全 no-op。
+        _hp_cards_feed_approval(str((d or {}).get("session_id") or ""),
+                               d or {}, resolved=status)
+    except Exception as e:  # noqa: BLE001
+        _log_event("hp_cards_feed_error", error=str(e)[:160])
     # B4 (issue #9): push the decision back to the creator (Hermes skill / TG
     # flow) so it doesn't have to poll GET /app/v1/approvals/{id}.
     if cb_row and cb_row[0]:
