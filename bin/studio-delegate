@@ -1,0 +1,149 @@
+#!/usr/bin/env python3
+"""studio-delegate — CC/CX 互調與人格派工的薄 CLI(包 /app/v1/delegations)。
+
+用法:
+  studio-delegate cc|cx "<objective>" --task-code X --subtask-code Y \
+      [--cwd DIR] [--parent PERSONA] [--parent-delegation 工號] \
+      [--wait [--timeout 1800]]
+  studio-delegate report <工號|id> "<成果摘要>" [--status done|running|failed]
+  studio-delegate status <工號|id>
+
+- 無 --wait:派工後印出 work_order 與 takeover 即返回(fire-and-forget)。
+- --wait:每 10s poll,直到 status 離開 created/running(或 meta.last_report
+  出現),把成果摘要印到 stdout —— 呼叫方 agent 同步拿到結果,這就是
+  CC↔CX 的回流通道。
+- token 讀序:$BRIDGE_TOKEN → launchd plist 的 EnvironmentVariables.BRIDGE_TOKEN。
+- 防遞迴:bridge 端 depth>2 回 400、同父併發 running >3 回 429。
+"""
+import argparse
+import json
+import os
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+
+BASE = os.environ.get("BRIDGE_BASE", "http://127.0.0.1:8081")
+PLIST = os.path.expanduser("~/Library/LaunchAgents/ai.studio.hermes-bridge.plist")
+
+
+def _token() -> str:
+    tok = os.environ.get("BRIDGE_TOKEN", "").strip()
+    if tok:
+        return tok
+    try:
+        out = subprocess.run(
+            ["plutil", "-extract", "EnvironmentVariables.BRIDGE_TOKEN", "raw", PLIST],
+            capture_output=True, text=True, timeout=5)
+        return out.stdout.strip()
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _call(method, path, body=None, timeout=60.0):
+    req = urllib.request.Request(BASE + path, method=method)
+    req.add_header("Authorization", "Bearer " + _token())
+    data = None
+    if body is not None:
+        req.add_header("Content-Type", "application/json")
+        data = json.dumps(body, ensure_ascii=False).encode()
+    try:
+        with urllib.request.urlopen(req, data=data, timeout=timeout) as r:
+            return json.loads(r.read().decode("utf-8", "replace"))
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", "replace")[:400]
+        sys.exit(f"studio-delegate: HTTP {e.code} {detail}")
+    except Exception as e:  # noqa: BLE001
+        sys.exit(f"studio-delegate: {type(e).__name__}: {e}")
+
+
+def cmd_delegate(args) -> None:
+    provider = {"cc": "claude_code", "cx": "codex"}[args.provider]
+    body = {
+        "provider": provider,
+        "objective": args.objective,
+        "task_code": args.task_code,
+        "subtask_code": args.subtask_code,
+        "cwd": args.cwd or os.getcwd(),
+        "parent_persona": args.parent,
+        "created_via": os.environ.get("STUDIO_DELEGATE_VIA", "cli"),
+    }
+    if args.parent_delegation:
+        body["parent_delegation"] = args.parent_delegation
+    res = _call("POST", "/app/v1/delegations", body, timeout=90.0)
+    d = res.get("delegation") or {}
+    wo = d.get("work_order") or d.get("id") or ""
+    tk = ((d.get("takeover") or {}).get("pocket") or {}).get("session_id") or ""
+    print(f"work_order={wo}")
+    if tk:
+        print(f"takeover={tk}")
+    if not args.wait:
+        return
+    deadline = time.time() + args.timeout
+    last_status = ""
+    while time.time() < deadline:
+        time.sleep(10)
+        got = _call("GET", f"/app/v1/delegations/{wo}")
+        dd = got.get("delegation") or {}
+        st = dd.get("status") or ""
+        if st != last_status:
+            print(f"status={st}", file=sys.stderr)
+            last_status = st
+        meta = dd.get("meta") or {}
+        if isinstance(meta, str):
+            try:
+                meta = json.loads(meta)
+            except Exception:  # noqa: BLE001
+                meta = {}
+        report = (meta or {}).get("last_report") or {}
+        if st in ("idle", "failed", "done", "archived"):
+            print(f"final_status={st}")
+            if report.get("summary"):
+                print("--- 成果摘要 ---")
+                print(report["summary"])
+            sys.exit(0 if st in ("idle", "done") else 1)
+    sys.exit(f"studio-delegate: timeout after {args.timeout}s (work_order={wo})")
+
+
+def cmd_report(args) -> None:
+    body = {"summary": args.summary}
+    if args.status:
+        body["status"] = args.status
+    res = _call("POST", f"/app/v1/delegations/{args.ref}/report", body)
+    print(f"ok work_order={res.get('work_order')} event={res.get('event')}")
+
+
+def cmd_status(args) -> None:
+    got = _call("GET", f"/app/v1/delegations/{args.ref}")
+    print(json.dumps(got.get("delegation") or {}, ensure_ascii=False, indent=1))
+
+
+def main() -> None:
+    p = argparse.ArgumentParser(prog="studio-delegate")
+    sub = p.add_subparsers(dest="cmd", required=True)
+    for prov in ("cc", "cx"):
+        sp = sub.add_parser(prov, help=f"派工給 {prov}")
+        sp.add_argument("objective")
+        sp.add_argument("--task-code", required=True)
+        sp.add_argument("--subtask-code", required=True)
+        sp.add_argument("--cwd", default="")
+        sp.add_argument("--parent", default="xcash")
+        sp.add_argument("--parent-delegation", default="")
+        sp.add_argument("--wait", action="store_true")
+        sp.add_argument("--timeout", type=int, default=1800)
+        sp.set_defaults(func=cmd_delegate, provider=prov)
+    rp = sub.add_parser("report", help="子代理回報成果")
+    rp.add_argument("ref")
+    rp.add_argument("summary")
+    rp.add_argument("--status", default="", choices=["", "done", "running", "failed", "idle"])
+    rp.set_defaults(func=cmd_report)
+    st = sub.add_parser("status", help="查詢委派狀態")
+    st.add_argument("ref")
+    st.set_defaults(func=cmd_status)
+    args = p.parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()

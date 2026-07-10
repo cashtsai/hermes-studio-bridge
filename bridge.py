@@ -1433,6 +1433,8 @@ def _delegation_prompt(work_order: str, parent_persona: str, title: str,
         "- 先提出可驗收計畫，再實作；不要改無關檔案。",
         "- 若涉及 production 寫入、正式通知、正式發文或真實使用者狀態變更，先停下等放行。",
         "- 完成時回報修改檔案、驗證命令與輸出、殘餘風險、下一步。",
+        f"- 完成或到達里程碑時,執行 `studio-delegate report {work_order} \"<成果摘要>\" --status done`"
+        "(進度回報用 --status running)把結果回流給派工方;此指令已在 PATH。",
     ]
     for label, key in (("規格文件", "spec_path"), ("限制", "constraints"),
                        ("驗收方式", "acceptance"), ("交接資訊", "handoff")):
@@ -1655,6 +1657,137 @@ def _delegated_codex_thread_ids() -> set:
         for r in _delegation_rows(limit=200)
         if dict(r).get("provider") == "codex"
     } - {""}
+
+
+# ─── 委派生命週期回流(M1)+ CC↔CX 互調結果注回(M2)──────────────────────
+# delegations 過去只存不回流:parent_session 存了沒用、完成無偵測,派工的人格
+# 永遠不知道結果。現在:父是人格 → 寫 report_events 進該人格對話(卡片流本來
+# 就會併入,Pocket 聊天串直接看到);父是另一個 delegation(CC↔CX 互調)→ 把
+# 完成通知注回父 session 喚醒父代理。done/failed 另發推播。
+
+def _delegation_meta(d: dict) -> dict:
+    try:
+        m = d.get("meta")
+        return json.loads(m) if isinstance(m, str) else (m or {})
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+async def _delegation_notify(d: dict, event: str, summary: str = "") -> None:
+    meta = _delegation_meta(d)
+    wo = d.get("work_order") or d.get("id") or ""
+    title = d.get("title") or ""
+    status_txt = {"created": "已建立", "done": "已完成", "failed": "失敗",
+                  "report": "進度回報"}.get(event, event)
+    parent_dlg = str(meta.get("parent_delegation") or "")
+    if parent_dlg:
+        # CC↔CX 互調:結果注回父 delegation 的 session(喚醒父代理繼續),
+        # 不再往人格灌(避免雙份)。
+        prow = _delegation_get(parent_dlg)
+        if prow:
+            p = dict(prow)
+            note = f"[子任務 {wo} {status_txt}] " + (summary.strip()[:800] or title)
+            try:
+                if p.get("provider") == "claude_code" and (p.get("cc_session_name") or ""):
+                    await _cc_paste_text(p["cc_session_name"], note)
+                elif p.get("provider") == "codex":
+                    ptid = p.get("codex_thread_id") or p.get("provider_session_id") or ""
+                    if ptid:
+                        await CODEX_APP.start_turn(
+                            ptid, await _codex_input_items(note, []),
+                            client_id=f"dlg-notify-{d.get('id','')[:12]}-{event}")
+            except Exception as e:  # noqa: BLE001
+                _log_event("delegation_parent_notify_failed",
+                           delegation=d.get("id"), error=str(e)[:160])
+        return
+    parent = d.get("parent_persona") or ""
+    if parent in PERSONAS:
+        lines = [f"[工號 {wo}] {title}", f"狀態:{status_txt}"]
+        if summary.strip():
+            lines += ["", summary.strip()[:2000]]
+        tk = _delegation_takeover(d)
+        sid = (tk.get("pocket") or {}).get("session_id") or ""
+        if sid:
+            lines += ["", f"接手:{sid}"]
+        _report_upsert(parent, {
+            "label": "委派任務", "name": f"dlg-{str(d.get('id') or '')[:12]}",
+            "content": "\n".join(lines), "ts": time.time(),
+            "external_source": "delegation",
+            "external_id": f"dlg:{d.get('id')}:{event}:{int(time.time())}",
+        })
+    if event in ("done", "failed"):
+        try:
+            await push_notify(("✅ " if event == "done" else "❌ ") + f"[{wo}] {title[:40]}",
+                              (summary.strip() or status_txt)[:160],
+                              {"kind": "delegation_done",
+                               "delegation_id": str(d.get("id") or "")})
+        except Exception:  # noqa: BLE001
+            pass
+
+
+async def _delegation_codex_completed(tid: str, failed: bool, err_msg: str = "") -> None:
+    """codex turn/completed → 對應委派 running→idle/failed 一次性回流。"""
+    for row in _delegation_rows(limit=200):
+        d = dict(row)
+        if d.get("provider") != "codex":
+            continue
+        if (d.get("codex_thread_id") or d.get("provider_session_id") or "") != tid:
+            continue
+        if (d.get("status") or "") != "running":
+            return                       # 只在 running→完成 的轉換回流一次
+        new_status = "failed" if failed else "idle"
+        _delegation_update(d["id"], status=new_status, updated_at=time.time(),
+                           last_error=(err_msg[:300] if failed else ""))
+        d["status"] = new_status
+        await _delegation_notify(d, "failed" if failed else "done",
+                                 summary=(err_msg if failed else ""))
+        return
+
+
+_DLG_CC_IDLE: dict = {}    # delegation id -> 連續 idle tick 數(debounce)
+
+
+async def _delegation_cc_watcher():
+    """15s 巡 created/running 的 CC 委派:busy→標 running;連兩 tick idle →
+    判完成回流;tmux 不在 → failed。codex 靠 turn/completed 事件,不用巡。"""
+    while True:
+        await asyncio.sleep(15.0)
+        try:
+            for row in _delegation_rows(limit=100):
+                d = dict(row)
+                if d.get("provider") != "claude_code":
+                    continue
+                if (d.get("status") or "") not in ("created", "running"):
+                    continue
+                name = d.get("cc_session_name") or d.get("provider_session_id") or ""
+                if not name:
+                    continue
+                st, _p = await _v2_cc_state(name)
+                if st in ("running", "waiting_approval"):
+                    _DLG_CC_IDLE.pop(d["id"], None)
+                    if d.get("status") == "created":
+                        _delegation_update(d["id"], status="running",
+                                           updated_at=time.time())
+                    continue
+                if st == "failed":
+                    _delegation_update(d["id"], status="failed",
+                                       updated_at=time.time(),
+                                       last_error="cc session not running")
+                    d["status"] = "failed"
+                    await _delegation_notify(d, "failed",
+                                             summary="CC session 掛了(tmux 不在)")
+                    _DLG_CC_IDLE.pop(d["id"], None)
+                    continue
+                n = _DLG_CC_IDLE.get(d["id"], 0) + 1
+                _DLG_CC_IDLE[d["id"]] = n
+                if n >= 2 and d.get("status") == "running":
+                    _delegation_update(d["id"], status="idle",
+                                       updated_at=time.time())
+                    d["status"] = "idle"
+                    await _delegation_notify(d, "done")
+                    _DLG_CC_IDLE.pop(d["id"], None)
+        except Exception as e:  # noqa: BLE001
+            _log_event("delegation_cc_watch_error", error=str(e)[:160])
 
 
 def _report_id(persona: str, name: str, sid: str, ts) -> str:
@@ -2713,6 +2846,15 @@ class CodexAppServerClient:
                 self._append(tid, ("text", f"\n⚠️ Codex turn failed: {msg}\n"))
             else:
                 self.thread_errors.pop(tid, None)
+            # M1:是委派 thread → 回流父對話(running→idle/failed 轉換內部去重)。
+            try:
+                t = asyncio.create_task(_delegation_codex_completed(
+                    tid, bool(err),
+                    str(err.get("message", err))[:300] if err else ""))
+                _BG_TASKS.add(t)
+                t.add_done_callback(_BG_TASKS.discard)
+            except RuntimeError:
+                pass
             return
         if method == "error":
             _log_event("codex_app_server_error",
@@ -7140,6 +7282,41 @@ async def app_delegation_input(delegation_id: str, request: Request):
     raise HTTPException(status_code=400, detail="unsupported delegation provider")
 
 
+@app.post("/app/v1/delegations/{delegation_id}/report")
+async def app_delegation_report(delegation_id: str, request: Request):
+    """子代理主動回報成果/里程碑(M1-3)。成果摘要由做事的人自己寫,品質最高、
+    不靠 watcher 猜。body {summary, files?, verification?, status?}。id 或工號皆可。
+    status=done/idle → 標完成並回流「已完成」;failed → 失敗;其餘 → 進度回報。"""
+    _check_auth(request)
+    row = _delegation_get(delegation_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="unknown delegation")
+    d = dict(row)
+    body = await request.json()
+    summary = str(body.get("summary") or body.get("content") or "").strip()
+    if not summary:
+        raise HTTPException(status_code=400, detail="summary required")
+    status_in = str(body.get("status") or "").strip().lower()
+    meta = _delegation_meta(d)
+    meta["last_report"] = {"summary": summary[:4000], "ts": time.time(),
+                           "files": body.get("files") or [],
+                           "verification": str(body.get("verification") or "")[:2000]}
+    fields = {"meta": meta, "updated_at": time.time()}
+    if status_in in ("done", "idle"):
+        fields["status"] = "idle"
+    elif status_in in ("failed", "running"):
+        fields["status"] = status_in
+    _delegation_update(d["id"], **fields)
+    d["meta"] = json.dumps(meta, ensure_ascii=False)
+    if "status" in fields:
+        d["status"] = fields["status"]
+    event = ("done" if status_in in ("done", "idle")
+             else "failed" if status_in == "failed" else "report")
+    await _delegation_notify(d, event, summary=summary)
+    return {"ok": True, "delegation_id": d["id"], "work_order": d.get("work_order"),
+            "event": event}
+
+
 @app.post("/app/v1/delegations")
 async def app_delegation_create(request: Request):
     """Create a durable CC/Codex work-order session.
@@ -7177,6 +7354,28 @@ async def app_delegation_create(request: Request):
                   _new_work_order(parent, task_code, subtask_code)).strip().upper()
     if not re.match(r"^[A-Z0-9][A-Z0-9._-]{2,60}$", work_order):
         raise HTTPException(status_code=400, detail="unsupported work_order")
+    # M2:CC↔CX 互調的呼叫鏈標記 + 防遞迴。parent_delegation = 父工號/父 id,
+    # depth 隨鏈遞增,>2 擋(防互派炸鏈);同父併發 running 子任務 >3 擋。
+    parent_delegation_ref = str(body.get("parent_delegation") or "").strip()
+    parent_dlg_id = ""
+    depth = 0
+    if parent_delegation_ref:
+        prow = _delegation_get(parent_delegation_ref)
+        if not prow:
+            raise HTTPException(status_code=400, detail="unknown parent_delegation")
+        pd = dict(prow)
+        parent_dlg_id = pd.get("id") or ""
+        depth = int(_delegation_meta(pd).get("depth") or 0) + 1
+        if depth > 2:
+            raise HTTPException(status_code=400,
+                                detail="delegation chain too deep (max depth 2)")
+        running_children = sum(
+            1 for r in _delegation_rows(limit=200)
+            if _delegation_meta(dict(r)).get("parent_delegation") == parent_dlg_id
+            and dict(r).get("status") == "running")
+        if running_children >= 3:
+            raise HTTPException(status_code=429,
+                                detail="parent already has 3 running children")
     did = "dlg-" + uuid.uuid4().hex[:16]
     now = time.time()
     prompt = _delegation_prompt(work_order, parent, title, objective, cwd, body)
@@ -7188,6 +7387,8 @@ async def app_delegation_create(request: Request):
         "parent_display": PERSONAS[parent][0],
         "created_by": "bridge",
         "created_via": body.get("created_via") or "bridge",
+        "parent_delegation": parent_dlg_id,
+        "depth": depth,
     }
 
     if provider == "codex":
@@ -7276,9 +7477,16 @@ async def app_delegation_create(request: Request):
                work_order=work_order,
                parent_persona=parent,
                provider=provider,
+               created_via=meta.get("created_via"),
+               depth=depth,
                provider_session_hash=_short_hash(provider_session_id),
                objective_chars=len(objective),
                attachment_count=len(body.get("attachments") or []))
+    # M1:建立即回流一張「已建立」卡進父人格對話(父是 delegation 則注回父 session)。
+    try:
+        await _delegation_notify(dict(row), "created")
+    except Exception:  # noqa: BLE001
+        pass
     return {"ok": True, "delegation": _delegation_public(row, status)}
 
 
@@ -8529,3 +8737,7 @@ async def _start_cc_approval_watcher():
     task = asyncio.create_task(_cc_approval_watcher())
     _BG_TASKS.add(task)
     task.add_done_callback(_BG_TASKS.discard)
+    # M1:CC 委派完成偵測(15s;codex 走 turn/completed 事件不用巡)
+    dtask = asyncio.create_task(_delegation_cc_watcher())
+    _BG_TASKS.add(dtask)
+    dtask.add_done_callback(_BG_TASKS.discard)
