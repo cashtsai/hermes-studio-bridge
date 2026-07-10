@@ -5309,11 +5309,23 @@ async def cc_history_resume(sid: str, request: Request):
     if rc != 0:
         raise http_err(502, "TMUX_FAILED", "tmux new-session failed",
                        (err or "tmux new-session failed")[:200])
+    # conf 單一寫者:走 ccsess register(內含 conf 鎖),不再直接 append ——
+    # 裸 append 會被 ccsess 端 mktemp+mv 全檔重寫蓋掉,或讓 rename 讀到半新不舊。
+    rc2, _out2, err2 = await _run_ccsess("register", name, cwd)
+    if rc2 != 0:
+        raise HTTPException(status_code=500,
+                            detail=f"registered tmux but conf register failed: {err2[:160]}")
+    # 精準 resume pin:這條 session 是明確 --resume <sid> 起的,直接落 pin,
+    # 重開機後 ensure 走 --resume 接回同一條對話(不再靠 --continue 猜目錄)。
     try:
-        with open(CCSESS_CONF, "a") as f:
-            f.write(f"{name}|{cwd}|1\n")
-    except Exception as e:  # noqa: BLE001
-        raise HTTPException(status_code=500, detail=f"registered tmux but conf write failed: {e}")
+        pdir = os.path.expanduser("~/.config/ccsess/resume")
+        os.makedirs(pdir, exist_ok=True)
+        tmp = os.path.join(pdir, name + ".tmp")
+        with open(tmp, "w") as f:
+            f.write(sid + "\n")
+        os.replace(tmp, os.path.join(pdir, name))
+    except Exception:  # noqa: BLE001
+        pass
     _log_event("cc_history_resume", session_id=sid, name=name, cwd=cwd)
     return {"ok": True, "name": name, "cwd": cwd}
 
@@ -5572,17 +5584,32 @@ async def cc_session_hook(request: Request):
     # 並順手把權威 sid 回寫 _CC_SID_CACHE —— 這同時補上「TUI 內 /clear 或
     # /resume 後 cmdline uuid 過期」的洞:hook 每回合都帶最新 sid。
     hook_sid = str(body.get("session_id") or "")
-    names = _cc_names_for_cwd(body.get("cwd"))
+    all_names = _cc_names_for_cwd(body.get("cwd"))
+    names = all_names
+    sid_matched = False
     if len(names) > 1 and hook_sid:
         matched = [n for n in names
                    if (_CC_SID_CACHE.get(n) or (0, None))[1] == hook_sid]
+        sid_matched = bool(matched)
         names = matched or names[:1]
     name = names[0] if names else None
     if not name:
         return {"ok": True, "ignored": True}
-    if hook_sid and len(_cc_names_for_cwd(body.get("cwd"))) == 1:
-        # workdir 唯一對應 → hook sid 就是這條 session 的權威身分,直接回寫。
+    if hook_sid and (len(all_names) == 1 or sid_matched):
+        # 身分有把握(workdir 唯一,或 sid 對上快取)→ hook sid 是權威:
+        # 回寫 _CC_SID_CACHE(修 /clear /resume 後 cmdline uuid 過期),並
+        # 原子落 resume pin —— 重開機後 ensure 走 --resume 精準接回這條對話,
+        # 不再靠 --continue 按目錄猜(同目錄多 session 會互搶)。
         _CC_SID_CACHE[name] = (time.monotonic(), hook_sid)
+        try:
+            pdir = os.path.expanduser("~/.config/ccsess/resume")
+            os.makedirs(pdir, exist_ok=True)
+            ptmp = os.path.join(pdir, name + ".tmp")
+            with open(ptmp, "w") as f:
+                f.write(hook_sid + "\n")
+            os.replace(ptmp, os.path.join(pdir, name))
+        except Exception:  # noqa: BLE001
+            pass
     now = time.time()
     state = {"busy": event == "UserPromptSubmit", "updated_at": now, "source": "hook"}
     if event == "Stop":
