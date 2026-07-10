@@ -427,8 +427,11 @@ class CodexThreadDigest:
             "approval",
             {"approval_id": record["id"], "title": title,
              "detail": record.get("detail") or "",
-             "options": [{"key": "approve", "label": "允許", "style": "primary"},
-                         {"key": "deny", "label": "拒絕", "style": "danger"}],
+             # 選項改由發起方宣告(record["options"]);沒宣告才退回二元預設。
+             # 不再把「允許/拒絕」寫死在這裡——見 CHOICE_GATEWAY_CONTRACT §1。
+             "options": record.get("options") or [
+                 {"key": "approve", "label": "允許", "style": "primary"},
+                 {"key": "deny", "label": "拒絕", "style": "danger"}],
              "source": "codex",
              "fallback_text": f"🔐 {title}"}, final=False))
         self._status()
@@ -551,7 +554,10 @@ class SessionCardStore:
 # 壞 JSON / 不認得的 kind → 圍欄原文保留(不吞內容,fallback 鐵律)。
 
 _SC_FENCE_RE = re.compile(r"```studio-card[ \t]*\n(.*?)\n?```", re.DOTALL)
-_SC_KINDS = ("table", "kv", "text", "markdown")
+# choices = 選擇閘道公版(docs/CHOICE_GATEWAY_CONTRACT.md):agent 吐一個
+# ```studio-card {kind:"choices", options:[…]}``` → App 渲染成原生按鈕。
+# body(含 options/rows)原樣過(extract 用 dict(payload)),不需另寫欄位。
+_SC_KINDS = ("table", "kv", "text", "markdown", "choices")
 
 
 def _studio_card_fallback(payload: dict) -> str:
@@ -581,6 +587,24 @@ def _studio_card_fallback(payload: dict) -> str:
             pairs = []
         lines = ([title] if title else []) + \
             [f"{k}: {v}" for k, v in pairs[:20]]
+        return "\n".join(lines).strip() or "studio-card"
+    if kind == "choices":
+        # 純文字降級(TG / 不認得 choices 的 client 照樣看得懂,= 契約的「文字備援」)。
+        lines = [title] if title else []
+        for o in payload.get("options") or []:
+            if not isinstance(o, dict):
+                continue
+            label = str(o.get("label") or "").strip()
+            if not label:
+                continue
+            url = str(o.get("url") or "").strip()
+            send = str(o.get("send") or "").strip()
+            if url:
+                lines.append(f"- {label}:{url}")
+            elif send:
+                lines.append(f"- {label}(送「{send}」)")
+            else:
+                lines.append(f"- {label}")
         return "\n".join(lines).strip() or "studio-card"
     text = str(payload.get("text") or "")
     return (f"{title}\n{text}" if title else text).strip() or "studio-card"

@@ -12,7 +12,8 @@
 盤點結論:bridge 端**單一權威其實已經存在**——SQLite `approvals` 表
 (三個 provider 都寫入)+ `_approval_decide_core`(以 `source` 前綴分派的
 唯一決定路由;v1 decision 與 v2 approve 都匯入它)。推播也已統一
-(`_approval_push`,category `SCARF_PENDING_PERMISSION`)。
+(`_approval_push`,category `POCKET_PENDING_PERMISSION`;Scarf 契約遷移 Stage 1b
+翻新,相容期仍保留舊 `SCARF_PENDING_PERMISSION` 巢/鍵)。
 
 **分裂在表面層**,目前同一件事有三套形狀:
 

@@ -37,6 +37,7 @@ from pathlib import Path
 
 from fastapi import FastAPI, Request, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, StreamingResponse, FileResponse
+from starlette.websockets import WebSocketState
 
 from acp_client import ACPPool, canonical_telegram_session
 
@@ -85,7 +86,7 @@ _POCKET_DIR = os.path.expanduser("~/.pocket")
 _DEVICE_TOKENS_PATH = os.path.join(_POCKET_DIR, "device-tokens.json")
 _PAIR_LOCK = threading.Lock()
 _PAIR_CODES: dict = {}          # code -> {expiry, apple_user_id} or legacy expiry
-_PAIR_CODE_TTL = 300.0          # a pairing code is valid for 5 minutes
+_PAIR_CODE_TTL = 600.0          # a pairing code is valid for 10 minutes
 APPLE_JWKS_URL = "https://appleid.apple.com/auth/keys"
 APPLE_ID_ISSUER = "https://appleid.apple.com"
 APPLE_ID_AUDIENCES = tuple(
@@ -1135,6 +1136,9 @@ def _canon_add(session: str, role: str, content: str, attachments=None,
         con.commit()
         con.close()
         _canon_notify(session)
+        # P1-3:人格完成一則回覆 → 推播把你叫回 app(前景由 app willPresent 抑制)。
+        if role == "assistant" and status == "done":
+            _push_persona_reply(session, content)
         return mid, True
     except Exception as e:  # noqa: BLE001
         _log_event("canonical_write_failed",
@@ -1434,6 +1438,8 @@ def _delegation_prompt(work_order: str, parent_persona: str, title: str,
         "- 先提出可驗收計畫，再實作；不要改無關檔案。",
         "- 若涉及 production 寫入、正式通知、正式發文或真實使用者狀態變更，先停下等放行。",
         "- 完成時回報修改檔案、驗證命令與輸出、殘餘風險、下一步。",
+        f"- 完成或到達里程碑時,執行 `studio-delegate report {work_order} \"<成果摘要>\" --status done`"
+        "(進度回報用 --status running)把結果回流給派工方;此指令已在 PATH。",
     ]
     for label, key in (("規格文件", "spec_path"), ("限制", "constraints"),
                        ("驗收方式", "acceptance"), ("交接資訊", "handoff")):
@@ -1658,6 +1664,137 @@ def _delegated_codex_thread_ids() -> set:
     } - {""}
 
 
+# ─── 委派生命週期回流(M1)+ CC↔CX 互調結果注回(M2)──────────────────────
+# delegations 過去只存不回流:parent_session 存了沒用、完成無偵測,派工的人格
+# 永遠不知道結果。現在:父是人格 → 寫 report_events 進該人格對話(卡片流本來
+# 就會併入,Pocket 聊天串直接看到);父是另一個 delegation(CC↔CX 互調)→ 把
+# 完成通知注回父 session 喚醒父代理。done/failed 另發推播。
+
+def _delegation_meta(d: dict) -> dict:
+    try:
+        m = d.get("meta")
+        return json.loads(m) if isinstance(m, str) else (m or {})
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+async def _delegation_notify(d: dict, event: str, summary: str = "") -> None:
+    meta = _delegation_meta(d)
+    wo = d.get("work_order") or d.get("id") or ""
+    title = d.get("title") or ""
+    status_txt = {"created": "已建立", "done": "已完成", "failed": "失敗",
+                  "report": "進度回報"}.get(event, event)
+    parent_dlg = str(meta.get("parent_delegation") or "")
+    if parent_dlg:
+        # CC↔CX 互調:結果注回父 delegation 的 session(喚醒父代理繼續),
+        # 不再往人格灌(避免雙份)。
+        prow = _delegation_get(parent_dlg)
+        if prow:
+            p = dict(prow)
+            note = f"[子任務 {wo} {status_txt}] " + (summary.strip()[:800] or title)
+            try:
+                if p.get("provider") == "claude_code" and (p.get("cc_session_name") or ""):
+                    await _cc_paste_text(p["cc_session_name"], note)
+                elif p.get("provider") == "codex":
+                    ptid = p.get("codex_thread_id") or p.get("provider_session_id") or ""
+                    if ptid:
+                        await CODEX_APP.start_turn(
+                            ptid, await _codex_input_items(note, []),
+                            client_id=f"dlg-notify-{d.get('id','')[:12]}-{event}")
+            except Exception as e:  # noqa: BLE001
+                _log_event("delegation_parent_notify_failed",
+                           delegation=d.get("id"), error=str(e)[:160])
+        return
+    parent = d.get("parent_persona") or ""
+    if parent in PERSONAS:
+        lines = [f"[工號 {wo}] {title}", f"狀態:{status_txt}"]
+        if summary.strip():
+            lines += ["", summary.strip()[:2000]]
+        tk = _delegation_takeover(d)
+        sid = (tk.get("pocket") or {}).get("session_id") or ""
+        if sid:
+            lines += ["", f"接手:{sid}"]
+        _report_upsert(parent, {
+            "label": "委派任務", "name": f"dlg-{str(d.get('id') or '')[:12]}",
+            "content": "\n".join(lines), "ts": time.time(),
+            "external_source": "delegation",
+            "external_id": f"dlg:{d.get('id')}:{event}:{int(time.time())}",
+        })
+    if event in ("done", "failed"):
+        try:
+            await push_notify(("✅ " if event == "done" else "❌ ") + f"[{wo}] {title[:40]}",
+                              (summary.strip() or status_txt)[:160],
+                              {"kind": "delegation_done",
+                               "delegation_id": str(d.get("id") or "")})
+        except Exception:  # noqa: BLE001
+            pass
+
+
+async def _delegation_codex_completed(tid: str, failed: bool, err_msg: str = "") -> None:
+    """codex turn/completed → 對應委派 running→idle/failed 一次性回流。"""
+    for row in _delegation_rows(limit=200):
+        d = dict(row)
+        if d.get("provider") != "codex":
+            continue
+        if (d.get("codex_thread_id") or d.get("provider_session_id") or "") != tid:
+            continue
+        if (d.get("status") or "") != "running":
+            return                       # 只在 running→完成 的轉換回流一次
+        new_status = "failed" if failed else "idle"
+        _delegation_update(d["id"], status=new_status, updated_at=time.time(),
+                           last_error=(err_msg[:300] if failed else ""))
+        d["status"] = new_status
+        await _delegation_notify(d, "failed" if failed else "done",
+                                 summary=(err_msg if failed else ""))
+        return
+
+
+_DLG_CC_IDLE: dict = {}    # delegation id -> 連續 idle tick 數(debounce)
+
+
+async def _delegation_cc_watcher():
+    """15s 巡 created/running 的 CC 委派:busy→標 running;連兩 tick idle →
+    判完成回流;tmux 不在 → failed。codex 靠 turn/completed 事件,不用巡。"""
+    while True:
+        await asyncio.sleep(15.0)
+        try:
+            for row in _delegation_rows(limit=100):
+                d = dict(row)
+                if d.get("provider") != "claude_code":
+                    continue
+                if (d.get("status") or "") not in ("created", "running"):
+                    continue
+                name = d.get("cc_session_name") or d.get("provider_session_id") or ""
+                if not name:
+                    continue
+                st, _p = await _v2_cc_state(name)
+                if st in ("running", "waiting_approval"):
+                    _DLG_CC_IDLE.pop(d["id"], None)
+                    if d.get("status") == "created":
+                        _delegation_update(d["id"], status="running",
+                                           updated_at=time.time())
+                    continue
+                if st == "failed":
+                    _delegation_update(d["id"], status="failed",
+                                       updated_at=time.time(),
+                                       last_error="cc session not running")
+                    d["status"] = "failed"
+                    await _delegation_notify(d, "failed",
+                                             summary="CC session 掛了(tmux 不在)")
+                    _DLG_CC_IDLE.pop(d["id"], None)
+                    continue
+                n = _DLG_CC_IDLE.get(d["id"], 0) + 1
+                _DLG_CC_IDLE[d["id"]] = n
+                if n >= 2 and d.get("status") == "running":
+                    _delegation_update(d["id"], status="idle",
+                                       updated_at=time.time())
+                    d["status"] = "idle"
+                    await _delegation_notify(d, "done")
+                    _DLG_CC_IDLE.pop(d["id"], None)
+        except Exception as e:  # noqa: BLE001
+            _log_event("delegation_cc_watch_error", error=str(e)[:160])
+
+
 def _report_id(persona: str, name: str, sid: str, ts) -> str:
     raw = f"cron:{persona}:{name}:{sid}:{ts}"
     return hashlib.sha1(raw.encode("utf-8", "replace")).hexdigest()[:24]
@@ -1739,7 +1876,11 @@ APNS_KEY_PATH = os.path.expanduser(
     "~/apps/hermes-agent/home/credentials/AuthKey_86FF9D976T.p8")
 APNS_KEY_ID = "86FF9D976T"
 APNS_TEAM_ID = "4F8B93R3SH"
-APNS_BUNDLE_ID = "com.pocketagent.ios"
+# 正式 app 是 Pocket kernel(com.pocketagent.kernel,見 ship-kernel.sh)。apns-topic
+# 必須對上 device token 所屬 app,否則 APNs 回 400 BadTopic / DeviceTokenNotForTopic
+# → 推播全滅(2026-07 之前寫成舊 SUN 的 com.pocketagent.ios,推播在正式版 100% 死)。
+# token-based(.p8)是 team 級,對同 team 任何 bundle 都有效,只要 topic 對。
+APNS_BUNDLE_ID = "com.pocketagent.kernel"
 APNS_HOST = "https://api.push.apple.com"   # production (TestFlight + App Store)
 _apns_jwt_cache: list = [None, 0.0]        # [token, issued_at]
 
@@ -1799,12 +1940,17 @@ def _device_remove(token: str) -> None:
 
 
 async def _apns_send(token: str, title: str, body: str, data: dict | None = None,
-                     category: str | None = None, thread_id: str | None = None):
+                     category: str | None = None, thread_id: str | None = None,
+                     content_available: bool = False):
     import httpx
     headers = {"authorization": f"bearer {_apns_jwt()}",
                "apns-topic": APNS_BUNDLE_ID,
                "apns-push-type": "alert", "apns-priority": "10"}
     aps = {"alert": {"title": title, "body": body}, "sound": "default"}
+    if content_available:
+        # 讓通知本體也能喚醒 app 在背景拉新訊息(通知本身已帶 title/body,
+        # 收到即最新;app 若在背景可順手 refresh 對話)。
+        aps["content-available"] = 1
     if category:
         # 批次 3 斷點①:category 才會讓 iOS/手錶顯示 UNNotificationAction
         # 動作鈕(app 端已註冊同名 category)。
@@ -1822,38 +1968,93 @@ async def _apns_send(token: str, title: str, body: str, data: dict | None = None
 
 async def push_notify(title: str, body: str, data: dict | None = None,
                       category: str | None = None,
-                      thread_id: str | None = None) -> int:
-    """Fan a push to every registered device; prune dead tokens (410/BadToken)."""
+                      thread_id: str | None = None,
+                      content_available: bool = False) -> dict:
+    """Fan a push to every registered device; prune dead tokens (410/BadToken).
+
+    Returns {sent, total, failures:[{code,detail}]}. **不再吞錯** —— 非 200/410 的
+    APNs 回應(400 BadTopic、403 bad key、429…)以前被靜默吃掉,推播死了好幾週都
+    查不到。現在一律 _log_event,`/push/test` 也回傳真實 code。"""
+    toks = _devices()
     sent = 0
-    for tok in _devices():
+    failures: list[dict] = []
+    for tok in toks:
         try:
             code, text = await _apns_send(tok, title, body, data,
-                                          category=category, thread_id=thread_id)
+                                          category=category, thread_id=thread_id,
+                                          content_available=content_available)
             if code == 200:
                 sent += 1
-            elif code == 410 or "BadDeviceToken" in text or "Unregistered" in text:
+            elif (code == 410 or "BadDeviceToken" in text or "Unregistered" in text
+                  or "DeviceTokenNotForTopic" in text):
+                # DeviceTokenNotForTopic = 舊 SUN(.ios)遺留 token,對 .kernel 永遠不合 → 清掉。
                 _device_remove(tok)
-        except Exception:  # noqa: BLE001
-            pass
-    return sent
+                failures.append({"code": code, "detail": "wrong-app/unregistered→pruned",
+                                 "token": tok[:8]})
+            else:
+                failures.append({"code": code, "detail": (text or "")[:160],
+                                 "token": tok[:8]})
+        except Exception as e:  # noqa: BLE001
+            failures.append({"code": "exc", "detail": str(e)[:160], "token": tok[:8]})
+    if failures:
+        _log_event("push_notify_failed", title=title[:48], sent=sent,
+                   total=len(toks), failures=str(failures)[:400])
+    return {"sent": sent, "total": len(toks), "failures": failures}
 
 
-_APNS_APPROVAL_CATEGORY = "SCARF_PENDING_PERMISSION"
+# Scarf 契約遷移 Stage 1b(見 pocketagent/docs/SCARF_CONTRACT_MIGRATION_PLAN.md)。
+# ⚠️ GATE:本分支只在「接受新 category 的 app(Stage 1a,pocketagent PR)」已
+#    上架/普及後才可 merge+deploy。先翻 producer 會讓舊 app 收不到動作鈕。app
+#    側 1a 已雙接受 POCKET_/SCARF_ 兩個 category 與 pocket/scarf 兩巢,故翻新後
+#    舊 app 仍靠 scarf 巢運作,新 app 走 pocket 巢。
+_APNS_APPROVAL_CATEGORY = "POCKET_PENDING_PERMISSION"
 
 
 def _approval_push(aid: str, title: str, body: str, session_id: str = ""):
-    """審核推播(批次 3 斷點①):category 出動作鈕、`scarf.{kind, approvalId,
-    sessionId}` 與 app 端約定對齊、thread-id 以 session 分串。舊鍵
-    {kind, id} 保留給既有 build。fire-and-forget,失敗吞在 push_notify。"""
-    data = {"kind": "approval", "id": aid,
-            "scarf": {"kind": "approval", "approvalId": aid,
-                      "sessionId": session_id}}
+    """審核推播(批次 3 斷點①):category 出動作鈕、payload 巢與 app 端約定對齊、
+    thread-id 以 session 分串。Stage 1b 翻新:新 `pocket.{kind, approvalId,
+    sessionId}` 巢 + category;**相容期保留** 舊 `scarf` 巢與更舊頂層 {kind, id},
+    讓尚未更新的 app 仍可解析(app 側 pocket 巢優先)。fire-and-forget。"""
+    _approval_nest = {"kind": "approval", "approvalId": aid,
+                      "sessionId": session_id}
+    data = {"kind": "approval", "id": aid,   # 最舊頂層鍵(相容期保留)
+            "pocket": _approval_nest,        # 新巢(app 優先讀)
+            "scarf": _approval_nest}         # 舊巢(相容期保留;Stage 1c 移除)
     task = asyncio.create_task(push_notify(
         f"🔐 {title}", body[:120], data,
         category=_APNS_APPROVAL_CATEGORY,
         thread_id=session_id or "approvals"))
     _BG_TASKS.add(task)
     task.add_done_callback(_BG_TASKS.discard)
+
+
+def _push_persona_reply(session: str, content: str) -> None:
+    """P1-3 人格回訊推播:人格(assistant)在 canonical 落地一則『完成』的回覆時,推播
+    把你叫回 app。標題=人格顯示名,body=清過卡片/步驟的預覽。payload `pocket.kind=
+    message` + sessionId 供 app deep-link 進該人格對話。content-available 讓背景也能
+    順手刷新。app 前景時由 willPresent 抑制橫幅(你正在看,不吵);背景時系統自動顯示。
+    fire-and-forget;無執行中 event loop(純 sync 匯入期)則跳過。"""
+    if session not in PERSONAS:
+        return
+    disp = PERSONAS[session][0]
+    try:
+        clean, _bodies = carddigest.extract_studio_cards(content or "")
+    except Exception:  # noqa: BLE001
+        clean = content or ""
+    clean = re.sub(r"<details>.*?</details>", "", clean, flags=re.S).strip()
+    body = (clean or "傳了一則訊息")[:140]
+    # sessionId 用 deep-link wire 格式 hermes:{persona}(app 點通知直達該人格對話);
+    # app 的 willPresent 會剝前綴比對「正在看哪條」以決定前景是否彈橫幅。
+    data = {"kind": "message",
+            "pocket": {"kind": "message", "sessionId": f"hermes:{session}"}}
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    t = loop.create_task(push_notify(disp, body, data,
+                                     thread_id=session, content_available=True))
+    _BG_TASKS.add(t)
+    t.add_done_callback(_BG_TASKS.discard)
 
 
 _canon_init()
@@ -2097,7 +2298,26 @@ async def chat_completions(request: Request):
 
 
 CLAUDE_BIN = "/Users/xcash/.local/bin/claude"
-CODEX_BIN = "/Users/xcash/.local/bin/codex"
+# 用能讀「新版 thread」的 codex 當 app-server。VS Code 用 codex 0.142 建 thread,
+# 舊的 standalone 0.137(~/.local/bin/codex)一讀其 full turns(thread/turns/list
+# itemsView=full)就 crash → UPSTREAM_FAILED「codex app-server stopped」,整條 stdio
+# 卡死,app 端該 session 空白且送不出。優先挑 Codex.app 內建的 0.142(VS Code 同款、
+# 共用 ~/.codex 登入),對不上再退回 standalone。CODEX_BIN 環境變數可覆蓋。
+def _resolve_codex_bin() -> str:
+    # 2026-07-10 事故:ChatGPT.app 更新把 Codex Desktop 併入、/Applications/Codex.app
+    # 整個消失 → 舊首選路徑失效,fallback 到 0.137 又是「讀新 thread 會 crash」地雷,
+    # 手機 CX 全空數小時且無錯誤日誌。候選序補上 ChatGPT.app 的新家,且 spawn 時
+    # 每次重新解析(見 _ensure_started_locked),桌面 app 更新不再需要重啟 bridge。
+    for c in (os.environ.get("CODEX_BIN"),
+              "/Applications/Codex.app/Contents/Resources/codex",
+              "/Applications/ChatGPT.app/Contents/Resources/codex",
+              os.path.expanduser("~/.local/bin/codex")):
+        if c and os.path.exists(c):
+            return c
+    return "/Users/xcash/.local/bin/codex"
+
+
+CODEX_BIN = _resolve_codex_bin()   # 僅供顯示/預設;spawn 走 _resolve_codex_bin()
 
 
 class CodexAppServerError(RuntimeError):
@@ -2164,14 +2384,25 @@ class CodexAppServerClient:
         self.pending_approvals.clear()
         self.pending_approvals_by_thread.clear()
         self._expire_stale_codex_approvals()
-        self.proc = await asyncio.create_subprocess_exec(
-            CODEX_BIN, "app-server", "--stdio",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            stdin=asyncio.subprocess.PIPE,
-            cwd=HOME_ROOT,
-            limit=8 * 1024 * 1024,
-        )
+        codex_bin = _resolve_codex_bin()   # 每次 spawn 重新解析:桌面 app 更新後路徑會變
+        self.spawned_bin = codex_bin
+        try:
+            self.proc = await asyncio.create_subprocess_exec(
+                codex_bin, "app-server", "--stdio",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                stdin=asyncio.subprocess.PIPE,
+                cwd=HOME_ROOT,
+                # StreamReader 單行上限。codex app-server 把每個 JSON-RPC 回應當「一行」
+                # 送;thread/turns/list itemsView=full 若含 computer-use 截圖(base64)可能
+                # 單行破 8MB → asyncio 讀取器丟 LimitOverrunError(「Separator is not found,
+                # and chunk exceed the limit」)→ reader task 死 → app-server「stopped」→ 整條
+                # codex 卡死(XCash 就是這樣)。放大到 128MB 吃得下含圖的大回應。
+                limit=128 * 1024 * 1024,
+            )
+        except (FileNotFoundError, PermissionError) as e:
+            _log_event("codex_spawn_failed", bin=codex_bin, error=type(e).__name__)
+            raise CodexAppServerError(f"codex binary unavailable: {codex_bin}") from e
         self._reader_task = asyncio.create_task(self._read_stdout())
         self._stderr_task = asyncio.create_task(self._read_stderr())
         init = await self._call_started_locked(
@@ -2189,7 +2420,8 @@ class CodexAppServerClient:
         await self._write_locked({"jsonrpc": "2.0", "method": "initialized"})
         _log_event("codex_app_server_started",
                    user_agent=(init or {}).get("userAgent", ""),
-                   codex_home=(init or {}).get("codexHome", ""))
+                   codex_home=(init or {}).get("codexHome", ""),
+                   bin=codex_bin)
 
     def _expire_stale_codex_approvals(self):
         import sqlite3
@@ -2389,6 +2621,7 @@ class CodexAppServerClient:
             "risk": record.get("risk"),
             "created_at": record.get("created_at"),
             "thread_id": record.get("thread_id"),
+            "options": record.get("options"),   # 發起方宣告的選項(去二元);None → app 用二元預設
         }
 
     def _approval_db_upsert(self, record: dict) -> None:
@@ -2434,6 +2667,27 @@ class CodexAppServerClient:
             "detail": self._approval_detail(method, params),
             "created_at": created,
         }
+        # 選項由發起方宣告(method-aware),不再由 carddigest 寫死二元。允許鈕
+        # 依動作類型給語意標籤;style=="deny" 是唯一「拒絕」判準(app 依此送
+        # approve=false)。三態第三顆 = for_session(一律允許此類、本 session 不再
+        # 問)→ 對 command/fileChange 映射 Codex 原生 acceptForSession。
+        _mlow = method.lower()
+        _allow_label = ("允許執行" if "command" in _mlow
+                        else "允許修改" if "filechange" in _mlow.replace("_", "")
+                        else "允許")
+        record["options"] = [
+            {"key": "approve", "label": _allow_label, "style": "primary"},
+        ]
+        # 只有支援 acceptForSession 的 method 才給第三顆(見 _approval_response_result)。
+        # key 用 approve_for_session:非 deny-ish → 舊 App(build ≤44,只認 approve/
+        # deny)會安全退成「一般允許」,不會誤送拒絕;新 App 認得此 key → 送
+        # for_session=true。style=secondary(較軟的允許)。
+        if method in ("item/commandExecution/requestApproval",
+                      "item/fileChange/requestApproval"):
+            record["options"].append(
+                {"key": "approve_for_session", "label": "本次全允許", "style": "secondary"})
+        record["options"].append(
+            {"key": "deny", "label": "拒絕", "style": "deny"})
         self.pending_approvals[approval_id] = record
         if thread_id:
             self.pending_approvals_by_thread[thread_id][approval_id] = record
@@ -2597,6 +2851,15 @@ class CodexAppServerClient:
                 self._append(tid, ("text", f"\n⚠️ Codex turn failed: {msg}\n"))
             else:
                 self.thread_errors.pop(tid, None)
+            # M1:是委派 thread → 回流父對話(running→idle/failed 轉換內部去重)。
+            try:
+                t = asyncio.create_task(_delegation_codex_completed(
+                    tid, bool(err),
+                    str(err.get("message", err))[:300] if err else ""))
+                _BG_TASKS.add(t)
+                t.add_done_callback(_BG_TASKS.discard)
+            except RuntimeError:
+                pass
             return
         if method == "error":
             _log_event("codex_app_server_error",
@@ -2949,6 +3212,11 @@ async def _codex_warm_threads(thread_ids: list) -> None:
     likely to tap next, so entering one skips the cold load. Strictly
     sequential and skip-if-loaded, so it never amplifies app-server queueing —
     at most one warm call is in the single _lock queue at a time."""
+    # 風險控管:若 spawn 到的是 ~/.local/bin 的舊 standalone(0.137 地雷版),
+    # 停用 warmup 的 thread/resume —— 0.137 resume/讀 0.142+ 建的 thread 會
+    # 引爆 app-server crash 連鎖(下一次「CX 全空」最可能的引信)。
+    if str(getattr(CODEX_APP, "spawned_bin", "")).endswith("/.local/bin/codex"):
+        return
     for tid in thread_ids:
         if not tid or tid in CODEX_APP.loaded_threads:
             continue
@@ -3352,6 +3620,188 @@ async def pair_revoke(request: Request):
     return {"revoked": removed}
 
 
+# --- In-app terminal (bridge PTY) --------------------------------------------
+# Contract: studio-os/docs/TERMINAL_PTY_CONTRACT.md v0. One WebSocket = one
+# local PTY shell on this Mac (the bridge already runs here — no SSH). Text
+# JSON both directions, UTF-8, no base64. Kernel/OSS feature too (self-serve
+# ops), so it is unconditionally present. Gated by POCKET_TERMINAL_ENABLED.
+
+def _terminal_enabled() -> bool:
+    """Default ON. POCKET_TERMINAL_ENABLED=0/false/no/off/'' → endpoint 403s."""
+    return os.environ.get("POCKET_TERMINAL_ENABLED", "1").strip().lower() \
+        not in ("0", "false", "no", "off", "")
+
+
+def _ws_bearer_token(websocket: WebSocket) -> str:
+    """Same token as every other /app/v1/* call: Authorization: Bearer <t>, or
+    ?token=<t> query fallback (the contract lets the bridge accept either, since
+    setting headers on a WS handshake isn't always convenient on the client)."""
+    auth = websocket.headers.get("authorization", "")
+    if auth.lower().startswith("bearer "):
+        return auth[7:].strip()
+    return (websocket.query_params.get("token") or "").strip()
+
+
+def _ws_token_authorized(token: str) -> bool:
+    """Accept branches mirror _check_auth: master token, a paired device token,
+    or an account-bound device token. No rate-limit bookkeeping here (the WS
+    handshake is not a brute-force surface the way the JSON gate is)."""
+    if not token:
+        return False
+    if hmac.compare_digest(token, BRIDGE_TOKEN):
+        return True
+    with _PAIR_LOCK:
+        dev = _DEVICE_TOKENS.get(token)
+        if dev is not None:
+            if not dev.get("apple_user_id") or _account_device_for_token(token) is not None:
+                dev["last_seen"] = time.time()
+                return True
+    if _account_device_for_token(token) is not None:
+        return True
+    return False
+
+
+@app.websocket("/app/v1/terminal")
+async def app_v1_terminal(websocket: WebSocket):
+    # Reject BEFORE accept() so Starlette answers the handshake with HTTP 403 —
+    # the iOS client keys "終端機已停用"/no-retry off that status code.
+    if not _terminal_enabled():
+        _log_event("terminal_rejected", reason="disabled")
+        await websocket.close(code=1008)
+        return
+    token = _ws_bearer_token(websocket)
+    if not _ws_token_authorized(token):
+        _log_event("terminal_rejected", reason="auth")
+        await websocket.close(code=1008)
+        return
+
+    await websocket.accept()
+
+    shell = os.environ.get("SHELL") or "/bin/zsh"
+    home = os.path.expanduser("~")
+    env = dict(os.environ)
+    env["TERM"] = "xterm-256color"
+    env.pop("POCKET_TERMINAL_ENABLED", None)  # bridge-internal, don't leak into the shell
+
+    # tmux-backed so the shell survives WS disconnects: reconnecting with the
+    # same ?session=<name> re-attaches the SAME live tmux session (running agents,
+    # state, scrollback all intact) instead of spawning a fresh shell. `-A` =
+    # attach-or-create. Killing the client (killpg below) only detaches — the tmux
+    # server keeps the session alive for the next attach. No ?session → a stable
+    # default, so even the current single-terminal UX becomes persistent.
+    raw_sess = (websocket.query_params.get("session") or "").strip()
+    if raw_sess and await _tmux_alive(raw_sess):
+        # 既有 tmux session(如 ccsess 的 "Ops"/"FLiPER")→ 直接 attach 進去,
+        # 讓 app 的 SSH 連線能接到那個跑著 Claude Code/Codex 的 session。
+        sess = raw_sess
+    elif raw_sess:
+        sess = "pocket-" + re.sub(r"[^A-Za-z0-9_-]", "_", raw_sess)[:60]
+    else:
+        sess = "pocket-term"
+
+    try:
+        master_fd, slave_fd = pty.openpty()
+    except OSError as e:
+        await websocket.send_text(json.dumps({"type": "error", "message": f"openpty failed: {e}"}))
+        await websocket.close()
+        return
+
+    try:
+        proc = subprocess.Popen(
+            [TMUX_BIN, "new-session", "-A", "-s", sess, "-c", home],
+            preexec_fn=os.setsid,               # own session+pgroup → killpg reaps only the client
+            stdin=slave_fd, stdout=slave_fd, stderr=slave_fd,
+            cwd=home, env=env, close_fds=True,
+        )
+    except Exception as e:  # noqa: BLE001
+        os.close(master_fd)
+        os.close(slave_fd)
+        await websocket.send_text(json.dumps({"type": "error", "message": f"spawn failed: {e}"}))
+        await websocket.close()
+        return
+    os.close(slave_fd)  # parent keeps only the master end
+    _log_event("terminal_open", device=_short_hash(token), shell=shell, tmux=sess)  # no keystrokes/output
+
+    loop = asyncio.get_running_loop()
+
+    def _read_master() -> bytes:
+        try:
+            return os.read(master_fd, 65536)
+        except OSError:
+            return b""                          # EIO on macOS when the child's side closes
+
+    async def pump_output():
+        """PTY → client. Ends (returns) on EOF, i.e. the shell exited."""
+        while True:
+            data = await loop.run_in_executor(None, _read_master)
+            if not data:
+                return
+            try:
+                await websocket.send_text(json.dumps(
+                    {"type": "output", "data": data.decode("utf-8", "replace")}))
+            except Exception:  # noqa: BLE001 — socket went away mid-send
+                return
+
+    async def pump_input():
+        """client → PTY. Ends (returns) when the socket closes/errors."""
+        while True:
+            try:
+                raw = await websocket.receive_text()
+            except (WebSocketDisconnect, RuntimeError):
+                return
+            try:
+                msg = json.loads(raw)
+            except Exception:  # noqa: BLE001
+                continue
+            mtype = msg.get("type")
+            if mtype == "input":
+                data = msg.get("data") or ""
+                if data:
+                    try:
+                        os.write(master_fd, data.encode("utf-8"))
+                    except OSError:
+                        return
+            elif mtype == "resize":
+                try:
+                    cols = max(1, min(int(msg.get("cols") or 80), 1000))
+                    rows = max(1, min(int(msg.get("rows") or 25), 1000))
+                    fcntl.ioctl(master_fd, termios.TIOCSWINSZ,
+                                struct.pack("HHHH", rows, cols, 0, 0))
+                except (OSError, ValueError, TypeError):
+                    pass
+
+    out_task = asyncio.create_task(pump_output())
+    in_task = asyncio.create_task(pump_input())
+    try:
+        done, pending = await asyncio.wait(
+            {out_task, in_task}, return_when=asyncio.FIRST_COMPLETED)
+        for t in pending:
+            t.cancel()
+        shell_exited = out_task in done
+    finally:
+        # Reap the shell + its process group; closing the master fd unblocks any
+        # os.read still parked in the executor thread.
+        try:
+            if proc.poll() is None:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                proc.wait(timeout=2)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            os.close(master_fd)
+        except OSError:
+            pass
+        _log_event("terminal_close", device=_short_hash(token))
+    # Tell the client the shell died (only meaningful if it, not the socket, ended).
+    if shell_exited and websocket.client_state == WebSocketState.CONNECTED:
+        try:
+            code = proc.returncode if proc.returncode is not None else 0
+            await websocket.send_text(json.dumps({"type": "exit", "code": code}))
+            await websocket.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+
 @app.post("/clientlog")
 async def client_log_write(request: Request):
     _check_auth(request)
@@ -3674,7 +4124,7 @@ async def _run_dispatch(sid: str, tool: str, task: str, cwd: str, isolate: bool 
             sub["cwd"] = wt   # follow-ups stay in the same isolated tree
             sub["output"].append(("text", f"_(隔離工作區 worktree:`{wt}` · 分支 `pocket/{sid}`)_\n\n"))
     if tool == "codex":
-        argv = [CODEX_BIN, "exec", "--json", task]
+        argv = [_resolve_codex_bin(), "exec", "--json", task]
     else:
         argv = _claude_argv(sub.get("parent", "yuanfang"), task)
     await _stream_agent(sid, argv, run_cwd, "dispatch 失敗")
@@ -3686,7 +4136,7 @@ async def _run_resume(sid: str, prompt: str):
     sub = SUBSESSIONS[sid]
     cwd = sub.get("cwd") or HOME_ROOT
     if sub.get("tool") == "codex":
-        argv = [CODEX_BIN, "exec", "--json", prompt]   # codex: new exec in same cwd
+        argv = [_resolve_codex_bin(), "exec", "--json", prompt]   # codex: new exec in same cwd
     else:
         argv = _claude_argv(sub.get("parent", "yuanfang"), prompt, resume=sub.get("cc_session"))
     await _stream_agent(sid, argv, cwd, "追問失敗")
@@ -3721,10 +4171,10 @@ def _parse_agent_event(ev: dict):
     return items
 
 
-def _persona_preview(home: str):
-    """Latest user-visible message of the persona's canonical Telegram session
-    → (text, ts). Walks back past rows that are pure runtime injection so the
-    conversation list never previews machine-facing preamble."""
+def _persona_preview_tg(home: str):
+    """Latest user-visible message of the persona's Telegram session → (text, ts).
+    Walks back past rows that are pure runtime injection so the conversation list
+    never previews machine-facing preamble."""
     import sqlite3
     db = os.path.join(home, "state.db")
     if not os.path.exists(db):
@@ -3750,6 +4200,103 @@ def _persona_preview(home: str):
     except Exception:
         pass
     return (None, None)
+
+
+def _persona_preview_canon(session: str):
+    """Latest user-visible message from the persona's CANONICAL store (app turns)
+    → (text, ts). studio-card fences collapse to their fallback text and the
+    folded 〈執行步驟〉 appendix is stripped, matching what the conversation view
+    shows — so the list preview never leaks a raw fence or tool log."""
+    try:
+        msgs = _canon_messages(session, 20)
+    except Exception:  # noqa: BLE001
+        return (None, None)
+    for m in reversed(msgs):
+        if m.get("role") not in ("user", "assistant"):
+            continue
+        content = (m.get("content") or "")
+        if not content.strip():
+            continue
+        clean, _bodies = carddigest.extract_studio_cards(content)
+        clean = re.sub(r"<details>.*?</details>", "", clean, flags=re.S).strip()
+        if clean:
+            return (clean[:80], m.get("ts"))
+    return (None, None)
+
+
+def _persona_preview(home: str, session: str | None = None):
+    """Conversation-list preview for a persona → (text, ts).
+
+    The list must mirror the merged conversation view (/app/v1/messages =
+    canonical ⊕ Telegram): reading TG only left app-side turns invisible, so the
+    preview stayed stale AND the app's preview-change unread detector never fired
+    for in-app messages. Take the newer of the two sources (both epoch seconds)."""
+    cands = []
+    tg_text, tg_ts = _persona_preview_tg(home)
+    if tg_text and tg_ts is not None:
+        cands.append((tg_ts, tg_text))
+    if session:
+        cn_text, cn_ts = _persona_preview_canon(session)
+        if cn_text and cn_ts is not None:
+            cands.append((cn_ts, cn_text))
+    if not cands:
+        return (None, None)
+    ts, text = max(cands, key=lambda x: x[0])
+    return (text, ts)
+
+
+def _persona_preview_merged(session: str, home: str):
+    """Conversation-list preview drawn from the SAME merged source as the card
+    stream (canonical ⊕ Telegram ⊕ cron reports), PLUS who sent the latest line
+    and the last *inbound* (persona) line.
+
+    Returns (latest_text, latest_ts, sender, inbound_text, inbound_ts) where
+    `sender` is "persona" (assistant) | "user" | None.
+
+    Why the extra fields: in a two-sided TG-style chat the newest message is
+    often the user's own send. The client's bell/unread detector keys off
+    `inbound_ts` so a self-send never lights the dot, and the notification
+    subtitle shows `inbound_text` so it never echoes the user's own words.
+
+    Skips the report *sync* (`_sync_persona_reports`) — the 30s card follower
+    already keeps report_events fresh — so this is just a few cheap read-only
+    sqlite queries, safe to run on every /sessions poll."""
+    msgs = []
+    try:
+        msgs.extend(_canon_messages(session, 30))          # app turns (canonical.db)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        msgs.extend(_persona_history(home, 30))            # Telegram (state.db), user-cleaned
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        msgs.extend(_report_messages(session, 10))         # cron briefs (role=assistant)
+    except Exception:  # noqa: BLE001
+        pass
+
+    def _visible(m) -> str | None:
+        if m.get("role") not in ("user", "assistant"):
+            return None
+        clean, _bodies = carddigest.extract_studio_cards(m.get("content") or "")
+        clean = re.sub(r"<details>.*?</details>", "", clean, flags=re.S).strip()
+        return clean or None
+
+    msgs.sort(key=lambda m: m.get("ts") or 0)
+    latest_text = latest_ts = sender = None
+    inbound_text = inbound_ts = None
+    for m in reversed(msgs):
+        text = _visible(m)
+        if not text:
+            continue
+        if latest_text is None:
+            latest_text, latest_ts = text[:120], m.get("ts")
+            sender = "persona" if m.get("role") == "assistant" else "user"
+        if m.get("role") == "assistant" and inbound_text is None:
+            inbound_text, inbound_ts = text[:120], m.get("ts")
+        if latest_text is not None and inbound_text is not None:
+            break
+    return (latest_text, latest_ts, sender, inbound_text, inbound_ts)
 
 
 # TG→app media (N4, pocketagent#36): Hermes' image_routing appends a
@@ -3969,9 +4516,13 @@ async def list_sessions(request: Request):
     _check_auth(request)
     out = []
     for mid, (disp, home) in PERSONAS.items():
-        text, ts = _persona_preview(home)
+        text, ts, sender, in_text, in_ts = _persona_preview_merged(mid, home)
         out.append({"id": mid, "type": "persona", "name": disp,
-                    "preview": text, "lastAt": ts, "status": "idle"})
+                    "preview": text, "lastAt": ts, "status": "idle",
+                    # who sent `preview` (persona|user) + the last inbound line,
+                    # so the app's bell/unread + notification subtitle stay role-
+                    # aware instead of echoing the user's own last message.
+                    "sender": sender, "inboundPreview": in_text, "inboundAt": in_ts})
     out.extend(await _delegation_app_sessions())
     for key, s in SUBSESSIONS.items():
         out.append({"id": key, "type": "subprocess", "name": s.get("name"),
@@ -4053,6 +4604,94 @@ def _cc_latest_jsonl(workdir: str):
     return max(files, key=os.path.getmtime) if files else None
 
 
+# ─── CC session 身分(per-session jsonl)────────────────────────────────────
+# 「session 身分 = 工作目錄」是身分混淆 bug 的根:同 workdir 的兩個 tmux session
+# (如 Main 與 cc-51a85f55)全被 dir-latest jsonl 代表,誰最後寫誰就是全目錄——
+# 清單/status/stream/卡片流全部混流。正解:從 tmux pane 的子行程樹找 claude 的
+# cmdline,parse --resume/--session-id 的 uuid → <projects>/<slug>/<uuid>.jsonl。
+# 實測本機 pgrep -P 對部分 pane 回空,所以用一次性 ps 快照(TTL 共用)。
+_CC_SID_RE = re.compile(r"--(?:resume|session-id)\s+([0-9a-fA-F][0-9a-fA-F-]{7,63})")
+_CC_SID_CACHE: dict = {}   # name -> (cached_at_monotonic, sid_or_None)
+_CC_SID_TTL = 30.0         # claude 行程在 session 生命週期內穩定;None 也快取避免狂掃
+_PS_SNAP = (0.0, {})       # (cached_at, {pid: (ppid, command)})
+_PS_SNAP_TTL = 5.0
+
+
+async def _ps_snapshot():
+    global _PS_SNAP
+    now = time.monotonic()
+    if now - _PS_SNAP[0] < _PS_SNAP_TTL:
+        return _PS_SNAP[1]
+    p = await asyncio.create_subprocess_exec(
+        "/bin/ps", "-axo", "pid=,ppid=,command=",
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+    try:
+        out, _ = await asyncio.wait_for(p.communicate(), 10.0)
+    except asyncio.TimeoutError:
+        try:
+            p.kill()
+        except ProcessLookupError:
+            pass
+        return _PS_SNAP[1]
+    procs = {}
+    for line in (out or b"").decode("utf-8", "replace").splitlines():
+        parts = line.strip().split(None, 2)
+        if len(parts) == 3 and parts[0].isdigit() and parts[1].isdigit():
+            procs[int(parts[0])] = (int(parts[1]), parts[2])
+    _PS_SNAP = (now, procs)
+    return procs
+
+
+async def _cc_pane_session_id(name: str):
+    """tmux pane 子行程樹裡 claude 的 --resume/--session-id uuid;失敗回 None。"""
+    now = time.monotonic()
+    hit = _CC_SID_CACHE.get(name)
+    if hit and now - hit[0] < _CC_SID_TTL:
+        return hit[1]
+    sid = None
+    try:
+        rc, out, _ = await _tmux_run("list-panes", "-t", name, "-F", "#{pane_pid}")
+        pane_pid = int(out.split()[0]) if rc == 0 and out.strip() else 0
+        if pane_pid:
+            procs = await _ps_snapshot()
+            kids: dict = {}
+            for pid, (ppid, _cmd) in procs.items():
+                kids.setdefault(ppid, []).append(pid)
+            stack, seen = [pane_pid], set()
+            while stack:                      # 走整棵子孫樹(claude 可能包在 zsh 下)
+                pid = stack.pop()
+                if pid in seen:
+                    continue
+                seen.add(pid)
+                cmd = procs.get(pid, (0, ""))[1]
+                if "claude" in cmd:
+                    m = _CC_SID_RE.search(cmd)
+                    if m:
+                        sid = m.group(1)
+                        break
+                stack.extend(kids.get(pid, []))
+    except Exception:  # noqa: BLE001
+        sid = None
+    _CC_SID_CACHE[name] = (now, sid)
+    return sid
+
+
+async def _cc_session_jsonl(name: str, workdir: str):
+    """這個 ccsess 的專屬 jsonl:pane 行程 sid 優先,失敗才 fallback dir-latest。
+    已知限制:TUI 內 /clear 或 /resume 會讓 cmdline 的 uuid 過期(行程不重啟、
+    實際寫新 jsonl)——hook(/ccsessions/_hook)帶的 session_id 會即時覆寫
+    _CC_SID_CACHE 來補這個洞(UserPromptSubmit 每回合都帶最新 sid,權威)。"""
+    sid = await _cc_pane_session_id(name)
+    if sid:
+        p = os.path.join(_cc_project_dir(workdir), sid + ".jsonl")
+        if os.path.exists(p):
+            return p
+        p = _cchist_find(sid)      # slug 正規化差異時跨 project glob
+        if p:
+            return p
+    return _cc_latest_jsonl(workdir)   # 向下相容:找不到行程/parse 失敗/裸 claude
+
+
 def _cc_conf_rows():
     rows = []
     try:
@@ -4069,6 +4708,37 @@ def _cc_conf_rows():
     return rows
 
 
+# App-owned CC sessions registry. CCSESS_CONF is shared with the ccsess CLI
+# (daemon sessions like "Culture Supply"/"Ops"/"FLiPER" live there too), and its
+# `name|workdir|enabled` format is read by many 3-tuple callers — so instead of
+# adding a 4th field we keep a SEPARATE bridge-managed list of the CC sessions
+# THIS app created (via POST /ccsessions). The approval watcher only pushes for
+# these, so a foreign ccsess session's TUI prompt never reaches the app's審核中心
+# / push. One name per line.
+APP_OWNED_CC = os.path.join(os.path.dirname(CCSESS_CONF), "app-owned.txt")
+
+
+def _cc_app_owned_names() -> set:
+    try:
+        with open(APP_OWNED_CC) as f:
+            return {ln.strip() for ln in f if ln.strip() and not ln.startswith("#")}
+    except Exception:  # noqa: BLE001
+        return set()
+
+
+def _cc_mark_app_owned(name: str) -> None:
+    """Record that the app opened this CC session (idempotent append)."""
+    name = (name or "").strip()
+    if not name or name in _cc_app_owned_names():
+        return
+    try:
+        os.makedirs(os.path.dirname(APP_OWNED_CC), exist_ok=True)
+        with open(APP_OWNED_CC, "a") as f:
+            f.write(name + "\n")
+    except Exception as e:  # noqa: BLE001
+        _log_event("cc_app_owned_write_failed", session=name, error=str(e)[:160])
+
+
 def _norm_cc_workdir(path: str) -> str:
     return os.path.realpath(os.path.abspath(os.path.expanduser(path or "")))
 
@@ -4081,6 +4751,14 @@ def _cc_name_for_cwd(cwd: str | None):
         if _norm_cc_workdir(workdir) == target:
             return name
     return None
+
+
+def _cc_names_for_cwd(cwd: str | None) -> list:
+    """同 workdir 的所有 conf 名(撞 workdir 時 hook 需要用 session_id 消歧)。"""
+    if not cwd:
+        return []
+    target = _norm_cc_workdir(cwd)
+    return [n for n, w, _e in _cc_conf_rows() if _norm_cc_workdir(w) == target]
 
 
 def _cc_fresh_hook_state(name: str):
@@ -4103,17 +4781,61 @@ async def _tmux_alive(name: str) -> bool:
         return False
 
 
-def _cc_last_activity(workdir: str):
+def _cc_last_activity(jsonl):
     """Transcript mtime for the home recency sort. Just os.path.getmtime — no file
     read/parse (the app shows YOUR last sent command from its local SentLog, so the
-    server needn't extract a preview). Cheap enough to run per-poll."""
-    jsonl = _cc_latest_jsonl(workdir)
+    server needn't extract a preview). Cheap enough to run per-poll.
+    收 per-session jsonl(_cc_session_jsonl 解析),不再吃 dir-latest。"""
     if not jsonl:
         return (0.0, "")
     try:
         return (os.path.getmtime(jsonl), "")
     except Exception:  # noqa: BLE001
         return (0.0, "")
+
+
+_cc_head_cache: dict = {}   # jsonl path -> (sessionId, title)
+
+
+def _cc_session_head(jsonl):
+    """(sessionId, title) for the Claude session this remote is running, so the app
+    can map a Pocket remote ("Main") to its Claude-app session ("Session review…").
+    sessionId = jsonl basename (free). title = first real user message, read from the
+    top and stopped early. Cached BY PATH: both are stable for the life of the session
+    file, so even a huge actively-appended jsonl is read at most once (never re-read
+    per poll like _cchist_meta would).
+    收 per-session jsonl(_cc_session_jsonl 解析),不再吃 dir-latest。"""
+    if not jsonl:
+        return (None, None)
+    cached = _cc_head_cache.get(jsonl)
+    if cached:
+        return cached
+    sid = os.path.basename(jsonl)[:-len(".jsonl")]
+    title = ""
+    try:
+        with open(jsonl, encoding="utf-8", errors="replace") as f:
+            for i, line in enumerate(f):
+                if i > 200:            # first real user msg is near the top; bound the scan
+                    break
+                try:
+                    d = json.loads(line)
+                except Exception:  # noqa: BLE001
+                    continue
+                if d.get("type") == "user":
+                    c = (d.get("message") or {}).get("content")
+                    if isinstance(c, list):
+                        c = next((x.get("text") for x in c
+                                  if isinstance(x, dict) and x.get("type") == "text"), "")
+                    if isinstance(c, str):
+                        t = c.strip()
+                        if t and not t.startswith("<") and not t.startswith("Caveat:"):
+                            title = t[:120]
+                            break
+    except Exception:  # noqa: BLE001
+        pass
+    res = (sid, title or None)
+    _cc_head_cache[jsonl] = res
+    return res
 
 
 async def _cc_sessions():
@@ -4140,10 +4862,13 @@ async def _cc_sessions():
                     awaiting = True
             except Exception:  # noqa: BLE001
                 busy = False
-        mtime, preview = _cc_last_activity(workdir)
+        jsonl = await _cc_session_jsonl(name, workdir)
+        mtime, preview = _cc_last_activity(jsonl)
+        sid, stitle = _cc_session_head(jsonl)
         out.append({"name": name, "workdir": workdir,
                     "status": "running" if alive else "down", "busy": busy,
-                    "awaiting": awaiting, "updatedAt": mtime, "preview": preview})
+                    "awaiting": awaiting, "updatedAt": mtime, "preview": preview,
+                    "sessionId": sid, "sessionTitle": stitle})
     return out
 
 
@@ -4237,7 +4962,7 @@ def _fmt_cc_event(d: dict) -> str:
 # re-scan an unchanged file.
 _CC_CONTEXT_WINDOW = 200_000
 _CC_JSONL_TAIL_BYTES = 262_144
-_CC_JSONL_SCAN_CACHE: dict = {}   # workdir -> (jsonl, mtime, usage, plan)
+_CC_JSONL_SCAN_CACHE: dict = {}   # jsonl path -> (jsonl, mtime, usage, plan)
 
 
 def _cc_jsonl_tail_events(jsonl: str):
@@ -4255,16 +4980,17 @@ def _cc_jsonl_tail_events(jsonl: str):
     return events
 
 
-def _cc_scan_jsonl(workdir: str):
-    """→ (usage_dict_or_None, latest_plan_or_None) for the session's live jsonl."""
-    jsonl = _cc_latest_jsonl(workdir)
+def _cc_scan_jsonl(jsonl):
+    """→ (usage_dict_or_None, latest_plan_or_None) for the session's live jsonl.
+    收 per-session jsonl(_cc_session_jsonl 解析);快取以 jsonl path 為 key,
+    同 workdir 的兩個 session 不再共用同一筆(身分混淆 bug)。"""
     if not jsonl:
         return (None, None)
     try:
         mt = os.path.getmtime(jsonl)
     except OSError:
         return (None, None)
-    hit = _CC_JSONL_SCAN_CACHE.get(workdir)
+    hit = _CC_JSONL_SCAN_CACHE.get(jsonl)
     if hit and hit[0] == jsonl and hit[1] == mt:
         return (hit[2], hit[3])
     usage = plan = None
@@ -4295,9 +5021,9 @@ def _cc_scan_jsonl(workdir: str):
             if usage is not None and plan is not None:
                 break
     except Exception as e:  # noqa: BLE001
-        _log_event("cc_jsonl_scan_failed", workdir=workdir,
+        _log_event("cc_jsonl_scan_failed", jsonl=os.path.basename(jsonl or ""),
                    error=type(e).__name__, error_message=str(e)[:120])
-    _CC_JSONL_SCAN_CACHE[workdir] = (jsonl, mt, usage, plan)
+    _CC_JSONL_SCAN_CACHE[jsonl] = (jsonl, mt, usage, plan)
     return (usage, plan)
 
 
@@ -4440,9 +5166,41 @@ async def cc_session_create(request: Request):
         raise HTTPException(status_code=400, detail=f"cannot create workdir: {e}")
     _pretrust_claude_dir(wd)
     await _run_ccsess("new", name, wd)
+    _cc_mark_app_owned(name)   # 這條是 app 開的 → 只有它的審核會進 app(見 _cc_approval_watcher)
     ready = await _cc_wait_ready(name)
     return {"ok": True, "session": {"name": name, "workdir": wd,
                                     "status": "running" if ready else "starting"}}
+
+
+@app.put("/app/v1/owned-cc-sessions")
+async def cc_set_app_owned(request: Request):
+    """App 宣告「我 SSH 列表裡的 CC session」——覆寫 app-owned.txt 為權威清單。
+    _cc_approval_watcher 只推這些 session 的審核(hermes 另計),別處的 ccsess
+    (Culture Supply/FLiPER…)不外漏。app 端於 load 時用 sshStore 的 CC 記錄呼叫,
+    所以「審核中心 = 這台 app 的 SSH 清單 ⊕ hermes」恆等對齊(含之前接進來的 Ops)。"""
+    _check_auth(request)
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        body = {}
+    names = body.get("names") or body.get("sessions") or []
+    clean = []
+    seen = set()
+    for n in names if isinstance(names, list) else []:
+        s = str(n or "").strip()
+        # 容錯:傳 "claude_code:Ops" 也接受,取冒號後段當 ccsess 名。
+        if s.startswith("claude_code:"):
+            s = s.split(":", 1)[1]
+        if s and s not in seen:
+            seen.add(s); clean.append(s)
+    try:
+        os.makedirs(os.path.dirname(APP_OWNED_CC), exist_ok=True)
+        with open(APP_OWNED_CC, "w") as f:
+            f.write("".join(x + "\n" for x in clean))
+    except Exception as e:  # noqa: BLE001
+        raise http_err(500, "WRITE_FAILED", f"could not write app-owned list: {e}")
+    _log_event("cc_app_owned_set", count=len(clean))
+    return {"ok": True, "count": len(clean), "names": clean}
 
 
 @app.get("/ccsessions/{name}/stream")
@@ -4464,7 +5222,7 @@ async def cc_session_stream(name: str, request: Request, replay: int = 80):
 
     async def gen():
         yield chunk({"role": "assistant", "content": ""})
-        jsonl = _cc_latest_jsonl(workdir)
+        jsonl = await _cc_session_jsonl(name, workdir)
         pos = 0
         if jsonl and os.path.exists(jsonl):
             try:
@@ -4497,7 +5255,7 @@ async def cc_session_stream(name: str, request: Request, replay: int = 80):
                 yield "data: [DONE]\n\n"
                 break
             await asyncio.sleep(1.0)
-            cur = _cc_latest_jsonl(workdir)
+            cur = await _cc_session_jsonl(name, workdir)
             if cur != jsonl:                      # session rotated to a new jsonl
                 jsonl, pos = cur, 0
             if jsonl and os.path.exists(jsonl):
@@ -4551,7 +5309,7 @@ async def cc_session_history(name: str, request: Request, offset: int = 0, limit
     row = next((r for r in _cc_conf_rows() if r[0] == name), None)
     if not row:
         raise http_err(404, "SESSION_NOT_FOUND", "unknown session")
-    jsonl = _cc_latest_jsonl(row[1])
+    jsonl = await _cc_session_jsonl(name, row[1])
     if not jsonl or not os.path.exists(jsonl):
         return {"text": "", "more": False}
     try:
@@ -4698,11 +5456,23 @@ async def cc_history_resume(sid: str, request: Request):
     if rc != 0:
         raise http_err(502, "TMUX_FAILED", "tmux new-session failed",
                        (err or "tmux new-session failed")[:200])
+    # conf 單一寫者:走 ccsess register(內含 conf 鎖),不再直接 append ——
+    # 裸 append 會被 ccsess 端 mktemp+mv 全檔重寫蓋掉,或讓 rename 讀到半新不舊。
+    rc2, _out2, err2 = await _run_ccsess("register", name, cwd)
+    if rc2 != 0:
+        raise HTTPException(status_code=500,
+                            detail=f"registered tmux but conf register failed: {err2[:160]}")
+    # 精準 resume pin:這條 session 是明確 --resume <sid> 起的,直接落 pin,
+    # 重開機後 ensure 走 --resume 接回同一條對話(不再靠 --continue 猜目錄)。
     try:
-        with open(CCSESS_CONF, "a") as f:
-            f.write(f"{name}|{cwd}|1\n")
-    except Exception as e:  # noqa: BLE001
-        raise HTTPException(status_code=500, detail=f"registered tmux but conf write failed: {e}")
+        pdir = os.path.expanduser("~/.config/ccsess/resume")
+        os.makedirs(pdir, exist_ok=True)
+        tmp = os.path.join(pdir, name + ".tmp")
+        with open(tmp, "w") as f:
+            f.write(sid + "\n")
+        os.replace(tmp, os.path.join(pdir, name))
+    except Exception:  # noqa: BLE001
+        pass
     _log_event("cc_history_resume", session_id=sid, name=name, cwd=cwd)
     return {"ok": True, "name": name, "cwd": cwd}
 
@@ -4799,6 +5569,22 @@ async def _cc_paste_text(name: str, text: str) -> None:
                                                "-b", buf, "-p", "-d")
         await asyncio.sleep(0.25)                    # let the editor settle
         rc_enter, _, e_enter = await _tmux_run("send-keys", "-t", name, "Enter")
+        # Enter 落地驗證+重試:長貼文(尤其 CJK)0.25s 未必夠,TUI 還在消化
+        # 貼上時 Enter 會被吞——結果是 API 回 200 但訊息掛在輸入框沒送出,
+        # 使用者只看到「連線逾時」以為壞掉。送完 Enter 後檢查 composer 是否
+        # 真的清空(live ❯ 之後還看得到貼文開頭 = 沒送出),沒清就補 Enter,
+        # 最多三次。誤判補送的 Enter 對空 composer 是 no-op,安全。
+        probe = text[:24].strip()
+        if not rc_enter and probe:
+            for _ in range(3):
+                await asyncio.sleep(0.6)
+                pane_now = await _cc_capture_pane_fresh(name)
+                marker = pane_now.rfind("❯")
+                if marker < 0 or probe not in pane_now[marker:]:
+                    break                            # composer 已清空 → 已送出
+                _log_event("cc_paste_enter_retry", session=name,
+                           text_chars=len(text))
+                await _tmux_run("send-keys", "-t", name, "Enter")
     except Exception as e:  # noqa: BLE001
         _log_event("cc_paste_failed", session=name, text_chars=len(text),
                    step="exec", error=f"{type(e).__name__}: {str(e)[:160]}")
@@ -4941,9 +5727,36 @@ async def cc_session_hook(request: Request):
     event = body.get("hook_event_name")
     if event not in ("UserPromptSubmit", "Stop"):
         return {"ok": True, "ignored": True}
-    name = _cc_name_for_cwd(body.get("cwd"))
+    # 同 workdir 撞名時用 hook 原生帶的 session_id 消歧(身分混淆修正);
+    # 並順手把權威 sid 回寫 _CC_SID_CACHE —— 這同時補上「TUI 內 /clear 或
+    # /resume 後 cmdline uuid 過期」的洞:hook 每回合都帶最新 sid。
+    hook_sid = str(body.get("session_id") or "")
+    all_names = _cc_names_for_cwd(body.get("cwd"))
+    names = all_names
+    sid_matched = False
+    if len(names) > 1 and hook_sid:
+        matched = [n for n in names
+                   if (_CC_SID_CACHE.get(n) or (0, None))[1] == hook_sid]
+        sid_matched = bool(matched)
+        names = matched or names[:1]
+    name = names[0] if names else None
     if not name:
         return {"ok": True, "ignored": True}
+    if hook_sid and (len(all_names) == 1 or sid_matched):
+        # 身分有把握(workdir 唯一,或 sid 對上快取)→ hook sid 是權威:
+        # 回寫 _CC_SID_CACHE(修 /clear /resume 後 cmdline uuid 過期),並
+        # 原子落 resume pin —— 重開機後 ensure 走 --resume 精準接回這條對話,
+        # 不再靠 --continue 按目錄猜(同目錄多 session 會互搶)。
+        _CC_SID_CACHE[name] = (time.monotonic(), hook_sid)
+        try:
+            pdir = os.path.expanduser("~/.config/ccsess/resume")
+            os.makedirs(pdir, exist_ok=True)
+            ptmp = os.path.join(pdir, name + ".tmp")
+            with open(ptmp, "w") as f:
+                f.write(hook_sid + "\n")
+            os.replace(ptmp, os.path.join(pdir, name))
+        except Exception:  # noqa: BLE001
+            pass
     now = time.time()
     state = {"busy": event == "UserPromptSubmit", "updated_at": now, "source": "hook"}
     if event == "Stop":
@@ -4993,7 +5806,7 @@ async def _cc_status_core(name: str) -> dict:
     # wave 2: usage meter + full plan text from the transcript jsonl.
     row = next((r for r in _cc_conf_rows() if r[0] == name), None)
     if row:
-        usage, plan = _cc_scan_jsonl(row[1])
+        usage, plan = _cc_scan_jsonl(await _cc_session_jsonl(name, row[1]))
         if usage:
             st["usage"] = usage
         if prompt and plan and "plan" in low:
@@ -5045,6 +5858,21 @@ async def _cc_key_core(name: str, raw: str) -> dict:
     if mapped:
         args.append(mapped)                  # named control key
     elif len(raw) == 1 and raw.isprintable():
+        # 選單/是否題的單字元答案(y/n/1-9)—— 送出前先拿「現在」的畫面重驗一次
+        # 是不是真的還有相符的選項在等。App 端的選單清單可能是稍早抓的:如果
+        # CLI 這段時間自己把提示解掉了(auto-accept、逾時、或已經被別的方式
+        # 回掉),畫面上其實已經沒有選單、focus 落在自由輸入框 —— 這時候盲送
+        # 字元只會變成打進聊天框的垃圾字(而且送不出去,因為沒送 Enter),使用
+        # 者會看到同一顆「核准」不斷冒出來、字元越疊越多卻永遠沒有真的解掉。
+        # 沒有相符選項就直接拒絕,好過默默打錯地方。
+        _PANE_CACHE.pop(name, None)           # 強制拿最新畫面,不吃快取
+        pane_now = await _tmux_capture_cached(name)
+        prompt_now = _cc_prompt(pane_now)
+        valid_keys = {str(o.get("key") or "").lower()
+                      for o in (prompt_now or {}).get("options", [])}
+        if not prompt_now or raw.lower() not in valid_keys:
+            raise http_err(409, "PROMPT_STALE", "no matching live prompt right now",
+                           "the on-screen menu may already be resolved — refresh and retry")
         args += ["-l", raw]                  # literal single char (y / n / 1-3)
     else:
         raise HTTPException(status_code=400, detail="unsupported key")
@@ -5065,7 +5893,7 @@ async def _cc_key_core(name: str, raw: str) -> dict:
 # (送 TUI 鍵),三線同一條 approval 管線(批次 3 完成判準)。
 
 _CC_APPROVAL_ACTIVE: dict = {}      # name -> {"aid": str, "sig": str}
-_CC_APPROVAL_POLL_SECS = 4.0
+_CC_APPROVAL_POLL_SECS = 1.5   # 4.0→1.5:審核偵測延遲主項;只巡 app-owned,可負擔
 _CC_APPROVAL_TTL = 900.0
 
 _CC_ALLOW_RE = re.compile(r"^(always allow|allow|yes)", re.IGNORECASE)
@@ -5129,13 +5957,22 @@ def _cc_approval_create(name: str, prompt: dict) -> str:
 
 
 async def _cc_approval_watcher():
-    """常駐:每 4s 巡一輪 enabled CC sessions(pane 走快取,成本低)。"""
+    """常駐:每 1.5s 巡一輪 owned CC sessions,強制拿新 pane(不吃 5s 快取)。
+    舊配置(4s 間隔 + 5s 舊 pane)讓「prompt 出現→建 approval」最壞 ~9 秒;
+    現在 ≤1.5s。只巡 app-owned(通常 1-7 條),capture-pane 一次 ~10-20ms,
+    可負擔;順帶把新鮮 pane 回填快取給首頁清單用。"""
     while True:
         await asyncio.sleep(_CC_APPROVAL_POLL_SECS)
+        owned = _cc_app_owned_names()   # 只推 app 自己開的 CC session 的審核
         for name, _workdir, enabled in _cc_conf_rows():
             if enabled != "1":
                 continue
+            # daemon / 別處開的 ccsess(Culture Supply、Ops、FLiPER…)不進 app 審核中心、
+            # 不發推播。它們照常在 ccsess 跑,只是審核通知不外漏到這台 app。
+            if name not in owned:
+                continue
             try:
+                _PANE_CACHE.pop(name, None)   # 審核偵測不能吃舊畫面
                 st = await _cc_status_core(name)
                 prompt = st.get("prompt")
                 active = _CC_APPROVAL_ACTIVE.get(name)
@@ -5281,6 +6118,7 @@ async def v2_agents(request: Request):
 async def v2_sessions(request: Request, provider: str = "", status: str = ""):
     _check_auth(request)
     out = []
+    degraded = []   # 取清單失敗的 provider(目前只有 codex 分支會標)
     out.extend(await _delegation_v2_sessions())
     for name, workdir, enabled in _cc_conf_rows():
         if enabled != "1":
@@ -5317,13 +6155,19 @@ async def v2_sessions(request: Request, provider: str = "", status: str = ""):
                         "last_event_at": s.get("lastEventAt"),
                         "capabilities": caps,
                         "meta": {"approval": CODEX_APP._approval_public(approval) if approval else None}})
-    except Exception:  # noqa: BLE001
-        pass
+    except Exception as e:  # noqa: BLE001
+        # 不再無聲吞錯:codex app-server 掛掉時 CX 區直接消失、log 零痕跡,
+        # 「CX 全空」查不到原因(2026-07-10 ChatGPT.app 併購式更新事故)。
+        _log_event("v2_codex_list_failed", error=type(e).__name__,
+                   error_message=str(e)[:200])
+        degraded.append("codex")
     if provider:
         out = [s for s in out if s["provider"] == provider]
     if status:
         out = [s for s in out if s["status"] == status]
-    return {"sessions": out}
+    # degraded_providers:清單為空 ≠ 沒有 session,可能是 provider 暫時掛了。
+    # 舊 app 忽略新欄位,向後相容;新 app 可據此顯示「清單暫時無法取得」。
+    return {"sessions": out, "degraded_providers": degraded}
 
 
 def _approval_bool_from_body(body: dict) -> bool:
@@ -5566,7 +6410,7 @@ async def _cc_card_seed(store, name: str, workdir: str):
     if store.seeded:
         return
     store.seeded = True
-    jsonl = _cc_latest_jsonl(workdir)
+    jsonl = await _cc_session_jsonl(name, workdir)
     if not jsonl or not os.path.exists(jsonl):
         return
     try:
@@ -5592,7 +6436,7 @@ async def _cc_card_follower(name: str, workdir: str):
     while True:
         await asyncio.sleep(1.0)
         try:
-            cur = _cc_latest_jsonl(workdir)
+            cur = await _cc_session_jsonl(name, workdir)
             if cur != store.tail_file:               # session 換了新 jsonl
                 store.tail_file, store.tail_pos, store.tail_lineno = cur or "", 0, 0
             j = store.tail_file
@@ -5612,6 +6456,12 @@ async def _cc_card_follower(name: str, workdir: str):
                 busy = bool(st.get("busy"))
                 if busy:
                     store.queued_until = 0.0   # 真忙了 → 排隊寬限交還正常路徑
+                # 新訂閱者(開啟/重連時可能在「忙碌中途」接入)→ 強制重發一次當前
+                # 狀態,否則 set_status「有變才發」會讓中途接入者停在舊的「待命」,
+                # 整段回覆期看起來像沒反應(snapshot 冷載不帶 status)。
+                if store.subscribers > getattr(store, "_last_subs", 0):
+                    store.status = None
+                store._last_subs = store.subscribers
                 if prev_busy is not None and busy != prev_busy:
                     if busy:
                         store.turn_id = "turn-" + uuid.uuid4().hex[:12]
@@ -5710,7 +6560,11 @@ async def _cx_card_digest(thread_id: str):
     if not d.seeded:
         d.seeded = True
         try:
-            await CODEX_APP.ensure_thread_loaded(thread_id)
+            # 只讀 seed 不做 thread/resume:resume 會「接管」該 thread,若它正被
+            # 別的 codex app-server(如 VS Code,thread source=vscode)持有就會卡死
+            # 整條 stdio → 之後所有 codex 呼叫一起 hang(XCash 就是這樣空白+送不出)。
+            # thread/turns/list 本來就不需 resume 也讀得到(/codexsessions/{id}/history
+            # 就是這樣讀的),所以這裡直接列 turns。
             res = await CODEX_APP.call("thread/turns/list", {
                 "threadId": thread_id, "limit": _CX_CARD_SEED_TURNS,
                 "itemsView": "full", "sortDirection": "desc"}, timeout=45.0)
@@ -5756,6 +6610,42 @@ def _hp_cards_turn_start(session: str, cid: str, user_mid: str | None,
         _log_event("hp_card_turn_error", session=session, error=str(e)[:160])
 
 
+def _hp_merged_messages(session: str, limit: int = 200):
+    """人格卡片流的訊息來源:canonical(app 回合)⊕ Telegram(state.db)⊕ cron 晨報,
+    與 /app/v1/messages 同一套合併/去重。之前卡片流只讀 canonical,所以你在 TG 講的
+    和晨報都不會進 Pocket 人格聊天(卡在最後一次 app 內回合 = 7/6)。改吃這個合併後,
+    TG 對話 + 晨報/午報都會出現。"""
+    out = _canon_messages(session, limit)
+    if session not in PERSONAS:
+        return out
+    _, home = PERSONAS[session]
+    def _steps_stripped(t: str) -> str:
+        return re.sub(r"<details>.*?</details>", "", t or "", flags=re.S).strip()
+    canon_assist = [((m.get("ts") or 0), _steps_stripped(m.get("content") or ""))
+                    for m in out if m.get("role") == "assistant"]
+    def _tg_dup(m) -> bool:
+        if m["role"] != "assistant":
+            return False
+        body = _steps_stripped(m["content"])
+        ts = m["ts"] or 0
+        return bool(body) and any(c == body and abs(ts - cts) < 600
+                                  for cts, c in canon_assist)
+    try:
+        for m in _persona_history(home, limit):
+            if _tg_dup(m):
+                continue
+            out.append({"id": f"tg-{m['ts']}", "role": m["role"], "content": m["content"],
+                        "attachments": m.get("attachments") or [], "ts": m["ts"],
+                        "status": "done", "source": "telegram"})
+        _sync_persona_reports(session, 50)
+        out.extend(_report_messages(session, limit))
+    except Exception as e:  # noqa: BLE001
+        # TG/cron 合併失敗不能拖垮卡片流 → 退回只有 canonical(至少不會壞掉整頁)。
+        _log_event("hp_merge_error", session=session, error=str(e)[:200])
+    out.sort(key=lambda m: m.get("ts") or 0)
+    return out[-limit:]
+
+
 async def _hp_canon_follower(session: str):
     """canonical 寫入版本喚醒(#28 的 _canon_wait)→ 補掃出卡。known_mids
     去重;30s 保險絲重掃與 v1 messages/events 同款。"""
@@ -5772,7 +6662,9 @@ async def _hp_canon_follower(session: str):
             await asyncio.sleep(2.0)
         ver = _CANON_VER.get(session, 0)
         try:
-            d.seed_messages(_canon_messages(session, 80))
+            # 30s 保險絲重掃:同時把 TG/state.db + cron 晨報合併進來(TG/cron 不寫
+            # canonical,不會觸發 _canon_wait,靠這條 timeout 週期補上,~30s 延遲)。
+            d.seed_messages(_hp_merged_messages(session, 80))
         except Exception as e:  # noqa: BLE001
             _log_event("hp_card_follower_error", session=session,
                        error=str(e)[:200])
@@ -5792,7 +6684,7 @@ async def _hp_card_digest(session: str):
     if not d.seeded:
         d.seeded = True
         try:
-            msgs = await asyncio.to_thread(_canon_messages, session,
+            msgs = await asyncio.to_thread(_hp_merged_messages, session,
                                            _HP_CARD_SEED_MSGS)
             d.seed_messages(msgs)
         except Exception as e:  # noqa: BLE001
@@ -6682,6 +7574,41 @@ async def app_delegation_input(delegation_id: str, request: Request):
     raise HTTPException(status_code=400, detail="unsupported delegation provider")
 
 
+@app.post("/app/v1/delegations/{delegation_id}/report")
+async def app_delegation_report(delegation_id: str, request: Request):
+    """子代理主動回報成果/里程碑(M1-3)。成果摘要由做事的人自己寫,品質最高、
+    不靠 watcher 猜。body {summary, files?, verification?, status?}。id 或工號皆可。
+    status=done/idle → 標完成並回流「已完成」;failed → 失敗;其餘 → 進度回報。"""
+    _check_auth(request)
+    row = _delegation_get(delegation_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="unknown delegation")
+    d = dict(row)
+    body = await request.json()
+    summary = str(body.get("summary") or body.get("content") or "").strip()
+    if not summary:
+        raise HTTPException(status_code=400, detail="summary required")
+    status_in = str(body.get("status") or "").strip().lower()
+    meta = _delegation_meta(d)
+    meta["last_report"] = {"summary": summary[:4000], "ts": time.time(),
+                           "files": body.get("files") or [],
+                           "verification": str(body.get("verification") or "")[:2000]}
+    fields = {"meta": meta, "updated_at": time.time()}
+    if status_in in ("done", "idle"):
+        fields["status"] = "idle"
+    elif status_in in ("failed", "running"):
+        fields["status"] = status_in
+    _delegation_update(d["id"], **fields)
+    d["meta"] = json.dumps(meta, ensure_ascii=False)
+    if "status" in fields:
+        d["status"] = fields["status"]
+    event = ("done" if status_in in ("done", "idle")
+             else "failed" if status_in == "failed" else "report")
+    await _delegation_notify(d, event, summary=summary)
+    return {"ok": True, "delegation_id": d["id"], "work_order": d.get("work_order"),
+            "event": event}
+
+
 @app.post("/app/v1/delegations")
 async def app_delegation_create(request: Request):
     """Create a durable CC/Codex work-order session.
@@ -6719,6 +7646,28 @@ async def app_delegation_create(request: Request):
                   _new_work_order(parent, task_code, subtask_code)).strip().upper()
     if not re.match(r"^[A-Z0-9][A-Z0-9._-]{2,60}$", work_order):
         raise HTTPException(status_code=400, detail="unsupported work_order")
+    # M2:CC↔CX 互調的呼叫鏈標記 + 防遞迴。parent_delegation = 父工號/父 id,
+    # depth 隨鏈遞增,>2 擋(防互派炸鏈);同父併發 running 子任務 >3 擋。
+    parent_delegation_ref = str(body.get("parent_delegation") or "").strip()
+    parent_dlg_id = ""
+    depth = 0
+    if parent_delegation_ref:
+        prow = _delegation_get(parent_delegation_ref)
+        if not prow:
+            raise HTTPException(status_code=400, detail="unknown parent_delegation")
+        pd = dict(prow)
+        parent_dlg_id = pd.get("id") or ""
+        depth = int(_delegation_meta(pd).get("depth") or 0) + 1
+        if depth > 2:
+            raise HTTPException(status_code=400,
+                                detail="delegation chain too deep (max depth 2)")
+        running_children = sum(
+            1 for r in _delegation_rows(limit=200)
+            if _delegation_meta(dict(r)).get("parent_delegation") == parent_dlg_id
+            and dict(r).get("status") == "running")
+        if running_children >= 3:
+            raise HTTPException(status_code=429,
+                                detail="parent already has 3 running children")
     did = "dlg-" + uuid.uuid4().hex[:16]
     now = time.time()
     prompt = _delegation_prompt(work_order, parent, title, objective, cwd, body)
@@ -6730,6 +7679,8 @@ async def app_delegation_create(request: Request):
         "parent_display": PERSONAS[parent][0],
         "created_by": "bridge",
         "created_via": body.get("created_via") or "bridge",
+        "parent_delegation": parent_dlg_id,
+        "depth": depth,
     }
 
     if provider == "codex":
@@ -6818,10 +7769,45 @@ async def app_delegation_create(request: Request):
                work_order=work_order,
                parent_persona=parent,
                provider=provider,
+               created_via=meta.get("created_via"),
+               depth=depth,
                provider_session_hash=_short_hash(provider_session_id),
                objective_chars=len(objective),
                attachment_count=len(body.get("attachments") or []))
+    # M1:建立即回流一張「已建立」卡進父人格對話(父是 delegation 則注回父 session)。
+    try:
+        await _delegation_notify(dict(row), "created")
+    except Exception:  # noqa: BLE001
+        pass
     return {"ok": True, "delegation": _delegation_public(row, status)}
+
+
+@app.post("/app/v1/persona-report")
+async def app_post_persona_report(request: Request):
+    """外部內容線(FLiPER fed 的 today-pick / story 發佈)灌一則報告進某人格對話流。
+    寫進 report_events(external_source 自訂,不會被 cron 同步蓋掉),再由
+    _report_messages 併進 v1/v2 卡片流 → 出現在 Pocket 該人格聊天(卡片流 30s 保險絲
+    週期補掃)。fed 端在發佈 today-pick / story 時 POST 這裡即可。"""
+    _check_auth(request)
+    body = await request.json()
+    session = str(body.get("session") or "").strip()
+    if session not in PERSONAS:
+        raise http_err(400, "SESSION_NOT_FOUND", "unknown persona session")
+    content = str(body.get("content") or "").strip()
+    if not content:
+        raise http_err(400, "EMPTY_CONTENT", "content required")
+    ts = float(body.get("ts") or time.time())
+    report = {
+        "label": str(body.get("label") or "今日精選"),
+        "name": str(body.get("name") or "fed-today"),
+        "content": content,
+        "ts": ts,
+        "external_source": str(body.get("external_source") or "fed"),
+        "external_id": str(body.get("external_id") or "")
+                       or _report_id(session, "fed-today", "", ts),
+    }
+    rid = _report_upsert(session, report)
+    return {"ok": True, "id": rid}
 
 
 @app.get("/app/v1/messages")
@@ -7749,10 +8735,12 @@ async def push_test(request: Request):
     """Send a test push to every registered device — verifies APNs auth end-to-end."""
     _check_auth(request)
     b = await request.json() if await request.body() else {}
-    n = await push_notify(b.get("title") or "Pocket Agent",
-                          b.get("body") or "測試推播 ✅ M23 已接上",
-                          {"kind": "test"})
-    return {"sent": n, "devices": len(_devices())}
+    res = await push_notify(b.get("title") or "Pocket Agent",
+                            b.get("body") or "測試推播 ✅ M23 已接上",
+                            {"kind": "test"})
+    # 回傳真實 APNs 結果(topic、每台裝置的 code/detail)—— 以前一律回 200 讓人盲測。
+    return {"sent": res["sent"], "devices": res["total"],
+            "apns_topic": APNS_BUNDLE_ID, "failures": res["failures"]}
 
 
 @app.get("/app/v1/approvals")
@@ -8041,3 +9029,7 @@ async def _start_cc_approval_watcher():
     task = asyncio.create_task(_cc_approval_watcher())
     _BG_TASKS.add(task)
     task.add_done_callback(_BG_TASKS.discard)
+    # M1:CC 委派完成偵測(15s;codex 走 turn/completed 事件不用巡)
+    dtask = asyncio.create_task(_delegation_cc_watcher())
+    _BG_TASKS.add(dtask)
+    dtask.add_done_callback(_BG_TASKS.discard)
