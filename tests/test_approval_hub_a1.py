@@ -143,8 +143,8 @@ class TestDecideCore(unittest.TestCase):
     def test_callback_carries_kind_status(self):
         fired = []
 
-        async def fake_cb(aid, cb, status, result):
-            fired.append((aid, cb, status, result))
+        async def fake_cb(aid, cb, status, result, key=""):
+            fired.append((aid, cb, status, result, key))
         orig = bridge._approval_fire_callback
         bridge._approval_fire_callback = fake_cb
         try:
@@ -157,7 +157,9 @@ class TestDecideCore(unittest.TestCase):
                 return r
             r = asyncio.run(run())
             self.assertEqual(r["status"], "answered")
-            self.assertEqual(fired, [("cb1", "http://127.0.0.1:9/x", "answered", "a")])
+            # A3:callback 也帶 key(persona-relay 靠它挑 send 文字)
+            self.assertEqual(fired,
+                             [("cb1", "http://127.0.0.1:9/x", "answered", "a", "a")])
         finally:
             bridge._approval_fire_callback = orig
 

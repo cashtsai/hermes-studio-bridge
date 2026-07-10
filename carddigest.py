@@ -369,18 +369,22 @@ class ApprovalCardMixin:
         store = self._appr_store()
         if hasattr(self, "prompt"):
             self.prompt = title
+        body = {"approval_id": record["id"], "title": title,
+                "detail": record.get("detail") or "",
+                # 選項改由發起方宣告(record["options"]);沒宣告才退回二元預設。
+                # 不再把「允許/拒絕」寫死在這裡——見 CHOICE_GATEWAY_CONTRACT §1。
+                "options": record.get("options") or [
+                    {"key": "approve", "label": "允許", "style": "primary"},
+                    {"key": "deny", "label": "拒絕", "style": "danger"}],
+                "source": self._appr_source,
+                "fallback_text": f"🔐 {title}"}
+        if record.get("kind") in ("question", "notice"):
+            # A3:加值欄位 —— app 靠它做 question 直選/notice 單鍵;
+            # 不認得就忽略(fallback 原則)。
+            body["kind"] = record["kind"]
         store.upsert_card(make_card(
             f"{self._appr_prefix}{record['id']}", store.turn_id, "system",
-            "approval",
-            {"approval_id": record["id"], "title": title,
-             "detail": record.get("detail") or "",
-             # 選項改由發起方宣告(record["options"]);沒宣告才退回二元預設。
-             # 不再把「允許/拒絕」寫死在這裡——見 CHOICE_GATEWAY_CONTRACT §1。
-             "options": record.get("options") or [
-                 {"key": "approve", "label": "允許", "style": "primary"},
-                 {"key": "deny", "label": "拒絕", "style": "danger"}],
-             "source": self._appr_source,
-             "fallback_text": f"🔐 {title}"}, final=False))
+            "approval", body, final=False))
         if hasattr(self, "_status"):
             self._status()
 
