@@ -820,6 +820,31 @@ def _canon_init():
         external_source TEXT, external_id TEXT UNIQUE, ingested_at REAL NOT NULL)""")
     con.execute("CREATE INDEX IF NOT EXISTS idx_report_session_time ON report_events(session, ts)")
     con.execute("CREATE INDEX IF NOT EXISTS idx_report_external ON report_events(external_source, external_id)")
+    # Sync engine P0 (docs/SYNC_ENGINE_REWRITE_PLAN_20260711.md §3):單一
+    # append-only 事件日誌,id 即全域遞增 seq。P0/P1 只寫不讀(雙寫過渡,
+    # 現有 canonical/state.db 讀取路徑不動),P2 起由 /app/v2/events 消費。
+    # external_id 供來源鏡射去重(TG/cron 是重複掃描式接入,必須冪等)。
+    con.execute("""CREATE TABLE IF NOT EXISTS event_log(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        session TEXT NOT NULL,
+        type TEXT NOT NULL,
+        external_id TEXT UNIQUE,
+        payload TEXT NOT NULL,
+        created_at REAL NOT NULL)""")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_event_session_seq ON event_log(session, id)")
+    # Sync engine P2:已讀游標的伺服器真相(取代 App 端 UserDefaults 計數
+    # 器的長期方向)。一列 = 一個(session, device)的已讀位置 — 按裝置分列
+    # 存,是為了「任一裝置讀過即全讀」(MAX over devices)與「每裝置各自
+    # 記」兩種語意都能從同一份資料推導;多裝置語意由善彰拍板後在 App 端
+    # (P3)選聚合方式,schema 不用改。
+    con.execute("""CREATE TABLE IF NOT EXISTS read_cursors(
+        session TEXT NOT NULL,
+        device_id TEXT NOT NULL,
+        last_read_seq INTEGER NOT NULL DEFAULT 0,
+        last_read_ts REAL NOT NULL DEFAULT 0,
+        message_id TEXT,
+        updated_at REAL NOT NULL,
+        PRIMARY KEY(session, device_id))""")
     con.execute("""CREATE TABLE IF NOT EXISTS delegations(
         id TEXT PRIMARY KEY,
         work_order TEXT UNIQUE,
@@ -1183,21 +1208,314 @@ async def _canon_wait(session: str, seen_ver: int) -> None:
         await asyncio.sleep(0.2)
 
 
+# ── Sync engine P0:event_log 資料層(SYNC_ENGINE_REWRITE_PLAN §3/P0)────
+# 單一事件日誌 + 游標訂閱的地基。這一層只提供 append / since 兩個原語;
+# 誰來寫(P1 三來源鏡射)、誰來讀(P2 /app/v2/events)都在上層。
+# _EVENT_VER 與 _CANON_VER 同款:純 int 版本號、無鎖,喚醒不漏即可。
+_EVENT_VER: dict[str, int] = {}
+# 記憶體去重快取:TG/cron 的接入是「重複掃描」式,同一批 external_id 每輪
+# 都會再撞一次 DB 的 INSERT OR IGNORE;這層快取讓穩態掃描零寫入。重啟後
+# 快取歸零沒關係 — DB 的 UNIQUE(external_id) 仍然守住冪等,只是第一輪
+# 掃描多付幾次 no-op INSERT。
+_EVENT_SEEN: dict[str, set] = {}
+_EVENT_SEEN_CAP = 8192
+# 全域版本計數(不分 session):/app/v2/events 省略 session 的全域訂閱
+# (P3 契約 #2:App 首頁列表+未讀用單一條 SSE)靠這個喚醒,不用每 0.2s
+# 掃整個 per-session dict。與 per-session 版同款:純 int、無鎖、喚醒不漏。
+_EVENT_VER_ALL = 0
+
+
+def _event_notify(session: str) -> None:
+    global _EVENT_VER_ALL
+    _EVENT_VER[session] = _EVENT_VER.get(session, 0) + 1
+    _EVENT_VER_ALL += 1
+
+
+async def _event_wait(session: str, seen_ver: int) -> None:
+    """等到該 session 的 event_log 版本離開 seen_ver(有新事件)。與
+    _canon_wait 同款 0.2s 純記憶體輪詢,不碰 DB、不用 Condition。"""
+    while _EVENT_VER.get(session, 0) == seen_ver:
+        await asyncio.sleep(0.2)
+
+
+def _event_append(session: str, etype: str, payload: dict,
+                  external_id: str | None = None) -> int:
+    """Append 一筆事件,回傳全域 seq(=event_log.id);0 表示去重略過或寫入
+    失敗。絕不 raise — 鏡射寫入掛在既有熱路徑上(_canon_add/_report_upsert/
+    合併掃描),event_log 故障只能降級成「新路徑落後」,不准拖垮舊路徑。"""
+    import sqlite3
+    try:
+        if external_id and external_id in _EVENT_SEEN.get(session, ()):
+            return 0
+        con = sqlite3.connect(CANON_DB, timeout=30)
+        cur = con.execute(
+            "INSERT OR IGNORE INTO event_log(session,type,external_id,payload,created_at) "
+            "VALUES(?,?,?,?,?)",
+            (session, etype, external_id,
+             json.dumps(payload, ensure_ascii=False), time.time()))
+        seq = int(cur.lastrowid or 0) if cur.rowcount else 0
+        con.commit()
+        con.close()
+        if external_id:
+            seen = _EVENT_SEEN.setdefault(session, set())
+            if len(seen) >= _EVENT_SEEN_CAP:
+                seen.clear()    # 粗略上限:清空後由 DB UNIQUE 繼續守冪等
+            seen.add(external_id)
+        if seq:
+            _event_notify(session)
+        return seq
+    except Exception as e:  # noqa: BLE001
+        _log_event("event_append_failed", session=session, type=etype,
+                   error=type(e).__name__, error_message=str(e)[:160])
+        return 0
+
+
+def _event_since(session: str, since_seq: int = 0, limit: int = 500) -> list[dict]:
+    """撈 id > since_seq 的事件(即時 + 補洞共用同一條查詢)。信封對齊
+    /app/v2/sessions/{id}/events 的 {seq,ts,type,data} 形狀。"""
+    import sqlite3
+    try:
+        con = sqlite3.connect(f"file:{CANON_DB}?mode=ro", uri=True, timeout=5)
+        rows = con.execute(
+            "SELECT id,type,payload,created_at FROM event_log "
+            "WHERE session=? AND id>? ORDER BY id LIMIT ?",
+            (session, int(since_seq or 0), max(1, limit))).fetchall()
+        con.close()
+    except Exception as e:  # noqa: BLE001
+        _log_event("event_since_failed", session=session,
+                   error=type(e).__name__, error_message=str(e)[:160])
+        return []
+    out = []
+    for r in rows:
+        try:
+            data = json.loads(r[2] or "{}")
+        except Exception:  # noqa: BLE001
+            data = {}
+        out.append({"seq": r[0], "ts": r[3], "type": r[1], "data": data})
+    return out
+
+
+def _event_since_all(since_seq: int = 0, limit: int = 500) -> list[dict]:
+    """全域版 _event_since:不分 session 撈 id > since_seq 的事件,餵
+    /app/v2/events 省略 session 的全域訂閱。event_log.id 本來就是全域
+    autoincrement,所以全域游標語意天然成立。信封比 per-session 版多帶
+    session 欄位(App 端 SyncEvent 收 session|session_id 雙鍵)。
+    SQL 限定 session IN 現任 PERSONAS — 落實拍板「v2 事件流只收 hermes
+    人格 session」:被移除的 persona 與未來任何非人格寫入不會漏進全域流。"""
+    import sqlite3
+    sessions = list(PERSONAS)
+    if not sessions:
+        return []
+    try:
+        con = sqlite3.connect(f"file:{CANON_DB}?mode=ro", uri=True, timeout=5)
+        rows = con.execute(
+            "SELECT id,session,type,payload,created_at FROM event_log "
+            f"WHERE id>? AND session IN ({','.join('?' * len(sessions))}) "
+            "ORDER BY id LIMIT ?",
+            (int(since_seq or 0), *sessions, max(1, limit))).fetchall()
+        con.close()
+    except Exception as e:  # noqa: BLE001
+        _log_event("event_since_all_failed",
+                   error=type(e).__name__, error_message=str(e)[:160])
+        return []
+    out = []
+    for r in rows:
+        try:
+            data = json.loads(r[3] or "{}")
+        except Exception:  # noqa: BLE001
+            data = {}
+        out.append({"seq": r[0], "ts": r[4], "type": r[2],
+                    "session": r[1], "data": data})
+    return out
+
+
+def _event_latest_seq(session: str) -> int:
+    import sqlite3
+    try:
+        con = sqlite3.connect(f"file:{CANON_DB}?mode=ro", uri=True, timeout=5)
+        row = con.execute("SELECT MAX(id) FROM event_log WHERE session=?",
+                          (session,)).fetchone()
+        con.close()
+        return int(row[0] or 0)
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+# ── Sync engine P1:三來源鏡射(SYNC_ENGINE_REWRITE_PLAN §4 P1)─────────
+# App 訊息(_canon_add)/ TG(state.db 合併掃描)/ cron 晨報(_report_upsert)
+# 都額外鏡射一份進 event_log。雙寫過渡:現有讀取路徑一律不動,event_log
+# 在 P2 之前只做影子累積。
+#
+# 鍵設計:{source}:{app可見id}:{sha1(role|status|content)[:16]}。
+# - 同一則訊息重複掃到 → 同鍵 → 去重(TG/cron 是重複掃描式接入)
+# - 同 id 但內容/狀態變了(報告改稿、訊息補寫)→ 新鍵 → 追加一筆新的
+#   message.upsert 事件,client 端以 message id 做 last-write-wins 覆蓋
+_EVENT_SYNC_TS: dict[str, float] = {}
+_EVENT_SYNC_MIN_SECS = float(os.environ.get("POCKET_EVENT_SYNC_SECS", "10"))
+
+
+def _event_msg_key(m: dict) -> str:
+    basis = f"{m.get('role')}|{m.get('status')}|{m.get('content') or ''}"
+    h = hashlib.sha1(basis.encode("utf-8", "replace")).hexdigest()[:16]
+    return f"{m.get('source') or 'app'}:{m.get('id')}:{h}"
+
+
+def _event_mirror_messages(session: str, msgs: list) -> int:
+    """把一批 app-shape 訊息 dict 鏡射進 event_log(冪等,靠 external_id
+    去重)。回傳真正新寫入的筆數。絕不 raise。"""
+    n = 0
+    for m in msgs or []:
+        try:
+            key = _event_msg_key(m)
+        except Exception:  # noqa: BLE001
+            continue
+        if _event_append(session, "message.upsert", {"message": m},
+                         external_id=key):
+            n += 1
+    return n
+
+
+def _event_sync_session(session: str, limit: int = 200,
+                        force: bool = False,
+                        min_secs: float | None = None) -> None:
+    """把 TG(state.db)+ cron 晨報拉進 event_log 的主動同步(P2 SSE 端點
+    在訂閱期間週期呼叫)。合併/清洗/去重全部沿用 _hp_merged_messages —
+    鏡射就掛在它的回傳路徑上,這裡只負責觸發 + 節流(同 session 至多每
+    _EVENT_SYNC_MIN_SECS 掃一次,多個訂閱者共享)。min_secs 可換小節流:
+    statedb watcher 喚醒路徑用 0.4s(配合呼叫端 0.5s 去抖)— 要穿越 10s
+    週期節流即時拉,但多訂閱者同時醒時仍只掃一次。"""
+    now = time.monotonic()
+    floor = _EVENT_SYNC_MIN_SECS if min_secs is None else min_secs
+    if not force and now - _EVENT_SYNC_TS.get(session, 0.0) < floor:
+        return
+    _EVENT_SYNC_TS[session] = now
+    try:
+        _hp_merged_messages(session, limit)   # 鏡射在合併函式內完成
+    except Exception as e:  # noqa: BLE001
+        _log_event("event_sync_failed", session=session,
+                   error=type(e).__name__, error_message=str(e)[:160])
+
+
+# ── TG/cron → state.db 寫入即時偵測(#tg-instant-sync)───────────────────
+# 根因:App 自己送出/收到的訊息走上面 _canon_notify/_canon_wait,寫入當下
+# 就 bump 版本、~0.2s 內喚醒 follower。但 Telegram 端訊息與 cron 晨報是
+# **Hermes 官方 gateway 進程**寫進各 persona 自己的 `<home>/state.db`(WAL
+# mode),那條寫入路徑在 hermes_cli 官方套件內部 —— 鐵律規定不准碰內核,
+# 所以完全不能掛 hook/callback 在寫入那一刻觸發。
+#
+# 這裡改用「唯讀輕量輪詢」繞過去:WAL mode 下,真正的寫入落在
+# `<home>/state.db-wal`(checkpoint 前主 db 檔案本身不太動),只要每
+# ~0.15s 對這個檔案做一次 os.stat()(不開檔、不連 sqlite、不解析內容),
+# mtime/size 一變就代表「剛剛有新內容寫進去」,立刻 bump 一個獨立的版本
+# 計數器喚醒對應 persona 的 follower 去重掃 `_hp_merged_messages`。
+# 這跟 `_canon_notify` 是同一種模式(純 int 版本號、無鎖),只是觸發源從
+# 「我們自己呼叫 _canon_add」換成「別人的程序寫了這個檔案」。
+#
+# 30s 保險絲(_hp_canon_follower 裡的 timeout=30.0)完全保留 —— 這個 stat
+# watcher 是「加速觸發」疊加在上面,不是取代:watcher 掛掉/漏抓(例如
+# checkpoint 時序恰好卡在兩次 stat 中間、mtime 精度不足撞期）,30s 週期
+# 還是會補上,同步不會因為單一機制失效就整個停擺。
+_STATEDB_VER: dict[str, int] = {}
+_STATEDB_VER_ALL = 0    # 全域計數,配 _EVENT_VER_ALL(全域訂閱喚醒用)
+_STATEDB_STAT_CACHE: dict[str, tuple] = {}   # session -> (path, mtime_ns, size)
+_STATEDB_POLL_SECS = float(os.environ.get("POCKET_STATEDB_POLL_SECS", "0.15"))
+
+
+def _statedb_notify(session: str) -> None:
+    global _STATEDB_VER_ALL
+    _STATEDB_VER[session] = _STATEDB_VER.get(session, 0) + 1
+    _STATEDB_VER_ALL += 1
+
+
+def _statedb_stat_key(home: str) -> tuple:
+    """只用 os.stat(),唯讀、不開檔、不連 DB。WAL 模式下實際寫入處是
+    state.db-wal;沒有的話(已 checkpoint 或非 WAL)退回 state.db 本身。
+    讀不到任何一個就回傳 (None, 0, 0),呼叫端據此跳過該 session 這一輪。"""
+    for name in ("state.db-wal", "state.db"):
+        p = os.path.join(home, name)
+        try:
+            st = os.stat(p)
+            return (p, st.st_mtime_ns, st.st_size)
+        except OSError:
+            continue
+    return (None, 0, 0)
+
+
+async def _state_db_watcher_loop() -> None:
+    """常駐背景迴圈:每輪對每個 persona home 的 state.db(-wal) 做一次
+    os.stat(),偵測到 mtime/size 變動就判定「TG/cron 剛寫入」,bump
+    `_STATEDB_VER` 喚醒 `_hp_canon_follower` 立刻重掃,不必等 30s 保險絲。
+    例外全吞:這條 loop 死掉不影響既有的 30s 兜底路徑,只是退回原本
+    的延遲,不會讓同步整個停擺(鐵律 #4)。"""
+    while True:
+        try:
+            for session, (_, home) in list(PERSONAS.items()):
+                key = _statedb_stat_key(home)
+                path = key[0]
+                if path is None:
+                    continue
+                prev = _STATEDB_STAT_CACHE.get(session)
+                if prev is not None and prev[0] == path and (prev[1] != key[1] or prev[2] != key[2]):
+                    _statedb_notify(session)
+                _STATEDB_STAT_CACHE[session] = key
+        except Exception as e:  # noqa: BLE001
+            _log_event("state_db_watcher_error", error=type(e).__name__,
+                       error_message=str(e)[:160])
+        await asyncio.sleep(_STATEDB_POLL_SECS)
+
+
+async def _canon_or_statedb_wait(session: str, seen_canon_ver: int,
+                                 seen_state_ver: int) -> None:
+    """`_canon_wait` 的擴充版:canonical 版本 *或* state.db stat 版本任一
+    變動就返回。同款 0.2s 純記憶體輪詢,無鎖、無 Condition。"""
+    while (_CANON_VER.get(session, 0) == seen_canon_ver
+           and _STATEDB_VER.get(session, 0) == seen_state_ver):
+        await asyncio.sleep(0.2)
+
+
+async def _event_or_statedb_wait(session: str, seen_ver: int,
+                                 seen_state_ver: int) -> None:
+    """`_event_wait` 的擴充版(v2 事件迴圈用):event_log 版本 *或*
+    state.db stat 版本任一變動就返回。statedb 醒 = TG/cron 剛寫入但還沒
+    鏡射進 event_log,呼叫端要立刻 _event_sync_session 把它拉進來 —
+    v2 訂閱者的 TG 延遲從節流上限(10s)壓到 ~0.4s。"""
+    while (_EVENT_VER.get(session, 0) == seen_ver
+           and _STATEDB_VER.get(session, 0) == seen_state_ver):
+        await asyncio.sleep(0.2)
+
+
+async def _event_or_statedb_wait_all(seen_ver: int,
+                                     seen_state_ver: int) -> None:
+    """全域版 _event_or_statedb_wait(/app/v2/events 省略 session 的訂閱用):
+    任何 session 的 event_log 或 state.db 有動靜就返回。盯兩個全域 int,
+    不掃 per-session dict。"""
+    while (_EVENT_VER_ALL == seen_ver
+           and _STATEDB_VER_ALL == seen_state_ver):
+        await asyncio.sleep(0.2)
+
+
 def _canon_add(session: str, role: str, content: str, attachments=None,
                mid: str | None = None, status: str = "done",
                client_id: str | None = None) -> tuple[str, bool]:
     import sqlite3
     mid = mid or uuid.uuid4().hex
+    now = time.time()
     try:
         con = sqlite3.connect(CANON_DB)
         con.execute("INSERT OR REPLACE INTO messages"
                     "(id,session,role,content,attachments,created_at,status,client_id) "
                     "VALUES(?,?,?,?,?,?,?,?)",
                     (mid, session, role, content, json.dumps(attachments or [], ensure_ascii=False),
-                     time.time(), status, client_id))
+                     now, status, client_id))
         con.commit()
         con.close()
         _canon_notify(session)
+        # Sync engine P1:App 訊息寫入點順便鏡射進 event_log(雙寫過渡)。
+        # payload 形狀對齊 _canon_messages 的輸出,client 兩邊看到同一種訊息。
+        _event_mirror_messages(session, [{
+            "id": mid, "role": role, "content": content,
+            "attachments": attachments or [], "ts": now, "status": status,
+            "client_id": client_id, "source": "app"}])
         # P1-3:人格完成一則回覆 → 推播把你叫回 app(前景由 app willPresent 抑制)。
         if role == "assistant" and status == "done":
             _push_persona_reply(session, content)
@@ -1887,6 +2205,11 @@ def _report_upsert(session: str, report: dict) -> str:
          report.get("external_source") or "hermes-cron", external_id, time.time()))
     con.commit()
     con.close()
+    # Sync engine P1:cron 晨報寫入點鏡射進 event_log(雙寫過渡)。形狀走
+    # _report_msg_shape = app 在 /app/v1/messages 看到的同一種報告訊息;
+    # 改稿(同 rid 新內容)→ 新鍵 → 追加新事件,同 message id 覆蓋。
+    _event_mirror_messages(session, [_report_msg_shape(
+        {"id": rid, "label": label, "content": content, "ts": ts})])
     return rid
 
 
@@ -1908,12 +2231,18 @@ def _report_events(session: str, limit: int = 20, newest_first: bool = False):
     } for r in rows]
 
 
-def _report_messages(session: str, limit: int = 100):
-    return [{
+def _report_msg_shape(r: dict) -> dict:
+    """report_events 列 → app-shape 訊息。_report_messages(v1 讀取)與
+    _report_upsert 的 event_log 鏡射(P1)共用,兩邊 payload/去重鍵一致。"""
+    return {
         "id": f"rep-{r['id']}", "role": "assistant",
         "content": f"📰 **{r['label']}**\n\n{r['content']}",
         "attachments": [], "ts": r["ts"], "status": "done", "source": "report",
-    } for r in _report_events(session, limit)]
+    }
+
+
+def _report_messages(session: str, limit: int = 100):
+    return [_report_msg_shape(r) for r in _report_events(session, limit)]
 
 
 def _clip_text(text: str, max_chars: int) -> str:
@@ -6869,17 +7198,28 @@ def _hp_merged_messages(session: str, limit: int = 200):
         # TG/cron 合併失敗不能拖垮卡片流 → 退回只有 canonical(至少不會壞掉整頁)。
         _log_event("hp_merge_error", session=session, error=str(e)[:200])
     out.sort(key=lambda m: m.get("ts") or 0)
-    return out[-limit:]
+    out = out[-limit:]
+    # Sync engine P1:TG 訊息沒有 bridge 端寫入點(Hermes 官方 gateway 直寫
+    # state.db),接入點就是這裡的合併掃描 — 卡片 follower 重掃 / v2 events
+    # 的 _event_sync_session 都會經過。掃描是重複式的,靠 external_id 冪等,
+    # 穩態時 _EVENT_SEEN 快取讓這行零寫入。順帶把 event_log 出生前的舊訊息
+    # 回填進日誌(§3.3:任何裝置從 seq=0 重放即可重建歷史)。
+    _event_mirror_messages(session, out)
+    return out
 
 
 async def _hp_canon_follower(session: str):
-    """canonical 寫入版本喚醒(#28 的 _canon_wait)→ 補掃出卡。known_mids
-    去重;30s 保險絲重掃與 v1 messages/events 同款。"""
+    """canonical 寫入版本喚醒(#28 的 _canon_wait)⊕ state.db stat 版本喚醒
+    (#tg-instant-sync 的 _statedb_notify)→ 補掃出卡。known_mids 去重;
+    兩條喚醒源任一觸發都立刻重掃,30s 仍是最後保險絲(見 timeout=30.0
+    註解)。"""
     d = _HP_CARD_DIGESTS[session]
     ver = _CANON_VER.get(session, 0)
+    sver = _STATEDB_VER.get(session, 0)
     while True:
         try:
-            await asyncio.wait_for(_canon_wait(session, ver), timeout=30.0)
+            await asyncio.wait_for(_canon_or_statedb_wait(session, ver, sver),
+                                   timeout=30.0)
         except asyncio.TimeoutError:
             pass
         except Exception as e:  # noqa: BLE001
@@ -6887,9 +7227,13 @@ async def _hp_canon_follower(session: str):
                        error=str(e)[:200])
             await asyncio.sleep(2.0)
         ver = _CANON_VER.get(session, 0)
+        sver = _STATEDB_VER.get(session, 0)
         try:
-            # 30s 保險絲重掃:同時把 TG/state.db + cron 晨報合併進來(TG/cron 不寫
-            # canonical,不會觸發 _canon_wait,靠這條 timeout 週期補上,~30s 延遲)。
+            # 保險絲重掃:同時把 TG/state.db + cron 晨報合併進來。正常情況下
+            # 這一段已經是被 state.db stat watcher 立刻(~0.2-0.3s)喚醒觸發
+            # 的,不是等 30s timeout —— watcher 偵測不到才會落回 30s 週期
+            # (見 _state_db_watcher_loop 註解:TG/cron 不寫 canonical,不會
+            # 觸發 _canon_notify,靠 stat 版本或最終這條 timeout 補上)。
             d.seed_messages(_hp_merged_messages(session, 80))
         except Exception as e:  # noqa: BLE001
             _log_event("hp_card_follower_error", session=session,
@@ -8471,6 +8815,10 @@ async def app_get_messages(session: str, request: Request, limit: int = 200):
     out.extend(_report_messages(session, limit))
     out.sort(key=lambda m: m.get("ts") or 0)
     out = out[-limit:]
+    # Sync engine P1:app 每次輪詢這頁就是一次現成的三來源合併掃描,順手
+    # 鏡射進 event_log(冪等、穩態零寫入;鏡射在 reaction overlay 疊加前,
+    # payload 保持訊息本體的正典形狀)。
+    _event_mirror_messages(session, out)
     # Reaction overlay (G2/#39) — one lookup for the whole page, ids as-is
     # (canonical mids and tg-<ts> alike), so reactions survive reinstall and
     # show identically on every device.
@@ -8585,6 +8933,264 @@ async def app_get_message_events(session: str, request: Request,
                 pass
 
     return StreamingResponse(gen(), media_type="text/event-stream")
+
+
+# ─────────────── Sync engine P2:/app/v2 統一事件流 + 已讀游標 ───────────
+_EVENTS_FOLLOW_MAX_SECS = 120.0   # 與 v1 messages/events 同款:app 週期重連
+
+
+@app.get("/app/v2/events")
+async def app_v2_events(request: Request, session: str | None = None,
+                        since_seq: int = 0, follow: bool = True):
+    """SYNC_ENGINE_REWRITE_PLAN §3.1 的統一訂閱端點:從 event_log 撈
+    id > since_seq 的所有列,補洞 + 即時走同一條 SSE,三來源(App/TG/cron)
+    與已讀游標不再各走各的加速通道。信封 {seq, ts, type, data} 與
+    /app/v2/sessions/{id}/events 卡片流對齊;event_log 是持久表,沒有卡片
+    ring buffer 的 410 SEQ_GONE 問題 — 任何裝置 since_seq=0 重放即可重建
+    完整歷史(§3.3 / backlog B3)。
+
+    session 可省略(P3 契約 #2):省略 = 全域訂閱,單一條 SSE 涵蓋全部
+    hermes 人格 session(App 首頁列表+未讀靠這條,不用每 persona 開一條)。
+    全域信封多帶 session 欄位;event_log.id 全域單調,since_seq 游標語意
+    與 per-session 模式相同。"""
+    _check_auth(request)
+    if session is not None and session not in PERSONAS:
+        raise http_err(400, "SESSION_NOT_FOUND", "unknown session")
+
+    async def gen():
+        cursor = max(0, int(since_seq or 0))
+        # 連上先主動拉一次 TG/cron(force 穿越節流):新訂閱者立刻看到外部
+        # 來源的積壓,不用等下一個同步週期。
+        await asyncio.to_thread(_event_sync_session, session, 200, True)
+        deadline = time.monotonic() + (_EVENTS_FOLLOW_MAX_SECS if follow else 0.0)
+        last_ver = -1     # 首輪必掃(補訂閱者斷線期間的積壓)
+        last_sync = time.monotonic()
+        sver = _STATEDB_VER.get(session, 0)   # watcher 版本基準(#tg-instant-sync)
+        while True:
+            sent = False
+            cur_sver = _STATEDB_VER.get(session, 0)
+            if cur_sver != sver:
+                # state.db 剛被 TG/cron 寫入(stat watcher bump)→ 立刻拉進
+                # event_log,不等下面的 10s 週期節流。先去抖:睡到距上次掃
+                # 描 ≥0.5s 再掃,吸掉同一批寫入的連續 bump;之後用 0.4s 小
+                # 節流 — 自己的時間線必然通過(剛睡滿 0.5s),只有別的訂閱
+                # 者在我們去抖期間已經掃過(該掃必然晚於這次寫入,已涵蓋)
+                # 才跳過。寫入絕不會被節流吞掉只剩 10s 兜底。
+                sver = cur_sver
+                gap = 0.5 - (time.monotonic() - _EVENT_SYNC_TS.get(session, 0.0))
+                if gap > 0:
+                    await asyncio.sleep(min(gap, 0.5))
+                last_sync = time.monotonic()
+                await asyncio.to_thread(_event_sync_session, session, 200,
+                                        False, 0.4)
+            ver = _EVENT_VER.get(session, 0)
+            if ver != last_ver:
+                last_ver = ver
+                while True:
+                    batch = await asyncio.to_thread(_event_since, session,
+                                                    cursor, 500)
+                    for ev in batch:
+                        cursor = ev["seq"]
+                        yield f"data: {json.dumps(ev, ensure_ascii=False)}\n\n"
+                        sent = True
+                    if len(batch) < 500:
+                        break
+            if not follow:
+                yield "data: [DONE]\n\n"
+                return
+            if not sent:
+                yield ": keepalive\n\n"
+            if time.monotonic() >= deadline:
+                yield "data: [DONE]\n\n"
+                return
+            if time.monotonic() - last_sync >= _EVENT_SYNC_MIN_SECS:
+                # 週期主動拉當保險絲:statedb watcher(上面的 sver 檢查)是
+                # 即時觸發主力,這條是 watcher 失效時的兜底 — v2 訂閱者的
+                # TG 延遲上限仍 = _EVENT_SYNC_MIN_SECS,不依賴單一機制。
+                last_sync = time.monotonic()
+                await asyncio.to_thread(_event_sync_session, session, 200)
+            try:
+                await asyncio.wait_for(
+                    _event_or_statedb_wait(session, last_ver, sver),
+                    timeout=SSE_KEEPALIVE_SECS)
+            except asyncio.TimeoutError:
+                pass
+
+    async def gen_all():
+        # 全域訂閱:與 gen() 同構,差異只在 (a) 初連/兜底同步掃全部
+        # persona (b) watcher 以 per-session snapshot 找出「誰剛被寫入」
+        # 只拉那幾個 (c) 批次改走 _event_since_all、版本盯 _EVENT_VER_ALL。
+        cursor = max(0, int(since_seq or 0))
+        for s in list(PERSONAS):
+            await asyncio.to_thread(_event_sync_session, s, 200, True)
+        deadline = time.monotonic() + (_EVENTS_FOLLOW_MAX_SECS if follow else 0.0)
+        last_ver = -1     # 首輪必掃
+        last_sync = time.monotonic()
+        svers = dict(_STATEDB_VER)   # per-session watcher 版本基準
+        while True:
+            sent = False
+            # 先讀全域計數再算 changed:之後才 bump 的寫入會讓下面的
+            # wait 立刻返回,喚醒不漏(順序反過來就有睡過頭的窗)。
+            cur_sall = _STATEDB_VER_ALL
+            changed = [s for s in list(PERSONAS)
+                       if _STATEDB_VER.get(s, 0) != svers.get(s, 0)]
+            if changed:
+                # 去抖 + 小節流與 per-session 版同參數;gap 以 changed 中
+                # 最近一次掃描起算(保守但上限 0.5s)。
+                for s in changed:
+                    svers[s] = _STATEDB_VER.get(s, 0)
+                gap = 0.5 - (time.monotonic() - max(
+                    _EVENT_SYNC_TS.get(s, 0.0) for s in changed))
+                if gap > 0:
+                    await asyncio.sleep(min(gap, 0.5))
+                last_sync = time.monotonic()
+                for s in changed:
+                    await asyncio.to_thread(_event_sync_session, s, 200,
+                                            False, 0.4)
+            ver = _EVENT_VER_ALL
+            if ver != last_ver:
+                last_ver = ver
+                while True:
+                    batch = await asyncio.to_thread(_event_since_all,
+                                                    cursor, 500)
+                    for ev in batch:
+                        cursor = ev["seq"]
+                        yield f"data: {json.dumps(ev, ensure_ascii=False)}\n\n"
+                        sent = True
+                    if len(batch) < 500:
+                        break
+            if not follow:
+                yield "data: [DONE]\n\n"
+                return
+            if not sent:
+                yield ": keepalive\n\n"
+            if time.monotonic() >= deadline:
+                yield "data: [DONE]\n\n"
+                return
+            if time.monotonic() - last_sync >= _EVENT_SYNC_MIN_SECS:
+                last_sync = time.monotonic()
+                for s in list(PERSONAS):
+                    await asyncio.to_thread(_event_sync_session, s, 200)
+            try:
+                await asyncio.wait_for(
+                    _event_or_statedb_wait_all(last_ver, cur_sall),
+                    timeout=SSE_KEEPALIVE_SECS)
+            except asyncio.TimeoutError:
+                pass
+
+    return StreamingResponse(gen() if session is not None else gen_all(),
+                             media_type="text/event-stream")
+
+
+def _read_cursor_rows(session: str) -> list[dict]:
+    import sqlite3
+    try:
+        con = sqlite3.connect(f"file:{CANON_DB}?mode=ro", uri=True, timeout=5)
+        rows = con.execute(
+            "SELECT device_id,last_read_seq,last_read_ts,message_id,updated_at "
+            "FROM read_cursors WHERE session=?", (session,)).fetchall()
+        con.close()
+    except Exception as e:  # noqa: BLE001
+        _log_event("read_cursor_read_failed", session=session,
+                   error=type(e).__name__, error_message=str(e)[:160])
+        return []
+    return [{"device_id": r[0], "last_read_seq": r[1], "last_read_ts": r[2],
+             "message_id": r[3], "updated_at": r[4]} for r in rows]
+
+
+def _read_cursor_global(rows: list[dict]) -> dict:
+    """已拍板語意(2026-07-11 善彰):「任一裝置讀過即全讀」= 全裝置 MAX。
+    這裡做伺服器端聚合,App 端(P3)未讀數直接拿 global.last_read_seq 比
+    event seq,不用自己算;cursors 仍按裝置分列保留原始資料(若未來要改
+    per-device 語意,資料都在,schema 不用動)。"""
+    return {
+        "last_read_seq": max((int(r.get("last_read_seq") or 0) for r in rows),
+                             default=0),
+        "last_read_ts": max((float(r.get("last_read_ts") or 0.0) for r in rows),
+                            default=0.0),
+    }
+
+
+@app.get("/app/v2/read")
+async def app_v2_read_get(session: str, request: Request):
+    """該 session 全部裝置的已讀游標(新裝置冷載算未讀用)。global 欄位
+    是拍板語意「任一裝置讀過即全讀」的聚合(見 _read_cursor_global)。"""
+    _check_auth(request)
+    if session not in PERSONAS:
+        raise http_err(400, "SESSION_NOT_FOUND", "unknown session")
+    rows = _read_cursor_rows(session)
+    return {"session": session, "cursors": rows,
+            "global": _read_cursor_global(rows)}
+
+
+@app.post("/app/v2/read")
+async def app_v2_read_post(request: Request):
+    """回報已讀游標(SYNC_ENGINE_REWRITE_PLAN §3.1 read_cursor.update)。
+    body: {session, device_id, last_read_seq 或 last_read_ts, message_id?}
+    游標只進不退(多裝置/亂序回報取 max);真的前進才追加一筆
+    read_cursor.update 事件,其他訂閱中的裝置從 /app/v2/events 收到就能
+    同步已讀狀態 — 未讀從此有伺服器真相,不再是各裝置本地計數器瞎猜。"""
+    import sqlite3
+    _check_auth(request)
+    body = await _json_body(request)
+    session = (body.get("session") or "").strip()
+    device_id = (body.get("device_id") or "").strip()
+    if session not in PERSONAS:
+        raise http_err(400, "SESSION_NOT_FOUND", "unknown session")
+    if not device_id:
+        raise http_err(400, "DEVICE_ID_REQUIRED",
+                       "device_id 必填(已讀游標按裝置分列)")
+    try:
+        req_seq = max(0, int(body.get("last_read_seq") or 0))
+        req_ts = max(0.0, float(body.get("last_read_ts") or 0))
+    except (TypeError, ValueError):
+        raise http_err(400, "CURSOR_INVALID", "last_read_seq/last_read_ts 需為數字")
+    message_id = str(body.get("message_id") or "").strip() or None
+    if req_seq <= 0 and req_ts <= 0:
+        raise http_err(400, "CURSOR_REQUIRED",
+                       "last_read_seq 或 last_read_ts 至少要有一個")
+    now = time.time()
+    con = sqlite3.connect(CANON_DB, timeout=30)
+    try:
+        row = con.execute(
+            "SELECT last_read_seq,last_read_ts,message_id,updated_at "
+            "FROM read_cursors WHERE session=? AND device_id=?",
+            (session, device_id)).fetchone()
+        prev_seq, prev_ts = (row[0], row[1]) if row else (0, 0.0)
+        new_seq, new_ts = max(prev_seq, req_seq), max(prev_ts, req_ts)
+        moved = new_seq > prev_seq or new_ts > prev_ts
+        if moved:
+            message_id = message_id or (row[2] if row else None)
+            con.execute(
+                "INSERT OR REPLACE INTO read_cursors"
+                "(session,device_id,last_read_seq,last_read_ts,message_id,updated_at) "
+                "VALUES(?,?,?,?,?,?)",
+                (session, device_id, new_seq, new_ts, message_id, now))
+            con.commit()
+        grow = con.execute(
+            "SELECT MAX(last_read_seq),MAX(last_read_ts) FROM read_cursors "
+            "WHERE session=?", (session,)).fetchone()
+    finally:
+        con.close()
+    # 拍板語意「任一裝置讀過即全讀」的聚合,事件與回應都帶上 — 其他訂閱
+    # 中的裝置收到 read_cursor.update 直接用 global 更新未讀,不用再 GET。
+    gcur = {"last_read_seq": int(grow[0] or 0),
+            "last_read_ts": float(grow[1] or 0.0)}
+    if moved:
+        cursor = {"device_id": device_id, "last_read_seq": new_seq,
+                  "last_read_ts": new_ts, "message_id": message_id,
+                  "updated_at": now}
+        seq = _event_append(session, "read_cursor.update",
+                            {"session": session, **cursor, "global": gcur})
+    else:
+        # 沒前進(重送/亂序)→ 冪等回現存游標,不追加事件
+        cursor = {"device_id": device_id, "last_read_seq": prev_seq,
+                  "last_read_ts": prev_ts,
+                  "message_id": row[2] if row else None,
+                  "updated_at": row[3] if row else None}
+        seq = 0
+    return {"ok": True, "moved": moved, "seq": seq, "cursor": cursor,
+            "global": gcur}
 
 
 @app.post("/app/v1/messages/{mid}/reaction")
@@ -9904,3 +10510,14 @@ async def _start_cc_approval_watcher():
     dtask = asyncio.create_task(_delegation_cc_watcher())
     _BG_TASKS.add(dtask)
     dtask.add_done_callback(_BG_TASKS.discard)
+
+
+@app.on_event("startup")
+async def _start_state_db_watcher():
+    # #tg-instant-sync:TG/cron 寫進各 persona home 的 state.db,唯讀 stat
+    # 輪詢偵測寫入 → 立刻喚醒 _hp_canon_follower(見該函式與
+    # _state_db_watcher_loop 上方註解)。只讀檔案 mtime/size,不碰
+    # hermes_cli 內核、不寫 state.db,常駐到 process 生命週期結束。
+    stask = asyncio.create_task(_state_db_watcher_loop())
+    _BG_TASKS.add(stask)
+    stask.add_done_callback(_BG_TASKS.discard)
