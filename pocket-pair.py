@@ -22,8 +22,12 @@ import urllib.parse
 import urllib.request
 
 PLIST = os.path.expanduser("~/Library/LaunchAgents/ai.studio.hermes-bridge.plist")
-# Public Tailscale Funnel surface (works on any network, no Tailscale on phone).
-HOST = os.environ.get("POCKET_FUNNEL_HOST", "cashcamp-1.tail905550.ts.net")
+# Public surface (works on any network, no Tailscale on phone) — Cloudflare
+# named tunnel `pocket.tsai.cash`, kept alive by launchd
+# (com.cloudflare.cloudflared.pocket, RunAtLoad+KeepAlive). NOT the Tailscale
+# Funnel hostname (cashcamp*.tail905550.ts.net) — that one requires Tailscale
+# Funnel to be enabled on the tailnet and was found unreachable (2026-07-11).
+HOST = os.environ.get("POCKET_FUNNEL_HOST", "pocket.tsai.cash")
 SCHEME = os.environ.get("POCKET_FUNNEL_SCHEME", "https")
 BRIDGE_PORT = int(os.environ.get("POCKET_BRIDGE_PORT", "8081"))
 
