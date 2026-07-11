@@ -820,6 +820,18 @@ def _canon_init():
         external_source TEXT, external_id TEXT UNIQUE, ingested_at REAL NOT NULL)""")
     con.execute("CREATE INDEX IF NOT EXISTS idx_report_session_time ON report_events(session, ts)")
     con.execute("CREATE INDEX IF NOT EXISTS idx_report_external ON report_events(external_source, external_id)")
+    # Sync engine P0 (docs/SYNC_ENGINE_REWRITE_PLAN_20260711.md §3):單一
+    # append-only 事件日誌,id 即全域遞增 seq。P0/P1 只寫不讀(雙寫過渡,
+    # 現有 canonical/state.db 讀取路徑不動),P2 起由 /app/v2/events 消費。
+    # external_id 供來源鏡射去重(TG/cron 是重複掃描式接入,必須冪等)。
+    con.execute("""CREATE TABLE IF NOT EXISTS event_log(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        session TEXT NOT NULL,
+        type TEXT NOT NULL,
+        external_id TEXT UNIQUE,
+        payload TEXT NOT NULL,
+        created_at REAL NOT NULL)""")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_event_session_seq ON event_log(session, id)")
     con.execute("""CREATE TABLE IF NOT EXISTS delegations(
         id TEXT PRIMARY KEY,
         work_order TEXT UNIQUE,
@@ -1181,6 +1193,99 @@ async def _canon_wait(session: str, seen_ver: int) -> None:
     keepalive 節奏。"""
     while _CANON_VER.get(session, 0) == seen_ver:
         await asyncio.sleep(0.2)
+
+
+# ── Sync engine P0:event_log 資料層(SYNC_ENGINE_REWRITE_PLAN §3/P0)────
+# 單一事件日誌 + 游標訂閱的地基。這一層只提供 append / since 兩個原語;
+# 誰來寫(P1 三來源鏡射)、誰來讀(P2 /app/v2/events)都在上層。
+# _EVENT_VER 與 _CANON_VER 同款:純 int 版本號、無鎖,喚醒不漏即可。
+_EVENT_VER: dict[str, int] = {}
+# 記憶體去重快取:TG/cron 的接入是「重複掃描」式,同一批 external_id 每輪
+# 都會再撞一次 DB 的 INSERT OR IGNORE;這層快取讓穩態掃描零寫入。重啟後
+# 快取歸零沒關係 — DB 的 UNIQUE(external_id) 仍然守住冪等,只是第一輪
+# 掃描多付幾次 no-op INSERT。
+_EVENT_SEEN: dict[str, set] = {}
+_EVENT_SEEN_CAP = 8192
+
+
+def _event_notify(session: str) -> None:
+    _EVENT_VER[session] = _EVENT_VER.get(session, 0) + 1
+
+
+async def _event_wait(session: str, seen_ver: int) -> None:
+    """等到該 session 的 event_log 版本離開 seen_ver(有新事件)。與
+    _canon_wait 同款 0.2s 純記憶體輪詢,不碰 DB、不用 Condition。"""
+    while _EVENT_VER.get(session, 0) == seen_ver:
+        await asyncio.sleep(0.2)
+
+
+def _event_append(session: str, etype: str, payload: dict,
+                  external_id: str | None = None) -> int:
+    """Append 一筆事件,回傳全域 seq(=event_log.id);0 表示去重略過或寫入
+    失敗。絕不 raise — 鏡射寫入掛在既有熱路徑上(_canon_add/_report_upsert/
+    合併掃描),event_log 故障只能降級成「新路徑落後」,不准拖垮舊路徑。"""
+    import sqlite3
+    try:
+        if external_id and external_id in _EVENT_SEEN.get(session, ()):
+            return 0
+        con = sqlite3.connect(CANON_DB, timeout=30)
+        cur = con.execute(
+            "INSERT OR IGNORE INTO event_log(session,type,external_id,payload,created_at) "
+            "VALUES(?,?,?,?,?)",
+            (session, etype, external_id,
+             json.dumps(payload, ensure_ascii=False), time.time()))
+        seq = int(cur.lastrowid or 0) if cur.rowcount else 0
+        con.commit()
+        con.close()
+        if external_id:
+            seen = _EVENT_SEEN.setdefault(session, set())
+            if len(seen) >= _EVENT_SEEN_CAP:
+                seen.clear()    # 粗略上限:清空後由 DB UNIQUE 繼續守冪等
+            seen.add(external_id)
+        if seq:
+            _event_notify(session)
+        return seq
+    except Exception as e:  # noqa: BLE001
+        _log_event("event_append_failed", session=session, type=etype,
+                   error=type(e).__name__, error_message=str(e)[:160])
+        return 0
+
+
+def _event_since(session: str, since_seq: int = 0, limit: int = 500) -> list[dict]:
+    """撈 id > since_seq 的事件(即時 + 補洞共用同一條查詢)。信封對齊
+    /app/v2/sessions/{id}/events 的 {seq,ts,type,data} 形狀。"""
+    import sqlite3
+    try:
+        con = sqlite3.connect(f"file:{CANON_DB}?mode=ro", uri=True, timeout=5)
+        rows = con.execute(
+            "SELECT id,type,payload,created_at FROM event_log "
+            "WHERE session=? AND id>? ORDER BY id LIMIT ?",
+            (session, int(since_seq or 0), max(1, limit))).fetchall()
+        con.close()
+    except Exception as e:  # noqa: BLE001
+        _log_event("event_since_failed", session=session,
+                   error=type(e).__name__, error_message=str(e)[:160])
+        return []
+    out = []
+    for r in rows:
+        try:
+            data = json.loads(r[2] or "{}")
+        except Exception:  # noqa: BLE001
+            data = {}
+        out.append({"seq": r[0], "ts": r[3], "type": r[1], "data": data})
+    return out
+
+
+def _event_latest_seq(session: str) -> int:
+    import sqlite3
+    try:
+        con = sqlite3.connect(f"file:{CANON_DB}?mode=ro", uri=True, timeout=5)
+        row = con.execute("SELECT MAX(id) FROM event_log WHERE session=?",
+                          (session,)).fetchone()
+        con.close()
+        return int(row[0] or 0)
+    except Exception:  # noqa: BLE001
+        return 0
 
 
 def _canon_add(session: str, role: str, content: str, attachments=None,
