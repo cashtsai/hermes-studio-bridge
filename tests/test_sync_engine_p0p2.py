@@ -192,5 +192,142 @@ class TestP1Mirrors(unittest.TestCase):
             bridge.PERSONAS.pop(sess, None)
 
 
+class _FakeReq:
+    def __init__(self, body=None):
+        self._b = body or {}
+        self.headers = {"authorization": f"bearer {os.environ['BRIDGE_TOKEN']}"}
+
+    async def json(self):
+        return self._b
+
+
+async def _collect_sse(resp):
+    """StreamingResponse → [事件dict](follow=False 模式,讀到 [DONE] 為止)。"""
+    out = []
+    async for chunk in resp.body_iterator:
+        text = chunk.decode() if isinstance(chunk, bytes) else chunk
+        for line in text.splitlines():
+            if not line.startswith("data: "):
+                continue
+            body = line[6:]
+            if body == "[DONE]":
+                return out
+            out.append(json.loads(body))
+    return out
+
+
+class TestP2EventsEndpoint(unittest.TestCase):
+    def setUp(self):
+        self._auth = bridge._check_auth
+        bridge._check_auth = lambda r: None
+
+    def tearDown(self):
+        bridge._check_auth = self._auth
+
+    def test_unknown_session_rejected(self):
+        from fastapi import HTTPException
+        with self.assertRaises(HTTPException) as ctx:
+            asyncio.run(bridge.app_v2_events("no-such-persona", _FakeReq()))
+        self.assertEqual(ctx.exception.status_code, 400)
+
+    def test_backlog_since_seq_and_tg_pull(self):
+        sess = "p2-ev"
+        home = _make_tg_home([("user", "TG那邊說的話", 5000.0)])
+        bridge.PERSONAS[sess] = (f"測試人格 ({sess})", home)
+        try:
+            mid, _ = bridge._canon_add(sess, "user", "app 這邊的訊息")
+            # follow=False:回放 event_log 積壓後 [DONE]。連線時的 force 同步
+            # 應把 TG 洞補進 event_log(app 訊息已由 _canon_add 鏡射,去重)。
+            resp = asyncio.run(bridge.app_v2_events(sess, _FakeReq(),
+                                                    since_seq=0, follow=False))
+            evs = asyncio.run(_collect_sse(resp))
+            self.assertEqual({e["type"] for e in evs}, {"message.upsert"})
+            contents = [e["data"]["message"]["content"] for e in evs]
+            self.assertIn("app 這邊的訊息", contents)
+            self.assertIn("TG那邊說的話", contents)
+            self.assertEqual(len(contents), 2)
+            seqs = [e["seq"] for e in evs]
+            self.assertEqual(seqs, sorted(seqs))
+            # since_seq 補洞:從第一筆之後訂閱,只收到之後的事件
+            resp = asyncio.run(bridge.app_v2_events(sess, _FakeReq(),
+                                                    since_seq=seqs[0],
+                                                    follow=False))
+            evs2 = asyncio.run(_collect_sse(resp))
+            self.assertEqual([e["seq"] for e in evs2], seqs[1:])
+        finally:
+            bridge.PERSONAS.pop(sess, None)
+
+
+class TestP2ReadCursor(unittest.TestCase):
+    def setUp(self):
+        self._auth = bridge._check_auth
+        bridge._check_auth = lambda r: None
+        # session 每個測試獨立:游標單調不退,共用 session 會互相污染
+        self.sess = f"p2-read-{self._testMethodName}"
+        bridge.PERSONAS[self.sess] = (f"測試人格 ({self.sess})",
+                                      tempfile.mkdtemp(prefix="syncengine-rc-"))
+
+    def tearDown(self):
+        bridge._check_auth = self._auth
+        bridge.PERSONAS.pop(self.sess, None)
+
+    def _post(self, body):
+        return asyncio.run(bridge.app_v2_read_post(_FakeReq(body)))
+
+    def test_post_get_roundtrip_and_event(self):
+        r = self._post({"session": self.sess, "device_id": "iphone",
+                        "last_read_seq": 42, "last_read_ts": 5100.0,
+                        "message_id": "m-42"})
+        self.assertTrue(r["ok"] and r["moved"])
+        self.assertGreater(r["seq"], 0)
+        # read_cursor.update 事件進了 event_log(其他裝置訂閱得到)
+        evs = bridge._event_since(self.sess, 0)
+        self.assertEqual(evs[-1]["type"], "read_cursor.update")
+        self.assertEqual(evs[-1]["data"]["device_id"], "iphone")
+        self.assertEqual(evs[-1]["data"]["last_read_seq"], 42)
+        g = asyncio.run(bridge.app_v2_read_get(self.sess, _FakeReq()))
+        self.assertEqual(len(g["cursors"]), 1)
+        self.assertEqual(g["cursors"][0]["last_read_seq"], 42)
+        self.assertEqual(g["cursors"][0]["message_id"], "m-42")
+
+    def test_cursor_monotonic_and_idempotent(self):
+        self._post({"session": self.sess, "device_id": "iphone",
+                    "last_read_seq": 42})
+        n_events = len(bridge._event_since(self.sess, 0))
+        # 倒退/重送 → 不動、不追加事件(冪等)
+        r = self._post({"session": self.sess, "device_id": "iphone",
+                        "last_read_seq": 7})
+        self.assertFalse(r["moved"])
+        self.assertEqual(r["cursor"]["last_read_seq"], 42)
+        self.assertEqual(len(bridge._event_since(self.sess, 0)), n_events)
+        # 前進 → 動、追加事件
+        r = self._post({"session": self.sess, "device_id": "iphone",
+                        "last_read_seq": 99})
+        self.assertTrue(r["moved"])
+        self.assertEqual(len(bridge._event_since(self.sess, 0)), n_events + 1)
+
+    def test_per_device_rows(self):
+        self._post({"session": self.sess, "device_id": "iphone",
+                    "last_read_seq": 10})
+        self._post({"session": self.sess, "device_id": "ipad",
+                    "last_read_seq": 3})
+        g = asyncio.run(bridge.app_v2_read_get(self.sess, _FakeReq()))
+        by_dev = {c["device_id"]: c["last_read_seq"] for c in g["cursors"]}
+        self.assertEqual(by_dev, {"iphone": 10, "ipad": 3})
+
+    def test_validation(self):
+        from fastapi import HTTPException
+        with self.assertRaises(HTTPException) as ctx:
+            self._post({"session": self.sess, "last_read_seq": 1})
+        self.assertEqual(ctx.exception.status_code, 400)   # device_id 必填
+        with self.assertRaises(HTTPException) as ctx:
+            self._post({"session": self.sess, "device_id": "iphone"})
+        self.assertEqual(ctx.exception.status_code, 400)   # 游標至少一個
+        with self.assertRaises(HTTPException) as ctx:
+            self._post({"session": "nope", "device_id": "iphone",
+                        "last_read_seq": 1})
+        self.assertEqual(ctx.exception.status_code, 400)   # unknown session
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

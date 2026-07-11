@@ -832,6 +832,19 @@ def _canon_init():
         payload TEXT NOT NULL,
         created_at REAL NOT NULL)""")
     con.execute("CREATE INDEX IF NOT EXISTS idx_event_session_seq ON event_log(session, id)")
+    # Sync engine P2:已讀游標的伺服器真相(取代 App 端 UserDefaults 計數
+    # 器的長期方向)。一列 = 一個(session, device)的已讀位置 — 按裝置分列
+    # 存,是為了「任一裝置讀過即全讀」(MAX over devices)與「每裝置各自
+    # 記」兩種語意都能從同一份資料推導;多裝置語意由善彰拍板後在 App 端
+    # (P3)選聚合方式,schema 不用改。
+    con.execute("""CREATE TABLE IF NOT EXISTS read_cursors(
+        session TEXT NOT NULL,
+        device_id TEXT NOT NULL,
+        last_read_seq INTEGER NOT NULL DEFAULT 0,
+        last_read_ts REAL NOT NULL DEFAULT 0,
+        message_id TEXT,
+        updated_at REAL NOT NULL,
+        PRIMARY KEY(session, device_id))""")
     con.execute("""CREATE TABLE IF NOT EXISTS delegations(
         id TEXT PRIMARY KEY,
         work_order TEXT UNIQUE,
@@ -8770,6 +8783,157 @@ async def app_get_message_events(session: str, request: Request,
                 pass
 
     return StreamingResponse(gen(), media_type="text/event-stream")
+
+
+# ─────────────── Sync engine P2:/app/v2 統一事件流 + 已讀游標 ───────────
+_EVENTS_FOLLOW_MAX_SECS = 120.0   # 與 v1 messages/events 同款:app 週期重連
+
+
+@app.get("/app/v2/events")
+async def app_v2_events(session: str, request: Request, since_seq: int = 0,
+                        follow: bool = True):
+    """SYNC_ENGINE_REWRITE_PLAN §3.1 的統一訂閱端點:從 event_log 撈
+    id > since_seq 的所有列,補洞 + 即時走同一條 SSE,三來源(App/TG/cron)
+    與已讀游標不再各走各的加速通道。信封 {seq, ts, type, data} 與
+    /app/v2/sessions/{id}/events 卡片流對齊;event_log 是持久表,沒有卡片
+    ring buffer 的 410 SEQ_GONE 問題 — 任何裝置 since_seq=0 重放即可重建
+    完整歷史(§3.3 / backlog B3)。"""
+    _check_auth(request)
+    if session not in PERSONAS:
+        raise http_err(400, "SESSION_NOT_FOUND", "unknown session")
+
+    async def gen():
+        cursor = max(0, int(since_seq or 0))
+        # 連上先主動拉一次 TG/cron(force 穿越節流):新訂閱者立刻看到外部
+        # 來源的積壓,不用等下一個同步週期。
+        await asyncio.to_thread(_event_sync_session, session, 200, True)
+        deadline = time.monotonic() + (_EVENTS_FOLLOW_MAX_SECS if follow else 0.0)
+        last_ver = -1     # 首輪必掃(補訂閱者斷線期間的積壓)
+        last_sync = time.monotonic()
+        while True:
+            sent = False
+            ver = _EVENT_VER.get(session, 0)
+            if ver != last_ver:
+                last_ver = ver
+                while True:
+                    batch = await asyncio.to_thread(_event_since, session,
+                                                    cursor, 500)
+                    for ev in batch:
+                        cursor = ev["seq"]
+                        yield f"data: {json.dumps(ev, ensure_ascii=False)}\n\n"
+                        sent = True
+                    if len(batch) < 500:
+                        break
+            if not follow:
+                yield "data: [DONE]\n\n"
+                return
+            if not sent:
+                yield ": keepalive\n\n"
+            if time.monotonic() >= deadline:
+                yield "data: [DONE]\n\n"
+                return
+            if time.monotonic() - last_sync >= _EVENT_SYNC_MIN_SECS:
+                # TG/cron 在 bridge 端沒有寫入即時信號(P1 註解),訂閱期間
+                # 週期主動拉 — v2 訂閱者的 TG 延遲上限 = _EVENT_SYNC_MIN_SECS,
+                # 不再依賴卡片 follower 恰好在跑。
+                last_sync = time.monotonic()
+                await asyncio.to_thread(_event_sync_session, session, 200)
+            try:
+                await asyncio.wait_for(_event_wait(session, last_ver),
+                                       timeout=SSE_KEEPALIVE_SECS)
+            except asyncio.TimeoutError:
+                pass
+
+    return StreamingResponse(gen(), media_type="text/event-stream")
+
+
+def _read_cursor_rows(session: str) -> list[dict]:
+    import sqlite3
+    try:
+        con = sqlite3.connect(f"file:{CANON_DB}?mode=ro", uri=True, timeout=5)
+        rows = con.execute(
+            "SELECT device_id,last_read_seq,last_read_ts,message_id,updated_at "
+            "FROM read_cursors WHERE session=?", (session,)).fetchall()
+        con.close()
+    except Exception as e:  # noqa: BLE001
+        _log_event("read_cursor_read_failed", session=session,
+                   error=type(e).__name__, error_message=str(e)[:160])
+        return []
+    return [{"device_id": r[0], "last_read_seq": r[1], "last_read_ts": r[2],
+             "message_id": r[3], "updated_at": r[4]} for r in rows]
+
+
+@app.get("/app/v2/read")
+async def app_v2_read_get(session: str, request: Request):
+    """該 session 全部裝置的已讀游標(新裝置冷載算未讀用)。按裝置分列 —
+    「任一裝置讀過即全讀」(取 MAX)與「每裝置各自記」兩種語意都能從同一
+    份資料推導,聚合方式留給 App 端(P3)按善彰拍板的語意選。"""
+    _check_auth(request)
+    if session not in PERSONAS:
+        raise http_err(400, "SESSION_NOT_FOUND", "unknown session")
+    return {"session": session, "cursors": _read_cursor_rows(session)}
+
+
+@app.post("/app/v2/read")
+async def app_v2_read_post(request: Request):
+    """回報已讀游標(SYNC_ENGINE_REWRITE_PLAN §3.1 read_cursor.update)。
+    body: {session, device_id, last_read_seq 或 last_read_ts, message_id?}
+    游標只進不退(多裝置/亂序回報取 max);真的前進才追加一筆
+    read_cursor.update 事件,其他訂閱中的裝置從 /app/v2/events 收到就能
+    同步已讀狀態 — 未讀從此有伺服器真相,不再是各裝置本地計數器瞎猜。"""
+    import sqlite3
+    _check_auth(request)
+    body = await _json_body(request)
+    session = (body.get("session") or "").strip()
+    device_id = (body.get("device_id") or "").strip()
+    if session not in PERSONAS:
+        raise http_err(400, "SESSION_NOT_FOUND", "unknown session")
+    if not device_id:
+        raise http_err(400, "DEVICE_ID_REQUIRED",
+                       "device_id 必填(已讀游標按裝置分列)")
+    try:
+        req_seq = max(0, int(body.get("last_read_seq") or 0))
+        req_ts = max(0.0, float(body.get("last_read_ts") or 0))
+    except (TypeError, ValueError):
+        raise http_err(400, "CURSOR_INVALID", "last_read_seq/last_read_ts 需為數字")
+    message_id = str(body.get("message_id") or "").strip() or None
+    if req_seq <= 0 and req_ts <= 0:
+        raise http_err(400, "CURSOR_REQUIRED",
+                       "last_read_seq 或 last_read_ts 至少要有一個")
+    now = time.time()
+    con = sqlite3.connect(CANON_DB, timeout=30)
+    try:
+        row = con.execute(
+            "SELECT last_read_seq,last_read_ts,message_id,updated_at "
+            "FROM read_cursors WHERE session=? AND device_id=?",
+            (session, device_id)).fetchone()
+        prev_seq, prev_ts = (row[0], row[1]) if row else (0, 0.0)
+        new_seq, new_ts = max(prev_seq, req_seq), max(prev_ts, req_ts)
+        moved = new_seq > prev_seq or new_ts > prev_ts
+        if moved:
+            message_id = message_id or (row[2] if row else None)
+            con.execute(
+                "INSERT OR REPLACE INTO read_cursors"
+                "(session,device_id,last_read_seq,last_read_ts,message_id,updated_at) "
+                "VALUES(?,?,?,?,?,?)",
+                (session, device_id, new_seq, new_ts, message_id, now))
+            con.commit()
+    finally:
+        con.close()
+    if moved:
+        cursor = {"device_id": device_id, "last_read_seq": new_seq,
+                  "last_read_ts": new_ts, "message_id": message_id,
+                  "updated_at": now}
+        seq = _event_append(session, "read_cursor.update",
+                            {"session": session, **cursor})
+    else:
+        # 沒前進(重送/亂序)→ 冪等回現存游標,不追加事件
+        cursor = {"device_id": device_id, "last_read_seq": prev_seq,
+                  "last_read_ts": prev_ts,
+                  "message_id": row[2] if row else None,
+                  "updated_at": row[3] if row else None}
+        seq = 0
+    return {"ok": True, "moved": moved, "seq": seq, "cursor": cursor}
 
 
 @app.post("/app/v1/messages/{mid}/reaction")
