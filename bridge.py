@@ -1352,6 +1352,80 @@ def _event_sync_session(session: str, limit: int = 200,
                    error=type(e).__name__, error_message=str(e)[:160])
 
 
+# ── TG/cron → state.db 寫入即時偵測(#tg-instant-sync)───────────────────
+# 根因:App 自己送出/收到的訊息走上面 _canon_notify/_canon_wait,寫入當下
+# 就 bump 版本、~0.2s 內喚醒 follower。但 Telegram 端訊息與 cron 晨報是
+# **Hermes 官方 gateway 進程**寫進各 persona 自己的 `<home>/state.db`(WAL
+# mode),那條寫入路徑在 hermes_cli 官方套件內部 —— 鐵律規定不准碰內核,
+# 所以完全不能掛 hook/callback 在寫入那一刻觸發。
+#
+# 這裡改用「唯讀輕量輪詢」繞過去:WAL mode 下,真正的寫入落在
+# `<home>/state.db-wal`(checkpoint 前主 db 檔案本身不太動),只要每
+# ~0.15s 對這個檔案做一次 os.stat()(不開檔、不連 sqlite、不解析內容),
+# mtime/size 一變就代表「剛剛有新內容寫進去」,立刻 bump 一個獨立的版本
+# 計數器喚醒對應 persona 的 follower 去重掃 `_hp_merged_messages`。
+# 這跟 `_canon_notify` 是同一種模式(純 int 版本號、無鎖),只是觸發源從
+# 「我們自己呼叫 _canon_add」換成「別人的程序寫了這個檔案」。
+#
+# 30s 保險絲(_hp_canon_follower 裡的 timeout=30.0)完全保留 —— 這個 stat
+# watcher 是「加速觸發」疊加在上面,不是取代:watcher 掛掉/漏抓(例如
+# checkpoint 時序恰好卡在兩次 stat 中間、mtime 精度不足撞期）,30s 週期
+# 還是會補上,同步不會因為單一機制失效就整個停擺。
+_STATEDB_VER: dict[str, int] = {}
+_STATEDB_STAT_CACHE: dict[str, tuple] = {}   # session -> (path, mtime_ns, size)
+_STATEDB_POLL_SECS = float(os.environ.get("POCKET_STATEDB_POLL_SECS", "0.15"))
+
+
+def _statedb_notify(session: str) -> None:
+    _STATEDB_VER[session] = _STATEDB_VER.get(session, 0) + 1
+
+
+def _statedb_stat_key(home: str) -> tuple:
+    """只用 os.stat(),唯讀、不開檔、不連 DB。WAL 模式下實際寫入處是
+    state.db-wal;沒有的話(已 checkpoint 或非 WAL)退回 state.db 本身。
+    讀不到任何一個就回傳 (None, 0, 0),呼叫端據此跳過該 session 這一輪。"""
+    for name in ("state.db-wal", "state.db"):
+        p = os.path.join(home, name)
+        try:
+            st = os.stat(p)
+            return (p, st.st_mtime_ns, st.st_size)
+        except OSError:
+            continue
+    return (None, 0, 0)
+
+
+async def _state_db_watcher_loop() -> None:
+    """常駐背景迴圈:每輪對每個 persona home 的 state.db(-wal) 做一次
+    os.stat(),偵測到 mtime/size 變動就判定「TG/cron 剛寫入」,bump
+    `_STATEDB_VER` 喚醒 `_hp_canon_follower` 立刻重掃,不必等 30s 保險絲。
+    例外全吞:這條 loop 死掉不影響既有的 30s 兜底路徑,只是退回原本
+    的延遲,不會讓同步整個停擺(鐵律 #4)。"""
+    while True:
+        try:
+            for session, (_, home) in list(PERSONAS.items()):
+                key = _statedb_stat_key(home)
+                path = key[0]
+                if path is None:
+                    continue
+                prev = _STATEDB_STAT_CACHE.get(session)
+                if prev is not None and prev[0] == path and (prev[1] != key[1] or prev[2] != key[2]):
+                    _statedb_notify(session)
+                _STATEDB_STAT_CACHE[session] = key
+        except Exception as e:  # noqa: BLE001
+            _log_event("state_db_watcher_error", error=type(e).__name__,
+                       error_message=str(e)[:160])
+        await asyncio.sleep(_STATEDB_POLL_SECS)
+
+
+async def _canon_or_statedb_wait(session: str, seen_canon_ver: int,
+                                 seen_state_ver: int) -> None:
+    """`_canon_wait` 的擴充版:canonical 版本 *或* state.db stat 版本任一
+    變動就返回。同款 0.2s 純記憶體輪詢,無鎖、無 Condition。"""
+    while (_CANON_VER.get(session, 0) == seen_canon_ver
+           and _STATEDB_VER.get(session, 0) == seen_state_ver):
+        await asyncio.sleep(0.2)
+
+
 def _canon_add(session: str, role: str, content: str, attachments=None,
                mid: str | None = None, status: str = "done",
                client_id: str | None = None) -> tuple[str, bool]:
@@ -7067,13 +7141,17 @@ def _hp_merged_messages(session: str, limit: int = 200):
 
 
 async def _hp_canon_follower(session: str):
-    """canonical 寫入版本喚醒(#28 的 _canon_wait)→ 補掃出卡。known_mids
-    去重;30s 保險絲重掃與 v1 messages/events 同款。"""
+    """canonical 寫入版本喚醒(#28 的 _canon_wait)⊕ state.db stat 版本喚醒
+    (#tg-instant-sync 的 _statedb_notify)→ 補掃出卡。known_mids 去重;
+    兩條喚醒源任一觸發都立刻重掃,30s 仍是最後保險絲(見 timeout=30.0
+    註解)。"""
     d = _HP_CARD_DIGESTS[session]
     ver = _CANON_VER.get(session, 0)
+    sver = _STATEDB_VER.get(session, 0)
     while True:
         try:
-            await asyncio.wait_for(_canon_wait(session, ver), timeout=30.0)
+            await asyncio.wait_for(_canon_or_statedb_wait(session, ver, sver),
+                                   timeout=30.0)
         except asyncio.TimeoutError:
             pass
         except Exception as e:  # noqa: BLE001
@@ -7081,9 +7159,13 @@ async def _hp_canon_follower(session: str):
                        error=str(e)[:200])
             await asyncio.sleep(2.0)
         ver = _CANON_VER.get(session, 0)
+        sver = _STATEDB_VER.get(session, 0)
         try:
-            # 30s 保險絲重掃:同時把 TG/state.db + cron 晨報合併進來(TG/cron 不寫
-            # canonical,不會觸發 _canon_wait,靠這條 timeout 週期補上,~30s 延遲)。
+            # 保險絲重掃:同時把 TG/state.db + cron 晨報合併進來。正常情況下
+            # 這一段已經是被 state.db stat watcher 立刻(~0.2-0.3s)喚醒觸發
+            # 的,不是等 30s timeout —— watcher 偵測不到才會落回 30s 週期
+            # (見 _state_db_watcher_loop 註解:TG/cron 不寫 canonical,不會
+            # 觸發 _canon_notify,靠 stat 版本或最終這條 timeout 補上)。
             d.seed_messages(_hp_merged_messages(session, 80))
         except Exception as e:  # noqa: BLE001
             _log_event("hp_card_follower_error", session=session,
@@ -10253,3 +10335,14 @@ async def _start_cc_approval_watcher():
     dtask = asyncio.create_task(_delegation_cc_watcher())
     _BG_TASKS.add(dtask)
     dtask.add_done_callback(_BG_TASKS.discard)
+
+
+@app.on_event("startup")
+async def _start_state_db_watcher():
+    # #tg-instant-sync:TG/cron 寫進各 persona home 的 state.db,唯讀 stat
+    # 輪詢偵測寫入 → 立刻喚醒 _hp_canon_follower(見該函式與
+    # _state_db_watcher_loop 上方註解)。只讀檔案 mtime/size,不碰
+    # hermes_cli 內核、不寫 state.db,常駐到 process 生命週期結束。
+    stask = asyncio.create_task(_state_db_watcher_loop())
+    _BG_TASKS.add(stask)
+    stask.add_done_callback(_BG_TASKS.discard)
