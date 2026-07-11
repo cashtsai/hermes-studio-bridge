@@ -32,7 +32,7 @@ import termios
 import threading
 import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi import FastAPI, Request, HTTPException, WebSocket, WebSocketDisconnect
@@ -7725,7 +7725,8 @@ async def capabilities(request: Request):
                           "/app/v1/pair/new", "/app/v1/pair/claim",
                           "/app/v1/devices/{id}/revoke",
                           "/app/v1/delegations", "/app/v2/sessions",
-                          "/app/v2/sessions/{id}/approve", "/app/v1/terminal"]}
+                          "/app/v2/sessions/{id}/approve", "/app/v1/terminal",
+                          "/app/v1/usage"]}
 
 
 @app.post("/app/v1/auth/apple")
@@ -7769,6 +7770,314 @@ async def app_auth_apple(request: Request):
             "expires_at": expires_at,
         },
     }
+
+
+# ── /app/v1/usage: Codex + Claude Code 本機用量(不打雲端 API)──────────
+# 資料來源事實(僅取自 AIBar README 描述的檔案格式知識,程式碼為本專案重寫,
+# 沒有看過/拷貝過它的 Swift 原始碼):
+#   1. Codex:~/.codex/sessions/**/*.jsonl 裡 event_msg.token_count 的
+#      payload.rate_limits(primary=5h window, secondary=7d/weekly window)。
+#      剩餘額度 = 100 - used_percent。只挑「最近修改的幾個」session 檔、
+#      每檔只讀尾部,避免整檔掃描動輒上百 MB 的 jsonl。
+#   2. Claude 官方額度:~/.ai-usage/claude-status/*.json(Claude Code 官方
+#      statusLine hook 寫入)。本機若沒裝這個 hook,目錄根本不存在 ——
+#      必須優雅地回 available:false / official_synced:false,不能報錯。
+#   3. Claude 本機備援:~/.claude/projects/**/*.jsonl 裡 assistant message
+#      的 usage 欄位,用 message.id 去重(同一個 assistant turn 常因串流/
+#      重試在 jsonl 裡留下多筆同 id 記錄)後加總 token 數。這只有 token
+#      count,沒有官方配額百分比或重置時間。
+#
+# 信任邊界(AIBar README 明訂的設計原則,這裡照樣遵守):Claude 的官方額度
+# 只能來自 claude-status/*.json 的 rate_limits;來源不存在、沒有
+# rate_limits、或該視窗已過期,一律視為未同步 —— 絕對不能拿
+# plan-usage-history.json / Desktop cache / IndexedDB 解析結果 / 本地
+# token 加總去推算一個看起來像官方的百分比。
+_USAGE_CACHE = {"ts": 0.0, "data": None}
+_USAGE_CACHE_TTL = 10.0  # 秒;擋掉 app 端高頻輪詢造成的重複 jsonl 全掃
+
+CODEX_SESSIONS_DIR = os.path.expanduser("~/.codex/sessions")
+CLAUDE_STATUS_DIR = os.path.expanduser("~/.ai-usage/claude-status")
+CLAUDE_PROJECTS_DIR = os.path.expanduser("~/.claude/projects")
+
+_USAGE_TAIL_BYTES = 200_000   # 每個 session 檔只讀最後 ~200KB 找 rate-limit
+_USAGE_MAX_CODEX_FILES = 8    # 只挑最近修改的幾個 codex session 檔
+_USAGE_MAX_CLAUDE_FILES = 40  # 備援統計只掃最近修改的幾個 claude jsonl
+
+
+def _usage_iso_utc(epoch_seconds):
+    """Unix epoch (int/float, seconds) -> ISO8601 UTC string, or None."""
+    if epoch_seconds is None:
+        return None
+    try:
+        return datetime.fromtimestamp(float(epoch_seconds), tz=timezone.utc) \
+            .strftime("%Y-%m-%dT%H:%M:%SZ")
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _usage_now_iso_utc():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _usage_normalize_iso_str(ts):
+    """jsonl timestamps are already ISO8601 UTC (e.g. '...T16:00:50.586Z');
+    just drop sub-second precision so every usage field matches the same
+    'YYYY-MM-DDTHH:MM:SSZ' shape."""
+    if not ts:
+        return None
+    try:
+        s = str(ts).replace("Z", "+00:00")
+        return datetime.fromisoformat(s).astimezone(timezone.utc) \
+            .strftime("%Y-%m-%dT%H:%M:%SZ")
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _usage_newest_files(root, pattern="*.jsonl", limit=8):
+    """Recently-modified files under root (recursive), newest first, capped
+    at `limit` — this endpoint only ever needs the freshest session logs,
+    never a full walk of a directory holding months of history."""
+    try:
+        paths = [str(p) for p in Path(root).rglob(pattern) if p.is_file()]
+    except Exception:  # noqa: BLE001
+        return []
+    paths.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+    return paths[:limit]
+
+
+def _usage_tail_text(path, max_bytes=_USAGE_TAIL_BYTES):
+    """Last max_bytes of a file, decoded loosely. Session jsonl files can run
+    into the hundreds of MB; the newest token_count/rate_limits event (or the
+    newest assistant usage record) is always near the end, so seeking from
+    EOF instead of parsing the whole file line-by-line keeps this endpoint
+    fast even on old, huge logs."""
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as f:
+            if size > max_bytes:
+                f.seek(size - max_bytes)
+            data = f.read()
+        return data.decode("utf-8", errors="replace")
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _codex_latest_rate_limits():
+    """Newest {timestamp, rate_limits} token_count event across the most
+    recently modified codex session files, or None if nothing usable found."""
+    best = None  # (timestamp_str, rate_limits_dict)
+    for path in _usage_newest_files(CODEX_SESSIONS_DIR, "*.jsonl", _USAGE_MAX_CODEX_FILES):
+        text = _usage_tail_text(path)
+        if not text or '"token_count"' not in text:
+            continue
+        for line in text.splitlines():
+            line = line.strip()
+            if not line or '"token_count"' not in line:
+                continue
+            try:
+                rec = json.loads(line)
+            except Exception:  # noqa: BLE001
+                continue
+            payload = rec.get("payload") or {}
+            if payload.get("type") != "token_count":
+                continue
+            rl = payload.get("rate_limits")
+            if not isinstance(rl, dict):
+                continue
+            ts = rec.get("timestamp") or ""
+            if best is None or ts > best[0]:
+                best = (ts, rl)
+    if best is None:
+        return None
+    return {"timestamp": best[0], "rate_limits": best[1]}
+
+
+def _codex_usage_snapshot():
+    """codex wire block per /app/v1/usage contract. AIBar's rule: remaining
+    quota is 100 - used_percent, headline percentage comes from the primary
+    (5h) rate-limit window; resets_at comes straight from that same window."""
+    found = _codex_latest_rate_limits()
+    if not found:
+        return {"available": False}
+    primary = (found["rate_limits"].get("primary") or {})
+    used_percent = primary.get("used_percent")
+    if used_percent is None:
+        return {"available": False}
+    try:
+        used_percent = float(used_percent)
+    except Exception:  # noqa: BLE001
+        return {"available": False}
+    return {
+        "available": True,
+        "used_percent": round(used_percent, 2),
+        "remaining_percent": round(100.0 - used_percent, 2),
+        "reset_at": _usage_iso_utc(primary.get("resets_at")),
+        "source": "codex_sessions_jsonl",
+        "last_synced_at": _usage_now_iso_utc(),
+    }
+
+
+def _claude_official_snapshot():
+    """~/.ai-usage/claude-status/*.json written by Claude Code's official
+    statusLine hook. Trust boundary (per AIBar's own design note): the ONLY
+    legitimate source for Claude's official quota percentage is this file's
+    rate_limits field. No hook installed / no rate_limits / an expired reset
+    window all mean "not synced" — never backfill a percentage from anywhere
+    else (Desktop cache, IndexedDB dumps, local jsonl token counts, etc.)."""
+    try:
+        files = [str(p) for p in Path(CLAUDE_STATUS_DIR).glob("*.json") if p.is_file()]
+    except Exception:  # noqa: BLE001
+        return None
+    if not files:
+        return None
+    files.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+    now = time.time()
+
+    def _window(block):
+        if not isinstance(block, dict):
+            return None
+        used = block.get("used_percentage", block.get("used_percent"))
+        resets_at = block.get("resets_at")
+        if used is None or resets_at is None:
+            return None
+        try:
+            resets_at = float(resets_at)
+            used = float(used)
+        except Exception:  # noqa: BLE001
+            return None
+        if resets_at <= now:   # window 已過期 -> 視為未同步,不能沿用舊值
+            return None
+        return {
+            "used_percent": round(used, 2),
+            "remaining_percent": round(100.0 - used, 2),
+            "reset_at": _usage_iso_utc(resets_at),
+        }
+
+    for path in files:
+        try:
+            with open(path, encoding="utf-8", errors="replace") as f:
+                doc = json.load(f)
+        except Exception:  # noqa: BLE001
+            continue
+        rate_limits = doc.get("rate_limits")
+        if not isinstance(rate_limits, dict):
+            continue
+        five_w = _window(rate_limits.get("five_hour"))
+        seven_w = _window(rate_limits.get("seven_day"))
+        if five_w is None and seven_w is None:
+            continue  # 這份 status 檔沒有可用的 rate_limits -> 未同步
+        return {
+            "five_hour": five_w,
+            "seven_day": seven_w,
+            "mtime": os.path.getmtime(path),
+            "account_label": doc.get("account_label") or doc.get("email") or None,
+        }
+    return None
+
+
+def _claude_local_fallback_usage():
+    """~/.claude/projects/**/*.jsonl assistant message usage, de-duplicated by
+    (path, message.id) — a streamed/retried turn can appear multiple times in
+    the log — and summed. Token counts ONLY, no percentage/reset time; exists
+    purely so the app has *something* while official_synced is false, and
+    must never be dressed up as an official quota number."""
+    total_input = total_output = total_cache_read = total_cache_creation = 0
+    seen_ids = set()
+    latest_ts = None
+    for path in _usage_newest_files(CLAUDE_PROJECTS_DIR, "*.jsonl", _USAGE_MAX_CLAUDE_FILES):
+        text = _usage_tail_text(path)
+        if not text or '"assistant"' not in text:
+            continue
+        for line in text.splitlines():
+            line = line.strip()
+            if not line or '"assistant"' not in line:
+                continue
+            try:
+                rec = json.loads(line)
+            except Exception:  # noqa: BLE001
+                continue
+            if rec.get("type") != "assistant":
+                continue
+            msg = rec.get("message") or {}
+            usage = msg.get("usage")
+            if not isinstance(usage, dict):
+                continue
+            mid = msg.get("id")
+            dedupe_key = (path, mid) if mid else (path, line[:80])
+            if dedupe_key in seen_ids:
+                continue
+            seen_ids.add(dedupe_key)
+            total_input += int(usage.get("input_tokens") or 0)
+            total_output += int(usage.get("output_tokens") or 0)
+            total_cache_read += int(usage.get("cache_read_input_tokens") or 0)
+            total_cache_creation += int(usage.get("cache_creation_input_tokens") or 0)
+            ts = rec.get("timestamp")
+            if ts and (latest_ts is None or ts > latest_ts):
+                latest_ts = ts
+    if not seen_ids:
+        return None
+    return {
+        "input_tokens": total_input,
+        "output_tokens": total_output,
+        "cache_read_input_tokens": total_cache_read,
+        "cache_creation_input_tokens": total_cache_creation,
+        "latest_timestamp": latest_ts,
+    }
+
+
+def _claude_usage_snapshot():
+    """claude wire block. official_synced only ever comes from the
+    statusLine hook's rate_limits; the local jsonl fallback supplies raw
+    token counts (not percent) when the hook isn't installed / hasn't
+    produced a fresh window yet."""
+    official = _claude_official_snapshot()
+    if official is not None:
+        return {
+            "available": True,
+            "official_synced": True,
+            "five_hour": official["five_hour"],
+            "seven_day": official["seven_day"],
+            "source": "claude_statusline",
+            "last_synced_at": _usage_iso_utc(official["mtime"]),
+            "account_label": official.get("account_label"),
+        }
+    fallback = _claude_local_fallback_usage()
+    if fallback is None:
+        return {"available": False, "official_synced": False}
+    return {
+        "available": True,
+        "official_synced": False,
+        "five_hour": None,
+        "seven_day": None,
+        "source": "claude_projects_jsonl_fallback",
+        "last_synced_at": _usage_normalize_iso_str(fallback["latest_timestamp"]) or _usage_now_iso_utc(),
+        "account_label": None,
+        "token_usage": {
+            "input_tokens": fallback["input_tokens"],
+            "output_tokens": fallback["output_tokens"],
+            "cache_read_input_tokens": fallback["cache_read_input_tokens"],
+            "cache_creation_input_tokens": fallback["cache_creation_input_tokens"],
+        },
+    }
+
+
+@app.get("/app/v1/usage")
+async def app_usage(request: Request):
+    """Codex + Claude Code 本機用量,供 Pocket app 設定頁消費。純讀本機
+    session/status 檔案,不打任何雲端用量 API(比照 AIBar 的做法)。
+    10 秒快取,擋掉高頻輪詢造成的重複 jsonl 全掃。"""
+    _check_auth(request)
+    now = time.time()
+    cached = _USAGE_CACHE["data"]
+    if cached is not None and now - _USAGE_CACHE["ts"] < _USAGE_CACHE_TTL:
+        return cached
+    data = {
+        "codex": _codex_usage_snapshot(),
+        "claude": _claude_usage_snapshot(),
+    }
+    _USAGE_CACHE["data"] = data
+    _USAGE_CACHE["ts"] = now
+    return data
 
 
 @app.get("/app/v1/account")
