@@ -3923,6 +3923,16 @@ async def client_log_read(request: Request, limit: int = 100, level: str = ""):
 
 @app.post("/codexsessions/{thread_id}/input")
 async def codex_session_input(thread_id: str, request: Request):
+    # 註:此端點呼叫 start_turn() → ensure_thread_loaded() → thread/resume,
+    # 這裡「有」呼叫 resume,但跟 /stream 舊坑不同類——送新訊息本來就是
+    # 要在這條 app-server 上真正「接管」該 thread 才能執行 turn/start,
+    # resume 對這個操作是必要、無法避免的(這是 Codex 單一 writer 的本質
+    # 限制,不是這支端點自己的 bug)。/stream 是唯讀回放,完全不需要接管
+    # 就能用 thread/turns/list 讀到內容,所以那裡才是純粹的誤用。若使用者
+    # 真的對一個「正被別的 codex app-server(ChatGPT 桌面 App/VS Code)持有」
+    # 的 thread 送訊息,resume 仍可能卡住——但那是搶奪同一 thread 寫入權的
+    # 固有衝突,防呆方式是 UI 層提示/衝突偵測,不是在這裡跳過 resume(跳過
+    # 就送不出訊息了)。
     _check_auth(request)
     body = await _json_body(request)
     input_items = await _codex_input_items((body.get("text") or "").strip(),
@@ -4034,10 +4044,15 @@ async def codex_session_stream(thread_id: str, request: Request, replay: int = 2
 
     async def gen():
         yield chunk({"role": "assistant", "content": ""})
-        try:
-            await CODEX_APP.ensure_thread_loaded(thread_id)
-        except Exception as e:  # noqa: BLE001
-            yield chunk({"content": f"\n⚠️ thread load failed: {e}\n"})
+        # 只讀 replay 不做 thread/resume(同 _cx_card_digest 的防呆):resume 會
+        # 「接管」該 thread,若它正被別的 codex app-server(如 ChatGPT 桌面
+        # App、VS Code,thread source=vscode/appServer)持有就會卡死整條
+        # stdio → 之後所有 codex 呼叫一起 hang(Pocket app「連線中...」卡死
+        # 就是這樣引爆的)。thread/turns/list 本來就不需 resume 也讀得到
+        # (/codexsessions/{id}/history 就是這樣讀的),所以這裡直接列
+        # turns,不呼叫 ensure_thread_loaded()/thread/resume。真正要送
+        # 新訊息時 /codexsessions/{id}/input → start_turn() 才需要
+        # resume(那是必要的,因為要在這條 app-server 上真的接管+送 turn)。
         if replay > 0:
             try:
                 res = await CODEX_APP.call("thread/turns/list", {
