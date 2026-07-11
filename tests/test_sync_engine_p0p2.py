@@ -86,5 +86,111 @@ class TestP0EventLog(unittest.TestCase):
         asyncio.run(_run())
 
 
+def _make_tg_home(rows):
+    """假 persona home:state.db schema 對齊 _persona_history 的 query
+    (sessions.source='telegram' JOIN messages)。rows=[(role, content, ts)]。"""
+    home = tempfile.mkdtemp(prefix="syncengine-home-")
+    con = sqlite3.connect(os.path.join(home, "state.db"))
+    con.execute("PRAGMA journal_mode=WAL")
+    con.execute("CREATE TABLE sessions(id TEXT PRIMARY KEY, source TEXT)")
+    con.execute("CREATE TABLE messages(session_id TEXT, role TEXT, "
+                "content TEXT, timestamp REAL)")
+    con.execute("INSERT INTO sessions VALUES('tg-main','telegram')")
+    for role, content, ts in rows:
+        con.execute("INSERT INTO messages VALUES('tg-main',?,?,?)",
+                    (role, content, ts))
+    con.commit()
+    con.close()
+    return home
+
+
+class TestP1Mirrors(unittest.TestCase):
+    def test_canon_add_mirrors_message_event(self):
+        mid, ok = bridge._canon_add("p1-app", "user", "你好,事件日誌")
+        self.assertTrue(ok)
+        evs = bridge._event_since("p1-app", 0)
+        self.assertEqual(len(evs), 1)
+        self.assertEqual(evs[0]["type"], "message.upsert")
+        m = evs[0]["data"]["message"]
+        self.assertEqual((m["id"], m["role"], m["content"], m["source"]),
+                         (mid, "user", "你好,事件日誌", "app"))
+
+    def test_canon_add_same_mid_content_dedups(self):
+        mid, _ = bridge._canon_add("p1-retry", "user", "同一則")
+        bridge._canon_add("p1-retry", "user", "同一則", mid=mid)  # replay
+        self.assertEqual(len(bridge._event_since("p1-retry", 0)), 1)
+
+    def test_report_upsert_mirrors_and_rewrites(self):
+        sess = "p1-rep"
+        rid = bridge._report_upsert(sess, {
+            "id": "r-1", "label": "晨報", "name": "morning",
+            "content": "第一版內容", "ts": 1000.0})
+        self.assertEqual(rid, "r-1")
+        evs = bridge._event_since(sess, 0)
+        self.assertEqual(len(evs), 1)
+        m = evs[0]["data"]["message"]
+        self.assertEqual(m["id"], "rep-r-1")
+        self.assertEqual(m["source"], "report")
+        self.assertIn("第一版內容", m["content"])
+        # 內容沒變 → upsert 短路 → 不追加事件
+        bridge._report_upsert(sess, {
+            "id": "r-1", "label": "晨報", "name": "morning",
+            "content": "第一版內容", "ts": 1000.0})
+        self.assertEqual(len(bridge._event_since(sess, 0)), 1)
+        # 改稿 → 新事件、同 message id(client 端以 id 覆蓋)
+        bridge._report_upsert(sess, {
+            "id": "r-1", "label": "晨報", "name": "morning",
+            "content": "改稿後內容", "ts": 1000.0})
+        evs = bridge._event_since(sess, 0)
+        self.assertEqual(len(evs), 2)
+        self.assertEqual(evs[1]["data"]["message"]["id"], "rep-r-1")
+        self.assertIn("改稿後內容", evs[1]["data"]["message"]["content"])
+
+    def test_tg_scan_mirrors_and_backfills(self):
+        sess = "p1-tg"
+        home = _make_tg_home([("user", "早安", 2000.0),
+                              ("assistant", "早安,今天天氣不錯", 2001.0)])
+        bridge.PERSONAS[sess] = (f"測試人格 ({sess})", home)
+        try:
+            # event_log 出生前的舊 canonical 訊息(直接落庫,不經 _canon_add)
+            con = sqlite3.connect(bridge.CANON_DB)
+            con.execute("INSERT INTO messages(id,session,role,content,attachments,"
+                        "created_at,status) VALUES('old-1',?,?,?,?,?,?)",
+                        (sess, "user", "歷史訊息", "[]", 1999.0, "done"))
+            con.commit()
+            con.close()
+            merged = bridge._hp_merged_messages(sess, 80)
+            self.assertEqual([m["content"] for m in merged],
+                             ["歷史訊息", "早安", "早安,今天天氣不錯"])
+            evs = bridge._event_since(sess, 0)
+            self.assertEqual([e["data"]["message"]["content"] for e in evs],
+                             ["歷史訊息", "早安", "早安,今天天氣不錯"])
+            self.assertEqual(evs[1]["data"]["message"]["source"], "telegram")
+            # 重掃冪等:不重複
+            bridge._hp_merged_messages(sess, 80)
+            self.assertEqual(len(bridge._event_since(sess, 0)), 3)
+        finally:
+            bridge.PERSONAS.pop(sess, None)
+
+    def test_event_sync_session_throttle(self):
+        sess = "p1-sync"
+        home = _make_tg_home([("user", "節流測試", 3000.0)])
+        bridge.PERSONAS[sess] = (f"測試人格 ({sess})", home)
+        try:
+            bridge._event_sync_session(sess, force=True)
+            self.assertEqual(len(bridge._event_since(sess, 0)), 1)
+            # 節流窗內再叫不掃(塞第二筆 TG 進 state.db 也看不到)
+            con = sqlite3.connect(os.path.join(home, "state.db"))
+            con.execute("INSERT INTO messages VALUES('tg-main','user','第二筆',3001.0)")
+            con.commit()
+            con.close()
+            bridge._event_sync_session(sess)
+            self.assertEqual(len(bridge._event_since(sess, 0)), 1)
+            bridge._event_sync_session(sess, force=True)
+            self.assertEqual(len(bridge._event_since(sess, 0)), 2)
+        finally:
+            bridge.PERSONAS.pop(sess, None)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -1288,21 +1288,79 @@ def _event_latest_seq(session: str) -> int:
         return 0
 
 
+# ── Sync engine P1:三來源鏡射(SYNC_ENGINE_REWRITE_PLAN §4 P1)─────────
+# App 訊息(_canon_add)/ TG(state.db 合併掃描)/ cron 晨報(_report_upsert)
+# 都額外鏡射一份進 event_log。雙寫過渡:現有讀取路徑一律不動,event_log
+# 在 P2 之前只做影子累積。
+#
+# 鍵設計:{source}:{app可見id}:{sha1(role|status|content)[:16]}。
+# - 同一則訊息重複掃到 → 同鍵 → 去重(TG/cron 是重複掃描式接入)
+# - 同 id 但內容/狀態變了(報告改稿、訊息補寫)→ 新鍵 → 追加一筆新的
+#   message.upsert 事件,client 端以 message id 做 last-write-wins 覆蓋
+_EVENT_SYNC_TS: dict[str, float] = {}
+_EVENT_SYNC_MIN_SECS = float(os.environ.get("POCKET_EVENT_SYNC_SECS", "10"))
+
+
+def _event_msg_key(m: dict) -> str:
+    basis = f"{m.get('role')}|{m.get('status')}|{m.get('content') or ''}"
+    h = hashlib.sha1(basis.encode("utf-8", "replace")).hexdigest()[:16]
+    return f"{m.get('source') or 'app'}:{m.get('id')}:{h}"
+
+
+def _event_mirror_messages(session: str, msgs: list) -> int:
+    """把一批 app-shape 訊息 dict 鏡射進 event_log(冪等,靠 external_id
+    去重)。回傳真正新寫入的筆數。絕不 raise。"""
+    n = 0
+    for m in msgs or []:
+        try:
+            key = _event_msg_key(m)
+        except Exception:  # noqa: BLE001
+            continue
+        if _event_append(session, "message.upsert", {"message": m},
+                         external_id=key):
+            n += 1
+    return n
+
+
+def _event_sync_session(session: str, limit: int = 200,
+                        force: bool = False) -> None:
+    """把 TG(state.db)+ cron 晨報拉進 event_log 的主動同步(P2 SSE 端點
+    在訂閱期間週期呼叫)。合併/清洗/去重全部沿用 _hp_merged_messages —
+    鏡射就掛在它的回傳路徑上,這裡只負責觸發 + 節流(同 session 至多每
+    _EVENT_SYNC_MIN_SECS 掃一次,多個訂閱者共享)。"""
+    now = time.monotonic()
+    if not force and now - _EVENT_SYNC_TS.get(session, 0.0) < _EVENT_SYNC_MIN_SECS:
+        return
+    _EVENT_SYNC_TS[session] = now
+    try:
+        _hp_merged_messages(session, limit)   # 鏡射在合併函式內完成
+    except Exception as e:  # noqa: BLE001
+        _log_event("event_sync_failed", session=session,
+                   error=type(e).__name__, error_message=str(e)[:160])
+
+
 def _canon_add(session: str, role: str, content: str, attachments=None,
                mid: str | None = None, status: str = "done",
                client_id: str | None = None) -> tuple[str, bool]:
     import sqlite3
     mid = mid or uuid.uuid4().hex
+    now = time.time()
     try:
         con = sqlite3.connect(CANON_DB)
         con.execute("INSERT OR REPLACE INTO messages"
                     "(id,session,role,content,attachments,created_at,status,client_id) "
                     "VALUES(?,?,?,?,?,?,?,?)",
                     (mid, session, role, content, json.dumps(attachments or [], ensure_ascii=False),
-                     time.time(), status, client_id))
+                     now, status, client_id))
         con.commit()
         con.close()
         _canon_notify(session)
+        # Sync engine P1:App 訊息寫入點順便鏡射進 event_log(雙寫過渡)。
+        # payload 形狀對齊 _canon_messages 的輸出,client 兩邊看到同一種訊息。
+        _event_mirror_messages(session, [{
+            "id": mid, "role": role, "content": content,
+            "attachments": attachments or [], "ts": now, "status": status,
+            "client_id": client_id, "source": "app"}])
         # P1-3:人格完成一則回覆 → 推播把你叫回 app(前景由 app willPresent 抑制)。
         if role == "assistant" and status == "done":
             _push_persona_reply(session, content)
@@ -1992,6 +2050,11 @@ def _report_upsert(session: str, report: dict) -> str:
          report.get("external_source") or "hermes-cron", external_id, time.time()))
     con.commit()
     con.close()
+    # Sync engine P1:cron 晨報寫入點鏡射進 event_log(雙寫過渡)。形狀走
+    # _report_msg_shape = app 在 /app/v1/messages 看到的同一種報告訊息;
+    # 改稿(同 rid 新內容)→ 新鍵 → 追加新事件,同 message id 覆蓋。
+    _event_mirror_messages(session, [_report_msg_shape(
+        {"id": rid, "label": label, "content": content, "ts": ts})])
     return rid
 
 
@@ -2013,12 +2076,18 @@ def _report_events(session: str, limit: int = 20, newest_first: bool = False):
     } for r in rows]
 
 
-def _report_messages(session: str, limit: int = 100):
-    return [{
+def _report_msg_shape(r: dict) -> dict:
+    """report_events 列 → app-shape 訊息。_report_messages(v1 讀取)與
+    _report_upsert 的 event_log 鏡射(P1)共用,兩邊 payload/去重鍵一致。"""
+    return {
         "id": f"rep-{r['id']}", "role": "assistant",
         "content": f"📰 **{r['label']}**\n\n{r['content']}",
         "attachments": [], "ts": r["ts"], "status": "done", "source": "report",
-    } for r in _report_events(session, limit)]
+    }
+
+
+def _report_messages(session: str, limit: int = 100):
+    return [_report_msg_shape(r) for r in _report_events(session, limit)]
 
 
 def _clip_text(text: str, max_chars: int) -> str:
@@ -6974,7 +7043,14 @@ def _hp_merged_messages(session: str, limit: int = 200):
         # TG/cron 合併失敗不能拖垮卡片流 → 退回只有 canonical(至少不會壞掉整頁)。
         _log_event("hp_merge_error", session=session, error=str(e)[:200])
     out.sort(key=lambda m: m.get("ts") or 0)
-    return out[-limit:]
+    out = out[-limit:]
+    # Sync engine P1:TG 訊息沒有 bridge 端寫入點(Hermes 官方 gateway 直寫
+    # state.db),接入點就是這裡的合併掃描 — 卡片 follower 重掃 / v2 events
+    # 的 _event_sync_session 都會經過。掃描是重複式的,靠 external_id 冪等,
+    # 穩態時 _EVENT_SEEN 快取讓這行零寫入。順帶把 event_log 出生前的舊訊息
+    # 回填進日誌(§3.3:任何裝置從 seq=0 重放即可重建歷史)。
+    _event_mirror_messages(session, out)
+    return out
 
 
 async def _hp_canon_follower(session: str):
@@ -8576,6 +8652,10 @@ async def app_get_messages(session: str, request: Request, limit: int = 200):
     out.extend(_report_messages(session, limit))
     out.sort(key=lambda m: m.get("ts") or 0)
     out = out[-limit:]
+    # Sync engine P1:app 每次輪詢這頁就是一次現成的三來源合併掃描,順手
+    # 鏡射進 event_log(冪等、穩態零寫入;鏡射在 reaction overlay 疊加前,
+    # payload 保持訊息本體的正典形狀)。
+    _event_mirror_messages(session, out)
     # Reaction overlay (G2/#39) — one lookup for the whole page, ids as-is
     # (canonical mids and tg-<ts> alike), so reactions survive reinstall and
     # show identically on every device.
