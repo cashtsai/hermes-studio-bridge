@@ -1336,13 +1336,17 @@ def _event_mirror_messages(session: str, msgs: list) -> int:
 
 
 def _event_sync_session(session: str, limit: int = 200,
-                        force: bool = False) -> None:
+                        force: bool = False,
+                        min_secs: float | None = None) -> None:
     """把 TG(state.db)+ cron 晨報拉進 event_log 的主動同步(P2 SSE 端點
     在訂閱期間週期呼叫)。合併/清洗/去重全部沿用 _hp_merged_messages —
     鏡射就掛在它的回傳路徑上,這裡只負責觸發 + 節流(同 session 至多每
-    _EVENT_SYNC_MIN_SECS 掃一次,多個訂閱者共享)。"""
+    _EVENT_SYNC_MIN_SECS 掃一次,多個訂閱者共享)。min_secs 可換小節流:
+    statedb watcher 喚醒路徑用 0.4s(配合呼叫端 0.5s 去抖)— 要穿越 10s
+    週期節流即時拉,但多訂閱者同時醒時仍只掃一次。"""
     now = time.monotonic()
-    if not force and now - _EVENT_SYNC_TS.get(session, 0.0) < _EVENT_SYNC_MIN_SECS:
+    floor = _EVENT_SYNC_MIN_SECS if min_secs is None else min_secs
+    if not force and now - _EVENT_SYNC_TS.get(session, 0.0) < floor:
         return
     _EVENT_SYNC_TS[session] = now
     try:
@@ -1422,6 +1426,17 @@ async def _canon_or_statedb_wait(session: str, seen_canon_ver: int,
     """`_canon_wait` 的擴充版:canonical 版本 *或* state.db stat 版本任一
     變動就返回。同款 0.2s 純記憶體輪詢,無鎖、無 Condition。"""
     while (_CANON_VER.get(session, 0) == seen_canon_ver
+           and _STATEDB_VER.get(session, 0) == seen_state_ver):
+        await asyncio.sleep(0.2)
+
+
+async def _event_or_statedb_wait(session: str, seen_ver: int,
+                                 seen_state_ver: int) -> None:
+    """`_event_wait` 的擴充版(v2 事件迴圈用):event_log 版本 *或*
+    state.db stat 版本任一變動就返回。statedb 醒 = TG/cron 剛寫入但還沒
+    鏡射進 event_log,呼叫端要立刻 _event_sync_session 把它拉進來 —
+    v2 訂閱者的 TG 延遲從節流上限(10s)壓到 ~0.4s。"""
+    while (_EVENT_VER.get(session, 0) == seen_ver
            and _STATEDB_VER.get(session, 0) == seen_state_ver):
         await asyncio.sleep(0.2)
 
@@ -8892,8 +8907,24 @@ async def app_v2_events(session: str, request: Request, since_seq: int = 0,
         deadline = time.monotonic() + (_EVENTS_FOLLOW_MAX_SECS if follow else 0.0)
         last_ver = -1     # 首輪必掃(補訂閱者斷線期間的積壓)
         last_sync = time.monotonic()
+        sver = _STATEDB_VER.get(session, 0)   # watcher 版本基準(#tg-instant-sync)
         while True:
             sent = False
+            cur_sver = _STATEDB_VER.get(session, 0)
+            if cur_sver != sver:
+                # state.db 剛被 TG/cron 寫入(stat watcher bump)→ 立刻拉進
+                # event_log,不等下面的 10s 週期節流。先去抖:睡到距上次掃
+                # 描 ≥0.5s 再掃,吸掉同一批寫入的連續 bump;之後用 0.4s 小
+                # 節流 — 自己的時間線必然通過(剛睡滿 0.5s),只有別的訂閱
+                # 者在我們去抖期間已經掃過(該掃必然晚於這次寫入,已涵蓋)
+                # 才跳過。寫入絕不會被節流吞掉只剩 10s 兜底。
+                sver = cur_sver
+                gap = 0.5 - (time.monotonic() - _EVENT_SYNC_TS.get(session, 0.0))
+                if gap > 0:
+                    await asyncio.sleep(min(gap, 0.5))
+                last_sync = time.monotonic()
+                await asyncio.to_thread(_event_sync_session, session, 200,
+                                        False, 0.4)
             ver = _EVENT_VER.get(session, 0)
             if ver != last_ver:
                 last_ver = ver
@@ -8915,14 +8946,15 @@ async def app_v2_events(session: str, request: Request, since_seq: int = 0,
                 yield "data: [DONE]\n\n"
                 return
             if time.monotonic() - last_sync >= _EVENT_SYNC_MIN_SECS:
-                # TG/cron 在 bridge 端沒有寫入即時信號(P1 註解),訂閱期間
-                # 週期主動拉 — v2 訂閱者的 TG 延遲上限 = _EVENT_SYNC_MIN_SECS,
-                # 不再依賴卡片 follower 恰好在跑。
+                # 週期主動拉當保險絲:statedb watcher(上面的 sver 檢查)是
+                # 即時觸發主力,這條是 watcher 失效時的兜底 — v2 訂閱者的
+                # TG 延遲上限仍 = _EVENT_SYNC_MIN_SECS,不依賴單一機制。
                 last_sync = time.monotonic()
                 await asyncio.to_thread(_event_sync_session, session, 200)
             try:
-                await asyncio.wait_for(_event_wait(session, last_ver),
-                                       timeout=SSE_KEEPALIVE_SECS)
+                await asyncio.wait_for(
+                    _event_or_statedb_wait(session, last_ver, sver),
+                    timeout=SSE_KEEPALIVE_SECS)
             except asyncio.TimeoutError:
                 pass
 
@@ -8945,15 +8977,29 @@ def _read_cursor_rows(session: str) -> list[dict]:
              "message_id": r[3], "updated_at": r[4]} for r in rows]
 
 
+def _read_cursor_global(rows: list[dict]) -> dict:
+    """已拍板語意(2026-07-11 善彰):「任一裝置讀過即全讀」= 全裝置 MAX。
+    這裡做伺服器端聚合,App 端(P3)未讀數直接拿 global.last_read_seq 比
+    event seq,不用自己算;cursors 仍按裝置分列保留原始資料(若未來要改
+    per-device 語意,資料都在,schema 不用動)。"""
+    return {
+        "last_read_seq": max((int(r.get("last_read_seq") or 0) for r in rows),
+                             default=0),
+        "last_read_ts": max((float(r.get("last_read_ts") or 0.0) for r in rows),
+                            default=0.0),
+    }
+
+
 @app.get("/app/v2/read")
 async def app_v2_read_get(session: str, request: Request):
-    """該 session 全部裝置的已讀游標(新裝置冷載算未讀用)。按裝置分列 —
-    「任一裝置讀過即全讀」(取 MAX)與「每裝置各自記」兩種語意都能從同一
-    份資料推導,聚合方式留給 App 端(P3)按善彰拍板的語意選。"""
+    """該 session 全部裝置的已讀游標(新裝置冷載算未讀用)。global 欄位
+    是拍板語意「任一裝置讀過即全讀」的聚合(見 _read_cursor_global)。"""
     _check_auth(request)
     if session not in PERSONAS:
         raise http_err(400, "SESSION_NOT_FOUND", "unknown session")
-    return {"session": session, "cursors": _read_cursor_rows(session)}
+    rows = _read_cursor_rows(session)
+    return {"session": session, "cursors": rows,
+            "global": _read_cursor_global(rows)}
 
 
 @app.post("/app/v2/read")
@@ -9000,14 +9046,21 @@ async def app_v2_read_post(request: Request):
                 "VALUES(?,?,?,?,?,?)",
                 (session, device_id, new_seq, new_ts, message_id, now))
             con.commit()
+        grow = con.execute(
+            "SELECT MAX(last_read_seq),MAX(last_read_ts) FROM read_cursors "
+            "WHERE session=?", (session,)).fetchone()
     finally:
         con.close()
+    # 拍板語意「任一裝置讀過即全讀」的聚合,事件與回應都帶上 — 其他訂閱
+    # 中的裝置收到 read_cursor.update 直接用 global 更新未讀,不用再 GET。
+    gcur = {"last_read_seq": int(grow[0] or 0),
+            "last_read_ts": float(grow[1] or 0.0)}
     if moved:
         cursor = {"device_id": device_id, "last_read_seq": new_seq,
                   "last_read_ts": new_ts, "message_id": message_id,
                   "updated_at": now}
         seq = _event_append(session, "read_cursor.update",
-                            {"session": session, **cursor})
+                            {"session": session, **cursor, "global": gcur})
     else:
         # 沒前進(重送/亂序)→ 冪等回現存游標,不追加事件
         cursor = {"device_id": device_id, "last_read_seq": prev_seq,
@@ -9015,7 +9068,8 @@ async def app_v2_read_post(request: Request):
                   "message_id": row[2] if row else None,
                   "updated_at": row[3] if row else None}
         seq = 0
-    return {"ok": True, "moved": moved, "seq": seq, "cursor": cursor}
+    return {"ok": True, "moved": moved, "seq": seq, "cursor": cursor,
+            "global": gcur}
 
 
 @app.post("/app/v1/messages/{mid}/reaction")

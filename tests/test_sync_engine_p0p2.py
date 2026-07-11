@@ -315,6 +315,28 @@ class TestP2ReadCursor(unittest.TestCase):
         by_dev = {c["device_id"]: c["last_read_seq"] for c in g["cursors"]}
         self.assertEqual(by_dev, {"iphone": 10, "ipad": 3})
 
+    def test_global_any_device_read(self):
+        """拍板語意(2026-07-11):任一裝置讀過即全讀 = 全裝置 MAX。"""
+        r1 = self._post({"session": self.sess, "device_id": "iphone",
+                         "last_read_seq": 10, "last_read_ts": 100.0})
+        self.assertEqual(r1["global"]["last_read_seq"], 10)
+        # 落後裝置回報 → 自己的游標動了,但 global 仍是全裝置 MAX
+        r2 = self._post({"session": self.sess, "device_id": "ipad",
+                         "last_read_seq": 3, "last_read_ts": 50.0})
+        self.assertTrue(r2["moved"])
+        self.assertEqual(r2["global"],
+                         {"last_read_seq": 10, "last_read_ts": 100.0})
+        g = asyncio.run(bridge.app_v2_read_get(self.sess, _FakeReq()))
+        self.assertEqual(g["global"]["last_read_seq"], 10)
+        # read_cursor.update 事件也帶 global(訂閱端免再 GET)
+        evs = [e for e in bridge._event_since(self.sess, 0)
+               if e["type"] == "read_cursor.update"]
+        self.assertEqual(evs[-1]["data"]["global"]["last_read_seq"], 10)
+
+    def test_global_empty_session(self):
+        g = asyncio.run(bridge.app_v2_read_get(self.sess, _FakeReq()))
+        self.assertEqual(g["global"], {"last_read_seq": 0, "last_read_ts": 0.0})
+
     def test_validation(self):
         from fastapi import HTTPException
         with self.assertRaises(HTTPException) as ctx:
@@ -327,6 +349,79 @@ class TestP2ReadCursor(unittest.TestCase):
             self._post({"session": "nope", "device_id": "iphone",
                         "last_read_seq": 1})
         self.assertEqual(ctx.exception.status_code, 400)   # unknown session
+
+
+class TestV2StateDbWiring(unittest.TestCase):
+    """watcher 合併後的 v2 接線(拍板 2026-07-11):state.db stat 版本 bump
+    → v2 事件迴圈立刻拉 TG/cron 進 event_log,不等 10s 節流。watcher 背景
+    loop 本身的延遲實測在 tests/test_tg_instant_sync.py;這裡手動
+    _statedb_notify 模擬 bump,驗證 v2 這一端的接線。"""
+
+    def setUp(self):
+        self._auth = bridge._check_auth
+        bridge._check_auth = lambda r: None
+
+    def tearDown(self):
+        bridge._check_auth = self._auth
+
+    def test_event_or_statedb_wait_wakes_on_statedb_bump(self):
+        async def _run():
+            sess = "v2-sdb-wait"
+            waiter = asyncio.create_task(bridge._event_or_statedb_wait(
+                sess, bridge._EVENT_VER.get(sess, 0),
+                bridge._STATEDB_VER.get(sess, 0)))
+            await asyncio.sleep(0.05)
+            self.assertFalse(waiter.done())
+            bridge._statedb_notify(sess)
+            await asyncio.wait_for(waiter, timeout=2.0)
+        asyncio.run(_run())
+
+    def test_statedb_bump_pulls_tg_within_subthrottle_latency(self):
+        sess = "v2-sdb-e2e"
+        home = _make_tg_home([("user", "第一則", 6000.0)])
+        bridge.PERSONAS[sess] = (f"測試人格 ({sess})", home)
+        try:
+            async def _run():
+                resp = await bridge.app_v2_events(sess, _FakeReq(),
+                                                  since_seq=0, follow=True)
+                got = []
+
+                async def reader():
+                    async for chunk in resp.body_iterator:
+                        text = chunk.decode() if isinstance(chunk, bytes) else chunk
+                        for line in text.splitlines():
+                            if line.startswith("data: ") and line[6:] != "[DONE]":
+                                got.append(json.loads(line[6:]))
+
+                task = asyncio.create_task(reader())
+                for _ in range(100):          # 等積壓(第一則)先到
+                    if got:
+                        break
+                    await asyncio.sleep(0.05)
+                self.assertTrue(got, "積壓事件沒進 SSE")
+                # 模擬 TG gateway 寫入 state.db + watcher bump
+                con = sqlite3.connect(os.path.join(home, "state.db"))
+                con.execute(
+                    "INSERT INTO messages VALUES('tg-main','user','第二則',6001.0)")
+                con.commit()
+                con.close()
+                t0 = time.monotonic()
+                bridge._statedb_notify(sess)
+
+                def _seen():
+                    return any(e["data"].get("message", {}).get("content") ==
+                               "第二則" for e in got)
+
+                while time.monotonic() - t0 < 5.0 and not _seen():
+                    await asyncio.sleep(0.05)
+                latency = time.monotonic() - t0
+                task.cancel()
+                self.assertTrue(_seen(), "statedb bump 後 TG 事件沒進 SSE")
+                # 去抖 0.5s + 等待粒度 0.2s;遠小於 10s 節流上限即算接線成功
+                self.assertLess(latency, 3.0)
+            asyncio.run(_run())
+        finally:
+            bridge.PERSONAS.pop(sess, None)
 
 
 if __name__ == "__main__":
