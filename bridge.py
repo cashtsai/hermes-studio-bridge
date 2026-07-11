@@ -1219,10 +1219,16 @@ _EVENT_VER: dict[str, int] = {}
 # 掃描多付幾次 no-op INSERT。
 _EVENT_SEEN: dict[str, set] = {}
 _EVENT_SEEN_CAP = 8192
+# 全域版本計數(不分 session):/app/v2/events 省略 session 的全域訂閱
+# (P3 契約 #2:App 首頁列表+未讀用單一條 SSE)靠這個喚醒,不用每 0.2s
+# 掃整個 per-session dict。與 per-session 版同款:純 int、無鎖、喚醒不漏。
+_EVENT_VER_ALL = 0
 
 
 def _event_notify(session: str) -> None:
+    global _EVENT_VER_ALL
     _EVENT_VER[session] = _EVENT_VER.get(session, 0) + 1
+    _EVENT_VER_ALL += 1
 
 
 async def _event_wait(session: str, seen_ver: int) -> None:
@@ -1286,6 +1292,40 @@ def _event_since(session: str, since_seq: int = 0, limit: int = 500) -> list[dic
         except Exception:  # noqa: BLE001
             data = {}
         out.append({"seq": r[0], "ts": r[3], "type": r[1], "data": data})
+    return out
+
+
+def _event_since_all(since_seq: int = 0, limit: int = 500) -> list[dict]:
+    """全域版 _event_since:不分 session 撈 id > since_seq 的事件,餵
+    /app/v2/events 省略 session 的全域訂閱。event_log.id 本來就是全域
+    autoincrement,所以全域游標語意天然成立。信封比 per-session 版多帶
+    session 欄位(App 端 SyncEvent 收 session|session_id 雙鍵)。
+    SQL 限定 session IN 現任 PERSONAS — 落實拍板「v2 事件流只收 hermes
+    人格 session」:被移除的 persona 與未來任何非人格寫入不會漏進全域流。"""
+    import sqlite3
+    sessions = list(PERSONAS)
+    if not sessions:
+        return []
+    try:
+        con = sqlite3.connect(f"file:{CANON_DB}?mode=ro", uri=True, timeout=5)
+        rows = con.execute(
+            "SELECT id,session,type,payload,created_at FROM event_log "
+            f"WHERE id>? AND session IN ({','.join('?' * len(sessions))}) "
+            "ORDER BY id LIMIT ?",
+            (int(since_seq or 0), *sessions, max(1, limit))).fetchall()
+        con.close()
+    except Exception as e:  # noqa: BLE001
+        _log_event("event_since_all_failed",
+                   error=type(e).__name__, error_message=str(e)[:160])
+        return []
+    out = []
+    for r in rows:
+        try:
+            data = json.loads(r[3] or "{}")
+        except Exception:  # noqa: BLE001
+            data = {}
+        out.append({"seq": r[0], "ts": r[4], "type": r[2],
+                    "session": r[1], "data": data})
     return out
 
 
@@ -1376,12 +1416,15 @@ def _event_sync_session(session: str, limit: int = 200,
 # checkpoint 時序恰好卡在兩次 stat 中間、mtime 精度不足撞期）,30s 週期
 # 還是會補上,同步不會因為單一機制失效就整個停擺。
 _STATEDB_VER: dict[str, int] = {}
+_STATEDB_VER_ALL = 0    # 全域計數,配 _EVENT_VER_ALL(全域訂閱喚醒用)
 _STATEDB_STAT_CACHE: dict[str, tuple] = {}   # session -> (path, mtime_ns, size)
 _STATEDB_POLL_SECS = float(os.environ.get("POCKET_STATEDB_POLL_SECS", "0.15"))
 
 
 def _statedb_notify(session: str) -> None:
+    global _STATEDB_VER_ALL
     _STATEDB_VER[session] = _STATEDB_VER.get(session, 0) + 1
+    _STATEDB_VER_ALL += 1
 
 
 def _statedb_stat_key(home: str) -> tuple:
@@ -1438,6 +1481,16 @@ async def _event_or_statedb_wait(session: str, seen_ver: int,
     v2 訂閱者的 TG 延遲從節流上限(10s)壓到 ~0.4s。"""
     while (_EVENT_VER.get(session, 0) == seen_ver
            and _STATEDB_VER.get(session, 0) == seen_state_ver):
+        await asyncio.sleep(0.2)
+
+
+async def _event_or_statedb_wait_all(seen_ver: int,
+                                     seen_state_ver: int) -> None:
+    """全域版 _event_or_statedb_wait(/app/v2/events 省略 session 的訂閱用):
+    任何 session 的 event_log 或 state.db 有動靜就返回。盯兩個全域 int,
+    不掃 per-session dict。"""
+    while (_EVENT_VER_ALL == seen_ver
+           and _STATEDB_VER_ALL == seen_state_ver):
         await asyncio.sleep(0.2)
 
 
@@ -8887,16 +8940,21 @@ _EVENTS_FOLLOW_MAX_SECS = 120.0   # 與 v1 messages/events 同款:app 週期重�
 
 
 @app.get("/app/v2/events")
-async def app_v2_events(session: str, request: Request, since_seq: int = 0,
-                        follow: bool = True):
+async def app_v2_events(request: Request, session: str | None = None,
+                        since_seq: int = 0, follow: bool = True):
     """SYNC_ENGINE_REWRITE_PLAN §3.1 的統一訂閱端點:從 event_log 撈
     id > since_seq 的所有列,補洞 + 即時走同一條 SSE,三來源(App/TG/cron)
     與已讀游標不再各走各的加速通道。信封 {seq, ts, type, data} 與
     /app/v2/sessions/{id}/events 卡片流對齊;event_log 是持久表,沒有卡片
     ring buffer 的 410 SEQ_GONE 問題 — 任何裝置 since_seq=0 重放即可重建
-    完整歷史(§3.3 / backlog B3)。"""
+    完整歷史(§3.3 / backlog B3)。
+
+    session 可省略(P3 契約 #2):省略 = 全域訂閱,單一條 SSE 涵蓋全部
+    hermes 人格 session(App 首頁列表+未讀靠這條,不用每 persona 開一條)。
+    全域信封多帶 session 欄位;event_log.id 全域單調,since_seq 游標語意
+    與 per-session 模式相同。"""
     _check_auth(request)
-    if session not in PERSONAS:
+    if session is not None and session not in PERSONAS:
         raise http_err(400, "SESSION_NOT_FOUND", "unknown session")
 
     async def gen():
@@ -8958,7 +9016,70 @@ async def app_v2_events(session: str, request: Request, since_seq: int = 0,
             except asyncio.TimeoutError:
                 pass
 
-    return StreamingResponse(gen(), media_type="text/event-stream")
+    async def gen_all():
+        # 全域訂閱:與 gen() 同構,差異只在 (a) 初連/兜底同步掃全部
+        # persona (b) watcher 以 per-session snapshot 找出「誰剛被寫入」
+        # 只拉那幾個 (c) 批次改走 _event_since_all、版本盯 _EVENT_VER_ALL。
+        cursor = max(0, int(since_seq or 0))
+        for s in list(PERSONAS):
+            await asyncio.to_thread(_event_sync_session, s, 200, True)
+        deadline = time.monotonic() + (_EVENTS_FOLLOW_MAX_SECS if follow else 0.0)
+        last_ver = -1     # 首輪必掃
+        last_sync = time.monotonic()
+        svers = dict(_STATEDB_VER)   # per-session watcher 版本基準
+        while True:
+            sent = False
+            # 先讀全域計數再算 changed:之後才 bump 的寫入會讓下面的
+            # wait 立刻返回,喚醒不漏(順序反過來就有睡過頭的窗)。
+            cur_sall = _STATEDB_VER_ALL
+            changed = [s for s in list(PERSONAS)
+                       if _STATEDB_VER.get(s, 0) != svers.get(s, 0)]
+            if changed:
+                # 去抖 + 小節流與 per-session 版同參數;gap 以 changed 中
+                # 最近一次掃描起算(保守但上限 0.5s)。
+                for s in changed:
+                    svers[s] = _STATEDB_VER.get(s, 0)
+                gap = 0.5 - (time.monotonic() - max(
+                    _EVENT_SYNC_TS.get(s, 0.0) for s in changed))
+                if gap > 0:
+                    await asyncio.sleep(min(gap, 0.5))
+                last_sync = time.monotonic()
+                for s in changed:
+                    await asyncio.to_thread(_event_sync_session, s, 200,
+                                            False, 0.4)
+            ver = _EVENT_VER_ALL
+            if ver != last_ver:
+                last_ver = ver
+                while True:
+                    batch = await asyncio.to_thread(_event_since_all,
+                                                    cursor, 500)
+                    for ev in batch:
+                        cursor = ev["seq"]
+                        yield f"data: {json.dumps(ev, ensure_ascii=False)}\n\n"
+                        sent = True
+                    if len(batch) < 500:
+                        break
+            if not follow:
+                yield "data: [DONE]\n\n"
+                return
+            if not sent:
+                yield ": keepalive\n\n"
+            if time.monotonic() >= deadline:
+                yield "data: [DONE]\n\n"
+                return
+            if time.monotonic() - last_sync >= _EVENT_SYNC_MIN_SECS:
+                last_sync = time.monotonic()
+                for s in list(PERSONAS):
+                    await asyncio.to_thread(_event_sync_session, s, 200)
+            try:
+                await asyncio.wait_for(
+                    _event_or_statedb_wait_all(last_ver, cur_sall),
+                    timeout=SSE_KEEPALIVE_SECS)
+            except asyncio.TimeoutError:
+                pass
+
+    return StreamingResponse(gen() if session is not None else gen_all(),
+                             media_type="text/event-stream")
 
 
 def _read_cursor_rows(session: str) -> list[dict]:

@@ -227,7 +227,7 @@ class TestP2EventsEndpoint(unittest.TestCase):
     def test_unknown_session_rejected(self):
         from fastapi import HTTPException
         with self.assertRaises(HTTPException) as ctx:
-            asyncio.run(bridge.app_v2_events("no-such-persona", _FakeReq()))
+            asyncio.run(bridge.app_v2_events(_FakeReq(), "no-such-persona"))
         self.assertEqual(ctx.exception.status_code, 400)
 
     def test_backlog_since_seq_and_tg_pull(self):
@@ -238,7 +238,7 @@ class TestP2EventsEndpoint(unittest.TestCase):
             mid, _ = bridge._canon_add(sess, "user", "app 這邊的訊息")
             # follow=False:回放 event_log 積壓後 [DONE]。連線時的 force 同步
             # 應把 TG 洞補進 event_log(app 訊息已由 _canon_add 鏡射,去重)。
-            resp = asyncio.run(bridge.app_v2_events(sess, _FakeReq(),
+            resp = asyncio.run(bridge.app_v2_events(_FakeReq(), sess,
                                                     since_seq=0, follow=False))
             evs = asyncio.run(_collect_sse(resp))
             self.assertEqual({e["type"] for e in evs}, {"message.upsert"})
@@ -249,13 +249,93 @@ class TestP2EventsEndpoint(unittest.TestCase):
             seqs = [e["seq"] for e in evs]
             self.assertEqual(seqs, sorted(seqs))
             # since_seq 補洞:從第一筆之後訂閱,只收到之後的事件
-            resp = asyncio.run(bridge.app_v2_events(sess, _FakeReq(),
+            resp = asyncio.run(bridge.app_v2_events(_FakeReq(), sess,
                                                     since_seq=seqs[0],
                                                     follow=False))
             evs2 = asyncio.run(_collect_sse(resp))
             self.assertEqual([e["seq"] for e in evs2], seqs[1:])
         finally:
             bridge.PERSONAS.pop(sess, None)
+
+
+class TestP2GlobalEvents(unittest.TestCase):
+    """省略 session 的全域訂閱(P3 契約 #2)。PERSONAS 以 in-place
+    clear+update 換成純測試人格 — 保持既有引用有效,且避免初連 force
+    同步掃到真實 builtin persona 的 home。"""
+
+    def setUp(self):
+        self._auth = bridge._check_auth
+        bridge._check_auth = lambda r: None
+        self._personas = dict(bridge.PERSONAS)
+        self.home_a = _make_tg_home([("user", "TG給A的話", 5000.0)])
+        self.home_b = _make_tg_home([])
+        bridge.PERSONAS.clear()
+        bridge.PERSONAS.update({
+            "g-a": ("全域測試A", self.home_a),
+            "g-b": ("全域測試B", self.home_b),
+        })
+
+    def tearDown(self):
+        bridge._check_auth = self._auth
+        bridge.PERSONAS.clear()
+        bridge.PERSONAS.update(self._personas)
+
+    def test_since_all_orders_and_filters(self):
+        sa = bridge._event_append("g-a", "t", {"v": "a1"})
+        sx = bridge._event_append("not-a-persona", "t", {"v": "x"})
+        sb = bridge._event_append("g-b", "t", {"v": "b1"})
+        evs = bridge._event_since_all(sa - 1)
+        # 全域依 id 排序;非 PERSONAS 的 session 被濾掉
+        self.assertEqual([e["seq"] for e in evs], [sa, sb])
+        self.assertNotIn(sx, [e["seq"] for e in evs])
+        # 全域信封多帶 session
+        self.assertEqual(set(evs[0].keys()),
+                         {"seq", "ts", "type", "session", "data"})
+        self.assertEqual([e["session"] for e in evs], ["g-a", "g-b"])
+        # since_seq 補洞
+        self.assertEqual([e["seq"] for e in bridge._event_since_all(sa)], [sb])
+
+    def test_endpoint_streams_all_sessions(self):
+        con_evs = bridge._event_since_all(0)
+        base = con_evs[-1]["seq"] if con_evs else 0
+        bridge._canon_add("g-a", "user", "A 的 app 訊息")
+        bridge._canon_add("g-b", "assistant", "B 的 app 訊息")
+        resp = asyncio.run(bridge.app_v2_events(_FakeReq(), since_seq=base,
+                                                follow=False))
+        evs = asyncio.run(_collect_sse(resp))
+        # 兩個 session 都在同一條流;初連 force 同步把 A 的 TG 洞也補進來
+        by_sess = {e["session"] for e in evs}
+        self.assertEqual(by_sess, {"g-a", "g-b"})
+        contents = [e["data"]["message"]["content"] for e in evs
+                    if e["type"] == "message.upsert"]
+        self.assertIn("A 的 app 訊息", contents)
+        self.assertIn("B 的 app 訊息", contents)
+        self.assertIn("TG給A的話", contents)
+        seqs = [e["seq"] for e in evs]
+        self.assertEqual(seqs, sorted(seqs))
+        # since_seq 從中段訂閱只收之後的
+        resp = asyncio.run(bridge.app_v2_events(_FakeReq(), since_seq=seqs[0],
+                                                follow=False))
+        evs2 = asyncio.run(_collect_sse(resp))
+        self.assertEqual([e["seq"] for e in evs2], seqs[1:])
+
+    def test_wait_all_wakes_on_any_session(self):
+        async def _run():
+            ver, sver = bridge._EVENT_VER_ALL, bridge._STATEDB_VER_ALL
+            waiter = asyncio.create_task(
+                bridge._event_or_statedb_wait_all(ver, sver))
+            await asyncio.sleep(0.05)
+            self.assertFalse(waiter.done())
+            bridge._event_append("g-b", "t", {})   # 任一 session 動就醒
+            await asyncio.wait_for(waiter, timeout=2.0)
+            ver, sver = bridge._EVENT_VER_ALL, bridge._STATEDB_VER_ALL
+            waiter = asyncio.create_task(
+                bridge._event_or_statedb_wait_all(ver, sver))
+            await asyncio.sleep(0.05)
+            self.assertFalse(waiter.done())
+            bridge._statedb_notify("g-a")          # statedb 路徑也要醒
+            await asyncio.wait_for(waiter, timeout=2.0)
+        asyncio.run(_run())
 
 
 class TestP2ReadCursor(unittest.TestCase):
@@ -382,7 +462,7 @@ class TestV2StateDbWiring(unittest.TestCase):
         bridge.PERSONAS[sess] = (f"測試人格 ({sess})", home)
         try:
             async def _run():
-                resp = await bridge.app_v2_events(sess, _FakeReq(),
+                resp = await bridge.app_v2_events(_FakeReq(), sess,
                                                   since_seq=0, follow=True)
                 got = []
 
