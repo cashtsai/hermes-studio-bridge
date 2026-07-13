@@ -279,6 +279,59 @@ class ACPSession:
             except Exception:
                 pass
 
+    async def reset(self):
+        """Retire a stuck ACP process; the next turn starts and reloads it.
+
+        `session/cancel` is advisory. A provider can stop producing output
+        without ever completing the JSON-RPC request, leaving `prompt_stream`
+        and its per-persona lock occupied forever. Callers first cancel the
+        task that owns that lock, then use this method to discard the inert
+        process. `ensure_started()` restores the canonical Telegram session on
+        the next turn, so recovery does not create a second conversation.
+        """
+        async with self._start_lock:
+            proc = self.proc
+            reader = self._reader
+
+            if proc and proc.returncode is None:
+                try:
+                    proc.terminate()
+                except ProcessLookupError:
+                    pass
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=2.0)
+                except asyncio.TimeoutError:
+                    try:
+                        proc.kill()
+                    except ProcessLookupError:
+                        pass
+                    try:
+                        await asyncio.wait_for(proc.wait(), timeout=1.0)
+                    except (asyncio.TimeoutError, ProcessLookupError):
+                        pass
+
+            if reader and reader is not asyncio.current_task():
+                if not reader.done():
+                    reader.cancel()
+                try:
+                    await reader
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    pass
+
+            for fut in self._pending.values():
+                if not fut.done():
+                    fut.cancel()
+            self._pending.clear()
+            self.proc = None
+            self._reader = None
+            self.session_id = None
+            self._active_q = None
+            self._loaded_session = False
+            self._proved_alive = False
+            self._last_canonical_sid = None
+
     async def _attempt(self, text: str):
         """One session/prompt turn — yields (kind, val) items."""
         rid = self._next_id()
