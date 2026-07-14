@@ -61,6 +61,10 @@ _MAIN_LOOP = None
 # One SSE keepalive cadence for every streaming endpoint (issue #8: it was
 # 2s / 4s / 10s across chat, ccsessions and codexsessions for no reason).
 SSE_KEEPALIVE_SECS = 2.0
+# A persona provider may stay connected but emit no ACP events. The timeout is
+# deliberately configurable so the cleanup path can be exercised quickly in
+# regression tests while production keeps the five-minute ceiling.
+PERSONA_STALL_LIMIT_SECS = float(os.environ.get("PERSONA_STALL_LIMIT_SECS", "300"))
 
 # 工具步驟 cmd/路徑的截斷上限(#38 diff 卡缺口):140 會把深路徑攔腰砍斷,
 # app 的 diff chip 拿殘缺路徑去打 /filediff 就 404。所有 transcript/步驟
@@ -1591,6 +1595,20 @@ def _app_message_event(m: dict) -> dict:
             "message_id": m.get("id"), "payload": {"message": m}}
 
 
+def _canonical_reply_failure(reply: str) -> tuple[str, str, str] | None:
+    """Classify bridge-generated terminal replies for recovery clients.
+
+    A timeout is persisted as a canonical assistant message so every surface
+    sees it, but that does not make the turn successful. Returning `done` here
+    made Pocket hide its retry control and replay the same timed-out client id.
+    """
+    text = (reply or "").lower()
+    if ("回合逾時" in reply or "回應逾時" in reply
+            or "伺服器端 5 分鐘" in reply or "turn timed out" in text):
+        return "timeout", "回合逾時", "persona turn timed out"
+    return None
+
+
 def _app_turn_status(session: str, client_id: str | None = None,
                      acp_busy: bool = False) -> dict:
     """Current app-turn recovery status for the mobile client.
@@ -1608,25 +1626,35 @@ def _app_turn_status(session: str, client_id: str | None = None,
     acc = (state or {}).get("acc") or ""
     canonical_reply = _canon_reply_for_client(session, client_id) if client_id else None
     runner_error = (state or {}).get("runner_error") or (state or {}).get("stream_error") or ""
+    canonical_failure = _canonical_reply_failure(canonical_reply or "")
     in_flight = bool(task is not None and not task.done())
-    if canonical_reply:
+    if canonical_failure:
+        turn_state, label, canonical_error = canonical_failure
+    elif canonical_reply:
         turn_state, label = "done", "已同步"
+        canonical_error = ""
     elif in_flight:
         turn_state = "streaming" if acc else ("queued" if acp_busy else "running")
         label = (state or {}).get("step_label") or ("思考中" if acc else "處理中")
+        canonical_error = ""
     elif task is not None and task.done():
         turn_state, label = ("done", "已同步") if acc else ("stream_detached", "處理中")
+        canonical_error = ""
     elif acp_busy:
         turn_state, label = "running", "處理中"
+        canonical_error = ""
     else:
         turn_state, label = "idle", "閒置"
+        canonical_error = ""
+    status_error = (canonical_error if canonical_failure
+                    else ("" if canonical_reply else runner_error))
     elapsed = int(now - entry["ts"]) if entry and entry.get("ts") else None
     return {"session": session, "state": turn_state, "label": label,
             "in_flight": in_flight, "acp_busy": acp_busy,
             "elapsed_seconds": elapsed, "stale_seconds": elapsed,
             "output_chars": len(acc), "canonical_reply": bool(canonical_reply),
             "canonical_reply_chars": len(canonical_reply or ""),
-            "error": runner_error or None}
+            "error": status_error or None}
 
 
 # ───────────────────── SUBSESSIONS persistence (issue #5) ───────────────────
@@ -2474,7 +2502,8 @@ async def _persona_content_stream(model: str, prompt: str):
         finally:
             await q.put(("end", None))
 
-    asyncio.create_task(pump())
+    pump_task = asyncio.create_task(pump())
+    pump_stopped = False
     got_text = False
     completed = False
     thought_buf: list[str] = []
@@ -2508,15 +2537,41 @@ async def _persona_content_stream(model: str, prompt: str):
 
     import time as _t
     last_event = _t.monotonic()
-    STALL_LIMIT = 300
+
+    async def stop_pump(*, reset: bool) -> None:
+        """Stop the task that owns ACPSession._lock and optionally retire ACP."""
+        nonlocal pump_stopped
+        if pump_stopped:
+            return
+        pump_stopped = True
+        try:
+            await asyncio.wait_for(session.cancel(), timeout=2.0)
+        except Exception:
+            pass
+        if not pump_task.done():
+            pump_task.cancel()
+        try:
+            await asyncio.wait_for(pump_task, timeout=2.0)
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            reset = True
+        # A five-minute silent provider is not safe to reuse even when task
+        # cancellation released the Python lock: its RPC turn may still run.
+        if reset or session.is_busy():
+            try:
+                await session.reset()
+            except Exception:
+                pass
+
     try:
         while True:
             try:
                 kind, val = await asyncio.wait_for(q.get(), timeout=SSE_KEEPALIVE_SECS)
                 last_event = _t.monotonic()
             except asyncio.TimeoutError:
-                if _t.monotonic() - last_event > STALL_LIMIT:
-                    asyncio.create_task(session.cancel())
+                if _t.monotonic() - last_event > PERSONA_STALL_LIMIT_SECS:
+                    await stop_pump(reset=True)
                     yield ("content", "\n\n⚠️ 回合逾時(伺服器端 5 分鐘無回應),已中止。")
                     completed = True
                     break
@@ -2577,7 +2632,7 @@ async def _persona_content_stream(model: str, prompt: str):
             yield ("content", fs)
     finally:
         if not completed:
-            asyncio.create_task(session.cancel())
+            await stop_pump(reset=False)
 
 
 @app.post("/v1/chat/completions")
@@ -5518,6 +5573,26 @@ async def cc_session_archive(name: str, request: Request):
     return {"ok": True, "archived": True}
 
 
+@app.post("/ccsessions/{name}/login")
+async def cc_session_login(name: str, request: Request):
+    """Open Claude Code's official login flow for a managed session.
+
+    This endpoint is intentionally user initiated. It does not rotate tokens,
+    switch providers, or fall back to an API key; `ccsess login` owns the tmux
+    recovery needed to put `/login` into the correct Claude TUI.
+    """
+    _check_auth(request)
+    if not any(row[0] == name for row in _cc_conf_rows()):
+        raise http_err(404, "SESSION_NOT_FOUND", "unknown session")
+    out = (await _run_ccsess("login", name)).strip()
+    return {
+        "ok": True,
+        "session": name,
+        "action": "login",
+        "message": out or f"已在 {name} 開啟登入流程",
+    }
+
+
 def _pretrust_claude_dir(path: str):
     """Mark a directory as trusted in ~/.claude.json so Claude Code doesn't open
     a brand-new session on the "Do you trust the files in this folder?" dialog
@@ -5998,16 +6073,32 @@ async def _cc_paste_text(name: str, text: str) -> None:
         # 真的清空(live ❯ 之後還看得到貼文開頭 = 沒送出),沒清就補 Enter,
         # 最多三次。誤判補送的 Enter 對空 composer 是 no-op,安全。
         probe = text[:24].strip()
+        submitted = True
         if not rc_enter and probe:
-            for _ in range(3):
-                await asyncio.sleep(0.6)
+            for attempt in range(5):
+                await asyncio.sleep(0.8)
                 pane_now = await _cc_capture_pane_fresh(name)
                 marker = pane_now.rfind("❯")
                 if marker < 0 or probe not in pane_now[marker:]:
+                    submitted = True
                     break                            # composer 已清空 → 已送出
+                submitted = False
                 _log_event("cc_paste_enter_retry", session=name,
-                           text_chars=len(text))
+                           text_chars=len(text), attempt=attempt + 1)
                 await _tmux_run("send-keys", "-t", name, "Enter")
+        # 2026-07-14 草稿擱淺事故:重試耗盡後文字仍掛在輸入框(TUI 處於吃
+        # Enter 的狀態,如提示框/選取態),舊行為回 200 = 沉默失敗——手機
+        # 以為送出了,文字卻變成跨重開機的殭屍草稿,使用者的指令無聲蒸發。
+        # 改為誠實回 502:app 端會顯示送出失敗,使用者知道要重送。
+        if not submitted:
+            _log_event("cc_paste_not_submitted", session=name,
+                       text_chars=len(text))
+            raise http_err(502, "PASTE_NOT_SUBMITTED",
+                           "message pasted but Enter not accepted by the TUI",
+                           "text is stranded in the composer — session may be "
+                           "showing a prompt/overlay; resolve it and resend")
+    except HTTPException:
+        raise
     except Exception as e:  # noqa: BLE001
         _log_event("cc_paste_failed", session=name, text_chars=len(text),
                    step="exec", error=f"{type(e).__name__}: {str(e)[:160]}")
