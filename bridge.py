@@ -6073,16 +6073,32 @@ async def _cc_paste_text(name: str, text: str) -> None:
         # 真的清空(live ❯ 之後還看得到貼文開頭 = 沒送出),沒清就補 Enter,
         # 最多三次。誤判補送的 Enter 對空 composer 是 no-op,安全。
         probe = text[:24].strip()
+        submitted = True
         if not rc_enter and probe:
-            for _ in range(3):
-                await asyncio.sleep(0.6)
+            for attempt in range(5):
+                await asyncio.sleep(0.8)
                 pane_now = await _cc_capture_pane_fresh(name)
                 marker = pane_now.rfind("❯")
                 if marker < 0 or probe not in pane_now[marker:]:
+                    submitted = True
                     break                            # composer 已清空 → 已送出
+                submitted = False
                 _log_event("cc_paste_enter_retry", session=name,
-                           text_chars=len(text))
+                           text_chars=len(text), attempt=attempt + 1)
                 await _tmux_run("send-keys", "-t", name, "Enter")
+        # 2026-07-14 草稿擱淺事故:重試耗盡後文字仍掛在輸入框(TUI 處於吃
+        # Enter 的狀態,如提示框/選取態),舊行為回 200 = 沉默失敗——手機
+        # 以為送出了,文字卻變成跨重開機的殭屍草稿,使用者的指令無聲蒸發。
+        # 改為誠實回 502:app 端會顯示送出失敗,使用者知道要重送。
+        if not submitted:
+            _log_event("cc_paste_not_submitted", session=name,
+                       text_chars=len(text))
+            raise http_err(502, "PASTE_NOT_SUBMITTED",
+                           "message pasted but Enter not accepted by the TUI",
+                           "text is stranded in the composer — session may be "
+                           "showing a prompt/overlay; resolve it and resend")
+    except HTTPException:
+        raise
     except Exception as e:  # noqa: BLE001
         _log_event("cc_paste_failed", session=name, text_chars=len(text),
                    step="exec", error=f"{type(e).__name__}: {str(e)[:160]}")
