@@ -5573,6 +5573,26 @@ async def cc_session_archive(name: str, request: Request):
     return {"ok": True, "archived": True}
 
 
+@app.post("/ccsessions/{name}/login")
+async def cc_session_login(name: str, request: Request):
+    """Open Claude Code's official login flow for a managed session.
+
+    This endpoint is intentionally user initiated. It does not rotate tokens,
+    switch providers, or fall back to an API key; `ccsess login` owns the tmux
+    recovery needed to put `/login` into the correct Claude TUI.
+    """
+    _check_auth(request)
+    if not any(row[0] == name for row in _cc_conf_rows()):
+        raise http_err(404, "SESSION_NOT_FOUND", "unknown session")
+    out = (await _run_ccsess("login", name)).strip()
+    return {
+        "ok": True,
+        "session": name,
+        "action": "login",
+        "message": out or f"已在 {name} 開啟登入流程",
+    }
+
+
 def _pretrust_claude_dir(path: str):
     """Mark a directory as trusted in ~/.claude.json so Claude Code doesn't open
     a brand-new session on the "Do you trust the files in this folder?" dialog
