@@ -1496,10 +1496,14 @@ async def _event_or_statedb_wait_all(seen_ver: int,
 
 def _canon_add(session: str, role: str, content: str, attachments=None,
                mid: str | None = None, status: str = "done",
-               client_id: str | None = None) -> tuple[str, bool]:
+               client_id: str | None = None, created_at: float | None = None,
+               push: bool = True) -> tuple[str, bool]:
+    # created_at:TG 鏡像 ingest 帶事件原始時間戳 —— 重放同一事件落同一
+    # (mid, ts),不會把訊息「頂」到現在。push=False:TG 端已送達的回覆
+    # 不再推播(否則同一句話 TG 通知 + Pocket 通知各一次)。
     import sqlite3
     mid = mid or uuid.uuid4().hex
-    now = time.time()
+    now = created_at if created_at is not None else time.time()
     try:
         con = sqlite3.connect(CANON_DB)
         con.execute("INSERT OR REPLACE INTO messages"
@@ -1517,7 +1521,7 @@ def _canon_add(session: str, role: str, content: str, attachments=None,
             "attachments": attachments or [], "ts": now, "status": status,
             "client_id": client_id, "source": "app"}])
         # P1-3:人格完成一則回覆 → 推播把你叫回 app(前景由 app willPresent 抑制)。
-        if role == "assistant" and status == "done":
+        if push and role == "assistant" and status == "done":
             _push_persona_reply(session, content)
         return mid, True
     except Exception as e:  # noqa: BLE001
@@ -6210,6 +6214,73 @@ async def cc_session_hook(request: Request):
     return {"ok": True, "session": name, "busy": state["busy"], "source": "hook"}
 
 
+# ── TG→Pocket 鏡像 ingest(XW-BRIDGE-TGMIRROR-20260714-340A)─────────────
+# 四個 hermes gateway 的 pocket_mirror hook(hermes-agent home*/hooks/
+# pocket_mirror/handler.py)對每則 TG 往來 POST 一筆事件到這裡:
+# inbound(agent:start, role=user)= 使用者在 TG 說的話;
+# outbound(agent:end, role=assistant)= 人格的 TG 回覆。
+# 寫進 canonical store 後,GET /app/v1/messages 與卡片流的三來源合併
+# 自然把它帶進 Pocket 人格對話,不用等 state.db watcher 的掃描週期。
+#
+# 冪等/防回聲雙寫(這條路和 state.db 掃描是同一則訊息的兩個來源):
+# 1. mid 由事件內容決定(tgm-<sha1(session|chat|thread|anchor|role|
+#    content-hash)>)→ hook 重送/重放同一事件 INSERT OR REPLACE 落同一列。
+# 2. state.db 掃出的同一則訊息由合併端 10 分鐘同文壓重擋掉(_tg_dup,
+#    雙 role — 見 _hp_merged_messages / GET /app/v1/messages)。
+# 3. user 內容先過 _tg_extract_attachments + _tg_clean_content —— 與
+#    _persona_history 的 state.db 讀取路徑同一套清洗,兩條路落出同一種
+#    文字,同文壓重才對得上。
+@app.post("/internal/v1/mirror/telegram-event")
+async def tg_mirror_event(request: Request):
+    host = _client_host(request)
+    if host not in ("127.0.0.1", "::1", "localhost"):
+        _check_auth(request)
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        body = None
+    if not isinstance(body, dict):
+        return {"ok": True, "ignored": True, "reason": "bad_body"}
+    if (body.get("platform") or "") != "telegram":
+        return {"ok": True, "ignored": True, "reason": "platform"}
+    session = str(body.get("session") or "")
+    role = str(body.get("role") or "")
+    content = str(body.get("content") or "")
+    if session not in PERSONAS:
+        _log_event("tg_mirror_unknown_session", session=session)
+        return {"ok": True, "ignored": True, "reason": "session"}
+    if role not in ("user", "assistant"):
+        return {"ok": True, "ignored": True, "reason": "role"}
+    attachments: list = []
+    if role == "user":
+        content, attachments = _tg_extract_attachments(content)
+        content = _tg_clean_content(content) or ""
+    if not content.strip() and not attachments:
+        # 整條都是 runtime 注入(剝完全空)或 gateway 送了空事件 → 不落地。
+        return {"ok": True, "ignored": True, "reason": "empty"}
+    try:
+        ts = float(body.get("ts") or 0)
+    except Exception:  # noqa: BLE001
+        ts = 0.0
+    now = time.time()
+    if not (now - 86400 * 366 < ts < now + 3600):
+        ts = now      # 時間戳缺席/離譜(時鐘歪掉)→ 用收件時間,別排進遠古
+    # anchor = gateway 的 reply-anchor message_id(inbound/outbound 同一turn
+    # 共用,role 區分)。缺席時退回 10 分鐘時間桶 —— 不同回合的同文不能
+    # 互相覆蓋,而 hook 重放帶原 ts,同桶仍冪等。
+    chash = hashlib.sha1(content.encode("utf-8", "replace")).hexdigest()
+    anchor = str(body.get("message_id") or "") or f"t{int(ts // 600)}"
+    basis = "|".join((session, str(body.get("chat_id") or ""),
+                      str(body.get("thread_id") or ""), anchor, role, chash))
+    mid = "tgm-" + hashlib.sha1(basis.encode("utf-8")).hexdigest()[:24]
+    _, ok = _canon_add(session, role, content, attachments, mid=mid,
+                       created_at=ts, push=False)
+    _log_event("tg_mirror_event", session=session, role=role, stored=ok,
+               mid=mid, event_type=str(body.get("event_type") or ""),
+               content_chars=len(content), attachment_count=len(attachments))
+    return {"ok": ok, "session": session, "id": mid, "stored": ok}
+
+
 async def _cc_status_core(name: str) -> dict:
     """CC session 的 busy/mode/prompt 判讀 — /ccsessions status 端點與
     Phase 0 卡片 follower 共用同一份真相。"""
@@ -7176,15 +7247,18 @@ def _hp_merged_messages(session: str, limit: int = 200):
     _, home = PERSONAS[session]
     def _steps_stripped(t: str) -> str:
         return re.sub(r"<details>.*?</details>", "", t or "", flags=re.S).strip()
-    canon_assist = [((m.get("ts") or 0), _steps_stripped(m.get("content") or ""))
-                    for m in out if m.get("role") == "assistant"]
+    # 雙 role 同文壓重:assistant 是 app 回合雙寫(canonical+state.db)的老
+    # 案例;user 是 TG 鏡像 ingest(/internal/v1/mirror/telegram-event)落
+    # canonical 後,state.db 掃描會再掃到同一句 —— 同 role+同文+10 分鐘內
+    # 視為同一則,壓掉 tg 側。app 端純 TG 舊訊息(canonical 無副本)不受影響。
+    canon_recent = [((m.get("ts") or 0), m.get("role"),
+                     _steps_stripped(m.get("content") or ""))
+                    for m in out if m.get("role") in ("user", "assistant")]
     def _tg_dup(m) -> bool:
-        if m["role"] != "assistant":
-            return False
         body = _steps_stripped(m["content"])
         ts = m["ts"] or 0
-        return bool(body) and any(c == body and abs(ts - cts) < 600
-                                  for cts, c in canon_assist)
+        return bool(body) and any(r == m["role"] and c == body and abs(ts - cts) < 600
+                                  for cts, r, c in canon_recent)
     try:
         for m in _persona_history(home, limit):
             if _tg_dup(m):
@@ -8784,23 +8858,24 @@ async def app_get_messages(session: str, request: Request, limit: int = 200):
         raise http_err(400, "SESSION_NOT_FOUND", "unknown session")
     out = _canon_messages(session, limit)
     _, home = PERSONAS[session]
-    # app 回合的 assistant 回覆會在兩個來源各留一份:canonical store(正文+
-    # 〈🔧 執行步驟〉摺疊附錄、帶 client_id)與 Hermes state.db(乾淨正文、
-    # tg-* id、無 client_id)。兩份文字不同 → app 端按文字去重必然失敗,同
-    # 一回覆畫面出現兩顆氣泡。在源頭壓掉 tg 側重複:剝附錄後正文相同、且
-    # 時間差 10 分鐘內,視為同一回合。純 TG 對話(canonical 無該回合)與
-    # 相隔久遠的同文回覆不受影響。
+    # 同一則訊息會在兩個來源各留一份:
+    # - assistant:app 回合寫 canonical(正文+〈🔧 執行步驟〉摺疊附錄、帶
+    #   client_id)、Hermes state.db 另存乾淨正文(tg-* id、無 client_id)。
+    # - user:TG 鏡像 ingest(/internal/v1/mirror/telegram-event)落 canonical
+    #   (tgm-* id)後,state.db 掃描會再掃到同一句。
+    # 兩份文字/ID 不同 → app 端按文字去重必然失敗,同一句畫面出現兩顆氣泡。
+    # 在源頭壓掉 tg 側重複:同 role、剝附錄後正文相同、時間差 10 分鐘內,
+    # 視為同一則。純 TG 對話(canonical 無副本)與相隔久遠的同文不受影響。
     def _steps_stripped(t: str) -> str:
         return re.sub(r"<details>.*?</details>", "", t or "", flags=re.S).strip()
-    canon_assist = [((m.get("ts") or 0), _steps_stripped(m.get("content") or ""))
-                    for m in out if m.get("role") == "assistant"]
+    canon_recent = [((m.get("ts") or 0), m.get("role"),
+                     _steps_stripped(m.get("content") or ""))
+                    for m in out if m.get("role") in ("user", "assistant")]
     def _tg_dup(m) -> bool:
-        if m["role"] != "assistant":
-            return False
         body = _steps_stripped(m["content"])
         ts = m["ts"] or 0
-        return bool(body) and any(c == body and abs(ts - cts) < 600
-                                  for cts, c in canon_assist)
+        return bool(body) and any(r == m["role"] and c == body and abs(ts - cts) < 600
+                                  for cts, r, c in canon_recent)
     for m in _persona_history(home, limit):
         if _tg_dup(m):
             continue
