@@ -5125,8 +5125,45 @@ def _cc_latest_jsonl(workdir: str):
 _CC_SID_RE = re.compile(r"--(?:resume|session-id)\s+([0-9a-fA-F][0-9a-fA-F-]{7,63})")
 _CC_SID_CACHE: dict = {}   # name -> (cached_at_monotonic, sid_or_None)
 _CC_SID_TTL = 30.0         # claude 行程在 session 生命週期內穩定;None 也快取避免狂掃
+_CC_SID_PINS: dict[str, str] = {}     # name -> hook-confirmed current sid
+_CC_SID_HISTORY: dict[str, list[str]] = {}  # name -> recent known sid chain
+_CC_SID_HISTORY_MAX = 8
 _PS_SNAP = (0.0, {})       # (cached_at, {pid: (ppid, command)})
 _PS_SNAP_TTL = 5.0
+
+
+def _cc_valid_sid(sid: str | None) -> bool:
+    return bool(re.fullmatch(r"[0-9a-fA-F][0-9a-fA-F-]{7,63}", sid or ""))
+
+
+def _cc_note_sid(name: str, sid: str | None) -> None:
+    if not name or not _cc_valid_sid(sid):
+        return
+    hist = _CC_SID_HISTORY.setdefault(name, [])
+    if sid in hist:
+        hist.remove(sid)
+    hist.append(str(sid))
+    del hist[:-_CC_SID_HISTORY_MAX]
+
+
+def _cc_cache_sid(name: str, sid: str | None, *, now: float | None = None,
+                  pin: bool = False) -> None:
+    now = time.monotonic() if now is None else now
+    _CC_SID_CACHE[name] = (now, sid)
+    _cc_note_sid(name, sid)
+    if pin and _cc_valid_sid(sid):
+        _CC_SID_PINS[name] = str(sid)
+
+
+def _cc_write_resume_pin(name: str, sid: str) -> None:
+    if not name or not _cc_valid_sid(sid):
+        return
+    pdir = os.path.expanduser("~/.config/ccsess/resume")
+    os.makedirs(pdir, exist_ok=True)
+    ptmp = os.path.join(pdir, name + ".tmp")
+    with open(ptmp, "w") as f:
+        f.write(sid + "\n")
+    os.replace(ptmp, os.path.join(pdir, name))
 
 
 async def _ps_snapshot():
@@ -5157,6 +5194,10 @@ async def _ps_snapshot():
 async def _cc_pane_session_id(name: str):
     """tmux pane 子行程樹裡 claude 的 --resume/--session-id uuid;失敗回 None。"""
     now = time.monotonic()
+    pinned = _CC_SID_PINS.get(name)
+    if pinned:
+        _cc_cache_sid(name, pinned, now=now)
+        return pinned
     hit = _CC_SID_CACHE.get(name)
     if hit and now - hit[0] < _CC_SID_TTL:
         return hit[1]
@@ -5184,7 +5225,7 @@ async def _cc_pane_session_id(name: str):
                 stack.extend(kids.get(pid, []))
     except Exception:  # noqa: BLE001
         sid = None
-    _CC_SID_CACHE[name] = (now, sid)
+    _cc_cache_sid(name, sid, now=now)
     return sid
 
 
@@ -6224,6 +6265,111 @@ _CC_OPT_NUM_RE = re.compile(r"^(\d+)[.)]\s+(.{1,60})$")
 _CC_OPT_LABEL_RE = re.compile(r"^(allow once|always allow|don.t allow|allow|deny|yes,|yes\b|no,|no\b)", re.IGNORECASE)
 
 
+def _cc_jsonl_sid(path: str | None) -> str:
+    base = os.path.basename(str(path or ""))
+    if not base.endswith(".jsonl"):
+        return ""
+    sid = base[:-len(".jsonl")]
+    return sid if _cc_valid_sid(sid) else ""
+
+
+def _cc_hook_transcript_path(body: dict) -> str:
+    return str(body.get("transcript_path") or body.get("transcriptPath") or "").strip()
+
+
+def _cc_hook_sid(body: dict) -> tuple[str, str]:
+    hook_sid = str(body.get("session_id") or "").strip()
+    path_sid = _cc_jsonl_sid(_cc_hook_transcript_path(body))
+    if hook_sid and not _cc_valid_sid(hook_sid):
+        return "", "bad_sid"
+    if hook_sid and path_sid and hook_sid != path_sid:
+        return "", "sid_transcript_mismatch"
+    return hook_sid or path_sid, ""
+
+
+def _cc_transcript_path_matches_cwd(path: str, cwd: str | None) -> bool:
+    if not path or not cwd:
+        return True
+    try:
+        real_path = os.path.realpath(os.path.expanduser(path))
+        expected_dir = os.path.realpath(_cc_project_dir(_norm_cc_workdir(cwd)))
+        if os.path.dirname(real_path) == expected_dir:
+            return True
+        meta = _cchist_meta(real_path)
+        if meta and _norm_cc_workdir(meta.get("cwd") or "") == _norm_cc_workdir(cwd):
+            return True
+    except Exception:  # noqa: BLE001
+        return False
+    return False
+
+
+def _cc_unique_names(names: list[str]) -> list[str]:
+    out, seen = [], set()
+    for name in names:
+        if name and name not in seen:
+            seen.add(name)
+            out.append(name)
+    return out
+
+
+async def _cc_busy_hook_candidates(names: list[str], *, attempts: int = 6,
+                                   delay: float = 0.35) -> list[str]:
+    """For same-cwd hooks, sample live panes briefly and return busy names.
+
+    UserPromptSubmit can reach the bridge just before the TUI paints its spinner,
+    so a short bounded poll is a better discriminator than a single cached pane.
+    """
+    for i in range(max(1, attempts)):
+        busy = []
+        for name in names:
+            try:
+                if _cc_pane_busy(await _cc_capture_pane_fresh(name)):
+                    busy.append(name)
+            except Exception:  # noqa: BLE001
+                continue
+        busy = _cc_unique_names(busy)
+        if busy or i == attempts - 1:
+            return busy
+        await asyncio.sleep(delay)
+    return []
+
+
+async def _cc_disambiguate_hook_name(body: dict, names: list[str],
+                                     hook_sid: str) -> tuple[str | None, str]:
+    names = _cc_unique_names(names)
+    if not names:
+        return None, "no_cwd_candidate"
+    if len(names) == 1:
+        return names[0], "cwd_unique"
+    if hook_sid:
+        matched = []
+        for name in names:
+            cached_sid = (_CC_SID_CACHE.get(name) or (0, None))[1]
+            if (cached_sid == hook_sid or _CC_SID_PINS.get(name) == hook_sid
+                    or hook_sid in (_CC_SID_HISTORY.get(name) or [])):
+                matched.append(name)
+        matched = _cc_unique_names(matched)
+        if len(matched) == 1:
+            return matched[0], "sid_history"
+        if len(matched) > 1:
+            return None, "sid_history_ambiguous"
+    event = body.get("hook_event_name")
+    if event == "Stop":
+        active = [n for n in names if (_cc_fresh_hook_state(n) or {}).get("busy")]
+        active = _cc_unique_names(active)
+        if len(active) == 1:
+            return active[0], "fresh_busy_state"
+        if len(active) > 1:
+            return None, "fresh_busy_state_ambiguous"
+    if event == "UserPromptSubmit":
+        busy = await _cc_busy_hook_candidates(names)
+        if len(busy) == 1:
+            return busy[0], "pane_busy"
+        if len(busy) > 1:
+            return None, "pane_busy_ambiguous"
+    return None, "ambiguous_same_cwd"
+
+
 def _cc_prompt(pane: str):
     """Detect a Claude Code interactive choice prompt so the app can render real
     buttons. Returns {kind,title,options:[{key,label}]} or None.
@@ -6298,34 +6444,31 @@ async def cc_session_hook(request: Request):
     event = body.get("hook_event_name")
     if event not in ("UserPromptSubmit", "Stop"):
         return {"ok": True, "ignored": True}
-    # 同 workdir 撞名時用 hook 原生帶的 session_id 消歧(身分混淆修正);
-    # 並順手把權威 sid 回寫 _CC_SID_CACHE —— 這同時補上「TUI 內 /clear 或
-    # /resume 後 cmdline uuid 過期」的洞:hook 每回合都帶最新 sid。
-    hook_sid = str(body.get("session_id") or "")
+    # 同 workdir 撞名時只在能唯一消歧時才把 hook 記到某個 name;拒絕
+    # names[:1] 猜測,避免 Main/cc-* 同 cwd 時把 busy 與 sid 寫到錯的 session。
+    hook_sid, sid_error = _cc_hook_sid(body)
+    if sid_error:
+        return {"ok": True, "ignored": True, "reason": sid_error}
+    transcript_path = _cc_hook_transcript_path(body)
+    if transcript_path and not _cc_transcript_path_matches_cwd(
+            transcript_path, body.get("cwd")):
+        return {"ok": True, "ignored": True, "reason": "transcript_cwd_mismatch"}
     all_names = _cc_names_for_cwd(body.get("cwd"))
-    names = all_names
-    sid_matched = False
-    if len(names) > 1 and hook_sid:
-        matched = [n for n in names
-                   if (_CC_SID_CACHE.get(n) or (0, None))[1] == hook_sid]
-        sid_matched = bool(matched)
-        names = matched or names[:1]
-    name = names[0] if names else None
+    name, resolution = await _cc_disambiguate_hook_name(body, all_names, hook_sid)
     if not name:
-        return {"ok": True, "ignored": True}
-    if hook_sid and (len(all_names) == 1 or sid_matched):
-        # 身分有把握(workdir 唯一,或 sid 對上快取)→ hook sid 是權威:
-        # 回寫 _CC_SID_CACHE(修 /clear /resume 後 cmdline uuid 過期),並
-        # 原子落 resume pin —— 重開機後 ensure 走 --resume 精準接回這條對話,
-        # 不再靠 --continue 按目錄猜(同目錄多 session 會互搶)。
-        _CC_SID_CACHE[name] = (time.monotonic(), hook_sid)
+        _log_event("cc_hook_ambiguous",
+                   hook_event_name=event,
+                   candidate_count=len(all_names),
+                   reason=resolution,
+                   hook_sid_hash=_short_hash(hook_sid),
+                   cwd_hash=_short_hash(str(body.get("cwd") or "")))
+        return {"ok": True, "ignored": True, "reason": resolution}
+    if hook_sid:
+        # 身分有把握 → hook sid 是權威。寫入 pin 後,即使 claude cmdline 還
+        # 掛著舊 --resume uuid,下一輪 _cc_pane_session_id 也不會把 cache 洗回去。
+        _cc_cache_sid(name, hook_sid, pin=True)
         try:
-            pdir = os.path.expanduser("~/.config/ccsess/resume")
-            os.makedirs(pdir, exist_ok=True)
-            ptmp = os.path.join(pdir, name + ".tmp")
-            with open(ptmp, "w") as f:
-                f.write(hook_sid + "\n")
-            os.replace(ptmp, os.path.join(pdir, name))
+            _cc_write_resume_pin(name, hook_sid)
         except Exception:  # noqa: BLE001
             pass
     now = time.time()
@@ -6337,6 +6480,8 @@ async def cc_session_hook(request: Request):
                name=name,
                hook_event_name=event,
                busy=state["busy"],
+               resolution=resolution,
+               hook_sid_hash=_short_hash(hook_sid),
                cwd_hash=_short_hash(str(body.get("cwd") or "")),
                last_assistant_message_chars=len(str(body.get("last_assistant_message") or "")))
     return {"ok": True, "session": name, "busy": state["busy"], "source": "hook"}
