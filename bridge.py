@@ -2788,6 +2788,7 @@ class CodexAppServerClient:
         self._reader_task = None
         self._stderr_task = None
         self.thread_events = collections.defaultdict(list)
+        self.thread_event_generations = collections.defaultdict(int)
         self.active_turns = {}
         self.last_event_at = {}
         self.thread_errors = {}
@@ -3372,6 +3373,7 @@ class CodexAppServerClient:
 
     async def start_turn(self, thread_id: str, input_items: list, client_id: str | None = None,
                          cwd: str | None = None):
+        self.thread_event_generations[thread_id] += 1
         self.thread_events[thread_id].clear()
         await self.ensure_thread_loaded(thread_id, cwd=cwd)
         params = {"threadId": thread_id, "input": input_items}
@@ -3663,6 +3665,14 @@ def _codex_history_invalidate(thread_id: str) -> None:
         _CODEX_HISTORY_CACHE.pop(k, None)
 
 
+def _codex_stream_turn_finished(seen_turn_activity: bool, active: bool,
+                                event_index: int, event_count: int) -> bool:
+    """A follow stream may stay open while idle, but once it has observed a
+    turn it must finish as soon as that turn reaches a terminal state and all
+    buffered events have been emitted."""
+    return seen_turn_activity and not active and event_index >= event_count
+
+
 async def _codex_warm_threads(thread_ids: list) -> None:
     """B3 light warmup: pre-run thread/resume for the sessions the user is most
     likely to tap next, so entering one skips the cold load. Strictly
@@ -3769,11 +3779,20 @@ async def codex_session_archive(thread_id: str, request: Request):
     archived = body.get("archived", True)
     # Try the known method names in order (the app server build varies).
     last = None
-    for method, params in (
-        ("thread/archive/set", {"threadId": thread_id, "archived": archived}),
-        ("thread/setArchived", {"threadId": thread_id, "archived": archived}),
-        ("thread/archive", {"threadId": thread_id}),
-    ):
+    methods = (
+        (
+            ("thread/archive/set", {"threadId": thread_id, "archived": True}),
+            ("thread/setArchived", {"threadId": thread_id, "archived": True}),
+            ("thread/archive", {"threadId": thread_id}),
+        )
+        if archived
+        else (
+            ("thread/archive/set", {"threadId": thread_id, "archived": False}),
+            ("thread/setArchived", {"threadId": thread_id, "archived": False}),
+            ("thread/unarchive", {"threadId": thread_id}),
+        )
+    )
+    for method, params in methods:
         try:
             await CODEX_APP.call(method, params, timeout=15.0)
             return {"ok": True, "method": method}
@@ -4455,30 +4474,48 @@ async def codex_session_stream(thread_id: str, request: Request, replay: int = 2
         idx = 0
         if replay <= 0 and not CODEX_APP.is_active(thread_id):
             idx = len(CODEX_APP.events_for(thread_id))
+        event_generation = CODEX_APP.thread_event_generations[thread_id]
+        seen_turn_activity = CODEX_APP.is_active(thread_id)
         idle = 0
         idle_limit = 120 if follow else 0
         while True:
             if await request.is_disconnected():
                 break
             events = CODEX_APP.events_for(thread_id)
+            current_generation = CODEX_APP.thread_event_generations[thread_id]
+            if current_generation != event_generation:
+                event_generation = current_generation
+                idx = 0
+                seen_turn_activity = True
+            # Defensive fallback for buffer compaction or an older producer
+            # that clears the list without bumping the generation.
+            if idx > len(events):
+                idx = 0
+                seen_turn_activity = True
             while idx < len(events):
                 kind, val = events[idx]
                 idx += 1
                 c = _fmt_item(kind, val)
                 if c:
                     yield chunk({"content": c})
-            if not CODEX_APP.is_active(thread_id) and idx >= len(events) and not follow:
+            active = CODEX_APP.is_active(thread_id)
+            if active:
+                seen_turn_activity = True
+            if _codex_stream_turn_finished(seen_turn_activity, active,
+                                           idx, len(events)):
+                break
+            if not active and idx >= len(events) and not follow:
                 break
             await asyncio.sleep(0.5)
             idle += 1
             if idle >= max(1, int(SSE_KEEPALIVE_SECS / 0.5)):
                 idle = 0
                 yield ": keepalive\n\n"
-            if follow and idle_limit > 0 and not CODEX_APP.is_active(thread_id):
+            if follow and idle_limit > 0 and not active:
                 idle_limit -= 1
                 if idle_limit <= 0:
                     break
-            elif follow and CODEX_APP.is_active(thread_id):
+            elif follow and active:
                 idle_limit = 120
         yield chunk({}, finish="stop")
         yield "data: [DONE]\n\n"
