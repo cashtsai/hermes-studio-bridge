@@ -5070,6 +5070,16 @@ TMUX_BIN = "/opt/homebrew/bin/tmux" if os.path.exists("/opt/homebrew/bin/tmux") 
 _CC_HOOK_STATE: dict[str, dict] = {}
 _CC_HOOK_TTL = 600.0
 
+# P0 修復(2026-07-10,root cause #3 — "Escape 打錯 turn"):
+# 每個 session 一個單調遞增的 turn 世代編號,由 UserPromptSubmit hook 事件遞增
+# (代表一個新 turn 開始了)。_cc_interrupt_core 在自己的 3 次重試迴圈中,每次
+# 送出 Escape 前後都會比對這個世代編號 —— 如果編號在等待期間變了,代表原本
+# 想中斷的那個 turn 已經結束、一個新 turn 已經開始,這時再送 Escape 極可能誤
+# 打進新 turn 的 Bash 工具執行期間,讓 CLI 誤判為「使用者拒絕工具呼叫」,進而
+# 讓那個新 turn 掉進無限期等待使用者回覆的假死狀態(過去實測卡過 5.4 / 13.5
+# 小時)。偵測到世代已變就立刻停手,不再送下一次 Escape。
+_CC_TURN_GEN: dict[str, int] = {}
+
 # Hard ceiling for any single tmux invocation. tmux normally answers in ms; a
 # hung tmux server used to hang the handler (and its _BG_TASKS entry) forever.
 _TMUX_TIMEOUT = 15.0
@@ -6275,12 +6285,47 @@ async def cc_session_interrupt(name: str, request: Request):
 
 
 async def _cc_interrupt_core(name: str) -> dict:
-    """cc 中斷核心(Esc + 驗證重試 3 次)— v1 與 v2 統一路由共用。"""
+    """cc 中斷核心(Esc + 驗證重試 3 次)— v1 與 v2 統一路由共用。
+
+    P0 修復(2026-07-10,root cause #3 —「Escape 打錯 turn」):
+    之前這裡完全沒有機制確保 Escape 打中「當下正在跑的那個 turn」。3 次重試
+    迴圈横跨最多約 2.1 秒(3 × (送鍵 + 0.7s 觀察)),如果在這段時間裡原本的
+    turn 已經自然結束、且緊接著一個新 turn 開始了(UserPromptSubmit),後續的
+    Escape 就可能打進新 turn 的 Bash 工具執行期間,讓 CLI 誤判成「使用者中途
+    拒絕這次工具呼叫」,新 turn 因而進入無限期等待使用者回覆的假死狀態(過去
+    實測卡過 5.4 小時、13.5 小時)。
+
+    修法:兩層防護,擇一命中就不再盲送 Escape。
+      1) 送出第一個 Escape 前,若 hook 回報的 busy 狀態新鮮且為 False(代表
+         目前根本沒有活躍 turn),直接視為「沒有需要中斷的對象」並跳過整個
+         tmux 操作 —— 這同時涵蓋「使用者快速連按兩次停止鍵」:第一次已經真的
+         中斷成功並同步了 busy=False(見前次 P0 修復),第二次點擊此時應該
+         被判定為無事可做,而不是再送一個 Escape 去賭運氣。
+      2) 重試迴圈中,每次送出 Escape 之前、以及送出後等待驗證之前,都比對
+         _CC_TURN_GEN 的世代編號是否還等於呼叫開始時記下的 gen0。世代編號由
+         UserPromptSubmit hook 遞增,代表「一個新 turn 開始了」。只要世代變了
+         就代表原本要中斷的 turn 已經結束、新 turn 已經開始 —— 立刻停止重試,
+         不再送下一個 Escape,並在回應中標記 stale_turn=True 讓呼叫端知道這次
+         interrupt 沒有(也不應該)打中任何東西。
+    """
     if not await _tmux_alive(name):
         raise http_err(409, "SESSION_NOT_RUNNING", "session not running")
+    fresh = _cc_fresh_hook_state(name)
+    if fresh is not None and fresh.get("busy") is False:
+        # hook 有新鮮資料且明確說「不忙碌」→ 沒有活躍 turn 可中斷,不送 Escape。
+        _log_event("cc_interrupt", session=name, interrupted=True, attempts=0,
+                   reason="already_idle_per_hook")
+        return {"ok": True, "interrupted": True, "attempts": 0,
+                "reason": "already_idle"}
+    gen0 = _CC_TURN_GEN.get(name, 0)
     attempts = 0
     interrupted = False
+    stale = False
     for _ in range(3):
+        if _CC_TURN_GEN.get(name, 0) != gen0:
+            # 世代已變:原本要中斷的 turn 已結束、新 turn 已開始,不該再送 Escape。
+            stale = True
+            break
         attempts += 1
         rc, _, err = await _tmux_run("send-keys", "-t", name, "Escape")
         if rc:
@@ -6288,6 +6333,11 @@ async def _cc_interrupt_core(name: str) -> dict:
                            err[:200] or "interrupt failed")
         _PANE_CACHE.pop(name, None)              # the cached pane is now stale
         await asyncio.sleep(0.7)                 # let the TUI react before checking
+        if _CC_TURN_GEN.get(name, 0) != gen0:
+            # 送出後才變:接下來的 pane 忙碌判斷可能量到的是新 turn 的狀態,
+            # 不可信,不當作「打中原 turn」的證據,也不再送下一次 Escape。
+            stale = True
+            break
         pane = await _cc_capture_pane_fresh(name)
         if not _cc_pane_busy(pane):
             interrupted = True
@@ -6303,8 +6353,10 @@ async def _cc_interrupt_core(name: str) -> dict:
             "updated_at": time.time(),
             "source": "interrupt",
         }
-    _log_event("cc_interrupt", session=name, interrupted=interrupted, attempts=attempts)
-    return {"ok": True, "interrupted": interrupted, "attempts": attempts}
+    _log_event("cc_interrupt", session=name, interrupted=interrupted,
+               attempts=attempts, stale_turn=stale)
+    return {"ok": True, "interrupted": interrupted, "attempts": attempts,
+            "stale_turn": stale}
 
 
 # Claude Code's TUI shows a working spinner like "· Fermenting… (1m 51s · ↓ 6.5k
@@ -6436,6 +6488,11 @@ def _cc_hook_commit(name: str, event: str, body: dict, hook_sid: str,
              "source": "hook"}
     if event == "Stop":
         state["last_assistant_message"] = body.get("last_assistant_message")
+    if event == "UserPromptSubmit":
+        # P0 修復(root cause #3):新 turn 開始 → 世代編號 +1,讓仍在跑的
+        # _cc_interrupt_core 重試迴圈偵測「原目標 turn 已結束」,不再誤送
+        # Escape 進新 turn。放在 commit 統一寫入點 → 延後消歧路徑也會 bump。
+        _CC_TURN_GEN[name] = _CC_TURN_GEN.get(name, 0) + 1
     _CC_HOOK_STATE[name] = state
     _log_event("cc_hook_state",
                name=name,
