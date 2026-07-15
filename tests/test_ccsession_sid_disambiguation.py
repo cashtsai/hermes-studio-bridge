@@ -1,5 +1,6 @@
 """CC hook sid disambiguation for same-workdir Claude Code sessions."""
 
+import asyncio
 import os
 import sys
 import tempfile
@@ -81,8 +82,10 @@ class TestCCSessionSidDisambiguation(unittest.IsolatedAsyncioTestCase):
         ):
             result = await bridge.cc_session_hook(FakeHookRequest(body))
 
-            self.assertEqual(result["session"], self.cc_name)
-            self.assertTrue(result["busy"])
+            # busy 輪詢改為 hook 回應後的延後任務(claude 在 hook 回應前不會
+            # 開跑,同步輪詢等不到 spinner)——先拿到 deferred,再等背景任務收斂。
+            self.assertTrue(result["deferred"])
+            await asyncio.gather(*list(bridge._CC_HOOK_BG_TASKS))
             self.assertEqual(bridge._CC_HOOK_STATE[self.cc_name]["busy"], True)
             self.assertNotIn("Main", bridge._CC_HOOK_STATE)
             self.assertEqual(bridge._CC_SID_PINS[self.cc_name], self.cc_new_sid)
@@ -115,11 +118,14 @@ class TestCCSessionSidDisambiguation(unittest.IsolatedAsyncioTestCase):
             patch.object(bridge, "_cc_capture_pane_fresh", side_effect=fake_capture),
             patch.object(bridge, "_cc_write_resume_pin", return_value=None),
             patch.object(bridge, "_log_event", return_value=None),
+            patch.object(bridge, "_CC_HOOK_BUSY_POLL_ATTEMPTS", 2),
+            patch.object(bridge, "_CC_HOOK_BUSY_POLL_DELAY", 0.01),
         ):
             result = await bridge.cc_session_hook(FakeHookRequest(body))
+            self.assertTrue(result["deferred"])
+            # 兩個候選 pane 都閒置 → 延後輪詢也不敢認人,誰都不准被污染。
+            await asyncio.gather(*list(bridge._CC_HOOK_BG_TASKS))
 
-        self.assertTrue(result["ignored"])
-        self.assertEqual(result["reason"], "ambiguous_same_cwd")
         self.assertNotIn("Main", bridge._CC_HOOK_STATE)
         self.assertNotIn(self.cc_name, bridge._CC_HOOK_STATE)
         self.assertNotIn(self.cc_name, bridge._CC_SID_PINS)

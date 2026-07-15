@@ -6362,12 +6362,71 @@ async def _cc_disambiguate_hook_name(body: dict, names: list[str],
         if len(active) > 1:
             return None, "fresh_busy_state_ambiguous"
     if event == "UserPromptSubmit":
-        busy = await _cc_busy_hook_candidates(names)
-        if len(busy) == 1:
-            return busy[0], "pane_busy"
-        if len(busy) > 1:
-            return None, "pane_busy_ambiguous"
+        # UserPromptSubmit 送達時 claude 行程還卡在等這個 hook 的 HTTP 回應
+        # (hook 是 turn 開跑前同步執行的),TUI spinner 根本還沒畫出來——在
+        # handler 裡同步輪詢 busy 永遠等不到(2026-07-15 實測:全數落
+        # ambiguous_same_cwd)。改成 hook 回應後的延後輪詢,見
+        # _cc_hook_deferred_disambiguate。
+        return None, "needs_busy_poll"
     return None, "ambiguous_same_cwd"
+
+
+def _cc_hook_commit(name: str, event: str, body: dict, hook_sid: str,
+                    resolution: str) -> dict:
+    """消歧成功後的統一寫入:sid 快取+pin、busy 狀態、log。"""
+    if hook_sid:
+        # 身分有把握 → hook sid 是權威。寫入 pin 後,即使 claude cmdline 還
+        # 掛著舊 --resume uuid,下一輪 _cc_pane_session_id 也不會把 cache 洗回去。
+        _cc_cache_sid(name, hook_sid, pin=True)
+        try:
+            _cc_write_resume_pin(name, hook_sid)
+        except Exception:  # noqa: BLE001
+            pass
+    state = {"busy": event == "UserPromptSubmit", "updated_at": time.time(),
+             "source": "hook"}
+    if event == "Stop":
+        state["last_assistant_message"] = body.get("last_assistant_message")
+    _CC_HOOK_STATE[name] = state
+    _log_event("cc_hook_state",
+               name=name,
+               hook_event_name=event,
+               busy=state["busy"],
+               resolution=resolution,
+               hook_sid_hash=_short_hash(hook_sid),
+               cwd_hash=_short_hash(str(body.get("cwd") or "")),
+               last_assistant_message_chars=len(str(body.get("last_assistant_message") or "")))
+    return state
+
+
+# 延後 busy 輪詢的參數:hook 回 200 後 claude 才會開跑,spinner 通常在
+# ~0.5-2.5s 內出現;拉 8s 窗口涵蓋慢機器。測試會把這兩個值 patch 小。
+_CC_HOOK_BUSY_POLL_ATTEMPTS = 20
+_CC_HOOK_BUSY_POLL_DELAY = 0.4
+_CC_HOOK_BG_TASKS: set = set()   # 防 GC;done_callback 自清
+
+
+async def _cc_hook_deferred_disambiguate(body: dict, names: list[str],
+                                         hook_sid: str) -> None:
+    """UserPromptSubmit 的同 cwd 消歧延後版:等 hook 已回應、TUI 真正開跑
+    畫出 busy 後再輪詢候選 pane;唯一 busy 者即為事主。"""
+    try:
+        busy = _cc_unique_names(await _cc_busy_hook_candidates(
+            names, attempts=_CC_HOOK_BUSY_POLL_ATTEMPTS,
+            delay=_CC_HOOK_BUSY_POLL_DELAY))
+        if len(busy) == 1:
+            _cc_hook_commit(busy[0], "UserPromptSubmit", body, hook_sid,
+                            "pane_busy_deferred")
+            return
+        _log_event("cc_hook_ambiguous",
+                   hook_event_name="UserPromptSubmit",
+                   candidate_count=len(names),
+                   reason=("pane_busy_deferred_ambiguous" if busy
+                           else "pane_busy_deferred_none"),
+                   hook_sid_hash=_short_hash(hook_sid),
+                   cwd_hash=_short_hash(str(body.get("cwd") or "")))
+    except Exception as e:  # noqa: BLE001
+        _log_event("cc_hook_deferred_error", error=type(e).__name__,
+                   error_message=str(e)[:160])
 
 
 def _cc_prompt(pane: str):
@@ -6455,6 +6514,14 @@ async def cc_session_hook(request: Request):
         return {"ok": True, "ignored": True, "reason": "transcript_cwd_mismatch"}
     all_names = _cc_names_for_cwd(body.get("cwd"))
     name, resolution = await _cc_disambiguate_hook_name(body, all_names, hook_sid)
+    if not name and resolution == "needs_busy_poll":
+        # 同 cwd 多候選、快速判據都對不上 → 回應 hook 放行 claude 開跑,
+        # 背景任務等 spinner 出現後用「唯一 busy pane」認人。
+        task = asyncio.create_task(
+            _cc_hook_deferred_disambiguate(body, list(all_names), hook_sid))
+        _CC_HOOK_BG_TASKS.add(task)
+        task.add_done_callback(_CC_HOOK_BG_TASKS.discard)
+        return {"ok": True, "deferred": True, "reason": "busy_poll_deferred"}
     if not name:
         _log_event("cc_hook_ambiguous",
                    hook_event_name=event,
@@ -6463,27 +6530,7 @@ async def cc_session_hook(request: Request):
                    hook_sid_hash=_short_hash(hook_sid),
                    cwd_hash=_short_hash(str(body.get("cwd") or "")))
         return {"ok": True, "ignored": True, "reason": resolution}
-    if hook_sid:
-        # 身分有把握 → hook sid 是權威。寫入 pin 後,即使 claude cmdline 還
-        # 掛著舊 --resume uuid,下一輪 _cc_pane_session_id 也不會把 cache 洗回去。
-        _cc_cache_sid(name, hook_sid, pin=True)
-        try:
-            _cc_write_resume_pin(name, hook_sid)
-        except Exception:  # noqa: BLE001
-            pass
-    now = time.time()
-    state = {"busy": event == "UserPromptSubmit", "updated_at": now, "source": "hook"}
-    if event == "Stop":
-        state["last_assistant_message"] = body.get("last_assistant_message")
-    _CC_HOOK_STATE[name] = state
-    _log_event("cc_hook_state",
-               name=name,
-               hook_event_name=event,
-               busy=state["busy"],
-               resolution=resolution,
-               hook_sid_hash=_short_hash(hook_sid),
-               cwd_hash=_short_hash(str(body.get("cwd") or "")),
-               last_assistant_message_chars=len(str(body.get("last_assistant_message") or "")))
+    state = _cc_hook_commit(name, event, body, hook_sid, resolution)
     return {"ok": True, "session": name, "busy": state["busy"], "source": "hook"}
 
 
