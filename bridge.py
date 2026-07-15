@@ -2274,7 +2274,12 @@ def _report_msg_shape(r: dict) -> dict:
 
 
 def _report_messages(session: str, limit: int = 100):
-    return [_report_msg_shape(r) for r in _report_events(session, limit)]
+    """最新 limit 筆(newest_first)——舊版 ASC LIMIT 拿的是「史上最舊 limit 筆」,
+    report_events 一超過 limit,新報告就永遠進不了 preview/對話合併
+    (2026-07-15 修:人格列表與對話凍結在舊訊息的根因之一)。
+    呼叫端(preview 合併/兩處對話合併)都會事後按 ts 重排,順序不影響。"""
+    return [_report_msg_shape(r)
+            for r in _report_events(session, limit, newest_first=True)]
 
 
 def _clip_text(text: str, max_chars: int) -> str:
@@ -5334,17 +5339,62 @@ async def _tmux_alive(name: str) -> bool:
         return False
 
 
+_cc_tail_cache: dict = {}   # jsonl path -> (mtime, preview)
+
+
+def _cc_tail_preview(jsonl: str) -> str:
+    """Transcript 尾巴 64KB 反向掃,抽最後一則 user/assistant 可讀文字。
+    tool_result/系統包裹(list 無 text 塊、'<'開頭)自然跳過。"""
+    try:
+        size = os.path.getsize(jsonl)
+        with open(jsonl, "rb") as f:
+            if size > 65536:
+                f.seek(-65536, os.SEEK_END)
+            chunk = f.read().decode("utf-8", "replace")
+        for line in reversed(chunk.splitlines()):
+            try:
+                d = json.loads(line)
+            except Exception:  # noqa: BLE001
+                continue
+            if d.get("type") not in ("user", "assistant"):
+                continue
+            content = (d.get("message") or {}).get("content")
+            text = ""
+            if isinstance(content, str):
+                text = content
+            elif isinstance(content, list):
+                for blk in content:
+                    if isinstance(blk, dict) and blk.get("type") == "text" \
+                            and (blk.get("text") or "").strip():
+                        text = blk["text"]
+                        break
+            text = (text or "").strip()
+            if text and not text.startswith("<") and not text.startswith("Caveat:"):
+                return text[:160]
+    except Exception:  # noqa: BLE001
+        pass
+    return ""
+
+
 def _cc_last_activity(jsonl):
-    """Transcript mtime for the home recency sort. Just os.path.getmtime — no file
-    read/parse (the app shows YOUR last sent command from its local SentLog, so the
-    server needn't extract a preview). Cheap enough to run per-poll.
-    收 per-session jsonl(_cc_session_jsonl 解析),不再吃 dir-latest。"""
+    """(mtime, preview) — mtime 供 recency 排序;preview 改為真的從 transcript
+    尾巴抽最後訊息(2026-07-15 前這裡永遠回空字串,app 端 SentLog 優先又讓
+    列表凍結在「你上次從 app 送的那句」——終端機工作的 session 預覽永不更新)。
+    以 (path, mtime) 快取,檔案沒動就零讀取。"""
     if not jsonl:
         return (0.0, "")
     try:
-        return (os.path.getmtime(jsonl), "")
+        mtime = os.path.getmtime(jsonl)
     except Exception:  # noqa: BLE001
         return (0.0, "")
+    cached = _cc_tail_cache.get(jsonl)
+    if cached and cached[0] == mtime:
+        return (mtime, cached[1])
+    preview = _cc_tail_preview(jsonl)
+    if len(_cc_tail_cache) > 512:
+        _cc_tail_cache.clear()
+    _cc_tail_cache[jsonl] = (mtime, preview)
+    return (mtime, preview)
 
 
 _cc_head_cache: dict = {}   # jsonl path -> (sessionId, title)
