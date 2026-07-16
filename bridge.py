@@ -5181,6 +5181,39 @@ def _cc_write_resume_pin(name: str, sid: str) -> None:
     os.replace(ptmp, os.path.join(pdir, name))
 
 
+def _cc_reseed_pins_from_files() -> int:
+    """啟動時把 ~/.config/ccsess/resume/<name> 的 sid 重載回 _CC_SID_PINS。
+
+    根因(2026-07-16 cc-51a85f55 不同步案):`claude --resume <舊id>` 續聊會
+    寫進**新**的 session 檔,但行程 cmdline 永遠停在啟動時的 `--resume <舊id>`。
+    於是 _cc_pane_session_id 解 cmdline 拿到凍結的舊 sid,服務凍結的舊 jsonl。
+    hook(UserPromptSubmit)每回合帶真正當前 session_id 覆寫 _CC_SID_PINS 並
+    落地 resume-pin 檔來補這個洞——但 _CC_SID_PINS 是**記憶體態**,bridge 一
+    重啟就清空,直到該 session 下次送 prompt 才重建。這中間的盲窗會讓 app 顯示
+    舊內容(這次正是部署 scope-v2 重啟後、使用者剛好在盲窗內開 cc-51a85f55)。
+    修法:啟動即從 pin 檔 reseed,盲窗歸零;pin 指向的 jsonl 若不存在,
+    _cc_session_jsonl 仍會優雅 fallback,所以這裡只驗 sid 格式。"""
+    pdir = os.path.expanduser("~/.config/ccsess/resume")
+    seeded = 0
+    try:
+        names = os.listdir(pdir)
+    except Exception:  # noqa: BLE001
+        return 0
+    for name in names:
+        if name.endswith(".tmp"):
+            continue
+        try:
+            with open(os.path.join(pdir, name)) as f:
+                sid = f.read().strip()
+        except Exception:  # noqa: BLE001
+            continue
+        if _cc_valid_sid(sid):
+            _CC_SID_PINS[name] = sid
+            _cc_note_sid(name, sid)
+            seeded += 1
+    return seeded
+
+
 async def _ps_snapshot():
     global _PS_SNAP
     now = time.monotonic()
@@ -11020,6 +11053,14 @@ async def _start_log_rotation():
     task = asyncio.create_task(_log_rotation_loop())
     _BG_TASKS.add(task)
     task.add_done_callback(_BG_TASKS.discard)
+
+
+@app.on_event("startup")
+async def _reseed_cc_resume_pins():
+    # 重啟盲窗修復:把 hook 落地的 resume-pin 重載回記憶體,避免重啟後
+    # cmdline 解到凍結舊 sid(見 _cc_reseed_pins_from_files 註解)。
+    n = _cc_reseed_pins_from_files()
+    _log_event("cc_resume_pins_reseeded", count=n)
 
 
 @app.on_event("startup")
