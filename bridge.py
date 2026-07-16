@@ -5284,6 +5284,11 @@ def _cc_conf_rows():
 # these, so a foreign ccsess session's TUI prompt never reaches the app's審核中心
 # / push. One name per line.
 APP_OWNED_CC = os.path.join(os.path.dirname(CCSESS_CONF), "app-owned.txt")
+# 審核作用域 v2(2026-07-16):舊制「只掃 app 開的 session」在那批 session 死光
+# 後名單清空,watcher 六天零產出 —— 聊天窗選項卡/審核中心/推播整條斷炊。
+# 新制:enabled 的 ccsess 一律在作用域內,除非列進排除檔(一行一名,# 註解)。
+# app-owned 仍保留(app 開的必收,即使之後改預設也不受影響)。
+APPROVALS_EXCLUDE = os.path.join(os.path.dirname(CCSESS_CONF), "approvals-exclude.txt")
 
 
 def _cc_app_owned_names() -> set:
@@ -5292,6 +5297,20 @@ def _cc_app_owned_names() -> set:
             return {ln.strip() for ln in f if ln.strip() and not ln.startswith("#")}
     except Exception:  # noqa: BLE001
         return set()
+
+
+def _cc_approvals_excluded() -> set:
+    try:
+        with open(APPROVALS_EXCLUDE) as f:
+            return {ln.strip() for ln in f if ln.strip() and not ln.startswith("#")}
+    except Exception:  # noqa: BLE001
+        return set()
+
+
+def _cc_approval_scope_names() -> set:
+    """審核外送作用域 = (enabled ccsess ∪ app-owned) − 排除檔。"""
+    enabled = {name for name, _wd, en in _cc_conf_rows() if en == "1"}
+    return (enabled | _cc_app_owned_names()) - _cc_approvals_excluded()
 
 
 def _cc_mark_app_owned(name: str) -> None:
@@ -6923,13 +6942,14 @@ async def _cc_approval_watcher():
     可負擔;順帶把新鮮 pane 回填快取給首頁清單用。"""
     while True:
         await asyncio.sleep(_CC_APPROVAL_POLL_SECS)
-        owned = _cc_app_owned_names()   # 只推 app 自己開的 CC session 的審核
+        # 作用域 v2:enabled ccsess 一律掃(訂閱制),排除靠 approvals-exclude.txt。
+        # 舊制只掃 app-owned,那批 session 死光後名單空,watcher 靜默斷炊六天
+        # (2026-07-10~16 零 approval)——聊天窗選項卡/審核中心/推播整條跟著死。
+        scope = _cc_approval_scope_names()
         for name, _workdir, enabled in _cc_conf_rows():
             if enabled != "1":
                 continue
-            # daemon / 別處開的 ccsess(Culture Supply、Ops、FLiPER…)不進 app 審核中心、
-            # 不發推播。它們照常在 ccsess 跑,只是審核通知不外漏到這台 app。
-            if name not in owned:
+            if name not in scope:
                 continue
             try:
                 _PANE_CACHE.pop(name, None)   # 審核偵測不能吃舊畫面
