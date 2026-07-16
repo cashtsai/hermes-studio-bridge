@@ -6968,6 +6968,121 @@ def _cc_approval_create(name: str, prompt: dict) -> str:
     return aid
 
 
+# ── 2b:人格 choices 卡 → 審核中心(2026-07-16 XCash 拍板:所有 choices 卡進、
+#    中心只放決策鈕、純連結選項留聊天)。FLiPER 複審卡等走選擇閘道契約,原本只是
+#    人格報告/訊息、不進 approvals 表 → 中心看不到。這裡定期掃 report_events,把
+#    kind:choices 卡同步成 hermes pending 審核;決議時把選項 send 文字當人格回合送回。
+_HP_CHOICES_SCAN_WINDOW = 3 * 3600     # 只把近 3h 的卡建成審核(避免復活舊卡);
+_HP_CHOICES_TTL = 12 * 3600            # 建了之後 pending 最多留 12h(未決自動過期)。
+_HP_CHOICES_POLL_SECS = 30.0
+_HP_CHOICES_FENCE = "```studio-card"
+
+
+def _hp_extract_choices(content: str) -> dict | None:
+    """從內容抽第一張 kind:choices 的 studio-card;無/壞則 None。"""
+    if _HP_CHOICES_FENCE not in content or '"choices"' not in content:
+        return None
+    i = content.find(_HP_CHOICES_FENCE)
+    after = content[i + len(_HP_CHOICES_FENCE):]
+    end = after.find("```")
+    if end < 0:
+        return None
+    try:
+        card = json.loads(after[:end].strip())
+    except Exception:  # noqa: BLE001
+        return None
+    if not isinstance(card, dict) or card.get("kind") != "choices" or not card.get("options"):
+        return None
+    return card
+
+
+def _hp_choices_stable_id(persona: str, card: dict) -> str:
+    ref = str(card.get("ref") or card.get("title") or "")
+    return "hpc-" + hashlib.sha1(f"{persona}|{ref}".encode("utf-8", "replace")).hexdigest()[:24]
+
+
+def _hp_choices_upsert(persona: str, card: dict) -> str | None:
+    """建一筆人格 choices 審核(session_id=hermes:{persona},kind=question)。只收
+    帶 send 的決策鈕(純連結選項有 url → 留聊天,不進中心)。已決議的同卡不復活。"""
+    import sqlite3
+    if persona not in PERSONAS:
+        return None
+    decision_opts = []
+    for o in card.get("options") or []:
+        if o.get("url"):
+            continue                                   # 純連結鈕不進中心(拍板)
+        key = str(o.get("key") or "").strip()
+        send = o.get("send") or o.get("label")
+        if not key or not send:
+            continue
+        decision_opts.append({"key": key, "label": str(o.get("label") or "")[:80],
+                              "style": o.get("style") or "primary", "send": str(send)})
+    if not decision_opts:
+        return None
+    aid = _hp_choices_stable_id(persona, card)
+    now = time.time()
+    con = sqlite3.connect(CANON_DB, timeout=30)
+    row = con.execute("SELECT status FROM approvals WHERE id=?", (aid,)).fetchone()
+    if row:
+        con.close()
+        return aid if row[0] == "pending" else None    # 已在/已決議 → 不重寫、不復活
+    title = str(card.get("title") or "需要你選擇")[:200]
+    detail = str(card.get("detail") or "")[:400]
+    con.execute("INSERT INTO approvals"
+                "(id,title,source,risk,detail,created_at,expires_at,status,decided_at,result,callback,"
+                "session_id,provider,kind,options) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (aid, title, f"hermes:{persona}", "low", detail,
+                 now, now + _HP_CHOICES_TTL, "pending", None, None, None,
+                 f"hermes:{persona}", "hermes", "question",
+                 json.dumps(decision_opts, ensure_ascii=False)))
+    con.commit()
+    con.close()
+    _log_event("hp_choices_approval_created", session=persona, approval_id=aid,
+               title=title[:60], options=len(decision_opts))
+    return aid
+
+
+def _hp_choices_scan() -> int:
+    """掃近 _HP_CHOICES_SCAN_WINDOW 的人格報告,把 choices 卡同步成審核。回新建數。"""
+    import sqlite3
+    since = time.time() - _HP_CHOICES_SCAN_WINDOW
+    try:
+        con = sqlite3.connect(CANON_DB, timeout=30)
+        rows = con.execute(
+            "SELECT session, content FROM report_events WHERE ts > ? "
+            "AND content LIKE '%```studio-card%' AND content LIKE '%\"choices\"%' "
+            "ORDER BY rowid DESC LIMIT 100", (since,)).fetchall()
+        con.close()
+    except Exception as e:  # noqa: BLE001
+        _log_event("hp_choices_scan_failed", error=str(e)[:160])
+        return 0
+    created, seen = 0, set()
+    for session, content in rows:
+        if session not in PERSONAS:
+            continue
+        card = _hp_extract_choices(content or "")
+        if not card:
+            continue
+        sid = _hp_choices_stable_id(session, card)
+        if sid in seen:
+            continue
+        seen.add(sid)
+        if _hp_choices_upsert(session, card):
+            created += 1
+    return created
+
+
+async def _hp_choices_watcher():
+    """常駐:定期把人格 choices 卡同步成審核中心 pending 列。"""
+    while True:
+        await asyncio.sleep(_HP_CHOICES_POLL_SECS)
+        try:
+            _hp_choices_scan()
+        except Exception as e:  # noqa: BLE001
+            _log_event("hp_choices_watcher_error", error=str(e)[:160])
+
+
 async def _cc_approval_watcher():
     """常駐:每 1.5s 巡一輪 owned CC sessions,強制拿新 pane(不吃 5s 快取)。
     舊配置(4s 間隔 + 5s 舊 pane)讓「prompt 出現→建 approval」最壞 ~9 秒;
@@ -10879,6 +10994,17 @@ async def _approval_decide_core(aid: str, b: dict) -> dict:
     if cb_row and cb_row[0]:
         asyncio.create_task(_approval_fire_callback(
             aid, cb_row[0], status, result_val, key=key))
+    # 2b:人格 choices 審核決議 → 把選項的 send 文字當人格回合送回(如 FLiPER
+    # 「解除待檢討」→ 送 "resume 386563" 給潘天晴,與聊天視窗點按鈕等效)。
+    if src.startswith("hermes:") and status == "answered":
+        persona = src.split(":", 1)[1]
+        chosen = next((o for o in options if str(o.get("key")) == key), None)
+        send_text = (chosen or {}).get("send")
+        if persona in PERSONAS and send_text:
+            asyncio.create_task(
+                _persona_inject_turn(persona, str(send_text), "approval-choice"))
+            _log_event("hp_choices_decision_relayed", session=persona,
+                       approval_id=aid, key=key)
     return {"id": aid, "status": status, "key": key}
 
 
@@ -11073,6 +11199,10 @@ async def _start_cc_approval_watcher():
     dtask = asyncio.create_task(_delegation_cc_watcher())
     _BG_TASKS.add(dtask)
     dtask.add_done_callback(_BG_TASKS.discard)
+    # 2b:人格 choices 卡 → 審核中心(30s 巡 report_events)
+    htask = asyncio.create_task(_hp_choices_watcher())
+    _BG_TASKS.add(htask)
+    htask.add_done_callback(_BG_TASKS.discard)
 
 
 @app.on_event("startup")
