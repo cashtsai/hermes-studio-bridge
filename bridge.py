@@ -6972,10 +6972,34 @@ def _cc_approval_create(name: str, prompt: dict) -> str:
 #    中心只放決策鈕、純連結選項留聊天)。FLiPER 複審卡等走選擇閘道契約,原本只是
 #    人格報告/訊息、不進 approvals 表 → 中心看不到。這裡定期掃 report_events,把
 #    kind:choices 卡同步成 hermes pending 審核;決議時把選項 send 文字當人格回合送回。
-_HP_CHOICES_SCAN_WINDOW = 3 * 3600     # 只把近 3h 的卡建成審核(避免復活舊卡);
+_HP_CHOICES_SCAN_WINDOW = 6 * 3600     # 掃近 6h 的卡(含已解除的,好把殭屍審核收掉);
 _HP_CHOICES_TTL = 12 * 3600            # 建了之後 pending 最多留 12h(未決自動過期)。
 _HP_CHOICES_POLL_SECS = 30.0
 _HP_CHOICES_FENCE = "```studio-card"
+
+# 即時待檢討真相來源:report 卡是快照,審核可能已在 FLiPER/TG 那邊解除(resume)。
+# 只靠 report 建審核會產生殭屍(2026-07-16 使用者回報:審查已結束卻還能按)。
+# review_pipeline.json 是 FLiPER 待檢討狀態機的落地檔(resume/hold 都寫它),
+# 用它驗證某貼文『當下是否真的還在 held(待檢討)』。
+FLIPER_REVIEW_STATE = os.path.expanduser(
+    "~/apps/lobster-tg/workspace/state/review_pipeline.json")
+
+
+def _fliper_review_state() -> dict | None:
+    """FLiPER 待檢討狀態(貼文 id → 記錄);讀不到回 None(狀態未知,不動作)。"""
+    try:
+        with open(FLIPER_REVIEW_STATE, encoding="utf-8") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _fliper_ref_held(state: dict, ref: str) -> bool:
+    """該貼文當下是否還在待檢討(任一審查階段 held=true)。"""
+    v = state.get(ref) if state else None
+    return bool(isinstance(v, dict)
+                and (v.get("first_review_held") or v.get("second_review_held")))
 
 
 def _hp_extract_choices(content: str) -> dict | None:
@@ -7043,10 +7067,32 @@ def _hp_choices_upsert(persona: str, card: dict) -> str | None:
     return aid
 
 
+def _hp_choices_expire(aid: str) -> None:
+    """把一筆殭屍 choices 審核收掉(已在 FLiPER 解除,不再需要決策)。"""
+    import sqlite3
+    try:
+        con = sqlite3.connect(CANON_DB, timeout=30)
+        cur = con.execute("UPDATE approvals SET status='expired', decided_at=? "
+                          "WHERE id=? AND status='pending'", (time.time(), aid))
+        con.commit()
+        n = cur.rowcount
+        con.close()
+        if n:
+            _log_event("hp_choices_approval_expired", approval_id=aid, reason="resolved_upstream")
+    except Exception as e:  # noqa: BLE001
+        _log_event("hp_choices_expire_failed", approval_id=aid, error=str(e)[:160])
+
+
 def _hp_choices_scan() -> int:
-    """掃近 _HP_CHOICES_SCAN_WINDOW 的人格報告,把 choices 卡同步成審核。回新建數。"""
+    """掃近 _HP_CHOICES_SCAN_WINDOW 的人格報告,同步 choices 卡到審核中心。
+    真相以 FLiPER review_pipeline.json 的即時 held 狀態為準:確實還在待檢討 → 建;
+    已解除 → 收掉殭屍。無法對映 FLiPER 貼文(非複審卡/查不到狀態)→ 保守不進中心
+    (避免無從得知解除的殭屍),那類卡的按鈕仍在聊天視窗可用。回新建數。"""
     import sqlite3
     since = time.time() - _HP_CHOICES_SCAN_WINDOW
+    state = _fliper_review_state()
+    if state is None:
+        return 0                            # 狀態未知 → 這輪不動作(不建、不亂 expire)
     try:
         con = sqlite3.connect(CANON_DB, timeout=30)
         rows = con.execute(
@@ -7064,12 +7110,18 @@ def _hp_choices_scan() -> int:
         card = _hp_extract_choices(content or "")
         if not card:
             continue
+        ref = str(card.get("ref") or "").strip()
+        if not ref or ref not in state:
+            continue                        # 非 FLiPER 貼文 / 查不到 → 不進中心
         sid = _hp_choices_stable_id(session, card)
         if sid in seen:
             continue
         seen.add(sid)
-        if _hp_choices_upsert(session, card):
-            created += 1
+        if _fliper_ref_held(state, ref):
+            if _hp_choices_upsert(session, card):
+                created += 1
+        else:
+            _hp_choices_expire(sid)         # 已解除 → 收掉殭屍(若存在且 pending)
     return created
 
 
