@@ -6898,6 +6898,69 @@ def _cc_prompt_sig(prompt: dict) -> str:
     return hashlib.sha1(raw.encode("utf-8", "replace")).hexdigest()[:16]
 
 
+def _cc_find_pending_aid(name: str, sig: str) -> str | None:
+    """重啟/記憶體遺失後,認領 DB 裡同一 live prompt 的既有 pending 審核。
+    背景:`_CC_APPROVAL_ACTIVE` 是行程內狀態,重啟即清空,但 DB 的 pending 列
+    還在;watcher 若 active=None 就盲建新 aid,App 手上的舊 aid 立刻變孤兒——
+    按了 `active.aid != aid` 吃 409、鍵送不進 TUI(2026-07-16 使用者回報「在
+    Pocket 按 CC 審核沒反應,得回 CC 裡按」的根因)。這裡以重建的 prompt sig
+    對映既有 pending 列;找到就認領該 aid(不另建),找不到回 None。"""
+    import sqlite3
+    try:
+        con = sqlite3.connect(CANON_DB, timeout=30)
+        rows = con.execute(
+            "SELECT id,title,options FROM approvals "
+            "WHERE source=? AND status='pending' ORDER BY created_at DESC",
+            (f"claude_code:{name}",)).fetchall()
+        con.close()
+    except Exception as e:  # noqa: BLE001
+        _log_event("cc_approval_adopt_query_error", session=name, error=str(e)[:160])
+        return None
+    for rid, title, options in rows:
+        try:
+            opts = json.loads(options) if options else []
+        except Exception:  # noqa: BLE001
+            opts = []
+        if _cc_prompt_sig({"title": title, "options": opts}) == sig:
+            return rid
+    return None
+
+
+def _cc_reseed_approvals_from_db() -> int:
+    """啟動時把 DB 的 pending CC 審核重新灌回 `_CC_APPROVAL_ACTIVE`,補上重啟
+    清空記憶體與 watcher 首巡(≤1.5s)之間的空窗。同一 session 多筆 pending 時
+    留最新一筆、其餘標 expired(收孤兒重複列)。回重灌筆數。"""
+    import sqlite3
+    try:
+        con = sqlite3.connect(CANON_DB, timeout=30)
+        rows = con.execute(
+            "SELECT id,source,title,options FROM approvals "
+            "WHERE source LIKE 'claude_code:%' AND status='pending' "
+            "ORDER BY created_at DESC").fetchall()
+        con.close()
+    except Exception as e:  # noqa: BLE001
+        _log_event("cc_approval_reseed_error", error=str(e)[:160])
+        return 0
+    seen: set = set()
+    n = 0
+    for rid, source, title, options in rows:
+        name = source.split(":", 1)[1] if ":" in source else source
+        if name in seen:
+            _cc_approval_set_status(rid, "expired")   # 同 session 舊的重複列 → 收掉
+            continue
+        seen.add(name)
+        try:
+            opts = json.loads(options) if options else []
+        except Exception:  # noqa: BLE001
+            opts = []
+        sig = _cc_prompt_sig({"title": title, "options": opts})
+        _CC_APPROVAL_ACTIVE[name] = {"aid": rid, "sig": sig}
+        n += 1
+    if n:
+        _log_event("cc_approval_reseeded", count=n)
+    return n
+
+
 def _cc_choice_key(prompt: dict, approve: bool) -> str:
     """approve 布林 → prompt option key。認得 allow/deny 字樣就精準選;
     認不得時 approve=第一個選項、deny=Esc(TUI 的通用取消)。"""
@@ -7168,6 +7231,15 @@ async def _cc_approval_watcher():
                                 resolved="expired")
                         except Exception as e:  # noqa: BLE001
                             _log_event("cc_cards_feed_error", error=str(e)[:160])
+                    # 記憶體沒有(常見於重啟後)→ 先認領 DB 既有的同一 prompt
+                    # pending 列,別另建新 aid 讓 App 手上的舊 aid 變孤兒(按了
+                    # 吃 409、TUI 收不到鍵)。認領到就沿用該 aid,不重推。
+                    adopted = _cc_find_pending_aid(name, sig)
+                    if adopted:
+                        _CC_APPROVAL_ACTIVE[name] = {"aid": adopted, "sig": sig}
+                        _log_event("cc_approval_adopted", session=name,
+                                   approval_id=adopted)
+                        continue
                     aid = _cc_approval_create(name, prompt)
                     _CC_APPROVAL_ACTIVE[name] = {"aid": aid, "sig": sig}
                     opts = " / ".join(str(o.get("label") or "")[:20]
@@ -11239,6 +11311,9 @@ async def _reseed_cc_resume_pins():
     # cmdline 解到凍結舊 sid(見 _cc_reseed_pins_from_files 註解)。
     n = _cc_reseed_pins_from_files()
     _log_event("cc_resume_pins_reseeded", count=n)
+    # 同源盲窗:`_CC_APPROVAL_ACTIVE` 也是行程內狀態,重啟即清空 → watcher
+    # 首巡前的空窗會把 App 手上舊 aid 的 CC 審核決議打成 409。先從 DB 灌回。
+    _cc_reseed_approvals_from_db()
 
 
 @app.on_event("startup")
