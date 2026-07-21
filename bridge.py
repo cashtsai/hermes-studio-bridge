@@ -5530,11 +5530,33 @@ async def _cc_sessions():
         jsonl = await _cc_session_jsonl(name, workdir)
         mtime, preview = _cc_last_activity(jsonl)
         sid, stitle = _cc_session_head(jsonl)
+        # Claude 標題(桌面 App rename 改的就是這個,存在終端 pane_title)→ app 當
+        # 副標題,主名仍是 ccsess 名。取不到就 None,不影響列表。
+        claude_title = await _cc_pane_title(name) if alive else None
         out.append({"name": name, "workdir": workdir,
                     "status": "running" if alive else "down", "busy": busy,
                     "awaiting": awaiting, "updatedAt": mtime, "preview": preview,
-                    "sessionId": sid, "sessionTitle": stitle})
+                    "sessionId": sid, "sessionTitle": stitle,
+                    "claudeTitle": claude_title})
     return out
+
+
+# CC session 顯示副標題:Claude(桌面 App rename / CLI 自動任務摘要)寫進終端標題,
+# tmux 存成 pane_title;前面帶狀態字元(✳ / braille spinner ⠂⠐ / ✓ …),剝掉取乾淨標題。
+_CC_TITLE_STRIP_RE = re.compile(r"^[\s☀-➿⠀-⣿·•⏺*]+")
+
+
+async def _cc_pane_title(name: str):
+    """這條 CC session 的 Claude 標題(終端 pane_title,剝掉前置狀態字元)。桌面
+    App 的 rename 改的就是這個。給 app 當副標題;取不到/空 → None。絕不 raise。"""
+    try:
+        rc, out, _ = await _tmux_run("display-message", "-t", name, "-p", "#{pane_title}")
+    except Exception:  # noqa: BLE001
+        return None
+    if rc != 0:
+        return None
+    t = _CC_TITLE_STRIP_RE.sub("", (out or "").strip()).strip()
+    return t or None
 
 
 def _blocks_text(content) -> str:
@@ -5690,6 +5712,58 @@ def _cc_scan_jsonl(jsonl):
                    error=type(e).__name__, error_message=str(e)[:120])
     _CC_JSONL_SCAN_CACHE[jsonl] = (jsonl, mt, usage, plan)
     return (usage, plan)
+
+
+def _cc_pending_ask(jsonl):
+    """讀 jsonl 尾巴,找「已發出但還沒被回答」的 AskUserQuestion(tool_use 無對應
+    tool_result)→ 回完整結構化 ask(問題全文 + 每個選項 label+description)。
+
+    這是 _cc_prompt 螢幕擷取的內容取代:終端只渲染截斷的 label(砍到終端寬/一行),
+    jsonl 的 tool_use input 有全文,app 才判斷得了(否則使用者得回 Claude app 看)。
+    偵測靠「tool_use 無 tool_result」比掃畫面錨點可靠(掃畫面在忙/捲動/多個 ask 連發
+    時會漏)。None = 沒有 pending ask。絕不 raise。"""
+    if not jsonl:
+        return None
+    try:
+        events = _cc_jsonl_tail_events(jsonl)
+    except Exception:  # noqa: BLE001
+        return None
+    answered = set()          # 已有 tool_result 的 tool_use_id
+    for d in events:
+        if d.get("type") != "user":
+            continue
+        c = (d.get("message") or {}).get("content")
+        if isinstance(c, list):
+            for b in c:
+                if isinstance(b, dict) and b.get("type") == "tool_result":
+                    tid = b.get("tool_use_id")
+                    if tid:
+                        answered.add(tid)
+    for d in reversed(events):
+        if d.get("type") != "assistant":
+            continue
+        for b in ((d.get("message") or {}).get("content") or []):
+            if (isinstance(b, dict) and b.get("type") == "tool_use"
+                    and b.get("name") == "AskUserQuestion"
+                    and b.get("id") not in answered):
+                qs = (b.get("input") or {}).get("questions") or []
+                if not qs:
+                    continue
+                q0 = qs[0]        # app 的 CCPrompt 是單問;多問先送第一題(multi 標記)
+                opts = []
+                for i, op in enumerate(q0.get("options") or []):
+                    if not isinstance(op, dict):
+                        continue
+                    opts.append({"key": str(i + 1),      # 對齊 TUI 選項編號(送鍵用)
+                                 "label": str(op.get("label") or "").strip(),
+                                 "description": str(op.get("description") or "").strip()})
+                if len(opts) < 2:
+                    continue
+                return {"kind": "menu", "semantic": "question",
+                        "title": str(q0.get("question") or "").strip(),
+                        "header": str(q0.get("header") or "").strip() or None,
+                        "options": opts, "multi": len(qs) > 1}
+    return None
 
 
 @app.get("/ccsessions")
@@ -6791,11 +6865,23 @@ async def _cc_status_core(name: str) -> dict:
     else:
         mode = "normal"
     prompt = _cc_prompt(pane)
-    st = {"busy": busy, "running": True, "mode": mode, "prompt": prompt}
     # wave 2: usage meter + full plan text from the transcript jsonl.
     row = next((r for r in _cc_conf_rows() if r[0] == name), None)
-    if row:
-        usage, plan = _cc_scan_jsonl(await _cc_session_jsonl(name, row[1]))
+    jsonl = await _cc_session_jsonl(name, row[1]) if row else None
+    # AskUserQuestion 完整內容(問題全文 + 選項 description)從 jsonl 讀,取代終端
+    # 截斷的螢幕擷取。pane-scrape 偵測到 question 選單 → 換成 jsonl 全文(修「太簡略」);
+    # pane 漏抓且沒在忙 → 也用 jsonl 補上(修「沒跳出來」);忙碌時不補,避免被跳脫的
+    # 殘留 ask 誤觸。權限 y/n(非 tool_use)仍走 pane-scrape。
+    if jsonl:
+        ask = _cc_pending_ask(jsonl)
+        if ask and (
+            (isinstance(prompt, dict) and prompt.get("semantic") == "question")
+            or (prompt is None and not busy)
+        ):
+            prompt = ask
+    st = {"busy": busy, "running": True, "mode": mode, "prompt": prompt}
+    if jsonl:
+        usage, plan = _cc_scan_jsonl(jsonl)
         if usage:
             st["usage"] = usage
         if prompt and plan and "plan" in low:
