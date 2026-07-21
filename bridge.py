@@ -5067,6 +5067,9 @@ async def persona_messages(persona: str, request: Request, limit: int = 100):
 
 CCSESS_CONF = os.path.expanduser(os.environ.get("CCSESS_CONF", "~/.config/ccsess/sessions.conf"))
 TMUX_BIN = "/opt/homebrew/bin/tmux" if os.path.exists("/opt/homebrew/bin/tmux") else "tmux"
+POCKET_CC_TMUX = os.environ.get("POCKET_CC_TMUX", "pocket-cc")
+POCKET_CX_TMUX = os.environ.get("POCKET_CX_TMUX", "pocket-cx")
+POCKET_AGENT_LANES = os.path.join(os.path.dirname(CCSESS_CONF), "pocket-agent-lanes.json")
 _CC_HOOK_STATE: dict[str, dict] = {}
 _CC_HOOK_TTL = 600.0
 
@@ -5898,6 +5901,187 @@ async def _cc_wait_ready(name: str, timeout: float = 12.0):
     return False
 
 
+def _pocket_lane_bindings() -> dict:
+    try:
+        with open(POCKET_AGENT_LANES, encoding="utf-8") as f:
+            d = json.load(f)
+            return d if isinstance(d, dict) else {}
+    except FileNotFoundError:
+        return {}
+    except Exception as e:  # noqa: BLE001
+        _log_event("pocket_lane_bindings_read_failed", error=str(e)[:160])
+        return {}
+
+
+def _pocket_lane_note(provider: str, tmux_name: str, native_id: str, cwd: str,
+                      title: str = "") -> None:
+    d = _pocket_lane_bindings()
+    d[provider] = {
+        "tmux": tmux_name,
+        "native_id": native_id,
+        "cwd": cwd,
+        "title": title,
+        "updated_at": time.time(),
+    }
+    try:
+        os.makedirs(os.path.dirname(POCKET_AGENT_LANES), exist_ok=True)
+        tmp = POCKET_AGENT_LANES + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(d, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, POCKET_AGENT_LANES)
+    except Exception as e:  # noqa: BLE001
+        _log_event("pocket_lane_bindings_write_failed",
+                   provider=provider, tmux=tmux_name, error=str(e)[:160])
+
+
+def _pocket_existing_dir(raw: str | None, fallback: str = HOME_ROOT) -> str:
+    for cand in (raw, fallback):
+        if not cand:
+            continue
+        wd = os.path.realpath(os.path.abspath(os.path.expanduser(str(cand))))
+        if os.path.isdir(wd):
+            return wd
+    raise http_err(409, "WORKDIR_MISSING",
+                   "session workdir does not exist",
+                   f"workdir missing: {raw or fallback or '(none)'}")
+
+
+async def _pocket_tmux_replace(name: str, cwd: str, argv: list[str]) -> None:
+    if await _tmux_alive(name):
+        rc, _, err = await _tmux_run("kill-session", "-t", name)
+        if rc != 0:
+            raise http_err(502, "TMUX_FAILED", "tmux kill-session failed",
+                           (err or "tmux kill-session failed")[:200])
+    rc, _, err = await _tmux_run("new-session", "-d", "-s", name, "-c", cwd, *argv)
+    if rc != 0:
+        raise http_err(502, "TMUX_FAILED", "tmux new-session failed",
+                       (err or "tmux new-session failed")[:200])
+    # Keep the lane visible/re-attachable even after the app disconnects or the
+    # agent exits, matching the manual `codex-current` recovery setup.
+    await _tmux_run("set-option", "-t", name, "remain-on-exit", "on")
+    await _tmux_run("set-option", "-t", name, "destroy-unattached", "off")
+    _PANE_CACHE.pop(name, None)
+
+
+async def _pocket_selected_cc(body: dict) -> tuple[str, str, str, str]:
+    sid = str(body.get("session_id") or body.get("sessionId")
+              or body.get("sid") or "").strip()
+    cwd = str(body.get("cwd") or body.get("workdir") or "").strip()
+    source_name = str(body.get("name") or body.get("session_name")
+                      or body.get("sessionName") or "").strip()
+    title = str(body.get("sessionTitle") or body.get("claudeTitle")
+                or body.get("title") or source_name or "").strip()
+
+    if source_name:
+        row = next((r for r in _cc_conf_rows() if r[0] == source_name), None)
+        if row:
+            cwd = cwd or row[1]
+            jsonl = await _cc_session_jsonl(source_name, row[1])
+            head_sid, head_title = _cc_session_head(jsonl)
+            if not _cc_valid_sid(sid):
+                sid = head_sid or sid
+            title = title or head_title or source_name
+
+    if not _cc_valid_sid(sid):
+        raise http_err(409, "SESSION_ID_MISSING",
+                       "Claude session id is required to bind the fixed lane",
+                       "this CC row has no resolved Claude session id yet")
+
+    if not cwd:
+        path = _cchist_find(sid)
+        meta = _cchist_meta(path) if path else None
+        cwd = (meta or {}).get("cwd") or ""
+        title = title or (meta or {}).get("title") or ""
+    cwd = _pocket_existing_dir(cwd, "")
+    return sid, cwd, title, source_name
+
+
+async def _pocket_activate_cc_lane(body: dict) -> dict:
+    sid, cwd, title, source_name = await _pocket_selected_cc(body)
+    lane = POCKET_CC_TMUX
+    if await _tmux_alive(lane):
+        current_sid = await _cc_pane_session_id(lane)
+        if current_sid == sid:
+            await _run_ccsess("register", lane, cwd)
+            _cc_write_resume_pin(lane, sid)
+            _cc_cache_sid(lane, sid, pin=True)
+            _cc_mark_app_owned(lane)
+            _pocket_lane_note("claude_code", lane, sid, cwd, title)
+            adopt_source = body.get("adopt_source", body.get("adoptSource", True)) is not False
+            if adopt_source and source_name and source_name != lane and await _tmux_alive(source_name):
+                rc, _, err = await _tmux_run("kill-session", "-t", source_name)
+                if rc != 0:
+                    _log_event("pocket_lane_source_kill_failed", source=source_name,
+                               tmux=lane, error=(err or "")[:160])
+            return {"name": lane, "workdir": cwd, "status": "running",
+                    "sessionId": sid, "sessionTitle": title or None}
+
+    _CC_HOOK_STATE.pop(lane, None)
+    _CC_SID_CACHE.pop(lane, None)
+    _CC_SID_PINS.pop(lane, None)
+    await _pocket_tmux_replace(lane, cwd, [CLAUDE_BIN, "--resume", sid])
+    await _run_ccsess("register", lane, cwd)
+    _cc_write_resume_pin(lane, sid)
+    _cc_cache_sid(lane, sid, pin=True)
+    _cc_mark_app_owned(lane)
+    ready = await _cc_wait_ready(lane)
+    _pocket_lane_note("claude_code", lane, sid, cwd, title)
+    adopt_source = body.get("adopt_source", body.get("adoptSource", True)) is not False
+    if adopt_source and source_name and source_name != lane and await _tmux_alive(source_name):
+        rc, _, err = await _tmux_run("kill-session", "-t", source_name)
+        if rc != 0:
+            _log_event("pocket_lane_source_kill_failed", source=source_name,
+                       tmux=lane, error=(err or "")[:160])
+
+    _log_event("pocket_lane_activate", provider="claude_code",
+               tmux=lane, native_hash=_short_hash(sid), cwd_hash=_short_hash(cwd))
+    return {"name": lane, "workdir": cwd,
+            "status": "running" if ready else "starting",
+            "sessionId": sid, "sessionTitle": title or None}
+
+
+async def _pocket_activate_cx_lane(body: dict) -> dict:
+    thread_id = str(body.get("thread_id") or body.get("threadId")
+                    or body.get("id") or "").strip()
+    if not thread_id:
+        raise http_err(400, "THREAD_ID_REQUIRED", "thread_id required")
+    cwd = _pocket_existing_dir(body.get("cwd") or body.get("workdir"), HOME_ROOT)
+    title = str(body.get("name") or body.get("title") or thread_id[:12] or "codex").strip()
+    lane = POCKET_CX_TMUX
+    binding = _pocket_lane_bindings().get("codex") or {}
+    if not (binding.get("native_id") == thread_id and await _tmux_alive(lane)):
+        await _pocket_tmux_replace(lane, cwd, [_resolve_codex_bin(), "resume", thread_id])
+    _pocket_lane_note("codex", lane, thread_id, cwd, title)
+    _log_event("pocket_lane_activate", provider="codex",
+               tmux=lane, native_hash=_short_hash(thread_id), cwd_hash=_short_hash(cwd))
+    return {"thread_id": thread_id, "session_id": None, "name": title, "workdir": cwd,
+            "preview": body.get("preview") or "", "status": "idle",
+            "source": "pocket-tmux", "updatedAt": None, "activeTurn": False}
+
+
+@app.post("/app/v1/agent-lanes/{provider}/activate")
+async def app_agent_lane_activate(provider: str, request: Request):
+    """Bind the provider's single Pocket lane to a native session.
+
+    Claude Code is fully tmux-driven: selecting any CC session resumes its
+    native Claude session id into the fixed `pocket-cc` ccsess. Codex keeps the
+    existing app-server control path, while this endpoint keeps `pocket-cx`
+    resumable/attachable to the selected native thread.
+    """
+    _check_auth(request)
+    body = await _json_body(request)
+    p = (provider or "").lower().replace("-", "_")
+    if p in ("cc", "claude", "claude_code"):
+        session = await _pocket_activate_cc_lane(body)
+        return {"ok": True, "provider": "claude_code", "tmux": POCKET_CC_TMUX,
+                "session": session}
+    if p in ("cx", "codex"):
+        session = await _pocket_activate_cx_lane(body)
+        return {"ok": True, "provider": "codex", "tmux": POCKET_CX_TMUX,
+                "session": session}
+    raise http_err(404, "PROVIDER_NOT_FOUND", "unknown agent lane provider")
+
+
 @app.post("/ccsessions")
 async def cc_session_create(request: Request):
     """Create + start a new Claude Code session."""
@@ -6223,10 +6407,7 @@ async def cc_history_resume(sid: str, request: Request):
                        (err or "tmux new-session failed")[:200])
     # conf 單一寫者:走 ccsess register(內含 conf 鎖),不再直接 append ——
     # 裸 append 會被 ccsess 端 mktemp+mv 全檔重寫蓋掉,或讓 rename 讀到半新不舊。
-    rc2, _out2, err2 = await _run_ccsess("register", name, cwd)
-    if rc2 != 0:
-        raise HTTPException(status_code=500,
-                            detail=f"registered tmux but conf register failed: {err2[:160]}")
+    await _run_ccsess("register", name, cwd)
     # 精準 resume pin:這條 session 是明確 --resume <sid> 起的,直接落 pin,
     # 重開機後 ensure 走 --resume 接回同一條對話(不再靠 --continue 猜目錄)。
     try:

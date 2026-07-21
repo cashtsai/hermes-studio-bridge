@@ -244,6 +244,25 @@ summary kept in sync with it.
   the escape hatch. Not gated behind `POCKET_KERNEL` — this is a
   self-ops feature, available in OSS/kernel builds too.
 
+### `POST /app/v1/agent-lanes/{provider}/activate`
+
+Pins Pocket's provider lane to a native agent session. `{provider}` accepts
+`cc` / `claude_code` and `cx` / `codex`.
+
+- **Claude Code body**: `{name?, session_id?, workdir?, adopt_source?}`.
+  The bridge resolves the native Claude session id, starts/replaces the fixed
+  `pocket-cc` tmux session with `claude --resume <session_id>`, registers it as
+  a normal ccsess, and returns `{session:{name:"pocket-cc", ...}}`.
+  `adopt_source` defaults true, so the selected source tmux is stopped after
+  the fixed lane is ready.
+- **Codex body**: `{thread_id, workdir?, name?, preview?}`.
+  The bridge starts/replaces fixed `pocket-cx` with `codex resume <thread_id>`
+  and returns the selected Codex session shape. Pocket's card UI continues to
+  use the existing Codex app-server endpoints for status/history/input.
+- Both lanes are configured with tmux `remain-on-exit on` and
+  `destroy-unattached off` so later device/SSH attaches always have a stable
+  target.
+
 ## 3. v1 遷移備註（persona 事件）
 
 `GET /app/v1/messages/events`（persona SSE）與 `POST /app/v1/messages` 串流
