@@ -787,6 +787,15 @@ def _canon_init():
     meta_cols = [r[1] for r in con.execute("PRAGMA table_info(message_meta)").fetchall()]
     if "deleted" not in meta_cols:
         con.execute("ALTER TABLE message_meta ADD COLUMN deleted INTEGER")
+    # G2/#39 canonical 化收尾:pin 要能按 session 讀回(PUT/GET
+    # /app/v1/sessions/{id}/pin),overlay 列補 session 歸屬。回填只認
+    # canonical messages 表 — tg-<ts>/報告 id 不在其中,維持 NULL,查詢端
+    # 以「messages join」補洞(見 _session_pinned_ids)。冪等:WHERE IS NULL。
+    if "session" not in meta_cols:
+        con.execute("ALTER TABLE message_meta ADD COLUMN session TEXT")
+    con.execute("UPDATE message_meta SET session="
+                "(SELECT m.session FROM messages m WHERE m.id=message_meta.message_id)"
+                " WHERE session IS NULL")
     # G6 (wave 2): persona registry — overlays/extends the code builtins so
     # personas can be added / renamed / disabled without editing bridge.py.
     con.execute("""CREATE TABLE IF NOT EXISTS personas(
@@ -9120,6 +9129,7 @@ async def capabilities(request: Request):
             "endpoints": ["/app/v1/sessions", "/app/v1/messages", "/reports",
                           "/app/v1/uploads",
                           "/app/v1/reactions", "/app/v1/pins",
+                          "/app/v1/messages/{id}", "/app/v1/sessions/{id}/pin",
                           "/app/v1/messages/retract", "/app/v1/personas",
                           "/app/v1/messages/status", "/app/v1/messages/events",
                           "/app/v1/messages/interrupt",
@@ -10297,6 +10307,30 @@ def _message_meta_load(con, message_id: str):
     return reactions, (int(row[1] or 0) if row else 0)
 
 
+def _message_session_of(con, message_id: str):
+    """Session a message belongs to, from the canonical messages table.
+    None for tg-<ts>/report ids — those live outside canonical (merged 流),
+    the overlay row then keeps session NULL(讀取端用 join 補洞)。"""
+    row = con.execute("SELECT session FROM messages WHERE id=?",
+                      (message_id,)).fetchone()
+    return row[0] if row else None
+
+
+def _message_meta_upsert(con, message_id: str, reactions: list,
+                         pinned: int, session=None):
+    """One shared upsert for every message_meta writer (G2/#39). session 只在
+    有值時覆蓋(COALESCE)— per-message 端點解析不出 tg id 的歸屬時,不把
+    PUT /sessions/{id}/pin 已寫入的歸屬洗掉。"""
+    con.execute(
+        "INSERT INTO message_meta(message_id, reactions, pinned, session, updated_at) "
+        "VALUES(?,?,?,?,?) ON CONFLICT(message_id) DO UPDATE SET "
+        "reactions=excluded.reactions, pinned=excluded.pinned, "
+        "session=COALESCE(excluded.session, session), "
+        "updated_at=excluded.updated_at",
+        (message_id, json.dumps(reactions, ensure_ascii=False),
+         pinned, session, time.time()))
+
+
 @app.post("/app/v1/reactions")
 async def app_reactions(request: Request):
     """Canonical reactions (G2/#39): add/remove one emoji on a message and
@@ -10320,11 +10354,8 @@ async def app_reactions(request: Request):
                 reactions.append(emoji)
         else:
             reactions = [r for r in reactions if r != emoji]
-        con.execute("INSERT INTO message_meta(message_id, reactions, pinned, updated_at) "
-                    "VALUES(?,?,?,?) ON CONFLICT(message_id) DO UPDATE SET "
-                    "reactions=excluded.reactions, updated_at=excluded.updated_at",
-                    (message_id, json.dumps(reactions, ensure_ascii=False),
-                     pinned, time.time()))
+        _message_meta_upsert(con, message_id, reactions, pinned,
+                             session=_message_session_of(con, message_id))
         con.commit()
         con.close()
     except Exception as e:  # noqa: BLE001
@@ -10348,11 +10379,8 @@ async def app_pins(request: Request):
         con = sqlite3.connect(CANON_DB, timeout=30)
         con.execute("PRAGMA busy_timeout=30000")
         reactions, _old = _message_meta_load(con, message_id)
-        con.execute("INSERT INTO message_meta(message_id, reactions, pinned, updated_at) "
-                    "VALUES(?,?,?,?) ON CONFLICT(message_id) DO UPDATE SET "
-                    "pinned=excluded.pinned, updated_at=excluded.updated_at",
-                    (message_id, json.dumps(reactions, ensure_ascii=False),
-                     pinned, time.time()))
+        _message_meta_upsert(con, message_id, reactions, pinned,
+                             session=_message_session_of(con, message_id))
         con.commit()
         con.close()
     except Exception as e:  # noqa: BLE001
@@ -10360,6 +10388,118 @@ async def app_pins(request: Request):
                    message_id=message_id, error=type(e).__name__)
         raise HTTPException(status_code=500, detail=str(e)[:200])
     return {"ok": True}
+
+
+@app.patch("/app/v1/messages/{mid}")
+async def app_patch_message(mid: str, request: Request):
+    """G2/#39 issue 合約收尾:單值 reaction 的 PATCH 形狀。body {"reaction":
+    "👍" | null}(null/空字串=清除)。只認 canonical messages 表的 id —
+    不存在回 404(合約要求存在性檢查;tg-<ts>/報告 id 不在 canonical,
+    請走 id-agnostic 的 POST /app/v1/reactions,那條才蓋得到 TG 側訊息)。
+    寫入同時落 legacy 單值 overlay 與 message_meta 清單(取代整串),
+    GET /app/v1/messages 的 reaction/reactions 兩欄一起對齊。"""
+    _check_auth(request)
+    body = await _json_body(request)
+    if "reaction" not in body:
+        raise http_err(400, "BAD_REQUEST", "body must carry a 'reaction' key")
+    raw = body.get("reaction")
+    reaction = str(raw).strip()[:16] if raw is not None else ""
+    import sqlite3
+    try:
+        con = sqlite3.connect(CANON_DB, timeout=30)
+        con.execute("PRAGMA busy_timeout=30000")
+        session = _message_session_of(con, mid)
+        if session is None:
+            con.close()
+            raise http_err(404, "MESSAGE_NOT_FOUND",
+                           "no canonical message with this id",
+                           "TG/cron-sourced ids: use POST /app/v1/reactions")
+        _reactions_old, pinned = _message_meta_load(con, mid)
+        if reaction:
+            con.execute("INSERT INTO reactions(msg_id, session, reaction, updated_at) "
+                        "VALUES(?,?,?,?) ON CONFLICT(msg_id) DO UPDATE SET "
+                        "reaction=excluded.reaction, updated_at=excluded.updated_at",
+                        (mid, session, reaction, time.time()))
+            _message_meta_upsert(con, mid, [reaction], pinned, session=session)
+        else:
+            con.execute("DELETE FROM reactions WHERE msg_id=?", (mid,))
+            _message_meta_upsert(con, mid, [], pinned, session=session)
+        con.commit()
+        con.close()
+    except HTTPException:
+        raise
+    except Exception as e:  # noqa: BLE001
+        _log_event("message_meta_write_failed", kind="reaction_patch",
+                   message_id=mid, error=type(e).__name__)
+        raise HTTPException(status_code=500, detail=str(e)[:200])
+    return {"ok": True, "id": mid, "reaction": reaction or None}
+
+
+def _session_pinned_ids(con, session: str) -> list:
+    """All pinned message ids belonging to a session, oldest-pin first.
+    session 欄有值直接比;NULL(舊列/歸屬未知)用 canonical messages join
+    補洞 — tg-<ts> 舊 pin 列兩邊都對不上時寧可漏,不跨 session 誤傷。"""
+    rows = con.execute(
+        "SELECT message_id FROM message_meta WHERE pinned=1 AND (session=? OR "
+        "(session IS NULL AND message_id IN (SELECT id FROM messages WHERE session=?)))"
+        " ORDER BY updated_at", (session, session)).fetchall()
+    return [r[0] for r in rows]
+
+
+@app.put("/app/v1/sessions/{sid}/pin")
+async def app_put_session_pins(sid: str, request: Request):
+    """G2/#39 issue 合約收尾:per-session 置頂全量替換。body
+    {"pinned_message_ids": [...]}(空清單=全部解除)。id 收 GET
+    /app/v1/messages 回的任何穩定 id(canonical mid / tg-<ts> / 報告 id)—
+    寫入時直接掛 session 歸屬,tg id 從此也能按 session 讀回。解除只掃
+    「歸屬得到本 session」的列,不動其他人格的置頂。"""
+    _check_auth(request)
+    if sid not in PERSONAS:
+        raise http_err(404, "SESSION_NOT_FOUND", "unknown session")
+    body = await _json_body(request)
+    ids = body.get("pinned_message_ids")
+    if not isinstance(ids, list) or not all(isinstance(i, str) and i.strip() for i in ids):
+        raise http_err(400, "BAD_REQUEST",
+                       "pinned_message_ids must be a list of message ids")
+    ids = [i.strip() for i in ids]
+    import sqlite3
+    try:
+        con = sqlite3.connect(CANON_DB, timeout=30)
+        con.execute("PRAGMA busy_timeout=30000")
+        for stale in _session_pinned_ids(con, sid):
+            if stale in ids:
+                continue
+            reactions, _pin = _message_meta_load(con, stale)
+            _message_meta_upsert(con, stale, reactions, 0, session=sid)
+        for mid in ids:
+            reactions, _pin = _message_meta_load(con, mid)
+            _message_meta_upsert(con, mid, reactions, 1, session=sid)
+        pinned_now = _session_pinned_ids(con, sid)
+        con.commit()
+        con.close()
+    except HTTPException:
+        raise
+    except Exception as e:  # noqa: BLE001
+        _log_event("message_meta_write_failed", kind="session_pin",
+                   session=sid, error=type(e).__name__)
+        raise HTTPException(status_code=500, detail=str(e)[:200])
+    return {"ok": True, "session": sid, "pinned_message_ids": pinned_now}
+
+
+@app.get("/app/v1/sessions/{sid}/pin")
+async def app_get_session_pins(sid: str, request: Request):
+    """PUT 的讀回面(G2/#39):本 session 目前置頂的訊息 id 清單。
+    (GET /app/v1/messages 的每則 pinned 旗標照舊,這條是 per-session 檢視。)"""
+    _check_auth(request)
+    if sid not in PERSONAS:
+        raise http_err(404, "SESSION_NOT_FOUND", "unknown session")
+    import sqlite3
+    con = sqlite3.connect(f"file:{CANON_DB}?mode=ro", uri=True, timeout=5)
+    try:
+        pinned = _session_pinned_ids(con, sid)
+    finally:
+        con.close()
+    return {"session": sid, "pinned_message_ids": pinned}
 
 
 @app.post("/app/v1/messages/retract")
