@@ -168,6 +168,28 @@ Rules:
 - Messages are oldest to newest.
 - Each message should include `role`, `content`, `ts`, `status`, and `source`
   when available.
+- Reaction/pin overlay (G2/#39): each message may additionally carry
+  `reaction`（legacy 單值）、`reactions`（清單）、`pinned`、`deleted` — 缺席
+  即無資料。canonical mid 與 tg-`<ts>` id 一視同仁。
+
+### Reaction / 置頂（G2/#39 canonical 化）
+
+寫入端點（皆 Bearer auth）：
+
+- `POST /app/v1/reactions` `{message_id, emoji, action:add|remove}` —
+  id-agnostic（canonical mid / tg-`<ts>` / 報告 id 皆可），回全清單。
+- `POST /app/v1/pins` `{message_id, pinned:bool}` — per-message 置頂。
+- `PATCH /app/v1/messages/{id}` `{reaction: "👍" | null}` — issue #39 合約的
+  單值形狀（null=清除）。**只認 canonical messages 表的 id，不存在回
+  `404 MESSAGE_NOT_FOUND`**；TG/cron 來源訊息請走上面 id-agnostic 的 POST。
+- `PUT /app/v1/sessions/{id}/pin` `{pinned_message_ids:[...]}` — per-session
+  全量替換（空清單=全解除），id 收 GET /app/v1/messages 回的任何穩定 id；
+  解除只掃歸屬本 session 的列。`GET` 同路徑讀回
+  `{session, pinned_message_ids}`。未知 session 回 404。
+
+儲存：`message_meta(message_id, reactions JSON, pinned, session, deleted)`
+overlay（`session` 欄 idempotent ALTER + 由 messages 表回填；tg id 由
+PUT pin 寫入時直接掛歸屬）。legacy `reactions` 單值表照舊鏡射，舊 app 不破。
 
 ### `POST /app/v1/messages`
 
