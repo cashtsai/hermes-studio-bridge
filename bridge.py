@@ -3862,6 +3862,26 @@ async def serve_file(request: Request, path: str):
     return FileResponse(p)
 
 
+async def _git_capture(*args, cwd=None, timeout: float = 20.0):
+    """git 子行程一次呼叫 → (returncode, stdout 文字)。逾時殺行程回 (124, "")
+    — git on a wedged repo/mount must not hang the handler (issue #7)。
+    /filediff 與 session diff 端點(S2 / #38)共用。"""
+    proc = await asyncio.create_subprocess_exec(
+        *args, cwd=cwd,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+    try:
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout)
+    except asyncio.TimeoutError:
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+        _log_event("filediff_git_timeout", args=" ".join(args[:4]),
+                   timeout_s=timeout)
+        return 124, ""
+    return proc.returncode, (out or b"").decode("utf-8", "replace")
+
+
 @app.get("/filediff")
 async def serve_filediff(request: Request, path: str):
     """Diff/content for a file an agent touched (S2, pocketagent#38). Finds the
@@ -3884,34 +3904,17 @@ async def serve_filediff(request: Request, path: str):
             or not (os.path.isfile(p) or os.path.isdir(p))):
         raise HTTPException(status_code=404, detail="not found")
 
-    async def _run(*args, cwd=None, timeout: float = 20.0):
-        proc = await asyncio.create_subprocess_exec(
-            *args, cwd=cwd,
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
-        try:
-            out, _ = await asyncio.wait_for(proc.communicate(), timeout)
-        except asyncio.TimeoutError:
-            # git on a wedged repo/mount must not hang the handler (issue #7).
-            try:
-                proc.kill()
-            except ProcessLookupError:
-                pass
-            _log_event("filediff_git_timeout", args=" ".join(args[:4]),
-                       timeout_s=timeout)
-            return 124, ""
-        return proc.returncode, (out or b"").decode("utf-8", "replace")
-
     if os.path.isdir(p):
-        rc, top = await _run("git", "-C", p, "rev-parse", "--show-toplevel")
+        rc, top = await _git_capture("git", "-C", p, "rev-parse", "--show-toplevel")
         if rc != 0 or not top.strip():
             raise HTTPException(status_code=404, detail="目錄不在 git repo 裡，沒有 diff 可看")
         top = top.strip()
-        rc2, out = await _run("git", "-C", top, "diff", "HEAD", "--", p)
+        rc2, out = await _git_capture("git", "-C", top, "diff", "HEAD", "--", p)
         diff = out if rc2 == 0 else ""
         if not diff:
             raise HTTPException(status_code=404, detail="目錄內沒有待提交的變更")
         files = []
-        rc3, names = await _run("git", "-C", top, "diff", "HEAD",
+        rc3, names = await _git_capture("git", "-C", top, "diff", "HEAD",
                                 "--name-status", "--", p)
         if rc3 == 0:
             for line in names.splitlines():
@@ -3925,11 +3928,11 @@ async def serve_filediff(request: Request, path: str):
         return {"kind": "diff", "path": p, "text": diff, "files": files}
 
     d = os.path.dirname(p)
-    rc, top = await _run("git", "-C", d, "rev-parse", "--show-toplevel")
+    rc, top = await _git_capture("git", "-C", d, "rev-parse", "--show-toplevel")
     diff = ""
     if rc == 0 and top.strip():
         # HEAD..worktree for this file — covers staged + unstaged edits.
-        rc2, out = await _run("git", "-C", top.strip(), "diff", "HEAD", "--", p)
+        rc2, out = await _git_capture("git", "-C", top.strip(), "diff", "HEAD", "--", p)
         if rc2 == 0:
             diff = out
     if diff:
@@ -3949,6 +3952,94 @@ async def serve_filediff(request: Request, path: str):
     if len(head) == 200_000:
         text += "\n...(truncated)"
     return {"kind": "content", "path": p, "text": text}
+
+
+# --- Session-scoped diff(S2 / pocketagent#38)------------------------------
+# /filediff 吃「絕對路徑、從檔案自身找 repo」;這組端點吃「session + workdir
+# 相對路徑」— transcript/卡片帶的常是相對路徑,由 bridge 用該 session 的
+# workdir 解析,並把 realpath 圈死在 workdir 內(防 ../ 逃逸)。三個入口共用
+# 一個核心:v1 /ccsessions|/codexsessions(issue 原文形)+ v2 統一路由。
+
+_SESSION_DIFF_MAX = 200_000     # 截斷上限,與 /filediff 同一數字
+
+
+async def _codex_thread_workdir(thread_id: str) -> str:
+    try:
+        res = await CODEX_APP.call("thread/read", {
+            "threadId": thread_id,
+            "includeTurns": False,
+        }, timeout=20.0)
+    except Exception as e:  # noqa: BLE001
+        _codex_http_error(e)
+    return ((res or {}).get("thread") or {}).get("cwd") or ""
+
+
+async def _session_workdir_diff(workdir: str, path: str) -> dict:
+    """Session workdir 內單檔的 pending diff 核心。
+
+    tracked 檔走 `git diff HEAD -- <p>`(staged+unstaged 一次都在);乾淨但
+    untracked 的新檔用 no-index 對 /dev/null 合成 new-file diff,app 端一樣
+    有 +行綠可看(/filediff 這種情況只退回全文,是 #38 驗收的缺口)。
+    回 {path, workdir, diff, truncated};diff 為空字串 = 該檔沒有待定變更。"""
+    wd = os.path.realpath(os.path.expanduser(workdir or ""))
+    if not workdir or not os.path.isdir(wd):
+        raise HTTPException(status_code=404, detail="session 沒有可用的工作目錄")
+    raw = os.path.expanduser((path or "").strip())
+    if not raw:
+        raise HTTPException(status_code=400, detail="path required")
+    p = os.path.realpath(raw if os.path.isabs(raw) else os.path.join(wd, raw))
+    if p != wd and not p.startswith(wd + os.sep):
+        raise HTTPException(status_code=400, detail="path 不在 session 工作目錄內")
+    rc, top = await _git_capture("git", "-C", wd, "rev-parse", "--show-toplevel")
+    if rc != 0 or not top.strip():
+        raise HTTPException(status_code=404,
+                            detail="工作目錄不在 git repo 裡,沒有 diff 可看")
+    top = top.strip()
+    rel = os.path.relpath(p, top)
+    rc2, out = await _git_capture("git", "-C", top, "diff", "HEAD", "--", rel)
+    diff = out if rc2 == 0 else ""
+    if not diff and os.path.isfile(p):
+        # tracked 且乾淨 vs untracked 新檔:porcelain 分辨;新檔合成 no-index
+        # diff(它的 rc=1 是「有差異」,不是錯)。
+        rcs, st = await _git_capture("git", "-C", top, "status", "--porcelain",
+                                     "--untracked-files=all", "--", rel)
+        if rcs == 0 and st.lstrip().startswith("??"):
+            _rcn, out_n = await _git_capture("git", "-C", top, "diff",
+                                             "--no-index", "--", os.devnull, rel)
+            diff = out_n
+    truncated = False
+    if len(diff) > _SESSION_DIFF_MAX:
+        diff = diff[:_SESSION_DIFF_MAX]
+        truncated = True
+    return {"path": p, "workdir": wd, "diff": diff, "truncated": truncated}
+
+
+@app.get("/ccsessions/{name}/diff")
+async def cc_session_diff(name: str, request: Request, path: str):
+    _check_auth(request)
+    row = next((r for r in _cc_conf_rows() if r[0] == name), None)
+    if not row:
+        raise http_err(404, "SESSION_NOT_FOUND", "unknown session")
+    return await _session_workdir_diff(row[1], path)
+
+
+@app.get("/codexsessions/{thread_id}/diff")
+async def codex_session_diff(thread_id: str, request: Request, path: str):
+    _check_auth(request)
+    return await _session_workdir_diff(await _codex_thread_workdir(thread_id), path)
+
+
+@app.get("/app/v2/sessions/{session_id}/diff")
+async def v2_session_diff(session_id: str, request: Request, path: str):
+    """統一路由 diff(卡片流表面直接用 store 的 v2 session id 打):cc=conf
+    workdir、cx/delegation=thread cwd;hermes 沒有工作目錄 → 400。"""
+    _check_auth(request)
+    src = _v2_card_source(session_id)
+    if src[0] == "cc":
+        return await _session_workdir_diff(src[2], path)
+    if src[0] == "cx":
+        return await _session_workdir_diff(await _codex_thread_workdir(src[1]), path)
+    raise http_err(400, "UNSUPPORTED_PROVIDER", "persona session 沒有工作目錄")
 
 
 # --- Client error log ------------------------------------------------------
