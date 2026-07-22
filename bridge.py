@@ -6140,8 +6140,55 @@ async def _pocket_selected_cc(body: dict) -> tuple[str, str, str, str]:
     return sid, cwd, title, source_name
 
 
+async def _pocket_bind_cc_source(name: str, sid: str, cwd: str,
+                                 title: str) -> dict:
+    """Bind Pocket to an existing ccsess without replacing its remote control.
+
+    A live Claude App session is already the single owner of its transcript.
+    Pocket controls that same tmux pane; cloning the sid into `pocket-cc` would
+    archive the original remote-control card and create two transcript writers.
+    """
+    _cc_write_remote_control_pin(name)
+    running = await _tmux_alive(name)
+    status = "running"
+    if running:
+        current_sid = await _cc_pane_session_id(name)
+        if current_sid and current_sid != sid:
+            raise http_err(409, "SOURCE_SESSION_CHANGED",
+                           "Claude session changed; refresh and reconnect",
+                           f"{name} now points at a different session id")
+        if not await _cc_pane_has_remote_control(name):
+            _CC_HOOK_STATE.pop(name, None)
+            _CC_SID_CACHE.pop(name, None)
+            _CC_SID_PINS.pop(name, None)
+            await _pocket_tmux_replace(name, cwd, _cc_remote_resume_argv(name, sid))
+            ready = await _cc_wait_ready(name)
+            status = "running" if ready else "starting"
+    else:
+        _CC_HOOK_STATE.pop(name, None)
+        _CC_SID_CACHE.pop(name, None)
+        _CC_SID_PINS.pop(name, None)
+        await _pocket_tmux_replace(name, cwd, _cc_remote_resume_argv(name, sid))
+        ready = await _cc_wait_ready(name)
+        status = "running" if ready else "starting"
+
+    await _cc_register_explicit_resume(name, cwd)
+    _cc_write_resume_pin(name, sid)
+    _cc_cache_sid(name, sid, pin=True)
+    _cc_mark_app_owned(name)
+    _pocket_lane_note("claude_code", name, sid, cwd, title)
+    _log_event("pocket_cc_source_bound", tmux=name,
+               native_hash=_short_hash(sid), cwd_hash=_short_hash(cwd),
+               reused=running)
+    return {"name": name, "workdir": cwd, "status": status,
+            "sessionId": sid, "sessionTitle": title or None}
+
+
 async def _pocket_activate_cc_lane(body: dict) -> dict:
     sid, cwd, title, source_name = await _pocket_selected_cc(body)
+    if source_name and source_name != POCKET_CC_TMUX:
+        return await _pocket_bind_cc_source(source_name, sid, cwd, title)
+
     lane = POCKET_CC_TMUX
     _cc_write_remote_control_pin(lane)
     if await _tmux_alive(lane):
@@ -6160,12 +6207,6 @@ async def _pocket_activate_cc_lane(body: dict) -> dict:
             _cc_cache_sid(lane, sid, pin=True)
             _cc_mark_app_owned(lane)
             _pocket_lane_note("claude_code", lane, sid, cwd, title)
-            adopt_source = body.get("adopt_source", body.get("adoptSource", True)) is not False
-            if adopt_source and source_name and source_name != lane and await _tmux_alive(source_name):
-                rc, _, err = await _tmux_run("kill-session", "-t", source_name)
-                if rc != 0:
-                    _log_event("pocket_lane_source_kill_failed", source=source_name,
-                               tmux=lane, error=(err or "")[:160])
             return {"name": lane, "workdir": cwd, "status": status,
                     "sessionId": sid, "sessionTitle": title or None}
 
@@ -6179,12 +6220,6 @@ async def _pocket_activate_cc_lane(body: dict) -> dict:
     _cc_mark_app_owned(lane)
     ready = await _cc_wait_ready(lane)
     _pocket_lane_note("claude_code", lane, sid, cwd, title)
-    adopt_source = body.get("adopt_source", body.get("adoptSource", True)) is not False
-    if adopt_source and source_name and source_name != lane and await _tmux_alive(source_name):
-        rc, _, err = await _tmux_run("kill-session", "-t", source_name)
-        if rc != 0:
-            _log_event("pocket_lane_source_kill_failed", source=source_name,
-                       tmux=lane, error=(err or "")[:160])
 
     _log_event("pocket_lane_activate", provider="claude_code",
                tmux=lane, native_hash=_short_hash(sid), cwd_hash=_short_hash(cwd))
@@ -6214,19 +6249,19 @@ async def _pocket_activate_cx_lane(body: dict) -> dict:
 
 @app.post("/app/v1/agent-lanes/{provider}/activate")
 async def app_agent_lane_activate(provider: str, request: Request):
-    """Bind the provider's single Pocket lane to a native session.
+    """Bind Pocket's provider page to a native session.
 
-    Claude Code is fully tmux-driven: selecting any CC session resumes its
-    native Claude session id into the fixed `pocket-cc` ccsess. Codex keeps the
-    existing app-server control path, while this endpoint keeps `pocket-cx`
-    resumable/attachable to the selected native thread.
+    Claude Code reuses an existing named tmux in place so the Claude App remote
+    control remains alive. A fixed `pocket-cc` fallback is created only for a
+    history sid with no live/source session name. Codex keeps the existing
+    app-server control path while `pocket-cx` remains resumable/attachable.
     """
     _check_auth(request)
     body = await _json_body(request)
     p = (provider or "").lower().replace("-", "_")
     if p in ("cc", "claude", "claude_code"):
         session = await _pocket_activate_cc_lane(body)
-        return {"ok": True, "provider": "claude_code", "tmux": POCKET_CC_TMUX,
+        return {"ok": True, "provider": "claude_code", "tmux": session["name"],
                 "session": session}
     if p in ("cx", "codex"):
         session = await _pocket_activate_cx_lane(body)
