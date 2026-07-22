@@ -1,4 +1,4 @@
-"""Pocket fixed CC/CX tmux lanes."""
+"""Pocket CC/CX agent bindings."""
 
 import os
 import sys
@@ -159,30 +159,25 @@ class TestPocketAgentLanes(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(res["session"]["name"], "cc-original")
         bind.assert_awaited_once_with("cc-original", sid, "/tmp", "Original")
 
-    async def test_activate_codex_lane_resumes_thread_into_fixed_tmux(self):
+    async def test_activate_codex_lane_uses_app_server_without_tmux(self):
         cwd = tempfile.mkdtemp(prefix="pocket-cx-cwd-")
-        tmux = AsyncMock(return_value=(0, "", ""))
+        replace = AsyncMock()
+        note = Mock()
         with (
             patch.object(bridge, "_check_auth"),
-            patch.object(bridge, "POCKET_CX_TMUX", "pocket-cx-test"),
-            patch.object(bridge, "_resolve_codex_bin", return_value="/bin/codex"),
-            patch.object(bridge, "_tmux_alive", AsyncMock(return_value=False)),
-            patch.object(bridge, "_tmux_run", tmux),
-            patch.object(bridge, "_pocket_lane_bindings", return_value={}),
-            patch.object(bridge, "_pocket_lane_note"),
+            patch.object(bridge, "_pocket_tmux_replace", replace),
+            patch.object(bridge, "_pocket_lane_note", note),
         ):
             res = await bridge.app_agent_lane_activate(
                 "codex", FakeRequest({"thread_id": "thread-123", "workdir": cwd, "name": "CX"})
             )
 
         self.assertTrue(res["ok"])
-        self.assertEqual(res["tmux"], "pocket-cx-test")
+        self.assertIsNone(res["tmux"])
         self.assertEqual(res["session"]["thread_id"], "thread-123")
-        self.assertIn(
-            ("new-session", "-d", "-s", "pocket-cx-test", "-c", os.path.realpath(cwd),
-             "/bin/codex", "resume", "thread-123"),
-            [call.args for call in tmux.await_args_list],
-        )
+        self.assertEqual(res["session"]["source"], "codex-app-server")
+        replace.assert_not_awaited()
+        note.assert_called_once_with("codex", "", "thread-123", os.path.realpath(cwd), "CX")
 
     async def test_cc_history_resume_registers_without_unpacking_ccsess_output(self):
         cwd = tempfile.mkdtemp(prefix="pocket-history-cwd-")
