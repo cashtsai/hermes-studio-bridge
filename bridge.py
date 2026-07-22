@@ -787,6 +787,15 @@ def _canon_init():
     meta_cols = [r[1] for r in con.execute("PRAGMA table_info(message_meta)").fetchall()]
     if "deleted" not in meta_cols:
         con.execute("ALTER TABLE message_meta ADD COLUMN deleted INTEGER")
+    # G2/#39 canonical 化收尾:pin 要能按 session 讀回(PUT/GET
+    # /app/v1/sessions/{id}/pin),overlay 列補 session 歸屬。回填只認
+    # canonical messages 表 — tg-<ts>/報告 id 不在其中,維持 NULL,查詢端
+    # 以「messages join」補洞(見 _session_pinned_ids)。冪等:WHERE IS NULL。
+    if "session" not in meta_cols:
+        con.execute("ALTER TABLE message_meta ADD COLUMN session TEXT")
+    con.execute("UPDATE message_meta SET session="
+                "(SELECT m.session FROM messages m WHERE m.id=message_meta.message_id)"
+                " WHERE session IS NULL")
     # G6 (wave 2): persona registry — overlays/extends the code builtins so
     # personas can be added / renamed / disabled without editing bridge.py.
     con.execute("""CREATE TABLE IF NOT EXISTS personas(
@@ -3862,6 +3871,26 @@ async def serve_file(request: Request, path: str):
     return FileResponse(p)
 
 
+async def _git_capture(*args, cwd=None, timeout: float = 20.0):
+    """git 子行程一次呼叫 → (returncode, stdout 文字)。逾時殺行程回 (124, "")
+    — git on a wedged repo/mount must not hang the handler (issue #7)。
+    /filediff 與 session diff 端點(S2 / #38)共用。"""
+    proc = await asyncio.create_subprocess_exec(
+        *args, cwd=cwd,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+    try:
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout)
+    except asyncio.TimeoutError:
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+        _log_event("filediff_git_timeout", args=" ".join(args[:4]),
+                   timeout_s=timeout)
+        return 124, ""
+    return proc.returncode, (out or b"").decode("utf-8", "replace")
+
+
 @app.get("/filediff")
 async def serve_filediff(request: Request, path: str):
     """Diff/content for a file an agent touched (S2, pocketagent#38). Finds the
@@ -3884,34 +3913,17 @@ async def serve_filediff(request: Request, path: str):
             or not (os.path.isfile(p) or os.path.isdir(p))):
         raise HTTPException(status_code=404, detail="not found")
 
-    async def _run(*args, cwd=None, timeout: float = 20.0):
-        proc = await asyncio.create_subprocess_exec(
-            *args, cwd=cwd,
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
-        try:
-            out, _ = await asyncio.wait_for(proc.communicate(), timeout)
-        except asyncio.TimeoutError:
-            # git on a wedged repo/mount must not hang the handler (issue #7).
-            try:
-                proc.kill()
-            except ProcessLookupError:
-                pass
-            _log_event("filediff_git_timeout", args=" ".join(args[:4]),
-                       timeout_s=timeout)
-            return 124, ""
-        return proc.returncode, (out or b"").decode("utf-8", "replace")
-
     if os.path.isdir(p):
-        rc, top = await _run("git", "-C", p, "rev-parse", "--show-toplevel")
+        rc, top = await _git_capture("git", "-C", p, "rev-parse", "--show-toplevel")
         if rc != 0 or not top.strip():
             raise HTTPException(status_code=404, detail="目錄不在 git repo 裡，沒有 diff 可看")
         top = top.strip()
-        rc2, out = await _run("git", "-C", top, "diff", "HEAD", "--", p)
+        rc2, out = await _git_capture("git", "-C", top, "diff", "HEAD", "--", p)
         diff = out if rc2 == 0 else ""
         if not diff:
             raise HTTPException(status_code=404, detail="目錄內沒有待提交的變更")
         files = []
-        rc3, names = await _run("git", "-C", top, "diff", "HEAD",
+        rc3, names = await _git_capture("git", "-C", top, "diff", "HEAD",
                                 "--name-status", "--", p)
         if rc3 == 0:
             for line in names.splitlines():
@@ -3925,11 +3937,11 @@ async def serve_filediff(request: Request, path: str):
         return {"kind": "diff", "path": p, "text": diff, "files": files}
 
     d = os.path.dirname(p)
-    rc, top = await _run("git", "-C", d, "rev-parse", "--show-toplevel")
+    rc, top = await _git_capture("git", "-C", d, "rev-parse", "--show-toplevel")
     diff = ""
     if rc == 0 and top.strip():
         # HEAD..worktree for this file — covers staged + unstaged edits.
-        rc2, out = await _run("git", "-C", top.strip(), "diff", "HEAD", "--", p)
+        rc2, out = await _git_capture("git", "-C", top.strip(), "diff", "HEAD", "--", p)
         if rc2 == 0:
             diff = out
     if diff:
@@ -3949,6 +3961,94 @@ async def serve_filediff(request: Request, path: str):
     if len(head) == 200_000:
         text += "\n...(truncated)"
     return {"kind": "content", "path": p, "text": text}
+
+
+# --- Session-scoped diff(S2 / pocketagent#38)------------------------------
+# /filediff 吃「絕對路徑、從檔案自身找 repo」;這組端點吃「session + workdir
+# 相對路徑」— transcript/卡片帶的常是相對路徑,由 bridge 用該 session 的
+# workdir 解析,並把 realpath 圈死在 workdir 內(防 ../ 逃逸)。三個入口共用
+# 一個核心:v1 /ccsessions|/codexsessions(issue 原文形)+ v2 統一路由。
+
+_SESSION_DIFF_MAX = 200_000     # 截斷上限,與 /filediff 同一數字
+
+
+async def _codex_thread_workdir(thread_id: str) -> str:
+    try:
+        res = await CODEX_APP.call("thread/read", {
+            "threadId": thread_id,
+            "includeTurns": False,
+        }, timeout=20.0)
+    except Exception as e:  # noqa: BLE001
+        _codex_http_error(e)
+    return ((res or {}).get("thread") or {}).get("cwd") or ""
+
+
+async def _session_workdir_diff(workdir: str, path: str) -> dict:
+    """Session workdir 內單檔的 pending diff 核心。
+
+    tracked 檔走 `git diff HEAD -- <p>`(staged+unstaged 一次都在);乾淨但
+    untracked 的新檔用 no-index 對 /dev/null 合成 new-file diff,app 端一樣
+    有 +行綠可看(/filediff 這種情況只退回全文,是 #38 驗收的缺口)。
+    回 {path, workdir, diff, truncated};diff 為空字串 = 該檔沒有待定變更。"""
+    wd = os.path.realpath(os.path.expanduser(workdir or ""))
+    if not workdir or not os.path.isdir(wd):
+        raise HTTPException(status_code=404, detail="session 沒有可用的工作目錄")
+    raw = os.path.expanduser((path or "").strip())
+    if not raw:
+        raise HTTPException(status_code=400, detail="path required")
+    p = os.path.realpath(raw if os.path.isabs(raw) else os.path.join(wd, raw))
+    if p != wd and not p.startswith(wd + os.sep):
+        raise HTTPException(status_code=400, detail="path 不在 session 工作目錄內")
+    rc, top = await _git_capture("git", "-C", wd, "rev-parse", "--show-toplevel")
+    if rc != 0 or not top.strip():
+        raise HTTPException(status_code=404,
+                            detail="工作目錄不在 git repo 裡,沒有 diff 可看")
+    top = top.strip()
+    rel = os.path.relpath(p, top)
+    rc2, out = await _git_capture("git", "-C", top, "diff", "HEAD", "--", rel)
+    diff = out if rc2 == 0 else ""
+    if not diff and os.path.isfile(p):
+        # tracked 且乾淨 vs untracked 新檔:porcelain 分辨;新檔合成 no-index
+        # diff(它的 rc=1 是「有差異」,不是錯)。
+        rcs, st = await _git_capture("git", "-C", top, "status", "--porcelain",
+                                     "--untracked-files=all", "--", rel)
+        if rcs == 0 and st.lstrip().startswith("??"):
+            _rcn, out_n = await _git_capture("git", "-C", top, "diff",
+                                             "--no-index", "--", os.devnull, rel)
+            diff = out_n
+    truncated = False
+    if len(diff) > _SESSION_DIFF_MAX:
+        diff = diff[:_SESSION_DIFF_MAX]
+        truncated = True
+    return {"path": p, "workdir": wd, "diff": diff, "truncated": truncated}
+
+
+@app.get("/ccsessions/{name}/diff")
+async def cc_session_diff(name: str, request: Request, path: str):
+    _check_auth(request)
+    row = next((r for r in _cc_conf_rows() if r[0] == name), None)
+    if not row:
+        raise http_err(404, "SESSION_NOT_FOUND", "unknown session")
+    return await _session_workdir_diff(row[1], path)
+
+
+@app.get("/codexsessions/{thread_id}/diff")
+async def codex_session_diff(thread_id: str, request: Request, path: str):
+    _check_auth(request)
+    return await _session_workdir_diff(await _codex_thread_workdir(thread_id), path)
+
+
+@app.get("/app/v2/sessions/{session_id}/diff")
+async def v2_session_diff(session_id: str, request: Request, path: str):
+    """統一路由 diff(卡片流表面直接用 store 的 v2 session id 打):cc=conf
+    workdir、cx/delegation=thread cwd;hermes 沒有工作目錄 → 400。"""
+    _check_auth(request)
+    src = _v2_card_source(session_id)
+    if src[0] == "cc":
+        return await _session_workdir_diff(src[2], path)
+    if src[0] == "cx":
+        return await _session_workdir_diff(await _codex_thread_workdir(src[1]), path)
+    raise http_err(400, "UNSUPPORTED_PROVIDER", "persona session 沒有工作目錄")
 
 
 # --- Client error log ------------------------------------------------------
@@ -5067,6 +5167,8 @@ async def persona_messages(persona: str, request: Request, limit: int = 100):
 
 CCSESS_CONF = os.path.expanduser(os.environ.get("CCSESS_CONF", "~/.config/ccsess/sessions.conf"))
 TMUX_BIN = "/opt/homebrew/bin/tmux" if os.path.exists("/opt/homebrew/bin/tmux") else "tmux"
+POCKET_CC_TMUX = os.environ.get("POCKET_CC_TMUX", "pocket-cc")
+POCKET_AGENT_LANES = os.path.join(os.path.dirname(CCSESS_CONF), "pocket-agent-lanes.json")
 _CC_HOOK_STATE: dict[str, dict] = {}
 _CC_HOOK_TTL = 600.0
 
@@ -5181,6 +5283,55 @@ def _cc_write_resume_pin(name: str, sid: str) -> None:
     os.replace(ptmp, os.path.join(pdir, name))
 
 
+def _cc_remote_control_pin_path(name: str) -> str:
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", name or "")
+    return os.path.expanduser(f"~/.config/ccsess/remote-control/{safe}")
+
+
+def _cc_remote_debug_path(name: str) -> str:
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", name or "")
+    path = os.path.expanduser(f"~/.local/share/ccsess/logs/remote-control-{safe}.log")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    return path
+
+
+def _cc_write_remote_control_pin(name: str, display_name: str | None = None) -> bool:
+    """Enable Claude App remote-control for a ccsess-managed tmux lane.
+
+    Returns True when the pin changed. A running bare `claude --resume` process
+    still needs a restart before the official app can see the lane.
+    """
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", name or "")
+    if not safe:
+        return False
+    pdir = os.path.expanduser("~/.config/ccsess/remote-control")
+    os.makedirs(pdir, exist_ok=True)
+    path = os.path.join(pdir, safe)
+    value = (display_name or name).strip() or safe
+    old = None
+    try:
+        with open(path, encoding="utf-8") as f:
+            old = f.read().strip()
+    except FileNotFoundError:
+        pass
+    if old == value:
+        return False
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(value + "\n")
+    os.replace(tmp, path)
+    return True
+
+
+def _cc_remote_resume_argv(name: str, sid: str) -> list[str]:
+    return [
+        CLAUDE_BIN,
+        "--resume", sid,
+        "--remote-control", name,
+        "--debug-file", _cc_remote_debug_path(name),
+    ]
+
+
 def _cc_reseed_pins_from_files() -> int:
     """啟動時把 ~/.config/ccsess/resume/<name> 的 sid 重載回 _CC_SID_PINS。
 
@@ -5277,6 +5428,35 @@ async def _cc_pane_session_id(name: str):
     return sid
 
 
+async def _cc_pane_has_remote_control(name: str) -> bool:
+    """Return True when the live Claude process under this pane advertises
+    Claude App remote-control for the expected ccsess name."""
+    try:
+        rc, out, _ = await _tmux_run("list-panes", "-t", name, "-F", "#{pane_pid}")
+        pane_pid = int(out.split()[0]) if rc == 0 and out.strip() else 0
+        if not pane_pid:
+            return False
+        procs = await _ps_snapshot()
+        kids: dict = {}
+        for pid, (ppid, _cmd) in procs.items():
+            kids.setdefault(ppid, []).append(pid)
+        stack, seen = [pane_pid], set()
+        remote_arg = f"--remote-control {name}"
+        remote_eq = f"--remote-control={name}"
+        while stack:
+            pid = stack.pop()
+            if pid in seen:
+                continue
+            seen.add(pid)
+            cmd = procs.get(pid, (0, ""))[1]
+            if "claude" in cmd and (remote_arg in cmd or remote_eq in cmd):
+                return True
+            stack.extend(kids.get(pid, []))
+    except Exception:  # noqa: BLE001
+        return False
+    return False
+
+
 async def _cc_session_jsonl(name: str, workdir: str):
     """這個 ccsess 的專屬 jsonl:pane 行程 sid 優先,失敗才 fallback dir-latest。
     已知限制:TUI 內 /clear 或 /resume 會讓 cmdline 的 uuid 過期(行程不重啟、
@@ -5307,6 +5487,72 @@ def _cc_conf_rows():
     except Exception:  # noqa: BLE001
         pass
     return rows
+
+
+def _cc_conf_upsert(name: str, workdir: str, enabled: str = "1") -> None:
+    """Update sessions.conf with the same lock convention as ccsess.
+
+    Used only for explicit `--resume <sid>` sessions when ccsess' same-workdir
+    guard rejects a fixed lane. Those launches do not rely on `--continue`, so
+    the original same-workdir footgun does not apply.
+    """
+    if not name:
+        return
+    os.makedirs(os.path.dirname(CCSESS_CONF), exist_ok=True)
+    lock = CCSESS_CONF + ".lock"
+    deadline = time.monotonic() + 5.0
+    while True:
+        try:
+            os.mkdir(lock)
+            break
+        except FileExistsError:
+            if time.monotonic() >= deadline:
+                raise http_err(502, "CCSESS_CONF_LOCKED",
+                               "ccsess config lock timeout",
+                               "sessions.conf lock timeout")
+            time.sleep(0.1)
+    try:
+        try:
+            with open(CCSESS_CONF, encoding="utf-8") as f:
+                lines = f.read().splitlines()
+        except FileNotFoundError:
+            lines = []
+        out = []
+        found = False
+        for line in lines:
+            if not line or line.startswith("#"):
+                out.append(line)
+                continue
+            parts = line.split("|")
+            if parts and parts[0] == name:
+                out.append(f"{name}|{workdir}|{enabled}")
+                found = True
+            else:
+                out.append(line)
+        if not found:
+            out.append(f"{name}|{workdir}|{enabled}")
+        tmp = f"{CCSESS_CONF}.{os.getpid()}.tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write("\n".join(out).rstrip() + "\n")
+        os.replace(tmp, CCSESS_CONF)
+    finally:
+        try:
+            os.rmdir(lock)
+        except OSError:
+            pass
+
+
+async def _cc_register_explicit_resume(name: str, workdir: str) -> None:
+    try:
+        await _run_ccsess("register", name, workdir)
+        return
+    except HTTPException as e:
+        detail = str(getattr(e, "detail", ""))
+        if "同目錄" not in detail and "workdir" not in detail:
+            raise
+        _log_event("ccsess_register_duplicate_workdir_resume_upsert",
+                   session=name, cwd_hash=_short_hash(workdir))
+    _cc_conf_upsert(name, workdir, "1")
 
 
 # App-owned CC sessions registry. CCSESS_CONF is shared with the ccsess CLI
@@ -5530,11 +5776,33 @@ async def _cc_sessions():
         jsonl = await _cc_session_jsonl(name, workdir)
         mtime, preview = _cc_last_activity(jsonl)
         sid, stitle = _cc_session_head(jsonl)
+        # Claude 標題(桌面 App rename 改的就是這個,存在終端 pane_title)→ app 當
+        # 副標題,主名仍是 ccsess 名。取不到就 None,不影響列表。
+        claude_title = await _cc_pane_title(name) if alive else None
         out.append({"name": name, "workdir": workdir,
                     "status": "running" if alive else "down", "busy": busy,
                     "awaiting": awaiting, "updatedAt": mtime, "preview": preview,
-                    "sessionId": sid, "sessionTitle": stitle})
+                    "sessionId": sid, "sessionTitle": stitle,
+                    "claudeTitle": claude_title})
     return out
+
+
+# CC session 顯示副標題:Claude(桌面 App rename / CLI 自動任務摘要)寫進終端標題,
+# tmux 存成 pane_title;前面帶狀態字元(✳ / braille spinner ⠂⠐ / ✓ …),剝掉取乾淨標題。
+_CC_TITLE_STRIP_RE = re.compile(r"^[\s☀-➿⠀-⣿·•⏺*]+")
+
+
+async def _cc_pane_title(name: str):
+    """這條 CC session 的 Claude 標題(終端 pane_title,剝掉前置狀態字元)。桌面
+    App 的 rename 改的就是這個。給 app 當副標題;取不到/空 → None。絕不 raise。"""
+    try:
+        rc, out, _ = await _tmux_run("display-message", "-t", name, "-p", "#{pane_title}")
+    except Exception:  # noqa: BLE001
+        return None
+    if rc != 0:
+        return None
+    t = _CC_TITLE_STRIP_RE.sub("", (out or "").strip()).strip()
+    return t or None
 
 
 def _blocks_text(content) -> str:
@@ -5692,6 +5960,58 @@ def _cc_scan_jsonl(jsonl):
     return (usage, plan)
 
 
+def _cc_pending_ask(jsonl):
+    """讀 jsonl 尾巴,找「已發出但還沒被回答」的 AskUserQuestion(tool_use 無對應
+    tool_result)→ 回完整結構化 ask(問題全文 + 每個選項 label+description)。
+
+    這是 _cc_prompt 螢幕擷取的內容取代:終端只渲染截斷的 label(砍到終端寬/一行),
+    jsonl 的 tool_use input 有全文,app 才判斷得了(否則使用者得回 Claude app 看)。
+    偵測靠「tool_use 無 tool_result」比掃畫面錨點可靠(掃畫面在忙/捲動/多個 ask 連發
+    時會漏)。None = 沒有 pending ask。絕不 raise。"""
+    if not jsonl:
+        return None
+    try:
+        events = _cc_jsonl_tail_events(jsonl)
+    except Exception:  # noqa: BLE001
+        return None
+    answered = set()          # 已有 tool_result 的 tool_use_id
+    for d in events:
+        if d.get("type") != "user":
+            continue
+        c = (d.get("message") or {}).get("content")
+        if isinstance(c, list):
+            for b in c:
+                if isinstance(b, dict) and b.get("type") == "tool_result":
+                    tid = b.get("tool_use_id")
+                    if tid:
+                        answered.add(tid)
+    for d in reversed(events):
+        if d.get("type") != "assistant":
+            continue
+        for b in ((d.get("message") or {}).get("content") or []):
+            if (isinstance(b, dict) and b.get("type") == "tool_use"
+                    and b.get("name") == "AskUserQuestion"
+                    and b.get("id") not in answered):
+                qs = (b.get("input") or {}).get("questions") or []
+                if not qs:
+                    continue
+                q0 = qs[0]        # app 的 CCPrompt 是單問;多問先送第一題(multi 標記)
+                opts = []
+                for i, op in enumerate(q0.get("options") or []):
+                    if not isinstance(op, dict):
+                        continue
+                    opts.append({"key": str(i + 1),      # 對齊 TUI 選項編號(送鍵用)
+                                 "label": str(op.get("label") or "").strip(),
+                                 "description": str(op.get("description") or "").strip()})
+                if len(opts) < 2:
+                    continue
+                return {"kind": "menu", "semantic": "question",
+                        "title": str(q0.get("question") or "").strip(),
+                        "header": str(q0.get("header") or "").strip() or None,
+                        "options": opts, "multi": len(qs) > 1}
+    return None
+
+
 @app.get("/ccsessions")
 async def cc_list(request: Request, archived: bool = False):
     _check_auth(request)
@@ -5824,6 +6144,233 @@ async def _cc_wait_ready(name: str, timeout: float = 12.0):
     return False
 
 
+def _pocket_lane_bindings() -> dict:
+    try:
+        with open(POCKET_AGENT_LANES, encoding="utf-8") as f:
+            d = json.load(f)
+            return d if isinstance(d, dict) else {}
+    except FileNotFoundError:
+        return {}
+    except Exception as e:  # noqa: BLE001
+        _log_event("pocket_lane_bindings_read_failed", error=str(e)[:160])
+        return {}
+
+
+def _pocket_lane_note(provider: str, tmux_name: str, native_id: str, cwd: str,
+                      title: str = "") -> None:
+    d = _pocket_lane_bindings()
+    d[provider] = {
+        "tmux": tmux_name,
+        "native_id": native_id,
+        "cwd": cwd,
+        "title": title,
+        "updated_at": time.time(),
+    }
+    try:
+        os.makedirs(os.path.dirname(POCKET_AGENT_LANES), exist_ok=True)
+        tmp = POCKET_AGENT_LANES + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(d, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, POCKET_AGENT_LANES)
+    except Exception as e:  # noqa: BLE001
+        _log_event("pocket_lane_bindings_write_failed",
+                   provider=provider, tmux=tmux_name, error=str(e)[:160])
+
+
+def _pocket_existing_dir(raw: str | None, fallback: str = HOME_ROOT) -> str:
+    for cand in (raw, fallback):
+        if not cand:
+            continue
+        wd = os.path.realpath(os.path.abspath(os.path.expanduser(str(cand))))
+        if os.path.isdir(wd):
+            return wd
+    raise http_err(409, "WORKDIR_MISSING",
+                   "session workdir does not exist",
+                   f"workdir missing: {raw or fallback or '(none)'}")
+
+
+async def _pocket_tmux_replace(name: str, cwd: str, argv: list[str]) -> None:
+    if await _tmux_alive(name):
+        rc, _, err = await _tmux_run("kill-session", "-t", name)
+        if rc != 0:
+            raise http_err(502, "TMUX_FAILED", "tmux kill-session failed",
+                           (err or "tmux kill-session failed")[:200])
+    rc, _, err = await _tmux_run("new-session", "-d", "-s", name, "-c", cwd, *argv)
+    if rc != 0:
+        raise http_err(502, "TMUX_FAILED", "tmux new-session failed",
+                       (err or "tmux new-session failed")[:200])
+    # Keep the lane visible/re-attachable even after the app disconnects or the
+    # agent exits, matching the manual `codex-current` recovery setup.
+    await _tmux_run("set-option", "-t", name, "remain-on-exit", "on")
+    await _tmux_run("set-option", "-t", name, "destroy-unattached", "off")
+    _PANE_CACHE.pop(name, None)
+
+
+async def _pocket_selected_cc(body: dict) -> tuple[str, str, str, str]:
+    sid = str(body.get("session_id") or body.get("sessionId")
+              or body.get("sid") or "").strip()
+    cwd = str(body.get("cwd") or body.get("workdir") or "").strip()
+    source_name = str(body.get("name") or body.get("session_name")
+                      or body.get("sessionName") or "").strip()
+    title = str(body.get("sessionTitle") or body.get("claudeTitle")
+                or body.get("title") or source_name or "").strip()
+
+    if source_name:
+        row = next((r for r in _cc_conf_rows() if r[0] == source_name), None)
+        if row:
+            cwd = cwd or row[1]
+            jsonl = await _cc_session_jsonl(source_name, row[1])
+            head_sid, head_title = _cc_session_head(jsonl)
+            if not _cc_valid_sid(sid):
+                sid = head_sid or sid
+            title = title or head_title or source_name
+
+    if not _cc_valid_sid(sid):
+        raise http_err(409, "SESSION_ID_MISSING",
+                       "Claude session id is required to bind the fixed lane",
+                       "this CC row has no resolved Claude session id yet")
+
+    if not cwd:
+        path = _cchist_find(sid)
+        meta = _cchist_meta(path) if path else None
+        cwd = (meta or {}).get("cwd") or ""
+        title = title or (meta or {}).get("title") or ""
+    cwd = _pocket_existing_dir(cwd, "")
+    return sid, cwd, title, source_name
+
+
+async def _pocket_bind_cc_source(name: str, sid: str, cwd: str,
+                                 title: str) -> dict:
+    """Bind Pocket to an existing ccsess without replacing its remote control.
+
+    A live Claude App session is already the single owner of its transcript.
+    Pocket controls that same tmux pane; cloning the sid into `pocket-cc` would
+    archive the original remote-control card and create two transcript writers.
+    """
+    _cc_write_remote_control_pin(name)
+    running = await _tmux_alive(name)
+    status = "running"
+    if running:
+        current_sid = await _cc_pane_session_id(name)
+        if current_sid and current_sid != sid:
+            raise http_err(409, "SOURCE_SESSION_CHANGED",
+                           "Claude session changed; refresh and reconnect",
+                           f"{name} now points at a different session id")
+        if not await _cc_pane_has_remote_control(name):
+            _CC_HOOK_STATE.pop(name, None)
+            _CC_SID_CACHE.pop(name, None)
+            _CC_SID_PINS.pop(name, None)
+            await _pocket_tmux_replace(name, cwd, _cc_remote_resume_argv(name, sid))
+            ready = await _cc_wait_ready(name)
+            status = "running" if ready else "starting"
+    else:
+        _CC_HOOK_STATE.pop(name, None)
+        _CC_SID_CACHE.pop(name, None)
+        _CC_SID_PINS.pop(name, None)
+        await _pocket_tmux_replace(name, cwd, _cc_remote_resume_argv(name, sid))
+        ready = await _cc_wait_ready(name)
+        status = "running" if ready else "starting"
+
+    await _cc_register_explicit_resume(name, cwd)
+    _cc_write_resume_pin(name, sid)
+    _cc_cache_sid(name, sid, pin=True)
+    _cc_mark_app_owned(name)
+    _pocket_lane_note("claude_code", name, sid, cwd, title)
+    _log_event("pocket_cc_source_bound", tmux=name,
+               native_hash=_short_hash(sid), cwd_hash=_short_hash(cwd),
+               reused=running)
+    return {"name": name, "workdir": cwd, "status": status,
+            "sessionId": sid, "sessionTitle": title or None}
+
+
+async def _pocket_activate_cc_lane(body: dict) -> dict:
+    sid, cwd, title, source_name = await _pocket_selected_cc(body)
+    if source_name and source_name != POCKET_CC_TMUX:
+        return await _pocket_bind_cc_source(source_name, sid, cwd, title)
+
+    lane = POCKET_CC_TMUX
+    _cc_write_remote_control_pin(lane)
+    if await _tmux_alive(lane):
+        current_sid = await _cc_pane_session_id(lane)
+        if current_sid == sid:
+            status = "running"
+            if not await _cc_pane_has_remote_control(lane):
+                _CC_HOOK_STATE.pop(lane, None)
+                _CC_SID_CACHE.pop(lane, None)
+                _CC_SID_PINS.pop(lane, None)
+                await _pocket_tmux_replace(lane, cwd, _cc_remote_resume_argv(lane, sid))
+                ready = await _cc_wait_ready(lane)
+                status = "running" if ready else "starting"
+            await _cc_register_explicit_resume(lane, cwd)
+            _cc_write_resume_pin(lane, sid)
+            _cc_cache_sid(lane, sid, pin=True)
+            _cc_mark_app_owned(lane)
+            _pocket_lane_note("claude_code", lane, sid, cwd, title)
+            return {"name": lane, "workdir": cwd, "status": status,
+                    "sessionId": sid, "sessionTitle": title or None}
+
+    _CC_HOOK_STATE.pop(lane, None)
+    _CC_SID_CACHE.pop(lane, None)
+    _CC_SID_PINS.pop(lane, None)
+    await _pocket_tmux_replace(lane, cwd, _cc_remote_resume_argv(lane, sid))
+    await _cc_register_explicit_resume(lane, cwd)
+    _cc_write_resume_pin(lane, sid)
+    _cc_cache_sid(lane, sid, pin=True)
+    _cc_mark_app_owned(lane)
+    ready = await _cc_wait_ready(lane)
+    _pocket_lane_note("claude_code", lane, sid, cwd, title)
+
+    _log_event("pocket_lane_activate", provider="claude_code",
+               tmux=lane, native_hash=_short_hash(sid), cwd_hash=_short_hash(cwd))
+    return {"name": lane, "workdir": cwd,
+            "status": "running" if ready else "starting",
+            "sessionId": sid, "sessionTitle": title or None}
+
+
+async def _pocket_activate_cx_lane(body: dict) -> dict:
+    thread_id = str(body.get("thread_id") or body.get("threadId")
+                    or body.get("id") or "").strip()
+    if not thread_id:
+        raise http_err(400, "THREAD_ID_REQUIRED", "thread_id required")
+    cwd = _pocket_existing_dir(body.get("cwd") or body.get("workdir"), HOME_ROOT)
+    title = str(body.get("name") or body.get("title") or thread_id[:12] or "codex").strip()
+    # Pocket already controls Codex through the app-server endpoints. Starting
+    # `codex resume <thread_id>` in another tmux would make that CLI and the
+    # official app-server compete for the same thread. Record only the logical
+    # binding; leaving Pocket then has no process or archive side effect.
+    _pocket_lane_note("codex", "", thread_id, cwd, title)
+    _log_event("pocket_lane_activate", provider="codex",
+               control="app_server", native_hash=_short_hash(thread_id),
+               cwd_hash=_short_hash(cwd))
+    return {"thread_id": thread_id, "session_id": None, "name": title, "workdir": cwd,
+            "preview": body.get("preview") or "", "status": body.get("status") or "idle",
+            "source": "codex-app-server", "updatedAt": body.get("updatedAt"),
+            "activeTurn": bool(body.get("activeTurn", False))}
+
+
+@app.post("/app/v1/agent-lanes/{provider}/activate")
+async def app_agent_lane_activate(provider: str, request: Request):
+    """Bind Pocket's provider page to a native session.
+
+    Claude Code reuses an existing named tmux in place so the Claude App remote
+    control remains alive. A fixed `pocket-cc` fallback is created only for a
+    history sid with no live/source session name. Codex keeps the existing
+    app-server control path without spawning a competing CLI process.
+    """
+    _check_auth(request)
+    body = await _json_body(request)
+    p = (provider or "").lower().replace("-", "_")
+    if p in ("cc", "claude", "claude_code"):
+        session = await _pocket_activate_cc_lane(body)
+        return {"ok": True, "provider": "claude_code", "tmux": session["name"],
+                "session": session}
+    if p in ("cx", "codex"):
+        session = await _pocket_activate_cx_lane(body)
+        return {"ok": True, "provider": "codex", "tmux": None,
+                "session": session}
+    raise http_err(404, "PROVIDER_NOT_FOUND", "unknown agent lane provider")
+
+
 @app.post("/ccsessions")
 async def cc_session_create(request: Request):
     """Create + start a new Claude Code session."""
@@ -5854,6 +6401,7 @@ async def cc_session_create(request: Request):
     # pin(`ccsess model <name> <model>`),讓企劃/大局思考類任務可指定旗艦
     # 模型、機械性任務指定輕量模型,不必全域切換 delegation.model。
     cc_model = (body.get("model") or "").strip()
+    _cc_write_remote_control_pin(name)
     new_args = ["new", name, wd] + ([cc_model] if cc_model else [])
     await _run_ccsess(*new_args)
     _cc_mark_app_owned(name)   # 這條是 app 開的 → 只有它的審核會進 app(見 _cc_approval_watcher)
@@ -6142,17 +6690,15 @@ async def cc_history_resume(sid: str, request: Request):
     name, i = base, 2
     while name in existing or await _tmux_alive(name):
         name, i = f"{base}-{i}", i + 1
+    _cc_write_remote_control_pin(name)
     rc, _, err = await _tmux_run("new-session", "-d", "-s", name, "-c", cwd,
-                                 CLAUDE_BIN, "--resume", sid)
+                                 *_cc_remote_resume_argv(name, sid))
     if rc != 0:
         raise http_err(502, "TMUX_FAILED", "tmux new-session failed",
                        (err or "tmux new-session failed")[:200])
     # conf 單一寫者:走 ccsess register(內含 conf 鎖),不再直接 append ——
     # 裸 append 會被 ccsess 端 mktemp+mv 全檔重寫蓋掉,或讓 rename 讀到半新不舊。
-    rc2, _out2, err2 = await _run_ccsess("register", name, cwd)
-    if rc2 != 0:
-        raise HTTPException(status_code=500,
-                            detail=f"registered tmux but conf register failed: {err2[:160]}")
+    await _cc_register_explicit_resume(name, cwd)
     # 精準 resume pin:這條 session 是明確 --resume <sid> 起的,直接落 pin,
     # 重開機後 ensure 走 --resume 接回同一條對話(不再靠 --continue 猜目錄)。
     try:
@@ -6791,11 +7337,23 @@ async def _cc_status_core(name: str) -> dict:
     else:
         mode = "normal"
     prompt = _cc_prompt(pane)
-    st = {"busy": busy, "running": True, "mode": mode, "prompt": prompt}
     # wave 2: usage meter + full plan text from the transcript jsonl.
     row = next((r for r in _cc_conf_rows() if r[0] == name), None)
-    if row:
-        usage, plan = _cc_scan_jsonl(await _cc_session_jsonl(name, row[1]))
+    jsonl = await _cc_session_jsonl(name, row[1]) if row else None
+    # AskUserQuestion 完整內容(問題全文 + 選項 description)從 jsonl 讀,取代終端
+    # 截斷的螢幕擷取。pane-scrape 偵測到 question 選單 → 換成 jsonl 全文(修「太簡略」);
+    # pane 漏抓且沒在忙 → 也用 jsonl 補上(修「沒跳出來」);忙碌時不補,避免被跳脫的
+    # 殘留 ask 誤觸。權限 y/n(非 tool_use)仍走 pane-scrape。
+    if jsonl:
+        ask = _cc_pending_ask(jsonl)
+        if ask and (
+            (isinstance(prompt, dict) and prompt.get("semantic") == "question")
+            or (prompt is None and not busy)
+        ):
+            prompt = ask
+    st = {"busy": busy, "running": True, "mode": mode, "prompt": prompt}
+    if jsonl:
+        usage, plan = _cc_scan_jsonl(jsonl)
         if usage:
             st["usage"] = usage
         if prompt and plan and "plan" in low:
@@ -6844,6 +7402,7 @@ async def _cc_key_core(name: str, raw: str) -> dict:
         raise http_err(409, "SESSION_NOT_RUNNING", "session not running")
     args = ["send-keys", "-t", name]
     mapped = _CC_KEYS.get(raw.lower())
+    submit_after_key = False
     if mapped:
         args.append(mapped)                  # named control key
     elif len(raw) == 1 and raw.isprintable():
@@ -6857,11 +7416,29 @@ async def _cc_key_core(name: str, raw: str) -> dict:
         _PANE_CACHE.pop(name, None)           # 強制拿最新畫面,不吃快取
         pane_now = await _tmux_capture_cached(name)
         prompt_now = _cc_prompt(pane_now)
+        # Keep key validation in sync with /status: AskUserQuestion details may
+        # only be visible in the transcript jsonl, while the pane has a trimmed
+        # or transient rendering. Still avoid resurrecting stale asks mid-turn.
+        low_now = pane_now.lower()
+        busy_now = bool(_CC_BUSY_RE.search(pane_now)) or ("esc to interrupt" in low_now)
+        row = next((r for r in _cc_conf_rows() if r[0] == name), None)
+        if row and (
+            (isinstance(prompt_now, dict) and prompt_now.get("semantic") == "question")
+            or (prompt_now is None and not busy_now)
+        ):
+            jsonl = await _cc_session_jsonl(name, row[1])
+            ask = _cc_pending_ask(jsonl) if jsonl else None
+            if ask:
+                prompt_now = ask
         valid_keys = {str(o.get("key") or "").lower()
                       for o in (prompt_now or {}).get("options", [])}
         if not prompt_now or raw.lower() not in valid_keys:
             raise http_err(409, "PROMPT_STALE", "no matching live prompt right now",
                            "the on-screen menu may already be resolved — refresh and retry")
+        # AskUserQuestion / generic question menus need a real submit. Sending
+        # only "1"/"2"/"3" leaves the digit in the TUI selection field on some
+        # Claude Code layouts; permission prompts keep the old single-key path.
+        submit_after_key = (prompt_now or {}).get("semantic") == "question"
         args += ["-l", raw]                  # literal single char (y / n / 1-3)
     else:
         raise HTTPException(status_code=400, detail="unsupported key")
@@ -6869,6 +7446,12 @@ async def _cc_key_core(name: str, raw: str) -> dict:
     if rc:
         raise http_err(502, "TMUX_FAILED", "tmux send-keys failed",
                        err[:200] or "send-keys failed")
+    if submit_after_key:
+        await asyncio.sleep(0.08)
+        rc_enter, _, err_enter = await _tmux_run("send-keys", "-t", name, "Enter")
+        if rc_enter:
+            raise http_err(502, "TMUX_FAILED", "tmux send-keys enter failed",
+                           err_enter[:200] or "send-keys Enter failed")
     # The key just changed the TUI (mode toggle, menu pick) — a cached pane
     # would feed the app a pre-keystroke mode/prompt for up to TTL seconds.
     _PANE_CACHE.pop(name, None)
@@ -8853,6 +9436,7 @@ async def capabilities(request: Request):
             "endpoints": ["/app/v1/sessions", "/app/v1/messages", "/reports",
                           "/app/v1/uploads",
                           "/app/v1/reactions", "/app/v1/pins",
+                          "/app/v1/messages/{id}", "/app/v1/sessions/{id}/pin",
                           "/app/v1/messages/retract", "/app/v1/personas",
                           "/app/v1/messages/status", "/app/v1/messages/events",
                           "/app/v1/messages/interrupt",
@@ -10030,6 +10614,30 @@ def _message_meta_load(con, message_id: str):
     return reactions, (int(row[1] or 0) if row else 0)
 
 
+def _message_session_of(con, message_id: str):
+    """Session a message belongs to, from the canonical messages table.
+    None for tg-<ts>/report ids — those live outside canonical (merged 流),
+    the overlay row then keeps session NULL(讀取端用 join 補洞)。"""
+    row = con.execute("SELECT session FROM messages WHERE id=?",
+                      (message_id,)).fetchone()
+    return row[0] if row else None
+
+
+def _message_meta_upsert(con, message_id: str, reactions: list,
+                         pinned: int, session=None):
+    """One shared upsert for every message_meta writer (G2/#39). session 只在
+    有值時覆蓋(COALESCE)— per-message 端點解析不出 tg id 的歸屬時,不把
+    PUT /sessions/{id}/pin 已寫入的歸屬洗掉。"""
+    con.execute(
+        "INSERT INTO message_meta(message_id, reactions, pinned, session, updated_at) "
+        "VALUES(?,?,?,?,?) ON CONFLICT(message_id) DO UPDATE SET "
+        "reactions=excluded.reactions, pinned=excluded.pinned, "
+        "session=COALESCE(excluded.session, session), "
+        "updated_at=excluded.updated_at",
+        (message_id, json.dumps(reactions, ensure_ascii=False),
+         pinned, session, time.time()))
+
+
 @app.post("/app/v1/reactions")
 async def app_reactions(request: Request):
     """Canonical reactions (G2/#39): add/remove one emoji on a message and
@@ -10053,11 +10661,8 @@ async def app_reactions(request: Request):
                 reactions.append(emoji)
         else:
             reactions = [r for r in reactions if r != emoji]
-        con.execute("INSERT INTO message_meta(message_id, reactions, pinned, updated_at) "
-                    "VALUES(?,?,?,?) ON CONFLICT(message_id) DO UPDATE SET "
-                    "reactions=excluded.reactions, updated_at=excluded.updated_at",
-                    (message_id, json.dumps(reactions, ensure_ascii=False),
-                     pinned, time.time()))
+        _message_meta_upsert(con, message_id, reactions, pinned,
+                             session=_message_session_of(con, message_id))
         con.commit()
         con.close()
     except Exception as e:  # noqa: BLE001
@@ -10081,11 +10686,8 @@ async def app_pins(request: Request):
         con = sqlite3.connect(CANON_DB, timeout=30)
         con.execute("PRAGMA busy_timeout=30000")
         reactions, _old = _message_meta_load(con, message_id)
-        con.execute("INSERT INTO message_meta(message_id, reactions, pinned, updated_at) "
-                    "VALUES(?,?,?,?) ON CONFLICT(message_id) DO UPDATE SET "
-                    "pinned=excluded.pinned, updated_at=excluded.updated_at",
-                    (message_id, json.dumps(reactions, ensure_ascii=False),
-                     pinned, time.time()))
+        _message_meta_upsert(con, message_id, reactions, pinned,
+                             session=_message_session_of(con, message_id))
         con.commit()
         con.close()
     except Exception as e:  # noqa: BLE001
@@ -10093,6 +10695,118 @@ async def app_pins(request: Request):
                    message_id=message_id, error=type(e).__name__)
         raise HTTPException(status_code=500, detail=str(e)[:200])
     return {"ok": True}
+
+
+@app.patch("/app/v1/messages/{mid}")
+async def app_patch_message(mid: str, request: Request):
+    """G2/#39 issue 合約收尾:單值 reaction 的 PATCH 形狀。body {"reaction":
+    "👍" | null}(null/空字串=清除)。只認 canonical messages 表的 id —
+    不存在回 404(合約要求存在性檢查;tg-<ts>/報告 id 不在 canonical,
+    請走 id-agnostic 的 POST /app/v1/reactions,那條才蓋得到 TG 側訊息)。
+    寫入同時落 legacy 單值 overlay 與 message_meta 清單(取代整串),
+    GET /app/v1/messages 的 reaction/reactions 兩欄一起對齊。"""
+    _check_auth(request)
+    body = await _json_body(request)
+    if "reaction" not in body:
+        raise http_err(400, "BAD_REQUEST", "body must carry a 'reaction' key")
+    raw = body.get("reaction")
+    reaction = str(raw).strip()[:16] if raw is not None else ""
+    import sqlite3
+    try:
+        con = sqlite3.connect(CANON_DB, timeout=30)
+        con.execute("PRAGMA busy_timeout=30000")
+        session = _message_session_of(con, mid)
+        if session is None:
+            con.close()
+            raise http_err(404, "MESSAGE_NOT_FOUND",
+                           "no canonical message with this id",
+                           "TG/cron-sourced ids: use POST /app/v1/reactions")
+        _reactions_old, pinned = _message_meta_load(con, mid)
+        if reaction:
+            con.execute("INSERT INTO reactions(msg_id, session, reaction, updated_at) "
+                        "VALUES(?,?,?,?) ON CONFLICT(msg_id) DO UPDATE SET "
+                        "reaction=excluded.reaction, updated_at=excluded.updated_at",
+                        (mid, session, reaction, time.time()))
+            _message_meta_upsert(con, mid, [reaction], pinned, session=session)
+        else:
+            con.execute("DELETE FROM reactions WHERE msg_id=?", (mid,))
+            _message_meta_upsert(con, mid, [], pinned, session=session)
+        con.commit()
+        con.close()
+    except HTTPException:
+        raise
+    except Exception as e:  # noqa: BLE001
+        _log_event("message_meta_write_failed", kind="reaction_patch",
+                   message_id=mid, error=type(e).__name__)
+        raise HTTPException(status_code=500, detail=str(e)[:200])
+    return {"ok": True, "id": mid, "reaction": reaction or None}
+
+
+def _session_pinned_ids(con, session: str) -> list:
+    """All pinned message ids belonging to a session, oldest-pin first.
+    session 欄有值直接比;NULL(舊列/歸屬未知)用 canonical messages join
+    補洞 — tg-<ts> 舊 pin 列兩邊都對不上時寧可漏,不跨 session 誤傷。"""
+    rows = con.execute(
+        "SELECT message_id FROM message_meta WHERE pinned=1 AND (session=? OR "
+        "(session IS NULL AND message_id IN (SELECT id FROM messages WHERE session=?)))"
+        " ORDER BY updated_at", (session, session)).fetchall()
+    return [r[0] for r in rows]
+
+
+@app.put("/app/v1/sessions/{sid}/pin")
+async def app_put_session_pins(sid: str, request: Request):
+    """G2/#39 issue 合約收尾:per-session 置頂全量替換。body
+    {"pinned_message_ids": [...]}(空清單=全部解除)。id 收 GET
+    /app/v1/messages 回的任何穩定 id(canonical mid / tg-<ts> / 報告 id)—
+    寫入時直接掛 session 歸屬,tg id 從此也能按 session 讀回。解除只掃
+    「歸屬得到本 session」的列,不動其他人格的置頂。"""
+    _check_auth(request)
+    if sid not in PERSONAS:
+        raise http_err(404, "SESSION_NOT_FOUND", "unknown session")
+    body = await _json_body(request)
+    ids = body.get("pinned_message_ids")
+    if not isinstance(ids, list) or not all(isinstance(i, str) and i.strip() for i in ids):
+        raise http_err(400, "BAD_REQUEST",
+                       "pinned_message_ids must be a list of message ids")
+    ids = [i.strip() for i in ids]
+    import sqlite3
+    try:
+        con = sqlite3.connect(CANON_DB, timeout=30)
+        con.execute("PRAGMA busy_timeout=30000")
+        for stale in _session_pinned_ids(con, sid):
+            if stale in ids:
+                continue
+            reactions, _pin = _message_meta_load(con, stale)
+            _message_meta_upsert(con, stale, reactions, 0, session=sid)
+        for mid in ids:
+            reactions, _pin = _message_meta_load(con, mid)
+            _message_meta_upsert(con, mid, reactions, 1, session=sid)
+        pinned_now = _session_pinned_ids(con, sid)
+        con.commit()
+        con.close()
+    except HTTPException:
+        raise
+    except Exception as e:  # noqa: BLE001
+        _log_event("message_meta_write_failed", kind="session_pin",
+                   session=sid, error=type(e).__name__)
+        raise HTTPException(status_code=500, detail=str(e)[:200])
+    return {"ok": True, "session": sid, "pinned_message_ids": pinned_now}
+
+
+@app.get("/app/v1/sessions/{sid}/pin")
+async def app_get_session_pins(sid: str, request: Request):
+    """PUT 的讀回面(G2/#39):本 session 目前置頂的訊息 id 清單。
+    (GET /app/v1/messages 的每則 pinned 旗標照舊,這條是 per-session 檢視。)"""
+    _check_auth(request)
+    if sid not in PERSONAS:
+        raise http_err(404, "SESSION_NOT_FOUND", "unknown session")
+    import sqlite3
+    con = sqlite3.connect(f"file:{CANON_DB}?mode=ro", uri=True, timeout=5)
+    try:
+        pinned = _session_pinned_ids(con, sid)
+    finally:
+        con.close()
+    return {"session": sid, "pinned_message_ids": pinned}
 
 
 @app.post("/app/v1/messages/retract")

@@ -168,6 +168,28 @@ Rules:
 - Messages are oldest to newest.
 - Each message should include `role`, `content`, `ts`, `status`, and `source`
   when available.
+- Reaction/pin overlay (G2/#39): each message may additionally carry
+  `reaction`（legacy 單值）、`reactions`（清單）、`pinned`、`deleted` — 缺席
+  即無資料。canonical mid 與 tg-`<ts>` id 一視同仁。
+
+### Reaction / 置頂（G2/#39 canonical 化）
+
+寫入端點（皆 Bearer auth）：
+
+- `POST /app/v1/reactions` `{message_id, emoji, action:add|remove}` —
+  id-agnostic（canonical mid / tg-`<ts>` / 報告 id 皆可），回全清單。
+- `POST /app/v1/pins` `{message_id, pinned:bool}` — per-message 置頂。
+- `PATCH /app/v1/messages/{id}` `{reaction: "👍" | null}` — issue #39 合約的
+  單值形狀（null=清除）。**只認 canonical messages 表的 id，不存在回
+  `404 MESSAGE_NOT_FOUND`**；TG/cron 來源訊息請走上面 id-agnostic 的 POST。
+- `PUT /app/v1/sessions/{id}/pin` `{pinned_message_ids:[...]}` — per-session
+  全量替換（空清單=全解除），id 收 GET /app/v1/messages 回的任何穩定 id；
+  解除只掃歸屬本 session 的列。`GET` 同路徑讀回
+  `{session, pinned_message_ids}`。未知 session 回 404。
+
+儲存：`message_meta(message_id, reactions JSON, pinned, session, deleted)`
+overlay（`session` 欄 idempotent ALTER + 由 messages 表回填；tg id 由
+PUT pin 寫入時直接掛歸屬）。legacy `reactions` 單值表照舊鏡射，舊 app 不破。
 
 ### `POST /app/v1/messages`
 
@@ -243,6 +265,23 @@ summary kept in sync with it.
   Acceptable for a self-hosted single-owner bridge; the kill switch above is
   the escape hatch. Not gated behind `POCKET_KERNEL` — this is a
   self-ops feature, available in OSS/kernel builds too.
+
+### `POST /app/v1/agent-lanes/{provider}/activate`
+
+Pins Pocket's provider lane to a native agent session. `{provider}` accepts
+`cc` / `claude_code` and `cx` / `codex`.
+
+- **Claude Code body**: `{name?, session_id?, workdir?, adopt_source?}`.
+  A named source session is reused in place so its Claude App remote-control
+  process remains alive when Pocket connects or exits. Only a history-only
+  session id with no source name uses the fixed `pocket-cc` fallback.
+- **Codex body**: `{thread_id, workdir?, name?, preview?}`.
+  The bridge records a logical binding and returns the selected Codex session
+  shape. Status/history/input continue through the Codex app-server; no
+  competing `codex resume` CLI or `pocket-cx` tmux is started.
+- The history-only `pocket-cc` fallback uses tmux `remain-on-exit on` and
+  `destroy-unattached off`. Exiting either Pocket agent page only clears client
+  UI state and never archives or terminates the native session.
 
 ## 3. v1 遷移備註（persona 事件）
 

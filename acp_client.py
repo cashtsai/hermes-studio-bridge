@@ -19,6 +19,7 @@ import os
 import uuid
 
 HERMES_BIN = "/Users/xcash/apps/hermes-agent/runtime/venv/bin/hermes"
+ACP_STREAM_LIMIT = 128 * 1024 * 1024
 
 
 def canonical_telegram_session(home: str):
@@ -101,6 +102,10 @@ class ACPSession:
                 HERMES_BIN, "acp", "--accept-hooks",
                 env=env, stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+                # ACP is newline-delimited JSON. Tool results and restored
+                # session payloads can exceed asyncio's 64 KiB line default;
+                # that would kill the reader task and leave the persona offline.
+                limit=ACP_STREAM_LIMIT,
             )
             self._pending.clear()
             self._reader = asyncio.create_task(self._read_loop())
