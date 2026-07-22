@@ -5184,6 +5184,55 @@ def _cc_write_resume_pin(name: str, sid: str) -> None:
     os.replace(ptmp, os.path.join(pdir, name))
 
 
+def _cc_remote_control_pin_path(name: str) -> str:
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", name or "")
+    return os.path.expanduser(f"~/.config/ccsess/remote-control/{safe}")
+
+
+def _cc_remote_debug_path(name: str) -> str:
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", name or "")
+    path = os.path.expanduser(f"~/.local/share/ccsess/logs/remote-control-{safe}.log")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    return path
+
+
+def _cc_write_remote_control_pin(name: str, display_name: str | None = None) -> bool:
+    """Enable Claude App remote-control for a ccsess-managed tmux lane.
+
+    Returns True when the pin changed. A running bare `claude --resume` process
+    still needs a restart before the official app can see the lane.
+    """
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", name or "")
+    if not safe:
+        return False
+    pdir = os.path.expanduser("~/.config/ccsess/remote-control")
+    os.makedirs(pdir, exist_ok=True)
+    path = os.path.join(pdir, safe)
+    value = (display_name or name).strip() or safe
+    old = None
+    try:
+        with open(path, encoding="utf-8") as f:
+            old = f.read().strip()
+    except FileNotFoundError:
+        pass
+    if old == value:
+        return False
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(value + "\n")
+    os.replace(tmp, path)
+    return True
+
+
+def _cc_remote_resume_argv(name: str, sid: str) -> list[str]:
+    return [
+        CLAUDE_BIN,
+        "--resume", sid,
+        "--remote-control", name,
+        "--debug-file", _cc_remote_debug_path(name),
+    ]
+
+
 def _cc_reseed_pins_from_files() -> int:
     """啟動時把 ~/.config/ccsess/resume/<name> 的 sid 重載回 _CC_SID_PINS。
 
@@ -5280,6 +5329,35 @@ async def _cc_pane_session_id(name: str):
     return sid
 
 
+async def _cc_pane_has_remote_control(name: str) -> bool:
+    """Return True when the live Claude process under this pane advertises
+    Claude App remote-control for the expected ccsess name."""
+    try:
+        rc, out, _ = await _tmux_run("list-panes", "-t", name, "-F", "#{pane_pid}")
+        pane_pid = int(out.split()[0]) if rc == 0 and out.strip() else 0
+        if not pane_pid:
+            return False
+        procs = await _ps_snapshot()
+        kids: dict = {}
+        for pid, (ppid, _cmd) in procs.items():
+            kids.setdefault(ppid, []).append(pid)
+        stack, seen = [pane_pid], set()
+        remote_arg = f"--remote-control {name}"
+        remote_eq = f"--remote-control={name}"
+        while stack:
+            pid = stack.pop()
+            if pid in seen:
+                continue
+            seen.add(pid)
+            cmd = procs.get(pid, (0, ""))[1]
+            if "claude" in cmd and (remote_arg in cmd or remote_eq in cmd):
+                return True
+            stack.extend(kids.get(pid, []))
+    except Exception:  # noqa: BLE001
+        return False
+    return False
+
+
 async def _cc_session_jsonl(name: str, workdir: str):
     """這個 ccsess 的專屬 jsonl:pane 行程 sid 優先,失敗才 fallback dir-latest。
     已知限制:TUI 內 /clear 或 /resume 會讓 cmdline 的 uuid 過期(行程不重啟、
@@ -5310,6 +5388,72 @@ def _cc_conf_rows():
     except Exception:  # noqa: BLE001
         pass
     return rows
+
+
+def _cc_conf_upsert(name: str, workdir: str, enabled: str = "1") -> None:
+    """Update sessions.conf with the same lock convention as ccsess.
+
+    Used only for explicit `--resume <sid>` sessions when ccsess' same-workdir
+    guard rejects a fixed lane. Those launches do not rely on `--continue`, so
+    the original same-workdir footgun does not apply.
+    """
+    if not name:
+        return
+    os.makedirs(os.path.dirname(CCSESS_CONF), exist_ok=True)
+    lock = CCSESS_CONF + ".lock"
+    deadline = time.monotonic() + 5.0
+    while True:
+        try:
+            os.mkdir(lock)
+            break
+        except FileExistsError:
+            if time.monotonic() >= deadline:
+                raise http_err(502, "CCSESS_CONF_LOCKED",
+                               "ccsess config lock timeout",
+                               "sessions.conf lock timeout")
+            time.sleep(0.1)
+    try:
+        try:
+            with open(CCSESS_CONF, encoding="utf-8") as f:
+                lines = f.read().splitlines()
+        except FileNotFoundError:
+            lines = []
+        out = []
+        found = False
+        for line in lines:
+            if not line or line.startswith("#"):
+                out.append(line)
+                continue
+            parts = line.split("|")
+            if parts and parts[0] == name:
+                out.append(f"{name}|{workdir}|{enabled}")
+                found = True
+            else:
+                out.append(line)
+        if not found:
+            out.append(f"{name}|{workdir}|{enabled}")
+        tmp = f"{CCSESS_CONF}.{os.getpid()}.tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write("\n".join(out).rstrip() + "\n")
+        os.replace(tmp, CCSESS_CONF)
+    finally:
+        try:
+            os.rmdir(lock)
+        except OSError:
+            pass
+
+
+async def _cc_register_explicit_resume(name: str, workdir: str) -> None:
+    try:
+        await _run_ccsess("register", name, workdir)
+        return
+    except HTTPException as e:
+        detail = str(getattr(e, "detail", ""))
+        if "同目錄" not in detail and "workdir" not in detail:
+            raise
+        _log_event("ccsess_register_duplicate_workdir_resume_upsert",
+                   session=name, cwd_hash=_short_hash(workdir))
+    _cc_conf_upsert(name, workdir, "1")
 
 
 # App-owned CC sessions registry. CCSESS_CONF is shared with the ccsess CLI
@@ -5999,10 +6143,19 @@ async def _pocket_selected_cc(body: dict) -> tuple[str, str, str, str]:
 async def _pocket_activate_cc_lane(body: dict) -> dict:
     sid, cwd, title, source_name = await _pocket_selected_cc(body)
     lane = POCKET_CC_TMUX
+    _cc_write_remote_control_pin(lane)
     if await _tmux_alive(lane):
         current_sid = await _cc_pane_session_id(lane)
         if current_sid == sid:
-            await _run_ccsess("register", lane, cwd)
+            status = "running"
+            if not await _cc_pane_has_remote_control(lane):
+                _CC_HOOK_STATE.pop(lane, None)
+                _CC_SID_CACHE.pop(lane, None)
+                _CC_SID_PINS.pop(lane, None)
+                await _pocket_tmux_replace(lane, cwd, _cc_remote_resume_argv(lane, sid))
+                ready = await _cc_wait_ready(lane)
+                status = "running" if ready else "starting"
+            await _cc_register_explicit_resume(lane, cwd)
             _cc_write_resume_pin(lane, sid)
             _cc_cache_sid(lane, sid, pin=True)
             _cc_mark_app_owned(lane)
@@ -6013,14 +6166,14 @@ async def _pocket_activate_cc_lane(body: dict) -> dict:
                 if rc != 0:
                     _log_event("pocket_lane_source_kill_failed", source=source_name,
                                tmux=lane, error=(err or "")[:160])
-            return {"name": lane, "workdir": cwd, "status": "running",
+            return {"name": lane, "workdir": cwd, "status": status,
                     "sessionId": sid, "sessionTitle": title or None}
 
     _CC_HOOK_STATE.pop(lane, None)
     _CC_SID_CACHE.pop(lane, None)
     _CC_SID_PINS.pop(lane, None)
-    await _pocket_tmux_replace(lane, cwd, [CLAUDE_BIN, "--resume", sid])
-    await _run_ccsess("register", lane, cwd)
+    await _pocket_tmux_replace(lane, cwd, _cc_remote_resume_argv(lane, sid))
+    await _cc_register_explicit_resume(lane, cwd)
     _cc_write_resume_pin(lane, sid)
     _cc_cache_sid(lane, sid, pin=True)
     _cc_mark_app_owned(lane)
@@ -6112,6 +6265,7 @@ async def cc_session_create(request: Request):
     # pin(`ccsess model <name> <model>`),讓企劃/大局思考類任務可指定旗艦
     # 模型、機械性任務指定輕量模型,不必全域切換 delegation.model。
     cc_model = (body.get("model") or "").strip()
+    _cc_write_remote_control_pin(name)
     new_args = ["new", name, wd] + ([cc_model] if cc_model else [])
     await _run_ccsess(*new_args)
     _cc_mark_app_owned(name)   # 這條是 app 開的 → 只有它的審核會進 app(見 _cc_approval_watcher)
@@ -6400,14 +6554,15 @@ async def cc_history_resume(sid: str, request: Request):
     name, i = base, 2
     while name in existing or await _tmux_alive(name):
         name, i = f"{base}-{i}", i + 1
+    _cc_write_remote_control_pin(name)
     rc, _, err = await _tmux_run("new-session", "-d", "-s", name, "-c", cwd,
-                                 CLAUDE_BIN, "--resume", sid)
+                                 *_cc_remote_resume_argv(name, sid))
     if rc != 0:
         raise http_err(502, "TMUX_FAILED", "tmux new-session failed",
                        (err or "tmux new-session failed")[:200])
     # conf 單一寫者:走 ccsess register(內含 conf 鎖),不再直接 append ——
     # 裸 append 會被 ccsess 端 mktemp+mv 全檔重寫蓋掉,或讓 rename 讀到半新不舊。
-    await _run_ccsess("register", name, cwd)
+    await _cc_register_explicit_resume(name, cwd)
     # 精準 resume pin:這條 session 是明確 --resume <sid> 起的,直接落 pin,
     # 重開機後 ensure 走 --resume 接回同一條對話(不再靠 --continue 猜目錄)。
     try:
@@ -7111,6 +7266,7 @@ async def _cc_key_core(name: str, raw: str) -> dict:
         raise http_err(409, "SESSION_NOT_RUNNING", "session not running")
     args = ["send-keys", "-t", name]
     mapped = _CC_KEYS.get(raw.lower())
+    submit_after_key = False
     if mapped:
         args.append(mapped)                  # named control key
     elif len(raw) == 1 and raw.isprintable():
@@ -7124,11 +7280,29 @@ async def _cc_key_core(name: str, raw: str) -> dict:
         _PANE_CACHE.pop(name, None)           # 強制拿最新畫面,不吃快取
         pane_now = await _tmux_capture_cached(name)
         prompt_now = _cc_prompt(pane_now)
+        # Keep key validation in sync with /status: AskUserQuestion details may
+        # only be visible in the transcript jsonl, while the pane has a trimmed
+        # or transient rendering. Still avoid resurrecting stale asks mid-turn.
+        low_now = pane_now.lower()
+        busy_now = bool(_CC_BUSY_RE.search(pane_now)) or ("esc to interrupt" in low_now)
+        row = next((r for r in _cc_conf_rows() if r[0] == name), None)
+        if row and (
+            (isinstance(prompt_now, dict) and prompt_now.get("semantic") == "question")
+            or (prompt_now is None and not busy_now)
+        ):
+            jsonl = await _cc_session_jsonl(name, row[1])
+            ask = _cc_pending_ask(jsonl) if jsonl else None
+            if ask:
+                prompt_now = ask
         valid_keys = {str(o.get("key") or "").lower()
                       for o in (prompt_now or {}).get("options", [])}
         if not prompt_now or raw.lower() not in valid_keys:
             raise http_err(409, "PROMPT_STALE", "no matching live prompt right now",
                            "the on-screen menu may already be resolved — refresh and retry")
+        # AskUserQuestion / generic question menus need a real submit. Sending
+        # only "1"/"2"/"3" leaves the digit in the TUI selection field on some
+        # Claude Code layouts; permission prompts keep the old single-key path.
+        submit_after_key = (prompt_now or {}).get("semantic") == "question"
         args += ["-l", raw]                  # literal single char (y / n / 1-3)
     else:
         raise HTTPException(status_code=400, detail="unsupported key")
@@ -7136,6 +7310,12 @@ async def _cc_key_core(name: str, raw: str) -> dict:
     if rc:
         raise http_err(502, "TMUX_FAILED", "tmux send-keys failed",
                        err[:200] or "send-keys failed")
+    if submit_after_key:
+        await asyncio.sleep(0.08)
+        rc_enter, _, err_enter = await _tmux_run("send-keys", "-t", name, "Enter")
+        if rc_enter:
+            raise http_err(502, "TMUX_FAILED", "tmux send-keys enter failed",
+                           err_enter[:200] or "send-keys Enter failed")
     # The key just changed the TUI (mode toggle, menu pick) — a cached pane
     # would feed the app a pre-keystroke mode/prompt for up to TTL seconds.
     _PANE_CACHE.pop(name, None)
