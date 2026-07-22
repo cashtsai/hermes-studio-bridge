@@ -5168,7 +5168,6 @@ async def persona_messages(persona: str, request: Request, limit: int = 100):
 CCSESS_CONF = os.path.expanduser(os.environ.get("CCSESS_CONF", "~/.config/ccsess/sessions.conf"))
 TMUX_BIN = "/opt/homebrew/bin/tmux" if os.path.exists("/opt/homebrew/bin/tmux") else "tmux"
 POCKET_CC_TMUX = os.environ.get("POCKET_CC_TMUX", "pocket-cc")
-POCKET_CX_TMUX = os.environ.get("POCKET_CX_TMUX", "pocket-cx")
 POCKET_AGENT_LANES = os.path.join(os.path.dirname(CCSESS_CONF), "pocket-agent-lanes.json")
 _CC_HOOK_STATE: dict[str, dict] = {}
 _CC_HOOK_TTL = 600.0
@@ -6335,16 +6334,18 @@ async def _pocket_activate_cx_lane(body: dict) -> dict:
         raise http_err(400, "THREAD_ID_REQUIRED", "thread_id required")
     cwd = _pocket_existing_dir(body.get("cwd") or body.get("workdir"), HOME_ROOT)
     title = str(body.get("name") or body.get("title") or thread_id[:12] or "codex").strip()
-    lane = POCKET_CX_TMUX
-    binding = _pocket_lane_bindings().get("codex") or {}
-    if not (binding.get("native_id") == thread_id and await _tmux_alive(lane)):
-        await _pocket_tmux_replace(lane, cwd, [_resolve_codex_bin(), "resume", thread_id])
-    _pocket_lane_note("codex", lane, thread_id, cwd, title)
+    # Pocket already controls Codex through the app-server endpoints. Starting
+    # `codex resume <thread_id>` in another tmux would make that CLI and the
+    # official app-server compete for the same thread. Record only the logical
+    # binding; leaving Pocket then has no process or archive side effect.
+    _pocket_lane_note("codex", "", thread_id, cwd, title)
     _log_event("pocket_lane_activate", provider="codex",
-               tmux=lane, native_hash=_short_hash(thread_id), cwd_hash=_short_hash(cwd))
+               control="app_server", native_hash=_short_hash(thread_id),
+               cwd_hash=_short_hash(cwd))
     return {"thread_id": thread_id, "session_id": None, "name": title, "workdir": cwd,
-            "preview": body.get("preview") or "", "status": "idle",
-            "source": "pocket-tmux", "updatedAt": None, "activeTurn": False}
+            "preview": body.get("preview") or "", "status": body.get("status") or "idle",
+            "source": "codex-app-server", "updatedAt": body.get("updatedAt"),
+            "activeTurn": bool(body.get("activeTurn", False))}
 
 
 @app.post("/app/v1/agent-lanes/{provider}/activate")
@@ -6354,7 +6355,7 @@ async def app_agent_lane_activate(provider: str, request: Request):
     Claude Code reuses an existing named tmux in place so the Claude App remote
     control remains alive. A fixed `pocket-cc` fallback is created only for a
     history sid with no live/source session name. Codex keeps the existing
-    app-server control path while `pocket-cx` remains resumable/attachable.
+    app-server control path without spawning a competing CLI process.
     """
     _check_auth(request)
     body = await _json_body(request)
@@ -6365,7 +6366,7 @@ async def app_agent_lane_activate(provider: str, request: Request):
                 "session": session}
     if p in ("cx", "codex"):
         session = await _pocket_activate_cx_lane(body)
-        return {"ok": True, "provider": "codex", "tmux": POCKET_CX_TMUX,
+        return {"ok": True, "provider": "codex", "tmux": None,
                 "session": session}
     raise http_err(404, "PROVIDER_NOT_FOUND", "unknown agent lane provider")
 
