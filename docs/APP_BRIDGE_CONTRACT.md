@@ -60,6 +60,7 @@ Required features:
 - `message_dry_run`
 - `accounts`
 - `apple_auth`
+- `apple_web_auth`
 - `account_pairing`
 - `delegations`
 - `control_plane_v2`
@@ -84,6 +85,41 @@ Rules:
 - `aud` must match configured `APPLE_ID_AUDIENCES` (`com.pocketagent.ios` for M1).
 - Invalid tokens return `401`.
 - The response includes an account session token for account-scoped endpoints.
+
+### Web Sign in with Apple (Developer ID builds)
+
+Developer ID distribution does not support the native Sign in with Apple
+entitlement. Pocket uses a three-step browser flow instead:
+
+1. `POST /app/v1/auth/apple/web/start`
+2. `POST /app/v1/auth/apple/web/callback` (Apple `form_post`)
+3. `POST /app/v1/auth/apple/web/status`
+
+These three endpoints form the fixed-domain public auth broker at
+`pocket.tsai.cash`; they do not run against each user's changing local tunnel.
+`start` is IP-rate-limited and returns a short-lived `flow_id`, a separate
+high-entropy `poll_secret`, and Apple's authorization URL. `status` requires
+both opaque values. The callback accepts only a single-use state, verifies the
+signed nonce, exchanges the five-minute authorization code at Apple's token
+endpoint, and compares the verified subjects.
+
+The callback HTML never contains an identity token or account session. Pocket
+polls the fixed-domain broker and receives the exchanged Apple identity token
+once, then sends that proof to its own `127.0.0.1` bridge through
+`POST /app/v1/auth/apple`. The local bridge verifies the Apple JWT and mints the
+local account session. Failed, cancelled, replayed, expired, or incorrectly
+keyed flows never return identity proof.
+
+Required bridge environment:
+
+- `APPLE_WEB_CLIENT_ID`: Apple Services ID, for example `com.pocketagent.web`.
+- `APPLE_WEB_REDIRECT_URI`: exact HTTPS callback URL registered with Apple.
+- `APPLE_WEB_TEAM_ID`: Apple Developer Team ID.
+- `APPLE_WEB_KEY_ID`: Sign in with Apple private-key ID.
+- `APPLE_WEB_PRIVATE_KEY_PATH`: local mode-600 `.p8` path.
+
+The Sign in with Apple key is a bridge runtime secret. It must not be bundled in
+Pocket, committed to git, or reused as a GitHub release-signing secret.
 
 ### `GET /app/v1/account`
 
