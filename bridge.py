@@ -36,6 +36,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
+import media_artifacts
 from fastapi import FastAPI, Request, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, StreamingResponse, FileResponse, HTMLResponse
 from starlette.websockets import WebSocketState
@@ -58,6 +59,14 @@ _BG_TASKS: set = set()
 # 能 call_soon_threadsafe 把卡片 feed 排回單圈(SessionCardStore 不上鎖)。
 # startup 時由 _start_log_rotation 填入。
 _MAIN_LOOP = None
+
+# Durable media index.  Construction is lazy so importing bridge.py in tests
+# does not create production state under ~/.pocket.
+_MEDIA_ARTIFACT_STORE = None
+_MEDIA_ARTIFACT_STORE_LOCK = threading.Lock()
+_MEDIA_ARTIFACT_ROOT = os.path.expanduser(
+    os.environ.get("POCKET_MEDIA_DIR", "~/.pocket/media-artifacts")
+)
 
 # One SSE keepalive cadence for every streaming endpoint (issue #8: it was
 # 2s / 4s / 10s across chat, ccsessions and codexsessions for no reason).
@@ -176,6 +185,57 @@ def _log_event(event: str, **fields) -> None:
         **fields,
     }
     print("[bridge-event] " + json.dumps(payload, ensure_ascii=False, sort_keys=True), flush=True)
+
+
+def _media_store() -> media_artifacts.MediaArtifactStore:
+    global _MEDIA_ARTIFACT_STORE
+    if _MEDIA_ARTIFACT_STORE is None:
+        with _MEDIA_ARTIFACT_STORE_LOCK:
+            if _MEDIA_ARTIFACT_STORE is None:
+                _MEDIA_ARTIFACT_STORE = media_artifacts.MediaArtifactStore(
+                    _MEDIA_ARTIFACT_ROOT
+                )
+    return _MEDIA_ARTIFACT_STORE
+
+
+def _media_capture_sync(session_id: str, payload) -> list:
+    return _media_store().capture_payload(session_id, payload)
+
+
+def _schedule_media_capture(session_id: str, payload) -> None:
+    """Copy referenced files off temp storage without blocking the event loop."""
+    if not session_id or payload is None:
+        return
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    task = loop.create_task(asyncio.to_thread(
+        _media_capture_sync, session_id, payload
+    ))
+    _BG_TASKS.add(task)
+
+    def _done(done_task):
+        _BG_TASKS.discard(done_task)
+        try:
+            done_task.result()
+        except Exception as exc:  # noqa: BLE001
+            _log_event(
+                "media_capture_error",
+                session_hash=_short_hash(session_id),
+                error=type(exc).__name__,
+            )
+
+    task.add_done_callback(_done)
+
+
+def _media_wire_item(item: dict) -> dict:
+    out = dict(item)
+    if out.get("source_kind") == "url":
+        out["source_url"] = out.get("source_ref")
+    elif out.get("available"):
+        out["download_url"] = f"/app/v2/artifacts/{out['media_id']}"
+    return out
 
 
 # Loaded after _log_event exists so a corrupt tokens file gets logged.
@@ -4113,9 +4173,26 @@ async def serve_file(request: Request, path: str):
         rt = os.path.realpath(t)
         if rt not in roots:
             roots.append(rt)
-    if not any(p == r or p.startswith(r + os.sep) for r in roots) or not os.path.isfile(p):
+    if not any(p == r or p.startswith(r + os.sep) for r in roots):
         raise HTTPException(status_code=404, detail="not found")
-    return FileResponse(p)
+    if os.path.isfile(p):
+        # Compatibility traffic also protects the file from disappearing after
+        # this response. Session-aware callers use the v2 media index instead.
+        try:
+            await asyncio.to_thread(
+                _media_store().capture_path, "legacy:file", path
+            )
+        except Exception as exc:  # noqa: BLE001
+            _log_event("media_legacy_capture_error", error=type(exc).__name__)
+        return FileResponse(p)
+
+    archived = await asyncio.to_thread(_media_store().resolve_original, path)
+    if archived is None and p != path:
+        archived = await asyncio.to_thread(_media_store().resolve_original, p)
+    if archived is None:
+        raise HTTPException(status_code=404, detail="not found")
+    archived_path, archived_mime, _ = archived
+    return FileResponse(archived_path, media_type=archived_mime or None)
 
 
 async def _git_capture(*args, cwd=None, timeout: float = 20.0):
@@ -8503,6 +8580,7 @@ def _cc_card_store(name: str):
     store = _CC_CARD_STORES.get(name)
     if store is None:
         store = _CC_CARD_STORES[name] = carddigest.SessionCardStore()
+        store.media_session_id = f"claude_code:{name}"
     return store
 
 
@@ -8532,6 +8610,7 @@ def _cc_card_uid(d: dict, jsonl_path: str, lineno: int) -> str:
 def _cc_digest_lines(store, lines, jsonl_path: str, start_lineno: int) -> int:
     """把 jsonl 行灌進卡片庫;回傳新增/更新的卡數。順手維護人話 label 素材。"""
     n = 0
+    media_payloads = []
     for off, line in enumerate(lines):
         line = line.strip()
         if not line:
@@ -8540,6 +8619,7 @@ def _cc_digest_lines(store, lines, jsonl_path: str, start_lineno: int) -> int:
             d = json.loads(line)
         except Exception:  # noqa: BLE001
             continue
+        media_payloads.append(d)
         uid = _cc_card_uid(d, jsonl_path, start_lineno + off)
         for card in carddigest.cc_event_to_cards(d, uid, turn_id=store.turn_id):
             store.upsert_card(card)
@@ -8549,6 +8629,10 @@ def _cc_digest_lines(store, lines, jsonl_path: str, start_lineno: int) -> int:
             elif card["kind"] == "markdown":
                 store.saw_output = True
                 store.last_tool = ""
+    if media_payloads:
+        _schedule_media_capture(
+            getattr(store, "media_session_id", ""), media_payloads
+        )
     return n
 
 
@@ -8692,6 +8776,10 @@ def _cx_cards_feed(method: str, params: dict) -> None:
     """CodexAppServerClient 通知 → 有訂閱過的 thread 餵進 digest。
     digest 只在首次 cards/events 請求時建立,之前的歷史由 seed 補。"""
     tid = str(params.get("threadId") or "")
+    # Delta notifications can arrive many times per second. Full item events
+    # contain the same attachment/path data without flooding the thread pool.
+    if tid and method in {"item/started", "item/completed"}:
+        _schedule_media_capture(f"codex:{tid}", params)
     d = _CX_CARD_DIGESTS.get(tid) if tid else None
     if d:
         d.handle(method, params)
@@ -8727,6 +8815,9 @@ async def _cx_card_digest(thread_id: str):
                 "itemsView": "full", "sortDirection": "desc"}, timeout=45.0)
             turns = list((res or {}).get("data", []))
             turns.reverse()
+            await asyncio.to_thread(
+                _media_capture_sync, f"codex:{thread_id}", turns
+            )
             d.seed_turns(turns)
             rec = CODEX_APP.pending_approval_for_thread(thread_id)
             if rec:
@@ -8773,6 +8864,9 @@ def _hp_cards_turn_start(session: str, cid: str, user_mid: str | None,
                          content: str, att_meta: list):
     """回合起點掛鉤:user 卡即時出(canonical mid → follower 不重出)+
     turn begin。無訂閱者時 no-op。"""
+    _schedule_media_capture(
+        f"hermes:{session}", {"content": content, "attachments": att_meta}
+    )
     d = _hp_digest_maybe(session)
     if d is None:
         return
@@ -8857,7 +8951,11 @@ async def _hp_canon_follower(session: str):
             # 的,不是等 30s timeout —— watcher 偵測不到才會落回 30s 週期
             # (見 _state_db_watcher_loop 註解:TG/cron 不寫 canonical,不會
             # 觸發 _canon_notify,靠 stat 版本或最終這條 timeout 補上)。
-            d.seed_messages(_hp_merged_messages(session, 80))
+            messages = _hp_merged_messages(session, 80)
+            await asyncio.to_thread(
+                _media_capture_sync, f"hermes:{session}", messages
+            )
+            d.seed_messages(messages)
         except Exception as e:  # noqa: BLE001
             _log_event("hp_card_follower_error", session=session,
                        error=str(e)[:200])
@@ -8879,6 +8977,9 @@ async def _hp_card_digest(session: str):
         try:
             msgs = await asyncio.to_thread(_hp_merged_messages, session,
                                            _HP_CARD_SEED_MSGS)
+            await asyncio.to_thread(
+                _media_capture_sync, f"hermes:{session}", msgs
+            )
             d.seed_messages(msgs)
             # A3 冷載:pending approval 從 DB 對回(與 cc/cx seed 同精神)——
             # 卡誕生時沒人訂閱這條的話,feed 是 no-op,全靠這裡補。
@@ -8914,6 +9015,39 @@ async def v2_session_cards(session_id: str, request: Request, limit: int = 100,
     _check_auth(request)
     store = await _v2_card_store(session_id)
     return store.snapshot(limit=max(1, min(limit, 500)), before_seq=before_seq)
+
+
+@app.get("/app/v2/sessions/{session_id}/media")
+async def v2_session_media(session_id: str, request: Request, limit: int = 100,
+                           cursor: int | None = None):
+    """Durable media index for persona, Claude Code, and Codex sessions."""
+    _check_auth(request)
+    # Reuse the canonical session router and seed path. Besides validating the
+    # id, this captures references from cold history before returning the index.
+    await _v2_card_store(session_id)
+    page = await asyncio.to_thread(
+        _media_store().list_session,
+        session_id,
+        limit=max(1, min(limit, 500)),
+        before=cursor,
+    )
+    page["items"] = [_media_wire_item(item) for item in page["items"]]
+    return page
+
+
+@app.get("/app/v2/artifacts/{media_id}")
+async def v2_artifact_download(media_id: str, request: Request):
+    """Serve an archived artifact. External URLs stay external and are never
+    fetched by the bridge, so they intentionally have no download endpoint."""
+    _check_auth(request)
+    opened = await asyncio.to_thread(_media_store().open_media, media_id)
+    if opened is None:
+        raise http_err(
+            404, "ARTIFACT_UNAVAILABLE",
+            "檔案未封存或來源已失效",
+        )
+    path, mime, _filename = opened
+    return FileResponse(path, media_type=mime or None)
 
 
 @app.get("/app/v2/sessions/{session_id}/events")
@@ -9679,7 +9813,8 @@ async def capabilities(request: Request):
                          "message_events", "apns_push", "accounts",
                          "apple_auth", "apple_web_auth", "account_pairing",
                          "delegations", "control_plane_v2", "attachment_uploads",
-                         "interactive_push"] + (["terminal"] if POCKET_TERMINAL_ENABLED else []),
+                         "interactive_push", "media_artifacts"] +
+                        (["terminal"] if POCKET_TERMINAL_ENABLED else []),
             "endpoints": ["/app/v1/sessions", "/app/v1/messages", "/reports",
                           "/app/v1/uploads",
                           "/app/v1/reactions", "/app/v1/pins",
@@ -9696,6 +9831,8 @@ async def capabilities(request: Request):
                           "/app/v1/pair/new", "/app/v1/pair/claim",
                           "/app/v1/devices/{id}/revoke",
                           "/app/v1/delegations", "/app/v2/sessions",
+                          "/app/v2/sessions/{id}/media",
+                          "/app/v2/artifacts/{media_id}",
                           "/app/v2/sessions/{id}/approve", "/app/v1/terminal",
                           "/app/v1/usage"]}
 
@@ -11547,6 +11684,7 @@ def _persona_launch_turn(session: str, prompt: str, client_id, common_log: dict,
         finally:
             reply_mid = ""
             if state["acc"]:
+                _schedule_media_capture(f"hermes:{session}", state["acc"])
                 reply_mid, reply_ok = _canon_add_retry(session, "assistant", state["acc"],
                                                        client_id=client_id)
                 state["canonical_reply_ok"] = reply_ok

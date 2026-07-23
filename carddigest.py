@@ -212,6 +212,26 @@ def _cx_user_text(content) -> str:
     return "\n".join(parts).strip()
 
 
+def _cx_attachments(content) -> list[dict]:
+    out = []
+    for item in content or []:
+        if not isinstance(item, dict):
+            continue
+        item_type = item.get("type") or ""
+        path = item.get("path") or ""
+        url = item.get("url") or ""
+        if item_type == "localImage" and path:
+            out.append({"kind": "image", "path": path,
+                        "filename": path.rsplit("/", 1)[-1]})
+        elif item_type == "image" and url:
+            out.append({"kind": "image", "url": url,
+                        "filename": url.rsplit("/", 1)[-1]})
+        elif path:
+            out.append({"kind": "file", "path": path,
+                        "filename": path.rsplit("/", 1)[-1]})
+    return out
+
+
 def _cx_tool_label(item: dict) -> str:
     """item → status label 用的短工具名（cc_status_label 的 last_tool 位）。"""
     t = item.get("type")
@@ -253,9 +273,13 @@ def codex_item_to_cards(item: dict, turn_id: str = "",
 
     if t == "userMessage":
         text = _cx_user_text(item.get("content") or [])
-        if text:
+        attachments = _cx_attachments(item.get("content") or [])
+        if text or attachments:
+            body = {"text": text, "fallback_text": text or "附件"}
+            if attachments:
+                body["attachments"] = attachments
             cards.append(make_card(cid, turn_id, "user", "text",
-                                   {"text": text, "fallback_text": text}))
+                                   body))
         return cards
 
     if t == "agentMessage":
@@ -741,19 +765,28 @@ class PersonaDigest(ApprovalCardMixin):
             return
         self.known_mids.add(mid)
         text = m.get("content") or ""
-        if not text:
+        atts = [a for a in (m.get("attachments") or []) if isinstance(a, dict)]
+        if not text and not atts:
             return
         role = "user" if m.get("role") == "user" else "assistant"
         kind = "text" if role == "user" else "markdown"
         sc_bodies = []
         if role == "assistant":
             text, sc_bodies = extract_studio_cards(text)
-        body = {"text": text, "fallback_text": text}
-        atts = m.get("attachments") or []
+        fallback = text or "附件：" + "、".join(
+            str(a.get("filename") or "檔案") for a in atts
+        )
+        body = {"text": text, "fallback_text": fallback}
         if atts:
-            body["attachments"] = [{"kind": a.get("kind"),
-                                    "filename": a.get("filename")}
-                                   for a in atts if isinstance(a, dict)]
+            keep = {
+                "kind", "filename", "mime", "path", "url", "media_id",
+                "download_url", "source_url", "byte_size", "available",
+            }
+            body["attachments"] = [
+                {key: value for key, value in a.items()
+                 if key in keep and value is not None}
+                for a in atts
+            ]
         ts = _epoch(m.get("ts"))
         self.store.upsert_card(make_card(f"card-hp-{mid}", "", role, kind,
                                          body, ts=ts))

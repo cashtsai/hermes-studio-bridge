@@ -64,6 +64,7 @@ Required features:
 - `account_pairing`
 - `delegations`
 - `control_plane_v2`
+- `media_artifacts`
 
 ### `POST /app/v1/auth/apple`
 
@@ -392,6 +393,8 @@ Pins Pocket's provider lane to a native agent session. `{provider}` accepts
 | `GET  /app/v2/sessions?provider=&status=` | 統一 session 清單（delegations 一等 row） | ✅ 上線 |
 | `GET  /app/v2/sessions/{id}/cards?limit=&before_seq=` | 冷載 snapshot（§7） | ✅ 上線（S1：cc；cx 待 S2、persona 待 S3） |
 | `GET  /app/v2/sessions/{id}/events?since_seq=&profile=` | SSE 卡片事件流（§5） | ✅ 上線（S1：cc；同上） |
+| `GET  /app/v2/sessions/{id}/media?limit=&cursor=` | session 媒體永久索引（§7） | ✅ 上線（cc/cx/persona） |
+| `GET  /app/v2/artifacts/{media_id}` | 已封存 artifact 位元組 | ✅ 上線 |
 | `POST /app/v2/sessions/{id}/approve` | 核准/拒絕（body: `{approve: bool}` 或 `{decision}`；`for_session` 可記住） | ✅ 上線（現路由僅 cx；cc/persona 併入待批次 2 統一路由） |
 | `POST /app/v2/sessions/{id}/input` | 送訊息/指令(可帶 attachments) | ⏳ 批次 2（統一路由；現走 v1 `/app/v1/delegations/{…}/input` 與 `/app/v1/messages`） |
 | `POST /app/v2/sessions/{id}/interrupt` | 停止當前 turn | ⏳ 批次 2 |
@@ -448,6 +451,10 @@ GET /app/v2/sessions/{session_id}/events?since_seq=N&profile=phone     (SSE)
 - per-kind body 重點：`tool_call {tool, summary, detail?, patch?}`、
   `approval {approval_id, title, options[{key,label,style}], source}`、
   `diff {path, adds, dels, hunks_text}`、`status {label, spinner:bool}`。
+- text/markdown 可帶
+  `attachments[{kind,filename,mime,path?,url?,media_id?,download_url?,source_url?,byte_size?,available?}]`；
+  attachment-only 訊息不得被 digest 丟棄。`attachment` kind 的 body 使用同組
+  欄位（單一附件）。
 - `tool_call.patch`（選配，2026-07-04 diff 卡缺口）：`{path, text, adds, dels}`
   — **該步驟自身**的變更內容，由 digest 從工具輸入（Edit old/new、Write
   content…）合成，不依賴 worktree 事後狀態——步驟過後再 commit 也能回看單步
@@ -467,6 +474,41 @@ GET /app/v2/sessions/{session_id}/cards?limit=100&before_seq=M
 回 `{cards: […], latest_seq: N}` → app 渲染後從 `since_seq=N` 接 SSE。
 `limit` 上限 500。**app 本地快取＝卡片庫**（key: session_id + card.id + rev）：
 離線可讀、進場秒開；快取只是 snapshot，永不當真相。
+
+### Durable session media
+
+```
+GET /app/v2/sessions/{session_id}/media?limit=100&cursor=M
+GET /app/v2/artifacts/{media_id}
+```
+
+媒體索引回 `{items, next_cursor}`，新到舊排序；`limit` 上限 500。每項至少有：
+
+```json
+{
+  "media_id": "med_…",
+  "session_id": "codex:…",
+  "source_ref": "/tmp/Q3 report.pdf",
+  "source_kind": "path",
+  "filename": "Q3 report.pdf",
+  "mime": "application/pdf",
+  "kind": "pdf",
+  "byte_size": 4096,
+  "available": true,
+  "unavailable_reason": null,
+  "download_url": "/app/v2/artifacts/med_…"
+}
+```
+
+- 本機路徑在仍存在時複製到 content-addressed blob；相同內容只存一份。
+- 預設單檔封存上限為 100 MB；超過上限仍保留索引並回
+  `available:false, unavailable_reason:"too_large"`。
+- `media_id` 對同 session + 原始 reference 穩定。原 `/tmp` 檔刪除後仍由
+  artifact endpoint 提供。
+- 已來不及封存的舊 reference 仍列出，`available:false` 並附 reason；client
+  必須顯示失效狀態，不得自動無限重試。
+- HTTP(S) URL 只索引、不由 bridge 代抓，回 `source_url`，避免 SSRF。
+- `/file?path=` 保留相容；成功讀取會順手封存，原路徑消失時會查已封存副本。
 
 ## 8. 裝置 profile（為衛星終端預留）
 
