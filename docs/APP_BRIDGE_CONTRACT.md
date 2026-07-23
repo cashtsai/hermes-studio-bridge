@@ -187,6 +187,43 @@ Rules:
   module silently disables itself (`push_notify` short-circuits with
   `disabled: true`) and logs a single `apns_disabled` event.
 
+### Interactive approval push payload
+
+Approval pushes carry `aps.category = "POCKET_PENDING_PERMISSION"` (legacy
+`SCARF_PENDING_PERMISSION` still registered app-side) so iOS/watchOS render
+approve/deny action buttons on the lock screen. Payload shape:
+
+```json
+{
+  "aps": {"alert": {...}, "sound": "default",
+          "category": "POCKET_PENDING_PERMISSION",
+          "thread-id": "<session id>"},
+  "kind": "approval", "id": "<approvalId>",
+  "pocket": {"kind": "approval",
+             "approvalId": "<approvalId>",
+             "sessionId": "claude_code:{name} | codex:{tid} | hermes:{p} | ''",
+             "approveKey": "<option key>",
+             "denyKey": "<option key>"},
+  "scarf": { same as pocket (compat window) }
+}
+```
+
+`approveKey`/`denyKey` are computed at push time from the approval row's
+`options` styles (`primary` → approve, `danger` → deny; Claude Code rows
+without a danger option fall back to `esc`, matching the TUI cancel key). The
+app's action handler POSTs them verbatim as `{key}` to
+`POST /app/v1/approvals/{id}/decision` — the same single decision path the
+Approval Center uses. Rules:
+
+- Keys are only attached when a clean approve/deny pair exists for a
+  `permission`-kind approval. `question`/`notice` kinds and complex multi-option
+  menus omit them; the app then falls back to the `{approve: bool}` compat
+  sugar, and anything richer than two buttons is handled inside the app.
+- A stale decision (prompt already answered elsewhere, approval expired) must
+  return 409; the app surfaces a human-readable local notification instead of
+  failing silently. Network failures likewise produce a failure notification
+  that deep-links back to the Approval Center for retry.
+
 ### `GET /app/v1/sessions`
 
 Returns persona and task sessions visible to the app.

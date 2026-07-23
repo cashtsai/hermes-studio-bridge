@@ -168,6 +168,88 @@ check("無偏好紀錄 → 預設全訂閱+原文",
 
 bridge._apns_send = _orig_send
 
+# ── 5. 審核推播動作鈕決定鍵(approveKey/denyKey → {key} 單一決定路徑)────────
+def _insert_approval(aid, source, provider, kind, options):
+    con = sqlite3.connect(bridge.CANON_DB)
+    now = __import__("time").time()
+    con.execute(
+        "INSERT OR REPLACE INTO approvals"
+        "(id,title,source,risk,detail,created_at,expires_at,status,decided_at,"
+        "result,callback,session_id,provider,kind,options) "
+        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (aid, f"t-{aid}", source, "high", "d", now, now + 600, "pending",
+         None, None, None, source, provider, kind,
+         __import__("json").dumps(options) if options is not None else None))
+    con.commit()
+    con.close()
+
+
+# CC permission:TUI 鍵 + style 標注 → 原鍵成對回傳。
+_insert_approval("ak-cc", "claude_code:ops", "claude_code", "permission",
+                 [{"key": "y", "label": "Yes, allow", "style": "primary"},
+                  {"key": "n", "label": "No, deny", "style": "danger"}])
+check("CC permission → (y, n)",
+      bridge._approval_decision_keys("ak-cc") == ("y", "n"))
+
+# CC permission 無 danger 選項 → 駁回鍵落 esc(TUI 通用取消)。
+_insert_approval("ak-cc2", "claude_code:ops", "claude_code", "permission",
+                 [{"key": "1", "label": "Yes", "style": "primary"},
+                  {"key": "2", "label": "Yes, and remember", "style": "secondary"}])
+check("CC 無 danger → deny 落 esc",
+      bridge._approval_decision_keys("ak-cc2") == ("1", "esc"))
+
+# hermes permission 無 options → 預設 approve/deny。
+_insert_approval("ak-hm", "tg-post", "hermes", "permission", None)
+check("hermes 預設 options → (approve, deny)",
+      bridge._approval_decision_keys("ak-hm") == ("approve", "deny"))
+
+# question(泛選單)→ 不出成對鍵(複雜選項導去 app)。
+_insert_approval("ak-q", "claude_code:ops", "claude_code", "question",
+                 [{"key": "1", "label": "選項一"}, {"key": "2", "label": "選項二"}])
+check("question → (None, None)",
+      bridge._approval_decision_keys("ak-q") == (None, None))
+
+# 不存在的審核 → (None, None),不炸。
+check("未知 aid → (None, None)",
+      bridge._approval_decision_keys("ak-nope") == (None, None))
+
+# _approval_push 的 pocket/scarf 巢帶鍵 + category(mock push_notify 截取)。
+_push_calls = []
+
+
+async def _mock_push_notify(title, body, data=None, category=None,
+                            thread_id=None, content_available=False,
+                            persona=None, no_preview_body=None):
+    _push_calls.append({"title": title, "data": data, "category": category,
+                        "thread_id": thread_id})
+    return {"sent": 0, "total": 0, "failures": []}
+
+
+_orig_push_notify = bridge.push_notify
+bridge.push_notify = _mock_push_notify
+
+
+async def _fire_approval_push():
+    bridge._approval_push("ak-cc", "ops 等待核准", "允許執行 rm?",
+                          "claude_code:ops")
+    await asyncio.sleep(0.05)   # 讓 fire-and-forget task 跑完
+
+asyncio.run(_fire_approval_push())
+bridge.push_notify = _orig_push_notify
+
+check("審核推播已送出", len(_push_calls) == 1)
+if _push_calls:
+    _d = _push_calls[0]["data"]
+    check("category = POCKET_PENDING_PERMISSION",
+          _push_calls[0]["category"] == "POCKET_PENDING_PERMISSION")
+    check("pocket 巢帶 approveKey/denyKey",
+          _d["pocket"].get("approveKey") == "y"
+          and _d["pocket"].get("denyKey") == "n")
+    check("scarf 巢同步帶鍵(相容期)",
+          _d["scarf"].get("approveKey") == "y")
+    check("thread-id 以 session 分串",
+          _push_calls[0]["thread_id"] == "claude_code:ops")
+
 print()
 if fails:
     print(f"✗ {len(fails)} failed: {fails}")

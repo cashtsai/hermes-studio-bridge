@@ -2867,13 +2867,45 @@ async def push_notify(title: str, body: str, data: dict | None = None,
 _APNS_APPROVAL_CATEGORY = "POCKET_PENDING_PERMISSION"
 
 
+def _approval_decision_keys(aid: str) -> tuple:
+    """推播動作鈕的決定鍵(feat/apns-sender):從審核列 options 的 style 挑
+    成對兩顆 — primary→核准鍵、danger→駁回鍵(CC 線 options 缺 danger 時
+    駁回鍵落 "esc",與 _cc_choice_key 的 deny fallback 一致)。app 按鈕按下
+    時把鍵原樣回送 `{key}`(A2 單一決定路徑),CC 的 TUI 鍵(y/esc…)不經
+    bool 猜測。挑不出成對兩顆(泛 question/notice/三態複雜選單)回
+    (None, None) — app 落回 `{approve: bool}` 相容糖,複雜選項導去 app 內
+    審核中心處理。"""
+    try:
+        d = _approval_get_row(aid)
+    except Exception:  # noqa: BLE001
+        return None, None
+    if not d or (d.get("kind") or "permission") != "permission":
+        return None, None
+    opts = [o for o in (d.get("options") or []) if isinstance(o, dict)]
+    ok = next((str(o.get("key")) for o in opts
+               if o.get("style") == "primary" and o.get("key")), None)
+    dk = next((str(o.get("key")) for o in opts
+               if o.get("style") == "danger" and o.get("key")), None)
+    if not dk and d.get("provider") == "claude_code":
+        dk = "esc"
+    if not ok or not dk:
+        return None, None
+    return ok, dk
+
+
 def _approval_push(aid: str, title: str, body: str, session_id: str = ""):
     """審核推播(批次 3 斷點①):category 出動作鈕、payload 巢與 app 端約定對齊、
     thread-id 以 session 分串。Stage 1b 翻新:新 `pocket.{kind, approvalId,
     sessionId}` 巢 + category;**相容期保留** 舊 `scarf` 巢與更舊頂層 {kind, id},
-    讓尚未更新的 app 仍可解析(app 側 pocket 巢優先)。fire-and-forget。"""
+    讓尚未更新的 app 仍可解析(app 側 pocket 巢優先)。feat/apns-sender:巢再帶
+    approveKey/denyKey(見 _approval_decision_keys)讓鎖屏動作鈕走 {key} 決定
+    路徑。fire-and-forget。"""
     _approval_nest = {"kind": "approval", "approvalId": aid,
                       "sessionId": session_id}
+    _ok, _dk = _approval_decision_keys(aid)
+    if _ok and _dk:
+        _approval_nest["approveKey"] = _ok
+        _approval_nest["denyKey"] = _dk
     data = {"kind": "approval", "id": aid,   # 最舊頂層鍵(相容期保留)
             "pocket": _approval_nest,        # 新巢(app 優先讀)
             "scarf": _approval_nest}         # 舊巢(相容期保留;Stage 1c 移除)
