@@ -37,6 +37,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import media_artifacts
+import hermes_media
 from fastapi import FastAPI, Request, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, StreamingResponse, FileResponse, HTMLResponse
 from starlette.websockets import WebSocketState
@@ -308,6 +309,19 @@ def _check_auth(request: Request) -> None:
     if over:
         raise HTTPException(status_code=429, detail="too many failed auth attempts; slow down")
     raise http_err(401, "AUTH_INVALID_TOKEN", "invalid bridge token")
+
+
+def _require_master_auth(request: Request) -> None:
+    """Require the owner token for host-level Hermes configuration changes."""
+    _check_auth(request)
+    auth = request.headers.get("authorization", "")
+    token = auth[7:].strip() if auth.lower().startswith("bearer ") else ""
+    if not hmac.compare_digest(token, BRIDGE_TOKEN):
+        raise http_err(
+            403,
+            "OWNER_AUTH_REQUIRED",
+            "owner authorization is required for Hermes settings changes",
+        )
 
 
 async def _json_body(request: Request) -> dict:
@@ -643,92 +657,35 @@ def _save_part_payload(value: str | None, filename: str) -> str | None:
 
 
 # ───────────────────────── voice transcription (語音訊息) ───────────────────
-# LINE-style voice messages: the app sends the audio file, the bridge transcribes
-# it, and the transcript becomes the turn text (the audio still shows in-chat).
-# Uses OpenAI whisper-1 (the stt.openai provider Hermes is already configured
-# with) — faster-whisper isn't installed on the box.
-_OPENAI_CLIENT = None
-
-
-def _openai_key() -> str:
+# The bridge persists transport bytes, then asks the persona's Hermes profile
+# to transcribe. Provider/model/endpoint/secret selection never lives here.
+def _transcribe(path: str, home: str, lang: str = "") -> str:
+    """Audio file path → Hermes transcript (best-effort; '' on failure)."""
     try:
-        for line in open(os.path.expanduser("~/apps/hermes-agent/home/.env")):
-            if line.startswith("OPENAI_API_KEY="):
-                return line.split("=", 1)[1].strip()
-    except Exception:  # noqa: BLE001
-        pass
-    return os.environ.get("OPENAI_API_KEY", "")
-
-
-def _openai_client():
-    global _OPENAI_CLIENT
-    if _OPENAI_CLIENT is None:
-        from openai import OpenAI
-        _OPENAI_CLIENT = OpenAI(api_key=_openai_key())
-    return _OPENAI_CLIENT
-
-
-# 預設本地 faster-whisper(OSS 自架預設 = Mac Studio/mini,跑得動;與 hermes
-# 同 venv 共用安裝與模型快取)。POCKET_STT=openai 才走雲端;本地失敗且有 key
-# 時自動雲端備援。模型 POCKET_STT_MODEL(預設 large-v3-turbo:品質貼平
-# large-v3、速度同 medium 級;首次使用下載 ~1.6GB)。
-STT_PROVIDER = os.environ.get("POCKET_STT", "local")
-STT_MODEL = os.environ.get("POCKET_STT_MODEL", "large-v3-turbo")
-_WHISPER_MODEL = None
-
-# app 介面語言 → whisper 語言碼 + 繁/簡輸出偏置(Whisper 對中文預設常吐簡體,
-# initial_prompt 是標準治法;en 鎖英文;未知/空 = 自動偵測)。
-_STT_LANG = {"zh-Hant": "zh", "zh-Hans": "zh", "zh": "zh", "en": "en"}
-_STT_PROMPT = {"zh-Hant": "以下是繁體中文的對話內容。", "zh-Hans": "以下是简体中文的对话内容。"}
-
-
-def _whisper_model():
-    global _WHISPER_MODEL
-    if _WHISPER_MODEL is None:
-        from faster_whisper import WhisperModel
-        _WHISPER_MODEL = WhisperModel(STT_MODEL, device="auto", compute_type="auto")
-    return _WHISPER_MODEL
-
-
-def _transcribe_openai(path: str, lang: str) -> str:
-    with open(path, "rb") as f:
-        kw = {}
-        if _STT_LANG.get(lang):
-            kw["language"] = _STT_LANG[lang]
-        if _STT_PROMPT.get(lang):
-            kw["prompt"] = _STT_PROMPT[lang]
-        r = _openai_client().audio.transcriptions.create(model="whisper-1", file=f, **kw)
-    return (r.text or "").strip()
-
-
-def _transcribe(path: str, lang: str = "") -> str:
-    """Audio file path → transcript (best-effort; '' on failure).
-    lang = app 介面語言(zh-Hant/zh-Hans/en/'' = 自動)。其餘呼叫端(CC/CX
-    語音流)不帶 lang = 自動偵測,行為不變。"""
-    if STT_PROVIDER == "openai":
-        try:
-            return _transcribe_openai(path, lang)
-        except Exception as e:  # noqa: BLE001
-            print(f"[voice] openai transcription failed: {e}", flush=True)
-            return ""
-    try:
-        segs, _info = _whisper_model().transcribe(
-            path, language=_STT_LANG.get(lang),
-            initial_prompt=_STT_PROMPT.get(lang), vad_filter=True)
-        return "".join(seg.text for seg in segs).strip()
+        result = hermes_media.transcribe_audio(home, path, locale=lang)
     except Exception as e:  # noqa: BLE001
-        print(f"[voice] local transcription failed: {e}", flush=True)
-        if _openai_key():   # 本地掛了(模型下載中斷等)→ 有 key 就雲端備援
-            try:
-                return _transcribe_openai(path, lang)
-            except Exception as e2:  # noqa: BLE001
-                print(f"[voice] openai fallback failed: {e2}", flush=True)
+        _log_event(
+            "hermes_stt_failed",
+            error=type(e).__name__,
+            error_message=str(e)[:240],
+        )
         return ""
+    if not result.get("success"):
+        _log_event(
+            "hermes_stt_failed",
+            provider=result.get("provider"),
+            error_message=str(result.get("error") or "unknown error")[:240],
+        )
+        return ""
+    return str(result.get("transcript") or "").strip()
 
 
-async def _transcribe_attachments(attachments: list, lang: str = "") -> str:
-    """Save + transcribe every audio attachment; return the joined transcript.
-    Runs the blocking whisper call off the event loop."""
+async def _transcribe_attachments(
+    attachments: list,
+    home: str,
+    lang: str = "",
+) -> str:
+    """Save and transcribe audio through the persona's Hermes profile."""
     texts = []
     for a in (attachments or []):
         if a.get("kind") != "audio":
@@ -736,7 +693,7 @@ async def _transcribe_attachments(attachments: list, lang: str = "") -> str:
         path = _save_attachment(a, a.get("filename") or "voice.m4a")
         if not path:
             continue
-        t = await asyncio.to_thread(_transcribe, path, lang)
+        t = await asyncio.to_thread(_transcribe, path, home, lang)
         if t:
             texts.append(t)
     return " ".join(texts).strip()
@@ -782,40 +739,40 @@ def _last_user_message(messages: list) -> str:
     return text
 
 
-async def _describe_image(path: str) -> str:
-    """Hermes personas have no vision, so we pre-read images with Claude Code
-    (which does) and hand the persona a text description instead of a bare path.
-    This is what makes image attachments actually work for a persona turn."""
-    proc = None
+async def _ocr_image(path: str, home: str) -> str:
+    """Extract image text through the persona's Hermes OCR capability."""
     try:
-        argv = [CLAUDE_BIN, "-p",
-                (f"請讀取圖片檔 {path},用繁體中文詳細描述內容;"
-                 "若是截圖,把可見的關鍵文字與數字也讀出來。只回描述本身,不要客套。"),
-                "--permission-mode", "bypassPermissions", "--output-format", "text"]
-        proc = await asyncio.create_subprocess_exec(
-            *argv, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
-        out, _ = await asyncio.wait_for(proc.communicate(), timeout=90)
-        return (out or b"").decode("utf-8", "replace").strip()
+        result = await asyncio.to_thread(hermes_media.ocr_document, home, path)
     except Exception as e:  # noqa: BLE001
-        _log_event("describe_image_failed", path=path,
-                   error=type(e).__name__, error_message=str(e)[:160])
-        if proc:
-            try:
-                proc.kill()
-            except Exception:
-                pass
+        _log_event(
+            "hermes_ocr_failed",
+            error=type(e).__name__,
+            error_message=str(e)[:240],
+        )
         return ""
+    if not result.get("success"):
+        _log_event(
+            "hermes_ocr_failed",
+            provider=result.get("provider"),
+            error_message=str(result.get("error") or "unknown error")[:240],
+        )
+        return ""
+    return str(result.get("text") or "").strip()
 
 
-async def _resolve_persona_prompt(messages: list) -> str:
-    """Prompt for a persona turn: text + file paths + vision descriptions of any
-    images (so a non-vision Hermes persona can still 'see' the picture)."""
+async def _resolve_persona_prompt(messages: list, home: str) -> str:
+    """Build a persona prompt with Hermes OCR and local attachment paths."""
     text, images, files = _extract_user_parts(messages)
     notes = [f"- {label}:{p}(請用 Read 讀取)" for label, p in files]
     for path in images:
-        desc = await _describe_image(path)
-        notes.append(f"- 圖片內容({path}):{desc}" if desc
-                     else f"- 圖片:{path}(自動描述失敗,請嘗試 Read)")
+        ocr_text = await _ocr_image(path, home)
+        if ocr_text:
+            notes.append(f"- 圖片 OCR({path}):{ocr_text[:12000]}")
+        else:
+            notes.append(
+                f"- 圖片:{path}"
+                "(Hermes OCR 未讀到文字；需要辨識非文字畫面時請使用 vision_analyze)"
+            )
     if notes:
         text = (text + "\n\n[使用者附件]\n" + "\n".join(notes)).strip()
     return text
@@ -3022,7 +2979,9 @@ async def chat_completions(request: Request):
 
     if model not in PERSONAS:
         model = "xcash"
-    prompt = await _resolve_persona_prompt(body.get("messages", []))
+    prompt = await _resolve_persona_prompt(
+        body.get("messages", []), home_for(model)
+    )
 
     if stream:
         # Live streaming over a warm ACP session: a background pump feeds text
@@ -9517,6 +9476,72 @@ async def app_uploads(request: Request):
     return {"ok": True, "attachments": saved}
 
 
+def _media_persona_home(persona: str) -> str:
+    persona_id = str(persona or "").strip() or "xcash"
+    if persona_id not in PERSONAS:
+        raise http_err(404, "PERSONA_NOT_FOUND", "unknown persona")
+    return home_for(persona_id)
+
+
+@app.get("/app/v2/hermes/media-capabilities")
+async def app_hermes_media_capabilities(
+    request: Request,
+    persona: str = "xcash",
+    probe: bool = True,
+):
+    """Secret-free effective media settings from the selected Hermes profile."""
+    _check_auth(request)
+    persona = str(persona or "").strip() or "xcash"
+    home = _media_persona_home(persona)
+    try:
+        capabilities = await asyncio.to_thread(
+            hermes_media.get_capabilities,
+            home,
+            probe=probe,
+            attachment_max_bytes=_ATT_MAX_FILE_BYTES,
+            attachment_max_count=_ATT_MAX_COUNT,
+        )
+    except hermes_media.HermesMediaError as exc:
+        raise http_err(503, "HERMES_MEDIA_UNAVAILABLE", str(exc)[:240])
+    return {
+        "persona": persona,
+        "profile": _persona_profile_of(home),
+        **capabilities,
+    }
+
+
+@app.put("/app/v2/hermes/media-settings")
+async def app_hermes_media_settings(
+    request: Request,
+    persona: str = "xcash",
+):
+    """Update allowlisted Hermes media settings; owner authorization only."""
+    _require_master_auth(request)
+    persona = str(persona or "").strip() or "xcash"
+    home = _media_persona_home(persona)
+    body = await _json_body(request)
+    try:
+        capabilities = await asyncio.to_thread(
+            hermes_media.update_settings,
+            home,
+            body,
+        )
+    except hermes_media.HermesMediaError as exc:
+        raise http_err(400, "HERMES_MEDIA_SETTINGS_INVALID", str(exc)[:240])
+    _log_event(
+        "hermes_media_settings_updated",
+        persona=persona,
+        stt_provider=(capabilities.get("stt") or {}).get("provider"),
+        ocr_provider=(capabilities.get("ocr") or {}).get("provider"),
+    )
+    return {
+        "ok": True,
+        "persona": persona,
+        "profile": _persona_profile_of(home),
+        **capabilities,
+    }
+
+
 # ───────────────────────── in-app terminal (PTY over WS) ────────────────────
 # docs/TERMINAL_PTY_CONTRACT.md is the authority; keep this section in sync
 # with it. One WS = one local PTY login shell running as the bridge's own
@@ -9813,7 +9838,9 @@ async def capabilities(request: Request):
                          "message_events", "apns_push", "accounts",
                          "apple_auth", "apple_web_auth", "account_pairing",
                          "delegations", "control_plane_v2", "attachment_uploads",
-                         "interactive_push", "media_artifacts"] +
+                         "interactive_push", "media_artifacts",
+                         "hermes_media_capabilities",
+                         "hermes_media_settings"] +
                         (["terminal"] if POCKET_TERMINAL_ENABLED else []),
             "endpoints": ["/app/v1/sessions", "/app/v1/messages", "/reports",
                           "/app/v1/uploads",
@@ -9833,6 +9860,8 @@ async def capabilities(request: Request):
                           "/app/v1/delegations", "/app/v2/sessions",
                           "/app/v2/sessions/{id}/media",
                           "/app/v2/artifacts/{media_id}",
+                          "/app/v2/hermes/media-capabilities",
+                          "/app/v2/hermes/media-settings",
                           "/app/v2/sessions/{id}/approve", "/app/v1/terminal",
                           "/app/v1/usage"]}
 
@@ -11595,7 +11624,10 @@ async def _persona_prepare_turn(session: str, content: str, attachments: list,
     # Voice messages: transcribe any audio attachment and fold the transcript
     # into the turn text. The audio still rides along as an attachment so the
     # conversation shows the voice bubble; the model gets the words.
-    voice_text = await _transcribe_attachments(attachments, stt_lang)
+    persona_home = home_for(session)
+    voice_text = await _transcribe_attachments(
+        attachments, persona_home, stt_lang
+    )
     if voice_text:
         content = (content + "\n" + voice_text).strip() if content else voice_text
 
@@ -11615,7 +11647,10 @@ async def _persona_prepare_turn(session: str, content: str, attachments: list,
                 continue
             parts.append({"type": "file", "file": {"filename": a.get("filename"),
                           "mime_type": a.get("mime"), "file_data": path}})
-    prompt = await _resolve_persona_prompt([{"role": "user", "content": parts or content}])
+    prompt = await _resolve_persona_prompt(
+        [{"role": "user", "content": parts or content}],
+        persona_home,
+    )
     report_context = _report_context_for_prompt(session, content)
     if report_context:
         prompt = f"{report_context}\n\n---\n【使用者現在的訊息】\n{prompt}"
