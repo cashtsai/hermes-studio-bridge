@@ -156,6 +156,37 @@ Revokes one account-bound device for the current Apple user. Requires an account
 session. Revoked device tokens must no longer authenticate app-facing bridge
 endpoints.
 
+### `POST /app/v1/push/register`
+
+Registers an APNs device token together with per-device notification
+preferences. Supersedes `POST /app/v1/devices` (which remains for older apps and
+registers with default preferences).
+
+Request body:
+
+- `token` (required): APNs device token, hex string.
+- `platform` (optional): defaults to `"ios"`.
+- `preview` (optional, default `true`): when `false`, persona-message pushes to
+  this device show only the persona display name; the message body is replaced
+  with a fixed placeholder so content never reaches the lock screen.
+- `personas` (optional, default `null`): `null` subscribes to every persona; a
+  list of persona session keys limits persona-message pushes to those personas.
+  Non-persona pushes (task done, approvals, test) are not affected.
+
+Response: `{ok, devices, prefs: {preview, personas}, apns_configured}`.
+`apns_configured=false` means the bridge has no usable APNs key
+(`APNS_KEY_PATH`/`APNS_KEY_ID`/`APNS_TEAM_ID`); registration still succeeds and
+takes effect once the key is provisioned.
+
+Rules:
+
+- Idempotent; the app re-posts on every launch and preference change.
+- Preferences live in `push_prefs.json` next to the canonical DB; pruning a dead
+  token (410/BadDeviceToken) drops its preferences too.
+- A missing APNs key must never prevent the bridge from starting: the push
+  module silently disables itself (`push_notify` short-circuits with
+  `disabled: true`) and logs a single `apns_disabled` event.
+
 ### `GET /app/v1/sessions`
 
 Returns persona and task sessions visible to the app.
