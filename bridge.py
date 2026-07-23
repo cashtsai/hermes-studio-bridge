@@ -1651,16 +1651,20 @@ def _app_turn_status(session: str, client_id: str | None = None,
         label = (state or {}).get("step_label") or ("思考中" if acc else "處理中")
         canonical_error = ""
     elif task is not None and task.done():
-        turn_state, label = ("done", "已同步") if acc else ("stream_detached", "處理中")
-        canonical_error = ""
+        # The background task has ended and canonical lookup still found no
+        # reply. There is nothing left for a detached client to wait for: mark
+        # it retryable instead of reporting stream_detached forever.
+        turn_state, label = "failed", "回合未能保存"
+        canonical_error = runner_error or (
+            "persona reply was not persisted" if acc else "persona returned no reply"
+        )
     elif acp_busy:
         turn_state, label = "running", "處理中"
         canonical_error = ""
     else:
         turn_state, label = "idle", "閒置"
         canonical_error = ""
-    status_error = (canonical_error if canonical_failure
-                    else ("" if canonical_reply else runner_error))
+    status_error = canonical_error or ("" if canonical_reply else runner_error)
     elapsed = int(now - entry["ts"]) if entry and entry.get("ts") else None
     return {"session": session, "state": turn_state, "label": label,
             "in_flight": in_flight, "acp_busy": acp_busy,
@@ -11072,6 +11076,7 @@ def _persona_launch_turn(session: str, prompt: str, client_id, common_log: dict,
     """
     q: asyncio.Queue = asyncio.Queue()
     state = {"acc": "", "usage": None, "content_chunks": 0, "keepalives": 0,
+             "first_content_ms": None, "first_status_ms": None, "status_updates": 0,
              "runner_error": "", "stream_error": "", "canonical_reply_ok": None,
              "done_sent": False}
 
@@ -11087,6 +11092,10 @@ def _persona_launch_turn(session: str, prompt: str, client_id, common_log: dict,
                 if k == "content":
                     state["acc"] += v
                     state["content_chunks"] += 1
+                    if state["first_content_ms"] is None:
+                        state["first_content_ms"] = int(
+                            (time.monotonic() - turn_started) * 1000
+                        )
                     state["step_label"] = ""     # 正文恢復 → 步驟 label 讓位
                 elif k == "usage":
                     state["usage"] = v
@@ -11094,6 +11103,11 @@ def _persona_launch_turn(session: str, prompt: str, client_id, common_log: dict,
                     # 步驟進度(執行步驟 N:工具)— 讓輪詢的 /messages/status
                     # 也能給 working bar 同一句人話。
                     state["step_label"] = (v or {}).get("label") or ""
+                    state["status_updates"] += 1
+                    if state["first_status_ms"] is None:
+                        state["first_status_ms"] = int(
+                            (time.monotonic() - turn_started) * 1000
+                        )
                 if digest is not None:
                     try:
                         if k == "content":
@@ -11123,6 +11137,9 @@ def _persona_launch_turn(session: str, prompt: str, client_id, common_log: dict,
             _log_event("app_turn_background_done", **common_log,
                        output_chars=len(state["acc"]),
                        content_chunks=state["content_chunks"],
+                       first_content_ms=state["first_content_ms"],
+                       first_status_ms=state["first_status_ms"],
+                       status_updates=state["status_updates"],
                        usage_used=(state["usage"] or {}).get("used"),
                        usage_size=(state["usage"] or {}).get("size"),
                        canonical_user_ok=canonical_user_ok,
@@ -11182,6 +11199,18 @@ async def app_post_message(request: Request):
                    "choices": [{"index": 0, "delta": {}, "finish_reason": None}]}
         return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
+    def stream_response(events):
+        # Explicit anti-buffering headers protect token deltas when this route
+        # sits behind nginx/CDN; uvicorn also flushes each yielded SSE frame.
+        return StreamingResponse(
+            events,
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache, no-transform",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
     # Retry idempotency: if this exact logical send already produced a recorded
     # reply (first attempt completed server-side but the app's network dropped
     # before it saw the reply), replay that reply — do NOT re-run the turn or
@@ -11207,7 +11236,7 @@ async def app_post_message(request: Request):
                                done_sent=done_sent,
                                duration_ms=int((time.monotonic() - turn_started) * 1000),
                                canonical_user_ok=None, canonical_reply_ok=True)
-            return StreamingResponse(replay_agen(), media_type="text/event-stream")
+            return stream_response(replay_agen())
 
     # In-flight idempotency (issue #9): the canonical replay above only covers
     # turns that already FINISHED. A duplicate POST while the first run is still
@@ -11232,23 +11261,43 @@ async def app_post_message(request: Request):
         async def attach_agen():
             done_sent = False
             acc = ""
+            sent_chars = 0
+            last_label = None
+            last_emit = time.monotonic()
             try:
                 yield chunk({"role": "assistant", "content": ""})
                 yield status_chunk("attached", "同一則訊息已在處理中，附掛原回合等待結果。")
                 t0 = time.monotonic()
                 while True:
                     _task = attached.get("task")
+                    st = attached.get("state") or {}
+                    current = st.get("acc") or ""
+                    if len(current) > sent_chars:
+                        yield chunk({"content": current[sent_chars:]})
+                        sent_chars = len(current)
+                        last_emit = time.monotonic()
+                    label = st.get("step_label") or ""
+                    if label and label != last_label:
+                        yield status_chunk("running", label)
+                        last_label = label
+                        last_emit = time.monotonic()
                     if _task is not None and _task.done():
                         break
                     if _task is None and time.monotonic() - t0 > 30:
                         break   # original request died before starting its turn
                     if time.monotonic() - t0 > _APP_TURN_INFLIGHT_TTL:
                         break
-                    await asyncio.sleep(SSE_KEEPALIVE_SECS)
-                    yield ": keepalive\n\n"
+                    if time.monotonic() - last_emit >= SSE_KEEPALIVE_SECS:
+                        yield ": keepalive\n\n"
+                        last_emit = time.monotonic()
+                    await asyncio.sleep(0.1)
                 st = attached.get("state") or {}
                 acc = st.get("acc") or ""
-                yield chunk({"content": acc or "(原回合沒有產出回覆)"})
+                if len(acc) > sent_chars:
+                    yield chunk({"content": acc[sent_chars:]})
+                    sent_chars = len(acc)
+                elif not acc:
+                    yield chunk({"content": "(原回合沒有產出回覆)"})
                 payload = {"id": cid, "object": "chat.completion.chunk", "created": created,
                            "model": session, "replayed": True,
                            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
@@ -11261,7 +11310,7 @@ async def app_post_message(request: Request):
                            done_sent=done_sent,
                            duration_ms=int((time.monotonic() - turn_started) * 1000),
                            canonical_user_ok=None, canonical_reply_ok=None)
-        return StreamingResponse(attach_agen(), media_type="text/event-stream")
+        return stream_response(attach_agen())
 
     if dry_run:
         async def dry_agen():
@@ -11283,7 +11332,7 @@ async def app_post_message(request: Request):
                            done_sent=done_sent,
                            duration_ms=int((time.monotonic() - turn_started) * 1000),
                            canonical_user_ok=None, canonical_reply_ok=None)
-        return StreamingResponse(dry_agen(), media_type="text/event-stream")
+        return stream_response(dry_agen())
 
     content, att_meta, prompt = await _persona_prepare_turn(
         session, content, attachments, stt_lang=str(body.get("stt_lang") or ""))
@@ -11338,6 +11387,9 @@ async def app_post_message(request: Request):
                        replayed=False,
                        output_chars=len(state["acc"]),
                        content_chunks=state["content_chunks"],
+                       first_content_ms=state["first_content_ms"],
+                       first_status_ms=state["first_status_ms"],
+                       status_updates=state["status_updates"],
                        keepalives=state["keepalives"],
                        done_sent=state["done_sent"],
                        canonical_user_ok=canonical_user_ok,
@@ -11345,7 +11397,7 @@ async def app_post_message(request: Request):
                        stream_error=state["stream_error"] or None,
                        duration_ms=int((time.monotonic() - turn_started) * 1000))
 
-    return StreamingResponse(agen(), media_type="text/event-stream")
+    return stream_response(agen())
 
 
 @app.post("/app/v1/messages/interrupt")

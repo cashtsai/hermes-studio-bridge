@@ -119,6 +119,22 @@ class TestPersonaTurnStatus(unittest.TestCase):
         self.assertEqual(status["state"], "done")
         self.assertIsNone(status["error"])
 
+    @patch.object(bridge, "_canon_reply_for_client", return_value=None)
+    def test_finished_turn_without_canonical_reply_is_retryable(self, _reply):
+        class FinishedTask:
+            @staticmethod
+            def done():
+                return True
+
+        key = ("xcash", "client-missing")
+        entry = {"state": {"acc": "unsaved reply", "runner_error": ""},
+                 "task": FinishedTask(), "ts": None}
+        with patch.dict(bridge._APP_TURN_INFLIGHT, {key: entry}, clear=False):
+            status = bridge._app_turn_status("xcash", "client-missing", acp_busy=False)
+        self.assertEqual(status["state"], "failed")
+        self.assertEqual(status["label"], "回合未能保存")
+        self.assertEqual(status["error"], "persona reply was not persisted")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
