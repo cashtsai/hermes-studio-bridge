@@ -65,6 +65,8 @@ Required features:
 - `delegations`
 - `control_plane_v2`
 - `media_artifacts`
+- `hermes_media_capabilities`
+- `hermes_media_settings`
 
 ### `POST /app/v1/auth/apple`
 
@@ -250,6 +252,83 @@ Rules:
   example `accepted`, `queued`, `running`, or `replayed`; clients should use
   them for delivery/working UI and must not persist them as assistant text.
 - The stream ends with `data: [DONE]`.
+
+### Hermes media capabilities and settings
+
+Pocket does not select or call Whisper/OCR providers directly. The dependency
+direction is:
+
+`Pocket -> Bridge transport -> Hermes profile -> configured media provider`
+
+`GET /app/v2/hermes/media-capabilities?persona=<id>&probe=true` returns the
+secret-free effective configuration for that persona:
+
+```json
+{
+  "persona": "xcash",
+  "profile": "xcash",
+  "stt": {
+    "enabled": true,
+    "provider": "siege",
+    "model": "whisper-1",
+    "configured": true,
+    "available": true
+  },
+  "ocr": {
+    "enabled": true,
+    "provider": "siege",
+    "configured": true,
+    "available": true
+  },
+  "limits": {
+    "attachment_count": 12,
+    "attachment_bytes": 33554432,
+    "stt_input_bytes": 26214400
+  },
+  "provider_options": {
+    "stt": ["local", "openai", "siege"],
+    "ocr": ["none", "siege"]
+  }
+}
+```
+
+`probe=false` returns configuration state without network health probes.
+Normal paired-device tokens may read capabilities.
+
+`PUT /app/v2/hermes/media-settings?persona=<id>` atomically updates the
+allowlisted settings in that persona's Hermes `config.yaml`. It requires the
+owner/master bridge token; paired-device tokens receive `403`. Accepted fields:
+
+```json
+{
+  "stt": {
+    "enabled": true,
+    "provider": "siege",
+    "siege": {
+      "base_url": "http://siege-host:8081/v1",
+      "model": "whisper-1",
+      "language": "",
+      "prompt": ""
+    }
+  },
+  "ocr": {
+    "enabled": true,
+    "provider": "siege",
+    "siege": {
+      "base_url": "http://siege-host:8083",
+      "use_doc_orientation_classify": true,
+      "use_doc_unwarping": true,
+      "use_textline_orientation": false,
+      "return_word_box": false
+    }
+  }
+}
+```
+
+Provider credentials are never accepted or returned by these endpoints. They
+remain in the Hermes profile secret scope. Pocket must not persist provider
+URLs, model credentials, or a second copy of these settings in UserDefaults or
+CloudKit.
 
 ### `GET /app/v1/approvals`
 
