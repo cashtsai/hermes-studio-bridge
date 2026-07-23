@@ -158,6 +158,74 @@ Revokes one account-bound device for the current Apple user. Requires an account
 session. Revoked device tokens must no longer authenticate app-facing bridge
 endpoints.
 
+### `POST /app/v1/push/register`
+
+Registers an APNs device token together with per-device notification
+preferences. Supersedes `POST /app/v1/devices` (which remains for older apps and
+registers with default preferences).
+
+Request body:
+
+- `token` (required): APNs device token, hex string.
+- `platform` (optional): defaults to `"ios"`.
+- `preview` (optional, default `true`): when `false`, persona-message pushes to
+  this device show only the persona display name; the message body is replaced
+  with a fixed placeholder so content never reaches the lock screen.
+- `personas` (optional, default `null`): `null` subscribes to every persona; a
+  list of persona session keys limits persona-message pushes to those personas.
+  Non-persona pushes (task done, approvals, test) are not affected.
+
+Response: `{ok, devices, prefs: {preview, personas}, apns_configured}`.
+`apns_configured=false` means the bridge has no usable APNs key
+(`APNS_KEY_PATH`/`APNS_KEY_ID`/`APNS_TEAM_ID`); registration still succeeds and
+takes effect once the key is provisioned.
+
+Rules:
+
+- Idempotent; the app re-posts on every launch and preference change.
+- Preferences live in `push_prefs.json` next to the canonical DB; pruning a dead
+  token (410/BadDeviceToken) drops its preferences too.
+- A missing APNs key must never prevent the bridge from starting: the push
+  module silently disables itself (`push_notify` short-circuits with
+  `disabled: true`) and logs a single `apns_disabled` event.
+
+### Interactive approval push payload
+
+Approval pushes carry `aps.category = "POCKET_PENDING_PERMISSION"` (legacy
+`SCARF_PENDING_PERMISSION` still registered app-side) so iOS/watchOS render
+approve/deny action buttons on the lock screen. Payload shape:
+
+```json
+{
+  "aps": {"alert": {...}, "sound": "default",
+          "category": "POCKET_PENDING_PERMISSION",
+          "thread-id": "<session id>"},
+  "kind": "approval", "id": "<approvalId>",
+  "pocket": {"kind": "approval",
+             "approvalId": "<approvalId>",
+             "sessionId": "claude_code:{name} | codex:{tid} | hermes:{p} | ''",
+             "approveKey": "<option key>",
+             "denyKey": "<option key>"},
+  "scarf": { same as pocket (compat window) }
+}
+```
+
+`approveKey`/`denyKey` are computed at push time from the approval row's
+`options` styles (`primary` → approve, `danger` → deny; Claude Code rows
+without a danger option fall back to `esc`, matching the TUI cancel key). The
+app's action handler POSTs them verbatim as `{key}` to
+`POST /app/v1/approvals/{id}/decision` — the same single decision path the
+Approval Center uses. Rules:
+
+- Keys are only attached when a clean approve/deny pair exists for a
+  `permission`-kind approval. `question`/`notice` kinds and complex multi-option
+  menus omit them; the app then falls back to the `{approve: bool}` compat
+  sugar, and anything richer than two buttons is handled inside the app.
+- A stale decision (prompt already answered elsewhere, approval expired) must
+  return 409; the app surfaces a human-readable local notification instead of
+  failing silently. Network failures likewise produce a failure notification
+  that deep-links back to the Approval Center for retry.
+
 ### `GET /app/v1/sessions`
 
 Returns persona and task sessions visible to the app.

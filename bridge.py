@@ -2570,20 +2570,47 @@ def _fmt_ts(ts) -> str:
 
 
 # ───────────────────────── APNs push (M23) ─────────────────────────────────
-# Token-based (.p8) auth. The key lives UNDER Hermes management:
-#   ~/apps/hermes-agent/home/credentials/AuthKey_86FF9D976T.p8  (chmod 600)
-# See docs/HANDOFF_CREDENTIALS.md for the rotation procedure / inventory.
-APNS_KEY_PATH = os.path.expanduser(
-    "~/apps/hermes-agent/home/credentials/AuthKey_86FF9D976T.p8")
-APNS_KEY_ID = "86FF9D976T"
-APNS_TEAM_ID = "4F8B93R3SH"
+# Token-based (.p8) auth. 正式金鑰(2026-07-23 換發,sandbox/production 皆已
+# 實測認證通過):
+#   ~/.pocket-release-secrets/apns/AuthKey_9XNQ4PS546.p8  (chmod 600)
+# 舊 Hermes 管理的 AuthKey_86FF9D976T.p8 已汰換。輪替程序見
+# docs/HANDOFF_CREDENTIALS.md。
+#
+# feat/apns-sender:全組設定改為 env 可注入(金鑰後補插槽):
+#   APNS_KEY_PATH / APNS_KEY_ID / APNS_TEAM_ID / APNS_BUNDLE_ID / APNS_HOST
+# 沒設 env 時用下方預設值;金鑰檔不存在/KEY_ID/TEAM_ID 缺席時,
+# `apns_configured()` 回 False,整個推播模組靜默停用(push_notify 直接短路,
+# bridge 照常啟動,絕不因缺金鑰起不來)。
+APNS_KEY_PATH = os.path.expanduser(os.environ.get(
+    "APNS_KEY_PATH",
+    "~/.pocket-release-secrets/apns/AuthKey_9XNQ4PS546.p8"))
+APNS_KEY_ID = os.environ.get("APNS_KEY_ID", "9XNQ4PS546")
+APNS_TEAM_ID = os.environ.get("APNS_TEAM_ID", "4F8B93R3SH")
 # 正式 app 是 Pocket kernel(com.pocketagent.kernel,見 ship-kernel.sh)。apns-topic
 # 必須對上 device token 所屬 app,否則 APNs 回 400 BadTopic / DeviceTokenNotForTopic
 # → 推播全滅(2026-07 之前寫成舊 SUN 的 com.pocketagent.ios,推播在正式版 100% 死)。
 # token-based(.p8)是 team 級,對同 team 任何 bundle 都有效,只要 topic 對。
-APNS_BUNDLE_ID = "com.pocketagent.kernel"
-APNS_HOST = "https://api.push.apple.com"   # production (TestFlight + App Store)
+APNS_BUNDLE_ID = os.environ.get("APNS_BUNDLE_ID", "com.pocketagent.kernel")
+APNS_HOST = os.environ.get(
+    "APNS_HOST", "https://api.push.apple.com")   # production (TestFlight + App Store)
 _apns_jwt_cache: list = [None, 0.0]        # [token, issued_at]
+_apns_disabled_logged: list = [False]      # 只記一次,避免每則推播都刷 log
+
+
+def apns_configured() -> bool:
+    """金鑰三件套(路徑上的 .p8 檔 + KEY_ID + TEAM_ID)齊備才算配置完成。
+
+    未配置 → 推播模組整體靜默停用:push_notify 短路回 disabled,不打 APNs、
+    不讀金鑰、不炸例外。第一次偵測到未配置時 _log_event 一筆(此後安靜),
+    讓「推播沒動靜」可以在 event log 裡查到原因而不是無聲消失。"""
+    ok = bool(APNS_KEY_ID) and bool(APNS_TEAM_ID) and os.path.isfile(APNS_KEY_PATH)
+    if not ok and not _apns_disabled_logged[0]:
+        _apns_disabled_logged[0] = True
+        _log_event("apns_disabled",
+                   key_path=APNS_KEY_PATH,
+                   key_file_exists=os.path.isfile(APNS_KEY_PATH),
+                   key_id_set=bool(APNS_KEY_ID), team_id_set=bool(APNS_TEAM_ID))
+    return ok
 
 
 def _apns_jwt() -> str:
@@ -2638,6 +2665,69 @@ def _device_remove(token: str) -> None:
     except Exception as e:  # noqa: BLE001
         _log_event("device_remove_failed", error=type(e).__name__,
                    error_message=str(e)[:160])
+    _push_pref_drop(token)
+
+
+# ── 推播偏好(/app/v1/push/register)────────────────────────────────────────
+# 每台裝置的通知偏好,存 canonical 旁的小 JSON(不動 devices 表 schema):
+#   { "<token>": {"preview": bool, "personas": [session,...] | null} }
+# preview=False → 人格訊息推播只顯示人格名,body 換成固定占位(不外洩內容)。
+# personas=null → 訂閱全部人格;給清單 → 只推清單內的人格回覆。
+# 沒有偏好紀錄的 token(走舊 /app/v1/devices 註冊)一律預設 preview=True、
+# personas=null —— 與現行行為完全一致。
+PUSH_PREFS_PATH = os.path.join(os.path.dirname(CANON_DB), "push_prefs.json")
+_PUSH_PREF_DEFAULT = {"preview": True, "personas": None}
+
+
+def _push_prefs_load() -> dict:
+    try:
+        with open(PUSH_PREFS_PATH) as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except FileNotFoundError:
+        return {}
+    except Exception as e:  # noqa: BLE001
+        # 壞檔=偏好全部回預設(照推),不讓推播管線炸掉;log 供診斷。
+        _log_event("push_prefs_read_failed", error=type(e).__name__,
+                   error_message=str(e)[:160])
+        return {}
+
+
+def _push_prefs_save(prefs: dict) -> None:
+    try:
+        tmp = PUSH_PREFS_PATH + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(prefs, f, ensure_ascii=False)
+        os.replace(tmp, PUSH_PREFS_PATH)   # 原子換檔,避免半寫壞檔
+    except Exception as e:  # noqa: BLE001
+        _log_event("push_prefs_write_failed", error=type(e).__name__,
+                   error_message=str(e)[:160])
+
+
+def _push_pref_set(token: str, preview: bool = True,
+                   personas: list | None = None) -> dict:
+    entry = {"preview": bool(preview),
+             "personas": [str(p) for p in personas] if personas is not None else None}
+    prefs = _push_prefs_load()
+    prefs[token] = entry
+    _push_prefs_save(prefs)
+    return entry
+
+
+def _push_pref_get(token: str, prefs: dict | None = None) -> dict:
+    entry = (prefs if prefs is not None else _push_prefs_load()).get(token)
+    if not isinstance(entry, dict):
+        return dict(_PUSH_PREF_DEFAULT)
+    return {"preview": entry.get("preview", True) is not False,
+            "personas": entry.get("personas")
+            if isinstance(entry.get("personas"), list) else None}
+
+
+def _push_pref_drop(token: str) -> None:
+    prefs = _push_prefs_load()
+    if token in prefs:
+        prefs.pop(token, None)
+        _push_prefs_save(prefs)
 
 
 async def _apns_send(token: str, title: str, body: str, data: dict | None = None,
@@ -2670,18 +2760,40 @@ async def _apns_send(token: str, title: str, body: str, data: dict | None = None
 async def push_notify(title: str, body: str, data: dict | None = None,
                       category: str | None = None,
                       thread_id: str | None = None,
-                      content_available: bool = False) -> dict:
+                      content_available: bool = False,
+                      persona: str | None = None,
+                      no_preview_body: str | None = None) -> dict:
     """Fan a push to every registered device; prune dead tokens (410/BadToken).
 
     Returns {sent, total, failures:[{code,detail}]}. **不再吞錯** —— 非 200/410 的
     APNs 回應(400 BadTopic、403 bad key、429…)以前被靜默吃掉,推播死了好幾週都
-    查不到。現在一律 _log_event,`/push/test` 也回傳真實 code。"""
+    查不到。現在一律 _log_event,`/push/test` 也回傳真實 code。
+
+    feat/apns-sender:
+    - 金鑰未配置(apns_configured() False)→ 整段短路,回 disabled=True,
+      不打 APNs、不讀金鑰 —— bridge 缺金鑰照常活著,推播模組靜默停用。
+    - persona 給定 → 逐台裝置查訂閱偏好(/app/v1/push/register),沒訂閱該
+      人格的裝置跳過(skipped 計數)。
+    - no_preview_body 給定 → preview=False 的裝置用它取代 body(關預覽只
+      顯示人格名,訊息內容不出現在鎖屏)。"""
+    if not apns_configured():
+        return {"sent": 0, "total": 0, "failures": [], "disabled": True}
     toks = _devices()
+    prefs = _push_prefs_load()
     sent = 0
+    skipped = 0
     failures: list[dict] = []
     for tok in toks:
+        pref = _push_pref_get(tok, prefs)
+        if persona is not None and pref["personas"] is not None \
+                and persona not in pref["personas"]:
+            skipped += 1
+            continue
+        tok_body = body
+        if no_preview_body is not None and not pref["preview"]:
+            tok_body = no_preview_body
         try:
-            code, text = await _apns_send(tok, title, body, data,
+            code, text = await _apns_send(tok, title, tok_body, data,
                                           category=category, thread_id=thread_id,
                                           content_available=content_available)
             if code == 200:
@@ -2700,7 +2812,8 @@ async def push_notify(title: str, body: str, data: dict | None = None,
     if failures:
         _log_event("push_notify_failed", title=title[:48], sent=sent,
                    total=len(toks), failures=str(failures)[:400])
-    return {"sent": sent, "total": len(toks), "failures": failures}
+    return {"sent": sent, "total": len(toks), "skipped": skipped,
+            "failures": failures}
 
 
 # Scarf 契約遷移 Stage 1b(見 pocketagent/docs/SCARF_CONTRACT_MIGRATION_PLAN.md)。
@@ -2711,13 +2824,45 @@ async def push_notify(title: str, body: str, data: dict | None = None,
 _APNS_APPROVAL_CATEGORY = "POCKET_PENDING_PERMISSION"
 
 
+def _approval_decision_keys(aid: str) -> tuple:
+    """推播動作鈕的決定鍵(feat/apns-sender):從審核列 options 的 style 挑
+    成對兩顆 — primary→核准鍵、danger→駁回鍵(CC 線 options 缺 danger 時
+    駁回鍵落 "esc",與 _cc_choice_key 的 deny fallback 一致)。app 按鈕按下
+    時把鍵原樣回送 `{key}`(A2 單一決定路徑),CC 的 TUI 鍵(y/esc…)不經
+    bool 猜測。挑不出成對兩顆(泛 question/notice/三態複雜選單)回
+    (None, None) — app 落回 `{approve: bool}` 相容糖,複雜選項導去 app 內
+    審核中心處理。"""
+    try:
+        d = _approval_get_row(aid)
+    except Exception:  # noqa: BLE001
+        return None, None
+    if not d or (d.get("kind") or "permission") != "permission":
+        return None, None
+    opts = [o for o in (d.get("options") or []) if isinstance(o, dict)]
+    ok = next((str(o.get("key")) for o in opts
+               if o.get("style") == "primary" and o.get("key")), None)
+    dk = next((str(o.get("key")) for o in opts
+               if o.get("style") == "danger" and o.get("key")), None)
+    if not dk and d.get("provider") == "claude_code":
+        dk = "esc"
+    if not ok or not dk:
+        return None, None
+    return ok, dk
+
+
 def _approval_push(aid: str, title: str, body: str, session_id: str = ""):
     """審核推播(批次 3 斷點①):category 出動作鈕、payload 巢與 app 端約定對齊、
     thread-id 以 session 分串。Stage 1b 翻新:新 `pocket.{kind, approvalId,
     sessionId}` 巢 + category;**相容期保留** 舊 `scarf` 巢與更舊頂層 {kind, id},
-    讓尚未更新的 app 仍可解析(app 側 pocket 巢優先)。fire-and-forget。"""
+    讓尚未更新的 app 仍可解析(app 側 pocket 巢優先)。feat/apns-sender:巢再帶
+    approveKey/denyKey(見 _approval_decision_keys)讓鎖屏動作鈕走 {key} 決定
+    路徑。fire-and-forget。"""
     _approval_nest = {"kind": "approval", "approvalId": aid,
                       "sessionId": session_id}
+    _ok, _dk = _approval_decision_keys(aid)
+    if _ok and _dk:
+        _approval_nest["approveKey"] = _ok
+        _approval_nest["denyKey"] = _dk
     data = {"kind": "approval", "id": aid,   # 最舊頂層鍵(相容期保留)
             "pocket": _approval_nest,        # 新巢(app 優先讀)
             "scarf": _approval_nest}         # 舊巢(相容期保留;Stage 1c 移除)
@@ -2752,8 +2897,13 @@ def _push_persona_reply(session: str, content: str) -> None:
         loop = asyncio.get_running_loop()
     except RuntimeError:
         return
+    # persona= 讓 push_notify 逐台裝置套用訂閱偏好(沒訂閱這個人格的裝置跳過);
+    # no_preview_body= 是 preview=False 裝置的替代 body(只顯示人格名+占位,
+    # 訊息內容不進鎖屏)。
     t = loop.create_task(push_notify(disp, body, data,
-                                     thread_id=session, content_available=True))
+                                     thread_id=session, content_available=True,
+                                     persona=session,
+                                     no_preview_body="傳了一則訊息"))
     _BG_TASKS.add(t)
     t.add_done_callback(_BG_TASKS.discard)
 
@@ -9840,7 +9990,8 @@ async def capabilities(request: Request):
                          "delegations", "control_plane_v2", "attachment_uploads",
                          "interactive_push", "media_artifacts",
                          "hermes_media_capabilities",
-                         "hermes_media_settings"] +
+                         "hermes_media_settings",
+                         "push_register"] +
                         (["terminal"] if POCKET_TERMINAL_ENABLED else []),
             "endpoints": ["/app/v1/sessions", "/app/v1/messages", "/reports",
                           "/app/v1/uploads",
@@ -9851,6 +10002,7 @@ async def capabilities(request: Request):
                           "/app/v1/messages/interrupt",
                           "/cron/jobs", "/ccsessions", "/app/v1/approvals",
                           "/app/v1/devices", "/app/v1/push/test",
+                          "/app/v1/push/register",
                           "/app/v1/auth/apple", "/app/v1/account",
                           "/app/v1/auth/apple/web/start",
                           "/app/v1/auth/apple/web/callback",
@@ -12309,6 +12461,36 @@ async def list_devices(request: Request):
     return {"count": len(_devices())}
 
 
+@app.post("/app/v1/push/register")
+async def push_register(request: Request):
+    """feat/apns-sender:註冊 device token + 通知偏好(取代舊 /app/v1/devices,
+    舊端點保留給還沒更新的 app)。body:
+
+        {"token": "<hex>", "platform": "ios",
+         "preview": true|false,          # 選填,預設 true;false=通知只顯示人格名
+         "personas": ["sess", ...]|null} # 選填,null/缺席=訂閱全部人格
+
+    冪等 — app 每次啟動/偏好變更都重打。回傳 apns_configured 讓 app 知道
+    bridge 端金鑰是否已配置(未配置=架構就緒但推不出去)。"""
+    _check_auth(request)
+    try:
+        b = await request.json()
+    except Exception:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail="bad json")
+    token = (b.get("token") or "").strip()
+    if not token:
+        raise HTTPException(status_code=400, detail="missing token")
+    personas = b.get("personas")
+    if personas is not None and not isinstance(personas, list):
+        raise HTTPException(status_code=400, detail="personas must be a list or null")
+    _device_add(token, b.get("platform") or "ios")
+    prefs = _push_pref_set(token,
+                           preview=b.get("preview") is not False,
+                           personas=personas)
+    return {"ok": True, "devices": len(_devices()), "prefs": prefs,
+            "apns_configured": apns_configured()}
+
+
 @app.post("/app/v1/push/test")
 async def push_test(request: Request):
     """Send a test push to every registered device — verifies APNs auth end-to-end."""
@@ -12318,8 +12500,11 @@ async def push_test(request: Request):
                             b.get("body") or "測試推播 ✅ M23 已接上",
                             {"kind": "test"})
     # 回傳真實 APNs 結果(topic、每台裝置的 code/detail)—— 以前一律回 200 讓人盲測。
+    # apns_configured=False 時 push_notify 短路(disabled),這裡如實回報。
     return {"sent": res["sent"], "devices": res["total"],
-            "apns_topic": APNS_BUNDLE_ID, "failures": res["failures"]}
+            "apns_topic": APNS_BUNDLE_ID, "failures": res["failures"],
+            "apns_configured": apns_configured(),
+            "disabled": res.get("disabled", False)}
 
 
 @app.get("/app/v1/approvals")
