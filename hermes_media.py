@@ -7,6 +7,7 @@ endpoints, models, and secrets stay in each Hermes profile.
 from __future__ import annotations
 
 from contextlib import contextmanager
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Iterator
 from urllib.parse import urlsplit, urlunsplit
@@ -64,14 +65,52 @@ def _profile_scope(home: str | Path) -> Iterator[None]:
         reset_hermes_home_override(token)
 
 
+def _plugin_api(module: Any) -> Any | None:
+    if module is None:
+        return None
+    api = getattr(module, "hermes_siege", module)
+    required = (
+        "ensure_stt_registered",
+        "request_options",
+        "ocr_document",
+        "get_media_capabilities",
+    )
+    if all(callable(getattr(api, name, None)) for name in required):
+        return api
+    return None
+
+
+@lru_cache(maxsize=1)
 def _load_plugin():
     try:
         import hermes_siege
-    except ImportError as exc:
+    except ImportError:
+        hermes_siege = None
+    api = _plugin_api(hermes_siege)
+    if api is not None:
+        return api
+
+    try:
+        from hermes_cli.plugins import get_plugin_manager
+
+        manager = get_plugin_manager()
+        manager.discover_and_load()
+        loaded = getattr(manager, "_plugins", {}).get("hermes-siege")
+        if loaded is None:
+            manager.discover_and_load(force=True)
+            loaded = getattr(manager, "_plugins", {}).get("hermes-siege")
+        api = _plugin_api(getattr(loaded, "module", None))
+    except Exception as exc:
         raise HermesMediaError(
-            "hermes-siege is not installed in the Hermes runtime"
+            "Hermes could not load the hermes-siege plugin"
         ) from exc
-    return hermes_siege
+    if loaded is None:
+        raise HermesMediaError("hermes-siege is not installed for this profile")
+    if not getattr(loaded, "enabled", False):
+        raise HermesMediaError("hermes-siege is not enabled for this profile")
+    if api is None:
+        raise HermesMediaError("hermes-siege does not expose its media API")
+    return api
 
 
 def transcribe_audio(

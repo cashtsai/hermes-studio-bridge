@@ -4,6 +4,7 @@ import asyncio
 import os
 import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -96,6 +97,39 @@ class TestHermesMediaSettings(unittest.TestCase):
 
         other_raw = yaml.safe_load((other / "config.yaml").read_text())
         self.assertEqual(other_raw["stt"]["provider"], "local")
+
+    def test_load_plugin_uses_hermes_directory_plugin_manager(self):
+        api = types.SimpleNamespace(
+            ensure_stt_registered=lambda: None,
+            request_options=lambda **_kwargs: None,
+            ocr_document=lambda *_args, **_kwargs: {},
+            get_media_capabilities=lambda **_kwargs: {},
+        )
+        loaded = types.SimpleNamespace(
+            enabled=True,
+            module=types.SimpleNamespace(hermes_siege=api),
+        )
+
+        class FakeManager:
+            _plugins = {"hermes-siege": loaded}
+
+            def discover_and_load(self, force=False):
+                return None
+
+        plugins_module = types.ModuleType("hermes_cli.plugins")
+        plugins_module.get_plugin_manager = lambda: FakeManager()
+        hermes_media._load_plugin.cache_clear()
+        try:
+            with mock.patch.dict(
+                sys.modules,
+                {
+                    "hermes_siege": None,
+                    "hermes_cli.plugins": plugins_module,
+                },
+            ):
+                self.assertIs(hermes_media._load_plugin(), api)
+        finally:
+            hermes_media._load_plugin.cache_clear()
 
 
 class TestBridgeHermesDelegation(unittest.TestCase):
