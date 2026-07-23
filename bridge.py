@@ -31,12 +31,13 @@ import subprocess
 import termios
 import threading
 import time
+import urllib.parse
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi import FastAPI, Request, HTTPException, WebSocket, WebSocketDisconnect
-from fastapi.responses import JSONResponse, StreamingResponse, FileResponse
+from fastapi.responses import JSONResponse, StreamingResponse, FileResponse, HTMLResponse
 from starlette.websockets import WebSocketState
 
 from acp_client import ACPPool, canonical_telegram_session
@@ -97,13 +98,38 @@ _PAIR_CODES: dict = {}          # code -> {expiry, apple_user_id} or legacy expi
 _PAIR_CODE_TTL = 600.0          # a pairing code is valid for 10 minutes
 APPLE_JWKS_URL = "https://appleid.apple.com/auth/keys"
 APPLE_ID_ISSUER = "https://appleid.apple.com"
-APPLE_ID_AUDIENCES = tuple(
-    a.strip() for a in os.environ.get("APPLE_ID_AUDIENCES", "com.pocketagent.ios").split(",")
-    if a.strip()
+APPLE_WEB_PUBLIC_AUDIENCE = os.environ.get(
+    "APPLE_WEB_PUBLIC_AUDIENCE", "com.pocketagent.web"
+).strip()
+APPLE_ID_AUDIENCES = tuple(dict.fromkeys([
+    *(
+        a.strip()
+        for a in os.environ.get("APPLE_ID_AUDIENCES", "com.pocketagent.ios").split(",")
+        if a.strip()
+    ),
+    APPLE_WEB_PUBLIC_AUDIENCE,
+]))
+APPLE_WEB_AUTHORIZE_URL = "https://appleid.apple.com/auth/authorize"
+APPLE_WEB_TOKEN_URL = "https://appleid.apple.com/auth/token"
+APPLE_WEB_CLIENT_ID = os.environ.get(
+    "APPLE_WEB_CLIENT_ID", APPLE_WEB_PUBLIC_AUDIENCE
+).strip()
+APPLE_WEB_REDIRECT_URI = os.environ.get("APPLE_WEB_REDIRECT_URI", "").strip()
+APPLE_WEB_TEAM_ID = os.environ.get("APPLE_WEB_TEAM_ID", "").strip()
+APPLE_WEB_KEY_ID = os.environ.get("APPLE_WEB_KEY_ID", "").strip()
+APPLE_WEB_PRIVATE_KEY_PATH = os.path.expanduser(
+    os.environ.get("APPLE_WEB_PRIVATE_KEY_PATH", "").strip()
 )
+APPLE_WEB_FLOW_TTL = 600
+APPLE_WEB_FLOW_LIMIT = 256
+APPLE_WEB_START_RATE_LIMIT = 10
+APPLE_WEB_START_RATE_WINDOW = 60.0
 ACCOUNT_SESSION_PREFIX = "paacct."
 ACCOUNT_SESSION_TTL = 60 * 60 * 24 * 90
 _APPLE_JWK_CLIENT = None
+_APPLE_WEB_FLOWS: dict = {}
+_APPLE_WEB_STARTS: dict[str, collections.deque] = {}
+_APPLE_WEB_FLOW_LOCK = threading.Lock()
 
 
 def _load_device_tokens() -> dict:
@@ -1178,9 +1204,10 @@ def _apple_jwk_client():
     return _APPLE_JWK_CLIENT
 
 
-def _apple_verify_identity_token(identity_token: str):
+def _apple_verify_identity_token(identity_token: str, audience=None):
     import jwt as pyjwt
-    if not APPLE_ID_AUDIENCES:
+    expected_audience = audience or list(APPLE_ID_AUDIENCES)
+    if not expected_audience:
         raise HTTPException(status_code=500, detail="APPLE_ID_AUDIENCES is not configured")
     try:
         header = pyjwt.get_unverified_header(identity_token)
@@ -1191,7 +1218,7 @@ def _apple_verify_identity_token(identity_token: str):
             identity_token,
             signing_key.key,
             algorithms=["RS256"],
-            audience=list(APPLE_ID_AUDIENCES),
+            audience=expected_audience,
             issuer=APPLE_ID_ISSUER,
             options={"require": ["exp", "iat", "iss", "aud", "sub"]},
         )
@@ -1200,6 +1227,222 @@ def _apple_verify_identity_token(identity_token: str):
     except Exception as e:  # noqa: BLE001
         _log_event("apple_auth_invalid_token", error=type(e).__name__)
         raise HTTPException(status_code=401, detail="invalid apple identity token")
+
+
+def _apple_web_config_error() -> str | None:
+    required = {
+        "APPLE_WEB_CLIENT_ID": APPLE_WEB_CLIENT_ID,
+        "APPLE_WEB_REDIRECT_URI": APPLE_WEB_REDIRECT_URI,
+        "APPLE_WEB_TEAM_ID": APPLE_WEB_TEAM_ID,
+        "APPLE_WEB_KEY_ID": APPLE_WEB_KEY_ID,
+        "APPLE_WEB_PRIVATE_KEY_PATH": APPLE_WEB_PRIVATE_KEY_PATH,
+    }
+    missing = [name for name, value in required.items() if not value]
+    if missing:
+        return "missing " + ", ".join(missing)
+    parsed = urllib.parse.urlparse(APPLE_WEB_REDIRECT_URI)
+    if parsed.scheme != "https" or not parsed.netloc:
+        return "APPLE_WEB_REDIRECT_URI must be an https URL"
+    key_path = Path(APPLE_WEB_PRIVATE_KEY_PATH)
+    if not key_path.is_file():
+        return "APPLE_WEB_PRIVATE_KEY_PATH is not readable"
+    return None
+
+
+def _apple_web_cleanup_locked(now: float | None = None) -> None:
+    now = now or time.time()
+    expired = [
+        flow_id for flow_id, flow in _APPLE_WEB_FLOWS.items()
+        if float(flow.get("expires_at") or 0) <= now
+    ]
+    for flow_id in expired:
+        _APPLE_WEB_FLOWS.pop(flow_id, None)
+
+
+def _apple_web_start_client_hash(request: Request) -> str:
+    # cloudflared supplies this header. Direct production access is localhost
+    # only, so an internet client cannot choose this value without traversing
+    # Cloudflare first.
+    client = (
+        request.headers.get("cf-connecting-ip", "").strip()
+        or _client_host(request)
+        or "unknown"
+    )
+    return _short_hash(client)
+
+
+def _apple_web_check_start_rate(request: Request) -> str:
+    now = time.monotonic()
+    client_hash = _apple_web_start_client_hash(request)
+    with _APPLE_WEB_FLOW_LOCK:
+        stale_before = now - APPLE_WEB_START_RATE_WINDOW
+        for key in list(_APPLE_WEB_STARTS):
+            attempts = _APPLE_WEB_STARTS[key]
+            while attempts and attempts[0] <= stale_before:
+                attempts.popleft()
+            if not attempts:
+                _APPLE_WEB_STARTS.pop(key, None)
+        attempts = _APPLE_WEB_STARTS.setdefault(client_hash, collections.deque())
+        if len(attempts) >= APPLE_WEB_START_RATE_LIMIT:
+            raise HTTPException(status_code=429, detail="too many sign-in attempts")
+        attempts.append(now)
+    return client_hash
+
+
+def _apple_web_new_flow() -> dict:
+    now = time.time()
+    with _APPLE_WEB_FLOW_LOCK:
+        _apple_web_cleanup_locked(now)
+        if len(_APPLE_WEB_FLOWS) >= APPLE_WEB_FLOW_LIMIT:
+            raise HTTPException(status_code=503, detail="too many active sign-in attempts")
+        flow = {
+            "flow_id": secrets.token_urlsafe(18),
+            "state": secrets.token_urlsafe(32),
+            "nonce": secrets.token_urlsafe(32),
+            "poll_secret": secrets.token_urlsafe(32),
+            "created_at": now,
+            "expires_at": now + APPLE_WEB_FLOW_TTL,
+            "status": "pending",
+            "result": None,
+            "error": None,
+        }
+        _APPLE_WEB_FLOWS[flow["flow_id"]] = flow
+        return dict(flow)
+
+
+def _apple_web_claim_flow(state: str) -> dict | None:
+    now = time.time()
+    with _APPLE_WEB_FLOW_LOCK:
+        _apple_web_cleanup_locked(now)
+        for flow in _APPLE_WEB_FLOWS.values():
+            if hmac.compare_digest(str(flow.get("state") or ""), state):
+                if flow.get("status") != "pending":
+                    return None
+                flow["status"] = "processing"
+                return dict(flow)
+    return None
+
+
+def _apple_web_finish_flow(flow_id: str, status: str, result=None,
+                           error: str | None = None) -> None:
+    with _APPLE_WEB_FLOW_LOCK:
+        flow = _APPLE_WEB_FLOWS.get(flow_id)
+        if not flow or flow.get("status") != "processing":
+            return
+        flow["status"] = status
+        flow["result"] = result
+        flow["error"] = error
+
+
+def _apple_web_client_secret() -> str:
+    import jwt as pyjwt
+    config_error = _apple_web_config_error()
+    if config_error:
+        raise RuntimeError(config_error)
+    key_path = Path(APPLE_WEB_PRIVATE_KEY_PATH)
+    if key_path.stat().st_size > 64 * 1024:
+        raise RuntimeError("Sign in with Apple private key is unexpectedly large")
+    private_key = key_path.read_text(encoding="utf-8")
+    now = int(time.time())
+    return pyjwt.encode(
+        {
+            "iss": APPLE_WEB_TEAM_ID,
+            "iat": now - 5,
+            "exp": now + 300,
+            "aud": APPLE_ID_ISSUER,
+            "sub": APPLE_WEB_CLIENT_ID,
+        },
+        private_key,
+        algorithm="ES256",
+        headers={"kid": APPLE_WEB_KEY_ID},
+    )
+
+
+async def _apple_web_exchange_code(code: str) -> dict:
+    import httpx
+    client_secret = await asyncio.to_thread(_apple_web_client_secret)
+    async with httpx.AsyncClient(timeout=10) as client:
+        response = await client.post(
+            APPLE_WEB_TOKEN_URL,
+            data={
+                "client_id": APPLE_WEB_CLIENT_ID,
+                "client_secret": client_secret,
+                "code": code,
+                "grant_type": "authorization_code",
+                "redirect_uri": APPLE_WEB_REDIRECT_URI,
+            },
+            headers={"Accept": "application/json"},
+        )
+    try:
+        payload = response.json()
+    except Exception as e:  # noqa: BLE001
+        raise RuntimeError("Apple token endpoint returned invalid JSON") from e
+    if response.status_code != 200:
+        error_code = str(payload.get("error") or "unknown")
+        _log_event("apple_web_token_exchange_failed",
+                   status=response.status_code, apple_error=error_code[:80])
+        raise RuntimeError("Apple authorization code validation failed")
+    identity_token = str(payload.get("id_token") or "")
+    if not identity_token:
+        raise RuntimeError("Apple token response is missing id_token")
+    return payload
+
+
+def _apple_web_display_name(user_payload: dict) -> str | None:
+    name = user_payload.get("name")
+    if not isinstance(name, dict):
+        return None
+    parts = [
+        str(name.get(key) or "").strip()
+        for key in ("firstName", "lastName", "givenName", "familyName")
+    ]
+    # Apple uses firstName/lastName on the web. The second pair keeps this
+    # tolerant of native-shaped fixtures without duplicating either value.
+    if parts[0] or parts[1]:
+        parts = parts[:2]
+    else:
+        parts = parts[2:]
+    return " ".join(part for part in parts if part).strip() or None
+
+
+def _apple_web_callback_page(kind: str) -> HTMLResponse:
+    if kind == "success":
+        title = "Pocket 登入完成"
+        message = "已完成 Apple 登入，可以關閉這個頁面並回到 Pocket。"
+    elif kind == "cancelled":
+        title = "已取消登入"
+        message = "你可以關閉這個頁面，回到 Pocket 後重新登入。"
+    else:
+        title = "登入未完成"
+        message = "請關閉這個頁面，回到 Pocket 後重新嘗試。"
+    html = f"""<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>{title}</title>
+  <style>
+    body {{ margin: 0; min-height: 100vh; display: grid; place-items: center;
+      font: 16px -apple-system, BlinkMacSystemFont, sans-serif;
+      color: #15171a; background: #f5f6f8; }}
+    main {{ width: min(34rem, calc(100% - 3rem)); }}
+    h1 {{ margin: 0 0 .75rem; font-size: 1.75rem; letter-spacing: 0; }}
+    p {{ margin: 0; color: #555b66; line-height: 1.6; }}
+  </style>
+</head>
+<body><main><h1>{title}</h1><p>{message}</p></main></body>
+</html>"""
+    return HTMLResponse(
+        html,
+        headers={
+            "Cache-Control": "no-store",
+            "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; "
+                                       "base-uri 'none'; frame-ancestors 'none'",
+            "Referrer-Policy": "no-referrer",
+            "X-Content-Type-Options": "nosniff",
+            "X-Frame-Options": "DENY",
+        },
+    )
 
 
 # canonical messages 的寫入版本計數(真事件推送,取代 SSE 每 2 秒重掃):
@@ -9434,7 +9677,7 @@ async def capabilities(request: Request):
                          "approvals", "cc_sessions", "attachments", "vision",
                          "message_dry_run", "message_interrupt", "message_status",
                          "message_events", "apns_push", "accounts",
-                         "apple_auth", "account_pairing",
+                         "apple_auth", "apple_web_auth", "account_pairing",
                          "delegations", "control_plane_v2", "attachment_uploads",
                          "interactive_push"] + (["terminal"] if POCKET_TERMINAL_ENABLED else []),
             "endpoints": ["/app/v1/sessions", "/app/v1/messages", "/reports",
@@ -9447,6 +9690,9 @@ async def capabilities(request: Request):
                           "/cron/jobs", "/ccsessions", "/app/v1/approvals",
                           "/app/v1/devices", "/app/v1/push/test",
                           "/app/v1/auth/apple", "/app/v1/account",
+                          "/app/v1/auth/apple/web/start",
+                          "/app/v1/auth/apple/web/callback",
+                          "/app/v1/auth/apple/web/status",
                           "/app/v1/pair/new", "/app/v1/pair/claim",
                           "/app/v1/devices/{id}/revoke",
                           "/app/v1/delegations", "/app/v2/sessions",
@@ -9495,6 +9741,183 @@ async def app_auth_apple(request: Request):
             "expires_at": expires_at,
         },
     }
+
+
+@app.post("/app/v1/auth/apple/web/start")
+async def app_auth_apple_web_start(request: Request):
+    client_hash = _apple_web_check_start_rate(request)
+    config_error = _apple_web_config_error()
+    if config_error:
+        _log_event("apple_web_auth_not_configured", reason=config_error)
+        raise HTTPException(status_code=503, detail="web Apple sign-in is not configured")
+    flow = _apple_web_new_flow()
+    authorization_url = APPLE_WEB_AUTHORIZE_URL + "?" + urllib.parse.urlencode({
+        "client_id": APPLE_WEB_CLIENT_ID,
+        "redirect_uri": APPLE_WEB_REDIRECT_URI,
+        "response_type": "code id_token",
+        "response_mode": "form_post",
+        "scope": "name email",
+        "state": flow["state"],
+        "nonce": flow["nonce"],
+    })
+    _log_event("apple_web_auth_started",
+               flow_hash=_short_hash(flow["flow_id"]), client_hash=client_hash)
+    return {
+        "ok": True,
+        "flow_id": flow["flow_id"],
+        "poll_secret": flow["poll_secret"],
+        "authorization_url": authorization_url,
+        "expires_at": int(flow["expires_at"]),
+        "poll_interval": 2,
+    }
+
+
+@app.post("/app/v1/auth/apple/web/status")
+async def app_auth_apple_web_status(request: Request):
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail="bad json")
+    flow_id = str(body.get("flow_id") or "").strip()
+    poll_secret = str(body.get("poll_secret") or "").strip()
+    if not flow_id or not poll_secret:
+        raise HTTPException(status_code=400, detail="flow_id and poll_secret required")
+    with _APPLE_WEB_FLOW_LOCK:
+        _apple_web_cleanup_locked()
+        flow = _APPLE_WEB_FLOWS.get(flow_id)
+        if not flow or not hmac.compare_digest(
+                str(flow.get("poll_secret") or ""), poll_secret):
+            raise HTTPException(status_code=404, detail="sign-in attempt not found")
+        status = str(flow.get("status") or "pending")
+        expires_at = int(flow.get("expires_at") or 0)
+        if status == "complete":
+            result = flow.get("result") or {}
+            _APPLE_WEB_FLOWS.pop(flow_id, None)
+        elif status in ("failed", "cancelled"):
+            result = {"error": str(flow.get("error") or status)}
+            _APPLE_WEB_FLOWS.pop(flow_id, None)
+        else:
+            result = None
+    if status == "complete":
+        return {"ok": True, "status": status, **result}
+    if status in ("failed", "cancelled"):
+        return {"ok": False, "status": status, **result}
+    return {"ok": True, "status": status, "expires_at": expires_at}
+
+
+@app.get("/app/v1/auth/apple/web/callback")
+async def app_auth_apple_web_callback_get():
+    return _apple_web_callback_page("failed")
+
+
+@app.post("/app/v1/auth/apple/web/callback")
+async def app_auth_apple_web_callback(request: Request):
+    content_type = request.headers.get("content-type", "").lower()
+    if not content_type.startswith("application/x-www-form-urlencoded"):
+        return _apple_web_callback_page("failed")
+    raw_body = await request.body()
+    if len(raw_body) > 16 * 1024:
+        return _apple_web_callback_page("failed")
+    try:
+        form = urllib.parse.parse_qs(
+            raw_body.decode("utf-8"),
+            keep_blank_values=True,
+            max_num_fields=16,
+        )
+    except (UnicodeDecodeError, ValueError):
+        return _apple_web_callback_page("failed")
+
+    def field(name: str) -> str:
+        values = form.get(name) or []
+        return str(values[0]).strip() if len(values) == 1 else ""
+
+    state = field("state")
+    if not state:
+        return _apple_web_callback_page("failed")
+    flow = _apple_web_claim_flow(state)
+    if not flow:
+        return _apple_web_callback_page("failed")
+
+    flow_id = str(flow["flow_id"])
+    apple_error = field("error")
+    if apple_error:
+        status = "cancelled" if apple_error == "user_cancelled_authorize" else "failed"
+        error = "cancelled" if status == "cancelled" else "authorization_failed"
+        _apple_web_finish_flow(flow_id, status, error=error)
+        _log_event("apple_web_auth_cancelled" if status == "cancelled"
+                   else "apple_web_auth_failed",
+                   flow_hash=_short_hash(flow_id), apple_error=apple_error[:80])
+        return _apple_web_callback_page(status)
+
+    try:
+        code = field("code")
+        front_identity_token = field("id_token")
+        if not code or not front_identity_token:
+            raise ValueError("missing authorization response")
+        front_claims = await asyncio.to_thread(
+            _apple_verify_identity_token,
+            front_identity_token,
+            APPLE_WEB_CLIENT_ID,
+        )
+        expected_nonce = str(flow.get("nonce") or "")
+        actual_nonce = str(front_claims.get("nonce") or "")
+        if not expected_nonce or not hmac.compare_digest(expected_nonce, actual_nonce):
+            raise ValueError("nonce mismatch")
+
+        token_payload = await _apple_web_exchange_code(code)
+        exchanged_claims = await asyncio.to_thread(
+            _apple_verify_identity_token,
+            str(token_payload["id_token"]),
+            APPLE_WEB_CLIENT_ID,
+        )
+        if exchanged_claims.get("sub") != front_claims.get("sub"):
+            raise ValueError("subject mismatch")
+        exchanged_nonce = str(exchanged_claims.get("nonce") or "")
+        if exchanged_nonce and not hmac.compare_digest(expected_nonce, exchanged_nonce):
+            raise ValueError("exchanged nonce mismatch")
+
+        user_payload = {}
+        raw_user = field("user")
+        if raw_user:
+            parsed_user = json.loads(raw_user)
+            if not isinstance(parsed_user, dict):
+                raise ValueError("bad user payload")
+            user_payload = parsed_user
+        apple_user_id = str(exchanged_claims.get("sub") or "").strip()
+        if not apple_user_id:
+            raise ValueError("missing subject")
+        email = str(
+            exchanged_claims.get("email") or front_claims.get("email")
+            or user_payload.get("email") or ""
+        ).strip() or None
+        display_name = _apple_web_display_name(user_payload)
+        _apple_web_finish_flow(
+            flow_id,
+            "complete",
+            result={
+                "identity": {
+                    "apple_user_id": apple_user_id,
+                    "identity_token": str(token_payload["id_token"]),
+                    "email": email,
+                    "display_name": display_name,
+                },
+            },
+        )
+        _log_event(
+            "apple_web_auth_success",
+            flow_hash=_short_hash(flow_id),
+            apple_user_hash=_short_hash(apple_user_id),
+            audience=str(exchanged_claims.get("aud") or ""),
+        )
+        return _apple_web_callback_page("success")
+    except Exception as e:  # noqa: BLE001
+        _apple_web_finish_flow(flow_id, "failed", error="verification_failed")
+        _log_event(
+            "apple_web_auth_failed",
+            flow_hash=_short_hash(flow_id),
+            error=type(e).__name__,
+        )
+        return _apple_web_callback_page("failed")
 
 
 # ── /app/v1/usage: Codex + Claude Code 本機用量(不打雲端 API)──────────
