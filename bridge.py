@@ -2613,18 +2613,21 @@ def _fmt_ts(ts) -> str:
 
 
 # ───────────────────────── APNs push (M23) ─────────────────────────────────
-# Token-based (.p8) auth. The key lives UNDER Hermes management:
-#   ~/apps/hermes-agent/home/credentials/AuthKey_86FF9D976T.p8  (chmod 600)
-# See docs/HANDOFF_CREDENTIALS.md for the rotation procedure / inventory.
+# Token-based (.p8) auth. 正式金鑰(2026-07-23 換發,sandbox/production 皆已
+# 實測認證通過):
+#   ~/.pocket-release-secrets/apns/AuthKey_9XNQ4PS546.p8  (chmod 600)
+# 舊 Hermes 管理的 AuthKey_86FF9D976T.p8 已汰換。輪替程序見
+# docs/HANDOFF_CREDENTIALS.md。
 #
-# feat/apns-sender:全組設定改為 env 可注入(金鑰後補插槽)。沒設 env 時沿用
-# 既有預設值 → 現行部署行為零改變;金鑰檔不存在/KEY_ID/TEAM_ID 缺席時,
+# feat/apns-sender:全組設定改為 env 可注入(金鑰後補插槽):
+#   APNS_KEY_PATH / APNS_KEY_ID / APNS_TEAM_ID / APNS_BUNDLE_ID / APNS_HOST
+# 沒設 env 時用下方預設值;金鑰檔不存在/KEY_ID/TEAM_ID 缺席時,
 # `apns_configured()` 回 False,整個推播模組靜默停用(push_notify 直接短路,
 # bridge 照常啟動,絕不因缺金鑰起不來)。
 APNS_KEY_PATH = os.path.expanduser(os.environ.get(
     "APNS_KEY_PATH",
-    "~/apps/hermes-agent/home/credentials/AuthKey_86FF9D976T.p8"))
-APNS_KEY_ID = os.environ.get("APNS_KEY_ID", "86FF9D976T")
+    "~/.pocket-release-secrets/apns/AuthKey_9XNQ4PS546.p8"))
+APNS_KEY_ID = os.environ.get("APNS_KEY_ID", "9XNQ4PS546")
 APNS_TEAM_ID = os.environ.get("APNS_TEAM_ID", "4F8B93R3SH")
 # 正式 app 是 Pocket kernel(com.pocketagent.kernel,見 ship-kernel.sh)。apns-topic
 # 必須對上 device token 所屬 app,否則 APNs 回 400 BadTopic / DeviceTokenNotForTopic
