@@ -20,6 +20,25 @@ import uuid
 
 HERMES_BIN = "/Users/xcash/apps/hermes-agent/runtime/venv/bin/hermes"
 ACP_STREAM_LIMIT = 128 * 1024 * 1024
+LOBSTER_ROOT = "/Users/xcash/apps/lobster-tg"
+
+
+def workspace_cwd_for(key: str, home: str) -> str:
+    """Return the ACP tool cwd for a persona.
+
+    HERMES_HOME owns durable state/memory. The ACP cwd should point at the
+    persona's workspace so relative startup files from AGENTS.md resolve.
+    """
+    candidates = {
+        "yuanfang": os.path.join(LOBSTER_ROOT, "workspace"),
+        "pantianqing": os.path.join(LOBSTER_ROOT, "fliper-workspace"),
+        "xcash": os.path.join(LOBSTER_ROOT, "xcash-workspace"),
+        # shuijing-workspace is not fully populated yet; the shared workspace
+        # contains the current absolute routing to ShuiJing's Hermes profile.
+        "shuijing": os.path.join(LOBSTER_ROOT, "workspace"),
+    }
+    cwd = candidates.get(key) or home
+    return cwd if os.path.isdir(cwd) else home
 
 
 def canonical_telegram_session(home: str):
@@ -52,8 +71,9 @@ def canonical_telegram_session(home: str):
 
 
 class ACPSession:
-    def __init__(self, home: str):
+    def __init__(self, home: str, cwd: str | None = None):
         self.home = home
+        self.cwd = cwd or home
         self.proc = None
         self.session_id = None
         self._id = 0
@@ -121,21 +141,21 @@ class ACPSession:
                 self._last_canonical_sid = sid   # one attempt per sid (flap guard)
                 try:
                     await self._request("session/load",
-                                        {"cwd": self.home, "sessionId": sid, "mcpServers": []},
+                                        {"cwd": self.cwd, "sessionId": sid, "mcpServers": []},
                                         timeout=120)
                     self.session_id = sid
                     self._loaded_session = True
                     return
                 except Exception:
                     pass
-            r = await self._request("session/new", {"cwd": self.home, "mcpServers": []}, timeout=60)
+            r = await self._request("session/new", {"cwd": self.cwd, "mcpServers": []}, timeout=60)
             self.session_id = (r or {}).get("sessionId")
             self._loaded_session = False
 
     async def _force_new_session(self):
         """Drop the loaded session and start a blank one — recovery path for a
         loaded Telegram session that turns out inert (prompts yield nothing)."""
-        r = await self._request("session/new", {"cwd": self.home, "mcpServers": []}, timeout=60)
+        r = await self._request("session/new", {"cwd": self.cwd, "mcpServers": []}, timeout=60)
         self.session_id = (r or {}).get("sessionId")
         self._loaded_session = False
 
@@ -185,7 +205,7 @@ class ACPSession:
         self._last_canonical_sid = sid
         try:
             await self._request("session/load",
-                                {"cwd": self.home, "sessionId": sid, "mcpServers": []},
+                                {"cwd": self.cwd, "sessionId": sid, "mcpServers": []},
                                 timeout=120)
             self.session_id = sid
             self._loaded_session = True
@@ -399,6 +419,6 @@ class ACPPool:
         async with self._lock:
             s = self._sessions.get(key)
             if s is None:
-                s = ACPSession(home)
+                s = ACPSession(home, workspace_cwd_for(key, home))
                 self._sessions[key] = s
             return s
