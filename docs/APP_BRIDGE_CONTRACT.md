@@ -544,6 +544,13 @@ Pins Pocket's provider lane to a native agent session. `{provider}` accepts
 | `GET  /app/v2/artifacts/{media_id}` | 已封存 artifact 位元組 | ✅ 上線 |
 | `POST /app/v2/sessions/{id}/approve` | 核准/拒絕（body: `{approve: bool}` 或 `{decision}`；`for_session` 可記住） | ✅ 上線（現路由僅 cx；cc/persona 併入待批次 2 統一路由） |
 | `POST /app/v2/sessions/{id}/input` | 送訊息/指令(可帶 attachments) | ⏳ 批次 2（統一路由；現走 v1 `/app/v1/delegations/{…}/input` 與 `/app/v1/messages`） |
+
+  - persona(hermes)input 的 2xx ack：`{ok, session_id, accepted, queued,
+    message_id, content}`。`message_id` = canonical user turn 的 mid（回顯卡
+    id = `card-hp-<mid>`，app 樂觀泡泡對位鍵）；`content` = 實收 user turn
+    正文 —— 語音附件的 STT transcript 已折入（feat/stt-transcript-echo），
+    app 用它把「🎤 語音訊息 · 辨識中…」樂觀泡泡原地替換成辨識文字。
+    `stt_lang`（body 選配）與 v1 messages 同語意：語音轉錄語言鎖定＋繁簡偏置。
 | `POST /app/v2/sessions/{id}/interrupt` | 停止當前 turn | ⏳ 批次 2 |
 | `POST /app/v2/sessions/{id}/key` | 送控制鍵(僅 `keys`) | ⏳ 後期（TUI 級,契約先佔位） |
 | `POST /app/v2/sessions` | 開新 session | ⏳ 後期（現走 v1 `POST /app/v1/delegations`） |

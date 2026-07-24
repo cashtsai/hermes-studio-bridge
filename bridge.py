@@ -8732,8 +8732,12 @@ async def _v2_persona_input(session: str, session_id: str, body: dict,
     if inflight_entry is not None:
         inflight_entry["task"] = task
         inflight_entry["state"] = state
+    # `content` = 實收 user turn 正文(語音附件的 STT transcript 已由
+    # _persona_prepare_turn 折入)。app 靠它把樂觀語音泡泡「🎤 語音訊息 ·
+    # 辨識中…」原地替換成辨識文字(feat/stt-transcript-echo);message_id
+    # 仍是回顯卡對位鍵。舊 app 忽略多的欄位,無害。
     return {"ok": True, "session_id": session_id, "accepted": True,
-            "queued": queued, "message_id": user_mid}
+            "queued": queued, "message_id": user_mid, "content": content}
 
 
 @app.post("/app/v2/sessions/{session_id}/interrupt")
