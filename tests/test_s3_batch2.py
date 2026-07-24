@@ -170,6 +170,8 @@ with patch.object(bridge.POOL, "get", _fake_pool_get), \
     check("input 200 + accepted(fire-and-forget)",
           r.status_code == 200 and r.json().get("accepted") is True)
     check("input 回 message_id(user 落 canonical)", bool(r.json().get("message_id")))
+    check("input ack 回 content(實收 user turn 正文,app 樂觀泡泡原地替換用)",
+          r.json().get("content") == USER_SAID)
 
     # 背景回合在 TestClient 的事件圈跑;等 canonical 出現 assistant 收尾。
     deadline = time.time() + 8
@@ -208,6 +210,35 @@ evs2 = _sse_events(f"/app/v2/events?session={SESSION}&since_seq={max_seq}&follow
 texts = json.dumps([e.get("data") for e in evs2], ensure_ascii=False)
 check("event_log 續增:user 發話在補洞範圍", USER_SAID in texts)
 check("event_log 續增:assistant 回覆在補洞範圍", REPLY in texts)
+
+# ── 4b. 語音訊息:STT transcript 折入 content 後,ack 原樣回給 app ────────
+# (feat/stt-transcript-echo:app 樂觀泡泡「🎤 語音訊息 · 辨識中…」靠這欄
+#  原地替換成辨識文字;transcript 本來就落 canonical user turn,這裡只是
+#  把實收正文一併帶回 2xx ack。)
+VOICE_TRANSCRIPT = "這是語音辨識出來的字"
+
+
+async def _fake_prepare_voice(session, content, attachments, stt_lang=""):
+    folded = (content + "\n" + VOICE_TRANSCRIPT).strip() if content else VOICE_TRANSCRIPT
+    att_meta = [{"kind": "audio", "filename": "voice.m4a", "mime": "audio/m4a",
+                 "path": None}]
+    return folded, att_meta, f"PROMPT::{folded}"
+
+
+with patch.object(bridge.POOL, "get", _fake_pool_get), \
+     patch.object(bridge, "_persona_prepare_turn", _fake_prepare_voice), \
+     patch.object(bridge, "_persona_content_stream", _fake_stream):
+    r = client.post(
+        f"/app/v2/sessions/{SID}/input",
+        json={"content": "", "client_id": "cli-s3b2-voice",
+              "attachments": [{"kind": "audio", "filename": "voice.m4a",
+                               "mime": "audio/m4a",
+                               "data": "data:audio/m4a;base64,AAAA"}]},
+        headers=AUTH)
+    check("語音 input:ack content = STT transcript(泡泡原地替換用)",
+          r.status_code == 200 and r.json().get("content") == VOICE_TRANSCRIPT)
+    check("語音 input:message_id 仍在(回顯卡對位鍵)",
+          bool(r.json().get("message_id")))
 
 # ── 5. v1 相容:同一段對話老路照看 ───────────────────────────────────────
 r = client.get("/app/v1/messages", params={"session": SESSION}, headers=AUTH)
