@@ -34,6 +34,18 @@ _LOCALE_LANGUAGE = {
     "zh-Hans": "zh",
     "zh": "zh",
     "en": "en",
+    "th": "th",
+    "ja": "ja",
+    "ko": "ko",
+    "vi": "vi",
+    "id": "id",
+    "ms": "ms",
+    "fr": "fr",
+    "es": "es",
+    "de": "de",
+    "pt": "pt",
+    "ru": "ru",
+    "ar": "ar",
 }
 _LOCALE_PROMPT = {
     "zh-Hant": "以下是繁體中文的對話內容。",

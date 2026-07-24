@@ -38,8 +38,23 @@ from pathlib import Path
 
 import media_artifacts
 import hermes_media
-from fastapi import FastAPI, Request, HTTPException, WebSocket, WebSocketDisconnect
-from fastapi.responses import JSONResponse, StreamingResponse, FileResponse, HTMLResponse
+from fastapi import (
+    FastAPI,
+    File,
+    Form,
+    HTTPException,
+    Request,
+    UploadFile,
+    WebSocket,
+    WebSocketDisconnect,
+)
+from fastapi.responses import (
+    FileResponse,
+    HTMLResponse,
+    JSONResponse,
+    PlainTextResponse,
+    StreamingResponse,
+)
 from starlette.websockets import WebSocketState
 
 from acp_client import ACPPool, canonical_telegram_session
@@ -565,6 +580,7 @@ _MIME_EXT = {"image/jpeg": ".jpg", "image/png": ".png", "image/gif": ".gif",
 # 上限是記憶體防爆閥(12 檔 × 32MB 的 base64 膨脹仍在其下)。
 _ATT_MAX_COUNT = 12
 _ATT_MAX_FILE_BYTES = 32 * 1024 * 1024
+_STT_UPLOAD_MAX_BYTES = 25 * 1024 * 1024
 _BODY_MAX_BYTES = 768 * 1024 * 1024
 
 
@@ -678,6 +694,80 @@ def _transcribe(path: str, home: str, lang: str = "") -> str:
         )
         return ""
     return str(result.get("transcript") or "").strip()
+
+
+@app.post("/v1/audio/transcriptions")
+async def audio_transcriptions(
+    request: Request,
+    file: UploadFile = File(...),
+    model: str = Form("xcash"),
+    language: str = Form(""),
+    response_format: str = Form("json"),
+):
+    """OpenAI-compatible STT transport backed by a Hermes profile.
+
+    The caller chooses only a registered Hermes profile. Provider, endpoint,
+    model, and credentials remain in that profile's config and secret scope.
+    """
+    _check_auth(request)
+    profile = str(model or "").strip()
+    if profile not in PERSONAS:
+        raise http_err(
+            400,
+            "UNKNOWN_HERMES_PROFILE",
+            "model must name a registered Hermes profile",
+        )
+    result_format = str(response_format or "json").strip().lower()
+    if result_format not in {"json", "text"}:
+        raise http_err(
+            400,
+            "UNSUPPORTED_RESPONSE_FORMAT",
+            "response_format must be json or text",
+        )
+
+    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    raw_name = os.path.basename(file.filename or "audio")
+    safe_name = re.sub(r"[^\w.\-]", "_", raw_name) or "audio"
+    if "." not in safe_name:
+        safe_name += _MIME_EXT.get(file.content_type or "", ".audio")
+    path = UPLOAD_DIR / f"stt-{uuid.uuid4().hex}-{safe_name}"
+    total = 0
+    try:
+        with path.open("wb") as destination:
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > _STT_UPLOAD_MAX_BYTES:
+                    raise http_err(
+                        413,
+                        "STT_FILE_TOO_LARGE",
+                        f"audio exceeds {_STT_UPLOAD_MAX_BYTES} bytes",
+                    )
+                destination.write(chunk)
+        if total == 0:
+            raise http_err(400, "EMPTY_AUDIO", "audio file is empty")
+        transcript = await asyncio.to_thread(
+            _transcribe,
+            str(path),
+            home_for(profile),
+            str(language or "").strip()[:32],
+        )
+    finally:
+        await file.close()
+        path.unlink(missing_ok=True)
+
+    if not transcript:
+        raise http_err(
+            502,
+            "HERMES_STT_FAILED",
+            "Hermes did not return a transcript",
+        )
+    _log_event("openai_audio_transcription", profile=profile, bytes=total)
+    if result_format == "text":
+        return PlainTextResponse(transcript)
+    return JSONResponse({"text": transcript})
 
 
 async def _transcribe_attachments(
@@ -9991,6 +10081,7 @@ async def capabilities(request: Request):
                          "interactive_push", "media_artifacts",
                          "hermes_media_capabilities",
                          "hermes_media_settings",
+                         "openai_audio_transcriptions",
                          "push_register"] +
                         (["terminal"] if POCKET_TERMINAL_ENABLED else []),
             "endpoints": ["/app/v1/sessions", "/app/v1/messages", "/reports",
@@ -10014,6 +10105,7 @@ async def capabilities(request: Request):
                           "/app/v2/artifacts/{media_id}",
                           "/app/v2/hermes/media-capabilities",
                           "/app/v2/hermes/media-settings",
+                          "/v1/audio/transcriptions",
                           "/app/v2/sessions/{id}/approve", "/app/v1/terminal",
                           "/app/v1/usage"]}
 

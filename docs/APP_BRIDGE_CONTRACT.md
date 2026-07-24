@@ -398,6 +398,24 @@ remain in the Hermes profile secret scope. Pocket must not persist provider
 URLs, model credentials, or a second copy of these settings in UserDefaults or
 CloudKit.
 
+### `POST /v1/audio/transcriptions`
+
+OpenAI-compatible multipart speech-to-text transport for non-Pocket clients
+such as LuvLink. It requires normal bridge bearer authentication.
+
+Multipart fields:
+
+- `file`: required audio upload, at most 25 MiB.
+- `model`: required registered Hermes persona/profile id.
+- `language`: optional locale or language hint.
+- `response_format`: optional `json` (default) or `text`.
+
+The endpoint only selects the Hermes profile. The profile's `config.yaml`
+selects the STT provider, model, and endpoint; credentials remain in the
+profile secret scope. A JSON response is `{"text":"..."}`. Unknown profiles
+return `400`, oversized uploads return `413`, and provider/transcription
+failure returns `502`.
+
 ### `GET /app/v1/approvals`
 
 Returns approval cards for app review.

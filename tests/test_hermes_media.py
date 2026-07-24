@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import io
+import json
 import os
 import sys
 import tempfile
@@ -10,6 +12,9 @@ from pathlib import Path
 from unittest import mock
 
 import yaml
+from fastapi import HTTPException
+from starlette.datastructures import Headers, UploadFile
+from starlette.requests import Request
 
 _ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_ROOT))
@@ -152,6 +157,11 @@ class TestBridgeHermesDelegation(unittest.TestCase):
             "/tmp/profile", "/tmp/voice.m4a", locale="zh-Hant"
         )
 
+    def test_luvlink_language_codes_are_forwarded_to_stt_provider(self):
+        self.assertEqual(hermes_media._LOCALE_LANGUAGE["th"], "th")
+        self.assertEqual(hermes_media._LOCALE_LANGUAGE["ja"], "ja")
+        self.assertEqual(hermes_media._LOCALE_LANGUAGE["ar"], "ar")
+
     def test_image_ocr_delegates_to_hermes(self):
         with mock.patch.object(
             bridge.hermes_media,
@@ -173,6 +183,80 @@ class TestBridgeHermesDelegation(unittest.TestCase):
         paths = {route.path for route in bridge.app.routes}
         self.assertIn("/app/v2/hermes/media-capabilities", paths)
         self.assertIn("/app/v2/hermes/media-settings", paths)
+        self.assertIn("/v1/audio/transcriptions", paths)
+        capabilities = asyncio.run(bridge.capabilities(self._request()))
+        self.assertIn("openai_audio_transcriptions", capabilities["features"])
+        self.assertIn("/v1/audio/transcriptions", capabilities["endpoints"])
+
+    @staticmethod
+    def _request():
+        token = f"Bearer {bridge.BRIDGE_TOKEN}".encode()
+        return Request(
+            {
+                "type": "http",
+                "method": "POST",
+                "path": "/v1/audio/transcriptions",
+                "headers": [(b"authorization", token)],
+            }
+        )
+
+    def test_openai_audio_transcription_uses_selected_hermes_profile(self):
+        upload = UploadFile(
+            io.BytesIO(b"voice-bytes"),
+            filename="voice.ogg",
+            headers=Headers({"content-type": "audio/ogg"}),
+        )
+        with mock.patch.object(
+            bridge,
+            "_transcribe",
+            return_value="delegated transcript",
+        ) as call:
+            response = asyncio.run(
+                bridge.audio_transcriptions(
+                    self._request(),
+                    upload,
+                    model="xcash",
+                    language="zh",
+                    response_format="json",
+                )
+            )
+
+        self.assertEqual(json.loads(response.body), {"text": "delegated transcript"})
+        path, home, language = call.call_args.args
+        self.assertEqual(home, bridge.home_for("xcash"))
+        self.assertEqual(language, "zh")
+        self.assertFalse(Path(path).exists())
+
+    def test_openai_audio_transcription_rejects_unknown_profile(self):
+        upload = UploadFile(io.BytesIO(b"voice"), filename="voice.ogg")
+        with self.assertRaises(HTTPException) as raised:
+            asyncio.run(
+                bridge.audio_transcriptions(
+                    self._request(),
+                    upload,
+                    model="missing",
+                    language="",
+                    response_format="json",
+                )
+            )
+        self.assertEqual(raised.exception.status_code, 400)
+
+    def test_openai_audio_transcription_enforces_streamed_size_limit(self):
+        upload = UploadFile(io.BytesIO(b"12345"), filename="voice.ogg")
+        with (
+            mock.patch.object(bridge, "_STT_UPLOAD_MAX_BYTES", 4),
+            self.assertRaises(HTTPException) as raised,
+        ):
+            asyncio.run(
+                bridge.audio_transcriptions(
+                    self._request(),
+                    upload,
+                    model="xcash",
+                    language="",
+                    response_format="json",
+                )
+            )
+        self.assertEqual(raised.exception.status_code, 413)
 
 
 if __name__ == "__main__":
