@@ -4866,6 +4866,76 @@ async def client_log_read(request: Request, limit: int = 100, level: str = ""):
     return {"entries": out[-limit:]}
 
 
+# ─────────────── diagnostics ingest(MetricKit + 使用者回報)────────────────
+# App 端可觀測性的落地口:MetricKit 崩潰/卡頓/指標 payload 與「回報問題」
+# 使用者回報,各自一筆一檔落在 DIAG_DIR(canonical.db 旁的 diagnostics/,
+# 可用 POCKET_DIAG_DIR 覆蓋)。刻意不進 db、不做 dashboard —— 檔案能被
+# 晨報巡查 / Claude session 直接 ls+read 就夠了。
+# 隱私語意:payload 由 app 端組裝,只含堆疊/裝置/版本/錯誤記錄摘要,
+# 不含對話內容;app 端有「診斷與使用資料」開關(預設開)管自動上傳。
+DIAG_DIR = os.environ.get("POCKET_DIAG_DIR") \
+    or os.path.join(os.path.dirname(CANON_DB), "diagnostics")
+_DIAG_MAX_BYTES = 2 * 1024 * 1024   # 單筆上限 2MB(MetricKit crash json 通常 <300KB)
+_DIAG_MAX_FILES = 500               # 目錄輪替上限 — 防當機迴圈灌爆磁碟
+_DIAG_KINDS = {"metrickit_diagnostic", "metrickit_metric", "user_report"}
+
+
+def _diag_prune() -> None:
+    """把 DIAG_DIR 的 json 檔數修剪到 _DIAG_MAX_FILES(刪最舊,冪等)。"""
+    try:
+        files = [os.path.join(DIAG_DIR, f) for f in os.listdir(DIAG_DIR)
+                 if f.endswith(".json")]
+        if len(files) <= _DIAG_MAX_FILES:
+            return
+        files.sort(key=lambda p: os.path.getmtime(p))
+        for p in files[: len(files) - _DIAG_MAX_FILES]:
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+
+@app.post("/app/v1/diagnostics")
+async def diagnostics_ingest(request: Request):
+    _check_auth(request)
+    raw = await request.body()
+    if len(raw) > _DIAG_MAX_BYTES:
+        raise http_err(413, "PAYLOAD_TOO_LARGE",
+                       f"diagnostics 單筆上限 {_DIAG_MAX_BYTES} bytes")
+    try:
+        body = json.loads(raw)
+        if not isinstance(body, dict):
+            raise ValueError("not a dict")
+    except Exception:  # noqa: BLE001
+        raise http_err(400, "BAD_REQUEST", "bad json")
+    kind = str(body.get("kind", "")).strip()
+    if kind not in _DIAG_KINDS:
+        raise http_err(400, "BAD_REQUEST",
+                       "kind 必須是 " + " / ".join(sorted(_DIAG_KINDS)))
+    entry = {
+        "server_ts": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "kind": kind,
+        # 裝置/版本中繼資料 — 截斷防灌爆;缺了也照收(舊 app 相容)。
+        "app_version": str(body.get("app_version", ""))[:32],
+        "build": str(body.get("build", ""))[:16],
+        "device": str(body.get("device", ""))[:64],
+        "os": str(body.get("os", ""))[:64],
+        # user_report:使用者文字 + 錯誤記錄摘要;MetricKit:payload 原文。
+        "note": str(body.get("note", ""))[:4000],
+        "summary": body.get("summary"),
+        "payload": body.get("payload"),
+    }
+    os.makedirs(DIAG_DIR, exist_ok=True)
+    stamp = datetime.now().astimezone().strftime("%Y%m%dT%H%M%S")
+    fname = f"{stamp}-{kind}-{uuid.uuid4().hex[:8]}.json"
+    with open(os.path.join(DIAG_DIR, fname), "w", encoding="utf-8") as f:
+        json.dump(entry, f, ensure_ascii=False, indent=1)
+    _diag_prune()
+    return {"ok": True, "stored": fname}
+
+
 @app.post("/codexsessions/{thread_id}/input")
 async def codex_session_input(thread_id: str, request: Request):
     # 註:此端點呼叫 start_turn() → ensure_thread_loaded() → thread/resume,
