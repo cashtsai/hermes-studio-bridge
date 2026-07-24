@@ -5367,6 +5367,50 @@ _TG_TEXTDOC_NOTE = re.compile(
 _TG_FILE_NOTE = re.compile(
     r"\[The user sent (a document|an audio file attachment|a video attachment): "
     r"'([^']*)'\. It is saved at: (.+?)\.\s(?s:.*?)\]")
+# hermes 0.19 起,TG 使用者照片走 vision 自動描述(gateway/run.py:16552-16568):
+#   [The user sent an image~ Here's what I can see:\n<描述>]
+#   [If you need a closer look, use vision_analyze with image_url: <path> ~]
+# 描述與提示行都是 agent 面文字,app 端要的是圖本身 → 從 image_url 拿回路徑
+# 掛一等附件、整塊移除。描述失敗的兩種變體("couldn't quite see it"/
+# "something went wrong")同樣以 `vision_analyze using image_url: <path>]` 收尾。
+_TG_VISION_IMAGE = re.compile(
+    r"\[The user sent an image~ Here's what I can see:(?s:.*?)\]\s*"
+    r"\[If you need a closer look, use vision_analyze with image_url: "
+    r"([^\]\s]+)\s*~\]")
+_TG_VISION_IMAGE_FAIL = re.compile(
+    r"\[The user sent an image but (?s:.*?)vision_analyze using image_url: "
+    r"([^\]\s]+)\]")
+# 人格在 TG 端直接回媒體:state.db 的 assistant 列存「原話+遞送標記
+# `MEDIA:<path>`」(hermes tools/send_message_tool 語法;實例:live db row
+# 9591 的 HR 表單 PDF)。副檔名集合抄 hermes gateway/platforms/base.py
+# MEDIA_DELIVERY_EXTS —— 同一組可遞送類型;標記在,代表 gateway 當時真的
+# 把這個檔案發進了 TG,對 app 就是一等附件。路徑允許含空白(錨定副檔名),
+# 引號/反引號包裹的變體照 hermes 同款收。
+_TG_MEDIA_EXTS = (
+    "png|jpe?g|gif|webp|bmp|tiff|svg|mp4|mov|avi|mkv|webm|mp3|wav|ogg|opus|"
+    "m4a|flac|pdf|docx?|odt|rtf|txt|md|epub|xlsx?|ods|csv|tsv|json|xml|"
+    "ya?ml|pptx?|odp|key|zip|tar|gz|tgz|bz2|xz|7z|rar|apk|ipa|html?")
+_TG_MEDIA_TAG = re.compile(
+    r'''[`"']?MEDIA:\s*'''
+    r'''(?P<path>`[^`\n]+`|"[^"\n]+"|'[^'\n]+'|'''
+    r'''~?/\S+(?:[^\S\n]+\S+)*?\.(?:''' + _TG_MEDIA_EXTS + r'''))'''
+    r'''(?=[\s`"',;:)\]}]|$)[`"']?''', re.IGNORECASE)
+# 跨 session send_message 的鏡射列(hermes tools/send_message_tool.py
+# `_describe_media_for_mirror`):純媒體訊息在 state.db 只留
+# `[Sent image attachment]` 這種佔位 —— 路徑不落任何欄位(mirror_to_session
+# 只寫文字),bridge 端無檔可引。能做的是把工程占位字翻成人話,別讓
+# 「[Sent image attachment]」直接出現在對話泡泡(#36 善彰實測的痛點)。
+_TG_SENT_MIRROR = re.compile(
+    r"^\[Sent (?:(?P<n>\d+) media attachments|"
+    r"(?P<kind>image|video|audio|document) attachment|voice message)\]$",
+    re.M)   # 行錨定:0.19 compaction 會把多則訊息併成一列,佔位變成行中段
+_TG_SENT_MIRROR_HUMAN = {
+    "image": "（已在 Telegram 傳送圖片附件）",
+    "video": "（已在 Telegram 傳送影片附件）",
+    "audio": "（已在 Telegram 傳送音訊附件）",
+    "document": "（已在 Telegram 傳送文件附件）",
+    None: "（已在 Telegram 傳送語音訊息）",
+}
 
 
 def _tg_extract_attachments(content: str):
@@ -5377,12 +5421,29 @@ def _tg_extract_attachments(content: str):
     the app fetches `path` through the existing GET /file endpoint, so no new
     media endpoint and no app-side decoding change is needed. Markers whose
     file has since been pruned from image_cache become a short human-readable
-    note — the raw path marker is engineering language the app must not show."""
+    note (帶檔名) — the raw path marker is engineering language the app must
+    not show. Covers both directions of the TG side:使用者傳入(image hint /
+    0.19 vision 描述塊 / document・audio・video saved-at 提示)與人格傳出
+    (assistant 列的 MEDIA:<path> 遞送標記);send_message 跨 session 鏡射的
+    [Sent … attachment] 佔位無路徑可引,翻成人話文字。"""
     attachments: list = []
 
-    def _repl(m):
-        path = m.group(1).strip()
-        if path and os.path.isfile(path):
+    def _tg_file_ok(path: str) -> bool:
+        """原檔在就直接用;被清掉(image_cache 週期修剪)但 media artifacts
+        已封存快照 → 引用仍有效:GET /file 對缺檔路徑會走 resolve_original
+        從封存供檔,app 端照常渲染。兩者皆無才退占位。"""
+        if not path:
+            return False
+        if os.path.isfile(path):
+            return True
+        try:
+            return _media_store().resolve_original(path) is not None
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _img_att(path: str) -> str:
+        """圖片路徑 → 附件(回空字串);檔案不在 → 人話占位帶檔名。"""
+        if _tg_file_ok(path):
             attachments.append({
                 "kind": "image",
                 "filename": os.path.basename(path),
@@ -5390,11 +5451,20 @@ def _tg_extract_attachments(content: str):
                 "path": path,
             })
             return ""
-        return "（附件圖片已失效）"
+        name = os.path.basename(path or "")
+        return f"（附件圖片『{name}』已失效）" if name else "（附件圖片已失效）"
+
+    def _repl(m):
+        return _img_att(m.group(1).strip())
+
+    def _repl_vision(m):
+        # 0.19 vision 描述塊:描述本身是給 agent 的,不是使用者說的話 —
+        # 拿掉整塊,只留圖(檔案不在則留人話占位,至少知道有張圖)。
+        return _img_att(m.group(1).strip())
 
     def _repl_replied(m):
         kind, name, path = m.group(1), m.group(2).strip(), m.group(3).strip()
-        if path and os.path.isfile(path):
+        if _tg_file_ok(path):
             att_kind = {"image": "image", "audio": "audio", "voice": "audio"}.get(kind, "file")
             attachments.append({
                 "kind": att_kind,
@@ -5407,7 +5477,7 @@ def _tg_extract_attachments(content: str):
 
     def _att_for(path: str, name: str, kind_hint: str) -> str:
         """共用落點:檔案在就掛附件(回空字串),不在就人話註記。"""
-        if path and os.path.isfile(path):
+        if _tg_file_ok(path):
             mime = mimetypes.guess_type(path)[0] or "application/octet-stream"
             kind = "audio" if kind_hint == "audio" else "file"
             attachments.append({"kind": kind,
@@ -5425,10 +5495,35 @@ def _tg_extract_attachments(content: str):
         hint = "audio" if what.startswith("an audio") else "file"
         return _att_for(path, name, hint)
 
+    def _repl_media_tag(m):
+        # MEDIA:<path> 遞送標記(assistant 回媒體)。引號/反引號包裹先剝掉,
+        # kind 依 mime 分派:image→image、audio→audio、其餘(含 video)→file
+        # (對齊 app Attachment.Kind;video 帶 video/* mime)。
+        path = m.group("path").strip()
+        if len(path) >= 2 and path[0] == path[-1] and path[0] in "`\"'":
+            path = path[1:-1].strip()
+        path = os.path.expanduser(path)
+        mime = mimetypes.guess_type(path)[0] or ""
+        if mime.startswith("image/"):
+            return _img_att(path)
+        return _att_for(path, os.path.basename(path),
+                        "audio" if mime.startswith("audio/") else "file")
+
     text = _TG_IMAGE_MARKER.sub(_repl, content or "")
+    text = _TG_VISION_IMAGE.sub(_repl_vision, text)
+    text = _TG_VISION_IMAGE_FAIL.sub(_repl_vision, text)
     text = _TG_REPLIED_MEDIA.sub(_repl_replied, text)
     text = _TG_TEXTDOC_NOTE.sub(_repl_textdoc, text)
     text = _TG_FILE_NOTE.sub(_repl_file, text)
+    text = _TG_MEDIA_TAG.sub(_repl_media_tag, text)
+
+    # send_message 鏡射佔位(無路徑可引)→ 人話。逐「行」錨定替換:
+    # 佔位獨佔一行才算(mirror 產物的真實形狀),行中引用原字串不誤傷。
+    def _repl_mirror(m):
+        n = m.group("n")
+        return (f"（已在 Telegram 傳送 {n} 件媒體附件）" if n
+                else _TG_SENT_MIRROR_HUMAN[m.group("kind")])
+    text = _TG_SENT_MIRROR.sub(_repl_mirror, text)
     if text != (content or ""):     # something was extracted or replaced
         # Collapse the blank lines the removed hint lines leave behind.
         text = re.sub(r"\n{3,}", "\n\n", text).strip()
