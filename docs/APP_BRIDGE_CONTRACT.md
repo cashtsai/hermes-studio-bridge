@@ -189,6 +189,42 @@ Rules:
   module silently disables itself (`push_notify` short-circuits with
   `disabled: true`) and logs a single `apns_disabled` event.
 
+### `POST /app/v1/diagnostics`
+
+Ingests app-side observability payloads: MetricKit crash/hang diagnostics,
+MetricKit metric aggregates, and user-filed "回報問題" reports. One JSON file
+per POST lands under the diagnostics directory next to the canonical DB
+(`~/.local/share/pocket-agent/diagnostics/` by default; `POCKET_DIAG_DIR`
+overrides). Nothing enters any database and there is no dashboard — the files
+are meant to be read directly by the morning-report patrol / Claude sessions.
+
+Request body (JSON object):
+
+- `kind` (required): one of `metrickit_diagnostic`, `metrickit_metric`,
+  `user_report`.
+- `app_version`, `build`, `device`, `os` (optional): free-form metadata,
+  truncated server-side (32/16/64/64 chars).
+- `note` (user_report): the user's free text, truncated to 4000 chars.
+- `summary` (optional): app-assembled context, e.g. recent ErrorLog lines and
+  whether MetricKit diagnostics exist. Stored verbatim.
+- `payload` (metrickit_*): the `jsonRepresentation()` of the MXDiagnosticPayload
+  / MXMetricPayload. Stored verbatim.
+
+Response: `{ok: true, stored: "<filename>.json"}`.
+
+Rules:
+
+- Bearer auth (master or per-device token), same as every app endpoint; 401
+  otherwise.
+- Per-request body cap 2 MB → 413 `PAYLOAD_TOO_LARGE`; malformed JSON or a
+  `kind` outside the whitelist → 400.
+- Directory is rotation-capped at 500 files (oldest deleted first) so a crash
+  loop cannot fill the disk.
+- Privacy: the payload is assembled app-side and must never contain
+  conversation content — stack traces, device/version metadata, and ErrorLog
+  summaries only. Automatic MetricKit uploads respect the app's
+  「診斷與使用資料」 toggle (default on); user reports are always explicit.
+
 ### Interactive approval push payload
 
 Approval pushes carry `aps.category = "POCKET_PENDING_PERMISSION"` (legacy
