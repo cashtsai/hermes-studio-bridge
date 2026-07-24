@@ -10896,6 +10896,74 @@ async def app_post_persona_report(request: Request):
     return {"ok": True, "id": rid}
 
 
+def _report_key_normalize(rid: str) -> str:
+    """App 側可見的報告識別形一律收:report_events.id / external_id 原形之外,
+    也收訊息形 `rep-<id>`(_report_msg_shape)與卡片形 `card-hp-rep-<id>`
+    (PersonaDigest.message_card 的 id 錨),去前綴後即原 id。"""
+    key = (rid or "").strip()
+    if key.startswith("card-hp-"):
+        key = key[len("card-hp-"):]
+    if key.startswith("rep-"):
+        key = key[len("rep-"):]
+    return key
+
+
+def _report_lookup(rid: str):
+    """單筆報告查找(唯讀):先按 id,再按 external_id(fed/persona-report
+    的外部識別)。找不到回 None。"""
+    import sqlite3
+    key = _report_key_normalize(rid)
+    if not key:
+        return None
+    try:
+        con = sqlite3.connect(f"file:{CANON_DB}?mode=ro", uri=True, timeout=5)
+        row = con.execute(
+            "SELECT id,session,label,name,content,ts,external_source,external_id "
+            "FROM report_events WHERE id=? OR external_id=? LIMIT 1",
+            (key, key)).fetchone()
+        con.close()
+    except Exception:  # noqa: BLE001
+        return None
+    if not row:
+        return None
+    return {"id": row[0], "session": row[1], "label": row[2] or "",
+            "name": row[3] or "", "content": row[4] or "", "ts": row[5],
+            "external_source": row[6] or "", "external_id": row[7] or ""}
+
+
+@app.get("/app/v1/reports")
+async def app_get_reports(session: str, request: Request, limit: int = 20):
+    """報告列表(唯讀,給日後的報告總覽用):某人格最新 limit 筆,newest-first。
+    只回 metadata + 200 字 preview,全文走單筆端點 —— 列表不揹整包長文。
+    不在這裡觸發 _sync_persona_reports:報告要進得了卡片流本來就得先同步
+    (messages/卡片 follower 都會做),這條保持零寫入。"""
+    _check_auth(request)
+    if session not in PERSONAS:
+        raise http_err(400, "SESSION_NOT_FOUND", "unknown persona session")
+    limit = max(1, min(int(limit or 20), 100))
+    rows = _report_events(session, limit, newest_first=True)
+    return {"reports": [{
+        "id": r["id"], "session": session, "label": r["label"] or "",
+        "name": r["name"] or "", "ts": r["ts"],
+        "external_source": r["external_source"] or "",
+        "external_id": r["external_id"] or "",
+        "preview": _clip_text(r["content"] or "", 200),
+        "chars": len(r["content"] or ""),
+    } for r in rows]}
+
+
+@app.get("/app/v1/reports/{report_id}")
+async def app_get_report(report_id: str, request: Request):
+    """單筆報告全文(唯讀)— Pocket 原生報告閱讀器的資料源。report_id 收
+    report_events.id / external_id / `rep-<id>` / `card-hp-rep-<id>` 四形
+    (app 從人格卡片流拿到的是卡片 id,直接原樣打過來即可)。"""
+    _check_auth(request)
+    r = _report_lookup(report_id)
+    if not r:
+        raise http_err(404, "REPORT_NOT_FOUND", "no such report")
+    return {"report": r}
+
+
 @app.get("/app/v1/messages")
 async def app_get_messages(session: str, request: Request, limit: int = 200):
     """Canonical history for a persona: app turns (bridge canonical store) merged
