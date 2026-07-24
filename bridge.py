@@ -7780,9 +7780,9 @@ async def cc_session_hook(request: Request):
 #    content-hash)>)→ hook 重送/重放同一事件 INSERT OR REPLACE 落同一列。
 # 2. state.db 掃出的同一則訊息由合併端 10 分鐘同文壓重擋掉(_tg_dup,
 #    雙 role — 見 _hp_merged_messages / GET /app/v1/messages)。
-# 3. user 內容先過 _tg_extract_attachments + _tg_clean_content —— 與
-#    _persona_history 的 state.db 讀取路徑同一套清洗,兩條路落出同一種
-#    文字,同文壓重才對得上。
+# 3. 內容先過 _tg_extract_attachments(雙 role;user 再過 _tg_clean_content)
+#    —— 與 _persona_history 的 state.db 讀取路徑同一套清洗,兩條路落出
+#    同一種文字+附件,同文壓重才對得上。
 @app.post("/internal/v1/mirror/telegram-event")
 async def tg_mirror_event(request: Request):
     host = _client_host(request)
@@ -7804,9 +7804,12 @@ async def tg_mirror_event(request: Request):
         return {"ok": True, "ignored": True, "reason": "session"}
     if role not in ("user", "assistant"):
         return {"ok": True, "ignored": True, "reason": "role"}
-    attachments: list = []
+    # 兩個 role 都先過媒體萃取(#36:assistant 的 MEDIA:<path> / [Sent …]
+    # 鏡射佔位也要還原/翻譯)—— 與 _persona_history 的 state.db 路徑同一套,
+    # 兩條路落出同一種文字+附件,合併端同文壓重才對得上(不然 canonical
+    # 留原字串、state.db 掃描出人話版,同一則變兩顆氣泡)。
+    content, attachments = _tg_extract_attachments(content)
     if role == "user":
-        content, attachments = _tg_extract_attachments(content)
         content = _tg_clean_content(content) or ""
     if not content.strip() and not attachments:
         # 整條都是 runtime 注入(剝完全空)或 gateway 送了空事件 → 不落地。
