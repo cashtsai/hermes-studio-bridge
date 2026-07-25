@@ -876,6 +876,12 @@ def _canon_init():
         external_source TEXT, external_id TEXT UNIQUE, ingested_at REAL NOT NULL)""")
     con.execute("CREATE INDEX IF NOT EXISTS idx_report_session_time ON report_events(session, ts)")
     con.execute("CREATE INDEX IF NOT EXISTS idx_report_external ON report_events(external_source, external_id)")
+    # feat/report-actions-api:報告可帶「快速行動」按鈕(actions JSON 陣列,
+    # 見 _report_actions_normalize)。舊列此欄 NULL = 無行動,讀取端當空陣列;
+    # ALTER 加欄不動舊資料(與上方 approvals 遷移同款保守作法)。
+    report_cols = {r[1] for r in con.execute("PRAGMA table_info(report_events)")}
+    if "actions" not in report_cols:
+        con.execute("ALTER TABLE report_events ADD COLUMN actions TEXT")
     # Sync engine P0 (docs/SYNC_ENGINE_REWRITE_PLAN_20260711.md §3):單一
     # append-only 事件日誌,id 即全域遞增 seq。P0/P1 只寫不讀(雙寫過渡,
     # 現有 canonical/state.db 讀取路徑不動),P2 起由 /app/v2/events 消費。
@@ -2485,6 +2491,48 @@ def _report_id(persona: str, name: str, sid: str, ts) -> str:
     return hashlib.sha1(raw.encode("utf-8", "replace")).hexdigest()[:24]
 
 
+REPORT_ACTIONS_MAX = 6          # 一份報告最多 6 顆行動鈕(閱讀器尾端一屏放得下)
+REPORT_ACTION_LABEL_MAX = 20    # 鈕面文字上限(字元)
+REPORT_ACTION_TEXT_MAX = 500    # 回傳指令文字上限(字元)
+
+
+def _report_actions_normalize(raw) -> list:
+    """persona-report 的 actions 收斂成正典形:list[{label,text,target_session}]。
+    - 上限 6 顆;label ≤20 字、text ≤500 字 — 超限**截斷不擋件**(發送端手滑
+      不至於整包被拒)。
+    - target_session 選填:`claude_code:<ccsess名>` 或人格 id;空字串 = 由
+      app 端預設回報告所屬人格。
+    - 非 list / 元素非 dict / 截斷後 label 或 text 為空 → 該顆略過,不擋整包。
+    """
+    out = []
+    if not isinstance(raw, list):
+        return out
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        label = str(item.get("label") or "").strip()[:REPORT_ACTION_LABEL_MAX]
+        text = str(item.get("text") or "").strip()[:REPORT_ACTION_TEXT_MAX]
+        if not label or not text:
+            continue
+        out.append({"label": label, "text": text,
+                    "target_session": str(item.get("target_session") or "").strip()})
+        if len(out) >= REPORT_ACTIONS_MAX:
+            break
+    return out
+
+
+def _report_actions_loads(raw) -> list:
+    """report_events.actions 欄(JSON 文字或 NULL)→ list。舊列 NULL /壞 JSON
+    /非 list 一律回空陣列 — 讀取端永遠拿得到可迭代的 actions。"""
+    if not raw:
+        return []
+    try:
+        val = json.loads(raw)
+    except Exception:  # noqa: BLE001
+        return []
+    return val if isinstance(val, list) else []
+
+
 def _report_upsert(session: str, report: dict) -> str:
     import sqlite3
     rid = report.get("id") or _report_id(session, report.get("name") or "",
@@ -2495,19 +2543,25 @@ def _report_upsert(session: str, report: dict) -> str:
     ts = float(report.get("ts") or time.time())
     label = report.get("label") or ""
     name = report.get("name") or ""
+    # actions 是 payload 的一部分:呼叫端每次 upsert 帶完整清單(更新即整組
+    # 替換);cron 同步線從不帶 → 寫 NULL,而 cron 報告本來就沒有行動,無損。
+    actions = _report_actions_normalize(report.get("actions"))
+    actions_json = json.dumps(actions, ensure_ascii=False) if actions else None
     con = sqlite3.connect(CANON_DB, timeout=30)
     existing = con.execute(
-        "SELECT label,name,content,ts,external_id FROM report_events WHERE id=?",
-        (rid,)).fetchone()
-    if existing and existing == (label, name, content, ts, external_id):
+        "SELECT label,name,content,ts,external_id,actions "
+        "FROM report_events WHERE id=?", (rid,)).fetchone()
+    if existing and existing == (label, name, content, ts, external_id,
+                                 actions_json):
         con.close()
         return ""
     con.execute(
         "INSERT OR REPLACE INTO report_events"
-        "(id,session,label,name,content,ts,external_source,external_id,ingested_at) "
-        "VALUES(?,?,?,?,?,?,?,?,?)",
+        "(id,session,label,name,content,ts,external_source,external_id,"
+        "ingested_at,actions) VALUES(?,?,?,?,?,?,?,?,?,?)",
         (rid, session, label, name, content, ts,
-         report.get("external_source") or "hermes-cron", external_id, time.time()))
+         report.get("external_source") or "hermes-cron", external_id,
+         time.time(), actions_json))
     con.commit()
     con.close()
     # Sync engine P1:cron 晨報寫入點鏡射進 event_log(雙寫過渡)。形狀走
@@ -11063,6 +11117,10 @@ async def app_post_persona_report(request: Request):
         "external_source": str(body.get("external_source") or "fed"),
         "external_id": str(body.get("external_id") or "")
                        or _report_id(session, "fed-today", "", ts),
+        # feat/report-actions-api:選填快速行動鈕(≤6 顆,label ≤20/text ≤500
+        # 超限截斷;target_session = claude_code:<名> 或人格 id,空 = 報告所
+        # 屬人格)。閱讀器尾端渲染成按鈕,點了把 text 送回 target session。
+        "actions": _report_actions_normalize(body.get("actions")),
     }
     rid = _report_upsert(session, report)
     return {"ok": True, "id": rid}
@@ -11090,8 +11148,8 @@ def _report_lookup(rid: str):
     try:
         con = sqlite3.connect(f"file:{CANON_DB}?mode=ro", uri=True, timeout=5)
         row = con.execute(
-            "SELECT id,session,label,name,content,ts,external_source,external_id "
-            "FROM report_events WHERE id=? OR external_id=? LIMIT 1",
+            "SELECT id,session,label,name,content,ts,external_source,external_id,"
+            "actions FROM report_events WHERE id=? OR external_id=? LIMIT 1",
             (key, key)).fetchone()
         con.close()
     except Exception:  # noqa: BLE001
@@ -11100,7 +11158,9 @@ def _report_lookup(rid: str):
         return None
     return {"id": row[0], "session": row[1], "label": row[2] or "",
             "name": row[3] or "", "content": row[4] or "", "ts": row[5],
-            "external_source": row[6] or "", "external_id": row[7] or ""}
+            "external_source": row[6] or "", "external_id": row[7] or "",
+            # 舊列 NULL → [](app 端「無 actions 區塊不出現」的約定)。
+            "actions": _report_actions_loads(row[8])}
 
 
 @app.get("/app/v1/reports")

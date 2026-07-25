@@ -446,6 +446,35 @@ Records approve/reject decisions. PocketAgent must not call this in smoke tests.
 
 Returns scheduled reports for app reading surfaces.
 
+### 報告快速行動(feat/report-actions-api)
+
+報告可帶「行動」:閱讀器(`ReportReaderView`)尾端渲染成按鈕,點擊把
+`text` 原樣送回 `target_session` — 執行口**不新開**,app 直接走既有
+`POST /app/v2/sessions/{id}/input` 統一路由。
+
+- `POST /app/v1/persona-report` 增收選填 `actions`:
+
+  ```json
+  {"session": "yuanfang", "label": "晨報", "content": "…",
+   "actions": [
+     {"label": "叫水鏡再算一卦", "text": "再起一卦,問今天的財運",
+      "target_session": ""},
+     {"label": "交辦 CC 修 bug", "text": "去修晨報提到的那個 bug",
+      "target_session": "claude_code:dev-main"}
+   ]}
+  ```
+
+  規範:**≤6 顆**;`label` ≤20 字、`text` ≤500 字(超限**截斷不擋件**);
+  `target_session` 選填 — `claude_code:<ccsess名>` 或人格 id(如
+  `yuanfang`),**空字串 = 報告所屬人格**。缺 `label`/`text` 的元素略過。
+  更新語意:同一報告(同 `external_id`)重發時 actions **整組替換**,
+  不帶就清空。
+- `GET /app/v1/reports/{id}` 回應的 `report` 帶 `actions`(正典形,同上
+  三鍵)。舊列/無行動 → `[]`;舊 bridge 沒這欄 → app 端當空。
+- `GET /app/v1/reports`(列表)**不揹** actions — 行動與全文都走單筆端點。
+- App 端 target 映射:`claude_code:*` 原樣、裸人格 id 補 `hermes:` 前綴、
+  空字串退回 `hermes:<報告所屬 session>`,再打 v2 統一 input。
+
 ### `GET /cron/jobs` and `POST /cron/jobs/{id}/{action}`
 
 Exposes notification-producing jobs. Use this carefully because it affects both
