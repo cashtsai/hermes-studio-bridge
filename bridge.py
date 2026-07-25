@@ -391,9 +391,12 @@ def _personas_db_rows() -> list:
     import sqlite3
     try:
         con = sqlite3.connect(f"file:{CANON_DB}?mode=ro", uri=True, timeout=5)
-        rows = con.execute("SELECT id,name,home,enabled,deleted FROM personas").fetchall()
-        con.close()
-        return rows
+        try:
+            rows = con.execute("SELECT id,name,home,enabled,deleted FROM personas").fetchall()
+            con.close()
+            return rows
+        finally:
+            con.close()
     except Exception:  # noqa: BLE001
         return []      # table not created yet (first boot) → builtins only
 
@@ -799,158 +802,161 @@ def _canon_init():
     import sqlite3
     os.makedirs(os.path.dirname(CANON_DB), exist_ok=True)
     con = sqlite3.connect(CANON_DB, timeout=30)
-    # WAL: concurrent handlers no longer serialize writers against readers;
-    # busy_timeout waits out short lock contention instead of erroring.
-    con.execute("PRAGMA journal_mode=WAL")
-    con.execute("PRAGMA busy_timeout=30000")
-    con.execute("""CREATE TABLE IF NOT EXISTS messages(
-        id TEXT PRIMARY KEY, session TEXT NOT NULL, role TEXT NOT NULL,
-        content TEXT, attachments TEXT, created_at REAL NOT NULL, status TEXT)""")
-    con.execute("CREATE INDEX IF NOT EXISTS idx_msg_session_time ON messages(session, created_at)")
-    # client_id: stable per-logical-send id so a retry after a dropped network
-    # connection replays the recorded reply instead of re-running the turn.
-    cols = [r[1] for r in con.execute("PRAGMA table_info(messages)").fetchall()]
-    if "client_id" not in cols:
-        con.execute("ALTER TABLE messages ADD COLUMN client_id TEXT")
-    con.execute("CREATE INDEX IF NOT EXISTS idx_msg_client ON messages(session, client_id)")
-    # Reaction overlay (G2, pocketagent#39): keyed by the message id the app
-    # sees in GET /app/v1/messages — canonical mids AND tg-<ts> ids alike — so
-    # one table syncs reactions on both app-sent and Telegram-side messages.
-    con.execute("""CREATE TABLE IF NOT EXISTS reactions(
-        msg_id TEXT PRIMARY KEY, session TEXT, reaction TEXT, updated_at REAL)""")
-    # Canonical reactions/pins (G2, pocketagent#39 final contract): multi-emoji
-    # reactions (JSON list) + per-message pin, keyed by the id the app sees in
-    # GET /app/v1/messages. Supersedes the single-`reaction` overlay above,
-    # which is kept for backward compatibility with older app builds.
-    con.execute("""CREATE TABLE IF NOT EXISTS message_meta(
-        message_id TEXT PRIMARY KEY, reactions TEXT, pinned INTEGER,
-        updated_at REAL)""")
-    # G4 tombstone (wave 2): deleted messages stay in the list, flagged. The
-    # table may pre-date this column, so ALTER idempotently.
-    meta_cols = [r[1] for r in con.execute("PRAGMA table_info(message_meta)").fetchall()]
-    if "deleted" not in meta_cols:
-        con.execute("ALTER TABLE message_meta ADD COLUMN deleted INTEGER")
-    # G2/#39 canonical 化收尾:pin 要能按 session 讀回(PUT/GET
-    # /app/v1/sessions/{id}/pin),overlay 列補 session 歸屬。回填只認
-    # canonical messages 表 — tg-<ts>/報告 id 不在其中,維持 NULL,查詢端
-    # 以「messages join」補洞(見 _session_pinned_ids)。冪等:WHERE IS NULL。
-    if "session" not in meta_cols:
-        con.execute("ALTER TABLE message_meta ADD COLUMN session TEXT")
-    con.execute("UPDATE message_meta SET session="
-                "(SELECT m.session FROM messages m WHERE m.id=message_meta.message_id)"
-                " WHERE session IS NULL")
-    # G6 (wave 2): persona registry — overlays/extends the code builtins so
-    # personas can be added / renamed / disabled without editing bridge.py.
-    con.execute("""CREATE TABLE IF NOT EXISTS personas(
-        id TEXT PRIMARY KEY, name TEXT, home TEXT,
-        enabled INTEGER NOT NULL DEFAULT 1, deleted INTEGER NOT NULL DEFAULT 0,
-        created_at REAL, updated_at REAL)""")
-    con.execute("""CREATE TABLE IF NOT EXISTS approvals(
-        id TEXT PRIMARY KEY, title TEXT, source TEXT, risk TEXT, detail TEXT,
-        created_at REAL, expires_at REAL, status TEXT, decided_at REAL, result TEXT)""")
-    # B4 (issue #9): decision push-back — the creating skill can register a
-    # callback URL that gets POSTed when the approval is decided/expired,
-    # instead of having to poll GET /app/v1/approvals/{id}.
-    approval_cols = [r[1] for r in con.execute("PRAGMA table_info(approvals)").fetchall()]
-    if "callback" not in approval_cols:
-        con.execute("ALTER TABLE approvals ADD COLUMN callback TEXT")
-    # A1 (Approval Hub 遷移切片): 統一 approval 物件 — 新欄位 + 回填。
-    # session_id/provider/kind/options 與 source 並存(source 相容期保留原樣);
-    # options 存建立方宣告的鍵(JSON 文字)。回填帶 IS NULL 守門,冪等。
-    # hermes 舊列的 source 是自由字串 → session_id 不硬造(拍板:留 NULL)。
-    for _col in ("session_id", "provider", "kind", "options"):
-        if _col not in approval_cols:
-            con.execute(f"ALTER TABLE approvals ADD COLUMN {_col} TEXT")
-    con.execute("UPDATE approvals SET provider=CASE"
-                " WHEN source LIKE 'claude_code:%' THEN 'claude_code'"
-                " WHEN source LIKE 'codex%' THEN 'codex'"
-                " ELSE 'hermes' END WHERE provider IS NULL")
-    con.execute("UPDATE approvals SET session_id=source WHERE session_id IS NULL"
-                " AND (source LIKE 'claude_code:%' OR source LIKE 'codex:%')")
-    con.execute("UPDATE approvals SET kind='permission' WHERE kind IS NULL")
-    con.execute("""CREATE TABLE IF NOT EXISTS devices(
-        token TEXT PRIMARY KEY, platform TEXT, created_at REAL)""")
-    con.execute("""CREATE TABLE IF NOT EXISTS report_events(
-        id TEXT PRIMARY KEY, session TEXT NOT NULL, label TEXT, name TEXT,
-        content TEXT NOT NULL, ts REAL NOT NULL,
-        external_source TEXT, external_id TEXT UNIQUE, ingested_at REAL NOT NULL)""")
-    con.execute("CREATE INDEX IF NOT EXISTS idx_report_session_time ON report_events(session, ts)")
-    con.execute("CREATE INDEX IF NOT EXISTS idx_report_external ON report_events(external_source, external_id)")
-    # feat/report-actions-api:報告可帶「快速行動」按鈕(actions JSON 陣列,
-    # 見 _report_actions_normalize)。舊列此欄 NULL = 無行動,讀取端當空陣列;
-    # ALTER 加欄不動舊資料(與上方 approvals 遷移同款保守作法)。
-    report_cols = {r[1] for r in con.execute("PRAGMA table_info(report_events)")}
-    if "actions" not in report_cols:
-        con.execute("ALTER TABLE report_events ADD COLUMN actions TEXT")
-    # Sync engine P0 (docs/SYNC_ENGINE_REWRITE_PLAN_20260711.md §3):單一
-    # append-only 事件日誌,id 即全域遞增 seq。P0/P1 只寫不讀(雙寫過渡,
-    # 現有 canonical/state.db 讀取路徑不動),P2 起由 /app/v2/events 消費。
-    # external_id 供來源鏡射去重(TG/cron 是重複掃描式接入,必須冪等)。
-    con.execute("""CREATE TABLE IF NOT EXISTS event_log(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        session TEXT NOT NULL,
-        type TEXT NOT NULL,
-        external_id TEXT UNIQUE,
-        payload TEXT NOT NULL,
-        created_at REAL NOT NULL)""")
-    con.execute("CREATE INDEX IF NOT EXISTS idx_event_session_seq ON event_log(session, id)")
-    # Sync engine P2:已讀游標的伺服器真相(取代 App 端 UserDefaults 計數
-    # 器的長期方向)。一列 = 一個(session, device)的已讀位置 — 按裝置分列
-    # 存,是為了「任一裝置讀過即全讀」(MAX over devices)與「每裝置各自
-    # 記」兩種語意都能從同一份資料推導;多裝置語意由善彰拍板後在 App 端
-    # (P3)選聚合方式,schema 不用改。
-    con.execute("""CREATE TABLE IF NOT EXISTS read_cursors(
-        session TEXT NOT NULL,
-        device_id TEXT NOT NULL,
-        last_read_seq INTEGER NOT NULL DEFAULT 0,
-        last_read_ts REAL NOT NULL DEFAULT 0,
-        message_id TEXT,
-        updated_at REAL NOT NULL,
-        PRIMARY KEY(session, device_id))""")
-    con.execute("""CREATE TABLE IF NOT EXISTS delegations(
-        id TEXT PRIMARY KEY,
-        work_order TEXT UNIQUE,
-        parent_persona TEXT NOT NULL,
-        parent_session TEXT,
-        created_via TEXT,
-        provider TEXT NOT NULL,
-        title TEXT,
-        objective TEXT,
-        cwd TEXT,
-        status TEXT,
-        provider_session_id TEXT,
-        codex_thread_id TEXT,
-        cc_session_name TEXT,
-        created_at REAL,
-        updated_at REAL,
-        last_error TEXT,
-        meta TEXT,
-        task_code TEXT,
-        subtask_code TEXT)""")
-    delegation_cols = [r[1] for r in con.execute("PRAGMA table_info(delegations)").fetchall()]
-    for name, ddl in {
-        "provider_session_id": "ALTER TABLE delegations ADD COLUMN provider_session_id TEXT",
-        "codex_thread_id": "ALTER TABLE delegations ADD COLUMN codex_thread_id TEXT",
-        "cc_session_name": "ALTER TABLE delegations ADD COLUMN cc_session_name TEXT",
-        "last_error": "ALTER TABLE delegations ADD COLUMN last_error TEXT",
-        "meta": "ALTER TABLE delegations ADD COLUMN meta TEXT",
-        "task_code": "ALTER TABLE delegations ADD COLUMN task_code TEXT",
-        "subtask_code": "ALTER TABLE delegations ADD COLUMN subtask_code TEXT",
-    }.items():
-        if name not in delegation_cols:
-            con.execute(ddl)
-    con.execute("CREATE INDEX IF NOT EXISTS idx_delegation_parent ON delegations(parent_persona, updated_at)")
-    con.execute("CREATE INDEX IF NOT EXISTS idx_delegation_provider ON delegations(provider, provider_session_id)")
-    con.execute("CREATE INDEX IF NOT EXISTS idx_delegation_task ON delegations(task_code, subtask_code)")
-    # SUBSESSIONS persistence (issue #5, plan A): /dispatch sub-sessions used to
-    # live only in the in-memory dict, so a bridge restart wiped them all —
-    # transcript, resume target (cc_session) and isolate cwd included.
-    con.execute("""CREATE TABLE IF NOT EXISTS subsessions(
-        sid TEXT PRIMARY KEY, name TEXT, parent TEXT, tool TEXT, status TEXT,
-        cwd TEXT, worktree TEXT, cc_session TEXT, last_user TEXT,
-        last_at REAL, output_json TEXT)""")
-    con.commit()
-    con.close()
+    try:
+        # WAL: concurrent handlers no longer serialize writers against readers;
+        # busy_timeout waits out short lock contention instead of erroring.
+        con.execute("PRAGMA journal_mode=WAL")
+        con.execute("PRAGMA busy_timeout=30000")
+        con.execute("""CREATE TABLE IF NOT EXISTS messages(
+            id TEXT PRIMARY KEY, session TEXT NOT NULL, role TEXT NOT NULL,
+            content TEXT, attachments TEXT, created_at REAL NOT NULL, status TEXT)""")
+        con.execute("CREATE INDEX IF NOT EXISTS idx_msg_session_time ON messages(session, created_at)")
+        # client_id: stable per-logical-send id so a retry after a dropped network
+        # connection replays the recorded reply instead of re-running the turn.
+        cols = [r[1] for r in con.execute("PRAGMA table_info(messages)").fetchall()]
+        if "client_id" not in cols:
+            con.execute("ALTER TABLE messages ADD COLUMN client_id TEXT")
+        con.execute("CREATE INDEX IF NOT EXISTS idx_msg_client ON messages(session, client_id)")
+        # Reaction overlay (G2, pocketagent#39): keyed by the message id the app
+        # sees in GET /app/v1/messages — canonical mids AND tg-<ts> ids alike — so
+        # one table syncs reactions on both app-sent and Telegram-side messages.
+        con.execute("""CREATE TABLE IF NOT EXISTS reactions(
+            msg_id TEXT PRIMARY KEY, session TEXT, reaction TEXT, updated_at REAL)""")
+        # Canonical reactions/pins (G2, pocketagent#39 final contract): multi-emoji
+        # reactions (JSON list) + per-message pin, keyed by the id the app sees in
+        # GET /app/v1/messages. Supersedes the single-`reaction` overlay above,
+        # which is kept for backward compatibility with older app builds.
+        con.execute("""CREATE TABLE IF NOT EXISTS message_meta(
+            message_id TEXT PRIMARY KEY, reactions TEXT, pinned INTEGER,
+            updated_at REAL)""")
+        # G4 tombstone (wave 2): deleted messages stay in the list, flagged. The
+        # table may pre-date this column, so ALTER idempotently.
+        meta_cols = [r[1] for r in con.execute("PRAGMA table_info(message_meta)").fetchall()]
+        if "deleted" not in meta_cols:
+            con.execute("ALTER TABLE message_meta ADD COLUMN deleted INTEGER")
+        # G2/#39 canonical 化收尾:pin 要能按 session 讀回(PUT/GET
+        # /app/v1/sessions/{id}/pin),overlay 列補 session 歸屬。回填只認
+        # canonical messages 表 — tg-<ts>/報告 id 不在其中,維持 NULL,查詢端
+        # 以「messages join」補洞(見 _session_pinned_ids)。冪等:WHERE IS NULL。
+        if "session" not in meta_cols:
+            con.execute("ALTER TABLE message_meta ADD COLUMN session TEXT")
+        con.execute("UPDATE message_meta SET session="
+                    "(SELECT m.session FROM messages m WHERE m.id=message_meta.message_id)"
+                    " WHERE session IS NULL")
+        # G6 (wave 2): persona registry — overlays/extends the code builtins so
+        # personas can be added / renamed / disabled without editing bridge.py.
+        con.execute("""CREATE TABLE IF NOT EXISTS personas(
+            id TEXT PRIMARY KEY, name TEXT, home TEXT,
+            enabled INTEGER NOT NULL DEFAULT 1, deleted INTEGER NOT NULL DEFAULT 0,
+            created_at REAL, updated_at REAL)""")
+        con.execute("""CREATE TABLE IF NOT EXISTS approvals(
+            id TEXT PRIMARY KEY, title TEXT, source TEXT, risk TEXT, detail TEXT,
+            created_at REAL, expires_at REAL, status TEXT, decided_at REAL, result TEXT)""")
+        # B4 (issue #9): decision push-back — the creating skill can register a
+        # callback URL that gets POSTed when the approval is decided/expired,
+        # instead of having to poll GET /app/v1/approvals/{id}.
+        approval_cols = [r[1] for r in con.execute("PRAGMA table_info(approvals)").fetchall()]
+        if "callback" not in approval_cols:
+            con.execute("ALTER TABLE approvals ADD COLUMN callback TEXT")
+        # A1 (Approval Hub 遷移切片): 統一 approval 物件 — 新欄位 + 回填。
+        # session_id/provider/kind/options 與 source 並存(source 相容期保留原樣);
+        # options 存建立方宣告的鍵(JSON 文字)。回填帶 IS NULL 守門,冪等。
+        # hermes 舊列的 source 是自由字串 → session_id 不硬造(拍板:留 NULL)。
+        for _col in ("session_id", "provider", "kind", "options"):
+            if _col not in approval_cols:
+                con.execute(f"ALTER TABLE approvals ADD COLUMN {_col} TEXT")
+        con.execute("UPDATE approvals SET provider=CASE"
+                    " WHEN source LIKE 'claude_code:%' THEN 'claude_code'"
+                    " WHEN source LIKE 'codex%' THEN 'codex'"
+                    " ELSE 'hermes' END WHERE provider IS NULL")
+        con.execute("UPDATE approvals SET session_id=source WHERE session_id IS NULL"
+                    " AND (source LIKE 'claude_code:%' OR source LIKE 'codex:%')")
+        con.execute("UPDATE approvals SET kind='permission' WHERE kind IS NULL")
+        con.execute("""CREATE TABLE IF NOT EXISTS devices(
+            token TEXT PRIMARY KEY, platform TEXT, created_at REAL)""")
+        con.execute("""CREATE TABLE IF NOT EXISTS report_events(
+            id TEXT PRIMARY KEY, session TEXT NOT NULL, label TEXT, name TEXT,
+            content TEXT NOT NULL, ts REAL NOT NULL,
+            external_source TEXT, external_id TEXT UNIQUE, ingested_at REAL NOT NULL)""")
+        con.execute("CREATE INDEX IF NOT EXISTS idx_report_session_time ON report_events(session, ts)")
+        con.execute("CREATE INDEX IF NOT EXISTS idx_report_external ON report_events(external_source, external_id)")
+        # feat/report-actions-api:報告可帶「快速行動」按鈕(actions JSON 陣列,
+        # 見 _report_actions_normalize)。舊列此欄 NULL = 無行動,讀取端當空陣列;
+        # ALTER 加欄不動舊資料(與上方 approvals 遷移同款保守作法)。
+        report_cols = {r[1] for r in con.execute("PRAGMA table_info(report_events)")}
+        if "actions" not in report_cols:
+            con.execute("ALTER TABLE report_events ADD COLUMN actions TEXT")
+        # Sync engine P0 (docs/SYNC_ENGINE_REWRITE_PLAN_20260711.md §3):單一
+        # append-only 事件日誌,id 即全域遞增 seq。P0/P1 只寫不讀(雙寫過渡,
+        # 現有 canonical/state.db 讀取路徑不動),P2 起由 /app/v2/events 消費。
+        # external_id 供來源鏡射去重(TG/cron 是重複掃描式接入,必須冪等)。
+        con.execute("""CREATE TABLE IF NOT EXISTS event_log(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session TEXT NOT NULL,
+            type TEXT NOT NULL,
+            external_id TEXT UNIQUE,
+            payload TEXT NOT NULL,
+            created_at REAL NOT NULL)""")
+        con.execute("CREATE INDEX IF NOT EXISTS idx_event_session_seq ON event_log(session, id)")
+        # Sync engine P2:已讀游標的伺服器真相(取代 App 端 UserDefaults 計數
+        # 器的長期方向)。一列 = 一個(session, device)的已讀位置 — 按裝置分列
+        # 存,是為了「任一裝置讀過即全讀」(MAX over devices)與「每裝置各自
+        # 記」兩種語意都能從同一份資料推導;多裝置語意由善彰拍板後在 App 端
+        # (P3)選聚合方式,schema 不用改。
+        con.execute("""CREATE TABLE IF NOT EXISTS read_cursors(
+            session TEXT NOT NULL,
+            device_id TEXT NOT NULL,
+            last_read_seq INTEGER NOT NULL DEFAULT 0,
+            last_read_ts REAL NOT NULL DEFAULT 0,
+            message_id TEXT,
+            updated_at REAL NOT NULL,
+            PRIMARY KEY(session, device_id))""")
+        con.execute("""CREATE TABLE IF NOT EXISTS delegations(
+            id TEXT PRIMARY KEY,
+            work_order TEXT UNIQUE,
+            parent_persona TEXT NOT NULL,
+            parent_session TEXT,
+            created_via TEXT,
+            provider TEXT NOT NULL,
+            title TEXT,
+            objective TEXT,
+            cwd TEXT,
+            status TEXT,
+            provider_session_id TEXT,
+            codex_thread_id TEXT,
+            cc_session_name TEXT,
+            created_at REAL,
+            updated_at REAL,
+            last_error TEXT,
+            meta TEXT,
+            task_code TEXT,
+            subtask_code TEXT)""")
+        delegation_cols = [r[1] for r in con.execute("PRAGMA table_info(delegations)").fetchall()]
+        for name, ddl in {
+            "provider_session_id": "ALTER TABLE delegations ADD COLUMN provider_session_id TEXT",
+            "codex_thread_id": "ALTER TABLE delegations ADD COLUMN codex_thread_id TEXT",
+            "cc_session_name": "ALTER TABLE delegations ADD COLUMN cc_session_name TEXT",
+            "last_error": "ALTER TABLE delegations ADD COLUMN last_error TEXT",
+            "meta": "ALTER TABLE delegations ADD COLUMN meta TEXT",
+            "task_code": "ALTER TABLE delegations ADD COLUMN task_code TEXT",
+            "subtask_code": "ALTER TABLE delegations ADD COLUMN subtask_code TEXT",
+        }.items():
+            if name not in delegation_cols:
+                con.execute(ddl)
+        con.execute("CREATE INDEX IF NOT EXISTS idx_delegation_parent ON delegations(parent_persona, updated_at)")
+        con.execute("CREATE INDEX IF NOT EXISTS idx_delegation_provider ON delegations(provider, provider_session_id)")
+        con.execute("CREATE INDEX IF NOT EXISTS idx_delegation_task ON delegations(task_code, subtask_code)")
+        # SUBSESSIONS persistence (issue #5, plan A): /dispatch sub-sessions used to
+        # live only in the in-memory dict, so a bridge restart wiped them all —
+        # transcript, resume target (cc_session) and isolate cwd included.
+        con.execute("""CREATE TABLE IF NOT EXISTS subsessions(
+            sid TEXT PRIMARY KEY, name TEXT, parent TEXT, tool TEXT, status TEXT,
+            cwd TEXT, worktree TEXT, cc_session TEXT, last_user TEXT,
+            last_at REAL, output_json TEXT)""")
+        con.commit()
+        con.close()
+    finally:
+        con.close()
 
 
 ACCOUNT_USER_COLUMNS = ("apple_user_id", "email", "display_name", "created_at", "last_seen_at")
@@ -964,32 +970,35 @@ def _accounts_init():
     import sqlite3
     os.makedirs(os.path.dirname(ACCOUNTS_DB), exist_ok=True)
     con = sqlite3.connect(ACCOUNTS_DB, timeout=30)
-    # Same WAL rationale as canonical.db (issue #7): auth reads happen on every
-    # request, so writers (pair/claim, last_seen) must not lock readers out.
-    con.execute("PRAGMA journal_mode=WAL")
-    con.execute("PRAGMA busy_timeout=30000")
-    con.execute("PRAGMA foreign_keys=ON")
-    con.execute("""CREATE TABLE IF NOT EXISTS users(
-        apple_user_id TEXT PRIMARY KEY,
-        email TEXT,
-        display_name TEXT,
-        created_at REAL NOT NULL,
-        last_seen_at REAL NOT NULL)""")
-    con.execute("""CREATE TABLE IF NOT EXISTS devices(
-        device_id TEXT PRIMARY KEY,
-        apple_user_id TEXT NOT NULL,
-        device_token TEXT NOT NULL UNIQUE,
-        platform TEXT,
-        label TEXT,
-        paired_at REAL NOT NULL,
-        last_seen_at REAL,
-        revoked INTEGER DEFAULT 0,
-        FOREIGN KEY(apple_user_id) REFERENCES users(apple_user_id)
-            ON UPDATE CASCADE ON DELETE CASCADE)""")
-    con.execute("CREATE INDEX IF NOT EXISTS idx_account_devices_user ON devices(apple_user_id, revoked)")
-    con.execute("CREATE INDEX IF NOT EXISTS idx_account_devices_token ON devices(device_token)")
-    con.commit()
-    con.close()
+    try:
+        # Same WAL rationale as canonical.db (issue #7): auth reads happen on every
+        # request, so writers (pair/claim, last_seen) must not lock readers out.
+        con.execute("PRAGMA journal_mode=WAL")
+        con.execute("PRAGMA busy_timeout=30000")
+        con.execute("PRAGMA foreign_keys=ON")
+        con.execute("""CREATE TABLE IF NOT EXISTS users(
+            apple_user_id TEXT PRIMARY KEY,
+            email TEXT,
+            display_name TEXT,
+            created_at REAL NOT NULL,
+            last_seen_at REAL NOT NULL)""")
+        con.execute("""CREATE TABLE IF NOT EXISTS devices(
+            device_id TEXT PRIMARY KEY,
+            apple_user_id TEXT NOT NULL,
+            device_token TEXT NOT NULL UNIQUE,
+            platform TEXT,
+            label TEXT,
+            paired_at REAL NOT NULL,
+            last_seen_at REAL,
+            revoked INTEGER DEFAULT 0,
+            FOREIGN KEY(apple_user_id) REFERENCES users(apple_user_id)
+                ON UPDATE CASCADE ON DELETE CASCADE)""")
+        con.execute("CREATE INDEX IF NOT EXISTS idx_account_devices_user ON devices(apple_user_id, revoked)")
+        con.execute("CREATE INDEX IF NOT EXISTS idx_account_devices_token ON devices(device_token)")
+        con.commit()
+        con.close()
+    finally:
+        con.close()
 
 
 def _account_user_row(row):
@@ -1033,20 +1042,23 @@ def _account_upsert_user(apple_user_id: str, email: str | None = None,
     import sqlite3
     now = time.time()
     con = sqlite3.connect(ACCOUNTS_DB, timeout=30)
-    con.execute(
-        """INSERT INTO users(apple_user_id,email,display_name,created_at,last_seen_at)
-           VALUES(?,?,?,?,?)
-           ON CONFLICT(apple_user_id) DO UPDATE SET
-             email=COALESCE(excluded.email, users.email),
-             display_name=COALESCE(excluded.display_name, users.display_name),
-             last_seen_at=excluded.last_seen_at""",
-        (apple_user_id, email or None, display_name or None, now, now))
-    row = con.execute(
-        f"SELECT {','.join(ACCOUNT_USER_COLUMNS)} FROM users WHERE apple_user_id=?",
-        (apple_user_id,)).fetchone()
-    con.commit()
-    con.close()
-    return _account_user_row(row)
+    try:
+        con.execute(
+            """INSERT INTO users(apple_user_id,email,display_name,created_at,last_seen_at)
+               VALUES(?,?,?,?,?)
+               ON CONFLICT(apple_user_id) DO UPDATE SET
+                 email=COALESCE(excluded.email, users.email),
+                 display_name=COALESCE(excluded.display_name, users.display_name),
+                 last_seen_at=excluded.last_seen_at""",
+            (apple_user_id, email or None, display_name or None, now, now))
+        row = con.execute(
+            f"SELECT {','.join(ACCOUNT_USER_COLUMNS)} FROM users WHERE apple_user_id=?",
+            (apple_user_id,)).fetchone()
+        con.commit()
+        con.close()
+        return _account_user_row(row)
+    finally:
+        con.close()
 
 
 def _account_get_user(apple_user_id: str, touch: bool = False):
@@ -1054,32 +1066,38 @@ def _account_get_user(apple_user_id: str, touch: bool = False):
     if not apple_user_id:
         return None
     con = sqlite3.connect(ACCOUNTS_DB, timeout=30)
-    if touch:
-        con.execute("UPDATE users SET last_seen_at=? WHERE apple_user_id=?",
-                    (time.time(), apple_user_id))
-        con.commit()
-    row = con.execute(
-        f"SELECT {','.join(ACCOUNT_USER_COLUMNS)} FROM users WHERE apple_user_id=?",
-        (apple_user_id,)).fetchone()
-    con.close()
-    return _account_user_row(row)
+    try:
+        if touch:
+            con.execute("UPDATE users SET last_seen_at=? WHERE apple_user_id=?",
+                        (time.time(), apple_user_id))
+            con.commit()
+        row = con.execute(
+            f"SELECT {','.join(ACCOUNT_USER_COLUMNS)} FROM users WHERE apple_user_id=?",
+            (apple_user_id,)).fetchone()
+        con.close()
+        return _account_user_row(row)
+    finally:
+        con.close()
 
 
 def _account_devices_for_user(apple_user_id: str, include_revoked: bool = False):
     import sqlite3
     con = sqlite3.connect(f"file:{ACCOUNTS_DB}?mode=ro", uri=True, timeout=5)
-    if include_revoked:
-        rows = con.execute(
-            f"SELECT {','.join(ACCOUNT_DEVICE_COLUMNS)} FROM devices "
-            "WHERE apple_user_id=? ORDER BY paired_at DESC",
-            (apple_user_id,)).fetchall()
-    else:
-        rows = con.execute(
-            f"SELECT {','.join(ACCOUNT_DEVICE_COLUMNS)} FROM devices "
-            "WHERE apple_user_id=? AND revoked=0 ORDER BY paired_at DESC",
-            (apple_user_id,)).fetchall()
-    con.close()
-    return [_account_device_row(r) for r in rows]
+    try:
+        if include_revoked:
+            rows = con.execute(
+                f"SELECT {','.join(ACCOUNT_DEVICE_COLUMNS)} FROM devices "
+                "WHERE apple_user_id=? ORDER BY paired_at DESC",
+                (apple_user_id,)).fetchall()
+        else:
+            rows = con.execute(
+                f"SELECT {','.join(ACCOUNT_DEVICE_COLUMNS)} FROM devices "
+                "WHERE apple_user_id=? AND revoked=0 ORDER BY paired_at DESC",
+                (apple_user_id,)).fetchall()
+        con.close()
+        return [_account_device_row(r) for r in rows]
+    finally:
+        con.close()
 
 
 def _account_device_put(apple_user_id: str, device_token: str, platform: str = "ios",
@@ -1088,25 +1106,28 @@ def _account_device_put(apple_user_id: str, device_token: str, platform: str = "
     now = time.time()
     device_id = device_id or "dev-" + uuid.uuid4().hex
     con = sqlite3.connect(ACCOUNTS_DB, timeout=30)
-    con.execute("PRAGMA foreign_keys=ON")
-    con.execute(
-        """INSERT INTO devices(device_id,apple_user_id,device_token,platform,label,
-                               paired_at,last_seen_at,revoked)
-           VALUES(?,?,?,?,?,?,?,0)
-           ON CONFLICT(device_token) DO UPDATE SET
-             apple_user_id=excluded.apple_user_id,
-             platform=excluded.platform,
-             label=excluded.label,
-             last_seen_at=excluded.last_seen_at,
-             revoked=0""",
-        (device_id, apple_user_id, device_token, platform or "ios",
-         (label or "device")[:80], now, now))
-    row = con.execute(
-        f"SELECT {','.join(ACCOUNT_DEVICE_COLUMNS)} FROM devices WHERE device_token=?",
-        (device_token,)).fetchone()
-    con.commit()
-    con.close()
-    return _account_device_row(row)
+    try:
+        con.execute("PRAGMA foreign_keys=ON")
+        con.execute(
+            """INSERT INTO devices(device_id,apple_user_id,device_token,platform,label,
+                                   paired_at,last_seen_at,revoked)
+               VALUES(?,?,?,?,?,?,?,0)
+               ON CONFLICT(device_token) DO UPDATE SET
+                 apple_user_id=excluded.apple_user_id,
+                 platform=excluded.platform,
+                 label=excluded.label,
+                 last_seen_at=excluded.last_seen_at,
+                 revoked=0""",
+            (device_id, apple_user_id, device_token, platform or "ios",
+             (label or "device")[:80], now, now))
+        row = con.execute(
+            f"SELECT {','.join(ACCOUNT_DEVICE_COLUMNS)} FROM devices WHERE device_token=?",
+            (device_token,)).fetchone()
+        con.commit()
+        con.close()
+        return _account_device_row(row)
+    finally:
+        con.close()
 
 
 def _account_device_for_token(device_token: str, touch: bool = True):
@@ -1115,16 +1136,19 @@ def _account_device_for_token(device_token: str, touch: bool = True):
         return None
     try:
         con = sqlite3.connect(ACCOUNTS_DB, timeout=30)
-        row = con.execute(
-            f"SELECT {','.join(ACCOUNT_DEVICE_COLUMNS)} FROM devices "
-            "WHERE device_token=? AND revoked=0",
-            (device_token,)).fetchone()
-        if row and touch:
-            con.execute("UPDATE devices SET last_seen_at=? WHERE device_token=?",
-                        (time.time(), device_token))
-            con.commit()
-        con.close()
-        return _account_device_row(row)
+        try:
+            row = con.execute(
+                f"SELECT {','.join(ACCOUNT_DEVICE_COLUMNS)} FROM devices "
+                "WHERE device_token=? AND revoked=0",
+                (device_token,)).fetchone()
+            if row and touch:
+                con.execute("UPDATE devices SET last_seen_at=? WHERE device_token=?",
+                            (time.time(), device_token))
+                con.commit()
+            con.close()
+            return _account_device_row(row)
+        finally:
+            con.close()
     except Exception:  # noqa: BLE001
         return None
 
@@ -1134,25 +1158,31 @@ def _account_device_by_id(apple_user_id: str, device_id: str):
     if not apple_user_id or not device_id:
         return None
     con = sqlite3.connect(f"file:{ACCOUNTS_DB}?mode=ro", uri=True, timeout=5)
-    row = con.execute(
-        f"SELECT {','.join(ACCOUNT_DEVICE_COLUMNS)} FROM devices "
-        "WHERE apple_user_id=? AND device_id=?",
-        (apple_user_id, device_id)).fetchone()
-    con.close()
-    return _account_device_row(row)
+    try:
+        row = con.execute(
+            f"SELECT {','.join(ACCOUNT_DEVICE_COLUMNS)} FROM devices "
+            "WHERE apple_user_id=? AND device_id=?",
+            (apple_user_id, device_id)).fetchone()
+        con.close()
+        return _account_device_row(row)
+    finally:
+        con.close()
 
 
 def _account_device_revoke(apple_user_id: str, device_id: str):
     import sqlite3
     con = sqlite3.connect(ACCOUNTS_DB, timeout=30)
-    cur = con.execute(
-        "UPDATE devices SET revoked=1, last_seen_at=? "
-        "WHERE apple_user_id=? AND device_id=? AND revoked=0",
-        (time.time(), apple_user_id, device_id))
-    con.commit()
-    revoked = cur.rowcount
-    con.close()
-    return revoked
+    try:
+        cur = con.execute(
+            "UPDATE devices SET revoked=1, last_seen_at=? "
+            "WHERE apple_user_id=? AND device_id=? AND revoked=0",
+            (time.time(), apple_user_id, device_id))
+        con.commit()
+        revoked = cur.rowcount
+        con.close()
+        return revoked
+    finally:
+        con.close()
 
 
 def _b64u(data: bytes) -> str:
@@ -1527,22 +1557,25 @@ def _event_append(session: str, etype: str, payload: dict,
         if external_id and external_id in _EVENT_SEEN.get(session, ()):
             return 0
         con = sqlite3.connect(CANON_DB, timeout=30)
-        cur = con.execute(
-            "INSERT OR IGNORE INTO event_log(session,type,external_id,payload,created_at) "
-            "VALUES(?,?,?,?,?)",
-            (session, etype, external_id,
-             json.dumps(payload, ensure_ascii=False), time.time()))
-        seq = int(cur.lastrowid or 0) if cur.rowcount else 0
-        con.commit()
-        con.close()
-        if external_id:
-            seen = _EVENT_SEEN.setdefault(session, set())
-            if len(seen) >= _EVENT_SEEN_CAP:
-                seen.clear()    # 粗略上限:清空後由 DB UNIQUE 繼續守冪等
-            seen.add(external_id)
-        if seq:
-            _event_notify(session)
-        return seq
+        try:
+            cur = con.execute(
+                "INSERT OR IGNORE INTO event_log(session,type,external_id,payload,created_at) "
+                "VALUES(?,?,?,?,?)",
+                (session, etype, external_id,
+                 json.dumps(payload, ensure_ascii=False), time.time()))
+            seq = int(cur.lastrowid or 0) if cur.rowcount else 0
+            con.commit()
+            con.close()
+            if external_id:
+                seen = _EVENT_SEEN.setdefault(session, set())
+                if len(seen) >= _EVENT_SEEN_CAP:
+                    seen.clear()    # 粗略上限:清空後由 DB UNIQUE 繼續守冪等
+                seen.add(external_id)
+            if seq:
+                _event_notify(session)
+            return seq
+        finally:
+            con.close()
     except Exception as e:  # noqa: BLE001
         _log_event("event_append_failed", session=session, type=etype,
                    error=type(e).__name__, error_message=str(e)[:160])
@@ -1555,11 +1588,14 @@ def _event_since(session: str, since_seq: int = 0, limit: int = 500) -> list[dic
     import sqlite3
     try:
         con = sqlite3.connect(f"file:{CANON_DB}?mode=ro", uri=True, timeout=5)
-        rows = con.execute(
-            "SELECT id,type,payload,created_at FROM event_log "
-            "WHERE session=? AND id>? ORDER BY id LIMIT ?",
-            (session, int(since_seq or 0), max(1, limit))).fetchall()
-        con.close()
+        try:
+            rows = con.execute(
+                "SELECT id,type,payload,created_at FROM event_log "
+                "WHERE session=? AND id>? ORDER BY id LIMIT ?",
+                (session, int(since_seq or 0), max(1, limit))).fetchall()
+            con.close()
+        finally:
+            con.close()
     except Exception as e:  # noqa: BLE001
         _log_event("event_since_failed", session=session,
                    error=type(e).__name__, error_message=str(e)[:160])
@@ -1587,12 +1623,15 @@ def _event_since_all(since_seq: int = 0, limit: int = 500) -> list[dict]:
         return []
     try:
         con = sqlite3.connect(f"file:{CANON_DB}?mode=ro", uri=True, timeout=5)
-        rows = con.execute(
-            "SELECT id,session,type,payload,created_at FROM event_log "
-            f"WHERE id>? AND session IN ({','.join('?' * len(sessions))}) "
-            "ORDER BY id LIMIT ?",
-            (int(since_seq or 0), *sessions, max(1, limit))).fetchall()
-        con.close()
+        try:
+            rows = con.execute(
+                "SELECT id,session,type,payload,created_at FROM event_log "
+                f"WHERE id>? AND session IN ({','.join('?' * len(sessions))}) "
+                "ORDER BY id LIMIT ?",
+                (int(since_seq or 0), *sessions, max(1, limit))).fetchall()
+            con.close()
+        finally:
+            con.close()
     except Exception as e:  # noqa: BLE001
         _log_event("event_since_all_failed",
                    error=type(e).__name__, error_message=str(e)[:160])
@@ -1612,10 +1651,13 @@ def _event_latest_seq(session: str) -> int:
     import sqlite3
     try:
         con = sqlite3.connect(f"file:{CANON_DB}?mode=ro", uri=True, timeout=5)
-        row = con.execute("SELECT MAX(id) FROM event_log WHERE session=?",
-                          (session,)).fetchone()
-        con.close()
-        return int(row[0] or 0)
+        try:
+            row = con.execute("SELECT MAX(id) FROM event_log WHERE session=?",
+                              (session,)).fetchone()
+            con.close()
+            return int(row[0] or 0)
+        finally:
+            con.close()
     except Exception:  # noqa: BLE001
         return 0
 
@@ -1785,24 +1827,27 @@ def _canon_add(session: str, role: str, content: str, attachments=None,
     now = created_at if created_at is not None else time.time()
     try:
         con = sqlite3.connect(CANON_DB)
-        con.execute("INSERT OR REPLACE INTO messages"
-                    "(id,session,role,content,attachments,created_at,status,client_id) "
-                    "VALUES(?,?,?,?,?,?,?,?)",
-                    (mid, session, role, content, json.dumps(attachments or [], ensure_ascii=False),
-                     now, status, client_id))
-        con.commit()
-        con.close()
-        _canon_notify(session)
-        # Sync engine P1:App 訊息寫入點順便鏡射進 event_log(雙寫過渡)。
-        # payload 形狀對齊 _canon_messages 的輸出,client 兩邊看到同一種訊息。
-        _event_mirror_messages(session, [{
-            "id": mid, "role": role, "content": content,
-            "attachments": attachments or [], "ts": now, "status": status,
-            "client_id": client_id, "source": "app"}])
-        # P1-3:人格完成一則回覆 → 推播把你叫回 app(前景由 app willPresent 抑制)。
-        if push and role == "assistant" and status == "done":
-            _push_persona_reply(session, content)
-        return mid, True
+        try:
+            con.execute("INSERT OR REPLACE INTO messages"
+                        "(id,session,role,content,attachments,created_at,status,client_id) "
+                        "VALUES(?,?,?,?,?,?,?,?)",
+                        (mid, session, role, content, json.dumps(attachments or [], ensure_ascii=False),
+                         now, status, client_id))
+            con.commit()
+            con.close()
+            _canon_notify(session)
+            # Sync engine P1:App 訊息寫入點順便鏡射進 event_log(雙寫過渡)。
+            # payload 形狀對齊 _canon_messages 的輸出,client 兩邊看到同一種訊息。
+            _event_mirror_messages(session, [{
+                "id": mid, "role": role, "content": content,
+                "attachments": attachments or [], "ts": now, "status": status,
+                "client_id": client_id, "source": "app"}])
+            # P1-3:人格完成一則回覆 → 推播把你叫回 app(前景由 app willPresent 抑制)。
+            if push and role == "assistant" and status == "done":
+                _push_persona_reply(session, content)
+            return mid, True
+        finally:
+            con.close()
     except Exception as e:  # noqa: BLE001
         _log_event("canonical_write_failed",
                    session=session, role=role, status=status,
@@ -1837,12 +1882,15 @@ def _canon_reply_for_client(session: str, client_id: str):
         return None
     try:
         con = sqlite3.connect(f"file:{CANON_DB}?mode=ro", uri=True, timeout=5)
-        row = con.execute(
-            "SELECT content FROM messages WHERE session=? AND client_id=? "
-            "AND role='assistant' AND status='done' AND content IS NOT NULL AND content!='' "
-            "ORDER BY created_at DESC LIMIT 1", (session, client_id)).fetchone()
-        con.close()
-        return row[0] if row else None
+        try:
+            row = con.execute(
+                "SELECT content FROM messages WHERE session=? AND client_id=? "
+                "AND role='assistant' AND status='done' AND content IS NOT NULL AND content!='' "
+                "ORDER BY created_at DESC LIMIT 1", (session, client_id)).fetchone()
+            con.close()
+            return row[0] if row else None
+        finally:
+            con.close()
     except Exception:  # noqa: BLE001
         return None
 
@@ -1851,9 +1899,12 @@ def _canon_messages(session: str, limit: int = 200):
     import sqlite3
     try:
         con = sqlite3.connect(f"file:{CANON_DB}?mode=ro", uri=True, timeout=5)
-        rows = con.execute("SELECT id,role,content,attachments,created_at,status,client_id FROM messages "
-                           "WHERE session=? ORDER BY created_at DESC LIMIT ?", (session, limit)).fetchall()
-        con.close()
+        try:
+            rows = con.execute("SELECT id,role,content,attachments,created_at,status,client_id FROM messages "
+                               "WHERE session=? ORDER BY created_at DESC LIMIT ?", (session, limit)).fetchall()
+            con.close()
+        finally:
+            con.close()
     except Exception:  # noqa: BLE001
         return []
     rows.reverse()
@@ -1966,17 +2017,20 @@ def _subsession_persist(sid: str) -> bool:
         return False
     try:
         con = sqlite3.connect(CANON_DB, timeout=30)
-        con.execute("INSERT OR REPLACE INTO subsessions"
-                    "(sid,name,parent,tool,status,cwd,worktree,cc_session,"
-                    "last_user,last_at,output_json) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                    (sid, sub.get("name"), sub.get("parent"), sub.get("tool"),
-                     sub.get("status"), sub.get("cwd"), sub.get("worktree"),
-                     sub.get("cc_session"), sub.get("last_user"),
-                     sub.get("lastAt") or time.time(),
-                     _sub_output_json(sub.get("output"))))
-        con.commit()
-        con.close()
-        return True
+        try:
+            con.execute("INSERT OR REPLACE INTO subsessions"
+                        "(sid,name,parent,tool,status,cwd,worktree,cc_session,"
+                        "last_user,last_at,output_json) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                        (sid, sub.get("name"), sub.get("parent"), sub.get("tool"),
+                         sub.get("status"), sub.get("cwd"), sub.get("worktree"),
+                         sub.get("cc_session"), sub.get("last_user"),
+                         sub.get("lastAt") or time.time(),
+                         _sub_output_json(sub.get("output"))))
+            con.commit()
+            con.close()
+            return True
+        finally:
+            con.close()
     except Exception as e:  # noqa: BLE001
         _log_event("subsession_persist_failed", sid=sid,
                    error=type(e).__name__, error_message=str(e)[:160])
@@ -1990,15 +2044,18 @@ def _subsessions_load():
     import sqlite3
     try:
         con = sqlite3.connect(CANON_DB, timeout=30)
-        rows = con.execute(
-            "SELECT sid,name,parent,tool,status,cwd,worktree,cc_session,"
-            "last_user,last_at,output_json FROM subsessions").fetchall()
-        interrupted = [r[0] for r in rows if r[4] == "running"]
-        if interrupted:
-            con.executemany("UPDATE subsessions SET status='interrupted' WHERE sid=?",
-                            [(sid,) for sid in interrupted])
-            con.commit()
-        con.close()
+        try:
+            rows = con.execute(
+                "SELECT sid,name,parent,tool,status,cwd,worktree,cc_session,"
+                "last_user,last_at,output_json FROM subsessions").fetchall()
+            interrupted = [r[0] for r in rows if r[4] == "running"]
+            if interrupted:
+                con.executemany("UPDATE subsessions SET status='interrupted' WHERE sid=?",
+                                [(sid,) for sid in interrupted])
+                con.commit()
+            con.close()
+        finally:
+            con.close()
     except Exception as e:  # noqa: BLE001
         _log_event("subsessions_load_failed",
                    error=type(e).__name__, error_message=str(e)[:160])
@@ -2202,25 +2259,28 @@ def _delegation_rows(limit: int = 50, parent_persona: str = "", status: str = ""
     import sqlite3
     try:
         con = sqlite3.connect(f"file:{CANON_DB}?mode=ro", uri=True, timeout=5)
-        con.row_factory = sqlite3.Row
-        where, args = [], []
-        if parent_persona:
-            where.append("parent_persona=?")
-            args.append(parent_persona)
-        if status:
-            where.append("status=?")
-            args.append(status)
-        if task_code:
-            where.append("task_code=?")
-            args.append(task_code.strip().upper())
-        sql = "SELECT * FROM delegations"
-        if where:
-            sql += " WHERE " + " AND ".join(where)
-        sql += " ORDER BY updated_at DESC LIMIT ?"
-        args.append(max(1, min(limit, 200)))
-        rows = con.execute(sql, args).fetchall()
-        con.close()
-        return rows
+        try:
+            con.row_factory = sqlite3.Row
+            where, args = [], []
+            if parent_persona:
+                where.append("parent_persona=?")
+                args.append(parent_persona)
+            if status:
+                where.append("status=?")
+                args.append(status)
+            if task_code:
+                where.append("task_code=?")
+                args.append(task_code.strip().upper())
+            sql = "SELECT * FROM delegations"
+            if where:
+                sql += " WHERE " + " AND ".join(where)
+            sql += " ORDER BY updated_at DESC LIMIT ?"
+            args.append(max(1, min(limit, 200)))
+            rows = con.execute(sql, args).fetchall()
+            con.close()
+            return rows
+        finally:
+            con.close()
     except Exception:  # noqa: BLE001
         return []
 
@@ -2228,31 +2288,37 @@ def _delegation_rows(limit: int = 50, parent_persona: str = "", status: str = ""
 def _delegation_get(delegation_id: str):
     import sqlite3
     con = sqlite3.connect(f"file:{CANON_DB}?mode=ro", uri=True, timeout=5)
-    con.row_factory = sqlite3.Row
-    row = con.execute("SELECT * FROM delegations WHERE id=? OR work_order=?",
-                      (delegation_id, delegation_id)).fetchone()
-    con.close()
-    return row
+    try:
+        con.row_factory = sqlite3.Row
+        row = con.execute("SELECT * FROM delegations WHERE id=? OR work_order=?",
+                          (delegation_id, delegation_id)).fetchone()
+        con.close()
+        return row
+    finally:
+        con.close()
 
 
 def _delegation_insert(row: dict) -> None:
     import sqlite3
     con = sqlite3.connect(CANON_DB, timeout=30)
-    con.execute("""INSERT INTO delegations
-        (id, work_order, parent_persona, parent_session, created_via, provider,
-         title, objective, cwd, status, provider_session_id, codex_thread_id,
-         cc_session_name, created_at, updated_at, last_error, meta,
-         task_code, subtask_code)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (row.get("id"), row.get("work_order"), row.get("parent_persona"),
-         row.get("parent_session"), row.get("created_via"), row.get("provider"),
-         row.get("title"), row.get("objective"), row.get("cwd"), row.get("status"),
-         row.get("provider_session_id"), row.get("codex_thread_id"),
-         row.get("cc_session_name"), row.get("created_at"), row.get("updated_at"),
-         row.get("last_error"), json.dumps(row.get("meta") or {}, ensure_ascii=False),
-         row.get("task_code"), row.get("subtask_code")))
-    con.commit()
-    con.close()
+    try:
+        con.execute("""INSERT INTO delegations
+            (id, work_order, parent_persona, parent_session, created_via, provider,
+             title, objective, cwd, status, provider_session_id, codex_thread_id,
+             cc_session_name, created_at, updated_at, last_error, meta,
+             task_code, subtask_code)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (row.get("id"), row.get("work_order"), row.get("parent_persona"),
+             row.get("parent_session"), row.get("created_via"), row.get("provider"),
+             row.get("title"), row.get("objective"), row.get("cwd"), row.get("status"),
+             row.get("provider_session_id"), row.get("codex_thread_id"),
+             row.get("cc_session_name"), row.get("created_at"), row.get("updated_at"),
+             row.get("last_error"), json.dumps(row.get("meta") or {}, ensure_ascii=False),
+             row.get("task_code"), row.get("subtask_code")))
+        con.commit()
+        con.close()
+    finally:
+        con.close()
 
 
 def _delegation_update(delegation_id: str, **fields) -> None:
@@ -2273,9 +2339,12 @@ def _delegation_update(delegation_id: str, **fields) -> None:
         return
     args.append(delegation_id)
     con = sqlite3.connect(CANON_DB, timeout=30)
-    con.execute(f"UPDATE delegations SET {', '.join(sets)} WHERE id=?", args)
-    con.commit()
-    con.close()
+    try:
+        con.execute(f"UPDATE delegations SET {', '.join(sets)} WHERE id=?", args)
+        con.commit()
+        con.close()
+    finally:
+        con.close()
 
 
 async def _delegation_runtime_status(row) -> str:
@@ -2548,28 +2617,31 @@ def _report_upsert(session: str, report: dict) -> str:
     actions = _report_actions_normalize(report.get("actions"))
     actions_json = json.dumps(actions, ensure_ascii=False) if actions else None
     con = sqlite3.connect(CANON_DB, timeout=30)
-    existing = con.execute(
-        "SELECT label,name,content,ts,external_id,actions "
-        "FROM report_events WHERE id=?", (rid,)).fetchone()
-    if existing and existing == (label, name, content, ts, external_id,
-                                 actions_json):
+    try:
+        existing = con.execute(
+            "SELECT label,name,content,ts,external_id,actions "
+            "FROM report_events WHERE id=?", (rid,)).fetchone()
+        if existing and existing == (label, name, content, ts, external_id,
+                                     actions_json):
+            con.close()
+            return ""
+        con.execute(
+            "INSERT OR REPLACE INTO report_events"
+            "(id,session,label,name,content,ts,external_source,external_id,"
+            "ingested_at,actions) VALUES(?,?,?,?,?,?,?,?,?,?)",
+            (rid, session, label, name, content, ts,
+             report.get("external_source") or "hermes-cron", external_id,
+             time.time(), actions_json))
+        con.commit()
         con.close()
-        return ""
-    con.execute(
-        "INSERT OR REPLACE INTO report_events"
-        "(id,session,label,name,content,ts,external_source,external_id,"
-        "ingested_at,actions) VALUES(?,?,?,?,?,?,?,?,?,?)",
-        (rid, session, label, name, content, ts,
-         report.get("external_source") or "hermes-cron", external_id,
-         time.time(), actions_json))
-    con.commit()
-    con.close()
-    # Sync engine P1:cron 晨報寫入點鏡射進 event_log(雙寫過渡)。形狀走
-    # _report_msg_shape = app 在 /app/v1/messages 看到的同一種報告訊息;
-    # 改稿(同 rid 新內容)→ 新鍵 → 追加新事件,同 message id 覆蓋。
-    _event_mirror_messages(session, [_report_msg_shape(
-        {"id": rid, "label": label, "content": content, "ts": ts})])
-    return rid
+        # Sync engine P1:cron 晨報寫入點鏡射進 event_log(雙寫過渡)。形狀走
+        # _report_msg_shape = app 在 /app/v1/messages 看到的同一種報告訊息;
+        # 改稿(同 rid 新內容)→ 新鍵 → 追加新事件,同 message id 覆蓋。
+        _event_mirror_messages(session, [_report_msg_shape(
+            {"id": rid, "label": label, "content": content, "ts": ts})])
+        return rid
+    finally:
+        con.close()
 
 
 def _report_events(session: str, limit: int = 20, newest_first: bool = False):
@@ -2577,11 +2649,14 @@ def _report_events(session: str, limit: int = 20, newest_first: bool = False):
     order = "DESC" if newest_first else "ASC"
     try:
         con = sqlite3.connect(f"file:{CANON_DB}?mode=ro", uri=True, timeout=5)
-        rows = con.execute(
-            f"SELECT id,label,name,content,ts,external_source,external_id "
-            f"FROM report_events WHERE session=? ORDER BY ts {order} LIMIT ?",
-            (session, limit)).fetchall()
-        con.close()
+        try:
+            rows = con.execute(
+                f"SELECT id,label,name,content,ts,external_source,external_id "
+                f"FROM report_events WHERE session=? ORDER BY ts {order} LIMIT ?",
+                (session, limit)).fetchall()
+            con.close()
+        finally:
+            con.close()
     except Exception:  # noqa: BLE001
         return []
     return [{
@@ -2685,9 +2760,12 @@ def _devices() -> list:
     import sqlite3
     try:
         con = sqlite3.connect(f"file:{CANON_DB}?mode=ro", uri=True, timeout=5)
-        rows = con.execute("SELECT token FROM devices").fetchall()
-        con.close()
-        return [r[0] for r in rows]
+        try:
+            rows = con.execute("SELECT token FROM devices").fetchall()
+            con.close()
+            return [r[0] for r in rows]
+        finally:
+            con.close()
     except Exception as e:  # noqa: BLE001
         # An unreadable devices table means "push notifications silently off" —
         # log it so the failure is diagnosable (issue #7).
@@ -2700,10 +2778,13 @@ def _device_add(token: str, platform: str = "ios") -> None:
     import sqlite3
     try:
         con = sqlite3.connect(CANON_DB)
-        con.execute("INSERT OR REPLACE INTO devices(token,platform,created_at) "
-                    "VALUES(?,?,?)", (token, platform, time.time()))
-        con.commit()
-        con.close()
+        try:
+            con.execute("INSERT OR REPLACE INTO devices(token,platform,created_at) "
+                        "VALUES(?,?,?)", (token, platform, time.time()))
+            con.commit()
+            con.close()
+        finally:
+            con.close()
     except Exception as e:  # noqa: BLE001
         _log_event("device_add_failed", platform=platform,
                    error=type(e).__name__, error_message=str(e)[:160])
@@ -2713,9 +2794,12 @@ def _device_remove(token: str) -> None:
     import sqlite3
     try:
         con = sqlite3.connect(CANON_DB)
-        con.execute("DELETE FROM devices WHERE token=?", (token,))
-        con.commit()
-        con.close()
+        try:
+            con.execute("DELETE FROM devices WHERE token=?", (token,))
+            con.commit()
+            con.close()
+        finally:
+            con.close()
     except Exception as e:  # noqa: BLE001
         _log_event("device_remove_failed", error=type(e).__name__,
                    error_message=str(e)[:160])
@@ -3362,16 +3446,19 @@ class CodexAppServerClient:
         import sqlite3
         try:
             con = sqlite3.connect(CANON_DB, timeout=30)
-            cur = con.execute(
-                "UPDATE approvals SET status='expired', decided_at=?, result=? "
-                "WHERE status='pending' AND source LIKE 'codex%'",
-                (time.time(), json.dumps({"reason": "codex app-server restarted"},
-                                         ensure_ascii=False)))
-            con.commit()
-            changed = cur.rowcount
-            con.close()
-            if changed:
-                _log_event("codex_approval_stale_expired", count=changed)
+            try:
+                cur = con.execute(
+                    "UPDATE approvals SET status='expired', decided_at=?, result=? "
+                    "WHERE status='pending' AND source LIKE 'codex%'",
+                    (time.time(), json.dumps({"reason": "codex app-server restarted"},
+                                             ensure_ascii=False)))
+                con.commit()
+                changed = cur.rowcount
+                con.close()
+                if changed:
+                    _log_event("codex_approval_stale_expired", count=changed)
+            finally:
+                con.close()
         except Exception as e:  # noqa: BLE001
             _log_event("codex_approval_stale_expire_failed",
                        error=type(e).__name__, error_message=str(e)[:160])
@@ -3562,33 +3649,39 @@ class CodexAppServerClient:
     def _approval_db_upsert(self, record: dict) -> None:
         import sqlite3
         con = sqlite3.connect(CANON_DB, timeout=30)
-        now = record.get("created_at") or time.time()
-        # A1:統一欄位落庫。DB 的 options style 收斂為規範字彙(deny→danger);
-        # 記憶體 record 保持原樣 — 現行 app 以 style=="deny" 判拒絕鍵,既有
-        # 曝露面(v2 meta.approval、卡片流)相容期不動(A4 收斂)。
-        src = str(record.get("source") or "")
-        options = [({**o, "style": "danger"} if o.get("style") == "deny" else dict(o))
-                   for o in (record.get("options") or [])]
-        con.execute("INSERT OR REPLACE INTO approvals"
-                    "(id,title,source,risk,detail,created_at,expires_at,status,decided_at,result,callback,"
-                    "session_id,provider,kind,options) "
-                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                    (record["id"], record["title"], record["source"], record["risk"],
-                     record["detail"], now, now + 3600, "pending", None, None, None,
-                     src if ":" in src else None, "codex", "permission",
-                     json.dumps(options, ensure_ascii=False) if options else None))
-        con.commit()
-        con.close()
+        try:
+            now = record.get("created_at") or time.time()
+            # A1:統一欄位落庫。DB 的 options style 收斂為規範字彙(deny→danger);
+            # 記憶體 record 保持原樣 — 現行 app 以 style=="deny" 判拒絕鍵,既有
+            # 曝露面(v2 meta.approval、卡片流)相容期不動(A4 收斂)。
+            src = str(record.get("source") or "")
+            options = [({**o, "style": "danger"} if o.get("style") == "deny" else dict(o))
+                       for o in (record.get("options") or [])]
+            con.execute("INSERT OR REPLACE INTO approvals"
+                        "(id,title,source,risk,detail,created_at,expires_at,status,decided_at,result,callback,"
+                        "session_id,provider,kind,options) "
+                        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                        (record["id"], record["title"], record["source"], record["risk"],
+                         record["detail"], now, now + 3600, "pending", None, None, None,
+                         src if ":" in src else None, "codex", "permission",
+                         json.dumps(options, ensure_ascii=False) if options else None))
+            con.commit()
+            con.close()
+        finally:
+            con.close()
 
     def _approval_db_decide(self, approval_id: str, status: str, result: dict | str) -> None:
         import sqlite3
         if not isinstance(result, str):
             result = json.dumps(result or {}, ensure_ascii=False)
         con = sqlite3.connect(CANON_DB, timeout=30)
-        con.execute("UPDATE approvals SET status=?, decided_at=?, result=? WHERE id=?",
-                    (status, time.time(), result, approval_id))
-        con.commit()
-        con.close()
+        try:
+            con.execute("UPDATE approvals SET status=?, decided_at=?, result=? WHERE id=?",
+                        (status, time.time(), result, approval_id))
+            con.commit()
+            con.close()
+        finally:
+            con.close()
 
     def _handle_approval_request(self, msg: dict) -> None:
         method = msg.get("method") or ""
@@ -5355,22 +5448,25 @@ def _persona_preview_tg(home: str):
         return (None, None)
     try:
         con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=5)
-        cur = con.execute(
-            "SELECT m.role, m.content, m.timestamp FROM messages m "
-            "JOIN sessions s ON s.id = m.session_id "
-            "WHERE s.source='telegram' AND m.role IN ('user','assistant') "
-            "AND m.content IS NOT NULL AND m.content != '' "
-            "ORDER BY m.timestamp DESC LIMIT 10")
-        rows = cur.fetchall()
-        con.close()
-        for role, content, ts in rows:
-            text, _atts = _tg_extract_attachments(str(content))
-            if role == "user":
-                text = _tg_clean_content(text)
-                if text is None:
-                    continue
-            if text:
-                return (text[:80], ts)
+        try:
+            cur = con.execute(
+                "SELECT m.role, m.content, m.timestamp FROM messages m "
+                "JOIN sessions s ON s.id = m.session_id "
+                "WHERE s.source='telegram' AND m.role IN ('user','assistant') "
+                "AND m.content IS NOT NULL AND m.content != '' "
+                "ORDER BY m.timestamp DESC LIMIT 10")
+            rows = cur.fetchall()
+            con.close()
+            for role, content, ts in rows:
+                text, _atts = _tg_extract_attachments(str(content))
+                if role == "user":
+                    text = _tg_clean_content(text)
+                    if text is None:
+                        continue
+                if text:
+                    return (text[:80], ts)
+        finally:
+            con.close()
     except Exception:
         pass
     return (None, None)
@@ -5750,27 +5846,30 @@ def _persona_history(home: str, limit: int = 100):
         return []
     try:
         con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=5)
-        cur = con.execute(
-            "SELECT m.role, m.content, m.timestamp FROM messages m "
-            "JOIN sessions s ON s.id = m.session_id "
-            "WHERE s.source='telegram' AND m.role IN ('user','assistant') "
-            "AND m.content IS NOT NULL AND m.content != '' "
-            "ORDER BY m.timestamp DESC LIMIT ?", (limit,))
-        rows = cur.fetchall()
-        con.close()
-        rows.reverse()  # oldest → newest for natural top-to-bottom rendering
-        out = []
-        for r in rows:
-            text, atts = _tg_extract_attachments(r[1])
-            if r[0] == "user":
-                # 前台只呈現使用者真正說的話:剝掉 runtime context 等機器面
-                # 包裹;整條都是內部注入(剝完全空)且無附件 → 不出現。
-                text = _tg_clean_content(text)
-                if text is None and not atts:
-                    continue
-            out.append({"role": r[0], "content": text or "", "ts": r[2],
-                        "attachments": atts})
-        return out
+        try:
+            cur = con.execute(
+                "SELECT m.role, m.content, m.timestamp FROM messages m "
+                "JOIN sessions s ON s.id = m.session_id "
+                "WHERE s.source='telegram' AND m.role IN ('user','assistant') "
+                "AND m.content IS NOT NULL AND m.content != '' "
+                "ORDER BY m.timestamp DESC LIMIT ?", (limit,))
+            rows = cur.fetchall()
+            con.close()
+            rows.reverse()  # oldest → newest for natural top-to-bottom rendering
+            out = []
+            for r in rows:
+                text, atts = _tg_extract_attachments(r[1])
+                if r[0] == "user":
+                    # 前台只呈現使用者真正說的話:剝掉 runtime context 等機器面
+                    # 包裹;整條都是內部注入(剝完全空)且無附件 → 不出現。
+                    text = _tg_clean_content(text)
+                    if text is None and not atts:
+                        continue
+                out.append({"role": r[0], "content": text or "", "ts": r[2],
+                            "attachments": atts})
+            return out
+        finally:
+            con.close()
     except Exception as e:  # noqa: BLE001
         # A broken state.db read renders the persona thread empty on every
         # device; that deserves a log line, not silence (issue #7).
@@ -8146,11 +8245,14 @@ def _cc_find_pending_aid(name: str, sig: str) -> str | None:
     import sqlite3
     try:
         con = sqlite3.connect(CANON_DB, timeout=30)
-        rows = con.execute(
-            "SELECT id,title,options FROM approvals "
-            "WHERE source=? AND status='pending' ORDER BY created_at DESC",
-            (f"claude_code:{name}",)).fetchall()
-        con.close()
+        try:
+            rows = con.execute(
+                "SELECT id,title,options FROM approvals "
+                "WHERE source=? AND status='pending' ORDER BY created_at DESC",
+                (f"claude_code:{name}",)).fetchall()
+            con.close()
+        finally:
+            con.close()
     except Exception as e:  # noqa: BLE001
         _log_event("cc_approval_adopt_query_error", session=name, error=str(e)[:160])
         return None
@@ -8171,11 +8273,14 @@ def _cc_reseed_approvals_from_db() -> int:
     import sqlite3
     try:
         con = sqlite3.connect(CANON_DB, timeout=30)
-        rows = con.execute(
-            "SELECT id,source,title,options FROM approvals "
-            "WHERE source LIKE 'claude_code:%' AND status='pending' "
-            "ORDER BY created_at DESC").fetchall()
-        con.close()
+        try:
+            rows = con.execute(
+                "SELECT id,source,title,options FROM approvals "
+                "WHERE source LIKE 'claude_code:%' AND status='pending' "
+                "ORDER BY created_at DESC").fetchall()
+            con.close()
+        finally:
+            con.close()
     except Exception as e:  # noqa: BLE001
         _log_event("cc_approval_reseed_error", error=str(e)[:160])
         return 0
@@ -8216,12 +8321,15 @@ def _cc_approval_set_status(aid: str, status: str) -> bool:
     import sqlite3
     try:
         con = sqlite3.connect(CANON_DB, timeout=30)
-        cur = con.execute("UPDATE approvals SET status=?, decided_at=? "
-                          "WHERE id=? AND status='pending'",
-                          (status, time.time(), aid))
-        con.commit()
-        con.close()
-        return bool(cur.rowcount)
+        try:
+            cur = con.execute("UPDATE approvals SET status=?, decided_at=? "
+                              "WHERE id=? AND status='pending'",
+                              (status, time.time(), aid))
+            con.commit()
+            con.close()
+            return bool(cur.rowcount)
+        finally:
+            con.close()
     except Exception as e:  # noqa: BLE001
         _log_event("cc_approval_db_error", approval_id=aid, error=str(e)[:160])
         return False
@@ -8255,18 +8363,21 @@ def _cc_approval_create(name: str, prompt: dict) -> str:
         options.append(ent)
     now = time.time()
     con = sqlite3.connect(CANON_DB, timeout=30)
-    con.execute("INSERT OR REPLACE INTO approvals"
-                "(id,title,source,risk,detail,created_at,expires_at,status,decided_at,result,callback,"
-                "session_id,provider,kind,options) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (aid, title, f"claude_code:{name}",
-                 "high" if kind == "permission" else "low", detail,
-                 now, now + _CC_APPROVAL_TTL, "pending", None, None, None,
-                 f"claude_code:{name}", "claude_code", kind,
-                 json.dumps(options, ensure_ascii=False) if options else None))
-    con.commit()
-    con.close()
-    return aid
+    try:
+        con.execute("INSERT OR REPLACE INTO approvals"
+                    "(id,title,source,risk,detail,created_at,expires_at,status,decided_at,result,callback,"
+                    "session_id,provider,kind,options) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (aid, title, f"claude_code:{name}",
+                     "high" if kind == "permission" else "low", detail,
+                     now, now + _CC_APPROVAL_TTL, "pending", None, None, None,
+                     f"claude_code:{name}", "claude_code", kind,
+                     json.dumps(options, ensure_ascii=False) if options else None))
+        con.commit()
+        con.close()
+        return aid
+    finally:
+        con.close()
 
 
 # ── 2b:人格 choices 卡 → 審核中心(2026-07-16 XCash 拍板:所有 choices 卡進、
@@ -8347,25 +8458,28 @@ def _hp_choices_upsert(persona: str, card: dict) -> str | None:
     aid = _hp_choices_stable_id(persona, card)
     now = time.time()
     con = sqlite3.connect(CANON_DB, timeout=30)
-    row = con.execute("SELECT status FROM approvals WHERE id=?", (aid,)).fetchone()
-    if row:
+    try:
+        row = con.execute("SELECT status FROM approvals WHERE id=?", (aid,)).fetchone()
+        if row:
+            con.close()
+            return aid if row[0] == "pending" else None    # 已在/已決議 → 不重寫、不復活
+        title = str(card.get("title") or "需要你選擇")[:200]
+        detail = str(card.get("detail") or "")[:400]
+        con.execute("INSERT INTO approvals"
+                    "(id,title,source,risk,detail,created_at,expires_at,status,decided_at,result,callback,"
+                    "session_id,provider,kind,options) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (aid, title, f"hermes:{persona}", "low", detail,
+                     now, now + _HP_CHOICES_TTL, "pending", None, None, None,
+                     f"hermes:{persona}", "hermes", "question",
+                     json.dumps(decision_opts, ensure_ascii=False)))
+        con.commit()
         con.close()
-        return aid if row[0] == "pending" else None    # 已在/已決議 → 不重寫、不復活
-    title = str(card.get("title") or "需要你選擇")[:200]
-    detail = str(card.get("detail") or "")[:400]
-    con.execute("INSERT INTO approvals"
-                "(id,title,source,risk,detail,created_at,expires_at,status,decided_at,result,callback,"
-                "session_id,provider,kind,options) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (aid, title, f"hermes:{persona}", "low", detail,
-                 now, now + _HP_CHOICES_TTL, "pending", None, None, None,
-                 f"hermes:{persona}", "hermes", "question",
-                 json.dumps(decision_opts, ensure_ascii=False)))
-    con.commit()
-    con.close()
-    _log_event("hp_choices_approval_created", session=persona, approval_id=aid,
-               title=title[:60], options=len(decision_opts))
-    return aid
+        _log_event("hp_choices_approval_created", session=persona, approval_id=aid,
+                   title=title[:60], options=len(decision_opts))
+        return aid
+    finally:
+        con.close()
 
 
 def _hp_choices_expire(aid: str) -> None:
@@ -8373,13 +8487,16 @@ def _hp_choices_expire(aid: str) -> None:
     import sqlite3
     try:
         con = sqlite3.connect(CANON_DB, timeout=30)
-        cur = con.execute("UPDATE approvals SET status='expired', decided_at=? "
-                          "WHERE id=? AND status='pending'", (time.time(), aid))
-        con.commit()
-        n = cur.rowcount
-        con.close()
-        if n:
-            _log_event("hp_choices_approval_expired", approval_id=aid, reason="resolved_upstream")
+        try:
+            cur = con.execute("UPDATE approvals SET status='expired', decided_at=? "
+                              "WHERE id=? AND status='pending'", (time.time(), aid))
+            con.commit()
+            n = cur.rowcount
+            con.close()
+            if n:
+                _log_event("hp_choices_approval_expired", approval_id=aid, reason="resolved_upstream")
+        finally:
+            con.close()
     except Exception as e:  # noqa: BLE001
         _log_event("hp_choices_expire_failed", approval_id=aid, error=str(e)[:160])
 
@@ -8396,11 +8513,14 @@ def _hp_choices_scan() -> int:
         return 0                            # 狀態未知 → 這輪不動作(不建、不亂 expire)
     try:
         con = sqlite3.connect(CANON_DB, timeout=30)
-        rows = con.execute(
-            "SELECT session, content FROM report_events WHERE ts > ? "
-            "AND content LIKE '%```studio-card%' AND content LIKE '%\"choices\"%' "
-            "ORDER BY rowid DESC LIMIT 100", (since,)).fetchall()
-        con.close()
+        try:
+            rows = con.execute(
+                "SELECT session, content FROM report_events WHERE ts > ? "
+                "AND content LIKE '%```studio-card%' AND content LIKE '%\"choices\"%' "
+                "ORDER BY rowid DESC LIMIT 100", (since,)).fetchall()
+            con.close()
+        finally:
+            con.close()
     except Exception as e:  # noqa: BLE001
         _log_event("hp_choices_scan_failed", error=str(e)[:160])
         return 0
@@ -9593,28 +9713,31 @@ def _reports(limit: int = 20):
     jobs = {j["id"]: j for j in _cron_jobs()}
     try:
         con = sqlite3.connect(f"file:{STATE_DB}?mode=ro", uri=True, timeout=5)
-        sids = con.execute(
-            "SELECT m.session_id, MAX(m.timestamp) ts FROM messages m "
-            "JOIN sessions s ON s.id = m.session_id WHERE s.source='cron' "
-            "GROUP BY m.session_id ORDER BY ts DESC LIMIT ?", (limit * 3,)).fetchall()
-        out = []
-        for sid, _ts in sids:
-            mobj = re.search(r"cron_([0-9a-f]+)_", str(sid))
-            job = jobs.get(mobj.group(1)) if mobj else None
-            if not (job and job.get("notify")):
-                continue                       # skip internal / unknown jobs
-            last = con.execute(
-                "SELECT content, timestamp FROM messages WHERE session_id=? "
-                "AND role='assistant' AND content IS NOT NULL AND content!='' "
-                "ORDER BY timestamp DESC LIMIT 1", (sid,)).fetchone()
-            if last and last[0]:
-                out.append({"label": job.get("label") or job.get("name"),
-                            "name": job.get("name"), "content": _clean_report(last[0]),
-                            "ts": last[1]})
-            if len(out) >= limit:
-                break
-        con.close()
-        return out
+        try:
+            sids = con.execute(
+                "SELECT m.session_id, MAX(m.timestamp) ts FROM messages m "
+                "JOIN sessions s ON s.id = m.session_id WHERE s.source='cron' "
+                "GROUP BY m.session_id ORDER BY ts DESC LIMIT ?", (limit * 3,)).fetchall()
+            out = []
+            for sid, _ts in sids:
+                mobj = re.search(r"cron_([0-9a-f]+)_", str(sid))
+                job = jobs.get(mobj.group(1)) if mobj else None
+                if not (job and job.get("notify")):
+                    continue                       # skip internal / unknown jobs
+                last = con.execute(
+                    "SELECT content, timestamp FROM messages WHERE session_id=? "
+                    "AND role='assistant' AND content IS NOT NULL AND content!='' "
+                    "ORDER BY timestamp DESC LIMIT 1", (sid,)).fetchone()
+                if last and last[0]:
+                    out.append({"label": job.get("label") or job.get("name"),
+                                "name": job.get("name"), "content": _clean_report(last[0]),
+                                "ts": last[1]})
+                if len(out) >= limit:
+                    break
+            con.close()
+            return out
+        finally:
+            con.close()
     except Exception:  # noqa: BLE001
         return []
 
@@ -9645,32 +9768,35 @@ def _persona_reports(persona: str, limit: int = 20):
     idname = _cron_names_for(home)
     try:
         con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=5)
-        sids = con.execute(
-            "SELECT m.session_id, MAX(m.timestamp) ts FROM messages m "
-            "JOIN sessions s ON s.id = m.session_id WHERE s.source='cron' "
-            "GROUP BY m.session_id ORDER BY ts DESC LIMIT ?", (limit * 3,)).fetchall()
-        out = []
-        for sid, _ts in sids:
-            mobj = re.search(r"cron_([0-9a-f]+)_", str(sid))
-            name = idname.get(mobj.group(1)) if mobj else None
-            label = labels.get(name)
-            if not label:
-                continue                       # not a user-facing daily job
-            last = con.execute(
-                "SELECT content, timestamp FROM messages WHERE session_id=? "
-                "AND role='assistant' AND content IS NOT NULL AND content!='' "
-                "ORDER BY timestamp DESC LIMIT 1", (sid,)).fetchone()
-            if last and last[0]:
-                external_id = f"cron:{persona}:{name}:{sid}"
-                out.append({"id": _report_id(persona, name or "", str(sid), last[1]),
-                            "external_id": external_id,
-                            "external_source": "hermes-cron",
-                            "session_id": sid, "label": label, "name": name,
-                            "content": _clean_report(last[0]), "ts": last[1]})
-            if len(out) >= limit:
-                break
-        con.close()
-        return out
+        try:
+            sids = con.execute(
+                "SELECT m.session_id, MAX(m.timestamp) ts FROM messages m "
+                "JOIN sessions s ON s.id = m.session_id WHERE s.source='cron' "
+                "GROUP BY m.session_id ORDER BY ts DESC LIMIT ?", (limit * 3,)).fetchall()
+            out = []
+            for sid, _ts in sids:
+                mobj = re.search(r"cron_([0-9a-f]+)_", str(sid))
+                name = idname.get(mobj.group(1)) if mobj else None
+                label = labels.get(name)
+                if not label:
+                    continue                       # not a user-facing daily job
+                last = con.execute(
+                    "SELECT content, timestamp FROM messages WHERE session_id=? "
+                    "AND role='assistant' AND content IS NOT NULL AND content!='' "
+                    "ORDER BY timestamp DESC LIMIT 1", (sid,)).fetchone()
+                if last and last[0]:
+                    external_id = f"cron:{persona}:{name}:{sid}"
+                    out.append({"id": _report_id(persona, name or "", str(sid), last[1]),
+                                "external_id": external_id,
+                                "external_source": "hermes-cron",
+                                "session_id": sid, "label": label, "name": name,
+                                "content": _clean_report(last[0]), "ts": last[1]})
+                if len(out) >= limit:
+                    break
+            con.close()
+            return out
+        finally:
+            con.close()
     except Exception:  # noqa: BLE001
         return []
 
@@ -11147,11 +11273,14 @@ def _report_lookup(rid: str):
         return None
     try:
         con = sqlite3.connect(f"file:{CANON_DB}?mode=ro", uri=True, timeout=5)
-        row = con.execute(
-            "SELECT id,session,label,name,content,ts,external_source,external_id,"
-            "actions FROM report_events WHERE id=? OR external_id=? LIMIT 1",
-            (key, key)).fetchone()
-        con.close()
+        try:
+            row = con.execute(
+                "SELECT id,session,label,name,content,ts,external_source,external_id,"
+                "actions FROM report_events WHERE id=? OR external_id=? LIMIT 1",
+                (key, key)).fetchone()
+            con.close()
+        finally:
+            con.close()
     except Exception:  # noqa: BLE001
         return None
     if not row:
@@ -11248,39 +11377,42 @@ async def app_get_messages(session: str, request: Request, limit: int = 200):
     try:
         import sqlite3
         con = sqlite3.connect(f"file:{CANON_DB}?mode=ro", uri=True, timeout=5)
-        rows = con.execute("SELECT msg_id, reaction FROM reactions WHERE session=?",
-                           (session,)).fetchall()
-        overlay = {r[0]: r[1] for r in rows if r[1]}
-        # Canonical multi-emoji reactions + pins (G2/#39 final contract). Both
-        # fields are optional in the payload: omitted when there's no data.
-        meta_rows = con.execute(
-            "SELECT message_id, reactions, pinned, deleted FROM message_meta").fetchall()
-        con.close()
-        meta = {}
-        for mid_, rx, pn, dl in meta_rows:
-            try:
-                lst = json.loads(rx) if rx else []
-            except Exception:  # noqa: BLE001
-                lst = []
-            meta[mid_] = ([str(r) for r in lst if r] if isinstance(lst, list) else [],
-                          bool(pn), bool(dl))
-        for m in out:
-            mid_ = str(m.get("id"))
-            legacy = overlay.get(mid_)
-            if legacy:
-                m["reaction"] = legacy
-            if mid_ in meta:
-                reactions, pinned, deleted = meta[mid_]
-                if reactions:
-                    m["reactions"] = reactions
-                if pinned:
-                    m["pinned"] = True
-                if deleted:
-                    m["deleted"] = True    # G4 tombstone: row stays, flagged
-            elif legacy:
-                # Older builds wrote the single-reaction overlay only; surface
-                # it in the new list field too so nothing disappears mid-migration.
-                m["reactions"] = [legacy]
+        try:
+            rows = con.execute("SELECT msg_id, reaction FROM reactions WHERE session=?",
+                               (session,)).fetchall()
+            overlay = {r[0]: r[1] for r in rows if r[1]}
+            # Canonical multi-emoji reactions + pins (G2/#39 final contract). Both
+            # fields are optional in the payload: omitted when there's no data.
+            meta_rows = con.execute(
+                "SELECT message_id, reactions, pinned, deleted FROM message_meta").fetchall()
+            con.close()
+            meta = {}
+            for mid_, rx, pn, dl in meta_rows:
+                try:
+                    lst = json.loads(rx) if rx else []
+                except Exception:  # noqa: BLE001
+                    lst = []
+                meta[mid_] = ([str(r) for r in lst if r] if isinstance(lst, list) else [],
+                              bool(pn), bool(dl))
+            for m in out:
+                mid_ = str(m.get("id"))
+                legacy = overlay.get(mid_)
+                if legacy:
+                    m["reaction"] = legacy
+                if mid_ in meta:
+                    reactions, pinned, deleted = meta[mid_]
+                    if reactions:
+                        m["reactions"] = reactions
+                    if pinned:
+                        m["pinned"] = True
+                    if deleted:
+                        m["deleted"] = True    # G4 tombstone: row stays, flagged
+                elif legacy:
+                    # Older builds wrote the single-reaction overlay only; surface
+                    # it in the new list field too so nothing disappears mid-migration.
+                    m["reactions"] = [legacy]
+        finally:
+            con.close()
     except Exception as e:  # noqa: BLE001
         # Failing open (messages without reactions/pins) is right, but silent
         # failure made it undiagnosable (issue #7).
@@ -11509,10 +11641,13 @@ def _read_cursor_rows(session: str) -> list[dict]:
     import sqlite3
     try:
         con = sqlite3.connect(f"file:{CANON_DB}?mode=ro", uri=True, timeout=5)
-        rows = con.execute(
-            "SELECT device_id,last_read_seq,last_read_ts,message_id,updated_at "
-            "FROM read_cursors WHERE session=?", (session,)).fetchall()
-        con.close()
+        try:
+            rows = con.execute(
+                "SELECT device_id,last_read_seq,last_read_ts,message_id,updated_at "
+                "FROM read_cursors WHERE session=?", (session,)).fetchall()
+            con.close()
+        finally:
+            con.close()
     except Exception as e:  # noqa: BLE001
         _log_event("read_cursor_read_failed", session=session,
                    error=type(e).__name__, error_message=str(e)[:160])
@@ -11630,15 +11765,18 @@ async def app_set_reaction(mid: str, request: Request):
     import sqlite3
     try:
         con = sqlite3.connect(CANON_DB, timeout=5)
-        if reaction:
-            con.execute("INSERT INTO reactions(msg_id, session, reaction, updated_at) "
-                        "VALUES(?,?,?,?) ON CONFLICT(msg_id) DO UPDATE SET "
-                        "reaction=excluded.reaction, updated_at=excluded.updated_at",
-                        (mid, session, reaction, time.time()))
-        else:
-            con.execute("DELETE FROM reactions WHERE msg_id=?", (mid,))
-        con.commit()
-        con.close()
+        try:
+            if reaction:
+                con.execute("INSERT INTO reactions(msg_id, session, reaction, updated_at) "
+                            "VALUES(?,?,?,?) ON CONFLICT(msg_id) DO UPDATE SET "
+                            "reaction=excluded.reaction, updated_at=excluded.updated_at",
+                            (mid, session, reaction, time.time()))
+            else:
+                con.execute("DELETE FROM reactions WHERE msg_id=?", (mid,))
+            con.commit()
+            con.close()
+        finally:
+            con.close()
     except Exception as e:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=str(e)[:200])
     return {"ok": True, "reaction": reaction or None}
@@ -11699,17 +11837,20 @@ async def app_reactions(request: Request):
     import sqlite3
     try:
         con = sqlite3.connect(CANON_DB, timeout=30)
-        con.execute("PRAGMA busy_timeout=30000")
-        reactions, pinned = _message_meta_load(con, message_id)
-        if action == "add":
-            if emoji not in reactions:
-                reactions.append(emoji)
-        else:
-            reactions = [r for r in reactions if r != emoji]
-        _message_meta_upsert(con, message_id, reactions, pinned,
-                             session=_message_session_of(con, message_id))
-        con.commit()
-        con.close()
+        try:
+            con.execute("PRAGMA busy_timeout=30000")
+            reactions, pinned = _message_meta_load(con, message_id)
+            if action == "add":
+                if emoji not in reactions:
+                    reactions.append(emoji)
+            else:
+                reactions = [r for r in reactions if r != emoji]
+            _message_meta_upsert(con, message_id, reactions, pinned,
+                                 session=_message_session_of(con, message_id))
+            con.commit()
+            con.close()
+        finally:
+            con.close()
     except Exception as e:  # noqa: BLE001
         _log_event("message_meta_write_failed", kind="reaction",
                    message_id=message_id, error=type(e).__name__)
@@ -11729,12 +11870,15 @@ async def app_pins(request: Request):
     import sqlite3
     try:
         con = sqlite3.connect(CANON_DB, timeout=30)
-        con.execute("PRAGMA busy_timeout=30000")
-        reactions, _old = _message_meta_load(con, message_id)
-        _message_meta_upsert(con, message_id, reactions, pinned,
-                             session=_message_session_of(con, message_id))
-        con.commit()
-        con.close()
+        try:
+            con.execute("PRAGMA busy_timeout=30000")
+            reactions, _old = _message_meta_load(con, message_id)
+            _message_meta_upsert(con, message_id, reactions, pinned,
+                                 session=_message_session_of(con, message_id))
+            con.commit()
+            con.close()
+        finally:
+            con.close()
     except Exception as e:  # noqa: BLE001
         _log_event("message_meta_write_failed", kind="pin",
                    message_id=message_id, error=type(e).__name__)
@@ -11759,25 +11903,28 @@ async def app_patch_message(mid: str, request: Request):
     import sqlite3
     try:
         con = sqlite3.connect(CANON_DB, timeout=30)
-        con.execute("PRAGMA busy_timeout=30000")
-        session = _message_session_of(con, mid)
-        if session is None:
+        try:
+            con.execute("PRAGMA busy_timeout=30000")
+            session = _message_session_of(con, mid)
+            if session is None:
+                con.close()
+                raise http_err(404, "MESSAGE_NOT_FOUND",
+                               "no canonical message with this id",
+                               "TG/cron-sourced ids: use POST /app/v1/reactions")
+            _reactions_old, pinned = _message_meta_load(con, mid)
+            if reaction:
+                con.execute("INSERT INTO reactions(msg_id, session, reaction, updated_at) "
+                            "VALUES(?,?,?,?) ON CONFLICT(msg_id) DO UPDATE SET "
+                            "reaction=excluded.reaction, updated_at=excluded.updated_at",
+                            (mid, session, reaction, time.time()))
+                _message_meta_upsert(con, mid, [reaction], pinned, session=session)
+            else:
+                con.execute("DELETE FROM reactions WHERE msg_id=?", (mid,))
+                _message_meta_upsert(con, mid, [], pinned, session=session)
+            con.commit()
             con.close()
-            raise http_err(404, "MESSAGE_NOT_FOUND",
-                           "no canonical message with this id",
-                           "TG/cron-sourced ids: use POST /app/v1/reactions")
-        _reactions_old, pinned = _message_meta_load(con, mid)
-        if reaction:
-            con.execute("INSERT INTO reactions(msg_id, session, reaction, updated_at) "
-                        "VALUES(?,?,?,?) ON CONFLICT(msg_id) DO UPDATE SET "
-                        "reaction=excluded.reaction, updated_at=excluded.updated_at",
-                        (mid, session, reaction, time.time()))
-            _message_meta_upsert(con, mid, [reaction], pinned, session=session)
-        else:
-            con.execute("DELETE FROM reactions WHERE msg_id=?", (mid,))
-            _message_meta_upsert(con, mid, [], pinned, session=session)
-        con.commit()
-        con.close()
+        finally:
+            con.close()
     except HTTPException:
         raise
     except Exception as e:  # noqa: BLE001
@@ -11867,15 +12014,18 @@ async def app_message_retract(request: Request):
     import sqlite3
     try:
         con = sqlite3.connect(CANON_DB, timeout=30)
-        con.execute("PRAGMA busy_timeout=30000")
-        reactions, pinned = _message_meta_load(con, message_id)
-        con.execute("INSERT INTO message_meta(message_id, reactions, pinned, deleted, updated_at) "
-                    "VALUES(?,?,?,1,?) ON CONFLICT(message_id) DO UPDATE SET "
-                    "deleted=1, updated_at=excluded.updated_at",
-                    (message_id, json.dumps(reactions, ensure_ascii=False),
-                     pinned, time.time()))
-        con.commit()
-        con.close()
+        try:
+            con.execute("PRAGMA busy_timeout=30000")
+            reactions, pinned = _message_meta_load(con, message_id)
+            con.execute("INSERT INTO message_meta(message_id, reactions, pinned, deleted, updated_at) "
+                        "VALUES(?,?,?,1,?) ON CONFLICT(message_id) DO UPDATE SET "
+                        "deleted=1, updated_at=excluded.updated_at",
+                        (message_id, json.dumps(reactions, ensure_ascii=False),
+                         pinned, time.time()))
+            con.commit()
+            con.close()
+        finally:
+            con.close()
     except Exception as e:  # noqa: BLE001
         _log_event("message_meta_write_failed", kind="retract",
                    message_id=message_id, error=type(e).__name__)
@@ -11923,23 +12073,29 @@ def _persona_public(pid: str, name: str, home: str, enabled: bool,
 def _persona_row_get(pid: str):
     import sqlite3
     con = sqlite3.connect(f"file:{CANON_DB}?mode=ro", uri=True, timeout=5)
-    r = con.execute("SELECT id,name,home,enabled,deleted FROM personas WHERE id=?",
-                    (pid,)).fetchone()
-    con.close()
-    return r
+    try:
+        r = con.execute("SELECT id,name,home,enabled,deleted FROM personas WHERE id=?",
+                        (pid,)).fetchone()
+        con.close()
+        return r
+    finally:
+        con.close()
 
 
 def _persona_row_upsert(pid: str, name: str, home: str, enabled: int, deleted: int):
     import sqlite3
     con = sqlite3.connect(CANON_DB, timeout=30)
-    con.execute("PRAGMA busy_timeout=30000")
-    con.execute("INSERT INTO personas(id,name,home,enabled,deleted,created_at,updated_at) "
-                "VALUES(?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET "
-                "name=excluded.name, home=excluded.home, enabled=excluded.enabled, "
-                "deleted=excluded.deleted, updated_at=excluded.updated_at",
-                (pid, name, home, enabled, deleted, time.time(), time.time()))
-    con.commit()
-    con.close()
+    try:
+        con.execute("PRAGMA busy_timeout=30000")
+        con.execute("INSERT INTO personas(id,name,home,enabled,deleted,created_at,updated_at) "
+                    "VALUES(?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET "
+                    "name=excluded.name, home=excluded.home, enabled=excluded.enabled, "
+                    "deleted=excluded.deleted, updated_at=excluded.updated_at",
+                    (pid, name, home, enabled, deleted, time.time(), time.time()))
+        con.commit()
+        con.close()
+    finally:
+        con.close()
 
 
 @app.get("/app/v1/personas")
@@ -12532,10 +12688,13 @@ def _approval_get_row(aid: str):
     """單筆統一物件(v2 meta.approval / 決定路由用);不存在回 None。"""
     import sqlite3
     con = sqlite3.connect(CANON_DB)
-    r = con.execute(f"SELECT {_APPROVAL_COLS} FROM approvals WHERE id=?",
-                    (aid,)).fetchone()
-    con.close()
-    return _approval_row(r) if r else None
+    try:
+        r = con.execute(f"SELECT {_APPROVAL_COLS} FROM approvals WHERE id=?",
+                        (aid,)).fetchone()
+        con.close()
+        return _approval_row(r) if r else None
+    finally:
+        con.close()
 
 
 def _hermes_pending_by_session() -> dict:
@@ -12545,15 +12704,18 @@ def _hermes_pending_by_session() -> dict:
     out = {}
     try:
         con = sqlite3.connect(CANON_DB)
-        _approvals_expire(con)
-        con.commit()
-        rows = con.execute(
-            f"SELECT {_APPROVAL_COLS} FROM approvals WHERE status='pending'"
-            " AND session_id LIKE 'hermes:%' ORDER BY created_at ASC").fetchall()
-        con.close()
-        for r in rows:
-            d = _approval_row(r)
-            out.setdefault(d["session_id"], d)
+        try:
+            _approvals_expire(con)
+            con.commit()
+            rows = con.execute(
+                f"SELECT {_APPROVAL_COLS} FROM approvals WHERE status='pending'"
+                " AND session_id LIKE 'hermes:%' ORDER BY created_at ASC").fetchall()
+            con.close()
+            for r in rows:
+                d = _approval_row(r)
+                out.setdefault(d["session_id"], d)
+        finally:
+            con.close()
     except Exception as e:  # noqa: BLE001
         _log_event("hermes_pending_scan_failed", error=str(e)[:160])
     return out
@@ -12715,32 +12877,35 @@ async def approval_create(request: Request):
         options = norm
     now = time.time()
     con = sqlite3.connect(CANON_DB)
-    con.execute("INSERT OR REPLACE INTO approvals"
-                "(id,title,source,risk,detail,created_at,expires_at,status,decided_at,result,callback,"
-                "session_id,provider,kind,options) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (aid, b.get("title") or "需要核准", session_id, b.get("risk") or "",
-                 b.get("detail") or "", now, now + ttl, "pending", None, None, callback,
-                 session_id or None, _approval_provider_of(session_id), kind,
-                 json.dumps(options, ensure_ascii=False) if options else None))
-    con.commit()
-    con.close()
-    title = b.get("title") or "需要核准"
     try:
-        # A3:hermes create 流程補齊卡片流 — pending → approval 卡(與
-        # cc/codex 同一組 wire shape,見 carddigest.ApprovalCardMixin)。
-        _hp_cards_feed_approval(session_id, _approval_get_row(aid) or {})
-    except Exception as e:  # noqa: BLE001
-        _log_event("hp_cards_feed_error", error=str(e)[:160])
-    if b.get("push") is False:
-        # A3:建立方已用自己的通道通知過(例:cron 報告本體已推)→ 不疊
-        # 推播;待審列/卡片照常存在。
+        con.execute("INSERT OR REPLACE INTO approvals"
+                    "(id,title,source,risk,detail,created_at,expires_at,status,decided_at,result,callback,"
+                    "session_id,provider,kind,options) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (aid, b.get("title") or "需要核准", session_id, b.get("risk") or "",
+                     b.get("detail") or "", now, now + ttl, "pending", None, None, callback,
+                     session_id or None, _approval_provider_of(session_id), kind,
+                     json.dumps(options, ensure_ascii=False) if options else None))
+        con.commit()
+        con.close()
+        title = b.get("title") or "需要核准"
+        try:
+            # A3:hermes create 流程補齊卡片流 — pending → approval 卡(與
+            # cc/codex 同一組 wire shape,見 carddigest.ApprovalCardMixin)。
+            _hp_cards_feed_approval(session_id, _approval_get_row(aid) or {})
+        except Exception as e:  # noqa: BLE001
+            _log_event("hp_cards_feed_error", error=str(e)[:160])
+        if b.get("push") is False:
+            # A3:建立方已用自己的通道通知過(例:cron 報告本體已推)→ 不疊
+            # 推播;待審列/卡片照常存在。
+            return {"id": aid, "status": "pending", "expires_at": now + ttl,
+                    "kind": kind, "session_id": session_id}
+        body = (b.get("detail") or session_id or "點開查看並決定")[:120]
+        _approval_push(aid, title, body, session_id)
         return {"id": aid, "status": "pending", "expires_at": now + ttl,
                 "kind": kind, "session_id": session_id}
-    body = (b.get("detail") or session_id or "點開查看並決定")[:120]
-    _approval_push(aid, title, body, session_id)
-    return {"id": aid, "status": "pending", "expires_at": now + ttl,
-            "kind": kind, "session_id": session_id}
+    finally:
+        con.close()
 
 
 @app.post("/app/v1/devices")
@@ -12817,23 +12982,26 @@ async def approval_list(request: Request, status: str = "", limit: int = 50,
     lim = max(1, min(int(limit or 50), 200))
     off = max(0, int(offset or 0))
     con = sqlite3.connect(CANON_DB)
-    _approvals_expire(con)
-    con.commit()
-    if status:
-        total = con.execute("SELECT COUNT(*) FROM approvals WHERE status=?",
-                            (status,)).fetchone()[0]
-        rows = con.execute(f"SELECT {_APPROVAL_COLS} "
-                           "FROM approvals WHERE status=? ORDER BY created_at DESC LIMIT ? OFFSET ?",
-                           (status, lim, off)).fetchall()
-    else:
-        total = con.execute("SELECT COUNT(*) FROM approvals").fetchone()[0]
-        rows = con.execute(f"SELECT {_APPROVAL_COLS} "
-                           "FROM approvals ORDER BY created_at DESC LIMIT ? OFFSET ?",
-                           (lim, off)).fetchall()
-    con.close()
-    out = [_approval_row(r) for r in rows]
-    return {"approvals": out, "total": total,
-            "next_offset": (off + lim) if off + lim < total else None}
+    try:
+        _approvals_expire(con)
+        con.commit()
+        if status:
+            total = con.execute("SELECT COUNT(*) FROM approvals WHERE status=?",
+                                (status,)).fetchone()[0]
+            rows = con.execute(f"SELECT {_APPROVAL_COLS} "
+                               "FROM approvals WHERE status=? ORDER BY created_at DESC LIMIT ? OFFSET ?",
+                               (status, lim, off)).fetchall()
+        else:
+            total = con.execute("SELECT COUNT(*) FROM approvals").fetchone()[0]
+            rows = con.execute(f"SELECT {_APPROVAL_COLS} "
+                               "FROM approvals ORDER BY created_at DESC LIMIT ? OFFSET ?",
+                               (lim, off)).fetchall()
+        con.close()
+        out = [_approval_row(r) for r in rows]
+        return {"approvals": out, "total": total,
+                "next_offset": (off + lim) if off + lim < total else None}
+    finally:
+        con.close()
 
 
 @app.get("/app/v1/approvals/{aid}")
@@ -12842,14 +13010,17 @@ async def approval_get(aid: str, request: Request):
     _check_auth(request)
     import sqlite3
     con = sqlite3.connect(CANON_DB)
-    _approvals_expire(con)
-    con.commit()
-    r = con.execute(f"SELECT {_APPROVAL_COLS} "
-                    "FROM approvals WHERE id=?", (aid,)).fetchone()
-    con.close()
-    if not r:
-        raise http_err(404, "APPROVAL_NOT_FOUND", "unknown approval")
-    return _approval_row(r)
+    try:
+        _approvals_expire(con)
+        con.commit()
+        r = con.execute(f"SELECT {_APPROVAL_COLS} "
+                        "FROM approvals WHERE id=?", (aid,)).fetchone()
+        con.close()
+        if not r:
+            raise http_err(404, "APPROVAL_NOT_FOUND", "unknown approval")
+        return _approval_row(r)
+    finally:
+        con.close()
 
 
 @app.post("/app/v1/approvals/{aid}/decision")
@@ -12943,40 +13114,43 @@ async def _approval_decide_core(aid: str, b: dict) -> dict:
     # (建立方自帶 result 優先,否則空字串)以免驚動既有 callback 消費者。
     result_val = str(b.get("result") or "") or (key if kind != "permission" else "")
     con = sqlite3.connect(CANON_DB)
-    cur = con.execute("UPDATE approvals SET status=?, decided_at=?, result=? "
-                      "WHERE id=? AND status='pending'",
-                      (status, time.time(), result_val, aid))
-    con.commit()
-    changed = cur.rowcount
-    cb_row = con.execute("SELECT callback FROM approvals WHERE id=?", (aid,)).fetchone()
-    con.close()
-    if not changed:
-        raise HTTPException(status_code=409, detail="already decided or expired")
     try:
-        # A3:hermes 決定發生時收尾卡片流(同一決定路徑,三 provider 一致)。
-        # _hp_cards_feed_approval 內部會篩 session_id 前綴,非 hermes: 的列
-        # (例如舊資料 session_id 空缺)在這裡是安全 no-op。
-        _hp_cards_feed_approval(str((d or {}).get("session_id") or ""),
-                               d or {}, resolved=status)
-    except Exception as e:  # noqa: BLE001
-        _log_event("hp_cards_feed_error", error=str(e)[:160])
-    # B4 (issue #9): push the decision back to the creator (Hermes skill / TG
-    # flow) so it doesn't have to poll GET /app/v1/approvals/{id}.
-    if cb_row and cb_row[0]:
-        asyncio.create_task(_approval_fire_callback(
-            aid, cb_row[0], status, result_val, key=key))
-    # 2b:人格 choices 審核決議 → 把選項的 send 文字當人格回合送回(如 FLiPER
-    # 「解除待檢討」→ 送 "resume 386563" 給潘天晴,與聊天視窗點按鈕等效)。
-    if src.startswith("hermes:") and status == "answered":
-        persona = src.split(":", 1)[1]
-        chosen = next((o for o in options if str(o.get("key")) == key), None)
-        send_text = (chosen or {}).get("send")
-        if persona in PERSONAS and send_text:
-            asyncio.create_task(
-                _persona_inject_turn(persona, str(send_text), "approval-choice"))
-            _log_event("hp_choices_decision_relayed", session=persona,
-                       approval_id=aid, key=key)
-    return {"id": aid, "status": status, "key": key}
+        cur = con.execute("UPDATE approvals SET status=?, decided_at=?, result=? "
+                          "WHERE id=? AND status='pending'",
+                          (status, time.time(), result_val, aid))
+        con.commit()
+        changed = cur.rowcount
+        cb_row = con.execute("SELECT callback FROM approvals WHERE id=?", (aid,)).fetchone()
+        con.close()
+        if not changed:
+            raise HTTPException(status_code=409, detail="already decided or expired")
+        try:
+            # A3:hermes 決定發生時收尾卡片流(同一決定路徑,三 provider 一致)。
+            # _hp_cards_feed_approval 內部會篩 session_id 前綴,非 hermes: 的列
+            # (例如舊資料 session_id 空缺)在這裡是安全 no-op。
+            _hp_cards_feed_approval(str((d or {}).get("session_id") or ""),
+                                   d or {}, resolved=status)
+        except Exception as e:  # noqa: BLE001
+            _log_event("hp_cards_feed_error", error=str(e)[:160])
+        # B4 (issue #9): push the decision back to the creator (Hermes skill / TG
+        # flow) so it doesn't have to poll GET /app/v1/approvals/{id}.
+        if cb_row and cb_row[0]:
+            asyncio.create_task(_approval_fire_callback(
+                aid, cb_row[0], status, result_val, key=key))
+        # 2b:人格 choices 審核決議 → 把選項的 send 文字當人格回合送回(如 FLiPER
+        # 「解除待檢討」→ 送 "resume 386563" 給潘天晴,與聊天視窗點按鈕等效)。
+        if src.startswith("hermes:") and status == "answered":
+            persona = src.split(":", 1)[1]
+            chosen = next((o for o in options if str(o.get("key")) == key), None)
+            send_text = (chosen or {}).get("send")
+            if persona in PERSONAS and send_text:
+                asyncio.create_task(
+                    _persona_inject_turn(persona, str(send_text), "approval-choice"))
+                _log_event("hp_choices_decision_relayed", session=persona,
+                           approval_id=aid, key=key)
+        return {"id": aid, "status": status, "key": key}
+    finally:
+        con.close()
 
 
 @app.post("/dispatch")
@@ -13209,15 +13383,18 @@ def _dashboard_approvals():
     """pending 數 + 前 5 筆統一物件(重用 approvals 表與 _approval_row)。"""
     import sqlite3
     con = sqlite3.connect(CANON_DB)
-    _approvals_expire(con)
-    con.commit()
-    pending = con.execute(
-        "SELECT COUNT(*) FROM approvals WHERE status='pending'").fetchone()[0]
-    rows = con.execute(
-        f"SELECT {_APPROVAL_COLS} FROM approvals WHERE status='pending' "
-        "ORDER BY created_at DESC LIMIT 5").fetchall()
-    con.close()
-    return {"pending": pending, "items": [_approval_row(r) for r in rows]}
+    try:
+        _approvals_expire(con)
+        con.commit()
+        pending = con.execute(
+            "SELECT COUNT(*) FROM approvals WHERE status='pending'").fetchone()[0]
+        rows = con.execute(
+            f"SELECT {_APPROVAL_COLS} FROM approvals WHERE status='pending' "
+            "ORDER BY created_at DESC LIMIT 5").fetchall()
+        con.close()
+        return {"pending": pending, "items": [_approval_row(r) for r in rows]}
+    finally:
+        con.close()
 
 
 async def _dashboard_sessions():
