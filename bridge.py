@@ -10163,7 +10163,7 @@ async def capabilities(request: Request):
                          "interactive_push", "media_artifacts",
                          "hermes_media_capabilities",
                          "hermes_media_settings",
-                         "push_register"] +
+                         "push_register", "dashboard"] +
                         (["terminal"] if POCKET_TERMINAL_ENABLED else []),
             "endpoints": ["/app/v1/sessions", "/app/v1/messages", "/reports",
                           "/app/v1/uploads",
@@ -10187,7 +10187,7 @@ async def capabilities(request: Request):
                           "/app/v2/hermes/media-capabilities",
                           "/app/v2/hermes/media-settings",
                           "/app/v2/sessions/{id}/approve", "/app/v1/terminal",
-                          "/app/v1/usage"]}
+                          "/app/v1/usage", "/app/v1/dashboard"]}
 
 
 @app.post("/app/v1/auth/apple")
@@ -13035,6 +13035,211 @@ def _fmt_item(kind, val):
     if kind == "perm":
         return f"\n› 🔐 自動允許 **{val}**\n"
     return None
+
+
+# ───────────────────────── 儀表板聚合(GET /app/v1/dashboard)──────────────
+# 首屏「指揮艙」一次拉全部:weather / oracle / approvals / sessions / health。
+# 全部唯讀;weather 是唯一外呼(open-meteo),bridge 側快取 30 分鐘,app 進
+# 前景/切分頁才打,不新增輪詢迴圈。
+
+# 水鏡卦象:oracle-engine 每日產物(唯讀)。date 非今日或 status 非 ok →
+# oracle 給 null,app 顯示「今日卦象尚未產生」。
+ORACLE_STATE_FILE = os.environ.get(
+    "POCKET_ORACLE_FILE",
+    os.path.expanduser("~/apps/oracle-engine/state/daily-latest.json"))
+
+_DASH_WEATHER_CITIES = (
+    ("taipei", "台北", 25.03, 121.56, "Asia/Taipei"),
+    ("bangkok", "曼谷", 13.75, 100.50, "Asia/Bangkok"),
+)
+_WEATHER_TTL = 1800.0                      # 30 min(拍板)
+_WEATHER_CACHE = {"at": 0.0, "data": None}  # monotonic ts → cities payload
+
+# 四個 hermes gateway 的 launchd label ↔ persona(健康卡)。
+_DASH_GATEWAYS = (
+    ("ai.hermes.gateway", "yuanfang"),
+    ("ai.hermes.gateway-fliper", "pantianqing"),
+    ("ai.hermes.gateway-shuijing", "shuijing"),
+    ("ai.hermes.gateway-xcash", "xcash"),
+)
+
+
+async def _weather_fetch_cities() -> list:
+    """open-meteo 當日:兩城市併發,高低溫 + 最大降雨機率。任一失敗整批視為
+    失敗(丟例外),由呼叫端決定回舊快取或 null。"""
+    import httpx
+
+    async def one(client, cid, name, lat, lon, tz):
+        r = await client.get(
+            "https://api.open-meteo.com/v1/forecast",
+            params={"latitude": lat, "longitude": lon,
+                    "daily": "temperature_2m_max,temperature_2m_min,"
+                             "precipitation_probability_max",
+                    "timezone": tz, "forecast_days": 1})
+        r.raise_for_status()
+        d = (r.json() or {}).get("daily") or {}
+        return {"id": cid, "name": name,
+                "temp_max": (d.get("temperature_2m_max") or [None])[0],
+                "temp_min": (d.get("temperature_2m_min") or [None])[0],
+                "precip_prob": (d.get("precipitation_probability_max") or [None])[0]}
+
+    async with httpx.AsyncClient(timeout=8) as client:
+        return list(await asyncio.gather(
+            *[one(client, *c) for c in _DASH_WEATHER_CITIES]))
+
+
+async def _dashboard_weather():
+    """快取 30 分鐘;過期才外呼。外呼失敗回舊資料(stale 總比空白好),
+    從未成功過則回 None(app 顯示「—」)。失敗不寫快取,下次再試。"""
+    now = time.monotonic()
+    if _WEATHER_CACHE["data"] is not None and now - _WEATHER_CACHE["at"] < _WEATHER_TTL:
+        return _WEATHER_CACHE["data"]
+    try:
+        cities = await _weather_fetch_cities()
+    except Exception as e:  # noqa: BLE001
+        _log_event("dashboard_weather_failed", error=type(e).__name__,
+                   error_message=str(e)[:160])
+        return _WEATHER_CACHE["data"]
+    _WEATHER_CACHE["at"] = now
+    _WEATHER_CACHE["data"] = {"fetched_at": time.time(), "cities": cities}
+    return _WEATHER_CACHE["data"]
+
+
+def _dashboard_oracle():
+    """讀 oracle-engine 每日卦象(唯讀)。缺檔/壞檔/date 非今日/status 非 ok
+    → None。只回 app 要渲染的欄位,不外流 personal_context/seed。"""
+    try:
+        with open(ORACLE_STATE_FILE, "r", encoding="utf-8") as f:
+            d = json.load(f)
+    except Exception:  # noqa: BLE001
+        return None
+    if str(d.get("status") or "") != "ok":
+        return None
+    try:
+        from zoneinfo import ZoneInfo
+        tz = ZoneInfo(str(d.get("timezone") or "Asia/Taipei"))
+        today = datetime.now(tz).strftime("%Y-%m-%d")
+    except Exception:  # noqa: BLE001
+        today = datetime.now().strftime("%Y-%m-%d")
+    if str(d.get("date") or "") != today:
+        return None
+    hx = d.get("hexagrams") or {}
+    itp = d.get("interpretation") or {}
+
+    def hexa(h):
+        h = h or {}
+        return {"number": h.get("number"), "name": h.get("name"),
+                "theme": h.get("theme")}
+
+    moving = [ln for ln in (d.get("lines") or []) if ln.get("changing")]
+    return {"date": d.get("date"),
+            "summary": itp.get("summary"),
+            "attack_or_defend": itp.get("attack_or_defend"),
+            "advice": itp.get("advice"),
+            "biggest_risk": itp.get("biggest_risk"),
+            "one_thing_to_push": itp.get("one_thing_to_push"),
+            "primary": hexa(hx.get("primary")),
+            "relating": hexa(hx.get("relating")),
+            "changing_lines": d.get("changing_lines") or [],
+            "changing_labels": [f"第{ln.get('position')}爻 {ln.get('label')}"
+                                for ln in moving]}
+
+
+def _dashboard_approvals():
+    """pending 數 + 前 5 筆統一物件(重用 approvals 表與 _approval_row)。"""
+    import sqlite3
+    con = sqlite3.connect(CANON_DB)
+    _approvals_expire(con)
+    con.commit()
+    pending = con.execute(
+        "SELECT COUNT(*) FROM approvals WHERE status='pending'").fetchone()[0]
+    rows = con.execute(
+        f"SELECT {_APPROVAL_COLS} FROM approvals WHERE status='pending' "
+        "ORDER BY created_at DESC LIMIT 5").fetchall()
+    con.close()
+    return {"pending": pending, "items": [_approval_row(r) for r in rows]}
+
+
+async def _dashboard_sessions():
+    """cc/cx/persona 各 {working, idle} — 重用既有列表邏輯的最便宜組合:
+    cc 走 _cc_sessions()(tmux 快取 capture),persona 走 PERSONAS +
+    _hermes_pending_by_session(),codex 走 thread/list(短 timeout,掛了標
+    degraded 不拖垮整包)。working = running/waiting_approval 同 v2 語意。"""
+    degraded = []
+    cc_w = cc_i = 0
+    try:
+        for s in await _cc_sessions():
+            if s.get("status") == "running" and (s.get("busy") or s.get("awaiting")):
+                cc_w += 1
+            else:
+                cc_i += 1
+    except Exception as e:  # noqa: BLE001
+        _log_event("dashboard_cc_failed", error=str(e)[:160])
+        degraded.append("claude_code")
+    hp = _hermes_pending_by_session()
+    p_w = sum(1 for mid in PERSONAS if f"hermes:{mid}" in hp)
+    p_i = len(PERSONAS) - p_w
+    cx_w = cx_i = 0
+    try:
+        res = await CODEX_APP.call(
+            "thread/list", {"limit": 20, "archived": False,
+                            "sortKey": "updated_at", "sortDirection": "desc",
+                            "useStateDbOnly": False}, timeout=5.0)
+        for t in (res or {}).get("data", [])[:20]:
+            s = _codex_session_summary(t)
+            tid = s.get("thread_id") or s.get("id")
+            active = bool(s.get("activeTurn")) or s.get("status") in ("active", "running")
+            if CODEX_APP.pending_approval_for_thread(tid) or active:
+                cx_w += 1
+            else:
+                cx_i += 1
+    except Exception as e:  # noqa: BLE001
+        _log_event("dashboard_codex_failed", error=type(e).__name__,
+                   error_message=str(e)[:160])
+        degraded.append("codex")
+    return {"cc": {"working": cc_w, "idle": cc_i},
+            "cx": {"working": cx_w, "idle": cx_i},
+            "persona": {"working": p_w, "idle": p_i},
+            "degraded": degraded}
+
+
+async def _dashboard_gateways() -> list:
+    """四個 hermes gateway 活著與否 — 一次 `launchctl list` 輕量判定
+    (pid 欄非 '-' = 活著);launchctl 不可用時 alive 全 None(app 顯示未知)。"""
+    alive_by_label = None
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "launchctl", "list",
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=5.0)
+        alive_by_label = {}
+        for line in out.decode("utf-8", "replace").splitlines():
+            parts = line.split("\t")
+            if len(parts) >= 3:
+                alive_by_label[parts[2].strip()] = parts[0].strip() != "-"
+    except Exception as e:  # noqa: BLE001
+        _log_event("dashboard_launchctl_failed", error=str(e)[:160])
+    return [{"label": label, "persona": persona,
+             "alive": (alive_by_label.get(label, False)
+                       if alive_by_label is not None else None)}
+            for label, persona in _DASH_GATEWAYS]
+
+
+@app.get("/app/v1/dashboard")
+async def app_dashboard(request: Request):
+    """儀表板聚合端點:一次回 weather/oracle/approvals/sessions/health。
+    Bearer 驗證同其他 /app/v1/*;全唯讀、可併發的子項一起 gather。"""
+    _check_auth(request)
+    weather, sessions, gateways = await asyncio.gather(
+        _dashboard_weather(), _dashboard_sessions(), _dashboard_gateways())
+    return {"generated_at": datetime.now(timezone.utc).isoformat(),
+            "weather": weather,
+            "oracle": _dashboard_oracle(),
+            "approvals": _dashboard_approvals(),
+            "sessions": sessions,
+            "health": {"gateways": gateways,
+                       "apns_configured": apns_configured(),
+                       "devices": len(_devices())}}
 
 
 @app.get("/health")
