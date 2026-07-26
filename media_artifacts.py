@@ -148,10 +148,10 @@ class MediaArtifactStore:
 
     def _connect(self) -> sqlite3.Connection:
         self._ensure_schema()
-        conn = sqlite3.connect(self.db_path, timeout=10.0)
+        conn = sqlite3.connect(self.db_path, timeout=30.0)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON")
-        conn.execute("PRAGMA busy_timeout = 10000")
+        conn.execute("PRAGMA busy_timeout = 30000")
         return conn
 
     def _ensure_schema(self) -> None:
@@ -164,7 +164,7 @@ class MediaArtifactStore:
             self.blob_root.mkdir(parents=True, exist_ok=True, mode=0o700)
             os.chmod(self.root, 0o700)
             os.chmod(self.blob_root, 0o700)
-            conn = sqlite3.connect(self.db_path, timeout=10.0)
+            conn = sqlite3.connect(self.db_path, timeout=30.0)
             try:
                 os.chmod(self.db_path, 0o600)
                 conn.executescript(

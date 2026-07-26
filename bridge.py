@@ -39,7 +39,8 @@ from pathlib import Path
 import media_artifacts
 import hermes_media
 from fastapi import FastAPI, Request, HTTPException, WebSocket, WebSocketDisconnect
-from fastapi.responses import JSONResponse, StreamingResponse, FileResponse, HTMLResponse
+from fastapi.responses import (JSONResponse, StreamingResponse, FileResponse,
+                               HTMLResponse, PlainTextResponse)
 from starlette.websockets import WebSocketState
 
 from acp_client import ACPPool, canonical_telegram_session
@@ -58,7 +59,7 @@ SUBSESSIONS: dict = {}
 _BG_TASKS: set = set()
 # A3-3:主事件圈把手 —— 讓 to_thread 裡的同步碼(報告同步的 notice 建立)
 # 能 call_soon_threadsafe 把卡片 feed 排回單圈(SessionCardStore 不上鎖)。
-# startup 時由 _start_log_rotation 填入。
+# startup 時由 _start_housekeeping 填入。
 _MAIN_LOOP = None
 
 # Durable media index.  Construction is lazy so importing bridge.py in tests
@@ -76,6 +77,12 @@ SSE_KEEPALIVE_SECS = 2.0
 # deliberately configurable so the cleanup path can be exercised quickly in
 # regression tests while production keeps the five-minute ceiling.
 PERSONA_STALL_LIMIT_SECS = float(os.environ.get("PERSONA_STALL_LIMIT_SECS", "300"))
+
+# A follow stream that has sent ZERO data (keepalives don't count) for this long
+# gets disconnected — a client that hangs without reading otherwise pins the
+# generator (and its task) forever. Shared by every long-lived streaming
+# endpoint (issue #7 item 4); env-overridable so tests can trip it fast.
+_STREAM_IDLE_CUTOFF_SECS = float(os.environ.get("BRIDGE_STREAM_IDLE_SECS", "1800"))
 
 # 工具步驟 cmd/路徑的截斷上限(#38 diff 卡缺口):140 會把深路徑攔腰砍斷,
 # app 的 diff chip 拿殘缺路徑去打 /filediff 就 404。所有 transcript/步驟
@@ -186,6 +193,53 @@ def _log_event(event: str, **fields) -> None:
         **fields,
     }
     print("[bridge-event] " + json.dumps(payload, ensure_ascii=False, sort_keys=True), flush=True)
+
+
+# ── 例外可觀測性(issue #7 項目 1)─────────────────────────────────────────
+# 稽核時全檔有 140+ 處 `except Exception` 完全不留痕:壞了只看得到症狀
+# (B1「送圖 502 沒有 stderr」就是這樣查不動)。這裡給一個統一入口,把
+# 「吞掉例外」變成「吞掉但留痕」,而且**不改控制流、不改回應碼**。
+#
+# 為什麼需要節流:這些 handler 有一大票在 0.5s 巡一次的 watcher 迴圈裡
+# (state.db 輪詢、CC follower…)。無腦每次都印,反而會把 bridge.out.log
+# 用比現在快兩個數量級的速度塞爆——那就是同一張 issue 的項目 6。所以:
+#
+#   expected=True (預期失敗:第一次開機表還沒建、client 丟壞 JSON、
+#       tmux pane 還沒生出來…)→ 同一個 (site, 例外型別) 在 cooldown 內
+#       只印一次,期間再發生只累計 suppressed 數,下次印出時一起帶出來。
+#   expected=False (異常:不該發生的事)→ 每次都印,不節流。
+_EXC_LOG_COOLDOWN_SECS = float(os.environ.get("BRIDGE_EXC_LOG_COOLDOWN", "60"))
+_EXC_LOG_STATE: dict = {}     # (site, exc_type) -> [last_logged_monotonic, suppressed]
+_EXC_LOG_LOCK = threading.Lock()
+
+
+def _log_exc(site: str, exc: BaseException, *, expected: bool = False,
+             **fields) -> None:
+    """把被吞掉的例外記成結構化事件。`site` 是「函式名[#序號]」,可直接 grep。"""
+    etype = type(exc).__name__
+    suppressed = 0
+    if expected:
+        key = (site, etype)
+        now = time.monotonic()
+        with _EXC_LOG_LOCK:
+            st = _EXC_LOG_STATE.get(key)
+            if st is not None and now - st[0] < _EXC_LOG_COOLDOWN_SECS:
+                st[1] += 1
+                return
+            if st is None:
+                _EXC_LOG_STATE[key] = [now, 0]
+            else:
+                suppressed, st[0], st[1] = st[1], now, 0
+    payload = {
+        "site": site,
+        "error": etype,
+        "error_message": str(exc)[:200],
+        "severity": "expected" if expected else "anomaly",
+        **fields,
+    }
+    if suppressed:
+        payload["suppressed"] = suppressed
+    _log_event("exc_swallowed", **payload)
 
 
 def _media_store() -> media_artifacts.MediaArtifactStore:
@@ -329,7 +383,8 @@ async def _json_body(request: Request) -> dict:
     hit their own field validation (400) instead of the parser's 500."""
     try:
         body = await request.json()
-    except Exception:  # noqa: BLE001
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("_json_body", _exc, expected=True)
         return {}
     return body if isinstance(body, dict) else {}
 
@@ -372,7 +427,8 @@ def _avatar_manifest() -> dict:
             with open(path, encoding="utf-8") as f:
                 _avatar_manifest_cache["data"] = json.load(f).get("personas") or {}
             _avatar_manifest_cache["mtime"] = mt
-    except Exception:  # noqa: BLE001 — 無 manifest = 無 overlay
+    except Exception as _exc:  # noqa: BLE001 — 無 manifest = 無 overlay
+        _log_exc("_avatar_manifest", _exc, expected=True)
         _avatar_manifest_cache["data"] = {}
         _avatar_manifest_cache["mtime"] = -1.0
     return _avatar_manifest_cache["data"]
@@ -397,7 +453,8 @@ def _personas_db_rows() -> list:
             return rows
         finally:
             con.close()
-    except Exception:  # noqa: BLE001
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("_personas_db_rows", _exc, expected=True)
         return []      # table not created yet (first boot) → builtins only
 
 
@@ -496,7 +553,52 @@ async def _bridge_http_exception_handler(request: Request, exc: StarletteHTTPExc
     }
     headers = dict(getattr(exc, "headers", None) or {})
     headers["X-Error-Code"] = code
+    # issue #7 項目 1:4xx/5xx 要分明。4xx 是**客戶端**的錯(送壞 body、問不
+    # 存在的 session),量大且無害,節流成一分鐘一筆免得洗版;5xx 是**我們**
+    # 的錯(上游掛掉、provider 逾時),每筆都要留痕,B1「送圖 502 查不到原因」
+    # 就是缺這個。回應碼與 body 一個字都不動,純加可觀測性。
+    server_fault = exc.status_code >= 500
+    if server_fault or _http_4xx_should_log(code, request.url.path):
+        _log_event(
+            "http_error_5xx" if server_fault else "http_error_4xx",
+            status=exc.status_code, code=code, method=request.method,
+            path=request.url.path, client=_client_host(request),
+            detail=detail[:200],
+        )
     return JSONResponse(status_code=exc.status_code, content=body, headers=headers)
+
+
+_HTTP_4XX_LOG_COOLDOWN = 60.0
+_HTTP_4XX_LOG_STATE: dict = {}
+_HTTP_4XX_LOG_LOCK = threading.Lock()
+
+
+def _http_4xx_should_log(code: str, path: str) -> bool:
+    """4xx 節流:同一 (code, path) 一分鐘一筆。掃描器/重連風暴打 401/404 時
+    (稽核裡有過單一 log 檔 11,936 筆 404)不會反過來把磁碟塞爆。"""
+    key = (code, path)
+    now = time.monotonic()
+    with _HTTP_4XX_LOG_LOCK:
+        last = _HTTP_4XX_LOG_STATE.get(key, 0.0)
+        if now - last < _HTTP_4XX_LOG_COOLDOWN:
+            return False
+        _HTTP_4XX_LOG_STATE[key] = now
+        if len(_HTTP_4XX_LOG_STATE) > 2000:      # 有界,不隨路徑數無限長
+            _HTTP_4XX_LOG_STATE.clear()
+            _HTTP_4XX_LOG_STATE[key] = now
+    return True
+
+
+@app.exception_handler(Exception)
+async def _bridge_unhandled_exception_handler(request: Request, exc: Exception):
+    """未被接住的例外 → 結構化事件。回應與 Starlette 預設**完全相同**
+    (`PlainTextResponse("Internal Server Error", 500)`),而且 ServerErrorMiddleware
+    仍會把例外往外拋,所以 uvicorn 的 traceback 照樣進 bridge.err.log。
+    也就是說:只多一筆可查的事件,回應碼/body/traceback 全部不變。"""
+    _log_exc("unhandled_request", exc, expected=False,
+             method=request.method, path=request.url.path,
+             client=_client_host(request))
+    return PlainTextResponse("Internal Server Error", status_code=500)
 
 
 @app.get("/")
@@ -629,13 +731,15 @@ def _upload_ref_path(value: str | None) -> str | None:
     try:
         root = UPLOAD_DIR.expanduser().resolve()
         path = Path(os.path.expanduser(raw)).resolve()
-    except Exception:  # noqa: BLE001
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("_upload_ref_path", _exc, expected=True)
         return None
     if not (path == root or root in path.parents):
         return None
     try:
         return str(path) if path.is_file() else None
-    except Exception:  # noqa: BLE001
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("_upload_ref_path#2", _exc, expected=True)
         return None
 
 
@@ -1149,7 +1253,8 @@ def _account_device_for_token(device_token: str, touch: bool = True):
             return _account_device_row(row)
         finally:
             con.close()
-    except Exception:  # noqa: BLE001
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("_account_device_for_token", _exc, expected=True)
         return None
 
 
@@ -1604,7 +1709,8 @@ def _event_since(session: str, since_seq: int = 0, limit: int = 500) -> list[dic
     for r in rows:
         try:
             data = json.loads(r[2] or "{}")
-        except Exception:  # noqa: BLE001
+        except Exception as _exc:  # noqa: BLE001
+            _log_exc("_event_since", _exc, expected=True)
             data = {}
         out.append({"seq": r[0], "ts": r[3], "type": r[1], "data": data})
     return out
@@ -1640,7 +1746,8 @@ def _event_since_all(since_seq: int = 0, limit: int = 500) -> list[dict]:
     for r in rows:
         try:
             data = json.loads(r[3] or "{}")
-        except Exception:  # noqa: BLE001
+        except Exception as _exc:  # noqa: BLE001
+            _log_exc("_event_since_all", _exc, expected=True)
             data = {}
         out.append({"seq": r[0], "ts": r[4], "type": r[2],
                     "session": r[1], "data": data})
@@ -1658,7 +1765,8 @@ def _event_latest_seq(session: str) -> int:
             return int(row[0] or 0)
         finally:
             con.close()
-    except Exception:  # noqa: BLE001
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("_event_latest_seq", _exc, expected=True)
         return 0
 
 
@@ -1688,7 +1796,8 @@ def _event_mirror_messages(session: str, msgs: list) -> int:
     for m in msgs or []:
         try:
             key = _event_msg_key(m)
-        except Exception:  # noqa: BLE001
+        except Exception as _exc:  # noqa: BLE001
+            _log_exc("_event_mirror_messages", _exc, expected=True)
             continue
         if _event_append(session, "message.upsert", {"message": m},
                          external_id=key):
@@ -1826,7 +1935,7 @@ def _canon_add(session: str, role: str, content: str, attachments=None,
     mid = mid or uuid.uuid4().hex
     now = created_at if created_at is not None else time.time()
     try:
-        con = sqlite3.connect(CANON_DB)
+        con = sqlite3.connect(CANON_DB, timeout=30)
         try:
             con.execute("INSERT OR REPLACE INTO messages"
                         "(id,session,role,content,attachments,created_at,status,client_id) "
@@ -1891,7 +2000,8 @@ def _canon_reply_for_client(session: str, client_id: str):
             return row[0] if row else None
         finally:
             con.close()
-    except Exception:  # noqa: BLE001
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("_canon_reply_for_client", _exc, expected=False, session=session)
         return None
 
 
@@ -1905,7 +2015,8 @@ def _canon_messages(session: str, limit: int = 200):
             con.close()
         finally:
             con.close()
-    except Exception:  # noqa: BLE001
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("_canon_messages", _exc, expected=False, session=session)
         return []
     rows.reverse()
     return [{"id": r[0], "role": r[1], "content": r[2],
@@ -1916,7 +2027,8 @@ def _canon_messages(session: str, limit: int = 200):
 def _app_message_seq(m: dict) -> int:
     try:
         return int(float(m.get("ts") or 0) * 1000)
-    except Exception:  # noqa: BLE001
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("_app_message_seq", _exc, expected=True)
         return int(time.time() * 1000)
 
 
@@ -2065,7 +2177,8 @@ def _subsessions_load():
          last_user, last_at, output_json) in rows:
         try:
             output = [(k, v) for k, v in json.loads(output_json or "[]")]
-        except Exception:  # noqa: BLE001
+        except Exception as _exc:  # noqa: BLE001
+            _log_exc("_subsessions_load", _exc, expected=True)
             output = []
         if status == "running":
             status = "interrupted"
@@ -2245,7 +2358,8 @@ def _delegation_public(row, runtime_status: str | None = None) -> dict:
     d = dict(row)
     try:
         meta = json.loads(d.get("meta") or "{}")
-    except Exception:  # noqa: BLE001
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("_delegation_public", _exc, expected=True)
         meta = {}
     d["display_title"] = _delegation_display_title(d)
     d["status"] = runtime_status or d.get("status") or "created"
@@ -2281,7 +2395,8 @@ def _delegation_rows(limit: int = 50, parent_persona: str = "", status: str = ""
             return rows
         finally:
             con.close()
-    except Exception:  # noqa: BLE001
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("_delegation_rows", _exc, expected=True)
         return []
 
 
@@ -2434,7 +2549,8 @@ def _delegation_meta(d: dict) -> dict:
     try:
         m = d.get("meta")
         return json.loads(m) if isinstance(m, str) else (m or {})
-    except Exception:  # noqa: BLE001
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("_delegation_meta", _exc, expected=True)
         return {}
 
 
@@ -2486,7 +2602,8 @@ async def _delegation_notify(d: dict, event: str, summary: str = "") -> None:
                               (summary.strip() or status_txt)[:160],
                               {"kind": "delegation_done",
                                "delegation_id": str(d.get("id") or "")})
-        except Exception:  # noqa: BLE001
+        except Exception as _exc:  # noqa: BLE001
+            _log_exc("_delegation_notify", _exc, expected=True)
             pass
 
 
@@ -2597,7 +2714,8 @@ def _report_actions_loads(raw) -> list:
         return []
     try:
         val = json.loads(raw)
-    except Exception:  # noqa: BLE001
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("_report_actions_loads", _exc, expected=True)
         return []
     return val if isinstance(val, list) else []
 
@@ -2657,7 +2775,8 @@ def _report_events(session: str, limit: int = 20, newest_first: bool = False):
             con.close()
         finally:
             con.close()
-    except Exception:  # noqa: BLE001
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("_report_events", _exc, expected=True)
         return []
     return [{
         "id": r[0], "label": r[1], "name": r[2], "content": r[3],
@@ -2694,7 +2813,8 @@ def _clip_text(text: str, max_chars: int) -> str:
 def _fmt_ts(ts) -> str:
     try:
         return time.strftime("%Y-%m-%d %H:%M", time.localtime(float(ts)))
-    except Exception:  # noqa: BLE001
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("_fmt_ts", _exc, expected=True)
         return ""
 
 
@@ -2777,7 +2897,7 @@ def _devices() -> list:
 def _device_add(token: str, platform: str = "ios") -> None:
     import sqlite3
     try:
-        con = sqlite3.connect(CANON_DB)
+        con = sqlite3.connect(CANON_DB, timeout=30)
         try:
             con.execute("INSERT OR REPLACE INTO devices(token,platform,created_at) "
                         "VALUES(?,?,?)", (token, platform, time.time()))
@@ -2793,7 +2913,7 @@ def _device_add(token: str, platform: str = "ios") -> None:
 def _device_remove(token: str) -> None:
     import sqlite3
     try:
-        con = sqlite3.connect(CANON_DB)
+        con = sqlite3.connect(CANON_DB, timeout=30)
         try:
             con.execute("DELETE FROM devices WHERE token=?", (token,))
             con.commit()
@@ -2946,6 +3066,7 @@ async def push_notify(title: str, body: str, data: dict | None = None,
                 failures.append({"code": code, "detail": (text or "")[:160],
                                  "token": tok[:8]})
         except Exception as e:  # noqa: BLE001
+            _log_exc("push_notify", e, expected=True)
             failures.append({"code": "exc", "detail": str(e)[:160], "token": tok[:8]})
     if failures:
         _log_event("push_notify_failed", title=title[:48], sent=sent,
@@ -2972,7 +3093,8 @@ def _approval_decision_keys(aid: str) -> tuple:
     審核中心處理。"""
     try:
         d = _approval_get_row(aid)
-    except Exception:  # noqa: BLE001
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("_approval_decision_keys", _exc, expected=True)
         return None, None
     if not d or (d.get("kind") or "permission") != "permission":
         return None, None
@@ -3023,7 +3145,8 @@ def _push_persona_reply(session: str, content: str) -> None:
     disp = PERSONAS[session][0]
     try:
         clean, _bodies = carddigest.extract_studio_cards(content or "")
-    except Exception:  # noqa: BLE001
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("_push_persona_reply", _exc, expected=True)
         clean = content or ""
     clean = re.sub(r"<details>.*?</details>", "", clean, flags=re.S).strip()
     body = (clean or "傳了一則訊息")[:140]
@@ -3068,6 +3191,7 @@ async def _persona_content_stream(model: str, prompt: str):
             async for kind, val in session.prompt_stream(prompt):
                 await q.put((kind, val))
         except Exception as e:  # noqa: BLE001
+            _log_exc("_persona_content_stream.pump", e, expected=False, model=model)
             await q.put(("error", str(e)))
         finally:
             await q.put(("end", None))
@@ -3116,7 +3240,8 @@ async def _persona_content_stream(model: str, prompt: str):
         pump_stopped = True
         try:
             await asyncio.wait_for(session.cancel(), timeout=2.0)
-        except Exception:
+        except Exception as _exc:
+            _log_exc("_persona_content_stream.stop_pump", _exc, expected=True)
             pass
         if not pump_task.done():
             pump_task.cancel()
@@ -3124,14 +3249,16 @@ async def _persona_content_stream(model: str, prompt: str):
             await asyncio.wait_for(pump_task, timeout=2.0)
         except asyncio.CancelledError:
             pass
-        except Exception:
+        except Exception as _exc:
+            _log_exc("_persona_content_stream.stop_pump#2", _exc, expected=True)
             reset = True
         # A five-minute silent provider is not safe to reuse even when task
         # cancellation released the Python lock: its RPC turn may still run.
         if reset or session.is_busy():
             try:
                 await session.reset()
-            except Exception:
+            except Exception as _exc:
+                _log_exc("_persona_content_stream.stop_pump#3", _exc, expected=True)
                 pass
 
     try:
@@ -3188,6 +3315,7 @@ async def _persona_content_stream(model: str, prompt: str):
                     try:
                         yield ("content", await run_hermes(model, prompt))
                     except Exception as e2:  # noqa: BLE001
+                        _log_exc("_persona_content_stream", e2, expected=True)
                         yield ("content", f"⚠️ {e2}")
                 else:
                     yield ("content", f"\n\n⚠️ 串流中斷:{val}")
@@ -3239,6 +3367,11 @@ async def chat_completions(request: Request):
             yield schunk({"role": "assistant", "content": ""})
             idx = start_idx
             quiet = 0.0
+            # issue #7 項目 4:這圈的出口條件是 sub["status"] 不再是 running。
+            # 正常路徑有 _stream_agent 的 finally 保證會落到 done,但只要有一條
+            # 路徑漏掉(狀態被外部改寫、字典被換掉),這裡就是無限迴圈。加一道
+            # 與 CC stream 同款的 idle 上限當保險絲。
+            last_out = time.monotonic()
             while True:
                 while idx < len(sub["output"]):
                     kind, val = sub["output"][idx]
@@ -3247,7 +3380,12 @@ async def chat_completions(request: Request):
                     if c:
                         yield schunk({"content": c})
                         quiet = 0.0
+                        last_out = time.monotonic()
                 if sub.get("status") != "running" and idx >= len(sub["output"]):
+                    break
+                if time.monotonic() - last_out >= _STREAM_IDLE_CUTOFF_SECS:
+                    _log_event("subagent_stream_idle_cutoff", sid=model,
+                               status=sub.get("status"))
                     break
                 await asyncio.sleep(0.4)
                 quiet += 0.4
@@ -3305,7 +3443,8 @@ async def chat_completions(request: Request):
 
     try:
         content = "(沒有收到訊息)" if not prompt else await acp_full(model, prompt)
-    except Exception:
+    except Exception as _exc:
+        _log_exc("chat_completions", _exc, expected=False, model=model, stage="acp_full_fallback_to_cold")
         content = await run_hermes(model, prompt)
     return JSONResponse({
         "id": cid, "object": "chat.completion", "created": created, "model": model,
@@ -3532,7 +3671,8 @@ class CodexAppServerClient:
                 text = raw.decode("utf-8", "replace").strip()
                 if text and "WARNING: proceeding" not in text:
                     _log_event("codex_app_server_stderr", message=text[:240])
-        except Exception:  # noqa: BLE001
+        except Exception as _exc:  # noqa: BLE001
+            _log_exc("CodexAppServerClient._read_stderr", _exc, expected=True)
             pass
 
     def _append(self, thread_id: str, item):
@@ -4354,7 +4494,8 @@ async def codex_session_archive(thread_id: str, request: Request):
     body = {}
     try:
         body = await request.json()
-    except Exception:  # noqa: BLE001
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("codex_session_archive", _exc, expected=True)
         pass
     _check_auth(request)
     archived = body.get("archived", True)
@@ -4378,6 +4519,7 @@ async def codex_session_archive(thread_id: str, request: Request):
             await CODEX_APP.call(method, params, timeout=15.0)
             return {"ok": True, "method": method}
         except Exception as e:  # noqa: BLE001
+            _log_exc("codex_session_archive#2", e, expected=True)
             last = e
     _codex_http_error(last or Exception("archive failed"))
 
@@ -4646,7 +4788,8 @@ def _pair_code_meta(value):
         }
     try:
         return {"expiry": float(value), "apple_user_id": None}
-    except Exception:  # noqa: BLE001
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("_pair_code_meta", _exc, expected=True)
         return {"expiry": 0.0, "apple_user_id": None}
 
 
@@ -4672,7 +4815,8 @@ async def pair_new(request: Request):
     _check_auth(request)
     try:
         body = await request.json()
-    except Exception:  # noqa: BLE001
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("pair_new", _exc, expected=True)
         body = {}
     required_account = request.url.path.startswith("/app/v1/")
     user = _account_user_from_request(request, body, required=required_account)
@@ -4696,7 +4840,8 @@ async def pair_claim(request: Request):
     credential (no bearer needed); it's single-use and expires in 5 minutes."""
     try:
         body = await request.json()
-    except Exception:
+    except Exception as _exc:
+        _log_exc("pair_claim", _exc, expected=True)
         body = {}
     code = (body.get("code") or "").strip()
     name = (str(body.get("device_name") or "iPhone"))[:60]
@@ -4769,7 +4914,8 @@ async def pair_revoke(request: Request):
     _check_auth(request)
     try:
         body = await request.json()
-    except Exception:
+    except Exception as _exc:
+        _log_exc("pair_revoke", _exc, expected=True)
         body = {}
     dev_id = (body.get("id") or "").strip()
     removed = 0
@@ -4878,6 +5024,7 @@ async def app_v1_terminal(websocket: WebSocket):
             cwd=home, env=env, close_fds=True,
         )
     except Exception as e:  # noqa: BLE001
+        _log_exc("app_v1_terminal", e, expected=True)
         os.close(master_fd)
         os.close(slave_fd)
         await websocket.send_text(json.dumps({"type": "error", "message": f"spawn failed: {e}"}))
@@ -4903,7 +5050,8 @@ async def app_v1_terminal(websocket: WebSocket):
             try:
                 await websocket.send_text(json.dumps(
                     {"type": "output", "data": data.decode("utf-8", "replace")}))
-            except Exception:  # noqa: BLE001 — socket went away mid-send
+            except Exception as _exc:  # noqa: BLE001 — socket went away mid-send
+                _log_exc("app_v1_terminal.pump_output", _exc, expected=True)
                 return
 
     async def pump_input():
@@ -4915,7 +5063,8 @@ async def app_v1_terminal(websocket: WebSocket):
                 return
             try:
                 msg = json.loads(raw)
-            except Exception:  # noqa: BLE001
+            except Exception as _exc:  # noqa: BLE001
+                _log_exc("app_v1_terminal.pump_input", _exc, expected=True)
                 continue
             mtype = msg.get("type")
             if mtype == "input":
@@ -4949,7 +5098,8 @@ async def app_v1_terminal(websocket: WebSocket):
             if proc.poll() is None:
                 os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
                 proc.wait(timeout=2)
-        except Exception:  # noqa: BLE001
+        except Exception as _exc:  # noqa: BLE001
+            _log_exc("app_v1_terminal#2", _exc, expected=True)
             pass
         try:
             os.close(master_fd)
@@ -4962,7 +5112,8 @@ async def app_v1_terminal(websocket: WebSocket):
             code = proc.returncode if proc.returncode is not None else 0
             await websocket.send_text(json.dumps({"type": "exit", "code": code}))
             await websocket.close()
-        except Exception:  # noqa: BLE001
+        except Exception as _exc:  # noqa: BLE001
+            _log_exc("app_v1_terminal#3", _exc, expected=True)
             pass
 
 
@@ -4991,7 +5142,8 @@ async def client_log_write(request: Request):
         if len(lines) > 3000:
             with open(CLIENT_LOG, "w", encoding="utf-8") as f:
                 f.write("\n".join(lines[-3000:]) + "\n")
-    except Exception:  # noqa: BLE001
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("client_log_write", _exc, expected=True)
         pass
     return {"ok": True}
 
@@ -5005,7 +5157,8 @@ async def client_log_read(request: Request, limit: int = 100, level: str = ""):
     for line in open(CLIENT_LOG, encoding="utf-8").read().splitlines()[-1000:]:
         try:
             e = json.loads(line)
-        except Exception:  # noqa: BLE001
+        except Exception as _exc:  # noqa: BLE001
+            _log_exc("client_log_read", _exc, expected=True)
             continue
         if level and e.get("level") != level:
             continue
@@ -5229,6 +5382,7 @@ async def codex_session_stream(thread_id: str, request: Request, replay: int = 2
                 if text:
                     yield chunk({"content": text})
             except Exception as e:  # noqa: BLE001
+                _log_exc("codex_session_stream.gen", e, expected=True)
                 yield chunk({"content": f"\n⚠️ history failed: {e}\n"})
         idx = 0
         if replay <= 0 and not CODEX_APP.is_active(thread_id):
@@ -5301,14 +5455,10 @@ def _claude_argv(parent: str, prompt: str, resume: str | None = None):
     return argv
 
 
-# A follow stream that has sent ZERO data (keepalives don't count) for this
-# long gets disconnected — a client that hangs without reading otherwise pins
-# the generator forever.
-_STREAM_IDLE_CUTOFF_SECS = 1800.0
-
 # A sub-agent that produces NOTHING on stdout for this long is stalled: kill it
 # so its _BG_TASKS entry finishes instead of leaking a forever-pending task.
-_AGENT_STALL_SECS = 1800.0
+# env-overridable so the regression test can trip it in milliseconds.
+_AGENT_STALL_SECS = float(os.environ.get("BRIDGE_AGENT_STALL_SECS", "1800"))
 
 
 async def _stream_agent(sid: str, argv: list, cwd: str, fail_label: str):
@@ -5362,6 +5512,20 @@ async def _stream_agent(sid: str, argv: list, cwd: str, fail_label: str):
         _log_event("subagent_stream_failed", sid=sid,
                    error=type(e).__name__, error_message=str(e)[:160])
     finally:
+        # issue #7 項目 3:任何離開路徑都不准留下孤兒子行程。
+        # `except Exception` 接不到 CancelledError(它是 BaseException),所以
+        # 關機/呼叫端取消時,原本會直接跳到 finally 而把 claude/codex 子行程
+        # 留在那裡跑到天荒地老——這就是「hang task 累積」的來源。放在 finally
+        # 最前面:就算下面的 await 出事,也已經先收掉了。
+        if proc is not None and proc.returncode is None:
+            try:
+                proc.kill()
+                _log_event("subagent_proc_killed", sid=sid, pid=proc.pid,
+                           tool=sub.get("tool"))
+            except ProcessLookupError:
+                pass
+            except Exception as _exc:  # noqa: BLE001
+                _log_exc("_stream_agent.kill", _exc, expected=True, sid=sid)
         if sub.get("status") != "stalled":
             sub["status"] = "done"
         sub["lastAt"] = time.time()
@@ -5467,7 +5631,8 @@ def _persona_preview_tg(home: str):
                     return (text[:80], ts)
         finally:
             con.close()
-    except Exception:
+    except Exception as _exc:
+        _log_exc("_persona_preview_tg", _exc, expected=True)
         pass
     return (None, None)
 
@@ -5479,7 +5644,8 @@ def _persona_preview_canon(session: str):
     shows — so the list preview never leaks a raw fence or tool log."""
     try:
         msgs = _canon_messages(session, 20)
-    except Exception:  # noqa: BLE001
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("_persona_preview_canon", _exc, expected=True)
         return (None, None)
     for m in reversed(msgs):
         if m.get("role") not in ("user", "assistant"):
@@ -5534,15 +5700,18 @@ def _persona_preview_merged(session: str, home: str):
     msgs = []
     try:
         msgs.extend(_canon_messages(session, 30))          # app turns (canonical.db)
-    except Exception:  # noqa: BLE001
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("_persona_preview_merged", _exc, expected=True)
         pass
     try:
         msgs.extend(_persona_history(home, 30))            # Telegram (state.db), user-cleaned
-    except Exception:  # noqa: BLE001
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("_persona_preview_merged#2", _exc, expected=True)
         pass
     try:
         msgs.extend(_report_messages(session, 10))         # cron briefs (role=assistant)
-    except Exception:  # noqa: BLE001
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("_persona_preview_merged#3", _exc, expected=True)
         pass
 
     def _visible(m) -> str | None:
@@ -5658,7 +5827,8 @@ def _tg_extract_attachments(content: str):
             return True
         try:
             return _media_store().resolve_original(path) is not None
-        except Exception:  # noqa: BLE001
+        except Exception as _exc:  # noqa: BLE001
+            _log_exc("_tg_extract_attachments._tg_file_ok", _exc, expected=True)
             return False
 
     def _img_att(path: str) -> str:
@@ -6099,7 +6269,8 @@ def _cc_reseed_pins_from_files() -> int:
     seeded = 0
     try:
         names = os.listdir(pdir)
-    except Exception:  # noqa: BLE001
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("_cc_reseed_pins_from_files", _exc, expected=True)
         return 0
     for name in names:
         if name.endswith(".tmp"):
@@ -6107,7 +6278,8 @@ def _cc_reseed_pins_from_files() -> int:
         try:
             with open(os.path.join(pdir, name)) as f:
                 sid = f.read().strip()
-        except Exception:  # noqa: BLE001
+        except Exception as _exc:  # noqa: BLE001
+            _log_exc("_cc_reseed_pins_from_files#2", _exc, expected=True)
             continue
         if _cc_valid_sid(sid):
             _CC_SID_PINS[name] = sid
@@ -6173,7 +6345,8 @@ async def _cc_pane_session_id(name: str):
                         sid = m.group(1)
                         break
                 stack.extend(kids.get(pid, []))
-    except Exception:  # noqa: BLE001
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("_cc_pane_session_id", _exc, expected=True)
         sid = None
     _cc_cache_sid(name, sid, now=now)
     return sid
@@ -6203,7 +6376,8 @@ async def _cc_pane_has_remote_control(name: str) -> bool:
             if "claude" in cmd and (remote_arg in cmd or remote_eq in cmd):
                 return True
             stack.extend(kids.get(pid, []))
-    except Exception:  # noqa: BLE001
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("_cc_pane_has_remote_control", _exc, expected=True)
         return False
     return False
 
@@ -6235,7 +6409,8 @@ def _cc_conf_rows():
                 parts = line.split("|")
                 if len(parts) >= 3:
                     rows.append((parts[0], parts[1], parts[2].strip()))
-    except Exception:  # noqa: BLE001
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("_cc_conf_rows", _exc, expected=True)
         pass
     return rows
 
@@ -6325,7 +6500,8 @@ def _cc_app_owned_names() -> set:
     try:
         with open(APP_OWNED_CC) as f:
             return {ln.strip() for ln in f if ln.strip() and not ln.startswith("#")}
-    except Exception:  # noqa: BLE001
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("_cc_app_owned_names", _exc, expected=True)
         return set()
 
 
@@ -6333,7 +6509,8 @@ def _cc_approvals_excluded() -> set:
     try:
         with open(APPROVALS_EXCLUDE) as f:
             return {ln.strip() for ln in f if ln.strip() and not ln.startswith("#")}
-    except Exception:  # noqa: BLE001
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("_cc_approvals_excluded", _exc, expected=True)
         return set()
 
 
@@ -6385,7 +6562,8 @@ def _cc_fresh_hook_state(name: str):
     try:
         if time.time() - float(state.get("updated_at") or 0) <= _CC_HOOK_TTL:
             return state
-    except Exception:  # noqa: BLE001
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("_cc_fresh_hook_state", _exc, expected=True)
         return None
     return None
 
@@ -6394,7 +6572,8 @@ async def _tmux_alive(name: str) -> bool:
     try:
         rc, _, _ = await _tmux_run("has-session", "-t", name)
         return rc == 0
-    except Exception:  # noqa: BLE001
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("_tmux_alive", _exc, expected=True)
         return False
 
 
@@ -6413,7 +6592,8 @@ def _cc_tail_preview(jsonl: str) -> str:
         for line in reversed(chunk.splitlines()):
             try:
                 d = json.loads(line)
-            except Exception:  # noqa: BLE001
+            except Exception as _exc:  # noqa: BLE001
+                _log_exc("_cc_tail_preview", _exc, expected=True)
                 continue
             if d.get("type") not in ("user", "assistant"):
                 continue
@@ -6430,7 +6610,8 @@ def _cc_tail_preview(jsonl: str) -> str:
             text = (text or "").strip()
             if text and not text.startswith("<") and not text.startswith("Caveat:"):
                 return text[:160]
-    except Exception:  # noqa: BLE001
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("_cc_tail_preview#2", _exc, expected=True)
         pass
     return ""
 
@@ -6444,7 +6625,8 @@ def _cc_last_activity(jsonl):
         return (0.0, "")
     try:
         mtime = os.path.getmtime(jsonl)
-    except Exception:  # noqa: BLE001
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("_cc_last_activity", _exc, expected=True)
         return (0.0, "")
     cached = _cc_tail_cache.get(jsonl)
     if cached and cached[0] == mtime:
@@ -6481,7 +6663,8 @@ def _cc_session_head(jsonl):
                     break
                 try:
                     d = json.loads(line)
-                except Exception:  # noqa: BLE001
+                except Exception as _exc:  # noqa: BLE001
+                    _log_exc("_cc_session_head", _exc, expected=True)
                     continue
                 if d.get("type") == "user":
                     c = (d.get("message") or {}).get("content")
@@ -6493,7 +6676,8 @@ def _cc_session_head(jsonl):
                         if t and not t.startswith("<") and not t.startswith("Caveat:"):
                             title = t[:120]
                             break
-    except Exception:  # noqa: BLE001
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("_cc_session_head#2", _exc, expected=True)
         pass
     res = (sid, title or None)
     _cc_head_cache[jsonl] = res
@@ -6522,7 +6706,8 @@ async def _cc_sessions():
                 # ("待放行") so a session waiting on you is never invisible.
                 if not busy and _cc_prompt(pane) is not None:
                     awaiting = True
-            except Exception:  # noqa: BLE001
+            except Exception as _exc:  # noqa: BLE001
+                _log_exc("_cc_sessions", _exc, expected=True)
                 busy = False
         jsonl = await _cc_session_jsonl(name, workdir)
         mtime, preview = _cc_last_activity(jsonl)
@@ -6548,7 +6733,8 @@ async def _cc_pane_title(name: str):
     App 的 rename 改的就是這個。給 app 當副標題;取不到/空 → None。絕不 raise。"""
     try:
         rc, out, _ = await _tmux_run("display-message", "-t", name, "-p", "#{pane_title}")
-    except Exception:  # noqa: BLE001
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("_cc_pane_title", _exc, expected=True)
         return None
     if rc != 0:
         return None
@@ -6571,7 +6757,8 @@ def _cc_time(ts) -> str:
     try:
         from datetime import datetime
         return datetime.fromisoformat(str(ts).replace("Z", "+00:00")).astimezone().strftime("%m/%d %H:%M:%S")
-    except Exception:  # noqa: BLE001
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("_cc_time", _exc, expected=True)
         return ""
 
 
@@ -6659,7 +6846,8 @@ def _cc_jsonl_tail_events(jsonl: str):
     for line in data.splitlines():
         try:
             events.append(json.loads(line))
-        except Exception:  # noqa: BLE001
+        except Exception as _exc:  # noqa: BLE001
+            _log_exc("_cc_jsonl_tail_events", _exc, expected=True)
             continue
     return events
 
@@ -6723,7 +6911,8 @@ def _cc_pending_ask(jsonl):
         return None
     try:
         events = _cc_jsonl_tail_events(jsonl)
-    except Exception:  # noqa: BLE001
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("_cc_pending_ask", _exc, expected=True)
         return None
     answered = set()          # 已有 tool_result 的 tool_use_id
     for d in events:
@@ -6828,7 +7017,8 @@ async def cc_session_archive(name: str, request: Request):
     _check_auth(request)
     try:
         body = await request.json()
-    except Exception:  # noqa: BLE001
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("cc_session_archive", _exc, expected=True)
         body = {}
     if body.get("archived") is False:
         await _run_ccsess("enable", name)
@@ -6867,7 +7057,8 @@ def _pretrust_claude_dir(path: str):
     try:
         with open(cfg) as f:
             d = json.load(f)
-    except Exception:
+    except Exception as _exc:
+        _log_exc("_pretrust_claude_dir", _exc, expected=True)
         d = {}
     projs = d.setdefault("projects", {})
     proj = projs.setdefault(path, {})
@@ -6877,7 +7068,8 @@ def _pretrust_claude_dir(path: str):
         with open(tmp, "w") as f:
             json.dump(d, f, indent=2)
         os.replace(tmp, cfg)
-    except Exception:
+    except Exception as _exc:
+        _log_exc("_pretrust_claude_dir#2", _exc, expected=True)
         pass
 
 
@@ -7171,7 +7363,8 @@ async def cc_set_app_owned(request: Request):
     _check_auth(request)
     try:
         body = await request.json()
-    except Exception:  # noqa: BLE001
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("cc_set_app_owned", _exc, expected=True)
         body = {}
     names = body.get("names") or body.get("sessions") or []
     clean = []
@@ -7217,7 +7410,8 @@ async def cc_session_stream(name: str, request: Request, replay: int = 80):
         if jsonl and os.path.exists(jsonl):
             try:
                 lines = open(jsonl, encoding="utf-8", errors="replace").read().splitlines()
-            except Exception:  # noqa: BLE001
+            except Exception as _exc:  # noqa: BLE001
+                _log_exc("cc_session_stream.gen", _exc, expected=True)
                 lines = []
             # replay=0 means "follow only" (reconnect). Guard against Python's
             # lines[-0:] == lines[0:] which would replay the ENTIRE file on every
@@ -7226,7 +7420,8 @@ async def cc_session_stream(name: str, request: Request, replay: int = 80):
             for line in (lines[-replay:] if replay > 0 else []):
                 try:
                     c = _fmt_cc_event(json.loads(line))
-                except Exception:  # noqa: BLE001
+                except Exception as _exc:  # noqa: BLE001
+                    _log_exc("cc_session_stream.gen#2", _exc, expected=True)
                     continue
                 if c:
                     yield chunk({"content": c})
@@ -7260,7 +7455,8 @@ async def cc_session_stream(name: str, request: Request, replay: int = 80):
                             continue
                         try:
                             c = _fmt_cc_event(json.loads(line))
-                        except Exception:  # noqa: BLE001
+                        except Exception as _exc:  # noqa: BLE001
+                            _log_exc("cc_session_stream.gen#3", _exc, expected=True)
                             continue
                         if c:
                             yield chunk({"content": c})
@@ -7284,7 +7480,8 @@ def _cc_format_lines(lines):
             continue
         try:
             c = _fmt_cc_event(json.loads(line))
-        except Exception:  # noqa: BLE001
+        except Exception as _exc:  # noqa: BLE001
+            _log_exc("_cc_format_lines", _exc, expected=True)
             continue
         if c:
             parts.append(c)
@@ -7304,7 +7501,8 @@ async def cc_session_history(name: str, request: Request, offset: int = 0, limit
         return {"text": "", "more": False}
     try:
         lines = open(jsonl, encoding="utf-8", errors="replace").read().splitlines()
-    except Exception:  # noqa: BLE001
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("cc_session_history", _exc, expected=True)
         return {"text": "", "more": False}
     total = len(lines)
     end = max(0, total - max(0, offset))
@@ -7327,7 +7525,8 @@ _cchist_meta_cache: dict = {}   # path -> (mtime, meta); title needs a file read
 def _cchist_meta(path: str):
     try:
         mtime = os.path.getmtime(path)
-    except Exception:  # noqa: BLE001
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("_cchist_meta", _exc, expected=True)
         return None
     cached = _cchist_meta_cache.get(path)
     if cached and cached[0] == mtime:
@@ -7342,7 +7541,8 @@ def _cchist_meta(path: str):
                     continue
                 try:
                     d = json.loads(line)
-                except Exception:  # noqa: BLE001
+                except Exception as _exc:  # noqa: BLE001
+                    _log_exc("_cchist_meta#2", _exc, expected=True)
                     continue
                 if not cwd and d.get("cwd"):
                     cwd = d["cwd"]
@@ -7356,7 +7556,8 @@ def _cchist_meta(path: str):
                         # skip harness noise (<local-command…>, Caveat banners)
                         if t and not t.startswith("<") and not t.startswith("Caveat:"):
                             title = t[:120]
-    except Exception:  # noqa: BLE001
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("_cchist_meta#3", _exc, expected=True)
         return None
     meta = {"id": sid, "title": title or "(無標題)", "cwd": cwd,
             "project": os.path.basename(os.path.dirname(path)),
@@ -7383,7 +7584,8 @@ async def cc_history_list(request: Request, limit: int = 50, offset: int = 0, q:
     def _mt(p):
         try:
             return os.path.getmtime(p)
-        except Exception:  # noqa: BLE001
+        except Exception as _exc:  # noqa: BLE001
+            _log_exc("cc_history_list._mt", _exc, expected=True)
             return 0.0
     files.sort(key=_mt, reverse=True)
     needle = (q or "").strip().lower()
@@ -7426,7 +7628,8 @@ async def cc_history_resume(sid: str, request: Request):
     _check_auth(request)
     try:
         body = await request.json()
-    except Exception:  # noqa: BLE001
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("cc_history_resume", _exc, expected=True)
         body = {}
     path = _cchist_find(sid)
     if not path:
@@ -7459,7 +7662,8 @@ async def cc_history_resume(sid: str, request: Request):
         with open(tmp, "w") as f:
             f.write(sid + "\n")
         os.replace(tmp, os.path.join(pdir, name))
-    except Exception:  # noqa: BLE001
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("cc_history_resume#2", _exc, expected=True)
         pass
     _log_event("cc_history_resume", session_id=sid, name=name, cwd=cwd)
     return {"ok": True, "name": name, "cwd": cwd}
@@ -7749,7 +7953,8 @@ def _cc_transcript_path_matches_cwd(path: str, cwd: str | None) -> bool:
         meta = _cchist_meta(real_path)
         if meta and _norm_cc_workdir(meta.get("cwd") or "") == _norm_cc_workdir(cwd):
             return True
-    except Exception:  # noqa: BLE001
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("_cc_transcript_path_matches_cwd", _exc, expected=True)
         return False
     return False
 
@@ -7776,7 +7981,8 @@ async def _cc_busy_hook_candidates(names: list[str], *, attempts: int = 6,
             try:
                 if _cc_pane_busy(await _cc_capture_pane_fresh(name)):
                     busy.append(name)
-            except Exception:  # noqa: BLE001
+            except Exception as _exc:  # noqa: BLE001
+                _log_exc("_cc_busy_hook_candidates", _exc, expected=True)
                 continue
         busy = _cc_unique_names(busy)
         if busy or i == attempts - 1:
@@ -7831,7 +8037,8 @@ def _cc_hook_commit(name: str, event: str, body: dict, hook_sid: str,
         _cc_cache_sid(name, hook_sid, pin=True)
         try:
             _cc_write_resume_pin(name, hook_sid)
-        except Exception:  # noqa: BLE001
+        except Exception as _exc:  # noqa: BLE001
+            _log_exc("_cc_hook_commit", _exc, expected=True)
             pass
     state = {"busy": event == "UserPromptSubmit", "updated_at": time.time(),
              "source": "hook"}
@@ -7952,7 +8159,8 @@ async def cc_session_hook(request: Request):
         _check_auth(request)
     try:
         body = await request.json()
-    except Exception:  # noqa: BLE001
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("cc_session_hook", _exc, expected=True)
         return {"ok": True, "ignored": True}
     if not isinstance(body, dict):
         return {"ok": True, "ignored": True}
@@ -8013,7 +8221,8 @@ async def tg_mirror_event(request: Request):
         _check_auth(request)
     try:
         body = await request.json()
-    except Exception:  # noqa: BLE001
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("tg_mirror_event", _exc, expected=True)
         body = None
     if not isinstance(body, dict):
         return {"ok": True, "ignored": True, "reason": "bad_body"}
@@ -8039,7 +8248,8 @@ async def tg_mirror_event(request: Request):
         return {"ok": True, "ignored": True, "reason": "empty"}
     try:
         ts = float(body.get("ts") or 0)
-    except Exception:  # noqa: BLE001
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("tg_mirror_event#2", _exc, expected=True)
         ts = 0.0
     now = time.time()
     if not (now - 86400 * 366 < ts < now + 3600):
@@ -8259,7 +8469,8 @@ def _cc_find_pending_aid(name: str, sig: str) -> str | None:
     for rid, title, options in rows:
         try:
             opts = json.loads(options) if options else []
-        except Exception:  # noqa: BLE001
+        except Exception as _exc:  # noqa: BLE001
+            _log_exc("_cc_find_pending_aid", _exc, expected=True)
             opts = []
         if _cc_prompt_sig({"title": title, "options": opts}) == sig:
             return rid
@@ -8294,7 +8505,8 @@ def _cc_reseed_approvals_from_db() -> int:
         seen.add(name)
         try:
             opts = json.loads(options) if options else []
-        except Exception:  # noqa: BLE001
+        except Exception as _exc:  # noqa: BLE001
+            _log_exc("_cc_reseed_approvals_from_db", _exc, expected=True)
             opts = []
         sig = _cc_prompt_sig({"title": title, "options": opts})
         _CC_APPROVAL_ACTIVE[name] = {"aid": rid, "sig": sig}
@@ -8403,7 +8615,8 @@ def _fliper_review_state() -> dict | None:
         with open(FLIPER_REVIEW_STATE, encoding="utf-8") as f:
             d = json.load(f)
         return d if isinstance(d, dict) else None
-    except Exception:  # noqa: BLE001
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("_fliper_review_state", _exc, expected=True)
         return None
 
 
@@ -8425,7 +8638,8 @@ def _hp_extract_choices(content: str) -> dict | None:
         return None
     try:
         card = json.loads(after[:end].strip())
-    except Exception:  # noqa: BLE001
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("_hp_extract_choices", _exc, expected=True)
         return None
     if not isinstance(card, dict) or card.get("kind") != "choices" or not card.get("options"):
         return None
@@ -8859,7 +9073,8 @@ async def v2_session_approve(session_id: str, request: Request):
     _check_auth(request)
     try:
         body = await request.json()
-    except Exception:  # noqa: BLE001
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("v2_session_approve", _exc, expected=True)
         body = {}
     # A1(spec §3.3):統一 body {approval_id, key}(approve bool 相容糖)—
     # 三 provider 一律轉呼 _approval_decide_core;三種舊 body({key}/{approve}/
@@ -9072,7 +9287,8 @@ def _cc_digest_lines(store, lines, jsonl_path: str, start_lineno: int) -> int:
             continue
         try:
             d = json.loads(line)
-        except Exception:  # noqa: BLE001
+        except Exception as _exc:  # noqa: BLE001
+            _log_exc("_cc_digest_lines", _exc, expected=True)
             continue
         media_payloads.append(d)
         uid = _cc_card_uid(d, jsonl_path, start_lineno + off)
@@ -9521,6 +9737,18 @@ async def v2_session_events(session_id: str, request: Request, since_seq: int = 
     async def gen():
         cursor = since_seq
         store.subscribers += 1
+        # issue #7 項目 4:這條原本是全檔唯一「完全沒有出口」的 stream ——
+        # 沒有 deadline、沒有 idle 上限,一路 while True。客戶端半死(TCP 沒收
+        # FIN,is_disconnected 永遠 False)就永久佔著一個 task + 一個 subscriber
+        # 計數,而 subscribers>0 會讓 follower 持續巡 status,連 CPU 一起漏。
+        #
+        # 為什麼 30 分鐘 idle 斷線不會漏事件:idle 的定義就是「這段時間
+        # store.seq 沒有前進」,也就是 ring buffer 完全沒有新事件。斷線時
+        # cursor == store.seq,app 帶 since_seq=cursor 重連時 `store.since()`
+        # 的三個 None 條件(領先 seq / 洞 / 空 ring 但落後)一個都不成立,
+        # 必定回傳空 backlog 然後續流 —— 零漏事件。真的漏不掉的情形(bridge
+        # 重啟過、ring 滾過)本來就回 410,app 走 snapshot 冷載,行為不變。
+        last_event = time.monotonic()
         try:
             for ev in backlog:
                 yield f"data: {json.dumps(ev, ensure_ascii=False)}\n\n"
@@ -9528,6 +9756,10 @@ async def v2_session_events(session_id: str, request: Request, since_seq: int = 
             idle = 0.0
             while True:
                 if await request.is_disconnected():
+                    break
+                if time.monotonic() - last_event >= _STREAM_IDLE_CUTOFF_SECS:
+                    _log_event("v2_events_idle_cutoff", session=session_id,
+                               cursor=cursor)
                     break
                 if store.seq > cursor:
                     fresh = store.since(cursor)
@@ -9537,6 +9769,7 @@ async def v2_session_events(session_id: str, request: Request, since_seq: int = 
                         yield f"data: {json.dumps(ev, ensure_ascii=False)}\n\n"
                         cursor = ev["seq"]
                     idle = 0.0
+                    last_event = time.monotonic()
                 else:
                     await asyncio.sleep(0.5)
                     idle += 0.5
@@ -9650,7 +9883,8 @@ def _notice_for_report(session: str, report: dict) -> None:
 def _cron_jobs():
     try:
         data = json.load(open(CRON_JOBS_JSON, encoding="utf-8"))
-    except Exception:  # noqa: BLE001
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("_cron_jobs", _exc, expected=True)
         return []
     out = []
     for j in data.get("jobs", []):
@@ -9672,6 +9906,7 @@ async def _hermes_cron(action: str, job_id: str):
         out, _ = await asyncio.wait_for(p.communicate(), timeout=30)
         return p.returncode == 0, (out or b"").decode("utf-8", "replace")
     except Exception as e:  # noqa: BLE001
+        _log_exc("_hermes_cron", e, expected=True)
         return False, str(e)
 
 
@@ -9738,7 +9973,8 @@ def _reports(limit: int = 20):
             return out
         finally:
             con.close()
-    except Exception:  # noqa: BLE001
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("_reports", _exc, expected=True)
         return []
 
 
@@ -9748,7 +9984,8 @@ def _cron_names_for(home: str) -> dict:
         data = json.load(open(os.path.join(home, "cron", "jobs.json"), encoding="utf-8"))
         jobs = data.get("jobs", data) if isinstance(data, dict) else data
         return {j.get("id"): j.get("name", "") for j in jobs}
-    except Exception:  # noqa: BLE001
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("_cron_names_for", _exc, expected=True)
         return {}
 
 
@@ -9797,7 +10034,8 @@ def _persona_reports(persona: str, limit: int = 20):
             return out
         finally:
             con.close()
-    except Exception:  # noqa: BLE001
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("_persona_reports", _exc, expected=True)
         return []
 
 
@@ -9963,7 +10201,8 @@ async def app_uploads(request: Request):
             raise HTTPException(status_code=400, detail=f"attachment {idx} upload failed")
         try:
             size = Path(path).stat().st_size
-        except Exception:  # noqa: BLE001
+        except Exception as _exc:  # noqa: BLE001
+            _log_exc("app_uploads", _exc, expected=True)
             size = 0
         saved.append({
             "kind": a.get("kind") or "file",
@@ -10185,7 +10424,8 @@ class _TerminalSession:
                     pass
                 try:
                     self.proc.wait(timeout=2)
-                except Exception:  # noqa: BLE001
+                except Exception as _exc:  # noqa: BLE001
+                    _log_exc("_TerminalSession.close", _exc, expected=True)
                     pass
         if self.master_fd is not None:
             try:
@@ -10244,7 +10484,8 @@ async def terminal_ws(websocket: WebSocket) -> None:
         await websocket.accept()
         try:
             await websocket.send_json({"type": "error", "message": "invalid or missing device token"})
-        except Exception:  # noqa: BLE001
+        except Exception as _exc:  # noqa: BLE001
+            _log_exc("terminal_ws", _exc, expected=True)
             pass
         await websocket.close(code=4401)
         return
@@ -10255,10 +10496,12 @@ async def terminal_ws(websocket: WebSocket) -> None:
     try:
         session.start()
     except Exception as e:  # noqa: BLE001 — PTY/shell spawn failed
+        _log_exc("terminal_ws#2", e, expected=True)
         try:
             await websocket.send_json({"type": "error",
                                        "message": f"pty spawn failed: {type(e).__name__}"})
-        except Exception:  # noqa: BLE001
+        except Exception as _exc:  # noqa: BLE001
+            _log_exc("terminal_ws#3", _exc, expected=True)
             pass
         await websocket.close(code=1011)
         return
@@ -10293,7 +10536,8 @@ async def terminal_ws(websocket: WebSocket) -> None:
             try:
                 await websocket.send_json({"type": "output",
                                            "data": item.decode("utf-8", "replace")})
-            except Exception:  # noqa: BLE001 — client gone; recv/exit path cleans up
+            except Exception as _exc:  # noqa: BLE001 — client gone; recv/exit path cleans up
+                _log_exc("terminal_ws._writer_loop", _exc, expected=True)
                 return
 
     recv_task = asyncio.create_task(_terminal_recv_loop(websocket, session))
@@ -10306,7 +10550,8 @@ async def terminal_ws(websocket: WebSocket) -> None:
             code = await loop.run_in_executor(None, session.exit_code)
             try:
                 await websocket.send_json({"type": "exit", "code": code})
-            except Exception:  # noqa: BLE001
+            except Exception as _exc:  # noqa: BLE001
+                _log_exc("terminal_ws#4", _exc, expected=True)
                 pass
     finally:
         for t in (recv_task, writer_task, exit_task):
@@ -10324,7 +10569,8 @@ async def terminal_ws(websocket: WebSocket) -> None:
         await loop.run_in_executor(None, session.close)
         try:
             await websocket.close(code=1000)
-        except Exception:  # noqa: BLE001
+        except Exception as _exc:  # noqa: BLE001
+            _log_exc("terminal_ws#5", _exc, expected=True)
             pass
         _log_event("terminal_close", device_id=device_id,
                    duration_s=round(time.time() - started_at, 3))
@@ -10629,7 +10875,8 @@ def _usage_iso_utc(epoch_seconds):
     try:
         return datetime.fromtimestamp(float(epoch_seconds), tz=timezone.utc) \
             .strftime("%Y-%m-%dT%H:%M:%SZ")
-    except Exception:  # noqa: BLE001
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("_usage_iso_utc", _exc, expected=True)
         return None
 
 
@@ -10647,7 +10894,8 @@ def _usage_normalize_iso_str(ts):
         s = str(ts).replace("Z", "+00:00")
         return datetime.fromisoformat(s).astimezone(timezone.utc) \
             .strftime("%Y-%m-%dT%H:%M:%SZ")
-    except Exception:  # noqa: BLE001
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("_usage_normalize_iso_str", _exc, expected=True)
         return None
 
 
@@ -10657,7 +10905,8 @@ def _usage_newest_files(root, pattern="*.jsonl", limit=8):
     never a full walk of a directory holding months of history."""
     try:
         paths = [str(p) for p in Path(root).rglob(pattern) if p.is_file()]
-    except Exception:  # noqa: BLE001
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("_usage_newest_files", _exc, expected=True)
         return []
     paths.sort(key=lambda p: os.path.getmtime(p), reverse=True)
     return paths[:limit]
@@ -10676,7 +10925,8 @@ def _usage_tail_text(path, max_bytes=_USAGE_TAIL_BYTES):
                 f.seek(size - max_bytes)
             data = f.read()
         return data.decode("utf-8", errors="replace")
-    except Exception:  # noqa: BLE001
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("_usage_tail_text", _exc, expected=True)
         return ""
 
 
@@ -10694,7 +10944,8 @@ def _codex_latest_rate_limits():
                 continue
             try:
                 rec = json.loads(line)
-            except Exception:  # noqa: BLE001
+            except Exception as _exc:  # noqa: BLE001
+                _log_exc("_codex_latest_rate_limits", _exc, expected=True)
                 continue
             payload = rec.get("payload") or {}
             if payload.get("type") != "token_count":
@@ -10723,7 +10974,8 @@ def _codex_usage_snapshot():
         return {"available": False}
     try:
         used_percent = float(used_percent)
-    except Exception:  # noqa: BLE001
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("_codex_usage_snapshot", _exc, expected=True)
         return {"available": False}
     return {
         "available": True,
@@ -10744,7 +10996,8 @@ def _claude_official_snapshot():
     else (Desktop cache, IndexedDB dumps, local jsonl token counts, etc.)."""
     try:
         files = [str(p) for p in Path(CLAUDE_STATUS_DIR).glob("*.json") if p.is_file()]
-    except Exception:  # noqa: BLE001
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("_claude_official_snapshot", _exc, expected=True)
         return None
     if not files:
         return None
@@ -10761,7 +11014,8 @@ def _claude_official_snapshot():
         try:
             resets_at = float(resets_at)
             used = float(used)
-        except Exception:  # noqa: BLE001
+        except Exception as _exc:  # noqa: BLE001
+            _log_exc("_claude_official_snapshot._window", _exc, expected=True)
             return None
         if resets_at <= now:   # window 已過期 -> 視為未同步,不能沿用舊值
             return None
@@ -10775,7 +11029,8 @@ def _claude_official_snapshot():
         try:
             with open(path, encoding="utf-8", errors="replace") as f:
                 doc = json.load(f)
-        except Exception:  # noqa: BLE001
+        except Exception as _exc:  # noqa: BLE001
+            _log_exc("_claude_official_snapshot#2", _exc, expected=True)
             continue
         rate_limits = doc.get("rate_limits")
         if not isinstance(rate_limits, dict):
@@ -10812,7 +11067,8 @@ def _claude_local_fallback_usage():
                 continue
             try:
                 rec = json.loads(line)
-            except Exception:  # noqa: BLE001
+            except Exception as _exc:  # noqa: BLE001
+                _log_exc("_claude_local_fallback_usage", _exc, expected=True)
                 continue
             if rec.get("type") != "assistant":
                 continue
@@ -11135,7 +11391,8 @@ async def app_delegation_create(request: Request):
                     "threadId": codex_thread_id,
                     "name": f"{work_order} - {title[:80]}",
                 }, timeout=15.0)
-            except Exception:  # noqa: BLE001
+            except Exception as _exc:  # noqa: BLE001
+                _log_exc("app_delegation_create", _exc, expected=True)
                 pass
             await CODEX_APP.start_turn(codex_thread_id, input_items,
                                        client_id=f"delegation-{did}", cwd=cwd)
@@ -11215,7 +11472,8 @@ async def app_delegation_create(request: Request):
     # M1:建立即回流一張「已建立」卡進父人格對話(父是 delegation 則注回父 session)。
     try:
         await _delegation_notify(dict(row), "created")
-    except Exception:  # noqa: BLE001
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("app_delegation_create#2", _exc, expected=True)
         pass
     return {"ok": True, "delegation": _delegation_public(row, status)}
 
@@ -11281,7 +11539,8 @@ def _report_lookup(rid: str):
             con.close()
         finally:
             con.close()
-    except Exception:  # noqa: BLE001
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("_report_lookup", _exc, expected=True)
         return None
     if not row:
         return None
@@ -11390,7 +11649,8 @@ async def app_get_messages(session: str, request: Request, limit: int = 200):
             for mid_, rx, pn, dl in meta_rows:
                 try:
                     lst = json.loads(rx) if rx else []
-                except Exception:  # noqa: BLE001
+                except Exception as _exc:  # noqa: BLE001
+                    _log_exc("app_get_messages", _exc, expected=True)
                     lst = []
                 meta[mid_] = ([str(r) for r in lst if r] if isinstance(lst, list) else [],
                               bool(pn), bool(dl))
@@ -11764,7 +12024,7 @@ async def app_set_reaction(mid: str, request: Request):
     reaction = (body.get("reaction") or "").strip()[:8]   # one emoji, not an essay
     import sqlite3
     try:
-        con = sqlite3.connect(CANON_DB, timeout=5)
+        con = sqlite3.connect(CANON_DB, timeout=30)
         try:
             if reaction:
                 con.execute("INSERT INTO reactions(msg_id, session, reaction, updated_at) "
@@ -11792,7 +12052,8 @@ def _message_meta_load(con, message_id: str):
             parsed = json.loads(row[0])
             if isinstance(parsed, list):
                 reactions = [str(r) for r in parsed if r]
-        except Exception:  # noqa: BLE001
+        except Exception as _exc:  # noqa: BLE001
+            _log_exc("_message_meta_load", _exc, expected=False)
             reactions = []
     return reactions, (int(row[1] or 0) if row else 0)
 
@@ -12322,6 +12583,7 @@ def _persona_launch_turn(session: str, prompt: str, client_id, common_log: dict,
                                    error=str(e)[:160])
                 await q.put((k, v))
         except Exception as e:  # noqa: BLE001
+            _log_exc("_persona_launch_turn.run_turn", e, expected=False, session=session, cid=cid)
             state["runner_error"] = f"{type(e).__name__}: {str(e)[:180]}"
             await q.put(("error", str(e)))
         finally:
@@ -12687,7 +12949,7 @@ def _approval_row(r):
 def _approval_get_row(aid: str):
     """單筆統一物件(v2 meta.approval / 決定路由用);不存在回 None。"""
     import sqlite3
-    con = sqlite3.connect(CANON_DB)
+    con = sqlite3.connect(CANON_DB, timeout=30)
     try:
         r = con.execute(f"SELECT {_APPROVAL_COLS} FROM approvals WHERE id=?",
                         (aid,)).fetchone()
@@ -12703,7 +12965,7 @@ def _hermes_pending_by_session() -> dict:
     import sqlite3
     out = {}
     try:
-        con = sqlite3.connect(CANON_DB)
+        con = sqlite3.connect(CANON_DB, timeout=30)
         try:
             _approvals_expire(con)
             con.commit()
@@ -12729,7 +12991,8 @@ def _approvals_expire(con):
         stale = con.execute(
             "SELECT id, title, session_id FROM approvals WHERE status='pending' "
             "AND expires_at IS NOT NULL AND expires_at < ?", (now,)).fetchall()
-    except Exception:  # noqa: BLE001
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("_approvals_expire", _exc, expected=True)
         stale = []
     con.execute("UPDATE approvals SET status='expired' WHERE status='pending' "
                 "AND expires_at IS NOT NULL AND expires_at < ?", (now,))
@@ -12876,7 +13139,7 @@ async def approval_create(request: Request):
             norm.append(ent)
         options = norm
     now = time.time()
-    con = sqlite3.connect(CANON_DB)
+    con = sqlite3.connect(CANON_DB, timeout=30)
     try:
         con.execute("INSERT OR REPLACE INTO approvals"
                     "(id,title,source,risk,detail,created_at,expires_at,status,decided_at,result,callback,"
@@ -12981,7 +13244,7 @@ async def approval_list(request: Request, status: str = "", limit: int = 50,
     import sqlite3
     lim = max(1, min(int(limit or 50), 200))
     off = max(0, int(offset or 0))
-    con = sqlite3.connect(CANON_DB)
+    con = sqlite3.connect(CANON_DB, timeout=30)
     try:
         _approvals_expire(con)
         con.commit()
@@ -13009,7 +13272,7 @@ async def approval_get(aid: str, request: Request):
     """Poll a decision (called by the requesting skill)."""
     _check_auth(request)
     import sqlite3
-    con = sqlite3.connect(CANON_DB)
+    con = sqlite3.connect(CANON_DB, timeout=30)
     try:
         _approvals_expire(con)
         con.commit()
@@ -13113,7 +13376,7 @@ async def _approval_decide_core(aid: str, b: dict) -> dict:
     # result:question/notice 的答案就是 key(spec §2);permission 維持舊預設
     # (建立方自帶 result 優先,否則空字串)以免驚動既有 callback 消費者。
     result_val = str(b.get("result") or "") or (key if kind != "permission" else "")
-    con = sqlite3.connect(CANON_DB)
+    con = sqlite3.connect(CANON_DB, timeout=30)
     try:
         cur = con.execute("UPDATE approvals SET status=?, decided_at=?, result=? "
                           "WHERE id=? AND status='pending'",
@@ -13213,41 +13476,100 @@ async def _git_out(*args, timeout: float = 15.0):
     return p.returncode, (out or b"").decode("utf-8", "replace")
 
 
-async def _cleanup_worktree(sid: str, sub: dict):
-    """After an isolated sub finishes: remove its worktree IF it's clean
-    (`git status --porcelain` empty). Dirty trees are kept — someone's
-    uncommitted work lives there — and logged. ~/.pocket/worktrees no longer
-    grows without bound (issue #7)."""
-    wt = sub.get("worktree")
+async def _worktree_try_remove(sid: str, wt: str, origin: str) -> bool:
+    """Remove ONE worktree if it's clean. Returns True when it's gone.
+
+    Dirty trees are kept and logged — someone's uncommitted work lives there,
+    and silently deleting a agent's unpushed diff is the one unrecoverable
+    failure mode here. Shared by the end-of-dispatch path and the orphan reaper
+    so both obey exactly the same rule (issue #7 item 5)."""
     if not wt or not os.path.isdir(wt):
-        return
+        return False
     try:
         rc, dirty = await _git_out("-C", wt, "status", "--porcelain")
         if rc != 0 or dirty.strip():
-            _log_event("worktree_kept", sid=sid, worktree=wt,
+            _log_event("worktree_kept", sid=sid, worktree=wt, origin=origin,
                        reason="status-failed" if rc != 0 else "dirty")
-            return
+            return False
         # `worktree remove` must run from the MAIN repo (git refuses to remove
         # the tree it's currently -C'd into), so resolve the common dir first.
         rc, common = await _git_out("-C", wt, "rev-parse", "--git-common-dir")
         common = common.strip()
         if rc != 0 or not common:
-            _log_event("worktree_kept", sid=sid, worktree=wt, reason="no-common-dir")
-            return
+            _log_event("worktree_kept", sid=sid, worktree=wt, origin=origin,
+                       reason="no-common-dir")
+            return False
         if not os.path.isabs(common):
             common = os.path.abspath(os.path.join(wt, common))
         main_root = os.path.dirname(common)
         rc, _ = await _git_out("-C", main_root, "worktree", "remove", wt, timeout=30)
         if rc == 0:
-            sub["worktree"] = None
-            if sub.get("base_cwd"):
-                sub["cwd"] = sub["base_cwd"]   # follow-ups run in the main tree
-            _log_event("worktree_removed", sid=sid, worktree=wt)
-        else:
-            _log_event("worktree_remove_failed", sid=sid, worktree=wt, rc=rc)
+            _log_event("worktree_removed", sid=sid, worktree=wt, origin=origin)
+            return True
+        _log_event("worktree_remove_failed", sid=sid, worktree=wt, origin=origin, rc=rc)
+        return False
     except Exception as e:  # noqa: BLE001
-        _log_event("worktree_cleanup_error", sid=sid, worktree=wt,
+        _log_event("worktree_cleanup_error", sid=sid, worktree=wt, origin=origin,
                    error=type(e).__name__, error_message=str(e)[:160])
+        return False
+
+
+async def _cleanup_worktree(sid: str, sub: dict):
+    """After an isolated sub finishes: reclaim its worktree if it's clean."""
+    wt = sub.get("worktree")
+    if not wt:
+        return
+    if await _worktree_try_remove(sid, wt, "dispatch_end"):
+        sub["worktree"] = None
+        if sub.get("base_cwd"):
+            sub["cwd"] = sub["base_cwd"]   # follow-ups run in the main tree
+
+
+_WORKTREE_ROOT = os.path.expanduser("~/.pocket/worktrees")
+# Grace period before a tree with no live sub-session counts as an orphan —
+# long enough that a dispatch which just created its tree (but hasn't been
+# registered in SUBSESSIONS yet) can never be reaped out from under itself.
+_WORKTREE_ORPHAN_MIN_AGE_SECS = float(
+    os.environ.get("BRIDGE_WORKTREE_ORPHAN_AGE", "3600"))
+
+
+async def _reap_orphan_worktrees() -> int:
+    """Sweep ~/.pocket/worktrees for trees whose sub-session no longer exists.
+
+    `_cleanup_worktree` only runs when `_stream_agent` reaches its `finally`.
+    A crash / `launchctl kickstart` mid-dispatch skips it entirely and leaks the
+    tree forever — one per killed dispatch, plus SUBSESSIONS is in-memory so
+    EVERY tree is orphaned by a restart. That's the "worktrees 目錄無限成長"
+    half of item 5 that the end-of-dispatch hook structurally cannot cover.
+    Same clean-only rule as the normal path: dirty trees are kept.
+    """
+    try:
+        names = os.listdir(_WORKTREE_ROOT)
+    except OSError:
+        return 0            # nothing dispatched in isolate mode yet
+    now = time.time()
+    reaped = 0
+    for name in names:
+        wt = os.path.join(_WORKTREE_ROOT, name)
+        if not os.path.isdir(wt):
+            continue
+        sub = SUBSESSIONS.get(name)
+        if sub is not None and sub.get("status") == "running":
+            continue        # live dispatch owns it
+        try:
+            if now - os.path.getmtime(wt) < _WORKTREE_ORPHAN_MIN_AGE_SECS:
+                continue    # too fresh to judge
+        except OSError:
+            continue
+        if await _worktree_try_remove(name, wt, "orphan_reap"):
+            reaped += 1
+            if sub is not None:
+                sub["worktree"] = None
+                if sub.get("base_cwd"):
+                    sub["cwd"] = sub["base_cwd"]
+    if reaped:
+        _log_event("worktree_orphans_reaped", count=reaped, root=_WORKTREE_ROOT)
+    return reaped
 
 
 def _fmt_item(kind, val):
@@ -13345,7 +13667,8 @@ def _dashboard_oracle():
     try:
         with open(ORACLE_STATE_FILE, "r", encoding="utf-8") as f:
             d = json.load(f)
-    except Exception:  # noqa: BLE001
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("_dashboard_oracle", _exc, expected=True)
         return None
     if str(d.get("status") or "") != "ok":
         return None
@@ -13353,7 +13676,8 @@ def _dashboard_oracle():
         from zoneinfo import ZoneInfo
         tz = ZoneInfo(str(d.get("timezone") or "Asia/Taipei"))
         today = datetime.now(tz).strftime("%Y-%m-%d")
-    except Exception:  # noqa: BLE001
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("_dashboard_oracle#2", _exc, expected=True)
         today = datetime.now().strftime("%Y-%m-%d")
     if str(d.get("date") or "") != today:
         return None
@@ -13382,7 +13706,7 @@ def _dashboard_oracle():
 def _dashboard_approvals():
     """pending 數 + 前 5 筆統一物件(重用 approvals 表與 _approval_row)。"""
     import sqlite3
-    con = sqlite3.connect(CANON_DB)
+    con = sqlite3.connect(CANON_DB, timeout=30)
     try:
         _approvals_expire(con)
         con.commit()
@@ -13488,12 +13812,20 @@ async def health():
 
 # ───────────────────────── log rotation (issue #7 item 6) ──────────────────
 # launchd redirects stdout/stderr to bridge.out.log / bridge.err.log and never
-# rotates them, so a long-running bridge grows them toward GBs. launchd keeps
-# the fd open, so rename-rotation would keep writing into the renamed file;
-# copy-then-truncate is safe here because launchd opens the logs with O_APPEND
-# (verified on the live process) — every write seeks to the new EOF.
-_LOG_ROTATE_MAX_BYTES = int(os.environ.get("BRIDGE_LOG_MAX_BYTES", 64 * 1024 * 1024))
-_LOG_ROTATE_CHECK_SECS = 900.0
+# rotates them, so a long-running bridge grows them toward GBs.
+#
+# 為什麼是 in-process 而不是 newsyslog(見 docs/LOG_ROTATION.md 的完整評估):
+# launchd 在 spawn 時就把那兩個檔開好、fd 交給行程,整個生命週期不會重開。
+# newsyslog 預設的 rotate 是 rename → launchd 的 fd 還綁在被改名的 inode 上,
+# 新的 bridge.out.log 會永遠是 0 byte(等於靜默停掉所有 log),而 newsyslog
+# 沒有 copytruncate。要修就得讓行程收訊號重開 fd,那是更大的改動。
+# copy-then-truncate 在這裡安全,因為 launchd 用 O_APPEND 開檔
+# (`lsof +fg` 實測 FILE-FLAG 有 AP)—— truncate 後下一次寫入照樣落在新 EOF,
+# 不會產生 sparse 空洞。
+_LOG_ROTATE_MAX_BYTES = int(os.environ.get("BRIDGE_LOG_MAX_BYTES", 32 * 1024 * 1024))
+# 保留幾代舊檔(.1 最新)。32MB × (1 + 3) ≈ 128MB/檔 的硬上限。
+_LOG_ROTATE_KEEP = int(os.environ.get("BRIDGE_LOG_KEEP", "3"))
+_LOG_ROTATE_CHECK_SECS = float(os.environ.get("BRIDGE_LOG_CHECK_SECS", "900"))
 
 
 def _rotate_log_file(path: str) -> None:
@@ -13504,15 +13836,22 @@ def _rotate_log_file(path: str) -> None:
         return
     try:
         import shutil
-        shutil.copyfile(path, path + ".1")   # keep exactly one old generation
+        # 先把舊代往後推 .2→.3、.1→.2,最舊的那代掉出視窗被覆蓋。
+        for gen in range(_LOG_ROTATE_KEEP - 1, 0, -1):
+            src, dst = f"{path}.{gen}", f"{path}.{gen + 1}"
+            if os.path.exists(src):
+                os.replace(src, dst)
+        shutil.copyfile(path, path + ".1")
         os.truncate(path, 0)
-        _log_event("log_rotated", path=path)
+        _log_event("log_rotated", path=path, keep=_LOG_ROTATE_KEEP)
     except Exception as e:  # noqa: BLE001
         _log_event("log_rotate_failed", path=path,
                    error=type(e).__name__, error_message=str(e)[:160])
 
 
-async def _log_rotation_loop():
+async def _housekeeping_loop():
+    """One periodic janitor for the things that grow without bound:
+    log files (item 6) and leaked isolate worktrees (item 5)."""
     base = os.path.dirname(os.path.abspath(__file__))
     logs = [os.path.join(base, "bridge.out.log"),
             os.path.join(base, "bridge.err.log")]
@@ -13522,14 +13861,20 @@ async def _log_rotation_loop():
         for p in logs:
             if os.path.exists(p):
                 _rotate_log_file(p)
+        try:
+            await _reap_orphan_worktrees()
+        except Exception as _exc:  # noqa: BLE001
+            # The janitor must never die — a dead loop silently stops rotating
+            # logs too, which is the failure this issue exists to prevent.
+            _log_exc("_housekeeping_loop.reap", _exc, expected=True)
         await asyncio.sleep(_LOG_ROTATE_CHECK_SECS)
 
 
 @app.on_event("startup")
-async def _start_log_rotation():
+async def _start_housekeeping():
     global _MAIN_LOOP
     _MAIN_LOOP = asyncio.get_running_loop()
-    task = asyncio.create_task(_log_rotation_loop())
+    task = asyncio.create_task(_housekeeping_loop())
     _BG_TASKS.add(task)
     task.add_done_callback(_BG_TASKS.discard)
 
