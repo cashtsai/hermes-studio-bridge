@@ -41,14 +41,20 @@ def workspace_cwd_for(key: str, home: str) -> str:
     return cwd if os.path.isdir(cwd) else home
 
 
-def canonical_telegram_session(home: str):
-    """The session id the TG gateway is CURRENTLY driving for this persona.
+def canonical_telegram_entry(home: str):
+    """The sessions.json entry the TG gateway is CURRENTLY driving for this
+    persona, as ``(session_key, entry)`` — or None when the map is missing/empty.
 
     sessions.json is the gateway's own session_key → session_id map, updated
     every time it rotates (auto-reset / new day). It beats any state.db
     heuristic: the richest session is often a rotated-OUT one — stale history —
     and writing the app's turns there means Telegram never sees them.
-    Returns None when the map is missing/empty (caller falls back).
+
+    The whole entry (not just the id) is returned because the reverse mirror
+    (app→TG, `tg_outbound`) needs the session_key as well: the chat_id lives
+    there (`agent:<profile>:telegram:<chat_type>:<chat_id>[…]`) and in no other
+    field. Both directions therefore agree on ONE chat by construction — we
+    post to exactly the chat whose session we write into.
     """
     try:
         with open(os.path.join(home, "sessions", "sessions.json")) as f:
@@ -59,15 +65,25 @@ def canonical_telegram_session(home: str):
                 continue
             if (ent.get("platform") or "") != "telegram" and ":telegram:" not in key:
                 continue
-            sid = ent.get("session_id")
-            if not sid:
+            if not ent.get("session_id"):
                 continue
             upd = ent.get("updated_at") or ""          # ISO strings sort lexically
             if best is None or upd > best[0]:
-                best = (upd, sid)
-        return best[1] if best else None
+                best = (upd, key, ent)
+        return (best[1], best[2]) if best else None
     except Exception:
         return None
+
+
+def canonical_telegram_session(home: str):
+    """The session id the TG gateway is CURRENTLY driving for this persona.
+
+    Thin accessor over :func:`canonical_telegram_entry` (the session-pinning
+    path only ever needs the id). None when there is no mapping — caller falls
+    back to the state.db heuristic.
+    """
+    found = canonical_telegram_entry(home)
+    return found[1].get("session_id") if found else None
 
 
 class ACPSession:

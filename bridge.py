@@ -38,6 +38,7 @@ from pathlib import Path
 
 import media_artifacts
 import hermes_media
+import tg_outbound
 from fastapi import FastAPI, Request, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import (JSONResponse, StreamingResponse, FileResponse,
                                HTMLResponse, PlainTextResponse)
@@ -2003,6 +2004,41 @@ def _canon_reply_for_client(session: str, client_id: str):
     except Exception as _exc:  # noqa: BLE001
         _log_exc("_canon_reply_for_client", _exc, expected=False, session=session)
         return None
+
+
+def _steps_stripped(t: str) -> str:
+    """訊息正文的壓重正規化:剝掉〈🔧 執行步驟〉/〈💭 思考〉那類 `<details>` 附錄。
+
+    同一則訊息在兩個來源的形狀不同 —— canonical 那份帶附錄、Hermes state.db 那份
+    是乾淨正文 —— 所以「是不是同一則」只能在剝完附錄後比。#37 的壓重鍵
+    (role, 本函式輸出, ±600s) 就建立在這上面。
+
+    唯一實作:`/app/v1/messages`、人格卡片流、以及 app→TG 反向鏡射(送進 TG 的正文
+    要與 state.db 側同形,將來萬一被回收才對得上壓重鍵)共用同一份 —— 三處各自
+    正規化就是雙氣泡回歸的入口。
+    """
+    body = re.sub(r"<details>.*?</details>", "", t or "", flags=re.S).strip()
+    # app→TG 鏡射會在 user 那句前面加 📱 標記(讓 TG 那頭看得出是從手機說的)。
+    # 壓重時當它不存在:Telegram 不會把 bot 自己送出的訊息當成 Update 回送,所以
+    # 正常情況下 state.db 根本不會有這份副本;但這條不變式不該建立在別人的實作
+    # 細節上 —— 萬一哪天真的被回收進來,帶標記的副本仍要能和 canonical 的原文
+    # 對上,否則就是一顆多出來的泡泡。
+    if body.startswith(tg_outbound.USER_PREFIX):
+        body = body[len(tg_outbound.USER_PREFIX):].lstrip()
+    return body
+
+
+def _tg_mirror_out(session: str, role: str, raw_body: str, mid: str) -> None:
+    """app→TG 反向鏡射的唯一呼叫點(#32)。預設關閉,且永不影響回合。
+
+    正文先過 `_steps_stripped`:送進 TG 的與 state.db 側的乾淨正文同形,#37 的
+    壓重鍵因此依然對得上(詳見 `tg_outbound` 模組 docstring 的去重不變式)。
+    """
+    if session not in PERSONAS:
+        return
+    _, home = PERSONAS[session]
+    tg_outbound.mirror_soon(home, session, role, _steps_stripped(raw_body), mid,
+                            log=_log_event)
 
 
 def _canon_messages(session: str, limit: int = 200):
@@ -9187,7 +9223,8 @@ async def _v2_persona_input(session: str, session_id: str, body: dict,
                                                    att_meta, client_id=client_id)
     _hp_cards_turn_start(session, cid, user_mid, content, att_meta)
     task, state, _q = _persona_launch_turn(session, prompt, client_id, common_log,
-                                           turn_started, canonical_user_ok, cid)
+                                           turn_started, canonical_user_ok, cid,
+                                           user_text=content, user_mid=user_mid)
     if inflight_entry is not None:
         inflight_entry["task"] = task
         inflight_entry["state"] = state
@@ -9559,8 +9596,6 @@ def _hp_merged_messages(session: str, limit: int = 200):
     if session not in PERSONAS:
         return out
     _, home = PERSONAS[session]
-    def _steps_stripped(t: str) -> str:
-        return re.sub(r"<details>.*?</details>", "", t or "", flags=re.S).strip()
     # 雙 role 同文壓重:assistant 是 app 回合雙寫(canonical+state.db)的老
     # 案例;user 是 TG 鏡像 ingest(/internal/v1/mirror/telegram-event)落
     # canonical 後,state.db 掃描會再掃到同一句 —— 同 role+同文+10 分鐘內
@@ -11602,8 +11637,6 @@ async def app_get_messages(session: str, request: Request, limit: int = 200):
     # 兩份文字/ID 不同 → app 端按文字去重必然失敗,同一句畫面出現兩顆氣泡。
     # 在源頭壓掉 tg 側重複:同 role、剝附錄後正文相同、時間差 10 分鐘內,
     # 視為同一則。純 TG 對話(canonical 無副本)與相隔久遠的同文不受影響。
-    def _steps_stripped(t: str) -> str:
-        return re.sub(r"<details>.*?</details>", "", t or "", flags=re.S).strip()
     canon_recent = [((m.get("ts") or 0), m.get("role"),
                      _steps_stripped(m.get("content") or ""))
                     for m in out if m.get("role") in ("user", "assistant")]
@@ -12531,12 +12564,18 @@ async def _persona_prepare_turn(session: str, content: str, attachments: list,
 
 
 def _persona_launch_turn(session: str, prompt: str, client_id, common_log: dict,
-                         turn_started: float, canonical_user_ok, cid: str):
+                         turn_started: float, canonical_user_ok, cid: str,
+                         user_text: str = "", user_mid: str = ""):
     """建 queue/state、把 persona 回合掛成獨立背景任務,回 (task, state, q)。
 
     v1 POST /app/v1/messages 串流消費 q;v2 統一路由 input 不消費 q(回覆走
     S3 卡片事件流)。回合獨立於 client 連線:斷網不斷回合,收尾一定落
     canonical。S3 digest 掛鉤都在這裡——delta/status/收尾,單一實作兩邊共用。
+
+    `user_text`/`user_mid`:app→TG 反向鏡射(#32)用的 user 側原文與 canonical id。
+    給了才鏡射 user 那句;`_persona_inject_turn`(approval relay)不給 —— 那不是
+    使用者在 app 打的字,不該出現在 TG 聊天室裡。assistant 側一律在收尾處鏡射。
+    預設關閉,見 `tg_outbound`。
     """
     q: asyncio.Queue = asyncio.Queue()
     state = {"acc": "", "usage": None, "content_chunks": 0, "keepalives": 0,
@@ -12551,6 +12590,9 @@ def _persona_launch_turn(session: str, prompt: str, client_id, common_log: dict,
         # what actually happened server-side (the tool ran, the calendar was
         # created) — a reload then shows the real reply instead of losing it.
         digest = _hp_digest_maybe(session)
+        # app→TG:使用者這句先貼進 TG,順序才像一段對話(問在前、答在後)。
+        if user_text:
+            _tg_mirror_out(session, "user", user_text, user_mid)
         try:
             async for k, v in _persona_content_stream(session, prompt):
                 if k == "content":
@@ -12593,6 +12635,8 @@ def _persona_launch_turn(session: str, prompt: str, client_id, common_log: dict,
                 reply_mid, reply_ok = _canon_add_retry(session, "assistant", state["acc"],
                                                        client_id=client_id)
                 state["canonical_reply_ok"] = reply_ok
+                # app→TG:人格的回覆也要進 TG 聊天室,否則 TG 那頭只看到問句。
+                _tg_mirror_out(session, "assistant", state["acc"], reply_mid)
             if digest is not None:
                 try:
                     digest.turn_end(cid, state["acc"], reply_mid=reply_mid or "",
@@ -12812,7 +12856,8 @@ async def app_post_message(request: Request):
     _hp_cards_turn_start(session, cid, _user_mid, content, att_meta)
 
     task, state, q = _persona_launch_turn(session, prompt, client_id, common_log,
-                                          turn_started, canonical_user_ok, cid)
+                                          turn_started, canonical_user_ok, cid,
+                                          user_text=content, user_mid=_user_mid)
     if inflight_entry is not None:
         inflight_entry["task"] = task
         inflight_entry["state"] = state
