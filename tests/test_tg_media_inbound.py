@@ -130,6 +130,48 @@ text, atts = X("我剛看到 [Sent image attachment] 這個字串是什麼?")
 check("鏡射佔位僅整行匹配", text == "我剛看到 [Sent image attachment] 這個字串是什麼?"
       and not atts)
 
+# ── 4.2 鏡射列帶路徑(新 hermes patch/mirror-media-path)→ 一等附件 ─────
+# hermes _describe_media_for_mirror 逐檔一行:[Sent image attachment: <path>]
+text, atts = X(f"[Sent image attachment: {IMG}]")
+check("鏡射帶路徑: image 附件", len(atts) == 1 and atts[0]["kind"] == "image"
+      and atts[0]["path"] == IMG and atts[0]["mime"] == "image/jpeg"
+      and text == "")
+
+text, atts = X(f"[Sent document attachment: {SPACED}]")   # 路徑含空白
+check("鏡射帶路徑: document→file 附件(路徑含空白)",
+      len(atts) == 1 and atts[0]["kind"] == "file" and atts[0]["path"] == SPACED
+      and atts[0]["filename"] == "hr form v2.pdf" and text == "")
+
+text, atts = X(f"[Sent voice message: {M4A}]")
+check("鏡射帶路徑: voice→audio 附件", len(atts) == 1
+      and atts[0]["kind"] == "audio" and atts[0]["path"] == M4A and text == "")
+
+# 多檔 = 多行(取代舊「[Sent N media attachments]」計數列)
+text, atts = X(f"[Sent image attachment: {IMG}]\n[Sent document attachment: {PDF}]")
+check("鏡射帶路徑: 多行逐檔萃取", len(atts) == 2 and text == ""
+      and atts[0]["kind"] == "image" and atts[1]["kind"] == "file")
+
+# 檔案+封存皆無 → 人話占位帶檔名(#36 回退慣例)
+text, atts = X("[Sent image attachment: /nonexistent/mirror_gone.jpg]")
+check("鏡射帶路徑檔案不在: 占位帶檔名",
+      not atts and "mirror_gone.jpg" in text and "已失效" in text and "[Sent" not in text)
+
+text, atts = X("[Sent document attachment: /nonexistent/mirror_doc.pdf]")
+check("鏡射帶路徑文件不在: 占位帶檔名",
+      not atts and "mirror_doc.pdf" in text and "[Sent" not in text)
+
+# 行中引用同字串不誤傷(行錨定,同 4 的不變式)
+text, atts = X(f"我剛看到 [Sent image attachment: {IMG}] 這個字串是什麼?")
+check("鏡射帶路徑僅整行匹配", not atts and text.startswith("我剛看到 [Sent"))
+
+# 原檔被清但 media artifacts 有封存 → 引用仍有效(同 4.5 機制)
+PRUNED_M = _mkfile("pruned_mirror.jpg", b"\xff\xd8\xff\xe0mirror-gone")
+bridge._media_store().capture_path("hermes:test", PRUNED_M)
+os.unlink(PRUNED_M)
+text, atts = X(f"[Sent image attachment: {PRUNED_M}]")
+check("鏡射帶路徑封存快照: 原檔已清仍掛附件",
+      len(atts) == 1 and atts[0]["path"] == PRUNED_M and atts[0]["kind"] == "image")
+
 # 0.19 compaction 會把多則訊息併成一列(live db row 12713 實例)—— 佔位
 # 以「行」的形式出現在長文中段,逐行替換、其餘正文原樣保留。
 text, atts = X("收到，Android 版驗收正常。\n🖼️ 圖片測試\n"
@@ -173,6 +215,7 @@ rows = [
     ("assistant", f"收到,回你一份表格。\n\nMEDIA:{PDF}", now - 30),
     ("assistant", "[Sent image attachment]", now - 20),
     ("user", "[Image attached at: /nonexistent/expired.jpg]", now - 10),
+    ("assistant", f"[Sent image attachment: {IMG}]", now - 5),
 ]
 for r, c, ts in rows:
     con.execute("INSERT INTO messages VALUES('tg-1',?,?,?)", (r, c, ts))
@@ -180,7 +223,7 @@ con.commit()
 con.close()
 
 hist = bridge._persona_history(_home, 50)
-check("history: 四列都在", len(hist) == 4)
+check("history: 五列都在", len(hist) == 5)
 check("history: user 圖片附件引用",
       hist[0]["attachments"] and hist[0]["attachments"][0]["path"] == IMG
       and hist[0]["content"] == "照片來了")
@@ -191,6 +234,9 @@ check("history: 鏡射佔位人話", hist[2]["content"] == "（已在 Telegram �
       and not hist[2]["attachments"])
 check("history: 失效檔案退占位帶檔名",
       not hist[3]["attachments"] and "expired.jpg" in hist[3]["content"])
+check("history: 鏡射帶路徑掛附件",
+      hist[4]["attachments"] and hist[4]["attachments"][0]["path"] == IMG
+      and hist[4]["attachments"][0]["kind"] == "image" and hist[4]["content"] == "")
 
 # 附件 dict 形狀 = app 契約 {kind, filename, mime, path}(缺一不可)
 a = hist[0]["attachments"][0]

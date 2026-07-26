@@ -5821,7 +5821,7 @@ _TG_MEDIA_TAG = re.compile(
     r'''~?/\S+(?:[^\S\n]+\S+)*?\.(?:''' + _TG_MEDIA_EXTS + r'''))'''
     r'''(?=[\s`"',;:)\]}]|$)[`"']?''', re.IGNORECASE)
 # 跨 session send_message 的鏡射列(hermes tools/send_message_tool.py
-# `_describe_media_for_mirror`):純媒體訊息在 state.db 只留
+# `_describe_media_for_mirror`):舊 hermes 純媒體訊息在 state.db 只留
 # `[Sent image attachment]` 這種佔位 —— 路徑不落任何欄位(mirror_to_session
 # 只寫文字),bridge 端無檔可引。能做的是把工程占位字翻成人話,別讓
 # 「[Sent image attachment]」直接出現在對話泡泡(#36 善彰實測的痛點)。
@@ -5836,6 +5836,16 @@ _TG_SENT_MIRROR_HUMAN = {
     "document": "（已在 Telegram 傳送文件附件）",
     None: "（已在 Telegram 傳送語音訊息）",
 }
+# 新 hermes(0.19 本地 patch/mirror-media-path)鏡射列帶路徑,逐檔一行:
+#   [Sent image attachment: /path/to/file.jpg]
+#   [Sent voice message: /path/to/voice.ogg]
+# 這才是 #36 缺口的正解:路徑在,鏡射的媒體就是一等附件(封存回退同
+# `_tg_file_ok`);檔案兩邊都不在 → 人話占位帶檔名。舊佔位(無路徑)
+# 照上面 _TG_SENT_MIRROR 人話化,新舊 hermes 都不壞。
+_TG_SENT_MIRROR_PATH = re.compile(
+    r"^\[Sent (?:(?P<kind>image|video|audio|document) attachment|voice message): "
+    r"(?P<path>[^\]\n]+)\]$",
+    re.M)   # 行錨定理由同上;路徑允許含空白(image_cache 檔名會有)
 
 
 def _tg_extract_attachments(content: str):
@@ -5849,8 +5859,9 @@ def _tg_extract_attachments(content: str):
     note (帶檔名) — the raw path marker is engineering language the app must
     not show. Covers both directions of the TG side:使用者傳入(image hint /
     0.19 vision 描述塊 / document・audio・video saved-at 提示)與人格傳出
-    (assistant 列的 MEDIA:<path> 遞送標記);send_message 跨 session 鏡射的
-    [Sent … attachment] 佔位無路徑可引,翻成人話文字。"""
+    (assistant 列的 MEDIA:<path> 遞送標記);send_message 跨 session 鏡射
+    帶路徑的新標記([Sent … attachment: <path>])解析回一等附件,舊佔位
+    (無路徑可引)翻成人話文字。"""
     attachments: list = []
 
     def _tg_file_ok(path: str) -> bool:
@@ -5943,8 +5954,21 @@ def _tg_extract_attachments(content: str):
     text = _TG_FILE_NOTE.sub(_repl_file, text)
     text = _TG_MEDIA_TAG.sub(_repl_media_tag, text)
 
-    # send_message 鏡射佔位(無路徑可引)→ 人話。逐「行」錨定替換:
-    # 佔位獨佔一行才算(mirror 產物的真實形狀),行中引用原字串不誤傷。
+    # send_message 鏡射列「帶路徑」變體(新 hermes patch/mirror-media-path)
+    # → 一等附件。kind 分派對齊 _repl_media_tag:image→image、
+    # audio/voice→audio、video/document→file(mime 由副檔名帶);檔案與
+    # 封存皆無 → 人話占位帶檔名(_img_att/_att_for 內建)。
+    def _repl_mirror_path(m):
+        kind = m.group("kind")          # None → voice message
+        path = os.path.expanduser(m.group("path").strip())
+        if kind == "image":
+            return _img_att(path)
+        hint = "audio" if kind in (None, "audio") else "file"
+        return _att_for(path, os.path.basename(path), hint)
+    text = _TG_SENT_MIRROR_PATH.sub(_repl_mirror_path, text)
+
+    # send_message 鏡射佔位(舊 hermes,無路徑可引)→ 人話。逐「行」錨定
+    # 替換:佔位獨佔一行才算(mirror 產物的真實形狀),行中引用原字串不誤傷。
     def _repl_mirror(m):
         n = m.group("n")
         return (f"（已在 Telegram 傳送 {n} 件媒體附件）" if n
