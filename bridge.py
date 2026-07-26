@@ -9116,7 +9116,7 @@ async def v2_session_approve(session_id: str, request: Request):
     # 三 provider 一律轉呼 _approval_decide_core;三種舊 body({key}/{approve}/
     # {approval_id})走下方原分支,相容期照收(A4 刪)。
     uni_aid = str(body.get("approval_id") or "").strip()
-    if uni_aid and ("key" in body or "approve" in body):
+    if uni_aid and ("key" in body or "approve" in body or "decision" in body):
         result = await _approval_decide_core(uni_aid, body)
         return {"ok": True, "session_id": session_id, **result}
     src = _v2_card_source(session_id)
@@ -9215,16 +9215,27 @@ async def _v2_persona_input(session: str, session_id: str, body: dict,
             inflight_entry = {"ts": _now, "task": None, "state": None}
             _APP_TURN_INFLIGHT[(session, client_id)] = inflight_entry
 
-    content, att_meta, prompt = await _persona_prepare_turn(
-        session, content, attachments, stt_lang=str(body.get("stt_lang") or ""))
-    acp_session = await POOL.get(session, home_for(session))
-    queued = acp_session.is_busy()
-    user_mid, canonical_user_ok = _canon_add_retry(session, "user", content,
-                                                   att_meta, client_id=client_id)
-    _hp_cards_turn_start(session, cid, user_mid, content, att_meta)
-    task, state, _q = _persona_launch_turn(session, prompt, client_id, common_log,
-                                           turn_started, canonical_user_ok, cid,
-                                           user_text=content, user_mid=user_mid)
+    try:
+        content, att_meta, prompt = await _persona_prepare_turn(
+            session, content, attachments, stt_lang=str(body.get("stt_lang") or ""))
+        acp_session = await POOL.get(session, home_for(session))
+        queued = acp_session.is_busy()
+        user_mid, canonical_user_ok = _canon_add_retry(session, "user", content,
+                                                       att_meta, client_id=client_id)
+        _hp_cards_turn_start(session, cid, user_mid, content, att_meta)
+        task, state, _q = _persona_launch_turn(session, prompt, client_id, common_log,
+                                               turn_started, canonical_user_ok, cid,
+                                               user_text=content, user_mid=user_mid)
+    except BaseException:
+        # claim → launch 之間失敗(STT/附件前置、ACP spawn…)必須釋放 claim,
+        # 否則同 client_id 的重試會被 in_flight 擋整整 600s TTL(issue #9)。
+        if inflight_entry is not None and \
+                _APP_TURN_INFLIGHT.get((session, client_id)) is inflight_entry:
+            _APP_TURN_INFLIGHT.pop((session, client_id), None)
+            _log_event("app_turn_inflight_released", session=session,
+                       client_id_hash=_short_hash(client_id),
+                       reason="prelaunch_error", via="v2_input")
+        raise
     if inflight_entry is not None:
         inflight_entry["task"] = task
         inflight_entry["state"] = state
@@ -12844,20 +12855,31 @@ async def app_post_message(request: Request):
                            canonical_user_ok=None, canonical_reply_ok=None)
         return stream_response(dry_agen())
 
-    content, att_meta, prompt = await _persona_prepare_turn(
-        session, content, attachments, stt_lang=str(body.get("stt_lang") or ""))
-    acp_session = await POOL.get(session, home_for(session))
-    queued_at_accept = acp_session.is_busy()
+    try:
+        content, att_meta, prompt = await _persona_prepare_turn(
+            session, content, attachments, stt_lang=str(body.get("stt_lang") or ""))
+        acp_session = await POOL.get(session, home_for(session))
+        queued_at_accept = acp_session.is_busy()
 
-    # Record the transcript as the canonical text (so other devices see what was
-    # said even without the audio bytes), tagged so the app can show 🎤.
-    _user_mid, canonical_user_ok = _canon_add_retry(session, "user", content, att_meta,
-                                                    client_id=client_id)
-    _hp_cards_turn_start(session, cid, _user_mid, content, att_meta)
+        # Record the transcript as the canonical text (so other devices see what
+        # was said even without the audio bytes), tagged so the app can show 🎤.
+        _user_mid, canonical_user_ok = _canon_add_retry(session, "user", content,
+                                                        att_meta, client_id=client_id)
+        _hp_cards_turn_start(session, cid, _user_mid, content, att_meta)
 
-    task, state, q = _persona_launch_turn(session, prompt, client_id, common_log,
-                                          turn_started, canonical_user_ok, cid,
-                                          user_text=content, user_mid=_user_mid)
+        task, state, q = _persona_launch_turn(session, prompt, client_id, common_log,
+                                              turn_started, canonical_user_ok, cid,
+                                              user_text=content, user_mid=_user_mid)
+    except BaseException:
+        # claim → launch 之間失敗必須釋放 claim,否則同 client_id 的重試會被
+        # 附掛到一個永遠不會啟動的 entry(task=None)直到 600s TTL(issue #9)。
+        if inflight_entry is not None and \
+                _APP_TURN_INFLIGHT.get(inflight_key) is inflight_entry:
+            _APP_TURN_INFLIGHT.pop(inflight_key, None)
+            _log_event("app_turn_inflight_released", session=session,
+                       client_id_hash=_short_hash(client_id),
+                       reason="prelaunch_error", via="v1_messages")
+        raise
     if inflight_entry is not None:
         inflight_entry["task"] = task
         inflight_entry["state"] = state
@@ -13348,6 +13370,12 @@ async def _approval_decide_core(aid: str, b: dict) -> dict:
     讀取端一律視為等價,A4 收斂。"""
     import sqlite3
     key = str(b.get("key") or "").strip()
+    # #13 收尾:契約 body {"approval_id","decision":"approve"|"deny"} 的
+    # decision 字串與 {approve: bool} 等價 —— 入口統一折成 approve bool,
+    # cc/codex/hermes 三分支照舊只認 key / approve 即可。
+    if not key and "approve" not in b and str(
+            b.get("decision") or b.get("status") or b.get("action") or "").strip():
+        b = {**b, "approve": _approval_bool_from_body(b)}
     d = _approval_get_row(aid)
     src = str((d or {}).get("source") or "")
     if d and src.startswith("claude_code:"):
