@@ -1907,7 +1907,15 @@ def _steps_stripped(t: str) -> str:
     要與 state.db 側同形,將來萬一被回收才對得上壓重鍵)共用同一份 —— 三處各自
     正規化就是雙氣泡回歸的入口。
     """
-    return re.sub(r"<details>.*?</details>", "", t or "", flags=re.S).strip()
+    body = re.sub(r"<details>.*?</details>", "", t or "", flags=re.S).strip()
+    # app→TG 鏡射會在 user 那句前面加 📱 標記(讓 TG 那頭看得出是從手機說的)。
+    # 壓重時當它不存在:Telegram 不會把 bot 自己送出的訊息當成 Update 回送,所以
+    # 正常情況下 state.db 根本不會有這份副本;但這條不變式不該建立在別人的實作
+    # 細節上 —— 萬一哪天真的被回收進來,帶標記的副本仍要能和 canonical 的原文
+    # 對上,否則就是一顆多出來的泡泡。
+    if body.startswith(tg_outbound.USER_PREFIX):
+        body = body[len(tg_outbound.USER_PREFIX):].lstrip()
+    return body
 
 
 def _tg_mirror_out(session: str, role: str, raw_body: str, mid: str) -> None:

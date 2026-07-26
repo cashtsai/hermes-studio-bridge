@@ -177,6 +177,26 @@ bodies = [m for m in merged if m.get("role") == "assistant"]
 check("鏡射回來的副本被壓掉,只剩一則 assistant(無雙氣泡)", len(bodies) == 1)
 check("留下的是 canonical 那份", bodies[0]["id"] == "canon-a1")
 
+# user 側:鏡射加的 📱 標記在壓重時要當它不存在。Telegram 不回送 bot 自己的
+# 訊息,所以正常不會有這份副本 —— 但這條不變式不建立在別人的實作細節上。
+USER_SAID = "幫我看一下明天的班表"
+check("📱 標記在壓重正規化中被剝掉",
+      bridge._steps_stripped(tg_outbound.format_text("user", USER_SAID))
+      == bridge._steps_stripped(USER_SAID) == USER_SAID)
+
+con = sqlite3.connect(_db)
+con.execute("INSERT INTO messages VALUES (?,?,?,?)",
+            (SID_NOW, "user", tg_outbound.format_text("user", USER_SAID), NOW))
+con.commit()
+con.close()
+bridge._canon_add(SESSION, "user", USER_SAID, None,
+                  mid="canon-u1", created_at=NOW, push=False)
+merged = bridge._hp_merged_messages(SESSION, 50)
+users = [m for m in merged if m.get("role") == "user"]
+check("帶 📱 標記的回收副本也被壓掉(無雙氣泡)", len(users) == 1)
+check("留下的是 canonical 的原文",
+      users[0]["id"] == "canon-u1" and users[0]["content"] == USER_SAID)
+
 
 # ── 5. 冪等:同一個 mid 只投一次 ────────────────────────────────────────
 tg_outbound.reset_state()
