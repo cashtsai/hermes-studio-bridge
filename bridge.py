@@ -2728,7 +2728,8 @@ def _report_action_url_ok(url: str) -> bool:
     try:
         from urllib.parse import urlsplit
         parts = urlsplit(url)
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
+        _log_exc("report_action_url_parse", exc, expected=True, url_len=len(url))
         return False
     return parts.scheme in ("http", "https") and bool(parts.netloc)
 
