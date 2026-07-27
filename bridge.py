@@ -38,6 +38,7 @@ from pathlib import Path
 
 import media_artifacts
 import hermes_media
+import openclaw_provider
 import tg_outbound
 from fastapi import FastAPI, Request, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import (JSONResponse, StreamingResponse, FileResponse,
@@ -9012,7 +9013,10 @@ async def v2_agents(request: Request):
          "status": "ready", "auth": {"connected": True, "account": None}, "can_create": True},
         {"provider": "hermes", "name": "Hermes", "kind": "persona",
          "status": "ready", "auth": {"connected": True, "account": None}, "can_create": False},
-    ]}
+    ] + ([
+        {"provider": "openclaw", "name": "OpenClaw", "kind": "code_agent",
+         "status": "ready", "auth": {"connected": True, "account": None}, "can_create": False},
+    ] if OPENCLAW.configured() else [])}
 
 
 @app.get("/app/v2/sessions")
@@ -9088,6 +9092,17 @@ async def v2_sessions(request: Request, provider: str = "", status: str = ""):
         _log_event("v2_codex_list_failed", error=type(e).__name__,
                    error_message=str(e)[:200])
         degraded.append("codex")
+    # S4:openclaw sessions(SPEC §5)。未配置 → 整段缺席(零影響現有使用者);
+    # 配置了但 gateway 掛 → 標 degraded,照 codex 同款不無聲吞錯。
+    if OPENCLAW.configured():
+        try:
+            res = await OPENCLAW.call("sessions.list", {"limit": 20}, timeout=10.0)
+            for row in (res or {}).get("sessions", [])[:20]:
+                out.append(openclaw_provider.session_v2_row(row))
+        except Exception as e:  # noqa: BLE001
+            _log_event("v2_openclaw_list_failed", error=type(e).__name__,
+                       error_message=str(e)[:200])
+            degraded.append("openclaw")
     if provider:
         out = [s for s in out if s["provider"] == provider]
     if status:
@@ -9158,6 +9173,10 @@ async def v2_session_approve(session_id: str, request: Request):
                            "hermes approve 需要 approval_id(approval 卡或 GET /app/v1/approvals)")
         result = await _approval_decide_core(aid, body)
         return {"ok": True, "session_id": session_id, **result}
+    if src[0] == "oc":
+        # SPEC §6-1:openclaw v1 不宣告 approve(exec.approval.* 接線留 TODO)。
+        raise http_err(400, "UNSUPPORTED_PROVIDER",
+                       "openclaw 尚不支援 approve(capability 未宣告)")
     approved = _approval_bool_from_body(body)
     for_session = bool(body.get("for_session") or body.get("approve_for_session") or
                        body.get("remember"))
@@ -9184,6 +9203,8 @@ async def v2_session_input(session_id: str, request: Request):
     if src[0] == "cc":
         res = await _cc_input_core(src[1], body)
         return {"session_id": session_id, **res}
+    if src[0] == "oc":
+        return await _oc_input_core(src[1], session_id, body)
     if src[0] == "cx":
         content = (body.get("content") or body.get("text") or "").strip()
         attachments = body.get("attachments") or []
@@ -9283,6 +9304,17 @@ async def v2_session_interrupt(session_id: str, request: Request):
     if src[0] == "hp":
         res = await _persona_interrupt_core(src[1])
         return {"session_id": session_id, **res}
+    if src[0] == "oc":
+        # SPEC §4:chat.abort {sessionKey}。gateway 對「無活躍 run」不報錯,
+        # 為維持 v2 契約(無活躍 turn 一律 409)先查 digest busy 狀態。
+        d = _OC_CARD_DIGESTS.get(src[1])
+        if d is not None and not d.busy:
+            raise http_err(409, "NO_ACTIVE_TURN", "no active OpenClaw run")
+        try:
+            await OPENCLAW.call("chat.abort", {"sessionKey": src[1]})
+        except openclaw_provider.OpenClawError as e:
+            _oc_http_error(e)
+        return {"ok": True, "session_id": session_id, "interrupted": True}
     try:
         await CODEX_APP.interrupt_turn(src[1])
     except CodexAppServerError as e:
@@ -9499,6 +9531,14 @@ def _v2_card_source(session_id: str) -> tuple:
             if rest not in PERSONAS:
                 raise http_err(404, "SESSION_NOT_FOUND", "unknown persona")
             return ("hp", rest)
+        if prov == "openclaw":
+            # S4:rest = 完整 sessionKey(本身含冒號,如 agent:main:main),
+            # partition 之後整段原樣保留。未配置 → 404(對外表現同不存在)。
+            if not OPENCLAW.configured():
+                raise http_err(404, "SESSION_NOT_FOUND", "openclaw not configured")
+            if not rest:
+                raise http_err(404, "SESSION_NOT_FOUND", "empty openclaw session key")
+            return ("oc", rest)
         if prov != "claude_code":
             raise http_err(400, "UNSUPPORTED_PROVIDER",
                            f"不支援的 provider: {prov}")
@@ -9735,6 +9775,190 @@ async def _hp_card_digest(session: str):
     return d
 
 
+# ─────────── Phase 0 S4:openclaw 卡片事件流(gateway 廣播,事件驅動)─────────
+# 契約:docs/OPENCLAW_PROVIDER_SPEC.md。傳輸層在 openclaw_provider.py,
+# digest 在 carddigest.OpenClawDigest;這裡只做接線:
+# - OPENCLAW 單例(未配置 → configured() False,全部端點靜默缺席)
+# - 事件泵:gateway 廣播 chat/agent → 有訂閱過的 digest;final 掛推播
+# - seed:chat.history(重連後 digest 標記重 seed,SPEC §6-4)
+
+OPENCLAW = openclaw_provider.OpenClawClient(log=_log_event)
+_OC_CARD_DIGESTS: dict = {}      # sessionKey -> carddigest.OpenClawDigest
+_OC_CARD_SEED_MSGS = 200         # 冷載種子:chat.history 訊息數
+_OC_HEARTBEAT_RUNS: "collections.OrderedDict" = collections.OrderedDict()
+_OC_HEARTBEAT_RUNS_MAX = 256     # runId → heartbeat 旗標(推播過濾用)
+_OC_PUMP_TASK: list = [None]     # 常駐事件泵 task(單例)
+
+
+def _oc_http_error(e: Exception):
+    """OpenClawError → HTTP 錯誤(同 _codex_http_error 精神)。"""
+    _log_event("openclaw_provider_error", error=type(e).__name__,
+               error_message=str(e)[:200], code=getattr(e, "code", None))
+    if isinstance(e, openclaw_provider.OpenClawError):
+        if e.code == "NOT_CONFIGURED":
+            raise http_err(404, "SESSION_NOT_FOUND", "openclaw not configured")
+        if e.code == "TIMEOUT":
+            raise http_err(504, "PROVIDER_TIMEOUT", "openclaw gateway timeout", str(e))
+        raise HTTPException(status_code=502, detail=str(e))
+    raise HTTPException(status_code=502, detail=str(e))
+
+
+def _oc_events_feed(event: str, payload: dict) -> None:
+    """OPENCLAW.on_event:gateway 廣播 → 依 sessionKey 分流到有訂閱過的
+    digest(沒人看過的 session 不建 digest,同 cx 模式);chat final 掛推播。"""
+    try:
+        key = str(payload.get("sessionKey") or "")
+        if not key:
+            return
+        if event == "agent" and payload.get("isHeartbeat"):
+            rid = str(payload.get("runId") or "")
+            if rid:
+                _OC_HEARTBEAT_RUNS[rid] = True
+                while len(_OC_HEARTBEAT_RUNS) > _OC_HEARTBEAT_RUNS_MAX:
+                    _OC_HEARTBEAT_RUNS.popitem(last=False)
+        d = _OC_CARD_DIGESTS.get(key)
+        if d is not None:
+            d.handle(event, payload)
+        if event == "chat" and payload.get("state") == "final":
+            _oc_push_final(key, payload)
+    except Exception as e:  # noqa: BLE001 — 單筆事件毒丸不斷流
+        _log_event("oc_events_feed_error", error=str(e)[:160])
+
+
+def _oc_push_final(key: str, payload: dict) -> None:
+    """openclaw 回合定稿 → 推播(照 _push_persona_reply 同款;heartbeat 自跑
+    回合不吵人)。fire-and-forget。"""
+    rid = str(payload.get("runId") or "")
+    if rid and rid in _OC_HEARTBEAT_RUNS:
+        return
+    msg = payload.get("message") or {}
+    text = carddigest._oc_msg_text(msg.get("content")).strip()
+    if not text:
+        return
+    title = f"OpenClaw · {openclaw_provider.session_short_name(key)}"
+    data = {"kind": "message",
+            "pocket": {"kind": "message", "sessionId": f"openclaw:{key}"}}
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    t = loop.create_task(push_notify(title, text[:140], data,
+                                     thread_id=f"openclaw:{key}",
+                                     content_available=True,
+                                     no_preview_body="傳了一則訊息"))
+    _BG_TASKS.add(t)
+    t.add_done_callback(_BG_TASKS.discard)
+
+
+def _oc_reseed_on_reconnect() -> None:
+    """斷線期間 gateway 事件不可重放(SPEC §6-4)→ 全部 digest 標記重 seed,
+    下一次 cards/events 請求會重讀 chat.history 補洞(卡 id 穩定,重疊只是
+    rev 遞增)。"""
+    for d in _OC_CARD_DIGESTS.values():
+        d.seeded = False
+
+
+OPENCLAW.on_event = _oc_events_feed
+OPENCLAW.on_reconnect = _oc_reseed_on_reconnect
+
+
+def _oc_ensure_pump() -> None:
+    """常駐事件泵(單例):配置存在才有意義;未配置時 run_forever 便宜輪空。"""
+    t = _OC_PUMP_TASK[0]
+    if t is not None and not t.done():
+        return
+    _OC_PUMP_TASK[0] = asyncio.create_task(OPENCLAW.run_forever())
+
+
+async def _oc_card_digest(key: str):
+    """取得(必要時建立+seed)該 sessionKey 的 digest。先註冊再 seed ——
+    seed 期間的 live 事件與 seed 產不同批卡 id(h- vs run-),known_mids
+    去重靠 __openclaw.id,不會雙份。"""
+    d = _OC_CARD_DIGESTS.get(key)
+    if d is None:
+        d = _OC_CARD_DIGESTS[key] = carddigest.OpenClawDigest()
+        d.store.media_session_id = f"openclaw:{key}"
+    if not d.seeded:
+        d.seeded = True
+        try:
+            res = await OPENCLAW.call("chat.history",
+                                      {"sessionKey": key,
+                                       "limit": _OC_CARD_SEED_MSGS})
+            d.seed_messages((res or {}).get("messages") or [])
+            si = (res or {}).get("sessionInfo") or {}
+            d.busy = bool(si.get("hasActiveRun"))
+            d._status()
+        except Exception as e:  # noqa: BLE001
+            d.seeded = False   # 下次請求重試 seed
+            _log_event("oc_card_seed_error", session=key[:48],
+                       error=str(e)[:200])
+            _oc_http_error(e)
+    return d
+
+
+async def _oc_input_core(key: str, session_id: str, body: dict) -> dict:
+    """v2 input(oc):chat.send fire-and-forget,回覆走 S4 卡片事件流。
+    client_id → idempotencyKey(gateway 原生冪等,重試不重跑)。"""
+    content = (body.get("content") or body.get("text") or "").strip()
+    attachments = body.get("attachments") or []
+    if attachments and not content:
+        # SPEC §6-2:v1 不宣告 attachments;純附件輸入直接拒絕,
+        # 文字夾附件則丟附件收文字(app 端 capability 缺席本來就不給附件 UI)。
+        raise http_err(400, "ATTACHMENTS_UNSUPPORTED",
+                       "openclaw v1 不支援附件輸入")
+    if not content:
+        raise HTTPException(status_code=400, detail="empty")
+    client_id = str(body.get("client_id") or "").strip()
+    idem = f"pocket-{client_id}" if client_id else f"pocket-{uuid.uuid4().hex[:20]}"
+    try:
+        res = await OPENCLAW.call("chat.send",
+                                  {"sessionKey": key, "message": content,
+                                   "idempotencyKey": idem})
+    except openclaw_provider.OpenClawError as e:
+        _oc_http_error(e)
+    d = _OC_CARD_DIGESTS.get(key)
+    if d is not None:
+        # user 回顯卡:openclaw 的 chat 事件只帶 assistant 訊息,app 送話
+        # 在這裡即時出卡(idem 冪等 → 重試同 id 不雙份)。
+        d.user_card(content, idem)
+    _log_event("oc_input", session=key[:48], chars=len(content),
+               run_id=str((res or {}).get("runId") or ""))
+    return {"ok": True, "session_id": session_id, "accepted": True,
+            "run_id": str((res or {}).get("runId") or "")}
+
+
+@app.get("/app/v1/openclaw/config")
+async def openclaw_config_get(request: Request):
+    """App 帳號頁「進階」讀 OpenClaw 連線設定(token 永不回傳明文)。"""
+    _check_auth(request)
+    cfg = openclaw_provider.load_config()
+    return {"configured": OPENCLAW.configured(),
+            "base_url": cfg["base_url"], "token_set": bool(cfg["token"]),
+            "source": cfg["source"]}
+
+
+@app.put("/app/v1/openclaw/config")
+async def openclaw_config_put(request: Request):
+    """App 手動配置 base_url+token(v1;QR/runtime 配對留 TODO,SPEC §6-5)。
+    base_url 給空字串 = 清除配置(provider 回到靜默缺席)。env 有值時 env
+    優先,source 欄位讓 app 能提示「目前由伺服器 env 鎖定」。"""
+    _check_auth(request)
+    body = await _json_body(request)
+    base = str(body.get("base_url") or "").strip()
+    token = str(body.get("token") or "").strip()
+    openclaw_provider.save_config(base, token)
+    OPENCLAW.reset()
+    _oc_reseed_on_reconnect()
+    if OPENCLAW.configured():
+        _oc_ensure_pump()
+    cfg = openclaw_provider.load_config()
+    _log_event("openclaw_config_updated", configured=OPENCLAW.configured(),
+               source=cfg["source"])
+    return {"ok": True, "configured": OPENCLAW.configured(),
+            "base_url": cfg["base_url"], "token_set": bool(cfg["token"]),
+            "source": cfg["source"]}
+
+
 async def _v2_card_store(session_id: str):
     """cards/events 共用:session id → 已 seed 的 SessionCardStore。"""
     src = _v2_card_source(session_id)
@@ -9742,6 +9966,8 @@ async def _v2_card_store(session_id: str):
         return (await _cx_card_digest(src[1])).store
     if src[0] == "hp":
         return (await _hp_card_digest(src[1])).store
+    if src[0] == "oc":
+        return (await _oc_card_digest(src[1])).store
     _, name, workdir = src
     store = _cc_card_store(name)
     await _cc_card_seed(store, name, workdir)
@@ -10659,8 +10885,9 @@ async def capabilities(request: Request):
                          "interactive_push", "media_artifacts",
                          "hermes_media_capabilities",
                          "hermes_media_settings",
-                         "push_register", "dashboard"] +
-                        (["terminal"] if POCKET_TERMINAL_ENABLED else []),
+                         "push_register", "dashboard", "openclaw_config"] +
+                        (["terminal"] if POCKET_TERMINAL_ENABLED else []) +
+                        (["openclaw_provider"] if OPENCLAW.configured() else []),
             "endpoints": ["/app/v1/sessions", "/app/v1/messages", "/reports",
                           "/app/v1/uploads",
                           "/app/v1/reactions", "/app/v1/pins",
@@ -10683,7 +10910,8 @@ async def capabilities(request: Request):
                           "/app/v2/hermes/media-capabilities",
                           "/app/v2/hermes/media-settings",
                           "/app/v2/sessions/{id}/approve", "/app/v1/terminal",
-                          "/app/v1/usage", "/app/v1/dashboard"]}
+                          "/app/v1/usage", "/app/v1/dashboard",
+                          "/app/v1/openclaw/config"]}
 
 
 @app.post("/app/v1/auth/apple")
@@ -13855,10 +14083,27 @@ async def _dashboard_sessions():
         _log_event("dashboard_codex_failed", error=type(e).__name__,
                    error_message=str(e)[:160])
         degraded.append("codex")
-    return {"cc": {"working": cc_w, "idle": cc_i},
-            "cx": {"working": cx_w, "idle": cx_i},
-            "persona": {"working": p_w, "idle": p_i},
-            "degraded": degraded}
+    out = {"cc": {"working": cc_w, "idle": cc_i},
+           "cx": {"working": cx_w, "idle": cx_i},
+           "persona": {"working": p_w, "idle": p_i},
+           "degraded": degraded}
+    # S4:openclaw 未配置 → 鍵缺席(app 端 optional decode 自動不畫那一行);
+    # 配置了但掛 → 鍵缺席 + degraded 標記,同 codex 精神。
+    if OPENCLAW.configured():
+        try:
+            res = await OPENCLAW.call("sessions.list", {"limit": 20}, timeout=5.0)
+            oc_w = oc_i = 0
+            for row in (res or {}).get("sessions", [])[:20]:
+                if openclaw_provider.session_status(row) == "running":
+                    oc_w += 1
+                else:
+                    oc_i += 1
+            out["openclaw"] = {"working": oc_w, "idle": oc_i}
+        except Exception as e:  # noqa: BLE001
+            _log_event("dashboard_openclaw_failed", error=type(e).__name__,
+                       error_message=str(e)[:160])
+            degraded.append("openclaw")
+    return out
 
 
 async def _dashboard_gateways() -> list:
@@ -13974,6 +14219,15 @@ async def _start_housekeeping():
     task = asyncio.create_task(_housekeeping_loop())
     _BG_TASKS.add(task)
     task.add_done_callback(_BG_TASKS.discard)
+
+
+@app.on_event("startup")
+async def _start_openclaw_pump():
+    # S4:openclaw 常駐事件泵。未配置 → 只記一次 log,泵便宜輪空
+    # (30s 一次 configured() 檢查),配置後(env 或 PUT config)自動接上。
+    if not OPENCLAW.configured():
+        _log_event("openclaw_disabled", reason="no base_url configured")
+    _oc_ensure_pump()
 
 
 @app.on_event("startup")
