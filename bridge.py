@@ -150,6 +150,38 @@ _APPLE_WEB_FLOWS: dict = {}
 _APPLE_WEB_STARTS: dict[str, collections.deque] = {}
 _APPLE_WEB_FLOW_LOCK = threading.Lock()
 
+# ───────── Apple 訂閱 entitlement(StoreKit 2,feat/subscription-entitlement)─────
+# 訂閱狀態的**權威在伺服器**:app 只能送 Apple 簽的 signedTransaction 當證據,
+# 永遠不能自稱「我是訂閱者」。收據用離線 JWS 驗簽(憑證鏈驗到我們釘死的
+# Apple Root CA - G3),理由與做法見 apple_storekit.py 模組 docstring。
+#
+# 缺配置 → 靜默停用(照 APNs 金鑰缺席的規矩):subscription_configured() 回
+# False 時,三個端點照樣活著、照樣回 200,但一律回「免費層」,不寫 DB、不驗
+# 簽、不炸例外。bridge 絕不因為沒設訂閱參數而起不來或壞掉既有功能。
+#
+#   APPLE_STOREKIT_BUNDLE_ID   我們接受哪個 app 的交易(空 = 未配置)
+#   APPLE_STOREKIT_ROOT_CA_PATH  Apple Root CA - G3 憑證(PEM 或 DER;空 = 未配置)
+#   APPLE_STOREKIT_ENVIRONMENTS  接受的環境,預設 Production,Sandbox
+#   APPLE_STOREKIT_APP_APPLE_ID  選填;有設就比對通知裡的 appAppleId
+#   POCKET_SUBSCRIPTION_PRODUCT_TIERS  "product_id:tier,..." 選填,預設全 pro
+APPLE_STOREKIT_BUNDLE_ID = os.environ.get("APPLE_STOREKIT_BUNDLE_ID", "").strip()
+APPLE_STOREKIT_ROOT_CA_PATH = os.path.expanduser(
+    os.environ.get("APPLE_STOREKIT_ROOT_CA_PATH", "").strip()
+)
+APPLE_STOREKIT_ENVIRONMENTS = tuple(
+    e.strip() for e in os.environ.get(
+        "APPLE_STOREKIT_ENVIRONMENTS", "Production,Sandbox").split(",") if e.strip()
+)
+APPLE_STOREKIT_APP_APPLE_ID = os.environ.get("APPLE_STOREKIT_APP_APPLE_ID", "").strip()
+# 憑證 OID 釘選(縱深防禦)。萬一 Apple 換 OID 導致正式交易全被拒,event log
+# 會留下 leaf_oid_missing / intermediate_oid_missing,屆時設 0 可先解鎖。
+APPLE_STOREKIT_CHECK_CERT_OIDS = os.environ.get(
+    "APPLE_STOREKIT_CHECK_CERT_OIDS", "1").strip().lower() not in ("0", "false", "no")
+SUBSCRIPTION_FREE_TIER = "free"
+SUBSCRIPTION_DEFAULT_TIER = "pro"
+_SUBSCRIPTION_ROOT_CACHE: list = [None, 0.0, ""]   # [certs, mtime, path]
+_SUBSCRIPTION_DISABLED_LOGGED: list = [False]
+
 
 def _load_device_tokens() -> dict:
     try:
@@ -894,7 +926,10 @@ async def _resolve_persona_prompt(messages: list, home: str) -> str:
 # Hermes state.db schema or cron JSON directly.
 CANON_DB = os.environ.get("POCKET_CANON_DB") \
     or os.path.expanduser("~/.local/share/pocket-agent/canonical.db")
-ACCOUNTS_DB = os.path.expanduser("~/.local/share/pocket-agent/accounts.db")
+# POCKET_ACCOUNTS_DB 覆寫是為了讓測試/smoke 能指到 /tmp 假 db —— 帳號與
+# entitlement 都在這裡,測試絕不能碰到正式檔(同 POCKET_CANON_DB 的用法)。
+ACCOUNTS_DB = os.environ.get("POCKET_ACCOUNTS_DB") \
+    or os.path.expanduser("~/.local/share/pocket-agent/accounts.db")
 REPORT_MEMORY_FILE = "REPORTS.md"
 REPORT_MEMORY_ITEMS = 20
 REPORT_MEMORY_CHARS = 2400
@@ -1101,6 +1136,34 @@ def _accounts_init():
                 ON UPDATE CASCADE ON DELETE CASCADE)""")
         con.execute("CREATE INDEX IF NOT EXISTS idx_account_devices_user ON devices(apple_user_id, revoked)")
         con.execute("CREATE INDEX IF NOT EXISTS idx_account_devices_token ON devices(device_token)")
+        # entitlements:訂閱狀態的伺服器端真相,讓「換手機/重裝」不會掉訂閱。
+        # 主鍵是 original_transaction_id —— Apple 對「一條訂閱」的永久識別,
+        # 續訂會換 transaction_id 但 original 不變。apple_user_id 可為 NULL:
+        # App Store Server Notification 可能比 app 的 /verify 先到,那時我們
+        # 還不知道這筆屬於誰,先落帳,等 app 帶著 account session 來認領。
+        # 這裡刻意**不加 users 的 FOREIGN KEY**:通知先到時 apple_user_id 是
+        # NULL 沒問題,但若之後填了一個尚未 upsert 的 user,外鍵會讓 Apple 的
+        # 通知寫入失敗 → 退款/撤銷事件被丟掉,是最不能壞的方向。
+        con.execute("""CREATE TABLE IF NOT EXISTS entitlements(
+            original_transaction_id TEXT PRIMARY KEY,
+            apple_user_id TEXT,
+            product_id TEXT,
+            tier TEXT,
+            status TEXT,
+            environment TEXT,
+            purchase_at REAL,
+            expires_at REAL,
+            grace_expires_at REAL,
+            revoked_at REAL,
+            auto_renew INTEGER,
+            transaction_id TEXT,
+            last_signed_at REAL,
+            source TEXT,
+            raw_json TEXT,
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL)""")
+        con.execute("CREATE INDEX IF NOT EXISTS idx_entitlements_user "
+                    "ON entitlements(apple_user_id)")
         con.commit()
         con.close()
     finally:
@@ -1290,6 +1353,349 @@ def _account_device_revoke(apple_user_id: str, device_id: str):
         return revoked
     finally:
         con.close()
+
+
+# ───────────── 訂閱 entitlement:配置、驗簽、資料存取 ─────────────────────
+ENTITLEMENT_COLUMNS = (
+    "original_transaction_id", "apple_user_id", "product_id", "tier", "status",
+    "environment", "purchase_at", "expires_at", "grace_expires_at", "revoked_at",
+    "auto_renew", "transaction_id", "last_signed_at", "source", "raw_json",
+    "created_at", "updated_at",
+)
+# 效力排序:同一個帳號可能有多筆 original_transaction_id(換方案、sandbox 與
+# production 並存、退款後再訂)。挑「最有利且最新」的那筆當有效 entitlement。
+_ENTITLEMENT_RANK = {"active": 3, "grace": 2, "expired": 1, "revoked": 0}
+
+
+def subscription_configured() -> bool:
+    """bundle id + Apple Root CA 都到位才算配置完成。
+
+    未配置 → 訂閱模組整體靜默停用:三個端點照樣回 200,但一律回免費層,
+    不驗簽、不寫 DB、不炸例外(照 apns_configured() 的同一套規矩)。第一次
+    偵測到未配置時 _log_event 一筆,讓「訂閱沒動靜」查得到原因。"""
+    ok = bool(APPLE_STOREKIT_BUNDLE_ID) and bool(APPLE_STOREKIT_ROOT_CA_PATH) \
+        and os.path.isfile(APPLE_STOREKIT_ROOT_CA_PATH)
+    if not ok and not _SUBSCRIPTION_DISABLED_LOGGED[0]:
+        _SUBSCRIPTION_DISABLED_LOGGED[0] = True
+        _log_event("subscription_disabled",
+                   bundle_id_set=bool(APPLE_STOREKIT_BUNDLE_ID),
+                   root_ca_path=APPLE_STOREKIT_ROOT_CA_PATH,
+                   root_ca_exists=bool(APPLE_STOREKIT_ROOT_CA_PATH)
+                   and os.path.isfile(APPLE_STOREKIT_ROOT_CA_PATH))
+    return ok
+
+
+def _subscription_root_certs():
+    """讀取並快取信任錨憑證(檔案 mtime 變了才重讀)。讀不到 → None。"""
+    import apple_storekit
+    path = APPLE_STOREKIT_ROOT_CA_PATH
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        return None
+    if _SUBSCRIPTION_ROOT_CACHE[0] is not None \
+            and _SUBSCRIPTION_ROOT_CACHE[1] == mtime \
+            and _SUBSCRIPTION_ROOT_CACHE[2] == path:
+        return _SUBSCRIPTION_ROOT_CACHE[0]
+    try:
+        with open(path, "rb") as fh:
+            certs = apple_storekit.load_root_certificates(fh.read())
+    except Exception as exc:  # noqa: BLE001
+        _log_event("subscription_root_ca_unreadable", path=path,
+                   error=type(exc).__name__)
+        return None
+    _SUBSCRIPTION_ROOT_CACHE[0] = certs
+    _SUBSCRIPTION_ROOT_CACHE[1] = mtime
+    _SUBSCRIPTION_ROOT_CACHE[2] = path
+    return certs
+
+
+def _subscription_verify_jws(token: str, what: str) -> dict:
+    """驗一段 Apple JWS,回 payload。失敗 → 401(**永不**回未驗證內容)。"""
+    import apple_storekit
+    roots = _subscription_root_certs()
+    if not roots:
+        raise http_err(503, "SUBSCRIPTION_NOT_CONFIGURED",
+                       "subscription verification is not configured")
+    try:
+        return apple_storekit.verify_jws(
+            token, roots, check_cert_oids=APPLE_STOREKIT_CHECK_CERT_OIDS)
+    except apple_storekit.StoreKitVerifyError as exc:
+        # reason 是我們自己的代碼,不含收據內容,可安全進 log。
+        _log_event("subscription_verify_rejected", what=what, reason=exc.reason,
+                   detail=str(exc.detail)[:80])
+        raise http_err(401, "SUBSCRIPTION_INVALID_RECEIPT",
+                       "receipt signature verification failed")
+
+
+def _subscription_tier_for_product(product_id: str | None) -> str:
+    """product_id → tier。預設「驗過簽的訂閱就是 pro」;env 可細分方案。"""
+    if not product_id:
+        return SUBSCRIPTION_FREE_TIER
+    raw = os.environ.get("POCKET_SUBSCRIPTION_PRODUCT_TIERS", "").strip()
+    if raw:
+        for pair in raw.split(","):
+            name, _, tier = pair.partition(":")
+            if name.strip() == product_id and tier.strip():
+                return tier.strip()
+    return SUBSCRIPTION_DEFAULT_TIER
+
+
+def _entitlement_status(row: dict, now: float | None = None) -> str:
+    """狀態一律**由時間戳當場算**,不信 status 欄位的快取值 —— 否則「到期」
+    就得靠 cron 掃表,而漏跑 cron 會讓過期訂閱一直看起來有效。"""
+    now = time.time() if now is None else now
+    if row.get("revoked_at"):
+        return "revoked"
+    expires_at = row.get("expires_at")
+    grace = row.get("grace_expires_at")
+    if expires_at and now < float(expires_at):
+        return "active"
+    if grace and now < float(grace):
+        return "grace"          # 帳單重試寬限期:Apple 說還算付費使用者
+    if expires_at is None and row.get("purchase_at"):
+        return "active"         # 沒有到期日(非續訂型購買)→ 永久有效
+    return "expired"
+
+
+def _entitlement_row(row):
+    return dict(zip(ENTITLEMENT_COLUMNS, row)) if row else None
+
+
+def _entitlement_free(configured: bool | None = None) -> dict:
+    """免費層 —— 未配置、查無資料、或訂閱已失效時的統一形狀。"""
+    return {
+        "tier": SUBSCRIPTION_FREE_TIER,
+        "active": False,
+        "status": "none",
+        "product_id": None,
+        "expires_at": None,
+        "grace_expires_at": None,
+        "auto_renew": None,
+        "environment": None,
+        "original_transaction_id": None,
+        "updated_at": None,
+        "configured": subscription_configured() if configured is None else configured,
+    }
+
+
+def _entitlement_public(row: dict | None, now: float | None = None) -> dict:
+    if not row:
+        return _entitlement_free()
+    status = _entitlement_status(row, now)
+    active = status in ("active", "grace")
+    auto_renew = row.get("auto_renew")
+    return {
+        "tier": (row.get("tier") or SUBSCRIPTION_DEFAULT_TIER) if active
+                else SUBSCRIPTION_FREE_TIER,
+        "active": active,
+        "status": status,
+        "product_id": row.get("product_id"),
+        "expires_at": row.get("expires_at"),
+        "grace_expires_at": row.get("grace_expires_at"),
+        "auto_renew": None if auto_renew is None else bool(auto_renew),
+        "environment": row.get("environment"),
+        "original_transaction_id": row.get("original_transaction_id"),
+        "updated_at": row.get("updated_at"),
+        "configured": True,
+    }
+
+
+def _entitlement_rows_for_user(apple_user_id: str) -> list:
+    import sqlite3
+    if not apple_user_id:
+        return []
+    try:
+        con = sqlite3.connect(f"file:{ACCOUNTS_DB}?mode=ro", uri=True, timeout=5)
+        try:
+            rows = con.execute(
+                f"SELECT {','.join(ENTITLEMENT_COLUMNS)} FROM entitlements "
+                "WHERE apple_user_id=? ORDER BY updated_at DESC",
+                (apple_user_id,)).fetchall()
+            con.close()
+            return [_entitlement_row(r) for r in rows]
+        finally:
+            con.close()
+    except Exception as exc:  # noqa: BLE001
+        # 讀不到 entitlement = 「該使用者掉回免費層」。絕不能無聲無息。
+        _log_event("entitlement_read_failed", error=type(exc).__name__,
+                   error_message=str(exc)[:160])
+        return []
+
+
+def _entitlement_by_original_transaction(original_transaction_id: str):
+    import sqlite3
+    if not original_transaction_id:
+        return None
+    try:
+        con = sqlite3.connect(f"file:{ACCOUNTS_DB}?mode=ro", uri=True, timeout=5)
+        try:
+            row = con.execute(
+                f"SELECT {','.join(ENTITLEMENT_COLUMNS)} FROM entitlements "
+                "WHERE original_transaction_id=?",
+                (original_transaction_id,)).fetchone()
+            con.close()
+            return _entitlement_row(row)
+        finally:
+            con.close()
+    except Exception as exc:  # noqa: BLE001
+        _log_event("entitlement_read_failed", error=type(exc).__name__,
+                   error_message=str(exc)[:160])
+        return None
+
+
+def _entitlement_effective(apple_user_id: str, now: float | None = None) -> dict:
+    """帳號目前的有效 entitlement(跨裝置一致的那個答案)。"""
+    if not subscription_configured():
+        return _entitlement_free(configured=False)
+    best = None
+    for row in _entitlement_rows_for_user(apple_user_id):
+        pub = _entitlement_public(row, now)
+        key = (_ENTITLEMENT_RANK.get(pub["status"], 0),
+               float(pub.get("expires_at") or 0.0),
+               float(pub.get("updated_at") or 0.0))
+        if best is None or key > best[0]:
+            best = (key, pub)
+    return best[1] if best else _entitlement_free(configured=True)
+
+
+def _entitlement_upsert(tx: dict, renewal: dict | None, *,
+                        apple_user_id: str | None, source: str) -> dict:
+    """把驗過簽的交易寫進 entitlements 表,回寫入後的 row。
+
+    冪等 + 單調:同一個 original_transaction_id 重複送不會有副作用;**較舊的
+    事件不得覆蓋較新的**(Apple 的通知會重送,順序沒有保證)。唯一例外是
+    「撤銷」——退款是終局狀態,就算 signedDate 較舊也一定要生效,否則一筆遲
+    到的續訂通知能讓已退款的人繼續用付費功能。"""
+    import sqlite3
+    original_transaction_id = tx.get("original_transaction_id")
+    if not original_transaction_id:
+        raise http_err(400, "SUBSCRIPTION_BAD_TRANSACTION",
+                       "transaction has no originalTransactionId")
+    renewal = renewal or {}
+    now = time.time()
+    incoming_signed_at = float(tx.get("signed_at") or renewal.get("signed_at") or now)
+    product_id = tx.get("product_id") or renewal.get("product_id")
+    candidate = {
+        "original_transaction_id": original_transaction_id,
+        "apple_user_id": apple_user_id or None,
+        "product_id": product_id,
+        "tier": _subscription_tier_for_product(product_id),
+        "environment": tx.get("environment") or renewal.get("environment"),
+        "purchase_at": tx.get("purchase_at"),
+        "expires_at": tx.get("expires_at"),
+        "grace_expires_at": renewal.get("grace_expires_at"),
+        "revoked_at": tx.get("revoked_at"),
+        "auto_renew": renewal.get("auto_renew"),
+        "transaction_id": tx.get("transaction_id"),
+        "last_signed_at": incoming_signed_at,
+        "source": source,
+    }
+
+    con = sqlite3.connect(ACCOUNTS_DB, timeout=30)
+    try:
+        con.execute("PRAGMA busy_timeout=30000")
+        # BEGIN IMMEDIATE:讀-改-寫要在同一把寫鎖裡,否則 app 的 /verify 與
+        # Apple 的 /notify 同時到會互相蓋掉(單調性檢查就形同虛設)。
+        con.execute("BEGIN IMMEDIATE")
+        existing = _entitlement_row(con.execute(
+            f"SELECT {','.join(ENTITLEMENT_COLUMNS)} FROM entitlements "
+            "WHERE original_transaction_id=?",
+            (original_transaction_id,)).fetchone())
+        if existing:
+            stored_signed_at = float(existing.get("last_signed_at") or 0.0)
+            newly_revoking = bool(candidate["revoked_at"]) and not existing.get("revoked_at")
+            if incoming_signed_at < stored_signed_at and not newly_revoking:
+                con.rollback()
+                con.close()
+                _log_event("entitlement_stale_event_ignored",
+                           source=source,
+                           otid_hash=_short_hash(original_transaction_id),
+                           incoming_signed_at=incoming_signed_at,
+                           stored_signed_at=stored_signed_at)
+                return existing
+            # 通知不帶帳號資訊 → 保留既有綁定,別把 apple_user_id 洗成 NULL。
+            if not candidate["apple_user_id"]:
+                candidate["apple_user_id"] = existing.get("apple_user_id")
+            # 較舊的撤銷事件:只補 revoked_at,其餘欄位維持較新的那份。
+            if newly_revoking and incoming_signed_at < stored_signed_at:
+                merged = dict(existing)
+                merged["revoked_at"] = candidate["revoked_at"]
+                merged["source"] = source
+                candidate = merged
+            candidate["last_signed_at"] = max(incoming_signed_at, stored_signed_at)
+            # 通知常常只帶交易、不帶續訂資訊 → 別把既有的寬限期/自動續訂/
+            # 方案資訊洗成 NULL(那會讓寬限期內的使用者瞬間掉出付費層)。
+            for key in ("grace_expires_at", "auto_renew", "environment", "product_id"):
+                if candidate.get(key) is None:
+                    candidate[key] = existing.get(key)
+            candidate["tier"] = _subscription_tier_for_product(candidate.get("product_id"))
+            created_at = float(existing.get("created_at") or now)
+        else:
+            created_at = now
+        # status 欄位只是給人查表用的快取(讀取時一律用 _entitlement_status 重
+        # 算)。這裡放在所有欄位合併**之後**才算,免得快取值與真相不一致。
+        candidate["status"] = _entitlement_status(candidate, now)
+        raw = json.dumps({"transaction": tx, "renewal": renewal},
+                         ensure_ascii=False, sort_keys=True)[:8000]
+        con.execute(
+            """INSERT INTO entitlements(
+                   original_transaction_id, apple_user_id, product_id, tier, status,
+                   environment, purchase_at, expires_at, grace_expires_at, revoked_at,
+                   auto_renew, transaction_id, last_signed_at, source, raw_json,
+                   created_at, updated_at)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+               ON CONFLICT(original_transaction_id) DO UPDATE SET
+                 apple_user_id=excluded.apple_user_id,
+                 product_id=excluded.product_id,
+                 tier=excluded.tier,
+                 status=excluded.status,
+                 environment=excluded.environment,
+                 purchase_at=excluded.purchase_at,
+                 expires_at=excluded.expires_at,
+                 grace_expires_at=excluded.grace_expires_at,
+                 revoked_at=excluded.revoked_at,
+                 auto_renew=excluded.auto_renew,
+                 transaction_id=excluded.transaction_id,
+                 last_signed_at=excluded.last_signed_at,
+                 source=excluded.source,
+                 raw_json=excluded.raw_json,
+                 updated_at=excluded.updated_at""",
+            (candidate["original_transaction_id"], candidate["apple_user_id"],
+             candidate["product_id"], candidate["tier"], candidate["status"],
+             candidate["environment"], candidate["purchase_at"],
+             candidate["expires_at"], candidate["grace_expires_at"],
+             candidate["revoked_at"],
+             None if candidate["auto_renew"] is None else int(bool(candidate["auto_renew"])),
+             candidate["transaction_id"], candidate["last_signed_at"],
+             candidate["source"], raw, created_at, now))
+        row = con.execute(
+            f"SELECT {','.join(ENTITLEMENT_COLUMNS)} FROM entitlements "
+            "WHERE original_transaction_id=?",
+            (original_transaction_id,)).fetchone()
+        con.commit()
+        con.close()
+        return _entitlement_row(row)
+    finally:
+        con.close()
+
+
+def _subscription_check_transaction(tx: dict) -> None:
+    """驗過簽之後的內容檢查:必須是**我們這個 app**、允許環境內的交易。
+
+    簽章只證明「Apple 簽過這筆」,不證明「這筆是我們的」—— 少了這關,別的
+    App Store app 的合法收據就能拿來換 Pocket 的付費層。"""
+    bundle_id = tx.get("bundle_id")
+    if bundle_id and APPLE_STOREKIT_BUNDLE_ID and bundle_id != APPLE_STOREKIT_BUNDLE_ID:
+        _log_event("subscription_bundle_mismatch", bundle_id=str(bundle_id)[:64])
+        raise http_err(400, "SUBSCRIPTION_BUNDLE_MISMATCH",
+                       "transaction belongs to a different app")
+    environment = tx.get("environment")
+    if environment and APPLE_STOREKIT_ENVIRONMENTS \
+            and environment not in APPLE_STOREKIT_ENVIRONMENTS:
+        _log_event("subscription_environment_rejected", environment=str(environment)[:32])
+        raise http_err(400, "SUBSCRIPTION_ENVIRONMENT_REJECTED",
+                       f"environment {environment} is not accepted")
 
 
 def _b64u(data: bytes) -> str:
@@ -10927,7 +11333,8 @@ async def capabilities(request: Request):
                          "interactive_push", "media_artifacts",
                          "hermes_media_capabilities",
                          "hermes_media_settings",
-                         "push_register", "dashboard", "openclaw_config"] +
+                         "push_register", "dashboard", "openclaw_config",
+                         "subscription_entitlement"] +
                         (["terminal"] if POCKET_TERMINAL_ENABLED else []) +
                         (["openclaw_provider"] if OPENCLAW.configured() else []),
             "endpoints": ["/app/v1/sessions", "/app/v1/messages", "/reports",
@@ -10953,7 +11360,11 @@ async def capabilities(request: Request):
                           "/app/v2/hermes/media-settings",
                           "/app/v2/sessions/{id}/approve", "/app/v1/terminal",
                           "/app/v1/usage", "/app/v1/dashboard",
-                          "/app/v1/openclaw/config"]}
+                          "/app/v1/openclaw/config",
+                          "/app/v1/subscription/verify",
+                          "/app/v1/subscription/status",
+                          "/app/v1/subscription/notify"],
+            "subscription_configured": subscription_configured()}
 
 
 @app.post("/app/v1/auth/apple")
@@ -10996,6 +11407,9 @@ async def app_auth_apple(request: Request):
             "token": session_token,
             "expires_at": expires_at,
         },
+        # 登入即知付費層 —— app 不必再多打一趟 /subscription/status 才敢決定
+        # 要不要開付費 UI。未配置訂閱時這裡就是免費層(configured=false)。
+        "entitlement": _entitlement_effective(apple_user_id),
     }
 
 
@@ -11174,6 +11588,191 @@ async def app_auth_apple_web_callback(request: Request):
             error=type(e).__name__,
         )
         return _apple_web_callback_page("failed")
+
+
+# ───────────── 訂閱 entitlement 端點(feat/subscription-entitlement)─────────
+# 信任模型:app **永遠不能**自稱訂閱者。唯一可接受的證據是 Apple 簽的 JWS
+# (StoreKit 2 的 signedTransaction / Server Notification 的 signedPayload),
+# 由 bridge 離線驗簽後自己解出 product / 到期日。app 送來的 product_id、
+# expires_at、"is_pro" 之類的欄位一律不讀 —— 那些都是可竄改的自我宣稱。
+
+@app.post("/app/v1/subscription/verify")
+async def app_subscription_verify(request: Request):
+    """app 買完/啟動時把 StoreKit 2 的 signedTransaction 送來換伺服器端 entitlement。
+
+    需要 account session:驗簽只證明「這筆訂閱存在」,是 account session 把它
+    綁到某個 Apple 帳號,訂閱才能跨裝置生效。"""
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        raise http_err(400, "BAD_REQUEST", "bad json")
+    if not isinstance(body, dict):
+        raise http_err(400, "BAD_REQUEST", "bad json")
+    user = _account_user_from_request(request, body)
+    apple_user_id = user["apple_user_id"]
+
+    if not subscription_configured():
+        # 缺配置靜默:回免費層,不報錯。app 看 configured=false 就知道這台
+        # bridge 沒開訂閱,不該顯示「驗證失敗」給使用者。
+        return {"ok": True, "configured": False,
+                "entitlement": _entitlement_free(configured=False)}
+
+    signed_transaction = str(
+        body.get("signedTransaction") or body.get("signed_transaction")
+        or body.get("signedTransactionInfo") or "").strip()
+    if not signed_transaction:
+        raise http_err(400, "SUBSCRIPTION_MISSING_RECEIPT",
+                       "signedTransaction required")
+    signed_renewal = str(
+        body.get("signedRenewalInfo") or body.get("signed_renewal_info") or "").strip()
+
+    tx_payload = await asyncio.to_thread(
+        _subscription_verify_jws, signed_transaction, "transaction")
+    import apple_storekit
+    tx = apple_storekit.normalize_transaction(tx_payload)
+    _subscription_check_transaction(tx)
+    renewal = None
+    if signed_renewal:
+        renewal_payload = await asyncio.to_thread(
+            _subscription_verify_jws, signed_renewal, "renewal")
+        renewal = apple_storekit.normalize_renewal(renewal_payload)
+        # 續訂資訊必須跟交易是同一條訂閱,否則就是拼接兩筆不同來源的證據。
+        if renewal.get("original_transaction_id") and \
+                renewal["original_transaction_id"] != tx.get("original_transaction_id"):
+            raise http_err(400, "SUBSCRIPTION_RENEWAL_MISMATCH",
+                           "renewal info belongs to a different subscription")
+
+    row = await asyncio.to_thread(
+        _entitlement_upsert, tx, renewal,
+        apple_user_id=apple_user_id, source="verify")
+    entitlement = _entitlement_public(row)
+    _log_event("subscription_verified",
+               apple_user_hash=_short_hash(apple_user_id),
+               otid_hash=_short_hash(tx.get("original_transaction_id")),
+               product_id=str(tx.get("product_id") or "")[:80],
+               status=entitlement["status"],
+               environment=str(tx.get("environment") or "")[:32])
+    return {"ok": True, "configured": True, "entitlement": entitlement}
+
+
+@app.get("/app/v1/subscription/status")
+async def app_subscription_status(request: Request):
+    """目前 entitlement(跨裝置一致的權威答案)。"""
+    user = _account_user_from_request(request)
+    apple_user_id = user["apple_user_id"]
+    if not subscription_configured():
+        return {"ok": True, "configured": False,
+                "entitlement": _entitlement_free(configured=False),
+                "entitlements": []}
+    rows = await asyncio.to_thread(_entitlement_rows_for_user, apple_user_id)
+    return {
+        "ok": True,
+        "configured": True,
+        "entitlement": _entitlement_effective(apple_user_id),
+        # 全部訂閱紀錄(換方案/sandbox 並存時的除錯用)。
+        "entitlements": [_entitlement_public(r) for r in rows],
+    }
+
+
+# 通知類型 → 我們要不要據此改狀態。REFUND/REVOKE 是撤銷(交易 payload 會帶
+# revocationDate,狀態自然變 revoked);其餘續訂/到期/方案變更都靠交易與續訂
+# 資訊裡的時間戳推導,不需要為每個 type 寫一套邏輯。
+_SUBSCRIPTION_NOTIFICATION_IGNORED = ("TEST",)
+
+
+@app.post("/app/v1/subscription/notify")
+async def app_subscription_notify(request: Request):
+    """App Store Server Notifications V2 接收端(Apple 主動推續訂/退款/取消)。
+
+    **這個端點沒有 bridge bearer 驗證**,因為呼叫者是 Apple,不可能帶我們的
+    token。它的認證完全來自 signedPayload 的憑證鏈 —— 驗不過就 401,不寫任何
+    東西。這也是為什麼它必須公網可達(cloudflare tunnel `pocket.tsai.cash`)。
+
+    回應碼對 Apple 有意義:非 2xx 會被重試(最長數天)。因此「我們這邊沒配置
+    訂閱」「這是 TEST 通知」「這筆不是我們的 app」都回 200 —— 那些重試無意義。
+    只有簽章驗不過才回 401(那是攻擊或設定錯誤,值得讓 Apple 重試/留痕)。"""
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        raise http_err(400, "BAD_REQUEST", "bad json")
+    if not isinstance(body, dict):
+        raise http_err(400, "BAD_REQUEST", "bad json")
+
+    if not subscription_configured():
+        _log_event("subscription_notification_dropped", reason="not_configured")
+        return {"ok": True, "configured": False}
+
+    signed_payload = str(body.get("signedPayload") or body.get("signed_payload") or "").strip()
+    if not signed_payload:
+        raise http_err(400, "SUBSCRIPTION_MISSING_PAYLOAD", "signedPayload required")
+
+    payload = await asyncio.to_thread(
+        _subscription_verify_jws, signed_payload, "notification")
+    import apple_storekit
+    notification_type = str(payload.get("notificationType") or "")[:48]
+    subtype = str(payload.get("subtype") or "")[:48]
+    data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+
+    if notification_type in _SUBSCRIPTION_NOTIFICATION_IGNORED:
+        _log_event("subscription_notification_received",
+                   notification_type=notification_type, applied=False,
+                   reason="test_notification")
+        return {"ok": True, "configured": True,
+                "notification_type": notification_type, "applied": False}
+
+    bundle_id = str(data.get("bundleId") or "")
+    if bundle_id and bundle_id != APPLE_STOREKIT_BUNDLE_ID:
+        _log_event("subscription_notification_dropped", reason="bundle_mismatch",
+                   notification_type=notification_type, bundle_id=bundle_id[:64])
+        return {"ok": True, "configured": True,
+                "notification_type": notification_type, "applied": False}
+    app_apple_id = str(data.get("appAppleId") or "")
+    if APPLE_STOREKIT_APP_APPLE_ID and app_apple_id \
+            and app_apple_id != APPLE_STOREKIT_APP_APPLE_ID:
+        _log_event("subscription_notification_dropped", reason="app_apple_id_mismatch",
+                   notification_type=notification_type)
+        return {"ok": True, "configured": True,
+                "notification_type": notification_type, "applied": False}
+
+    signed_transaction = str(data.get("signedTransactionInfo") or "").strip()
+    if not signed_transaction:
+        # 有些通知(如 RENEWAL_EXTENSION 的彙總、PRICE_INCREASE)沒有交易資訊。
+        # 沒有可驗證的交易就沒有可信的狀態變更 —— 收下、記錄、不改 DB。
+        _log_event("subscription_notification_received",
+                   notification_type=notification_type, subtype=subtype,
+                   applied=False, reason="no_transaction_info")
+        return {"ok": True, "configured": True,
+                "notification_type": notification_type, "applied": False}
+
+    tx_payload = await asyncio.to_thread(
+        _subscription_verify_jws, signed_transaction, "notification_transaction")
+    tx = apple_storekit.normalize_transaction(tx_payload)
+    _subscription_check_transaction(tx)
+    renewal = None
+    signed_renewal = str(data.get("signedRenewalInfo") or "").strip()
+    if signed_renewal:
+        renewal_payload = await asyncio.to_thread(
+            _subscription_verify_jws, signed_renewal, "notification_renewal")
+        renewal = apple_storekit.normalize_renewal(renewal_payload)
+        if renewal.get("original_transaction_id") and \
+                renewal["original_transaction_id"] != tx.get("original_transaction_id"):
+            renewal = None      # 拼接的證據,寧可不用
+
+    # apple_user_id=None:通知不帶帳號資訊。既有列會保留原本的綁定;若這是第
+    # 一次見到這條訂閱(通知比 app 的 /verify 先到),先落無主的一列,等 app
+    # 帶 account session 來 /verify 認領。
+    row = await asyncio.to_thread(
+        _entitlement_upsert, tx, renewal, apple_user_id=None, source="notification")
+    entitlement = _entitlement_public(row)
+    _log_event("subscription_notification_applied",
+               notification_type=notification_type, subtype=subtype,
+               otid_hash=_short_hash(tx.get("original_transaction_id")),
+               status=entitlement["status"],
+               claimed=bool(row and row.get("apple_user_id")),
+               environment=str(tx.get("environment") or "")[:32])
+    return {"ok": True, "configured": True,
+            "notification_type": notification_type, "subtype": subtype or None,
+            "applied": True, "status": entitlement["status"]}
 
 
 # ── /app/v1/usage: Codex + Claude Code 本機用量(不打雲端 API)──────────
@@ -11501,6 +12100,7 @@ async def app_account(request: Request, include_revoked: bool = False):
     return {
         "user": _account_public_user(user),
         "devices": [_account_public_device(d) for d in devices],
+        "entitlement": _entitlement_effective(user["apple_user_id"]),
     }
 
 
