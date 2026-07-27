@@ -893,6 +893,7 @@ class OpenClawDigest(ApprovalCardMixin):
         self.known_mids: set = set()
         self.run_text: dict[str, str] = {}   # runId → 累積正文
         self.busy = False
+        self.active_run = ""                 # busy 的 run 對位(見 _handle_agent)
         self.prompt = None
         self.seeded = False
 
@@ -963,6 +964,11 @@ class OpenClawDigest(ApprovalCardMixin):
             if not full:
                 return
             self.run_text[run] = full
+            # delta 還在流 = 一定忙(防禦:lifecycle start 沒到/被舊 run 的
+            # end 誤清時,靠這裡自癒 —— 實測 gateway 會把舊 run 的 end 遲送)。
+            self.busy = True
+            if run:
+                self.active_run = run
             self.store.saw_output = True
             self.store.last_tool = ""
             self.store.upsert_card(make_card(
@@ -985,6 +991,7 @@ class OpenClawDigest(ApprovalCardMixin):
                 f"{cid}-err", self.store.turn_id, "system", "text",
                 {"text": f"⚠️ {emsg}", "fallback_text": f"⚠️ {emsg}"}))
             self.busy = False
+            self.active_run = ""
             self._status()
 
     def _handle_agent(self, run: str, p: dict):
@@ -994,12 +1001,17 @@ class OpenClawDigest(ApprovalCardMixin):
             ph = data.get("phase")
             if ph == "start":
                 self.busy = True
+                self.active_run = run
                 self.store.turn_id = f"turn-{run or 'oc'}"
                 self.store.saw_output = False
                 self.store.last_tool = ""
                 self.store.push_turn("begin", self.store.turn_id)
                 self._status()
             elif ph in ("end", "error"):
+                # run 對位:舊 run 的 end 可能在新 run start 之後才到
+                # (abort 收尾遲送,實測),不能清掉新 run 的 busy。
+                if run and self.active_run and run != self.active_run:
+                    return
                 if ph == "error" and data.get("error"):
                     emsg = str(data["error"])
                     self.store.upsert_card(make_card(
@@ -1007,6 +1019,7 @@ class OpenClawDigest(ApprovalCardMixin):
                         "system", "text",
                         {"text": f"⚠️ {emsg}", "fallback_text": f"⚠️ {emsg}"}))
                 self.busy = False
+                self.active_run = ""
                 self.store.push_turn("end", self.store.turn_id)
                 self.store.turn_id = ""
                 self.store.last_tool = ""

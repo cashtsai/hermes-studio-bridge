@@ -140,6 +140,26 @@ class DigestTests(unittest.TestCase):
         self.assertTrue(any("boom" in c["body"]["text"] for c in cards))
         self.assertFalse(d.busy)
 
+    def test_stale_run_end_does_not_clear_busy(self):
+        """實測坑:舊 run 被 abort 後,其 lifecycle end 會在新 run start 之後
+        才到 — 不能把新 run 的 busy 誤清(interrupt 會因此 409)。"""
+        d = cd.OpenClawDigest()
+        d.handle("agent", {"runId": "old", "stream": "lifecycle",
+                           "data": {"phase": "start"}})
+        d.handle("agent", {"runId": "new", "stream": "lifecycle",
+                           "data": {"phase": "start"}})
+        d.handle("agent", {"runId": "old", "stream": "lifecycle",
+                           "data": {"phase": "end", "stopReason": "stop"}})
+        self.assertTrue(d.busy)          # 舊 run 的 end 不得誤清
+        self.assertEqual(d.active_run, "new")
+        # chat delta 也要能自癒 busy(lifecycle start 漏接時)
+        d2 = cd.OpenClawDigest()
+        d2.handle("chat", {"runId": "r", "state": "delta", "deltaText": "x"})
+        self.assertTrue(d2.busy)
+        d.handle("agent", {"runId": "new", "stream": "lifecycle",
+                           "data": {"phase": "end", "stopReason": "stop"}})
+        self.assertFalse(d.busy)
+
     def test_tool_stream_card(self):
         d = cd.OpenClawDigest()
         d.handle("agent", {"runId": "r7", "stream": "tool",

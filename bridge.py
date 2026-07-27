@@ -9317,8 +9317,12 @@ async def v2_session_interrupt(session_id: str, request: Request):
                                           timeout=8.0)
                 busy = any(str(r.get("key") or "") == src[1] and r.get("hasActiveRun")
                            for r in (res or {}).get("sessions", []))
-            except Exception as _exc:  # noqa: BLE001 — 查不到就當不忙,走 409
+            except Exception as _exc:  # noqa: BLE001
+                # 生成高峰時 gateway 事件圈會塞住,RPC 逾時 ≠ 不忙(實測:
+                # 長文生成中連 sessions.list 都答不了)。查不到就當忙,
+                # 盡力送 abort —— gateway 對無活躍 run 的 abort 無害。
                 _log_exc("oc_interrupt_active_probe", _exc, expected=True)
+                busy = True
         if not busy:
             raise http_err(409, "NO_ACTIVE_TURN", "no active OpenClaw run")
         try:
