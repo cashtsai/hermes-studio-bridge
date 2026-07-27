@@ -840,3 +840,209 @@ class PersonaDigest(ApprovalCardMixin):
         self.store.push_turn("end", self.store.turn_id)
         self.store.turn_id = ""
         self._status()
+
+
+# ───────────────────────── S4:openclaw gateway 事件 → 卡片 ───────────────────
+# 契約依據 docs/OPENCLAW_PROVIDER_SPEC.md(§2/§3)。兩個來源,一個卡片庫:
+# - seed:chat.history messages(__openclaw.id 穩定 → 卡 id,重放同 id)。
+# - live:gateway 廣播事件 —— `chat`(delta/final/error,正文權威)+
+#   `agent`(lifecycle → turn/status;tool → tool_call 卡;assistant 流與
+#   chat delta 是同一份正文,刻意不雙出)。
+
+
+def _oc_msg_text(content) -> str:
+    """chat.history / chat 事件的 message.content(str 或 blocks)→ 純文字。"""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for b in content:
+            if isinstance(b, dict) and b.get("type") == "text" and b.get("text"):
+                parts.append(b["text"])
+        return "\n".join(parts)
+    return ""
+
+
+def _oc_ts(ms) -> float | None:
+    """OpenClaw timestamp 是 epoch 毫秒;解不動回 None(make_card 用當下)。"""
+    try:
+        v = float(ms)
+    except (TypeError, ValueError):
+        return None
+    return v / 1000.0 if v > 1e11 else v
+
+
+class OpenClawDigest(ApprovalCardMixin):
+    """S4:一個 openclaw session(sessionKey)的卡片 digest。
+
+    - 正文權威 = `chat` 事件:delta 帶累積 message(缺了才用 deltaText 自累),
+      同 runId upsert 同一張卡 rev 遞增;final 全文覆蓋收尾;error/aborted
+      出 ⚠️ 系統卡。
+    - `agent` lifecycle 驅動 turn begin/end 與人話 label;`agent` tool 流出
+      tool_call 卡(靶機未觸發過,防禦性解析,未知形狀全落 fallback_text)。
+    - heartbeat 回合(isHeartbeat)卡片照出(可回看),推播由 bridge 側濾。
+    - 無 canonical follower:openclaw 歷史只在 seed/重連重 seed 時讀,
+      live 事件靠 gateway 廣播(SPEC §6-4)。
+    """
+    _appr_prefix = "card-oc-appr-"
+    _appr_source = "openclaw"
+    _appr_default_title = "OpenClaw 等待核准"
+
+    def __init__(self):
+        self.store = SessionCardStore()
+        self.known_mids: set = set()
+        self.run_text: dict[str, str] = {}   # runId → 累積正文
+        self.busy = False
+        self.active_run = ""                 # busy 的 run 對位(見 _handle_agent)
+        self.prompt = None
+        self.seeded = False
+
+    def _status(self):
+        self.store.set_status({
+            "busy": self.busy, "mode": None, "prompt": self.prompt,
+            "phase": "run" if self.busy else "idle",
+            "label": cc_status_label(self.busy, self.prompt,
+                                     self.store.last_tool, self.store.saw_output),
+        })
+
+    # ── seed(chat.history,舊→新)──
+
+    def message_card(self, m: dict):
+        oc = m.get("__openclaw") or {}
+        if oc.get("kind"):          # compaction 等內部列,不出卡(SPEC §2)
+            return
+        role = m.get("role")
+        if role not in ("user", "assistant"):
+            return
+        text = _oc_msg_text(m.get("content"))
+        if not text:
+            return
+        mid = str(oc.get("id") or "")
+        if not mid:
+            # 沒有穩定 id 的列(不該發生)→ 以 ts+role 合成,重放仍穩定
+            mid = f"x{int(_oc_ts(m.get('timestamp')) or 0)}-{role}"
+        if mid in self.known_mids:
+            return
+        self.known_mids.add(mid)
+        kind = "text" if role == "user" else "markdown"
+        self.store.upsert_card(make_card(
+            f"card-oc-h-{mid}", "", role, kind,
+            {"text": text, "fallback_text": text}, ts=_oc_ts(m.get("timestamp"))))
+
+    def seed_messages(self, msgs: list):
+        for m in msgs or []:
+            self.message_card(m)
+
+    # ── live 事件(bridge 的 OC 客戶端餵)──
+
+    def user_card(self, text: str, mid: str):
+        """bridge input 路由的即時 user 回顯卡(openclaw 無 canonical 寫入點,
+        chat 事件也只帶 assistant 訊息 → app 送話由這裡出卡)。"""
+        if not text or mid in self.known_mids:
+            return
+        self.known_mids.add(mid)
+        self.store.upsert_card(make_card(
+            f"card-oc-u-{mid}", self.store.turn_id, "user", "text",
+            {"text": text, "fallback_text": text}))
+
+    def handle(self, event: str, payload: dict):
+        if not isinstance(payload, dict):
+            return
+        run = str(payload.get("runId") or "")
+        if event == "chat":
+            self._handle_chat(run, payload)
+        elif event == "agent":
+            self._handle_agent(run, payload)
+
+    def _handle_chat(self, run: str, p: dict):
+        state = p.get("state")
+        msg = p.get("message") or {}
+        text = _oc_msg_text(msg.get("content"))
+        cid = f"card-oc-{run or 'run'}"
+        if state == "delta":
+            full = text or (self.run_text.get(run, "") + (p.get("deltaText") or ""))
+            if not full:
+                return
+            self.run_text[run] = full
+            # delta 還在流 = 一定忙(防禦:lifecycle start 沒到/被舊 run 的
+            # end 誤清時,靠這裡自癒 —— 實測 gateway 會把舊 run 的 end 遲送)。
+            self.busy = True
+            if run:
+                self.active_run = run
+            self.store.saw_output = True
+            self.store.last_tool = ""
+            self.store.upsert_card(make_card(
+                cid, self.store.turn_id, "assistant", "markdown",
+                {"text": full, "fallback_text": full}, final=False))
+            self._status()
+        elif state == "final":
+            full = text or self.run_text.pop(run, "")
+            self.run_text.pop(run, None)
+            if full:
+                self.store.upsert_card(make_card(
+                    cid, self.store.turn_id, "assistant", "markdown",
+                    {"text": full, "fallback_text": full},
+                    ts=_oc_ts(msg.get("timestamp"))))
+        elif state in ("error", "aborted"):
+            self.run_text.pop(run, None)
+            emsg = str(p.get("errorMessage") or text
+                       or ("已中斷" if state == "aborted" else "OpenClaw 回合失敗"))
+            self.store.upsert_card(make_card(
+                f"{cid}-err", self.store.turn_id, "system", "text",
+                {"text": f"⚠️ {emsg}", "fallback_text": f"⚠️ {emsg}"}))
+            self.busy = False
+            self.active_run = ""
+            self._status()
+
+    def _handle_agent(self, run: str, p: dict):
+        stream = p.get("stream")
+        data = p.get("data") or {}
+        if stream == "lifecycle":
+            ph = data.get("phase")
+            if ph == "start":
+                self.busy = True
+                self.active_run = run
+                self.store.turn_id = f"turn-{run or 'oc'}"
+                self.store.saw_output = False
+                self.store.last_tool = ""
+                self.store.push_turn("begin", self.store.turn_id)
+                self._status()
+            elif ph in ("end", "error"):
+                # run 對位:舊 run 的 end 可能在新 run start 之後才到
+                # (abort 收尾遲送,實測),不能清掉新 run 的 busy。
+                if run and self.active_run and run != self.active_run:
+                    return
+                if ph == "error" and data.get("error"):
+                    emsg = str(data["error"])
+                    self.store.upsert_card(make_card(
+                        f"card-oc-{run or 'run'}-lcerr", self.store.turn_id,
+                        "system", "text",
+                        {"text": f"⚠️ {emsg}", "fallback_text": f"⚠️ {emsg}"}))
+                self.busy = False
+                self.active_run = ""
+                self.store.push_turn("end", self.store.turn_id)
+                self.store.turn_id = ""
+                self.store.last_tool = ""
+                self._status()
+            # finishing / fallback_step:中間態,不出卡不收 turn
+        elif stream == "tool":
+            name = str(data.get("name") or data.get("tool") or
+                       data.get("toolName") or "tool")
+            args = data.get("args") or data.get("input") or {}
+            summary = ""
+            if isinstance(args, dict):
+                summary = next((str(v) for v in args.values()
+                                if isinstance(v, (str, int))), "")
+            elif isinstance(args, str):
+                summary = args
+            summary = summary.splitlines()[0][:_CMD_MAX] if summary else ""
+            tid = str(data.get("toolCallId") or data.get("id") or
+                      f"{self.store.seq}")
+            self.store.last_tool = name
+            fb = f"› 🔧 {name}" + (f" `{summary}`" if summary else "")
+            self.store.upsert_card(make_card(
+                f"card-oc-{run or 'run'}-t{tid}", self.store.turn_id,
+                "assistant", "tool_call",
+                {"tool": name, "summary": summary, "fallback_text": fb}))
+            self._status()
+        # assistant 流:與 chat delta 同一份正文,刻意不雙出(見類 docstring)
