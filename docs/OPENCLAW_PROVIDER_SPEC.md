@@ -137,7 +137,7 @@ v1 直接吃全域廣播 + 以 `sessionKey` 分流）。
 | capability | OpenClaw 支撐 | v1 宣告 |
 |---|---|---|
 | `input` | `chat.send`（idempotencyKey 必填 → 天然冪等） | ✅ |
-| `interrupt` | `chat.abort {sessionKey}` | ✅ |
+| `interrupt` | `chat.abort {sessionKey}`(忙碌判定雙軌:digest busy OR sessions.list `hasActiveRun` —— send 剛排隊、lifecycle 未 start 的窗口實測踩過) | ✅ |
 | `replay` / `follow` | `chat.history` seed + 事件流 → SessionCardStore ring | ✅ |
 | `attachments` | `chat.send.attachments[]`（`{type,url|content(base64),mimeType,fileName}`） | ⛔ v1 不宣告（媒體管線見 §7 已知限制） |
 | `approve` | `exec.approval.*` 存在但屬 gateway exec 審批（agent 執行系統指令時才觸發;靶機純聊天流無法穩定驗證） | ⛔ v1 不宣告 |

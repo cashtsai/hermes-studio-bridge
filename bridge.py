@@ -9305,10 +9305,21 @@ async def v2_session_interrupt(session_id: str, request: Request):
         res = await _persona_interrupt_core(src[1])
         return {"session_id": session_id, **res}
     if src[0] == "oc":
-        # SPEC §4:chat.abort {sessionKey}。gateway 對「無活躍 run」不報錯,
-        # 為維持 v2 契約(無活躍 turn 一律 409)先查 digest busy 狀態。
+        # SPEC §4:chat.abort {sessionKey}。v2 契約「無活躍 turn 一律 409」,
+        # 忙碌判定雙軌:digest.busy(lifecycle start 之後)OR gateway
+        # sessions.list 的 hasActiveRun(send 剛排隊、lifecycle 未 start 的
+        # 窗口 —— 使用者送出後馬上按停止就落在這裡,實測踩過)。
         d = _OC_CARD_DIGESTS.get(src[1])
-        if d is not None and not d.busy:
+        busy = bool(d is not None and d.busy)
+        if not busy:
+            try:
+                res = await OPENCLAW.call("sessions.list", {"limit": 100},
+                                          timeout=8.0)
+                busy = any(str(r.get("key") or "") == src[1] and r.get("hasActiveRun")
+                           for r in (res or {}).get("sessions", []))
+            except Exception as _exc:  # noqa: BLE001 — 查不到就當不忙,走 409
+                _log_exc("oc_interrupt_active_probe", _exc, expected=True)
+        if not busy:
             raise http_err(409, "NO_ACTIVE_TURN", "no active OpenClaw run")
         try:
             await OPENCLAW.call("chat.abort", {"sessionKey": src[1]})
