@@ -13,6 +13,7 @@ S2（codex app-server 事件）/ S3（persona stream）之後各自加一個
 """
 
 import json
+import hashlib
 import re
 import time
 
@@ -37,6 +38,98 @@ def make_card(cid: str, turn_id: str, role: str, kind: str, body: dict,
     return {"id": cid, "turn_id": turn_id, "role": role, "kind": kind,
             "rev": rev, "final": final, "ts": ts if ts is not None else time.time(),
             "body": body}
+
+
+def _norm_visible_text(text: str) -> str:
+    return re.sub(r"\s+", " ", str(text or "")).strip()
+
+
+def _safe_source(source: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]+", "-", str(source or "input")).strip("-") or "input"
+
+
+def make_input_accepted_card(source: str, client_id: str | None, text: str,
+                             attachments: list[dict] | None = None,
+                             typed_text: str | None = None,
+                             ts: float | None = None,
+                             turn_id: str = "") -> dict:
+    """Durable user card emitted when an input POST returns 200.
+
+    The provider transcript may appear later, or not be available while the user
+    switches tabs. This card gives clients an immediate stable echo that the
+    later transcript user item can merge into.
+    """
+    source_key = _safe_source(source)
+    cid_raw = str(client_id or "").strip()
+    visible = str(text or typed_text or "").strip()
+    typed = str(typed_text or text or "").strip()
+    stamp = ts if ts is not None else time.time()
+    key = cid_raw or f"{visible}\0{typed}\0{stamp:.6f}"
+    digest = hashlib.sha1(f"{source_key}\0{key}".encode("utf-8")).hexdigest()[:16]
+    fallback = visible or "附件"
+    body = {
+        "text": visible,
+        "fallback_text": fallback,
+        "origin": "input.accepted",
+    }
+    if cid_raw:
+        body["client_id"] = cid_raw
+    if typed:
+        body["typed_text"] = typed
+    if attachments:
+        body["attachments"] = [dict(a) for a in attachments if isinstance(a, dict)]
+    return make_card(f"card-{source_key}-input-{digest}", turn_id, "user", "text",
+                     body, ts=stamp, final=True)
+
+
+def merge_input_accepted_echo(store, card: dict) -> dict:
+    """Merge a later transcript user echo into the earlier accepted card.
+
+    Matching prefers client_id when both sides carry it, then falls back to the
+    exact visible or typed text that was actually pasted/submitted.
+    """
+    if not isinstance(card, dict) or card.get("role") != "user":
+        return card
+    body = card.get("body") or {}
+    incoming_text = _norm_visible_text(body.get("text") or body.get("fallback_text") or "")
+    incoming_client = str(body.get("client_id") or "").strip()
+    if not incoming_text and not incoming_client:
+        return card
+    cards = getattr(store, "cards", {}) or {}
+    order = getattr(store, "order", []) or []
+    for cid in reversed(order[-200:]):
+        prev = cards.get(cid) or {}
+        prev_body = prev.get("body") or {}
+        if prev.get("role") != "user":
+            continue
+        if prev_body.get("origin") != "input.accepted" and not prev_body.get("client_id"):
+            continue
+        prev_client = str(prev_body.get("client_id") or "").strip()
+        prev_text = _norm_visible_text(prev_body.get("text") or "")
+        prev_typed = _norm_visible_text(prev_body.get("typed_text") or "")
+        matched = False
+        if incoming_client and prev_client and incoming_client == prev_client:
+            matched = True
+        elif incoming_text and incoming_text in {prev_text, prev_typed}:
+            matched = True
+        if not matched:
+            continue
+        merged = dict(card)
+        merged["id"] = prev["id"]
+        if not merged.get("turn_id"):
+            merged["turn_id"] = prev.get("turn_id", "")
+        merged_body = dict(prev_body)
+        merged_body.update(body)
+        merged_body["origin"] = "transcript.echo"
+        if prev_client and not merged_body.get("client_id"):
+            merged_body["client_id"] = prev_client
+        if prev_body.get("attachments") and not merged_body.get("attachments"):
+            merged_body["attachments"] = prev_body["attachments"]
+        if prev_body.get("typed_text") and not merged_body.get("typed_text"):
+            merged_body["typed_text"] = prev_body["typed_text"]
+        merged["body"] = merged_body
+        return merged
+    return card
 
 
 # 與 bridge._fmt_cc_event 同一份「不是善彰打的」判定 — harness/系統管線不出卡。
@@ -460,7 +553,7 @@ class CodexThreadDigest(ApprovalCardMixin):
             tid = str(turn.get("id") or "")
             for item in (turn.get("items") or []):
                 for card in codex_item_to_cards(item, turn_id=tid):
-                    self.store.upsert_card(card)
+                    self.store.upsert_card(merge_input_accepted_echo(self.store, card))
 
     def handle(self, method: str, params: dict):
         """一則 app-server 通知 → 卡片/turn/status 事件。"""
@@ -510,7 +603,7 @@ class CodexThreadDigest(ApprovalCardMixin):
                 if label:
                     self.store.last_tool = label if phase == "started" else ""
             for card in codex_item_to_cards(item, self.store.turn_id, phase=phase):
-                self.store.upsert_card(card)
+                self.store.upsert_card(merge_input_accepted_echo(self.store, card))
             self._status()
 
     # handle_approval / resolve_approval：見 ApprovalCardMixin（A3，三 provider 共用）。
@@ -552,6 +645,7 @@ class SessionCardStore(ApprovalCardMixin):
         self.tail_file = ""
         self.tail_pos = 0
         self.tail_lineno = 0
+        self.tail_partial = ""
 
     def _push(self, etype: str, data: dict) -> dict:
         self.seq += 1
