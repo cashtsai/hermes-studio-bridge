@@ -4614,6 +4614,10 @@ async def codex_session_create(request: Request):
         CODEX_APP.loaded_threads.add(thread_id)
         await CODEX_APP.start_turn(thread_id, input_items,
                                    client_id=body.get("client_id"), cwd=cwd)
+        _cx_feed_input_accepted(
+            thread_id, body.get("client_id"), _codex_user_input_text(input_items),
+            attachments, typed_text=_codex_user_input_text(input_items),
+            create_if_missing=True)
         return {"ok": True, "thread_id": thread_id,
                 "session": _codex_enrich_summary(_codex_session_summary(thread))}
     except Exception as e:  # noqa: BLE001
@@ -5323,6 +5327,9 @@ async def codex_session_input(thread_id: str, request: Request):
         res = await CODEX_APP.start_turn(thread_id, input_items,
                                          client_id=body.get("client_id"),
                                          cwd=body.get("cwd"))
+        _cx_feed_input_accepted(
+            thread_id, body.get("client_id"), _codex_user_input_text(input_items),
+            body.get("attachments") or [], typed_text=_codex_user_input_text(input_items))
         return {"ok": True, "thread_id": thread_id, "turn": (res or {}).get("turn")}
     except Exception as e:  # noqa: BLE001
         _codex_http_error(e)
@@ -6674,10 +6681,17 @@ def _cc_tail_preview(jsonl: str) -> str:
     try:
         size = os.path.getsize(jsonl)
         with open(jsonl, "rb") as f:
+            start = 0
             if size > 65536:
                 f.seek(-65536, os.SEEK_END)
+                start = f.tell()
             chunk = f.read().decode("utf-8", "replace")
-        for line in reversed(chunk.splitlines()):
+        lines = chunk.splitlines()
+        if start > 0 and lines:
+            lines = lines[1:]
+        for line in reversed(lines):
+            if not line.lstrip().startswith("{"):
+                continue
             try:
                 d = json.loads(line)
             except Exception as _exc:  # noqa: BLE001
@@ -6928,10 +6942,16 @@ def _cc_jsonl_tail_events(jsonl: str):
     with open(jsonl, "rb") as f:
         f.seek(0, 2)
         size = f.tell()
-        f.seek(max(0, size - _CC_JSONL_TAIL_BYTES))
+        start = max(0, size - _CC_JSONL_TAIL_BYTES)
+        f.seek(start)
         data = f.read().decode("utf-8", "replace")
     events = []
-    for line in data.splitlines():
+    lines = data.splitlines()
+    if start > 0 and lines:
+        lines = lines[1:]
+    for line in lines:
+        if not line.lstrip().startswith("{"):
+            continue
         try:
             events.append(json.loads(line))
         except Exception as _exc:  # noqa: BLE001
@@ -7772,6 +7792,8 @@ async def _cc_input_core(name: str, body: dict) -> dict:
     """cc 輸入核心 — /ccsessions/{name}/input 與 v2 統一路由 input 共用。
     附件轉存＋語音轉寫＋tmux bracketed paste。"""
     text = (body.get("text") or body.get("content") or "").strip()
+    client_id = str(body.get("client_id") or "").strip()
+    attachments_summary = _input_attachment_summary(body.get("attachments") or [])
     _att_guard(body.get("attachments"))   # 修復單「附件限制」:直送口件數閥
     # Relay layer (like the persona attachment path): persist any attachments and
     # inject their on-disk paths into the typed line. Claude Code can Read files
@@ -7791,6 +7813,7 @@ async def _cc_input_core(name: str, body: dict) -> dict:
             saved.append(path)
     if voice_lines:
         text = (text + " " + " ".join(voice_lines)).strip()
+    visible_text = text
     if saved:
         # SINGLE-LINE reference (no embedded newlines — a newline in send-keys/
         # paste submits the prompt early). Claude Code's Read tool handles image
@@ -7800,6 +7823,8 @@ async def _cc_input_core(name: str, body: dict) -> dict:
     if not text:
         raise HTTPException(status_code=400, detail="empty")
     await _cc_paste_text(name, text)
+    _cc_feed_input_accepted(name, client_id, visible_text, attachments_summary,
+                            typed_text=text)
     # 排隊空窗回音:輸入落地「當下」就發 status 事件,不等 transcript digest。
     # session 若正忙上一輪,pane 不會立即轉 busy,舊行為是 app 一路顯示
     # 「待命」直到真正接手(可能好幾分鐘)——使用者看起來就是沒反應。
@@ -9243,6 +9268,9 @@ async def v2_session_input(session_id: str, request: Request):
                                        client_id=body.get("client_id"))
         except CodexAppServerError as e:
             _codex_http_error(e)
+        _cx_feed_input_accepted(
+            src[1], body.get("client_id"), _codex_user_input_text(items),
+            attachments, typed_text=_codex_user_input_text(items))
         return {"ok": True, "session_id": session_id, "accepted": True}
     return await _v2_persona_input(src[1], session_id, body, request)
 
@@ -9415,6 +9443,16 @@ def _cc_cards_feed_approval(name: str, record: dict, resolved: str = "") -> None
         store.handle_approval(record)
 
 
+def _cc_feed_input_accepted(name: str, client_id: str | None, text: str,
+                            attachments=None, typed_text: str | None = None) -> None:
+    store = _cc_card_store(name)
+    card = carddigest.make_input_accepted_card(
+        "claude_code", client_id, text,
+        attachments=_input_attachment_summary(attachments),
+        typed_text=typed_text)
+    store.upsert_card(card)
+
+
 def _cc_card_uid(d: dict, jsonl_path: str, lineno: int) -> str:
     u = d.get("uuid")
     if u:
@@ -9439,6 +9477,7 @@ def _cc_digest_lines(store, lines, jsonl_path: str, start_lineno: int) -> int:
         media_payloads.append(d)
         uid = _cc_card_uid(d, jsonl_path, start_lineno + off)
         for card in carddigest.cc_event_to_cards(d, uid, turn_id=store.turn_id):
+            card = carddigest.merge_input_accepted_echo(store, card)
             store.upsert_card(card)
             n += 1
             if card["kind"] == "tool_call":
@@ -9468,6 +9507,9 @@ async def _cc_card_seed(store, name: str, workdir: str):
         _log_event("cc_card_seed_error", session=name, error=str(e)[:200])
         return
     lines = text.splitlines()
+    store.tail_partial = ""
+    if text and not text.endswith("\n") and lines:
+        store.tail_partial = lines.pop()
     seed = lines[-_CC_CARD_SEED_LINES:]
     _cc_digest_lines(store, seed, jsonl, len(lines) - len(seed))
     store.tail_file = jsonl
@@ -9497,6 +9539,7 @@ async def _cc_card_follower(name: str, workdir: str):
             cur = await _cc_session_jsonl(name, workdir)
             if cur != store.tail_file:               # session 換了新 jsonl
                 store.tail_file, store.tail_pos, store.tail_lineno = cur or "", 0, 0
+                store.tail_partial = ""
             j = store.tail_file
             if j and os.path.exists(j):
                 size = os.path.getsize(j)
@@ -9506,7 +9549,12 @@ async def _cc_card_follower(name: str, workdir: str):
                             f.seek(store.tail_pos)
                             return f.read(), f.tell()
                     new, store.tail_pos = await asyncio.to_thread(_read_new)
-                    nl = new.splitlines()
+                    chunk = (getattr(store, "tail_partial", "") or "") + new
+                    nl = chunk.splitlines()
+                    if chunk and not chunk.endswith("\n") and nl:
+                        store.tail_partial = nl.pop()
+                    else:
+                        store.tail_partial = ""
                     _cc_digest_lines(store, nl, j, store.tail_lineno)
                     store.tail_lineno += len(nl)
             if store.subscribers > 0:
@@ -9619,6 +9667,36 @@ def _cx_cards_feed_approval(record: dict, resolved: str = "") -> None:
         d.resolve_approval(record, resolved)
     else:
         d.handle_approval(record)
+
+
+def _input_attachment_summary(attachments) -> list[dict]:
+    out = []
+    for a in attachments or []:
+        if not isinstance(a, dict):
+            continue
+        row = {}
+        for key in ("kind", "filename", "mime", "content_type", "size"):
+            if a.get(key) not in (None, ""):
+                row[key] = a.get(key)
+        if row:
+            out.append(row)
+    return out
+
+
+def _cx_feed_input_accepted(thread_id: str, client_id: str | None, text: str,
+                            attachments=None, typed_text: str | None = None,
+                            create_if_missing: bool = False) -> None:
+    if not thread_id:
+        return
+    d = _CX_CARD_DIGESTS.get(thread_id)
+    if d is None:
+        if not create_if_missing:
+            return
+        d = _CX_CARD_DIGESTS[thread_id] = carddigest.CodexThreadDigest()
+    card = carddigest.make_input_accepted_card(
+        "codex", client_id, text, attachments=_input_attachment_summary(attachments),
+        typed_text=typed_text)
+    d.store.upsert_card(card)
 
 
 async def _cx_card_digest(thread_id: str):
