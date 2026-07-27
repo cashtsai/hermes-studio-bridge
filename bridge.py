@@ -2716,15 +2716,33 @@ def _report_id(persona: str, name: str, sid: str, ts) -> str:
 REPORT_ACTIONS_MAX = 6          # 一份報告最多 6 顆行動鈕(閱讀器尾端一屏放得下)
 REPORT_ACTION_LABEL_MAX = 20    # 鈕面文字上限(字元)
 REPORT_ACTION_TEXT_MAX = 500    # 回傳指令文字上限(字元)
+REPORT_ACTION_URL_MAX = 1000    # 連結型 url 長度上限(超限**略過**——URL 截斷即斷鏈)
+
+
+def _report_action_url_ok(url: str) -> bool:
+    """連結型行動的 url 白名單:只收 http/https、必須有 host、長度設限。
+    javascript:/data:/file:… 一律擋(app 端點了直接 openURL,不能給怪 scheme)。"""
+    if not url or len(url) > REPORT_ACTION_URL_MAX:
+        return False
+    try:
+        from urllib.parse import urlsplit
+        parts = urlsplit(url)
+    except Exception:  # noqa: BLE001
+        return False
+    return parts.scheme in ("http", "https") and bool(parts.netloc)
 
 
 def _report_actions_normalize(raw) -> list:
-    """persona-report 的 actions 收斂成正典形:list[{label,text,target_session}]。
-    - 上限 6 顆;label ≤20 字、text ≤500 字 — 超限**截斷不擋件**(發送端手滑
-      不至於整包被拒)。
-    - target_session 選填:`claude_code:<ccsess名>` 或人格 id;空字串 = 由
-      app 端預設回報告所屬人格。
-    - 非 list / 元素非 dict / 截斷後 label 或 text 為空 → 該顆略過,不擋整包。
+    """persona-report 的 actions 收斂成正典形。兩型(feat/report-url-actions):
+    - 指令型 `{label,text,target_session}`:點了把 text 送回 target session。
+      label ≤20 字、text ≤500 字 — 超限**截斷不擋件**(發送端手滑不至於整包
+      被拒);target_session 選填(`claude_code:<ccsess名>`/人格 id;空字串 =
+      由 app 端預設回報告所屬人格)。
+    - 連結型 `{label,url}`:點了開連結(app 走既有 StudioLinkRouter 分流)。
+      元素帶 `url` 鍵即判連結型,url 只收 http/https + 有 host、≤1000 字 —
+      壞 url **略過該顆**(截斷會斷鏈,不能比照 text 截),不落回指令型。
+    - 兩型共用上限 6 顆,順序照發送端;非 list /元素非 dict /欄位不齊 →
+      該顆略過,不擋整包。
     """
     out = []
     if not isinstance(raw, list):
@@ -2733,11 +2751,19 @@ def _report_actions_normalize(raw) -> list:
         if not isinstance(item, dict):
             continue
         label = str(item.get("label") or "").strip()[:REPORT_ACTION_LABEL_MAX]
-        text = str(item.get("text") or "").strip()[:REPORT_ACTION_TEXT_MAX]
-        if not label or not text:
+        if not label:
             continue
-        out.append({"label": label, "text": text,
-                    "target_session": str(item.get("target_session") or "").strip()})
+        if item.get("url") is not None:
+            url = str(item.get("url") or "").strip()
+            if not _report_action_url_ok(url):
+                continue
+            out.append({"label": label, "url": url})
+        else:
+            text = str(item.get("text") or "").strip()[:REPORT_ACTION_TEXT_MAX]
+            if not text:
+                continue
+            out.append({"label": label, "text": text,
+                        "target_session": str(item.get("target_session") or "").strip()})
         if len(out) >= REPORT_ACTIONS_MAX:
             break
     return out
@@ -11571,9 +11597,11 @@ async def app_post_persona_report(request: Request):
         "external_source": str(body.get("external_source") or "fed"),
         "external_id": str(body.get("external_id") or "")
                        or _report_id(session, "fed-today", "", ts),
-        # feat/report-actions-api:選填快速行動鈕(≤6 顆,label ≤20/text ≤500
-        # 超限截斷;target_session = claude_code:<名> 或人格 id,空 = 報告所
-        # 屬人格)。閱讀器尾端渲染成按鈕,點了把 text 送回 target session。
+        # feat/report-actions-api:選填快速行動鈕(≤6 顆)。指令型
+        # {label,text,target_session}(label ≤20/text ≤500 超限截斷;
+        # target_session = claude_code:<名> 或人格 id,空 = 報告所屬人格),
+        # 點了把 text 送回 target session。feat/report-url-actions 增收連結型
+        # {label,url}(http/https 驗過才收),點了開連結(StudioLinkRouter)。
         "actions": _report_actions_normalize(body.get("actions")),
     }
     rid = _report_upsert(session, report)
