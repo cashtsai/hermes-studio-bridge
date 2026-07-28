@@ -14051,12 +14051,21 @@ ORACLE_STATE_FILE = os.environ.get(
     "POCKET_ORACLE_FILE",
     os.path.expanduser("~/apps/oracle-engine/state/daily-latest.json"))
 
+# 未帶天氣參數時的預設城市組 — 保留機主時期的雙城,純為**舊 app 相容**:
+# 已更新的 app 一律自己算出所在城市用 wx_lat/wx_lon/wx_label 傳上來(見
+# `_dashboard_weather_cities`),不再吃這組預設。
 _DASH_WEATHER_CITIES = (
     ("taipei", "台北", 25.03, 121.56, "Asia/Taipei"),
     ("bangkok", "曼谷", 13.75, 100.50, "Asia/Bangkok"),
 )
 _WEATHER_TTL = 1800.0                      # 30 min(拍板)
-_WEATHER_CACHE = {"at": 0.0, "data": None}  # monotonic ts → cities payload
+# 城市組 → {"at": monotonic, "data": payload}。城市由 app 決定後,快取不能再
+# 是單一格子(否則 A 使用者的台北會被 B 使用者的曼谷洗掉),鍵含座標。
+_WEATHER_CACHE: dict = {}
+# 鍵是 client 可控的(座標任意),設上限防止無限長大;滿了先丟最舊的。
+_WEATHER_CACHE_MAX = 64
+# wx_label 是 client 傳的顯示字串,截斷 + 去控制字元後才回進 payload。
+_WX_LABEL_MAX = 32
 
 # 四個 hermes gateway 的 launchd label ↔ persona(健康卡)。
 _DASH_GATEWAYS = (
@@ -14067,10 +14076,18 @@ _DASH_GATEWAYS = (
 )
 
 
-async def _weather_fetch_cities() -> list:
-    """open-meteo 當日:兩城市併發,高低溫 + 最大降雨機率。任一失敗整批視為
-    失敗(丟例外),由呼叫端決定回舊快取或 null。"""
+def _weather_cache_key(cities) -> tuple:
+    """快取鍵 = 城市座標組(取到小數第 2 位,≈1km,足以合併同城市的抖動)。
+    名稱不入鍵——同一座標換個顯示字串沒必要重打 open-meteo。"""
+    return tuple(sorted((round(lat, 2), round(lon, 2)) for _, _, lat, lon, _ in cities))
+
+
+async def _weather_fetch_cities(cities=None) -> list:
+    """open-meteo 當日:城市併發,高低溫 + 最大降雨機率。任一失敗整批視為
+    失敗(丟例外),由呼叫端決定回舊快取或 null。`cities` 省略 = 預設城市組。"""
     import httpx
+
+    cities = _DASH_WEATHER_CITIES if cities is None else tuple(cities)
 
     async def one(client, cid, name, lat, lon, tz):
         r = await client.get(
@@ -14088,24 +14105,76 @@ async def _weather_fetch_cities() -> list:
 
     async with httpx.AsyncClient(timeout=8) as client:
         return list(await asyncio.gather(
-            *[one(client, *c) for c in _DASH_WEATHER_CITIES]))
+            *[one(client, *c) for c in cities]))
 
 
-async def _dashboard_weather():
-    """快取 30 分鐘;過期才外呼。外呼失敗回舊資料(stale 總比空白好),
-    從未成功過則回 None(app 顯示「—」)。失敗不寫快取,下次再試。"""
+async def _dashboard_weather(cities=None):
+    """快取 30 分鐘(每個城市組各自一格);過期才外呼。外呼失敗回同組舊資料
+    (stale 總比空白好),該組從未成功過則回 None(app 顯示「—」)。失敗不寫
+    快取,下次再試。`cities` 省略 = 預設城市組;空序列 = 使用者關掉天氣 →
+    直接 None,不外呼。"""
+    cities = _DASH_WEATHER_CITIES if cities is None else tuple(cities)
+    if not cities:
+        return None
+    key = _weather_cache_key(cities)
     now = time.monotonic()
-    if _WEATHER_CACHE["data"] is not None and now - _WEATHER_CACHE["at"] < _WEATHER_TTL:
-        return _WEATHER_CACHE["data"]
+    hit = _WEATHER_CACHE.get(key)
+    if hit and hit["data"] is not None and now - hit["at"] < _WEATHER_TTL:
+        return hit["data"]
     try:
-        cities = await _weather_fetch_cities()
+        fetched = await _weather_fetch_cities(cities)
     except Exception as e:  # noqa: BLE001
         _log_event("dashboard_weather_failed", error=type(e).__name__,
                    error_message=str(e)[:160])
-        return _WEATHER_CACHE["data"]
-    _WEATHER_CACHE["at"] = now
-    _WEATHER_CACHE["data"] = {"fetched_at": time.time(), "cities": cities}
-    return _WEATHER_CACHE["data"]
+        return hit["data"] if hit else None
+    # 寫入前先騰位:鍵由 client 控制,不設限會被任意座標灌爆。
+    while len(_WEATHER_CACHE) >= _WEATHER_CACHE_MAX and key not in _WEATHER_CACHE:
+        _WEATHER_CACHE.pop(min(_WEATHER_CACHE, key=lambda k: _WEATHER_CACHE[k]["at"]))
+    _WEATHER_CACHE[key] = {"at": now,
+                           "data": {"fetched_at": time.time(), "cities": fetched}}
+    return _WEATHER_CACHE[key]["data"]
+
+
+def _dashboard_weather_cities(request):
+    """把 `/app/v1/dashboard` 的天氣 query 參數解析成城市組。
+
+    城市由 **app** 決定(裝置時區推斷或使用者在設定裡手選),bridge 只照做 —
+    這樣同一個 bridge 服務不同地點的人都對。三種結果:
+
+      * `?wx=off`                      → `()`,關掉天氣(不外呼、payload 給 null)
+      * `?wx_lat=&wx_lon=[&wx_label=&wx_tz=]` → 單一城市
+      * 沒帶(或帶了但不合法)         → `_DASH_WEATHER_CITIES` 雙城預設,
+                                        舊版 app 行為完全不變
+
+    `wx_tz` 省略時交給 open-meteo `timezone=auto`(依座標判時區),因此 app
+    只需要送座標就會拿到當地日界的當日高低溫。
+    """
+    q = getattr(request, "query_params", None) or {}
+    if str(q.get("wx") or "").strip().lower() in ("off", "0", "none", "false"):
+        return ()
+    raw_lat, raw_lon = q.get("wx_lat"), q.get("wx_lon")
+    if raw_lat in (None, "") or raw_lon in (None, ""):
+        return _DASH_WEATHER_CITIES
+    try:
+        lat, lon = float(raw_lat), float(raw_lon)
+    except (TypeError, ValueError):
+        lat = lon = None
+    if (lat is None or not (-90.0 <= lat <= 90.0)
+            or not (-180.0 <= lon <= 180.0)
+            or lat != lat or lon != lon):          # NaN 自己不等於自己
+        _log_event("dashboard_weather_bad_coords",
+                   lat=str(raw_lat)[:24], lon=str(raw_lon)[:24])
+        return _DASH_WEATHER_CITIES
+    # 顯示名由 app 給(它有在地語言的城市表);沒給就退回座標字串。
+    label = "".join(ch for ch in str(q.get("wx_label") or "")
+                    if ch.isprintable()).strip()[:_WX_LABEL_MAX]
+    if not label:
+        label = f"{lat:.2f},{lon:.2f}"
+    tz = str(q.get("wx_tz") or "").strip()
+    # 只放行 IANA 形狀的字串,其餘一律 auto(不把 client 字串直接轉給外部 API)。
+    if not tz or not re.fullmatch(r"[A-Za-z][A-Za-z0-9+_-]*(/[A-Za-z0-9+._-]+){0,2}", tz):
+        tz = "auto"
+    return ((f"{lat:.2f},{lon:.2f}", label, lat, lon, tz),)
 
 
 def _dashboard_oracle():
@@ -14253,10 +14322,15 @@ async def _dashboard_gateways() -> list:
 @app.get("/app/v1/dashboard")
 async def app_dashboard(request: Request):
     """儀表板聚合端點:一次回 weather/oracle/approvals/sessions/health。
-    Bearer 驗證同其他 /app/v1/*;全唯讀、可併發的子項一起 gather。"""
+    Bearer 驗證同其他 /app/v1/*;全唯讀、可併發的子項一起 gather。
+
+    天氣城市由 app 用 `wx_lat`/`wx_lon`/`wx_label`(選配 `wx_tz`)指定,
+    `wx=off` 關閉;未帶參數維持雙城預設(舊 app 相容)。詳見
+    `_dashboard_weather_cities`。"""
     _check_auth(request)
     weather, sessions, gateways = await asyncio.gather(
-        _dashboard_weather(), _dashboard_sessions(), _dashboard_gateways())
+        _dashboard_weather(_dashboard_weather_cities(request)),
+        _dashboard_sessions(), _dashboard_gateways())
     return {"generated_at": datetime.now(timezone.utc).isoformat(),
             "weather": weather,
             "oracle": _dashboard_oracle(),
