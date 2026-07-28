@@ -6850,6 +6850,100 @@ async def _tmux_alive(name: str) -> bool:
 
 
 _cc_tail_cache: dict = {}   # jsonl path -> (mtime, preview)
+_cc_ctx_cache: dict = {}    # jsonl path -> (mtime, usage|None)
+
+# model id 片段 → context window。Claude 5 家族與 Opus/Sonnet 4.6+ 都是 1M;
+# Haiku 4.5 與 Claude 3.x 是 200K。認不出來的一律當 1M(現役機種的多數)。
+_CC_CTX_WINDOWS = (
+    ("haiku", 200_000),
+    ("claude-3", 200_000),
+    ("sonnet-4-5", 200_000),
+    ("opus-4-5", 200_000),
+    ("opus-4-1", 200_000),
+    ("opus-4-0", 200_000),
+    ("sonnet-4-0", 200_000),
+)
+_CC_CTX_WINDOW_DEFAULT = 1_000_000
+
+
+def _cc_context_window(model: str) -> int:
+    m = (model or "").lower()
+    for frag, size in _CC_CTX_WINDOWS:
+        if frag in m:
+            return size
+    return _CC_CTX_WINDOW_DEFAULT
+
+
+def _cc_context_usage(jsonl: str):
+    """這條 CC session 目前吃掉多少 context → {"used", "size"}(app 的儀表形狀,
+    與 Codex 的 _codex_usage_map 同款)。取 transcript 最後一則帶 usage 的 assistant
+    訊息:input + cache_read + cache_creation = 這回合送進去的 prompt 大小。
+
+    為什麼不讀終端狀態列:CC 的「% context used」只在快滿時才畫出來(平常那行是
+    5h/7d 用量配額,不是 context),對「提早知道該不該壓縮」剛好太晚。
+
+    尾巴反向掃 256KB;工具輸出很肥時一則 assistant 可能落在更外面,再退一次 4MB。
+    取不到 → None(app 端整條隱藏,不顯示假數字)。"""
+    for window in (262_144, 4_194_304):
+        try:
+            size = os.path.getsize(jsonl)
+            with open(jsonl, "rb") as f:
+                start = 0
+                if size > window:
+                    f.seek(-window, os.SEEK_END)
+                    start = f.tell()
+                chunk = f.read().decode("utf-8", "replace")
+        except Exception as _exc:  # noqa: BLE001
+            _log_exc("_cc_context_usage", _exc, expected=True)
+            return None
+        lines = chunk.splitlines()
+        if start > 0 and lines:
+            lines = lines[1:]          # 半行開頭丟掉
+        for line in reversed(lines):
+            if '"usage"' not in line or not line.lstrip().startswith("{"):
+                continue
+            try:
+                d = json.loads(line)
+            except Exception as _exc:  # noqa: BLE001
+                _log_exc("_cc_context_usage.parse", _exc, expected=True)
+                continue
+            if d.get("type") != "assistant":
+                continue
+            msg = d.get("message") or {}
+            u = msg.get("usage")
+            if not isinstance(u, dict):
+                continue
+            try:
+                used = (int(u.get("input_tokens") or 0)
+                        + int(u.get("cache_read_input_tokens") or 0)
+                        + int(u.get("cache_creation_input_tokens") or 0))
+            except (TypeError, ValueError):
+                continue
+            if used <= 0:
+                continue
+            return {"used": used, "size": _cc_context_window(msg.get("model"))}
+        if start == 0:
+            break                      # 整個檔都掃過了,再放大也沒用
+    return None
+
+
+def _cc_context_usage_cached(jsonl):
+    """_cc_context_usage 的 mtime 快取版(檔案沒動就零讀取,同 _cc_last_activity)。"""
+    if not jsonl:
+        return None
+    try:
+        mtime = os.path.getmtime(jsonl)
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("_cc_context_usage_cached", _exc, expected=True)
+        return None
+    cached = _cc_ctx_cache.get(jsonl)
+    if cached and cached[0] == mtime:
+        return cached[1]
+    usage = _cc_context_usage(jsonl)
+    if len(_cc_ctx_cache) > 512:
+        _cc_ctx_cache.clear()
+    _cc_ctx_cache[jsonl] = (mtime, usage)
+    return usage
 
 
 def _cc_tail_preview(jsonl: str) -> str:
@@ -6994,11 +7088,17 @@ async def _cc_sessions():
         # Claude 標題(桌面 App rename 改的就是這個,存在終端 pane_title)→ app 當
         # 副標題,主名仍是 ccsess 名。取不到就 None,不影響列表。
         claude_title = await _cc_pane_title(name) if alive else None
-        out.append({"name": name, "workdir": workdir,
-                    "status": "running" if alive else "down", "busy": busy,
-                    "awaiting": awaiting, "updatedAt": mtime, "preview": preview,
-                    "sessionId": sid, "sessionTitle": stitle,
-                    "claudeTitle": claude_title})
+        row = {"name": name, "workdir": workdir,
+               "status": "running" if alive else "down", "busy": busy,
+               "awaiting": awaiting, "updatedAt": mtime, "preview": preview,
+               "sessionId": sid, "sessionTitle": stitle,
+               "claudeTitle": claude_title}
+        # context 用量(與 Codex 同款 {used,size});取不到就不放這個 key,
+        # app 端整條隱藏而不是顯示 0%。
+        ctx = _cc_context_usage_cached(jsonl)
+        if ctx:
+            row["usage"] = ctx
+        out.append(row)
     return out
 
 
