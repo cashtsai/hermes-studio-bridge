@@ -24,6 +24,15 @@
    高於任何接力包內容，因為接力包會被下一個 session 改寫/壓縮/濾掉細節，
    本檔不會。
 4. 若不確定某個動作是否踩到紅線，**先問 XCash/善彰，不要自己判斷後執行**。
+5. **`~/apps/hermes-openwebui-bridge` 這個工作樹必須常駐 `main`**（launchd 的
+   `WorkingDirectory` 直接指到這裡，服務跑的就是這份 checkout 的 `bridge.py`）。
+   **功能開發一律開 worktree**：`git worktree add ~/apps/bridge-<題目> -b <branch>`。
+   > 建立原因：2026-07-28 一天內兩次事故。上午這棵樹被留在 `agent/input-accepted-cards`，
+   > 導致 main 的 merge **靜默失敗**（顯示 Updating 卻沒生效，查了一輪才抓到）；
+   > 下午又被留在 `agent/tool-error-reports` 並在該分支上重啟，使 **production 實際跑著
+   > 未合併、且被健壯性護欄擋著的 commit**。兩次都不會報錯，只會安靜地跑錯東西。
+   - 離開前請 `git checkout main`；重啟服務前後記得
+     `rm -f /tmp/hermes-bridge-watchdog.fails`（維護空窗的失敗計數會讓看門狗誤殺）。
 
 ## 這個 repo 的基本資訊
 
