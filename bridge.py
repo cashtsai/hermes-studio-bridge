@@ -7822,7 +7822,7 @@ async def _cc_input_core(name: str, body: dict) -> dict:
         text = (text + f"  [附件已存到本機,請用 Read 讀取/檢視: {refs}]").strip()
     if not text:
         raise HTTPException(status_code=400, detail="empty")
-    await _cc_paste_text(name, text)
+    receipt = await _cc_paste_text(name, text)
     _cc_feed_input_accepted(name, client_id, visible_text, attachments_summary,
                             typed_text=text)
     # 排隊空窗回音:輸入落地「當下」就發 status 事件,不等 transcript digest。
@@ -7833,7 +7833,15 @@ async def _cc_input_core(name: str, body: dict) -> dict:
     store.queued_until = time.time() + _CC_QUEUED_GRACE_SECS
     store.set_status({"busy": True, "mode": None, "prompt": None,
                       "phase": "queued", "label": "已排入佇列,等待接手…"})
-    return {"ok": True}
+    # delivery 語意(2026-07-28):200 不再一律等於「已送達」。
+    #   accepted — 已經確認被 CLI 收走並開跑
+    #   queued   — CLI 收下但還在忙上一輪(或我們無法在預算內確認)→ app 顯示
+    #              排隊態,等 transcript 回顯才轉「已送達」
+    # 「沒被收下」在 _cc_paste_text 就已丟 409 CC_INPUT_NOT_ACCEPTED,走不到這。
+    return {"ok": True,
+            "delivery": receipt.get("delivery", "accepted"),
+            "confirmed": bool(receipt.get("confirmed")),
+            "enter_retries": receipt.get("attempts", 0)}
 
 
 async def _tmux_run_stdin(args: list, data: bytes,
@@ -7858,13 +7866,205 @@ async def _tmux_run_stdin(args: list, data: bytes,
             (err or b"").decode("utf-8", "replace").strip())
 
 
-async def _cc_paste_text(name: str, text: str) -> None:
+# ── CC 送出驗證(2026-07-28 靜默掉訊息事故)────────────────────────────────
+# 現場:CLI 正在跑工具(pane 顯示 spinner + `100% context used`),Pocket 送出的
+# 那句話停在 `❯` 輸入框裡沒送出,bridge 卻回了 200 —— app 顯示「已送達」,
+# 訊息實際永遠不會被處理。比 UI 錯亂嚴重:使用者不知道要重送。
+#
+# 根因不在「沒有驗證」(2026-07-14 已經加了回讀重試),而在**驗證是 fail-open**:
+#   1) `pane.rfind("❯") < 0` 直接當成功。畫面重繪、overlay 蓋住、輸入框被
+#      擠出可視區時看不到提示符 —— 「看不到輸入框」是未知,不是成功。
+#   2) 用「輸入框裡看不到我們的字」單一快照當成功。但 CLI 忙碌時貼上的字有
+#      可能還沒被 render 出來(PTY 還沒被讀走),此時輸入框當然是空的 ——
+#      這正是現場那筆「0 次 cc_paste_enter_retry 就回 200」的來源。
+#      **不能用「沒看到」證明送出**,要先看到字真的出現過,再看到它離開。
+#   3) 子字串比對對空白/換行敏感:Claude Code 的輸入框用 U+00A0 當提示符後
+#      的間隔,長句在 80 欄會折行,兩者都會讓 probe 對不上 → 假清空。
+# 另外多路徑併發送出(app 的 drainNext + 離線補送 + 使用者手動)會交錯打進
+# 同一個 pane,C-u/paste/Enter 三步互相插隊 —— 這裡補 per-session 序列化鎖。
+_CC_COMPOSER_MARKS = ("❯", "›")
+_CC_CONTEXT_FULL_RE = re.compile(r"(?:9[5-9]|100)\s*%\s*context\s+used",
+                                 re.IGNORECASE)
+_CC_VERIFY_BUDGET_SECS = 8.0        # 驗證總預算(手機 POST 可接受的等待上限)
+_CC_VERIFY_SETTLE_SECS = 0.8        # 送 Enter 後先讓 TUI 消化貼上再回讀
+_CC_VERIFY_POLL_SECS = 0.5          # 之後的回讀間隔
+_CC_VERIFY_MAX_ENTER_RETRIES = 4    # 卡住時最多補幾次 Enter
+_CC_PASTE_LOCKS: dict = {}
+
+
+def _cc_paste_lock(name: str) -> asyncio.Lock:
+    """同一個 session 的貼上/送出全序列化 —— 併發打進同一個 pane 會讓
+    C-u(清空)插到別人的 paste 與 Enter 中間,兩則都可能擱淺。"""
+    lock = _CC_PASTE_LOCKS.get(name)
+    if lock is None:
+        lock = asyncio.Lock()
+        _CC_PASTE_LOCKS[name] = lock
+    return lock
+
+
+def _cc_squash(s: str) -> str:
+    """比對用正規化:拿掉所有空白(含 U+00A0)與換行。
+    輸入框把提示符後的間隔畫成 NBSP、長句在 80 欄折行,原字串比對會假性
+    對不上;拿掉空白後「字有沒有還在框裡」才問得準。"""
+    return "".join((s or "").split()).replace(" ", "")
+
+
+def _cc_composer_split(pane: str):
+    """把畫面切成 (提示符以上的內容, 輸入框區域)。找不到提示符時輸入框回
+    **None** —— 呼叫端必須把 None 當「未知」處理,不准當成「已清空 = 已送出」。
+    輸入框在下邊框收尾:框下面還有 statusline / 背景 agent 清單,整段吃進來
+    會讓短訊息(1-3 字)在那些文字裡誤中,判成「還卡在框裡」。"""
+    idx = max(pane.rfind(m) for m in _CC_COMPOSER_MARKS)
+    if idx < 0:
+        lines = pane.splitlines()
+        for i in range(len(lines) - 1, max(-1, len(lines) - 13), -1):
+            if lines[i].lstrip().startswith(">"):    # 舊版 layout 的提示符
+                idx = sum(len(x) + 1 for x in lines[:i])
+                break
+        if idx < 0:
+            return pane, None
+    out = []
+    for ln in pane[idx:].splitlines():
+        s = ln.strip()
+        if out and s and set(s) <= {"─", "-", "═", "━", "│"}:
+            break                                    # 輸入框下邊框 → 收尾
+        out.append(ln)
+    return pane[:idx], "\n".join(out)
+
+
+def _cc_composer_region(pane: str) -> str | None:
+    return _cc_composer_split(pane)[1]
+
+
+def _cc_not_accepted_reason(pane: str) -> str:
+    """文字卡在輸入框時,分辨 CLI 是處在哪種「吃掉 Enter」的狀態。"""
+    if _CC_CONTEXT_FULL_RE.search(pane):
+        return "context_full"
+    if _cc_prompt(pane):
+        return "awaiting_prompt"
+    return "composer_stuck"
+
+
+_CC_NOT_ACCEPTED_HINT = {
+    "context_full": "CC 這條線 context 已滿,先 /compact 或壓縮再送",
+    "awaiting_prompt": "CC 正在等你回覆畫面上的選項,先處理再送",
+    "composer_stuck": "CC 沒有收下這則訊息,請重送",
+    "composer_missing": "CC 現在不在可輸入狀態(啟動中或有對話框蓋住畫面),"
+                        "處理完再重送",
+}
+
+
+async def _cc_verify_submitted(name: str, probe: str, gen0: int,
+                               pre_pane: str = "") -> dict:
+    """送 Enter 之後回讀 pane,判定貼上的文字**到底有沒有被 CLI 收走**。
+
+    回 {"state": ..., "reason": ..., "attempts": n, "pane": 最後一次畫面}
+      accepted    — 有正面證據:UserPromptSubmit hook 世代跳號 / 文字出現在
+                    輸入框以外(= 已進 transcript)/ 曾經在框裡、現在不在了。
+      stranded    — 補完 Enter 之後文字還卡在輸入框 → 必須回錯誤,不准回 200。
+      stranded/composer_missing — 整段預算裡都看不到輸入框(啟動中的信任
+                    對話框、全螢幕 overlay…)。實測真 CLI 就是這樣:字被打進
+                    看不見的輸入框然後留在那裡。當失敗處理,不當佇列。
+      unconfirmed — 輸入框看得到、也一直是空的,但從沒看到我們的字出現。
+                    既不能證明送出、也沒有擱淺證據(CLI 可能已經收進自己的
+                    佇列)→ 回「已排入佇列、尚未確認」,由 transcript 回顯
+                    收尾,**不謊稱已送達**。
+    """
+    deadline = time.monotonic() + _CC_VERIFY_BUDGET_SECS
+    seen_in_composer = False
+    attempts = 0
+    held_streak = 0
+    pane = ""
+    delay = _CC_VERIFY_SETTLE_SECS
+    squashed_probe = _cc_squash(probe)
+    # 重送同一句話時,舊那則的回顯還留在畫面上 —— 拿它當「這次送出了」的
+    # 證據會再度變成假成功。貼上前畫面就有的字一律不計分。
+    stale_echo = bool(squashed_probe) and squashed_probe in _cc_squash(pre_pane)
+    while True:
+        await asyncio.sleep(delay)
+        delay = _CC_VERIFY_POLL_SECS
+        if _CC_TURN_GEN.get(name, 0) != gen0:
+            # UserPromptSubmit hook 跳號 = CLI 真的收到一則使用者輸入(權威)。
+            return {"state": "accepted", "reason": "turn_started",
+                    "attempts": attempts, "pane": pane}
+        pane = await _cc_capture_pane_fresh(name)
+        body, region = _cc_composer_split(pane)
+        # ① 先看「有沒有被收下」的正面證據,再看「是不是卡住」。
+        # 順序很重要:忙碌中送出時 Claude Code 會把訊息排進自己的佇列並在
+        # 輸入框上方回顯,但輸入框本身有幾百毫秒的清空延遲 —— 先判「卡住」
+        # 就會補 Enter,把同一則訊息**排進佇列兩次**(2026-07-28 真 CLI 實測
+        # 抓到重複)。只要它已經出現在輸入框以外,就是收下了,絕不再補 Enter。
+        # region is None(看不到輸入框)時不採信:分不出那段字是回顯還是被
+        # overlay 蓋住的輸入框殘字。
+        if region is not None and squashed_probe and not stale_echo \
+                and squashed_probe in _cc_squash(body):
+            return {"state": "accepted", "reason": "echoed_in_pane",
+                    "attempts": attempts, "pane": pane}
+        held = region is not None and squashed_probe in _cc_squash(region)
+        if held:
+            seen_in_composer = True
+            held_streak += 1
+            # ② 連續兩次都還在框裡才補 Enter:單一快照可能只是 TUI 消化貼上
+            # 的延遲,一看到就補 Enter 同樣會送出兩次。
+            if held_streak < 2 and time.monotonic() < deadline:
+                continue
+            if attempts >= _CC_VERIFY_MAX_ENTER_RETRIES or \
+                    time.monotonic() >= deadline:
+                return {"state": "stranded",
+                        "reason": _cc_not_accepted_reason(pane),
+                        "attempts": attempts, "pane": pane}
+            attempts += 1
+            held_streak = 0
+            _log_event("cc_paste_enter_retry", session=name,
+                       probe_chars=len(probe), attempt=attempts)
+            await _tmux_run("send-keys", "-t", name, "Enter")
+            continue
+        held_streak = 0
+        if seen_in_composer:
+            return {"state": "accepted", "reason": "composer_cleared",
+                    "attempts": attempts, "pane": pane}
+        if time.monotonic() >= deadline:
+            if region is None:
+                # 整段預算都看不到輸入框 = TUI 不在可輸入狀態,字很可能被打進
+                # 被蓋住的輸入框裡擱淺(2026-07-28 真 CLI 實測就是這樣)。
+                return {"state": "stranded", "reason": "composer_missing",
+                        "attempts": attempts, "pane": pane}
+            return {"state": "unconfirmed", "reason": "never_rendered",
+                    "attempts": attempts, "pane": pane}
+
+
+async def _cc_paste_text(name: str, text: str) -> dict:
     """tmux 貼字唯一原語(B1):bracketed paste,buffer 內容改走 load-buffer
     stdin——set-buffer 把整段文字放 argv,長貼文/特殊字元踩 exec 邊界就 502,
-    這一整類從此消失。每步 rc/stderr 失敗即進 log(502 先可觀測再談修)。"""
+    這一整類從此消失。每步 rc/stderr 失敗即進 log(502 先可觀測再談修)。
+
+    送出後一律回讀 pane 驗證(見上方 _cc_verify_submitted):
+      * 卡在輸入框 → 清掉殘字並丟 409 CC_INPUT_NOT_ACCEPTED,**不准回 200**
+      * 確認送出   → {"delivery": "accepted"|"queued", "confirmed": True}
+      * 無法確認   → {"delivery": "queued", "confirmed": False}
+    """
+    async with _cc_paste_lock(name):
+        return await _cc_paste_text_locked(name, text)
+
+
+async def _cc_paste_text_locked(name: str, text: str) -> dict:
     if not await _tmux_alive(name):
         raise http_err(409, "SESSION_NOT_RUNNING", "session not running")
 
+    # 貼上前先看畫面:CLI 正停在「權限審核」這類選單時,貼進去的字只會變成
+    # 選單裡的垃圾輸入(而且送不出去)—— 與其之後回報擱淺,不如當場擋下並
+    # 告訴使用者要先處理選單。AskUserQuestion(semantic=question)容許自由
+    # 文字作答,放行。busy 中 _cc_prompt 本來就回 None,不影響正常送出。
+    pre_pane = await _cc_capture_pane_fresh(name)
+    pre_prompt = _cc_prompt(pre_pane)
+    if pre_prompt and pre_prompt.get("semantic") != "question":
+        _log_event("cc_input_not_accepted", session=name, reason="awaiting_prompt",
+                   stage="pre_check", text_chars=len(text))
+        raise http_err(409, "CC_INPUT_NOT_ACCEPTED",
+                       "session is waiting on an on-screen prompt",
+                       _CC_NOT_ACCEPTED_HINT["awaiting_prompt"])
+
+    gen0 = _CC_TURN_GEN.get(name, 0)
     buf = "pa-" + uuid.uuid4().hex[:8]
     try:
         rc_clear, _, e_clear = await _tmux_run("send-keys", "-t", name, "C-u")
@@ -7875,38 +8075,6 @@ async def _cc_paste_text(name: str, text: str) -> None:
                                                "-b", buf, "-p", "-d")
         await asyncio.sleep(0.25)                    # let the editor settle
         rc_enter, _, e_enter = await _tmux_run("send-keys", "-t", name, "Enter")
-        # Enter 落地驗證+重試:長貼文(尤其 CJK)0.25s 未必夠,TUI 還在消化
-        # 貼上時 Enter 會被吞——結果是 API 回 200 但訊息掛在輸入框沒送出,
-        # 使用者只看到「連線逾時」以為壞掉。送完 Enter 後檢查 composer 是否
-        # 真的清空(live ❯ 之後還看得到貼文開頭 = 沒送出),沒清就補 Enter,
-        # 最多三次。誤判補送的 Enter 對空 composer 是 no-op,安全。
-        probe = text[:24].strip()
-        submitted = True
-        if not rc_enter and probe:
-            for attempt in range(5):
-                await asyncio.sleep(0.8)
-                pane_now = await _cc_capture_pane_fresh(name)
-                marker = pane_now.rfind("❯")
-                if marker < 0 or probe not in pane_now[marker:]:
-                    submitted = True
-                    break                            # composer 已清空 → 已送出
-                submitted = False
-                _log_event("cc_paste_enter_retry", session=name,
-                           text_chars=len(text), attempt=attempt + 1)
-                await _tmux_run("send-keys", "-t", name, "Enter")
-        # 2026-07-14 草稿擱淺事故:重試耗盡後文字仍掛在輸入框(TUI 處於吃
-        # Enter 的狀態,如提示框/選取態),舊行為回 200 = 沉默失敗——手機
-        # 以為送出了,文字卻變成跨重開機的殭屍草稿,使用者的指令無聲蒸發。
-        # 改為誠實回 502:app 端會顯示送出失敗,使用者知道要重送。
-        if not submitted:
-            _log_event("cc_paste_not_submitted", session=name,
-                       text_chars=len(text))
-            raise http_err(502, "PASTE_NOT_SUBMITTED",
-                           "message pasted but Enter not accepted by the TUI",
-                           "text is stranded in the composer — session may be "
-                           "showing a prompt/overlay; resolve it and resend")
-    except HTTPException:
-        raise
     except Exception as e:  # noqa: BLE001
         _log_event("cc_paste_failed", session=name, text_chars=len(text),
                    step="exec", error=f"{type(e).__name__}: {str(e)[:160]}")
@@ -7922,6 +8090,37 @@ async def _cc_paste_text(name: str, text: str) -> None:
     if rc_clear:
         _log_event("cc_paste_clear_warn", session=name,
                    rc=rc_clear, stderr=(e_clear or "")[:120])
+
+    probe = text[:24].strip()
+    if not probe:
+        return {"delivery": "accepted", "confirmed": False, "attempts": 0}
+    verdict = await _cc_verify_submitted(name, probe, gen0, pre_pane)
+    pane = verdict.get("pane") or ""
+    if verdict["state"] == "stranded":
+        # 2026-07-14 草稿擱淺 / 2026-07-28 靜默掉訊息:重試耗盡文字還在框裡。
+        # 舊行為回 200 = 沉默失敗;回 200 之外還有第二個坑 —— 殘字會變成跨
+        # 重開機的殭屍草稿,下一則送出時被 C-u 吃掉也可能與新字黏在一起。
+        # 這裡先把「我們貼的那段」清掉(框裡確定是我們的字才清),再誠實回 409。
+        await _tmux_run("send-keys", "-t", name, "C-u")
+        _log_event("cc_input_not_accepted", session=name, stage="verify",
+                   reason=verdict["reason"], attempts=verdict["attempts"],
+                   text_chars=len(text), busy=_cc_pane_busy(pane))
+        raise http_err(409, "CC_INPUT_NOT_ACCEPTED",
+                       f"message not accepted by the TUI ({verdict['reason']})",
+                       _CC_NOT_ACCEPTED_HINT.get(verdict["reason"],
+                                                 _CC_NOT_ACCEPTED_HINT["composer_stuck"]))
+    confirmed = verdict["state"] == "accepted"
+    busy = _cc_pane_busy(pane)
+    # busy 取捨:CLI 自己就有輸入佇列(忙碌中送出會排到本回合結束才處理),
+    # bridge 端再疊一層持久佇列會出現兩個排序來源 → 重複送/亂序。所以這裡
+    # 不排隊,只把「已被 CLI 收下、但還沒開始跑」誠實標成 queued 讓 app 顯示
+    # 排隊態;真正「沒被收下」才回 409 由 app 重試。
+    delivery = "queued" if (busy or not confirmed) else "accepted"
+    if not confirmed:
+        _log_event("cc_input_unconfirmed", session=name,
+                   reason=verdict["reason"], text_chars=len(text))
+    return {"delivery": delivery, "confirmed": confirmed,
+            "attempts": verdict["attempts"], "reason": verdict["reason"]}
 
 
 async def _cc_capture_pane_fresh(name: str) -> str:

@@ -616,6 +616,28 @@ Pins Pocket's provider lane to a native agent session. `{provider}` accepts
     正文 —— 語音附件的 STT transcript 已折入（feat/stt-transcript-echo），
     app 用它把「🎤 語音訊息 · 辨識中…」樂觀泡泡原地替換成辨識文字。
     `stt_lang`（body 選配）與 v1 messages 同語意：語音轉錄語言鎖定＋繁簡偏置。
+
+  - **claude_code input 的交付語意（`fix/cc-input-delivery`；同時適用
+    `POST /ccsessions/{name}/input`）**：bridge 送完 Enter 會回讀 tmux pane
+    驗證訊息「真的被 TUI 收走」才回 200。2xx ack 增加三個欄位：
+
+    - `delivery`：`accepted` = 已確認被 CLI 收走；`queued` = CLI 收下但還在
+      忙上一輪，或 bridge 在驗證預算內拿不到正面證據。
+    - `confirmed`：是否拿到正面證據（UserPromptSubmit hook 世代跳號／文字
+      出現在輸入框以外／曾在框裡現已清空）。
+    - `enter_retries`：補送 Enter 的次數（0 = 一次就過）。
+
+    `delivery=queued` **不得**顯示成「已送達」——標排隊態，等 transcript
+    回顯才收尾；也**不得**進 app 的本機補送佇列（補送擁有者是 CLI 自己的
+    佇列，app 再送一次會變兩則）。
+
+    訊息**沒被收下**時回 `409 CC_INPUT_NOT_ACCEPTED`（不再回 200，取代舊的
+    502 `PASTE_NOT_SUBMITTED`），`message` 尾端帶原因：`context_full`
+    （context 已滿）／`awaiting_prompt`（畫面有選單在等回覆）／
+    `composer_missing`（TUI 不在可輸入狀態，如啟動對話框、全螢幕 overlay）／
+    `composer_stuck`。bridge 會先把卡在輸入框的殘字清掉再回錯，不留殭屍草稿。
+    app 應標成「可重試的失敗」並顯示原因，**不要**自動補送 —— 這些狀態多半
+    要人先處理（先 `/compact`、先答選單）。
 | `POST /app/v2/sessions/{id}/interrupt` | 停止當前 turn | ⏳ 批次 2 |
 | `POST /app/v2/sessions/{id}/key` | 送控制鍵(僅 `keys`) | ⏳ 後期（TUI 級,契約先佔位） |
 | `POST /app/v2/sessions` | 開新 session | ⏳ 後期（現走 v1 `POST /app/v1/delegations`） |
