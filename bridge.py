@@ -2867,6 +2867,182 @@ def _report_messages(session: str, limit: int = 100):
             for r in _report_events(session, limit, newest_first=True)]
 
 
+TOOL_ERROR_REPORT_SOURCE = "hermes-tool-error"
+TOOL_ERROR_REPORT_NAME = "agent-tool-error"
+TOOL_ERROR_REPORT_LABEL = "錯誤報告"
+TOOL_ERROR_REPORT_MAX_AGE = float(os.environ.get(
+    "POCKET_TOOL_ERROR_REPORT_MAX_AGE", str(7 * 86400)))
+TOOL_ERROR_REPORT_SCAN_MULTIPLIER = 8
+TOOL_ERROR_DETAIL_CHARS = 5000
+_TOOL_ERROR_PATTERNS = (
+    "traceback", "[exit ", "exit_code\": 1", "exit_code\": -",
+    "\"status\": \"error\"", "'status': 'error'", "status=error",
+    "\"ok\": false", "'ok': false", "error:", " error", "failed",
+    "failure", "exception", "timed out", "timeout", "blocked:",
+    "permission denied", "forbidden", "unauthorized", "http error 403",
+    "403", "401", "remote did not return json", "no space left",
+    "file not found", "not found:", "stderr ---",
+)
+
+
+def _tool_error_payload(raw: str):
+    try:
+        obj = json.loads(raw)
+    except Exception as exc:  # noqa: BLE001
+        _log_exc("tool_error_payload_parse", exc, expected=True, raw_len=len(raw or ""))
+        return None
+    return obj if isinstance(obj, dict) else None
+
+
+def _tool_error_like(raw: str) -> bool:
+    """True when a TG tool row should become a user-visible diagnostic report.
+
+    Hermes stores every tool result in state.db. Most rows are normal progress
+    and must stay out of Pocket; only error-shaped rows graduate to report_events.
+    """
+    text = str(raw or "").strip()
+    if not text:
+        return False
+    payload = _tool_error_payload(text)
+    if payload:
+        status = str(payload.get("status") or "").strip().lower()
+        if status in {"error", "failed", "failure"}:
+            return True
+        if payload.get("ok") is False:
+            return True
+        try:
+            if int(payload.get("exit_code")) != 0:
+                return True
+        except Exception as exc:  # noqa: BLE001
+            _log_exc("tool_error_exit_code_parse", exc, expected=True,
+                     value=repr(payload.get("exit_code"))[:40])
+        err = payload.get("error")
+        if err not in (None, "", False):
+            return True
+    low = text.lower()
+    return any(p in low for p in _TOOL_ERROR_PATTERNS)
+
+
+def _tool_error_summary(raw: str) -> str:
+    payload = _tool_error_payload(raw)
+    candidates = []
+    if payload:
+        for key in ("error", "message", "stderr", "output", "content"):
+            val = payload.get(key)
+            if isinstance(val, str) and val.strip():
+                candidates.append(val)
+        status = str(payload.get("status") or "").strip()
+        exit_code = payload.get("exit_code")
+        if status:
+            candidates.append(f"status={status}")
+        if exit_code not in (None, ""):
+            candidates.append(f"exit_code={exit_code}")
+    candidates.append(raw)
+    for value in candidates:
+        line = re.sub(r"\s+", " ", str(value or "")).strip()
+        if not line:
+            continue
+        return line[:220]
+    return "工具回傳錯誤"
+
+
+def _fenced_text(raw: str, max_chars: int) -> str:
+    text = _clip_text(str(raw or ""), max_chars)
+    return text.replace("```", "'''")
+
+
+def _tool_error_user_context(raw: str) -> str:
+    text = _tg_clean_content(raw or "") or ""
+    if text.startswith("[IMPORTANT: You are running as a scheduled cron job"):
+        return ""
+    return text
+
+
+def _tool_error_report_content(persona: str, row: dict) -> str:
+    ts = row.get("ts") or time.time()
+    tool = (row.get("tool_name") or "tool").strip() or "tool"
+    user_context = _tool_error_user_context(row.get("user_context") or "")
+    summary = _tool_error_summary(row.get("content") or "")
+    lines = [
+        f"## {PERSONAS.get(persona, (persona, None))[0]} 工具錯誤",
+        "",
+        f"- 時間：{_fmt_ts(ts)}",
+        f"- 工具：`{tool}`",
+        f"- Telegram session：`{row.get('session_id') or ''}`",
+        f"- 摘要：{summary}",
+    ]
+    if user_context:
+        lines.append(f"- 前一則使用者訊息：{_clip_text(user_context, 180)}")
+    lines += [
+        "",
+        "<details><summary>原始工具輸出</summary>",
+        "",
+        "```text",
+        _fenced_text(row.get("content") or "", TOOL_ERROR_DETAIL_CHARS),
+        "```",
+        "",
+        "</details>",
+    ]
+    return "\n".join(lines).strip()
+
+
+def _persona_tool_error_reports(persona: str, limit: int = 20) -> list[dict]:
+    """Newest TG/cron tool errors for a persona, shaped as report_events payloads.
+
+    These reports make raw execution failures visible in Pocket's report/card
+    surfaces without mixing traceback/stderr rows into the main chat transcript.
+    """
+    import sqlite3
+    if persona not in PERSONAS:
+        return []
+    home = home_for(persona)
+    db = os.path.join(home, "state.db")
+    if not os.path.exists(db):
+        return []
+    scan_limit = max(limit * TOOL_ERROR_REPORT_SCAN_MULTIPLIER, limit)
+    min_ts = time.time() - TOOL_ERROR_REPORT_MAX_AGE
+    try:
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=5)
+        try:
+            rows = con.execute(
+                "SELECT m.id, m.session_id, m.tool_name, m.content, m.timestamp, "
+                "(SELECT u.content FROM messages u WHERE u.session_id=m.session_id "
+                " AND u.role='user' AND u.timestamp < m.timestamp "
+                " AND u.content IS NOT NULL AND u.content!='' "
+                " ORDER BY u.timestamp DESC LIMIT 1) AS user_context "
+                "FROM messages m JOIN sessions s ON s.id=m.session_id "
+                "WHERE s.source IN ('telegram','cron') AND m.role='tool' "
+                "AND m.content IS NOT NULL AND m.content!='' "
+                "AND m.timestamp >= ? ORDER BY m.timestamp DESC LIMIT ?",
+                (min_ts, scan_limit)).fetchall()
+            con.close()
+        finally:
+            con.close()
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("_persona_tool_error_reports", _exc, expected=True)
+        return []
+    out = []
+    for mid, sid, tool_name, content, ts, user_context in rows:
+        if not _tool_error_like(content or ""):
+            continue
+        row = {"id": mid, "session_id": sid, "tool_name": tool_name or "tool",
+               "content": content or "", "ts": ts, "user_context": user_context or ""}
+        external_id = f"{TOOL_ERROR_REPORT_SOURCE}:{persona}:{sid}:{mid}"
+        out.append({
+            "id": _report_id(persona, TOOL_ERROR_REPORT_NAME, f"{sid}:{mid}", ts),
+            "external_id": external_id,
+            "external_source": TOOL_ERROR_REPORT_SOURCE,
+            "session_id": sid,
+            "label": TOOL_ERROR_REPORT_LABEL,
+            "name": TOOL_ERROR_REPORT_NAME,
+            "content": _tool_error_report_content(persona, row),
+            "ts": ts,
+        })
+        if len(out) >= limit:
+            break
+    return out
+
+
 def _clip_text(text: str, max_chars: int) -> str:
     text = (text or "").strip()
     if len(text) <= max_chars:
@@ -10452,7 +10628,8 @@ def _notice_for_report(session: str, report: dict) -> None:
     報告內容修訂不會把已 ack 的通知翻回 pending。"""
     import sqlite3
     name = report.get("name") or ""
-    if name not in NOTICE_REPORT_JOBS.get(session, ()):
+    is_tool_error = report.get("external_source") == TOOL_ERROR_REPORT_SOURCE
+    if name not in NOTICE_REPORT_JOBS.get(session, ()) and not is_tool_error:
         return
     rid = str(report.get("id") or "")
     if not rid:
@@ -10692,6 +10869,7 @@ def _write_report_memory(session: str, reports: list[dict]) -> None:
 
 def _sync_persona_reports(session: str, limit: int = 50) -> list[dict]:
     reports = _persona_reports(session, limit)
+    reports.extend(_persona_tool_error_reports(session, min(limit, 20)))
     if not reports:
         return _report_events(session, limit, newest_first=True)
     upserted = 0
