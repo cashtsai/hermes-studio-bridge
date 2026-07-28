@@ -8505,8 +8505,82 @@ async def _cc_interrupt_core(name: str) -> dict:
 # tokens)" while a turn runs — capture the pane and look for it. Covers long,
 # silent commands (the spinner stays up), which a stream-silence heuristic misses.
 _CC_BUSY_RE = re.compile(r"\((?:\d+m\s*)?\d+(?:\.\d+)?s\s*·.*tokens", re.IGNORECASE)
-_CC_OPT_NUM_RE = re.compile(r"^(\d+)[.)]\s+(.{1,60})$")
+_CC_OPT_NUM_RE = re.compile(r"^(\d+)[.)]\s+(.{1,120})$")
 _CC_OPT_LABEL_RE = re.compile(r"^(allow once|always allow|don.t allow|allow|deny|yes,|yes\b|no,|no\b)", re.IGNORECASE)
+_CC_MARKER_CHARS = "❯>•· "
+
+
+def _cc_is_border(s: str) -> bool:
+    """整行只有框線字元(TUI 會在選單上下、甚至選項之間畫線)。"""
+    return bool(s) and set(s) <= {"─", "-", "═", "—", "_", "━"}
+
+
+def _cc_opt_match(raw: str):
+    return _CC_OPT_NUM_RE.match(raw.strip().lstrip(_CC_MARKER_CHARS).strip())
+
+
+def _cc_menu_from_footer(lines: list[str], footer_i: int):
+    """從 "Enter to select" footer 往上收選單區塊 → (title, options)。
+
+    為什麼要這樣收:舊版固定往上掃 `lines[-28:]`,會掃進**對話正文**。2026-07-29
+    實際炸開 —— 我方訊息裡有「1. …2. …3. …4. 草稿存附件 …」的編號段落,整段被
+    當成選單選項,假選項還卡在真選項前面,害標題搜尋跑到更上面找不到東西,
+    退回通用字串「cc-65bc73e9 等待核准」→ App 上問題整句消失、選項多出垃圾。
+
+    真實 TUI 結構(實機擷取):
+        ────────────────
+         ☐ 優先序                ← header chip
+        (空行)
+        問題本文                  ← 非縮排普通文字
+        (空行)
+        ❯ 1. 選項一
+             說明第一行           ← 縮排 = 上一個選項的說明
+             說明第二行
+          2. 選項二
+        ────────────────         ← 框線也會出現在選項「之間」,不能當停止點
+          5. Chat about this
+        Enter to select · …
+
+    所以界線是「第一個非縮排、非編號、非框線的普通文字」= 問題本身,停在那。
+    """
+    i = footer_i - 1
+    block_start = footer_i
+    while i >= 0:
+        raw = lines[i]
+        s = raw.strip()
+        if not s or _cc_is_border(s) or _cc_opt_match(raw) or raw[:4].strip() == "":
+            # 空行 / 框線 / 編號選項 / 縮排說明 —— 都還在選單區塊裡
+            block_start = i
+            i -= 1
+            continue
+        break                                  # 撞到問題本文 → 區塊到此為止
+
+    # 問題可能折成多行:繼續往上收連續的普通文字,停在空行/框線/header chip。
+    title_lines: list[str] = []
+    while i >= 0:
+        s = lines[i].strip()
+        if not s or _cc_is_border(s) or s[0] in "☐☑" or _cc_opt_match(lines[i]):
+            break
+        title_lines.insert(0, s)
+        i -= 1
+
+    # 區塊內正向掃一次:編號行 = 選項,其後縮排行 = 該選項的說明。
+    options: list[dict] = []
+    seen_keys: set[str] = set()
+    for raw in lines[block_start:footer_i]:
+        m = _cc_opt_match(raw)
+        if m:
+            key = m.group(1)
+            if key in seen_keys:               # 同號重複 → 只留第一個
+                continue                       # (假選項與真選項撞號會顯示兩次)
+            seen_keys.add(key)
+            options.append({"key": key, "label": m.group(2).strip(), "description": ""})
+            continue
+        s = raw.strip()
+        if s and not _cc_is_border(s) and raw[:4].strip() == "" and options:
+            prev = options[-1]                 # 縮排續行 → 併進上一個選項的說明
+            prev["description"] = (prev["description"] + " " + s).strip()
+    return " ".join(title_lines)[:280], options
 
 
 def _cc_jsonl_sid(path: str | None) -> str:
@@ -8698,28 +8772,15 @@ def _cc_prompt(pane: str):
     # (1) generic choice menu: the selection footer only exists while a menu is
     # live, so numbered lines above it ARE the options — no keyword gate needed.
     if "enter to select" in tail_low:
-        wide = lines[-28:]              # room for options with description lines
-        opts, first_opt_at = [], None
-        for i, ln in enumerate(wide):
-            s = ln.strip().lstrip("❯>•· ").strip()
-            m = _CC_OPT_NUM_RE.match(s)
-            if m:
-                if first_opt_at is None:
-                    first_opt_at = i
-                opts.append({"key": m.group(1), "label": m.group(2).strip()})
+        footer_i = max(i for i, ln in enumerate(lines)
+                       if "enter to select" in ln.lower())
+        title, opts = _cc_menu_from_footer(lines, footer_i)
         if len(opts) >= 2:
-            title = ""
-            for ln in reversed(wide[:first_opt_at or 0]):
-                s = ln.strip()
-                if not s or set(s) <= {"─", "-", "═"} or s[0] in "☐☑":
-                    continue
-                title = s[:140]
-                break
             # A1 semantic:泛選單(AskUserQuestion 等)= Approval Hub 的 question,
             # 不是 permission — app 端永不再用 label 猜語意。kind 欄位維持
             # "menu"(app 現行相容),語意走新增的 semantic 欄位。
             return {"kind": "menu", "semantic": "question", "title": title,
-                    "options": opts[:6]}
+                    "options": opts[:8]}
     has_context = any(k in tail_low for k in ("wants to", "do you want", "proceed?", "would you like"))
     if has_context:
         opts = []
