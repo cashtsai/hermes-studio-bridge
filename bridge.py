@@ -2888,7 +2888,9 @@ _TOOL_ERROR_PATTERNS = (
 def _tool_error_payload(raw: str):
     try:
         obj = json.loads(raw)
-    except Exception:
+    except Exception as exc:
+        _log_exc("_tool_error_payload", exc, expected=True,
+                 raw_len=len(raw or ""))
         return None
     return obj if isinstance(obj, dict) else None
 
@@ -2912,8 +2914,9 @@ def _tool_error_like(raw: str) -> bool:
         try:
             if int(payload.get("exit_code")) != 0:
                 return True
-        except Exception:
-            pass
+        except Exception as exc:
+            _log_exc("_tool_error_like.exit_code", exc, expected=True,
+                     value=repr(payload.get("exit_code"))[:40])
         err = payload.get("error")
         if err not in (None, "", False):
             return True
