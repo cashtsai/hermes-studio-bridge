@@ -8829,6 +8829,31 @@ def _cc_prompt(pane: str):
     return None
 
 
+def _log_hook_dropped(reason: str, event, body: dict) -> None:
+    """Hook 被丟掉就一定要留痕。
+
+    2026-07-29 事故追查:`cc_session_hook` 的四個早退全部靜靜 return
+    `{"ok": True, "ignored": True}`,curl 收 200、CC 端無感,日誌一個字也沒有。
+    實測全 log 210 筆 hook POST 只有 66 筆被採用、6 筆記成 ambiguous ——
+    **138 筆(66%)憑空消失**,而 `_CC_TURN_GEN` 的跳號只靠 UserPromptSubmit,
+    它一死,送出驗證就只剩回讀畫面猜(那正是「訊息被吃掉」那條的幫兇)。
+    當時無法從日誌分辨是哪一個閘門擋的,所以先補可觀測性。
+
+    只記形狀不記內容:欄位名、路徑的 basename、雜湊後的 sid/cwd —— 足以指認
+    是哪個閘門、對上是哪個 session,不會把使用者的 prompt 寫進 log。
+    """
+    path = _cc_hook_transcript_path(body) if isinstance(body, dict) else ""
+    _log_event("cc_hook_dropped",
+               reason=reason,
+               hook_event_name=str(event) if event is not None else None,
+               payload_keys=sorted(body.keys())[:20] if isinstance(body, dict) else [],
+               transcript_basename=os.path.basename(path) if path else "",
+               sid_hash=_short_hash(str(body.get("session_id") or "")
+                                    if isinstance(body, dict) else ""),
+               cwd_hash=_short_hash(str(body.get("cwd") or "")
+                                    if isinstance(body, dict) else ""))
+
+
 @app.post("/ccsessions/_hook")
 async def cc_session_hook(request: Request):
     host = _client_host(request)
@@ -8840,18 +8865,22 @@ async def cc_session_hook(request: Request):
         _log_exc("cc_session_hook", _exc, expected=True)
         return {"ok": True, "ignored": True}
     if not isinstance(body, dict):
+        _log_hook_dropped("body_not_dict", None, {})
         return {"ok": True, "ignored": True}
     event = body.get("hook_event_name")
     if event not in ("UserPromptSubmit", "Stop"):
+        _log_hook_dropped("event_not_tracked", event, body)
         return {"ok": True, "ignored": True}
     # 同 workdir 撞名時只在能唯一消歧時才把 hook 記到某個 name;拒絕
     # names[:1] 猜測,避免 Main/cc-* 同 cwd 時把 busy 與 sid 寫到錯的 session。
     hook_sid, sid_error = _cc_hook_sid(body)
     if sid_error:
+        _log_hook_dropped(sid_error, event, body)
         return {"ok": True, "ignored": True, "reason": sid_error}
     transcript_path = _cc_hook_transcript_path(body)
     if transcript_path and not _cc_transcript_path_matches_cwd(
             transcript_path, body.get("cwd")):
+        _log_hook_dropped("transcript_cwd_mismatch", event, body)
         return {"ok": True, "ignored": True, "reason": "transcript_cwd_mismatch"}
     all_names = _cc_names_for_cwd(body.get("cwd"))
     name, resolution = await _cc_disambiguate_hook_name(body, all_names, hook_sid)

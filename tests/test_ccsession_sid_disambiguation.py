@@ -1,6 +1,7 @@
 """CC hook sid disambiguation for same-workdir Claude Code sessions."""
 
 import asyncio
+import json
 import os
 import sys
 import tempfile
@@ -129,6 +130,67 @@ class TestCCSessionSidDisambiguation(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("Main", bridge._CC_HOOK_STATE)
         self.assertNotIn(self.cc_name, bridge._CC_HOOK_STATE)
         self.assertNotIn(self.cc_name, bridge._CC_SID_PINS)
+
+
+class TestCCHookDropObservability(unittest.IsolatedAsyncioTestCase):
+    """hook 被丟掉就一定要留痕(2026-07-29)。
+
+    四個早退原本全都靜靜 return 200 + ignored,日誌一個字也沒有 —— 實測全 log
+    210 筆 hook POST 只有 66 筆被採用、6 筆記成 ambiguous,138 筆憑空消失,
+    追查時完全分不出是哪個閘門擋的。這組測試把「每一條丟棄路徑都要留痕」釘住。
+    """
+
+    def setUp(self):
+        self.events = []
+
+    def _capture(self, name, **fields):
+        self.events.append((name, fields))
+
+    async def _drop(self, body):
+        with patch.object(bridge, "_log_event", self._capture):
+            result = await bridge.cc_session_hook(FakeHookRequest(body))
+        return result
+
+    async def test_untracked_event_is_logged(self):
+        r = await self._drop({"hook_event_name": "PreToolUse", "cwd": "/Users/xcash"})
+        self.assertTrue(r["ignored"])
+        drops = [f for n, f in self.events if n == "cc_hook_dropped"]
+        self.assertEqual(len(drops), 1)
+        self.assertEqual(drops[0]["reason"], "event_not_tracked")
+        self.assertEqual(drops[0]["hook_event_name"], "PreToolUse")
+
+    async def test_non_dict_body_is_logged(self):
+        r = await self._drop(["not", "a", "dict"])
+        self.assertTrue(r["ignored"])
+        self.assertEqual([f["reason"] for n, f in self.events if n == "cc_hook_dropped"],
+                         ["body_not_dict"])
+
+    async def test_sid_mismatch_is_logged_with_shape_not_content(self):
+        body = {"hook_event_name": "UserPromptSubmit",
+                "session_id": "11111111-1111-1111-1111-111111111111",
+                "transcript_path": "/tmp/proj/22222222-2222-2222-2222-222222222222.jsonl",
+                "cwd": "/Users/xcash",
+                "prompt": "使用者打的字,絕對不可以進 log"}
+        await self._drop(body)
+        drops = [f for n, f in self.events if n == "cc_hook_dropped"]
+        self.assertEqual(len(drops), 1)
+        self.assertEqual(drops[0]["reason"], "sid_transcript_mismatch")
+        # 指認得出是哪個 session、哪個閘門
+        self.assertEqual(drops[0]["transcript_basename"],
+                         "22222222-2222-2222-2222-222222222222.jsonl")
+        self.assertIn("prompt", drops[0]["payload_keys"])
+        # 但內容一個字都不准出現
+        self.assertNotIn("使用者打的字", json.dumps(drops[0], ensure_ascii=False))
+
+    async def test_transcript_cwd_mismatch_is_logged(self):
+        sid = "44444444-4444-4444-4444-444444444444"
+        body = {"hook_event_name": "Stop", "session_id": sid,
+                "transcript_path": f"/somewhere/else/{sid}.jsonl",
+                "cwd": "/Users/xcash"}
+        with patch.object(bridge, "_cc_transcript_path_matches_cwd", return_value=False):
+            await self._drop(body)
+        self.assertEqual([f["reason"] for n, f in self.events if n == "cc_hook_dropped"],
+                         ["transcript_cwd_mismatch"])
 
 
 if __name__ == "__main__":
