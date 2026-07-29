@@ -40,7 +40,8 @@ import media_artifacts
 import hermes_media
 import openclaw_provider
 import tg_outbound
-from fastapi import FastAPI, Request, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import (FastAPI, Request, HTTPException, WebSocket, WebSocketDisconnect,
+                     File, Form, UploadFile)
 from fastapi.responses import (JSONResponse, StreamingResponse, FileResponse,
                                HTMLResponse, PlainTextResponse)
 from starlette.websockets import WebSocketState
@@ -688,6 +689,19 @@ def _data_uri_estimated_bytes(data_uri: str) -> int:
     return 0 if i < 0 else (len(data_uri) - i - 8) * 3 // 4
 
 
+def _upload_dest_path(filename: str, mime: str) -> Path:
+    """落盤檔名的唯一產生處(data-URI 與 multipart 逐件上傳共用)。
+
+    抽出來是為了讓兩條收檔路徑產生**一模一樣**的命名規則:時間戳 + 亂數
+    + 淨化過的原檔名,副檔名缺了就依 mime 補。兩邊各寫一份遲早會漂移。
+    """
+    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    safe = re.sub(r"[^\w.\-]", "_", os.path.basename(filename or "")) or "file"
+    if "." not in safe:
+        safe += _MIME_EXT.get(mime, "")
+    return UPLOAD_DIR / f"{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}-{safe}"
+
+
 def _save_data_uri(data_uri: str, filename: str = "") -> str | None:
     """Decode a `data:<mime>;base64,<...>` URI to UPLOAD_DIR; return the path."""
     m = re.match(r"data:([^;]+);base64,(.*)$", data_uri or "", re.DOTALL)
@@ -706,11 +720,7 @@ def _save_data_uri(data_uri: str, filename: str = "") -> str | None:
         _log_event("save_data_uri_failed", stage="b64decode", mime=mime,
                    filename=(filename or "")[:80], error=type(e).__name__)
         return None
-    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-    safe = re.sub(r"[^\w.\-]", "_", os.path.basename(filename or "")) or "file"
-    if "." not in safe:
-        safe += _MIME_EXT.get(mime, "")
-    path = UPLOAD_DIR / f"{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}-{safe}"
+    path = _upload_dest_path(filename, mime)
     try:
         path.write_bytes(raw)
     except Exception as e:  # noqa: BLE001
@@ -11226,6 +11236,78 @@ async def app_uploads(request: Request):
                bytes=sum(int(a.get("size") or 0) for a in saved),
                client=_client_host(request))
     return {"ok": True, "attachments": saved}
+
+
+_UPLOAD_CHUNK = 1 << 20      # 1MB:串流落盤的讀取塊大小
+
+
+@app.post("/app/v1/uploads/file")
+async def app_upload_file(request: Request,
+                          file: UploadFile = File(...),
+                          kind: str = Form("file"),
+                          filename: str = Form(""),
+                          mime: str = Form("")):
+    """逐件上傳(multipart)—— 讓 app 畫得出**單一附件的**上傳進度。
+
+    為什麼不沿用 `/app/v1/uploads`:那支是「一次收整包 base64 JSON」,client 在
+    請求送完之前拿不到任何回饋,而且 base64 讓傳輸量膨脹 33%。逐件 + 原始位元組
+    之後,app 端才有辦法用 URLSession 的 didSendBodyData 畫出每個 chip 的進度。
+
+    舊端點**原封不動保留** —— 舊版 app 還在用它,而且離線補送路徑也走同一支。
+    這裡只是多一條路,不是取代。
+
+    串流落盤:一次讀 1MB,不把整個檔案堆進記憶體(舊路徑得先把整包 base64 讀進
+    來再 decode,一支 32MB 的影片瞬間吃掉近百 MB)。超過單檔上限就中止並刪掉
+    半套檔案 —— 不留下一個「看起來上傳好了」的截斷檔。
+    """
+    _check_auth(request)
+    name = (filename or file.filename or "file").strip()
+    content_type = (mime or file.content_type or "application/octet-stream").strip()
+    path = _upload_dest_path(name, content_type)
+    written = 0
+    try:
+        with open(path, "wb") as out:
+            while True:
+                chunk = await file.read(_UPLOAD_CHUNK)
+                if not chunk:
+                    break
+                written += len(chunk)
+                if written > _ATT_MAX_FILE_BYTES:
+                    raise _UploadTooLarge()
+                out.write(chunk)
+    except _UploadTooLarge:
+        _unlink_quietly(path)
+        _log_event("app_upload_file_rejected", reason="too_large",
+                   filename=name[:80], mime=content_type[:60],
+                   limit=_ATT_MAX_FILE_BYTES)
+        raise http_err(413, "ATTACHMENT_TOO_LARGE",
+                       f"超過單檔上限 {_ATT_MAX_FILE_BYTES} bytes")
+    except Exception as exc:  # noqa: BLE001
+        _unlink_quietly(path)
+        _log_event("app_upload_file_failed", filename=name[:80],
+                   error=type(exc).__name__, error_message=str(exc)[:160])
+        raise HTTPException(status_code=500, detail="upload failed")
+    _log_event("app_upload_file_saved", filename=name[:80],
+               mime=content_type[:60], bytes=written,
+               client=_client_host(request))
+    return {"ok": True, "attachment": {
+        "kind": kind or "file",
+        "filename": name,
+        "mime": content_type,
+        "path": str(path),
+        "size": written,
+    }}
+
+
+class _UploadTooLarge(Exception):
+    """串流途中超過單檔上限 —— 內部訊號,轉成 413。"""
+
+
+def _unlink_quietly(path) -> None:
+    try:
+        Path(path).unlink(missing_ok=True)
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("_unlink_quietly", _exc, expected=True)
 
 
 def _media_persona_home(persona: str) -> str:
