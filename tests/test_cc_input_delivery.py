@@ -124,6 +124,8 @@ class CCInputDeliveryTest(unittest.IsolatedAsyncioTestCase):
         bridge._CC_VERIFY_SETTLE_SECS = 0.05
         bridge._CC_VERIFY_POLL_SECS = 0.05
         bridge._CC_VERIFY_MAX_ENTER_RETRIES = 3
+        self.regrasp = bridge._CC_IDLE_REGRASP_SECS
+        bridge._CC_IDLE_REGRASP_SECS = 0.05
         bridge._CC_PASTE_LOCKS.clear()
         bridge._CC_TURN_GEN.clear()
         self.tmux = AsyncMock(return_value=(0, "", ""))
@@ -144,6 +146,7 @@ class CCInputDeliveryTest(unittest.IsolatedAsyncioTestCase):
         bridge._CC_VERIFY_SETTLE_SECS = self.settle
         bridge._CC_VERIFY_POLL_SECS = self.poll
         bridge._CC_VERIFY_MAX_ENTER_RETRIES = self.retries
+        bridge._CC_IDLE_REGRASP_SECS = self.regrasp
 
     def enters(self):
         return [c for c in self.tmux.call_args_list
@@ -256,18 +259,46 @@ class CCInputDeliveryTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(cm.exception.code, "CC_INPUT_NOT_ACCEPTED")
         self.assertIn("composer_missing", cm.exception.message)
 
-    async def test_never_rendered_is_not_success(self):
-        """貼上的字從沒出現在畫面(CLI 還沒把 PTY 讀走)→ 不能宣稱已送達。"""
-        script = PaneScript([pane_idle_empty()])
+    async def test_never_rendered_while_busy_is_queued_not_success(self):
+        """字沒出現在畫面、但 pane 確實在忙 → CLI 可能已收進自己的佇列,
+        誠實回 queued/unconfirmed,但絕不宣稱 accepted。"""
+        script = PaneScript([pane_busy_holding(text="別的字")])
         with patch.object(bridge, "_cc_capture_pane_fresh", script):
             r = await bridge._cc_paste_text("s1", TEXT)
         self.assertFalse(r["confirmed"])
         self.assertEqual(r["delivery"], "queued")
         self.assertEqual(r["reason"], "never_rendered")
 
+    async def test_never_rendered_while_idle_is_rejected(self):
+        """2026-07-29 訊息被吃掉事故:善彰 07:51 送「壓縮」,session 已閒置 4
+        分鐘,bridge 回 200 + delivery=queued,app 顯示「已排入佇列,等待接手…」
+        —— 但那則訊息在 CC transcript 裡從頭到尾不存在。
+
+        待命中的 CLI 收到輸入會**立刻**開跑,所以「驗證不到 + pane 不忙」只能
+        是沒送到。idle 不可能排隊,必須 fail-closed 回 409 讓 app 重送。"""
+        script = PaneScript([pane_idle_empty()])
+        with patch.object(bridge, "_cc_capture_pane_fresh", script):
+            with self.assertRaises(bridge.HTTPException) as cm:
+                await bridge._cc_paste_text("s1", "壓縮")
+        self.assertEqual(cm.exception.status_code, 409)
+        self.assertEqual(cm.exception.code, "CC_INPUT_NOT_ACCEPTED")
+        # 殘字要清掉,否則會變成跨重開機的殭屍草稿
+        self.assertGreaterEqual(
+            len([c for c in self.tmux.call_args_list
+                 if len(c.args) >= 4 and c.args[3] == "C-u"]), 2)
+
+    async def test_idle_regrasp_saves_a_slow_spinner(self):
+        """判死前的最後一次回讀:Enter 落地到 spinner 畫出來有幾百毫秒空隙,
+        剛好卡在那裡的送出是真的收下了,不能誤殺成 409。"""
+        script = PaneScript([pane_idle_empty(), pane_idle_empty(),
+                             pane_busy_holding(text="別的字")])
+        with patch.object(bridge, "_cc_capture_pane_fresh", script):
+            r = await bridge._cc_paste_text("s1", TEXT)
+        self.assertEqual(r["delivery"], "queued")
+
     async def test_resend_ignores_stale_echo_of_same_text(self):
         """重送同一句:畫面上舊那則的回顯不算這次送出的證據。"""
-        script = PaneScript([pane_echoed(busy=False)])   # 貼上前就有同樣的字
+        script = PaneScript([pane_echoed(busy=True)])    # 貼上前就有同樣的字
         with patch.object(bridge, "_cc_capture_pane_fresh", script):
             r = await bridge._cc_paste_text("s1", TEXT)
         self.assertFalse(r["confirmed"])
@@ -290,7 +321,7 @@ class CCInputDeliveryTest(unittest.IsolatedAsyncioTestCase):
         async def slow_pane(name):
             order.append("capture")
             await asyncio.sleep(0)
-            return pane_echoed(busy=False)
+            return pane_echoed(busy=True)
 
         with patch.object(bridge, "_cc_capture_pane_fresh", slow_pane):
             lock = bridge._cc_paste_lock("s1")

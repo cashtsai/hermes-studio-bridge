@@ -8228,7 +8228,13 @@ _CC_NOT_ACCEPTED_HINT = {
     "composer_stuck": "CC 沒有收下這則訊息,請重送",
     "composer_missing": "CC 現在不在可輸入狀態(啟動中或有對話框蓋住畫面),"
                         "處理完再重送",
+    "never_rendered_idle": "CC 沒有收下這則訊息(當時是待命中,收到就會立刻開跑),"
+                           "請重送",
 }
+
+# idle 判死前的最後一次機會:Enter 落地到 spinner 畫出來還有幾百毫秒,
+# 驗證預算剛好卡在這個空隙用完時不能就地判死。
+_CC_IDLE_REGRASP_SECS = 1.5
 
 
 async def _cc_verify_submitted(name: str, probe: str, gen0: int,
@@ -8318,7 +8324,8 @@ async def _cc_paste_text(name: str, text: str) -> dict:
     送出後一律回讀 pane 驗證(見上方 _cc_verify_submitted):
       * 卡在輸入框 → 清掉殘字並丟 409 CC_INPUT_NOT_ACCEPTED,**不准回 200**
       * 確認送出   → {"delivery": "accepted"|"queued", "confirmed": True}
-      * 無法確認   → {"delivery": "queued", "confirmed": False}
+      * 無法確認 + pane 真的在忙 → {"delivery": "queued", "confirmed": False}
+      * 無法確認 + pane 待命中   → 409(idle 不可能排隊,見下方 idle_recheck)
     """
     async with _cc_paste_lock(name):
         return await _cc_paste_text_locked(name, text)
@@ -8388,6 +8395,26 @@ async def _cc_paste_text_locked(name: str, text: str) -> dict:
                                                  _CC_NOT_ACCEPTED_HINT["composer_stuck"]))
     confirmed = verdict["state"] == "accepted"
     busy = _cc_pane_busy(pane)
+    if not confirmed and not busy:
+        # 2026-07-29 訊息被吃掉:待命中的 CLI 一收到輸入就會**立刻**開跑,所以
+        # 「驗證不到 + pane 也不忙」代表這段字根本沒進 TUI ——「排隊」在 idle
+        # session 上根本不成立。舊行為把它一律標成 queued,app 顯示「已排入
+        # 佇列,等待接手…」,120 秒寬限過完就安靜消失:使用者看到一則永遠不會
+        # 被處理的訊息。實測 07:51 那則「壓縮」在 CC transcript 裡完全不存在,
+        # 當下 session 已閒置 4 分鐘。只有真 busy 才准叫排隊,idle 一律 fail-closed。
+        await asyncio.sleep(_CC_IDLE_REGRASP_SECS)
+        late_pane = await _cc_capture_pane_fresh(name)
+        if _CC_TURN_GEN.get(name, 0) != gen0 or _cc_pane_busy(late_pane):
+            busy = True                       # 只是 spinner 慢一拍,確實收下了
+        else:
+            await _tmux_run("send-keys", "-t", name, "C-u")
+            _log_event("cc_input_not_accepted", session=name,
+                       stage="idle_recheck", reason="never_rendered_idle",
+                       attempts=verdict["attempts"], text_chars=len(text),
+                       busy=False)
+            raise http_err(409, "CC_INPUT_NOT_ACCEPTED",
+                           "message never reached the TUI (session was idle)",
+                           _CC_NOT_ACCEPTED_HINT["never_rendered_idle"])
     # busy 取捨:CLI 自己就有輸入佇列(忙碌中送出會排到本回合結束才處理),
     # bridge 端再疊一層持久佇列會出現兩個排序來源 → 重複送/亂序。所以這裡
     # 不排隊,只把「已被 CLI 收下、但還沒開始跑」誠實標成 queued 讓 app 顯示
