@@ -139,8 +139,14 @@ class TestOracle(unittest.TestCase):
             "changing_lines": [5],
             "lines": [{"position": 5, "value": 9, "yin_yang": "yang",
                        "changing": True, "label": "老陽"}],
-            "hexagrams": {"primary": {"number": 47, "name": "困", "theme": "守志"},
-                          "relating": {"number": 40, "name": "解", "theme": "鬆綁"}},
+            "hexagrams": {
+                "primary": {"number": 47, "name": "困", "theme": "守志",
+                            "upper": {"name": "兌", "image": "澤",
+                                      "keywords": ["交流", "收口"]},
+                            "lower": {"name": "坎", "image": "水",
+                                      "keywords": ["風險", "守險"]}},
+                "relating": {"number": 40, "name": "解", "theme": "鬆綁"},
+            },
             "interpretation": {"summary": "一句話", "attack_or_defend": "宜守",
                                "advice": "建言", "biggest_risk": "風險",
                                "one_thing_to_push": "推進",
@@ -149,6 +155,12 @@ class TestOracle(unittest.TestCase):
         o = bridge._dashboard_oracle()
         self.assertEqual(o["summary"], "一句話")
         self.assertEqual(o["attack_or_defend"], "宜守")
+        self.assertEqual(
+            o["hexagram_line"],
+            "主卦：47.困（上兌澤 / 下坎水） / 變卦：40.解 / 動爻：九五",
+        )
+        self.assertIn("水在澤下", o["hexagram_reading"])
+        self.assertIn("九五動", o["hexagram_reading"])
         self.assertEqual(o["primary"], {"number": 47, "name": "困", "theme": "守志"})
         self.assertEqual(o["relating"]["name"], "解")
         self.assertEqual(o["changing_lines"], [5])

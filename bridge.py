@@ -13131,9 +13131,74 @@ def _dashboard_oracle():
         return {"number": h.get("number"), "name": h.get("name"),
                 "theme": h.get("theme")}
 
+    def hex_name(h):
+        h = h or {}
+        num = h.get("number")
+        name = h.get("name") or ""
+        return f"{num}.{name}" if num is not None else name
+
+    def trigram_name(t):
+        t = t or {}
+        name = t.get("name") or ""
+        image = t.get("image") or ""
+        return f"{name}{image}" if name or image else ""
+
+    def classical_line_label(ln):
+        pos = ln.get("position")
+        yin_yang = ln.get("yin_yang")
+        digit = "九" if yin_yang == "yang" or ln.get("value") in (7, 9) else "六"
+        if pos == 1:
+            return f"初{digit}"
+        if pos == 6:
+            return f"上{digit}"
+        numerals = {2: "二", 3: "三", 4: "四", 5: "五"}
+        return f"{digit}{numerals.get(pos, pos)}"
+
     moving = [ln for ln in (d.get("lines") or []) if ln.get("changing")]
+    primary = hx.get("primary") or {}
+    relating = hx.get("relating") or {}
+    upper = primary.get("upper") or {}
+    lower = primary.get("lower") or {}
+    moving_classical = [classical_line_label(ln) for ln in moving]
+    moving_text = "、".join(moving_classical) if moving_classical else "無"
+    upper_text = trigram_name(upper)
+    lower_text = trigram_name(lower)
+    hexagram_line = (
+        f"主卦：{hex_name(primary)}"
+        f"{f'（上{upper_text} / 下{lower_text}）' if upper_text or lower_text else ''}"
+        f" / 變卦：{hex_name(relating)} / 動爻：{moving_text}"
+    )
+    lower_image = lower.get("image") or lower_text
+    upper_image = upper.get("image") or upper_text
+    lower_keywords = "、".join((lower.get("keywords") or [])[:2])
+    upper_keywords = "、".join((upper.get("keywords") or [])[:2])
+    primary_theme = primary.get("theme") or itp.get("summary") or ""
+    relating_theme = relating.get("theme") or ""
+    trigram_sentence = (
+        f"{primary.get('name') or '本'}卦是「{lower_image}在{upper_image}下」"
+        if lower_image and upper_image else f"{primary.get('name') or '本'}卦"
+    )
+    role_sentence = ""
+    if lower_keywords or upper_keywords:
+        role_sentence = (
+            f"下卦主{lower_keywords or lower_image}，"
+            f"上卦主{upper_keywords or upper_image}。"
+        )
+    turn_sentence = (
+        f"{moving_text}動，局勢由{primary.get('name') or '主卦'}轉入"
+        f"{relating.get('name') or '變卦'}；{relating_theme}"
+        if moving_classical else
+        f"無動爻，今日重點是守住{primary.get('name') or '主卦'}本義；{primary_theme}"
+    )
+    if (relating.get("name") or "") == "蹇" and moving_classical:
+        turn_sentence += " 蹇不是失敗，是提醒改走法、求援、設界線。"
+    hexagram_reading = (
+        f"{trigram_sentence}：{role_sentence}{primary_theme} {turn_sentence}"
+    ).strip()
     return {"date": d.get("date"),
             "summary": itp.get("summary"),
+            "hexagram_line": hexagram_line,
+            "hexagram_reading": hexagram_reading,
             "attack_or_defend": itp.get("attack_or_defend"),
             "advice": itp.get("advice"),
             "biggest_risk": itp.get("biggest_risk"),
