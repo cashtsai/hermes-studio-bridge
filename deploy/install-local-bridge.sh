@@ -227,7 +227,7 @@ install_bridge_runtime() {
   fi
   "$BRIDGE_VENV/bin/python" -m pip install --upgrade pip >/dev/null
   "$BRIDGE_VENV/bin/python" -m pip install \
-    fastapi uvicorn httpx PyJWT websockets python-multipart >/dev/null
+    fastapi uvicorn httpx PyJWT websockets python-multipart eval_type_backport >/dev/null
 }
 
 install_requested_provider
