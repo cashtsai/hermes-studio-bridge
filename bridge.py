@@ -912,6 +912,39 @@ REPORT_CONTEXT_DEFAULT = 3
 REPORT_CONTEXT_TRIGGERED = 8
 REPORT_CONTEXT_CHARS = 18000
 REPORT_CONTEXT_ITEM_CHARS = 5000
+HIDDEN_REPORT_SOURCES = {"hermes-tool-error", "bridge-health"}
+HIDDEN_REPORT_NAMES = {"agent-tool-error", "bridge-health"}
+HIDDEN_REPORT_LABELS = {"錯誤報告", "Bridge 健康警報", "Bridge 復原", "Bridge 警告"}
+
+
+def _is_hidden_report(report: dict) -> bool:
+    source = str(report.get("external_source") or "").strip()
+    name = str(report.get("name") or "").strip()
+    label = str(report.get("label") or "").strip()
+    return (
+        source in HIDDEN_REPORT_SOURCES
+        or name in HIDDEN_REPORT_NAMES
+        or label in HIDDEN_REPORT_LABELS
+    )
+
+
+def _is_hidden_report_message(message: dict) -> bool:
+    mid = str(message.get("id") or "")
+    if not mid.startswith("rep-"):
+        return False
+    text = str(message.get("content") or "").strip()
+    return (
+        text.startswith("📰 **錯誤報告**")
+        or text.startswith("📰 **Bridge 健康警報**")
+        or text.startswith("📰 **Bridge 復原**")
+        or text.startswith("📰 **Bridge 警告**")
+        or "工具錯誤" in text
+    )
+
+
+def _is_hidden_message_event(data: dict) -> bool:
+    message = data.get("message") if isinstance(data, dict) else None
+    return isinstance(message, dict) and _is_hidden_report_message(message)
 
 
 def _canon_init():
@@ -1724,6 +1757,8 @@ def _event_since(session: str, since_seq: int = 0, limit: int = 500) -> list[dic
         except Exception as _exc:  # noqa: BLE001
             _log_exc("_event_since", _exc, expected=True)
             data = {}
+        if _is_hidden_message_event(data):
+            continue
         out.append({"seq": r[0], "ts": r[3], "type": r[1], "data": data})
     return out
 
@@ -1761,6 +1796,8 @@ def _event_since_all(since_seq: int = 0, limit: int = 500) -> list[dict]:
         except Exception as _exc:  # noqa: BLE001
             _log_exc("_event_since_all", _exc, expected=True)
             data = {}
+        if _is_hidden_message_event(data):
+            continue
         out.append({"seq": r[0], "ts": r[4], "type": r[2],
                     "session": r[1], "data": data})
     return out
@@ -2804,6 +2841,16 @@ def _report_upsert(session: str, report: dict) -> str:
     ts = float(report.get("ts") or time.time())
     label = report.get("label") or ""
     name = report.get("name") or ""
+    external_source = report.get("external_source") or "hermes-cron"
+    if _is_hidden_report({
+        "label": label,
+        "name": name,
+        "external_source": external_source,
+    }):
+        _log_event("report_event_hidden",
+                   session=session, label=label, name=name,
+                   external_source=external_source)
+        return ""
     # actions 是 payload 的一部分:呼叫端每次 upsert 帶完整清單(更新即整組
     # 替換);cron 同步線從不帶 → 寫 NULL,而 cron 報告本來就沒有行動,無損。
     actions = _report_actions_normalize(report.get("actions"))
@@ -2822,15 +2869,15 @@ def _report_upsert(session: str, report: dict) -> str:
             "(id,session,label,name,content,ts,external_source,external_id,"
             "ingested_at,actions) VALUES(?,?,?,?,?,?,?,?,?,?)",
             (rid, session, label, name, content, ts,
-             report.get("external_source") or "hermes-cron", external_id,
-             time.time(), actions_json))
+             external_source, external_id, time.time(), actions_json))
         con.commit()
         con.close()
         # Sync engine P1:cron 晨報寫入點鏡射進 event_log(雙寫過渡)。形狀走
         # _report_msg_shape = app 在 /app/v1/messages 看到的同一種報告訊息;
         # 改稿(同 rid 新內容)→ 新鍵 → 追加新事件,同 message id 覆蓋。
-        _event_mirror_messages(session, [_report_msg_shape(
-            {"id": rid, "label": label, "content": content, "ts": ts})])
+        _event_mirror_messages(session, [_report_msg_shape({
+            "id": rid, "label": label, "content": content, "ts": ts,
+        })])
         return rid
     finally:
         con.close()
@@ -2842,20 +2889,22 @@ def _report_events(session: str, limit: int = 20, newest_first: bool = False):
     try:
         con = sqlite3.connect(f"file:{CANON_DB}?mode=ro", uri=True, timeout=5)
         try:
+            fetch_limit = max(limit * 5, limit + 100)
             rows = con.execute(
                 f"SELECT id,label,name,content,ts,external_source,external_id "
                 f"FROM report_events WHERE session=? ORDER BY ts {order} LIMIT ?",
-                (session, limit)).fetchall()
+                (session, fetch_limit)).fetchall()
             con.close()
         finally:
             con.close()
     except Exception as _exc:  # noqa: BLE001
         _log_exc("_report_events", _exc, expected=True)
         return []
-    return [{
+    events = [{
         "id": r[0], "label": r[1], "name": r[2], "content": r[3],
         "ts": r[4], "external_source": r[5], "external_id": r[6],
     } for r in rows]
+    return [r for r in events if not _is_hidden_report(r)][:limit]
 
 
 def _report_msg_shape(r: dict) -> dict:
@@ -2880,6 +2929,8 @@ def _report_messages(session: str, limit: int = 100):
 TOOL_ERROR_REPORT_SOURCE = "hermes-tool-error"
 TOOL_ERROR_REPORT_NAME = "agent-tool-error"
 TOOL_ERROR_REPORT_LABEL = "錯誤報告"
+TOOL_ERROR_REPORTS_ENABLED = os.environ.get(
+    "POCKET_ENABLE_TOOL_ERROR_REPORTS", "0").strip().lower() in {"1", "true", "yes", "on"}
 TOOL_ERROR_REPORT_MAX_AGE = float(os.environ.get(
     "POCKET_TOOL_ERROR_REPORT_MAX_AGE", str(7 * 86400)))
 TOOL_ERROR_REPORT_SCAN_MULTIPLIER = 8
@@ -10856,8 +10907,7 @@ def _notice_for_report(session: str, report: dict) -> None:
     報告內容修訂不會把已 ack 的通知翻回 pending。"""
     import sqlite3
     name = report.get("name") or ""
-    is_tool_error = report.get("external_source") == TOOL_ERROR_REPORT_SOURCE
-    if name not in NOTICE_REPORT_JOBS.get(session, ()) and not is_tool_error:
+    if name not in NOTICE_REPORT_JOBS.get(session, ()):
         return
     rid = str(report.get("id") or "")
     if not rid:
@@ -11097,7 +11147,8 @@ def _write_report_memory(session: str, reports: list[dict]) -> None:
 
 def _sync_persona_reports(session: str, limit: int = 50) -> list[dict]:
     reports = _persona_reports(session, limit)
-    reports.extend(_persona_tool_error_reports(session, min(limit, 20)))
+    if TOOL_ERROR_REPORTS_ENABLED:
+        reports.extend(_persona_tool_error_reports(session, min(limit, 20)))
     if not reports:
         return _report_events(session, limit, newest_first=True)
     upserted = 0
@@ -12641,11 +12692,12 @@ def _report_lookup(rid: str):
         return None
     if not row:
         return None
-    return {"id": row[0], "session": row[1], "label": row[2] or "",
-            "name": row[3] or "", "content": row[4] or "", "ts": row[5],
-            "external_source": row[6] or "", "external_id": row[7] or "",
-            # 舊列 NULL → [](app 端「無 actions 區塊不出現」的約定)。
-            "actions": _report_actions_loads(row[8])}
+    report = {"id": row[0], "session": row[1], "label": row[2] or "",
+              "name": row[3] or "", "content": row[4] or "", "ts": row[5],
+              "external_source": row[6] or "", "external_id": row[7] or "",
+              # 舊列 NULL → [](app 端「無 actions 區塊不出現」的約定)。
+              "actions": _report_actions_loads(row[8])}
+    return None if _is_hidden_report(report) else report
 
 
 @app.get("/app/v1/reports")
