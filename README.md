@@ -26,10 +26,13 @@ gateways; nothing about Telegram changes.
 ## Quickstart (this host = cashcamp)
 
 ```bash
-# 1. bridge (already installed as a LaunchAgent)
+# 1. bridge (install or upgrade the per-user LaunchAgent)
+./deploy/install-local-bridge.sh
+
+# 2. bridge restart
 launchctl kickstart -k gui/$(id -u)/ai.studio.hermes-bridge
 
-# 2. Open WebUI (needs Docker/Colima)
+# 3. Open WebUI (needs Docker/Colima)
 colima start
 BRIDGE_TOKEN=<your token> ./deploy/run-openwebui.sh
 ```
@@ -42,6 +45,51 @@ Reach it from your phone over Tailscale: **http://100.67.0.12:3000**
 - **bridge**: bearer-token gated (`BRIDGE_TOKEN`, set in the LaunchAgent env; never commit it). Bound to `0.0.0.0:8081` but only reachable on LAN/tailnet.
 - **Open WebUI**: login required (`WEBUI_AUTH` default on).
 - HTTP today; tighten to HTTPS later via **Tailscale Serve**.
+
+## Local Bridge Install Contract
+
+PocketConnect should install the bridge as a per-user component instead of
+asking users to clone repos and hand-edit paths. The supported installer entry
+point is:
+
+```bash
+./deploy/install-local-bridge.sh
+```
+
+The installer copies this bridge bundle to
+`~/Library/Application Support/PocketConnect/bridge/current`, writes a per-user
+LaunchAgent, preserves an existing `BRIDGE_TOKEN` across upgrades, and injects
+runtime paths through environment variables:
+
+| Variable | Purpose |
+|---|---|
+| `BRIDGE_TOKEN` | Per-machine app-to-bridge bearer token. |
+| `HERMES_BIN` | Absolute path to the Hermes CLI. |
+| `HERMES_HOME_ROOT` | Persona/profile root, usually `~/apps/hermes-agent/home`. |
+| `OPENCLAW_CONFIG_FILE` | Optional OpenClaw provider config, usually `~/.pocket/openclaw.json`. |
+
+This keeps clean installs separate from production: do not reuse
+`pocket.tsai.cash`, Telegram gateway LaunchAgents, or copied production Hermes
+credentials on a test host.
+
+For a full clean-machine bootstrap, set `POCKET_PROVIDER=auto` before running
+the installer. The installer first adopts existing user installs:
+
+- existing Hermes CLI from `~/apps/hermes-agent/.../hermes` or `~/.local/bin/hermes`
+- existing OpenClaw config from `~/.pocket/openclaw.json`
+
+If neither provider is already present, `POCKET_DEFAULT_PROVIDER` decides which
+single provider to fresh-install (`hermes`, `openclaw`, or `none`). It never
+installs both providers in one pass. The fresh-install paths are:
+
+- Hermes from `https://github.com/NousResearch/hermes-agent.git` into
+  `~/apps/hermes-agent`
+- Node `24.18.0` from nodejs.org into `~/apps/node-v24.18.0-darwin-arm64`
+- OpenClaw `2026.7.1-2` from npm into `~/apps/openclaw-clean`
+- OpenClaw LaunchAgent `com.pocketconnect.openclaw` on `127.0.0.1:19801`
+
+No production profiles, credentials, Telegram gateway LaunchAgents, or
+Cloudflare named tunnels are copied.
 
 ## Roadmap / known limits
 

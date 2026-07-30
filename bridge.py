@@ -391,8 +391,26 @@ async def _json_body(request: Request) -> dict:
         return {}
     return body if isinstance(body, dict) else {}
 
-HERMES_BIN = "/Users/xcash/apps/hermes-agent/runtime/venv/bin/hermes"
-HOME_ROOT = "/Users/xcash/apps/hermes-agent/home"
+def _first_existing_path(candidates: list[str], fallback: str) -> str:
+    for raw in candidates:
+        path = os.path.expanduser(raw)
+        if os.path.exists(path):
+            return path
+    return os.path.expanduser(fallback)
+
+
+HOME_ROOT = os.path.expanduser(os.environ.get(
+    "HERMES_HOME_ROOT",
+    "~/apps/hermes-agent/home",
+))
+HERMES_BIN = os.path.expanduser(os.environ.get("HERMES_BIN", "")) or _first_existing_path(
+    [
+        "~/apps/hermes-agent/runtime/venv/bin/hermes",
+        "~/apps/hermes-agent/venv/bin/hermes",
+        "~/.local/bin/hermes",
+    ],
+    "~/apps/hermes-agent/runtime/venv/bin/hermes",
+)
 
 # In-app terminal kill switch (TERMINAL_PTY_CONTRACT.md §安全). Paired devices
 # get full shell access over /app/v1/terminal, so a self-hosted owner needs an
