@@ -1,3 +1,4 @@
+from __future__ import annotations
 """Minimal persistent ACP client for Hermes.
 
 Keeps one warm `hermes acp` process per persona (HERMES_HOME), so each turn

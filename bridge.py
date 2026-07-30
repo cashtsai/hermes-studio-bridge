@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+from __future__ import annotations
 """OpenAI-compatible bridge → Hermes agent (per-persona, shared memory).
 
 Open WebUI (or any OpenAI-compatible client) points its API base at this

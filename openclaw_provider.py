@@ -1,3 +1,4 @@
+from __future__ import annotations
 """OpenClaw gateway WS 客戶端 — Pocket 第四 provider 的傳輸層。
 
 契約:docs/OPENCLAW_PROVIDER_SPEC.md(靶機 2026.7.1-2 實測)。
