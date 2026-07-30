@@ -3748,15 +3748,17 @@ async def _run_status_cli(argv: list[str], timeout: float = 10.0) -> tuple[int, 
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
             stdin=asyncio.subprocess.DEVNULL)
-    except Exception:  # noqa: BLE001 — 執行檔不在/不可執行
+    except Exception as _exc:  # noqa: BLE001 — 執行檔不在/不可執行
+        _log_exc("_run_status_cli.spawn", _exc, expected=True,
+                 argv0=(argv[0] if argv else ""))
         return -1, ""
     try:
         out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
     except asyncio.TimeoutError:
         try:
             proc.kill()
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as _exc:  # noqa: BLE001 — 已自行結束的競態
+            _log_exc("_run_status_cli.kill", _exc, expected=True)
         return -1, ""
     return (proc.returncode if proc.returncode is not None else -1,
             (out or b"").decode("utf-8", "replace"))
@@ -3771,7 +3773,9 @@ def _parse_claude_auth(exit_code: int, output: str) -> tuple[bool, str | None]:
         if start < 0 or end <= start:
             return False, None
         d = json.loads(output[start:end + 1])
-    except Exception:  # noqa: BLE001
+    except Exception as _exc:  # noqa: BLE001 — CLI 輸出不是 JSON
+        _log_exc("_parse_claude_auth", _exc, expected=True,
+                 output_chars=len(output or ""))
         return False, None
     if d.get("loggedIn") is not True:
         return False, None
@@ -3785,7 +3789,8 @@ def _claude_oauth_profile_fallback() -> tuple[bool, str | None] | None:
     try:
         with open(os.path.expanduser("~/.claude.json"), "r", encoding="utf-8") as f:
             acct = (json.load(f) or {}).get("oauthAccount") or {}
-    except Exception:  # noqa: BLE001
+    except Exception as _exc:  # noqa: BLE001 — 檔案不存在/格式壞
+        _log_exc("_claude_oauth_profile_fallback", _exc, expected=True)
         return None
     if not acct:
         return None
