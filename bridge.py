@@ -3728,6 +3728,134 @@ def _resolve_codex_bin() -> str:
 CODEX_BIN = _resolve_codex_bin()   # 僅供顯示/預設;spawn 走 _resolve_codex_bin()
 
 
+# ─────────── CC/CX 登入狀態探測(給 app gate CC/CX 頁籤)───────────
+# app 端 CC/CX 頁籤在對應引擎「這台 Mac 從未登入」時要蓋版凍結、提示去 Pocket
+# 桌面控制台登入。真相只在這台 Mac 的 CLI:
+#   • claude auth status → JSON {"loggedIn":true,"email":…,"subscriptionType":…} exit 0
+#   • codex login status → 登入時 "Logged in using ChatGPT" exit 0;未登入 exit 1
+# spawn 是秒級、且不需要即時 → 快取 TTL 60s,避免每次 dashboard/gate 都開子程序。
+# 純唯讀:只查狀態,不碰/不搬任何憑證。
+_AGENT_AUTH_TTL = 60.0
+_AGENT_AUTH_CACHE: dict = {"at": 0.0, "data": None}
+_AGENT_AUTH_REFRESHING = False
+
+
+async def _run_status_cli(argv: list[str], timeout: float = 10.0) -> tuple[int, str]:
+    """跑一次狀態查詢 CLI,回 (exit_code, 合併輸出);逾時/失敗回 (-1, "")。"""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *argv,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+            stdin=asyncio.subprocess.DEVNULL)
+    except Exception:  # noqa: BLE001 — 執行檔不在/不可執行
+        return -1, ""
+    try:
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except asyncio.TimeoutError:
+        try:
+            proc.kill()
+        except Exception:  # noqa: BLE001
+            pass
+        return -1, ""
+    return (proc.returncode if proc.returncode is not None else -1,
+            (out or b"").decode("utf-8", "replace"))
+
+
+def _parse_claude_auth(exit_code: int, output: str) -> tuple[bool, str | None]:
+    """claude auth status(JSON)→ (logged_in, account)。保守取第一個 {…最後一個 }。"""
+    if exit_code != 0:
+        return False, None
+    try:
+        start, end = output.find("{"), output.rfind("}")
+        if start < 0 or end <= start:
+            return False, None
+        d = json.loads(output[start:end + 1])
+    except Exception:  # noqa: BLE001
+        return False, None
+    if d.get("loggedIn") is not True:
+        return False, None
+    parts = [p for p in (d.get("email"), d.get("subscriptionType")) if p]
+    return True, (" · ".join(parts) if parts else None)
+
+
+def _claude_oauth_profile_fallback() -> tuple[bool, str | None] | None:
+    """Claude Code 2.1.x 有時 `auth status` 回 loggedIn:false 但 /status 其實有登入;
+    非機密的側寫在 ~/.claude.json 的 oauthAccount。僅作顯示用備援,不讀/不搬憑證。"""
+    try:
+        with open(os.path.expanduser("~/.claude.json"), "r", encoding="utf-8") as f:
+            acct = (json.load(f) or {}).get("oauthAccount") or {}
+    except Exception:  # noqa: BLE001
+        return None
+    if not acct:
+        return None
+    parts = [p for p in (acct.get("emailAddress"),
+                         acct.get("seatTier") or acct.get("billingType")) if p]
+    return True, (" · ".join(parts) if parts else None)
+
+
+def _parse_codex_login(exit_code: int, output: str) -> tuple[bool, str | None]:
+    text = output.strip()
+    low = text.lower()
+    if exit_code != 0 or "logged in" not in low or "not logged in" in low:
+        return False, None
+    first = text.splitlines()[0] if text else None
+    return True, first
+
+
+async def _probe_agent_auth() -> dict:
+    claude = {"installed": os.path.exists(CLAUDE_BIN),
+              "logged_in": False, "account": None}
+    if claude["installed"]:
+        rc, out = await _run_status_cli([CLAUDE_BIN, "auth", "status"])
+        logged_in, account = _parse_claude_auth(rc, out)
+        if not logged_in:
+            fb = _claude_oauth_profile_fallback()
+            if fb is not None:
+                logged_in, account = fb
+        claude["logged_in"], claude["account"] = logged_in, account
+
+    codex_bin = _resolve_codex_bin()
+    codex = {"installed": os.path.exists(codex_bin),
+             "logged_in": False, "account": None}
+    if codex["installed"]:
+        rc, out = await _run_status_cli([codex_bin, "login", "status"])
+        codex["logged_in"], codex["account"] = _parse_codex_login(rc, out)
+
+    return {"claude": claude, "codex": codex}
+
+
+async def _agent_auth_refresh() -> None:
+    global _AGENT_AUTH_REFRESHING
+    try:
+        data = await _probe_agent_auth()
+        _AGENT_AUTH_CACHE["at"], _AGENT_AUTH_CACHE["data"] = time.time(), data
+    except Exception as e:  # noqa: BLE001 — 探測失敗不該打斷 dashboard
+        _log_event("agent_auth_probe_failed", error=str(e)[:160])
+    finally:
+        _AGENT_AUTH_REFRESHING = False
+
+
+async def _agent_auth_status() -> dict:
+    """CC/CX 登入狀態,TTL 60s 快取。**永不阻塞請求** —— 過期就丟背景刷新、
+    先回上次結果;從未探測完成則回 logged_in=null(檢查中,app fail-open 不凍結)。
+    冷啟首探可能 10s+(claude/codex 首次 spawn 慢),所以絕不擋在請求路徑上。"""
+    global _AGENT_AUTH_REFRESHING
+    now = time.time()
+    data = _AGENT_AUTH_CACHE["data"]
+    fresh = data is not None and now - _AGENT_AUTH_CACHE["at"] < _AGENT_AUTH_TTL
+    if not fresh and not _AGENT_AUTH_REFRESHING:
+        _AGENT_AUTH_REFRESHING = True
+        asyncio.create_task(_agent_auth_refresh())
+    if data is not None:
+        return data
+    return {"claude": {"installed": os.path.exists(CLAUDE_BIN),
+                       "logged_in": None, "account": None},
+            "codex": {"installed": os.path.exists(_resolve_codex_bin()),
+                      "logged_in": None, "account": None},
+            "checking": True}
+
+
 class CodexAppServerError(RuntimeError):
     def __init__(self, message: str, code=None):
         super().__init__(message)
@@ -15005,17 +15133,27 @@ async def app_dashboard(request: Request):
     `wx=off` 關閉;未帶參數維持雙城預設(舊 app 相容)。詳見
     `_dashboard_weather_cities`。"""
     _check_auth(request)
-    weather, sessions, gateways = await asyncio.gather(
+    weather, sessions, gateways, agents = await asyncio.gather(
         _dashboard_weather(_dashboard_weather_cities(request)),
-        _dashboard_sessions(), _dashboard_gateways())
+        _dashboard_sessions(), _dashboard_gateways(), _agent_auth_status())
     return {"generated_at": datetime.now(timezone.utc).isoformat(),
             "weather": weather,
             "oracle": _dashboard_oracle(),
             "approvals": _dashboard_approvals(),
             "sessions": sessions,
+            "agents": agents,
             "health": {"gateways": gateways,
                        "apns_configured": apns_configured(),
                        "devices": len(_devices())}}
+
+
+@app.get("/app/v1/agents/auth")
+async def app_agents_auth(request: Request):
+    """CC/CX 這台 Mac 的登入狀態(app gate CC/CX 頁籤用)。
+    回 {"claude": {"installed", "logged_in", "account"}, "codex": {…}}。
+    TTL 60s 快取;純唯讀查狀態,不碰憑證。"""
+    _check_auth(request)
+    return await _agent_auth_status()
 
 
 @app.get("/health")
