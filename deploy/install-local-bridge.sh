@@ -9,6 +9,10 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SOURCE_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
+log_step() {
+  printf '==> %s\n' "$*" >&2
+}
+
 BRIDGE_LABEL="${POCKET_BRIDGE_LABEL:-com.pocketconnect.bridge}"
 INSTALL_ROOT="${POCKET_BRIDGE_INSTALL_ROOT:-$HOME/Library/Application Support/PocketConnect/bridge/current}"
 BRIDGE_VENV="${POCKET_BRIDGE_VENV:-$INSTALL_ROOT/venv}"
@@ -53,6 +57,7 @@ detect_hermes_bin() {
 
 install_hermes_provider() {
   if [ "$INSTALL_HERMES" != "1" ]; then
+    log_step "Hermes automatic install is disabled"
     return 0
   fi
 
@@ -65,15 +70,18 @@ install_hermes_provider() {
       "$HERMES_HOME_ROOT/profiles/xcash" \
       "$HERMES_HOME_ROOT/profiles/shuijing" \
       "$HERMES_HOME_ROOT/uploads"
+    log_step "Using existing Hermes"
     echo "Hermes already installed: $existing_hermes"
     return 0
   fi
 
   mkdir -p "$(dirname "$HERMES_INSTALL_DIR")"
   if [ ! -d "$HERMES_INSTALL_DIR/.git" ]; then
+    log_step "Downloading Hermes"
     git clone "$HERMES_REPO_URL" "$HERMES_INSTALL_DIR"
   fi
 
+  log_step "Preparing Hermes home"
   mkdir -p "$HERMES_HOME_ROOT" \
     "$HERMES_HOME_ROOT/profiles/fliper" \
     "$HERMES_HOME_ROOT/profiles/xcash" \
@@ -81,6 +89,7 @@ install_hermes_provider() {
     "$HERMES_HOME_ROOT/uploads"
 
   if [ ! -x "$HERMES_INSTALL_DIR/venv/bin/hermes" ] && [ -x "$HERMES_INSTALL_DIR/setup-hermes.sh" ]; then
+    log_step "Installing Hermes runtime"
     (
       cd "$HERMES_INSTALL_DIR"
       printf 'n\nn\n' | HERMES_HOME="$HERMES_HOME_ROOT" ./setup-hermes.sh
@@ -91,10 +100,12 @@ install_hermes_provider() {
 install_node_for_openclaw() {
   local node_root="$HOME/apps/node-v$OPENCLAW_NODE_VERSION-darwin-arm64"
   if [ -x "$node_root/bin/node" ]; then
+    log_step "Using existing Node runtime for OpenClaw"
     printf '%s\n' "$node_root"
     return 0
   fi
 
+  log_step "Downloading Node runtime for OpenClaw"
   mkdir -p "$HOME/apps"
   local archive="$HOME/apps/node-v$OPENCLAW_NODE_VERSION-darwin-arm64.tar.xz"
   curl -fL "https://nodejs.org/dist/v$OPENCLAW_NODE_VERSION/node-v$OPENCLAW_NODE_VERSION-darwin-arm64.tar.xz" \
@@ -106,15 +117,18 @@ install_node_for_openclaw() {
 
 install_openclaw_provider() {
   if [ "$INSTALL_OPENCLAW" != "1" ]; then
+    log_step "OpenClaw automatic install is disabled"
     return 0
   fi
   if [ -s "$OPENCLAW_CONFIG_FILE" ]; then
+    log_step "Using existing OpenClaw configuration"
     echo "OpenClaw already configured: $OPENCLAW_CONFIG_FILE"
     return 0
   fi
 
   local node_root
   node_root="$(install_node_for_openclaw)"
+  log_step "Installing OpenClaw"
   mkdir -p "$OPENCLAW_INSTALL_DIR/npm" "$OPENCLAW_INSTALL_DIR/home/state" "$(dirname "$OPENCLAW_CONFIG_FILE")"
 
   PATH="$node_root/bin:$PATH" npm install --prefix "$OPENCLAW_INSTALL_DIR/npm" "openclaw@$OPENCLAW_VERSION"
@@ -173,6 +187,7 @@ PLIST
 
   chmod 600 "$OPENCLAW_LAUNCH_AGENT"
   plutil -lint "$OPENCLAW_LAUNCH_AGENT" >/dev/null
+  log_step "Starting OpenClaw gateway"
   launchctl bootout "gui/$(id -u)/$OPENCLAW_LABEL" 2>/dev/null || true
   if launchctl bootstrap "gui/$(id -u)" "$OPENCLAW_LAUNCH_AGENT" 2>/dev/null; then
     launchctl kickstart -k "gui/$(id -u)/$OPENCLAW_LABEL" 2>/dev/null || true
@@ -205,6 +220,7 @@ resolve_requested_provider() {
 
 install_requested_provider() {
   REQUESTED_PROVIDER="$(resolve_requested_provider)"
+  log_step "Selected provider: $REQUESTED_PROVIDER"
   case "$REQUESTED_PROVIDER" in
     hermes)
       install_hermes_provider
@@ -213,6 +229,7 @@ install_requested_provider() {
       install_openclaw_provider
       ;;
     none|"")
+      log_step "Skipping AI provider automatic install"
       ;;
     *)
       echo "Unsupported resolved provider=$REQUESTED_PROVIDER (use auto, hermes, openclaw, or none)." >&2
@@ -222,6 +239,7 @@ install_requested_provider() {
 }
 
 install_bridge_runtime() {
+  log_step "Preparing Pocket bridge runtime"
   if [ ! -x "$BRIDGE_VENV/bin/python" ]; then
     python3 -m venv "$BRIDGE_VENV"
   fi
@@ -252,6 +270,7 @@ if [ -z "$BRIDGE_TOKEN" ]; then
 fi
 
 mkdir -p "$INSTALL_ROOT" "$(dirname "$LAUNCH_AGENT")" "$HERMES_HOME_ROOT" "$(dirname "$OPENCLAW_CONFIG_FILE")"
+log_step "Copying Pocket bridge"
 rsync -a --delete \
   --exclude ".git" \
   --exclude "__pycache__" \
@@ -263,6 +282,7 @@ rsync -a --delete \
 
 install_bridge_runtime
 
+log_step "Writing LaunchAgent"
 cat > "$LAUNCH_AGENT" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -317,6 +337,7 @@ chmod 600 "$LAUNCH_AGENT"
 plutil -lint "$LAUNCH_AGENT" >/dev/null
 
 launchctl bootout "gui/$(id -u)/$BRIDGE_LABEL" 2>/dev/null || true
+log_step "Starting Pocket bridge"
 if launchctl bootstrap "gui/$(id -u)" "$LAUNCH_AGENT" 2>/dev/null; then
   launchctl kickstart -k "gui/$(id -u)/$BRIDGE_LABEL" 2>/dev/null || true
 else
@@ -324,6 +345,7 @@ else
   echo "Run: launchctl bootstrap gui/$(id -u) \"$LAUNCH_AGENT\""
 fi
 
+log_step "Pocket bridge installed"
 echo "Bridge installed: $INSTALL_ROOT"
 echo "LaunchAgent: $LAUNCH_AGENT"
 echo "Provider: $REQUESTED_PROVIDER"
