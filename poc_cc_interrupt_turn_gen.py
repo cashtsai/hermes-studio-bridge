@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+from __future__ import annotations
 """POC: 驗證 _cc_interrupt_core 的 turn-generation 防護邏輯。
 
 純邏輯模擬,不碰 tmux/正式服務。模擬三個情境:

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+from __future__ import annotations
 """pocket-pair — show a QR that pairs the Pocket phone app to THIS desktop.
 
 Security model: the phone is a remote control; all agent auth (CC/Codex/Hermes)

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+from __future__ import annotations
 """Minimal stdio MCP server exposing Hermes long-term memory to dispatched
 Claude Code / Codex sub-agents — so they share the canonical brain.
 

@@ -1,3 +1,4 @@
+from __future__ import annotations
 """app→TG 反向鏡射(#32 的最後一哩):Pocket 端的 persona 對話回投到同一條
 Telegram 聊天室,讓「TG 那頭看得到」。
 

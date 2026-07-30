@@ -1,3 +1,4 @@
+from __future__ import annotations
 """Phase 0 §2 — 伺服器端卡片 digest（Terminal Gateway 契約的核心模組）。
 
 一份 parser、伺服器端、所有終端共享（手機 / ESP32 / e-paper 吃同一套）：
