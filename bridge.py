@@ -6608,6 +6608,33 @@ def _cc_valid_sid(sid: str | None) -> bool:
     return bool(re.fullmatch(r"[0-9a-fA-F][0-9a-fA-F-]{7,63}", sid or ""))
 
 
+def _cc_name_for_sid(sid: str) -> str | None:
+    """用 sid 反查它屬於哪個 session name —— **完全不依賴 cwd**。
+
+    sid 是 Claude Code 的 session 全域唯一識別;pin/cache/history 都是 hook 自己
+    確認過的 name→sid 對應。只要 sid 對得上,就能權威地認出是哪個 session,
+    不管它現在 cwd 在哪。
+
+    2026-07-31 修:hook 走的 `_cc_names_for_cwd` 是拿「當前 cwd」比對 sessions.conf
+    設定的 workdir。使用者在 session 內 `cd` 到別的目錄(worktree)後,cwd 飄離
+    原始 workdir → 找不到候選 → hook 被 `transcript_cwd_mismatch`/`no_cwd_candidate`
+    丟掉 → Stop 收不到 → bridge status 卡 busy → app 永遠顯示「思考中」。sid 反查
+    補上這條路:身分明確就別讓 cwd 飄移把 hook 誤殺。
+
+    回唯一 name;對不上、或多個撞同 sid(不該發生)→ None,交回 cwd 路徑。"""
+    if not sid:
+        return None
+    matched = []
+    for name in set(_CC_SID_PINS) | set(_CC_SID_CACHE) | set(_CC_SID_HISTORY):
+        pinned = _CC_SID_PINS.get(name)
+        cached = (_CC_SID_CACHE.get(name) or (0, None))[1]
+        history = _CC_SID_HISTORY.get(name) or []
+        if sid == pinned or sid == cached or sid in history:
+            matched.append(name)
+    matched = _cc_unique_names(matched)
+    return matched[0] if len(matched) == 1 else None
+
+
 def _cc_note_sid(name: str, sid: str | None) -> None:
     if not name or not _cc_valid_sid(sid):
         return
@@ -9039,6 +9066,16 @@ async def cc_session_hook(request: Request):
     if sid_error:
         _log_hook_dropped(sid_error, event, body)
         return {"ok": True, "ignored": True, "reason": sid_error}
+    # sid 是權威身分 —— 先用它直接認 session,完全不靠 cwd。使用者在 session 內
+    # `cd` 到別的目錄(worktree)後 cwd 飄離原始 workdir,下面的 cwd 檢查與
+    # _cc_names_for_cwd 都會失效把 hook 誤殺(2026-07-31 查到 app 卡「思考中」的
+    # 根因)。sid 反查到唯一 name 就直接落定,不受 cwd 飄移影響。
+    sid_name = _cc_name_for_sid(hook_sid) if hook_sid else None
+    if sid_name:
+        state = _cc_hook_commit(sid_name, event, body, hook_sid, "sid_pin")
+        return {"ok": True, "session": sid_name, "busy": state["busy"], "source": "hook"}
+    # 沒有可靠 sid 反查(首次、pin 還沒建、或舊 client)→ 退回原本的 cwd +
+    # transcript 位置推斷。這條路仍保留原本防「同 cwd 撞名寫錯 session」的檢查。
     transcript_path = _cc_hook_transcript_path(body)
     if transcript_path and not _cc_transcript_path_matches_cwd(
             transcript_path, body.get("cwd")):
