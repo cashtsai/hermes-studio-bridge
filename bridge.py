@@ -8232,13 +8232,13 @@ async def _cc_input_core(name: str, body: dict) -> dict:
     附件轉存＋語音轉寫＋tmux bracketed paste。"""
     text = (body.get("text") or body.get("content") or "").strip()
     client_id = str(body.get("client_id") or "").strip()
-    attachments_summary = _input_attachment_summary(body.get("attachments") or [])
     _att_guard(body.get("attachments"))   # 修復單「附件限制」:直送口件數閥
     # Relay layer (like the persona attachment path): persist any attachments and
     # inject their on-disk paths into the typed line. Claude Code can Read files
     # (and sees images natively), so a bare path is enough — no vision pre-pass.
     # Audio attachments are transcribed (voice message → typed command).
     saved = []
+    att_meta = []
     voice_lines = []
     for a in (body.get("attachments") or []):
         path = _save_attachment(a, a.get("filename") or "file")
@@ -8250,6 +8250,15 @@ async def _cc_input_core(name: str, body: dict) -> dict:
                 voice_lines.append(t)
         else:
             saved.append(path)
+            # 附件 metadata 帶上真實 on-disk 路徑(比照人格 _persona_prepare_turn),
+            # input.accepted 卡片才有可載來源 → app 走 /file?path= 顯示圖片,不再
+            # 「來源已失效」。原本傳 _input_attachment_summary 會把 path 剝光(keep-list
+            # 只有 kind/filename/mime),CC 卡片因此拿不到來源。
+            meta = {"path": path, "available": True}
+            for k in ("kind", "filename", "mime"):
+                if a.get(k) not in (None, ""):
+                    meta[k] = a.get(k)
+            att_meta.append(meta)
     if voice_lines:
         text = (text + " " + " ".join(voice_lines)).strip()
     visible_text = text
@@ -8262,7 +8271,7 @@ async def _cc_input_core(name: str, body: dict) -> dict:
     if not text:
         raise HTTPException(status_code=400, detail="empty")
     receipt = await _cc_paste_text(name, text)
-    _cc_feed_input_accepted(name, client_id, visible_text, attachments_summary,
+    _cc_feed_input_accepted(name, client_id, visible_text, att_meta,
                             typed_text=text)
     # 排隊空窗回音:輸入落地「當下」就發 status 事件,不等 transcript digest。
     # session 若正忙上一輪,pane 不會立即轉 busy,舊行為是 app 一路顯示
@@ -10203,7 +10212,9 @@ def _cc_feed_input_accepted(name: str, client_id: str | None, text: str,
     store = _cc_card_store(name)
     card = carddigest.make_input_accepted_card(
         "claude_code", client_id, text,
-        attachments=_input_attachment_summary(attachments),
+        # 附件已在 _cc_input_core 帶好 path/available(比照人格);不再走
+        # _input_attachment_summary 剝掉 path,否則 app 拿不到來源 →「來源已失效」。
+        attachments=attachments,
         typed_text=typed_text)
     store.upsert_card(card)
 
