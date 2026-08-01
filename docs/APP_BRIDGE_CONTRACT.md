@@ -542,8 +542,9 @@ Pins Pocket's provider lane to a native agent session. `{provider}` accepts
 
 > 來源：CONTROL_PLANE_V2（6/29 拍板）的 Session/Agent 抽象與統一路由，
 > **provider 矩陣改寫成 Hermes 拓撲**：session 只有三種——`hp:` persona、
-> `cc:` Claude Code、`cx:` Codex；**delegations 是連結 persona 與 cc/cx 兩層的
-> 一等公民**。telegram / gmail / calendar 不是 session provider：TG 是 persona
+> `cc:` Claude Code、`cx:` Codex（2026-07 追加選配第四 provider
+> `openclaw:`，見 4.1b；未配置時整段缺席）；**delegations 是連結 persona 與
+> cc/cx 兩層的一等公民**。telegram / gmail / calendar 不是 session provider：TG 是 persona
 > session 的另一個表面（已合流，開成 provider 會出現兩份對話）；Gmail/Calendar
 > 是 persona 的工具，正確形態是 studio-card。v2 是疊加的 facade，v1 與
 > provider 內部不動。
@@ -571,6 +572,26 @@ Pins Pocket's provider lane to a native agent session. `{provider}` accepts
   `meta` 必含 `work_order` 與 `takeover`（另含 `delegation` 完整物件與
   pending `approval`）。同一 Codex thread 已被 delegation 收養時，
   不再重複出現在裸 `codex:` 列。
+
+### 4.1b OpenClaw（第四 provider，選配）
+
+完整規格在 [`OPENCLAW_PROVIDER_SPEC.md`](OPENCLAW_PROVIDER_SPEC.md)；這裡只寫
+client 對接要知道的最小集合（2026-08-01 補：Android 端曾因本節缺席猜了不存在的
+`/openclawsessions` 端點——**沒有那個端點，也不會有**）：
+
+- **provider 值 = `openclaw`，session id = `openclaw:{sessionKey}`**（同 4.1 全寫
+  規則）。列表走 `GET /app/v2/sessions?provider=openclaw`，卡片流/輸入直接拿
+  `openclaw:{sessionKey}` 打既有 v2 session 端點——**沒有專屬 REST 端點家族**
+  （不存在 `/openclawsessions`；別比照 `/ccsessions` 猜）。
+- **未配置 = 整段靜默缺席（不是 404、不是空陣列旗標）**：bridge 未設 OpenClaw
+  gateway 時，v2 列表不出 `openclaw:` row、dashboard `sessions.openclaw` 整鍵
+  缺席。client 判斷「這台有沒有 OpenClaw」的正規探針是
+  `GET /app/v1/openclaw/config` 的 `configured` 欄。
+- **配置面**：`GET/PUT /app/v1/openclaw/config`（`base_url` + `token`；token 只
+  上行不回顯；`source:"env"` 表示被伺服器 `OPENCLAW_BASE_URL` 鎖定、PUT 不生效）。
+- **測試須知**：OpenClaw 是「bridge 代連外部 gateway」，只有配置了 gateway 的
+  那台主機才看得到任何 openclaw 內容。對著未配置的 bridge 開發永遠是缺席態——
+  這不是 bridge 缺功能。
 
 ### 4.2 Agent
 
