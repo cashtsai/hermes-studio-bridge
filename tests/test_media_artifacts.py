@@ -239,3 +239,68 @@ class MediaArtifactEndpointTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ConnectionLeakTests(unittest.TestCase):
+    """sqlite 連線洩漏(2026-08-01 production 事故)。
+
+    `with sqlite3.connect(...) as conn:` **不會關閉連線** —— 那個 context manager
+    只管交易 commit/rollback。7 個呼叫點每查一次就漏 1 個 fd,production 跑 19
+    小時漏了 72 個,撞上 launchd 預設 256 上限 → socketpair 開不出來 → 子行程
+    全失敗 → 桌面/手機看到 bridge「離線」。
+
+    這組測試直接數:操作 N 次之後,開著的 sqlite 連線必須是 0。
+    """
+
+    def test_operations_do_not_leak_connections(self):
+        import sqlite3 as _sq
+
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        base = Path(temp.name)
+        (base / "src").mkdir()
+        store = MediaArtifactStore(base / "store", safe_roots=[str(base / "src")],
+                                   max_bytes=1024 * 1024)
+
+        live = []
+        real_connect = _sq.connect
+
+        class TrackedConn:
+            # sqlite3.Connection 的 close 是 C 型別唯讀屬性,不能 monkeypatch,
+            # 用 proxy 追蹤 close 有沒有被呼叫。
+            def __init__(self, conn):
+                object.__setattr__(self, "_conn", conn)
+                live.append(self)
+
+            def close(self):
+                if self in live:
+                    live.remove(self)
+                self._conn.close()
+
+            def __getattr__(self, k):
+                return getattr(object.__getattribute__(self, "_conn"), k)
+
+            def __setattr__(self, k, v):   # row_factory 賦值要穿透
+                setattr(object.__getattribute__(self, "_conn"), k, v)
+
+            def __enter__(self):
+                self._conn.__enter__()
+                return self
+
+            def __exit__(self, *a):
+                return self._conn.__exit__(*a)
+
+        def counting_connect(*a, **k):
+            return TrackedConn(real_connect(*a, **k))
+
+        src = base / "src" / "pic.png"
+        src.write_bytes(b"\x89PNG fake")
+        with patch("media_artifacts.sqlite3.connect", counting_connect):
+            for i in range(5):
+                item = store.capture_path(f"codex:s{i}", str(src))
+                store.open_media(item["media_id"])
+                store.list_session(f"codex:s{i}")
+        self.assertEqual(
+            len(live), 0,
+            f"洩漏了 {len(live)} 條 sqlite 連線 —— `with sqlite3.connect()` 不會關,"
+            "必須 contextlib.closing")

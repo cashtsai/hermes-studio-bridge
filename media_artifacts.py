@@ -13,6 +13,7 @@ import mimetypes
 import os
 import re
 import sqlite3
+from contextlib import closing
 import threading
 import time
 import urllib.parse
@@ -252,7 +253,7 @@ class MediaArtifactStore:
                 pass
 
     def _existing_available(self, session_id: str, source_ref: str) -> dict | None:
-        with self._connect() as conn:
+        with closing(self._connect()) as conn, conn:
             row = conn.execute(
                 "SELECT rowid AS cursor, * FROM artifacts "
                 "WHERE session_id = ? AND source_ref = ?",
@@ -282,7 +283,7 @@ class MediaArtifactStore:
             if kind in {"", "file", "attachment"}
             else kind
         )
-        with self._connect() as conn:
+        with closing(self._connect()) as conn, conn:
             conn.execute(
                 "UPDATE artifacts SET filename = ?, mime = ?, media_kind = ? "
                 "WHERE media_id = ?",
@@ -361,7 +362,7 @@ class MediaArtifactStore:
                 previous, filename=filename, mime=mime, kind=kind
             )
 
-        with self._connect() as conn:
+        with closing(self._connect()) as conn, conn:
             conn.execute(
                 """
                 INSERT INTO artifacts(
@@ -417,7 +418,7 @@ class MediaArtifactStore:
             if kind in {"", "file", "attachment"}
             else kind
         )
-        with self._connect() as conn:
+        with closing(self._connect()) as conn, conn:
             conn.execute(
                 """
                 INSERT INTO artifacts(
@@ -538,7 +539,7 @@ class MediaArtifactStore:
             if before is not None
             else (session_id, limit + 1)
         )
-        with self._connect() as conn:
+        with closing(self._connect()) as conn, conn:
             rows = conn.execute(query, params).fetchall()
         has_more = len(rows) > limit
         rows = rows[:limit]
@@ -549,7 +550,7 @@ class MediaArtifactStore:
         }
 
     def open_media(self, media_id: str) -> tuple[str, str, str] | None:
-        with self._connect() as conn:
+        with closing(self._connect()) as conn, conn:
             row = conn.execute(
                 "SELECT rowid AS cursor, * FROM artifacts WHERE media_id = ?",
                 (media_id,),
@@ -566,7 +567,7 @@ class MediaArtifactStore:
 
     def resolve_original(self, source_ref: str) -> tuple[str, str, str] | None:
         source_ref = _clean_reference(source_ref)
-        with self._connect() as conn:
+        with closing(self._connect()) as conn, conn:
             rows = conn.execute(
                 "SELECT rowid AS cursor, * FROM artifacts "
                 "WHERE source_ref = ? AND available = 1 "
