@@ -99,10 +99,25 @@ def _clean_reference(value: str) -> str:
     return value
 
 
+# base64 連續區段(data URI 本體、貼上的裸 blob)。base64 每 ~64 字元一個
+# '/',對 _ABSOLUTE_PATH_RE 是災難輸入:每個 '/' 都是比對起點、惰性掃描到行尾
+# → O(n²)。實測 120KB 單行要 9.96s、且 C 層 regex 全程不放 GIL —— 2026-08-01
+# production 整個 bridge 因此反覆凍結,被看門狗連環 kickstart(sample 存
+# /tmp/bridge-freeze-*.sample.txt)。掃描前先把這些區段挖掉;本 regex 是純
+# 字元類 + 長度下限,線性。512 起跳:真路徑/URL 不會有 512 字元的無空白
+# base64 連續段,誤挖不了東西。
+_BASE64_RUN_RE = re.compile(r"[A-Za-z0-9+/=]{512,}")
+
+
+def _excise_base64_runs(text: str) -> str:
+    return _BASE64_RUN_RE.sub(" ", text)
+
+
 def references_in_text(text: str) -> list[str]:
     """Extract local paths and HTTP links, including local paths with spaces."""
     if not text or len(text) > 2_000_000:
         return []
+    text = _excise_base64_runs(text)
     refs: list[str] = []
 
     def add(raw: str) -> None:

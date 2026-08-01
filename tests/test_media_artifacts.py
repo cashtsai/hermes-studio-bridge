@@ -304,3 +304,36 @@ class ConnectionLeakTests(unittest.TestCase):
             len(live), 0,
             f"洩漏了 {len(live)} 條 sqlite 連線 —— `with sqlite3.connect()` 不會關,"
             "必須 contextlib.closing")
+
+
+class Base64FreezeRegressionTests(unittest.TestCase):
+    """災難性 regex 回溯(2026-08-01 production 連環凍結)。
+
+    base64 每 ~64 字元一個 '/',_ABSOLUTE_PATH_RE 對它是 O(n²):實測 120KB
+    單行要 ~10s,且 C 層 regex 全程持 GIL → 整個 bridge 凍結 → 看門狗連環
+    kickstart。修法:掃描前線性挖掉 512+ 字元的 base64 連續段。
+    """
+
+    def test_base64_line_scans_fast(self):
+        import base64 as _b64, os as _os, time as _t
+        from media_artifacts import references_in_text
+        line = "data:image/png;base64," + _b64.b64encode(_os.urandom(90_000)).decode()
+        t0 = _t.monotonic()
+        refs = references_in_text(line)
+        dt = _t.monotonic() - t0
+        self.assertLess(dt, 1.0, f"base64 行掃描花了 {dt:.1f}s —— O(n²) 回歸")
+        self.assertEqual(refs, [])
+
+    def test_real_refs_survive_next_to_base64(self):
+        import base64 as _b64, os as _os
+        from media_artifacts import references_in_text
+        blob = _b64.b64encode(_os.urandom(60_000)).decode()
+        text = f"圖在 /tmp/pic.jpg 內容 data:image/png;base64,{blob} 完"
+        refs = references_in_text(text)
+        self.assertIn("/tmp/pic.jpg", refs)
+
+    def test_short_base64ish_tokens_untouched(self):
+        # 512 以下不挖 —— commit hash、短 token、正常字全不受影響
+        from media_artifacts import references_in_text
+        refs = references_in_text("hash abc123def456 檔案 /var/log/x.pdf")
+        self.assertIn("/var/log/x.pdf", refs)
