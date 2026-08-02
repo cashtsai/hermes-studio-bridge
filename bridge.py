@@ -7340,7 +7340,8 @@ def _fmt_cc_event(d: dict) -> str:
         if isinstance(content, str):
             head = content.lstrip()[:80]
             if any(tag in head for tag in ("<task-notification>", "<system-reminder>",
-                                           "[Internal", "<command-name>", "<local-command")):
+                                           "[Internal", "<command-name>", "<local-command",
+                                           "[Your previous response")):
                 return ""           # harness/system plumbing, not something 善彰 typed
             ts = _cc_time(d.get("timestamp"))
             stamp = f" _{ts}_" if ts else ""

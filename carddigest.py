@@ -179,7 +179,10 @@ def merge_input_accepted_echo(store, card: dict) -> dict:
 
 # 與 bridge._fmt_cc_event 同一份「不是善彰打的」判定 — harness/系統管線不出卡。
 PLUMBING_TAGS = ("<task-notification>", "<system-reminder>", "[Internal",
-                 "<command-name>", "<local-command")
+                 "<command-name>", "<local-command",
+                 # harness 自動催促(模型上一輪無可見輸出時系統代打的 user 訊息)—
+                 # 不是使用者打的,不該出成紅泡泡(2026-08-02 回報)。
+                 "[Your previous response")
 
 _TOOL_RESULT_MAX = 2000       # tool_result 卡上限（fallback 再截一半）
 _THINKING_MAX = 2000
