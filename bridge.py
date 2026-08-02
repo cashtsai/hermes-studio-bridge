@@ -10253,6 +10253,9 @@ def _cc_feed_input_accepted(name: str, client_id: str | None, text: str,
         # _input_attachment_summary 剝掉 path,否則 app 拿不到來源 →「來源已失效」。
         attachments=attachments,
         typed_text=typed_text)
+    # 反向合併:paste 驗證等待期間 follower 已把 jsonl 回顯 digest 成卡的話,
+    # 併進那張、不開第二張(附件送出幾乎必中的雙泡根因,見 carddigest)。
+    card = carddigest.absorb_echo_into_accepted(store, card)
     store.upsert_card(card)
 
 
