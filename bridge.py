@@ -10411,6 +10411,23 @@ def _ensure_cc_card_follower(name: str, workdir: str):
     _CC_CARD_FOLLOWERS[name] = asyncio.create_task(_cc_card_follower(name, workdir))
 
 
+def _oc_safe_session_key(key: str) -> str:
+    """OpenClaw sessionKey 防呆:sub-key 與 agent id 同名(`agent:<a>:<a>`)會撞到
+    gateway 的 default agent lane —— 一次 chat.send 被同時投到「default lane」與
+    「session lane」各跑一個 prompt,兩者搶同一份 session 檔互相 takeover,
+    使用者送一則卻雙泡泡、且回覆被吞成空(2026-08-02 rakutai 測試機實測坐實:
+    `agent:main:main` 起 2 個 prompt、`agent:main:pocket` 起 1 個)。
+
+    把這種撞名的 sub-key 統一改道到 `pocket`。**在 _v2_card_source 這個唯一入口
+    改道** → send / history / abort / 卡片 digest / 推播全走同一個安全 key,
+    不會「送到 A 讀 B」對不上。gateway 上原本那條 `:main` session 弃用即可
+    (它本來就壞,歷史夾著 takeover 錯誤卡)。"""
+    parts = key.split(":")
+    if len(parts) == 3 and parts[0] == "agent" and parts[2] == parts[1]:
+        return f"{parts[0]}:{parts[1]}:pocket"
+    return key
+
+
 def _v2_card_source(session_id: str) -> tuple:
     """v2 session id 路由 → ('cc', name, workdir) / ('cx', thread_id) /
     ('hp', persona)。
@@ -10435,7 +10452,7 @@ def _v2_card_source(session_id: str) -> tuple:
                 raise http_err(404, "SESSION_NOT_FOUND", "openclaw not configured")
             if not rest:
                 raise http_err(404, "SESSION_NOT_FOUND", "empty openclaw session key")
-            return ("oc", rest)
+            return ("oc", _oc_safe_session_key(rest))
         if prov != "claude_code":
             raise http_err(400, "UNSUPPORTED_PROVIDER",
                            f"不支援的 provider: {prov}")

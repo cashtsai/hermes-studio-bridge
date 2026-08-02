@@ -293,9 +293,11 @@ class BridgeWiringTests(unittest.TestCase):
     # card source 路由:sessionKey 含冒號要整段保留
 
     def test_card_source_keeps_full_key(self):
+        # openclaw key 本身含冒號,partition 後整段保留(不截斷)。用非撞名的
+        # sub-key 驗這件事;撞 default lane 的改道另見 MainLaneCollisionTests。
         bridge.OPENCLAW = _FakeOC(configured=True)
-        src = bridge._v2_card_source("openclaw:agent:main:main")
-        self.assertEqual(src, ("oc", "agent:main:main"))
+        src = bridge._v2_card_source("openclaw:agent:main:dev")
+        self.assertEqual(src, ("oc", "agent:main:dev"))
 
     # input 路由
 
@@ -415,13 +417,13 @@ class BridgeWiringTests(unittest.TestCase):
     def test_interrupt_calls_abort_when_busy(self):
         fake = _FakeOC(configured=True)
         bridge.OPENCLAW = fake
-        d = bridge._OC_CARD_DIGESTS["agent:main:main"] = cd.OpenClawDigest()
+        d = bridge._OC_CARD_DIGESTS["agent:main:dev"] = cd.OpenClawDigest()
         d.busy = True
-        res = _run(bridge.v2_session_interrupt("openclaw:agent:main:main",
+        res = _run(bridge.v2_session_interrupt("openclaw:agent:main:dev",
                                                _FakeReq()))
         self.assertTrue(res["interrupted"])
         self.assertEqual(fake.calls[0][0], "chat.abort")
-        self.assertEqual(fake.calls[0][1], {"sessionKey": "agent:main:main"})
+        self.assertEqual(fake.calls[0][1], {"sessionKey": "agent:main:dev"})
 
     # approve 明示不支援
 
@@ -540,6 +542,35 @@ class BridgeWiringTests(unittest.TestCase):
         out3 = _run(_dash(fake3))
         self.assertNotIn("openclaw", out3)
         self.assertIn("openclaw", out3["degraded"])
+
+
+class MainLaneCollisionTests(unittest.TestCase):
+    """sub-key 撞 agent default lane 的防呆(2026-08-02 rakutai 空回應事故)。
+
+    `agent:<a>:<a>` 會讓 gateway 一次 chat.send 起兩條 lane(default + session)
+    各跑一個 prompt,互相 takeover → 使用者送一則卻雙泡泡、回覆被吞成空。
+    bridge 在唯一入口 _v2_card_source 改道到安全 key,send/讀/abort 一致。
+    """
+
+    def test_safe_key_redirects_collision_only(self):
+        f = bridge._oc_safe_session_key
+        self.assertEqual(f("agent:main:main"), "agent:main:pocket")
+        self.assertEqual(f("agent:xcash:xcash"), "agent:xcash:pocket")
+        # 不撞名的一律原樣
+        self.assertEqual(f("agent:main:pocket"), "agent:main:pocket")
+        self.assertEqual(f("agent:main:pocket-e2e"), "agent:main:pocket-e2e")
+        self.assertEqual(f("agent:main:main2"), "agent:main:main2")
+        self.assertEqual(f("weird"), "weird")
+
+    def test_card_source_routes_collision_key(self):
+        # 進 _v2_card_source 的 openclaw 撞名 key → src[1] 已被改道
+        import unittest.mock as mock
+        with mock.patch.object(bridge.OPENCLAW, "configured", return_value=True):
+            src = bridge._v2_card_source("openclaw:agent:main:main")
+        self.assertEqual(src, ("oc", "agent:main:pocket"))
+        with mock.patch.object(bridge.OPENCLAW, "configured", return_value=True):
+            src2 = bridge._v2_card_source("openclaw:agent:main:dev")
+        self.assertEqual(src2, ("oc", "agent:main:dev"))   # 不撞名不動
 
 
 if __name__ == "__main__":
