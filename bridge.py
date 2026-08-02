@@ -915,12 +915,26 @@ REPORT_CONTEXT_ITEM_CHARS = 5000
 HIDDEN_REPORT_SOURCES = {"hermes-tool-error", "bridge-health"}
 HIDDEN_REPORT_NAMES = {"agent-tool-error", "bridge-health"}
 HIDDEN_REPORT_LABELS = {"錯誤報告", "Bridge 健康警報", "Bridge 復原", "Bridge 警告"}
+# 工具錯誤家族有逃生門(POCKET_ENABLE_TOOL_ERROR_REPORTS=1 放行進 app);
+# bridge-health 家族永遠隱藏。逃生門若不在寫入閘(_report_upsert)前生效,
+# flag 開了報告也會被 upsert 吞掉 → 死碼,所以三個判斷都要看同一面旗。
+TOOL_ERROR_HIDDEN_SOURCES = {"hermes-tool-error"}
+TOOL_ERROR_HIDDEN_NAMES = {"agent-tool-error"}
+TOOL_ERROR_HIDDEN_LABELS = {"錯誤報告"}
+TOOL_ERROR_REPORTS_ENABLED = os.environ.get(
+    "POCKET_ENABLE_TOOL_ERROR_REPORTS", "0").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _is_hidden_report(report: dict) -> bool:
     source = str(report.get("external_source") or "").strip()
     name = str(report.get("name") or "").strip()
     label = str(report.get("label") or "").strip()
+    if TOOL_ERROR_REPORTS_ENABLED:
+        return (
+            source in HIDDEN_REPORT_SOURCES - TOOL_ERROR_HIDDEN_SOURCES
+            or name in HIDDEN_REPORT_NAMES - TOOL_ERROR_HIDDEN_NAMES
+            or label in HIDDEN_REPORT_LABELS - TOOL_ERROR_HIDDEN_LABELS
+        )
     return (
         source in HIDDEN_REPORT_SOURCES
         or name in HIDDEN_REPORT_NAMES
@@ -933,13 +947,13 @@ def _is_hidden_report_message(message: dict) -> bool:
     if not mid.startswith("rep-"):
         return False
     text = str(message.get("content") or "").strip()
-    return (
-        text.startswith("📰 **錯誤報告**")
-        or text.startswith("📰 **Bridge 健康警報**")
-        or text.startswith("📰 **Bridge 復原**")
-        or text.startswith("📰 **Bridge 警告**")
-        or "工具錯誤" in text
-    )
+    if (text.startswith("📰 **Bridge 健康警報**")
+            or text.startswith("📰 **Bridge 復原**")
+            or text.startswith("📰 **Bridge 警告**")):
+        return True
+    if TOOL_ERROR_REPORTS_ENABLED:
+        return False
+    return text.startswith("📰 **錯誤報告**") or "工具錯誤" in text
 
 
 def _is_hidden_message_event(data: dict) -> bool:
@@ -2929,8 +2943,7 @@ def _report_messages(session: str, limit: int = 100):
 TOOL_ERROR_REPORT_SOURCE = "hermes-tool-error"
 TOOL_ERROR_REPORT_NAME = "agent-tool-error"
 TOOL_ERROR_REPORT_LABEL = "錯誤報告"
-TOOL_ERROR_REPORTS_ENABLED = os.environ.get(
-    "POCKET_ENABLE_TOOL_ERROR_REPORTS", "0").strip().lower() in {"1", "true", "yes", "on"}
+# TOOL_ERROR_REPORTS_ENABLED 定義在 HIDDEN_REPORT_* 旁(隱藏判斷要用同一面旗)
 TOOL_ERROR_REPORT_MAX_AGE = float(os.environ.get(
     "POCKET_TOOL_ERROR_REPORT_MAX_AGE", str(7 * 86400)))
 TOOL_ERROR_REPORT_SCAN_MULTIPLIER = 8
@@ -10907,7 +10920,9 @@ def _notice_for_report(session: str, report: dict) -> None:
     報告內容修訂不會把已 ack 的通知翻回 pending。"""
     import sqlite3
     name = report.get("name") or ""
-    if name not in NOTICE_REPORT_JOBS.get(session, ()):
+    is_tool_error = (TOOL_ERROR_REPORTS_ENABLED
+                     and report.get("external_source") == TOOL_ERROR_REPORT_SOURCE)
+    if name not in NOTICE_REPORT_JOBS.get(session, ()) and not is_tool_error:
         return
     rid = str(report.get("id") or "")
     if not rid:
