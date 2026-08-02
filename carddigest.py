@@ -83,6 +83,50 @@ def make_input_accepted_card(source: str, client_id: str | None, text: str,
                      body, ts=stamp, final=True)
 
 
+def absorb_echo_into_accepted(store, card: dict) -> dict:
+    """反向合併:accepted 卡到得比 transcript 回顯**晚**時,併進既有回顯卡。
+
+    `merge_input_accepted_echo` 只處理「accepted 先、echo 後」;但 CC 的
+    `_cc_paste_text` 貼上後要 settle + 驗證輪詢,這段等待期間 follower 往往已把
+    jsonl user 行 digest 成卡(附件送出的 typed 文字帶長路徑 marker,驗證更久,
+    幾乎每次都輸這個 race)→ accepted 後到、無人合併 → app 同一則訊息兩顆泡泡
+    (2026-08-02 回報)。這裡補反向:找最近的「裸回顯」(無 client_id、非
+    accepted/echo)且文字對得上(visible 或 typed),把 accepted 的
+    client_id/attachments/typed_text 併進它的 id,不再開第二張卡。"""
+    if not isinstance(card, dict) or card.get("role") != "user":
+        return card
+    body = card.get("body") or {}
+    if body.get("origin") != "input.accepted":
+        return card
+    texts = {_norm_visible_text(body.get("text") or ""),
+             _norm_visible_text(body.get("typed_text") or "")}
+    texts.discard("")
+    if not texts:
+        return card
+    cards = getattr(store, "cards", {}) or {}
+    order = getattr(store, "order", []) or []
+    for cid in reversed(order[-50:]):
+        prev = cards.get(cid) or {}
+        prev_body = prev.get("body") or {}
+        if prev.get("role") != "user":
+            continue
+        if prev_body.get("client_id") or \
+           prev_body.get("origin") in ("input.accepted", "transcript.echo"):
+            continue
+        if _norm_visible_text(prev_body.get("text") or "") not in texts:
+            continue
+        merged = dict(card)
+        merged["id"] = prev["id"]
+        if not merged.get("turn_id"):
+            merged["turn_id"] = prev.get("turn_id", "")
+        merged_body = dict(prev_body)
+        merged_body.update(body)
+        merged_body["origin"] = "transcript.echo"
+        merged["body"] = merged_body
+        return merged
+    return card
+
+
 def merge_input_accepted_echo(store, card: dict) -> dict:
     """Merge a later transcript user echo into the earlier accepted card.
 
