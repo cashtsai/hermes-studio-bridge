@@ -572,9 +572,10 @@ class ApprovalCardMixin:
 
 
 class CodexThreadDigest(ApprovalCardMixin):
-    """S2：一個 codex thread 的事件驅動 digest（無輪詢——status/turn/卡片
-    全由 app-server 通知推進）。冷載 seed 走 thread/turns/list（舊→新），
-    item id 穩定 → seed 與 live 事件 upsert 同一批卡 id，重疊只是 rev 遞增。
+    """S2：一個 codex thread 的 digest。平常由 app-server 通知推進；請求端
+    可用 thread/turns/list 做 canonical seed/catch-up，補桌面 Codex 寫入但
+    沒有送到本 bridge notification 的狀況。item id 穩定 → seed 與 live 事件
+    upsert 同一批卡 id，重疊只是 rev 遞增。
     """
     _appr_prefix = "card-cx-appr-"
     _appr_source = "codex"
@@ -586,6 +587,8 @@ class CodexThreadDigest(ApprovalCardMixin):
         self.busy = False
         self.prompt = None                     # pending approval title（label 素材）
         self.seeded = False
+        self.seeding = False
+        self.last_seed_at = 0.0
 
     def _status(self):
         self.store.set_status({
@@ -595,13 +598,29 @@ class CodexThreadDigest(ApprovalCardMixin):
                                      self.store.last_tool, self.store.saw_output),
         })
 
-    def seed_turns(self, turns: list):
+    @staticmethod
+    def _same_card(prev: dict | None, card: dict) -> bool:
+        if not prev:
+            return False
+        def comparable(c: dict) -> dict:
+            d = dict(c or {})
+            d.pop("rev", None)
+            d.pop("ts", None)
+            return d
+        return comparable(prev) == comparable(card)
+
+    def seed_turns(self, turns: list, emit_unchanged: bool = True):
         """thread/turns/list 的 data（呼叫端先 reverse 成舊→新）→ 卡片庫。"""
         for turn in turns or []:
             tid = str(turn.get("id") or "")
             for item in (turn.get("items") or []):
                 for card in codex_item_to_cards(item, turn_id=tid):
-                    self.store.upsert_card(merge_input_accepted_echo(self.store, card))
+                    card = merge_input_accepted_echo(self.store, card)
+                    if not emit_unchanged and self._same_card(
+                        self.store.cards.get(card["id"]), card
+                    ):
+                        continue
+                    self.store.upsert_card(card)
 
     def handle(self, method: str, params: dict):
         """一則 app-server 通知 → 卡片/turn/status 事件。"""

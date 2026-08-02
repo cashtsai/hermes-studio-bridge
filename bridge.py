@@ -10467,6 +10467,7 @@ def _v2_card_source(session_id: str) -> tuple:
 
 _CX_CARD_DIGESTS: dict = {}     # thread_id -> carddigest.CodexThreadDigest
 _CX_CARD_SEED_TURNS = 50        # 冷載種子:thread/turns/list 的 turn 數
+_CX_CARD_RESEED_TTL = 8.0       # 已 seed 後的 canonical catch-up 最短間隔
 
 
 def _cx_cards_feed(method: str, params: dict) -> None:
@@ -10523,37 +10524,59 @@ def _cx_feed_input_accepted(thread_id: str, client_id: str | None, text: str,
     d.store.upsert_card(card)
 
 
-async def _cx_card_digest(thread_id: str):
-    """取得(必要時建立+seed)該 thread 的 digest。先註冊再 seed——seed 期間的
-    live 事件與 seed 產同一批卡 id,重疊只是 rev 遞增,不會漏也不會雙份。"""
-    d = _CX_CARD_DIGESTS.get(thread_id)
-    if d is None:
-        d = _CX_CARD_DIGESTS[thread_id] = carddigest.CodexThreadDigest()
-    if not d.seeded:
+async def _cx_seed_card_digest(thread_id: str, d, required: bool = False) -> None:
+    """Seed/catch-up from canonical turns without resuming the thread.
+
+    Desktop Codex/VS Code can append turns that this bridge never sees as live
+    app-server notifications. A light request-time catch-up keeps v2 cards in
+    sync while preserving the no-resume rule that avoids stealing the thread.
+    """
+    now = time.monotonic()
+    if d.seeding:
+        return
+    if d.seeded and not required and now - d.last_seed_at < _CX_CARD_RESEED_TTL:
+        return
+    d.seeding = True
+    try:
+        # 只讀 seed 不做 thread/resume:resume 會「接管」該 thread,若它正被
+        # 別的 codex app-server(如 VS Code,thread source=vscode)持有就會卡死
+        # 整條 stdio → 之後所有 codex 呼叫一起 hang(XCash 就是這樣空白+送不出)。
+        # thread/turns/list 本來就不需 resume 也讀得到(/codexsessions/{id}/history
+        # 就是這樣讀的),所以這裡直接列 turns。
+        res = await CODEX_APP.call("thread/turns/list", {
+            "threadId": thread_id, "limit": _CX_CARD_SEED_TURNS,
+            "itemsView": "full", "sortDirection": "desc"}, timeout=45.0)
+        turns = list((res or {}).get("data", []))
+        turns.reverse()
+        await asyncio.to_thread(
+            _media_capture_sync, f"codex:{thread_id}", turns
+        )
+        d.seed_turns(turns, emit_unchanged=required)
+        rec = CODEX_APP.pending_approval_for_thread(thread_id)
+        if rec:
+            d.handle_approval(rec)
         d.seeded = True
-        try:
-            # 只讀 seed 不做 thread/resume:resume 會「接管」該 thread,若它正被
-            # 別的 codex app-server(如 VS Code,thread source=vscode)持有就會卡死
-            # 整條 stdio → 之後所有 codex 呼叫一起 hang(XCash 就是這樣空白+送不出)。
-            # thread/turns/list 本來就不需 resume 也讀得到(/codexsessions/{id}/history
-            # 就是這樣讀的),所以這裡直接列 turns。
-            res = await CODEX_APP.call("thread/turns/list", {
-                "threadId": thread_id, "limit": _CX_CARD_SEED_TURNS,
-                "itemsView": "full", "sortDirection": "desc"}, timeout=45.0)
-            turns = list((res or {}).get("data", []))
-            turns.reverse()
-            await asyncio.to_thread(
-                _media_capture_sync, f"codex:{thread_id}", turns
-            )
-            d.seed_turns(turns)
-            rec = CODEX_APP.pending_approval_for_thread(thread_id)
-            if rec:
-                d.handle_approval(rec)
-        except Exception as e:  # noqa: BLE001
+        d.last_seed_at = now
+    except Exception as e:  # noqa: BLE001
+        if required:
             d.seeded = False   # 下次請求重試 seed
             _log_event("cx_card_seed_error", thread=thread_id[:16],
                        error=str(e)[:200])
             _codex_http_error(e)
+        _log_event("cx_card_reseed_error", thread=thread_id[:16],
+                   error=str(e)[:200])
+    finally:
+        d.seeding = False
+
+
+async def _cx_card_digest(thread_id: str):
+    """取得(必要時建立+seed)該 thread 的 digest。先註冊再 seed——seed 期間的
+    live 事件與 seed 產同一批卡 id,不會漏也不會雙份；已 seed 的 digest 會
+    依 TTL 從 canonical turns/list 補桌面端進度。"""
+    d = _CX_CARD_DIGESTS.get(thread_id)
+    if d is None:
+        d = _CX_CARD_DIGESTS[thread_id] = carddigest.CodexThreadDigest()
+    await _cx_seed_card_digest(thread_id, d, required=not d.seeded)
     return d
 
 
