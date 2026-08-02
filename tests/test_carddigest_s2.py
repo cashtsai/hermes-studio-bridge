@@ -39,6 +39,13 @@ d.seed_turns(turns)
 snap2 = d.store.snapshot()
 check("重放 seed 卡數不變(dedup by id)", len(snap2["cards"]) == 5)
 check("重放 seed rev 遞增", snap2["cards"][0]["rev"] == 2)
+seq_before_catchup = d.store.seq
+d.seed_turns(turns, emit_unchanged=False)
+check("catch-up 同批 turns 不推新事件", d.store.seq == seq_before_catchup)
+d.seed_turns([{"id": "t1b", "items": [
+    {"id": "u1b", "type": "userMessage", "content": [{"type": "text", "text": "補新進度"}]},
+]}], emit_unchanged=False)
+check("catch-up 會補新 turn", "card-cx-u1b" in d.store.cards)
 
 # 3. 真串流:delta 累積、rev 遞增、final 收尾
 d.handle("turn/started", {"threadId": "T", "turn": {"id": "t2"}})
