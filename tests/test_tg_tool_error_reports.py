@@ -4,6 +4,10 @@
 1. role=tool 的 error-like 訊息會被轉成 report_events 錯誤報告。
 2. 同一筆 tool error 重複同步不新增 report / notice。
 3. status=success + exit_code=0 的正常 tool result 不進錯誤報告。
+
+feat/hide-internal-reports 後,工具錯誤報告預設不進 app(隱藏閘),本檔驗的
+是 POCKET_ENABLE_TOOL_ERROR_REPORTS=1 逃生門下的完整舊行為;預設(flag off)
+的隱藏行為由 tests/test_hidden_reports.py 覆蓋。
 """
 import json
 import os
@@ -15,6 +19,7 @@ import time
 _TMP = tempfile.mkdtemp(prefix="tg-tool-error-report-")
 os.environ["POCKET_CANON_DB"] = os.path.join(_TMP, "canonical.db")
 os.environ.setdefault("BRIDGE_TOKEN", "test-unit-token")
+os.environ["POCKET_ENABLE_TOOL_ERROR_REPORTS"] = "1"  # 逃生門全開驗舊契約
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import bridge  # noqa: E402
