@@ -5413,6 +5413,20 @@ def _terminal_enabled() -> bool:
         not in ("0", "false", "no", "off", "")
 
 
+def _terminal_tmux_bin() -> str | None:
+    return shutil.which(TMUX_BIN) or shutil.which("tmux")
+
+
+def _terminal_capabilities() -> dict:
+    tmux_bin = _terminal_tmux_bin()
+    return {
+        "enabled": _terminal_enabled(),
+        "backend": "tmux" if tmux_bin else "shell",
+        "persistent": bool(tmux_bin),
+        "reattach": bool(tmux_bin),
+    }
+
+
 def _ws_bearer_token(websocket: WebSocket) -> str:
     """Same token as every other /app/v1/* call: Authorization: Bearer <t>, or
     ?token=<t> query fallback (the contract lets the bridge accept either, since
@@ -5471,7 +5485,8 @@ async def app_v1_terminal(websocket: WebSocket):
     # server keeps the session alive for the next attach. No ?session → a stable
     # default, so even the current single-terminal UX becomes persistent.
     raw_sess = (websocket.query_params.get("session") or "").strip()
-    if raw_sess and await _tmux_alive(raw_sess):
+    tmux_bin = _terminal_tmux_bin()
+    if tmux_bin and raw_sess and await _tmux_alive(raw_sess):
         # 既有 tmux session(如 ccsess 的 "Ops"/"FLiPER")→ 直接 attach 進去,
         # 讓 app 的 SSH 連線能接到那個跑著 Claude Code/Codex 的 session。
         sess = raw_sess
@@ -5488,8 +5503,10 @@ async def app_v1_terminal(websocket: WebSocket):
         return
 
     try:
+        argv = ([tmux_bin, "new-session", "-A", "-s", sess, "-c", home]
+                if tmux_bin else [shell, "-l"])
         proc = subprocess.Popen(
-            [TMUX_BIN, "new-session", "-A", "-s", sess, "-c", home],
+            argv,
             preexec_fn=os.setsid,               # own session+pgroup → killpg reaps only the client
             stdin=slave_fd, stdout=slave_fd, stderr=slave_fd,
             cwd=home, env=env, close_fds=True,
@@ -5502,7 +5519,9 @@ async def app_v1_terminal(websocket: WebSocket):
         await websocket.close()
         return
     os.close(slave_fd)  # parent keeps only the master end
-    _log_event("terminal_open", device=_short_hash(token), shell=shell, tmux=sess)  # no keystrokes/output
+    _log_event("terminal_open", device=_short_hash(token), shell=shell,
+               tmux=sess if tmux_bin else None,
+               mode="tmux" if tmux_bin else "shell")  # no keystrokes/output
 
     loop = asyncio.get_running_loop()
 
@@ -11998,6 +12017,7 @@ async def capabilities(request: Request):
                          "push_register", "dashboard", "openclaw_config"] +
                         (["terminal"] if POCKET_TERMINAL_ENABLED else []) +
                         (["openclaw_provider"] if OPENCLAW.configured() else []),
+            "terminal": _terminal_capabilities(),
             "endpoints": ["/app/v1/sessions", "/app/v1/messages", "/reports",
                           "/app/v1/uploads",
                           "/app/v1/reactions", "/app/v1/pins",
