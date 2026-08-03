@@ -127,6 +127,45 @@ def absorb_echo_into_accepted(store, card: dict) -> dict:
     return card
 
 
+def dedupe_transcript_message(store, card: dict) -> dict:
+    """訊息卡按 (turn_id, role, 正規化文字) 收斂到既有卡。
+
+    「item id 穩定」的前提只在 live 通知內部成立:thread/turns/list 回補的
+    item id 是位置型(item-N),live 事件是 uuid/msg_*,同一句話兩邊 id 對不上
+    → 回補每輪都開平行卡(2026-08-03 Android cx 一句多卡回報,#59 之後回補
+    常駐化被放大)。id 撞不上就退而求其次用內容鍵收斂。
+
+    只處理 user/assistant 的 text/markdown 訊息卡;tool 卡的 call id 兩邊
+    一致,且同 turn 同輸出可能是真的重複執行,不碰。"""
+    if not isinstance(card, dict) or card.get("role") not in ("user", "assistant"):
+        return card
+    if card.get("kind") not in ("text", "markdown"):
+        return card
+    turn = card.get("turn_id") or ""
+    if not turn:
+        return card
+    cards = getattr(store, "cards", {}) or {}
+    if card.get("id") in cards:
+        return card              # 本尊已在庫:正常 rev 遞增路徑
+    text = _norm_visible_text((card.get("body") or {}).get("text") or "")
+    if not text:
+        return card
+    order = getattr(store, "order", []) or []
+    for cid in reversed(order[-200:]):
+        prev = cards.get(cid) or {}
+        if prev.get("turn_id") != turn or prev.get("role") != card.get("role"):
+            continue
+        if _norm_visible_text((prev.get("body") or {}).get("text") or "") != text:
+            continue
+        merged = dict(card)
+        merged["id"] = cid
+        body = dict(prev.get("body") or {})
+        body.update(card.get("body") or {})
+        merged["body"] = body
+        return merged
+    return card
+
+
 def merge_input_accepted_echo(store, card: dict) -> dict:
     """Merge a later transcript user echo into the earlier accepted card.
 
@@ -147,7 +186,17 @@ def merge_input_accepted_echo(store, card: dict) -> dict:
         prev_body = prev.get("body") or {}
         if prev.get("role") != "user":
             continue
-        if prev_body.get("origin") != "input.accepted" and not prev_body.get("client_id"):
+        prev_origin = prev_body.get("origin")
+        if prev_origin == "transcript.echo":
+            # 已合併過一次的回顯卡:同一 item 的 started→completed 重放、或
+            # canonical 回補(item id 對不上)再送同一句時,要繼續收斂回這張,
+            # 否則第一次合併把 origin 翻掉後,後續副本全數另開新卡(2026-08-03
+            # Android cx 一句三卡回報)。只在同 turn 內視為同一則,不跨 turn
+            # 吃掉使用者刻意重送的同文。
+            if not (card.get("turn_id")
+                    and card.get("turn_id") == prev.get("turn_id")):
+                continue
+        elif prev_origin != "input.accepted" and not prev_body.get("client_id"):
             continue
         prev_client = str(prev_body.get("client_id") or "").strip()
         prev_text = _norm_visible_text(prev_body.get("text") or "")
@@ -616,6 +665,7 @@ class CodexThreadDigest(ApprovalCardMixin):
             for item in (turn.get("items") or []):
                 for card in codex_item_to_cards(item, turn_id=tid):
                     card = merge_input_accepted_echo(self.store, card)
+                    card = dedupe_transcript_message(self.store, card)
                     if not emit_unchanged and self._same_card(
                         self.store.cards.get(card["id"]), card
                     ):
@@ -670,7 +720,9 @@ class CodexThreadDigest(ApprovalCardMixin):
                 if label:
                     self.store.last_tool = label if phase == "started" else ""
             for card in codex_item_to_cards(item, self.store.turn_id, phase=phase):
-                self.store.upsert_card(merge_input_accepted_echo(self.store, card))
+                card = merge_input_accepted_echo(self.store, card)
+                card = dedupe_transcript_message(self.store, card)
+                self.store.upsert_card(card)
             self._status()
 
     # handle_approval / resolve_approval：見 ApprovalCardMixin（A3，三 provider 共用）。
