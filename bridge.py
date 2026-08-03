@@ -10585,7 +10585,10 @@ def _cx_feed_input_accepted(thread_id: str, client_id: str | None, text: str,
     card = carddigest.make_input_accepted_card(
         "codex", client_id, text, attachments=_input_attachment_summary(attachments),
         typed_text=typed_text)
-    d.store.upsert_card(card)
+    # start_turn 先 await 才走到這裡:live userMessage 事件常在等待期間已把
+    # transcript 回顯 digest 成卡(card-cx-<uuid>),accepted 晚到再開一張=
+    # 同句兩顆泡泡。CC 同款 race 用 absorb 反向合併,cx 一直沒接上。
+    d.store.upsert_card(carddigest.absorb_echo_into_accepted(d.store, card))
 
 
 async def _cx_seed_card_digest(thread_id: str, d, required: bool = False) -> None:
