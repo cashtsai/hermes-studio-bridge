@@ -38,8 +38,8 @@ check("附錄剝除後同文 → 壓掉", D(N(tg), "assistant", 1030.0,
 # 不同 role 不壓
 check("role 不同 → 保留", not D(N(tg), "user", 1030.0, recent))
 
-# 時間窗外不壓(相隔 15 分鐘的同文 = 兩次真回覆)
-check("超出 600s 窗 → 保留", not D(N(tg), "assistant", 1700.0, recent))
+# 時間窗外不壓(窗 = 900s;相隔 20 分鐘的同文 = 兩次真回覆)
+check("超出 900s 窗 → 保留", not D(N(tg), "assistant", 2200.0, recent))
 
 # 真正不同的回覆不壓(相似度低)
 other = "善彰,晨報已經整理好,重點在最後一哩:build 105 已出貨,等你驗收。"
@@ -77,3 +77,9 @@ if fails:
     print(f"{len(fails)} FAILED: {fails}")
     sys.exit(1)
 print("ALL PASS (incl. fixtures)")
+
+# ---- 片段×總結(2026-08-04 生產大宗:TG 進度短句被 canonical 長總結全包) ----
+_fr, _fi = _fx["fragment"]
+check("片段×長總結(10-30×長度比) → 壓掉",
+      D(N(_fr[2]), "assistant", _fr[1], [(_fi[1], "assistant", N(_fi[2]))]))
+print("fragment case done")

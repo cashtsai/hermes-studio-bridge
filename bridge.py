@@ -2122,7 +2122,7 @@ def _dual_source_dup(body_norm: str, role: str, ts: float, canon_recent) -> bool
     if not body_norm:
         return False
     for cts, r, c in canon_recent:
-        if r != role or abs(ts - cts) >= 600 or not c:
+        if r != role or abs(ts - cts) >= 900 or not c:
             continue
         if c == body_norm:
             return True
@@ -2130,10 +2130,14 @@ def _dual_source_dup(body_norm: str, role: str, ts: float, canon_recent) -> bool
         # + 前綴/後綴增生」(canonical 多開場白/附錄、TG 被長度截尾),對齊窗
         # ratio 會把增生當相異扣到 0.69-0.75;covering(短方內容按序出現在長方
         # 的比例)才是對的度量 — xcash 07/25 = 0.993、袁方 07/30 = 1.000。
-        # 守門:短方 ≥40 字(太短誤撞)、長方 ≤3× 短方(整段被引用不是重複)。
+        # 守門只留「短方 ≥24 字」:生產大宗(2026-08-04 xcash 16:41-17:29 整批)
+        # 是 TG 側中途進度短句 ×N + canonical 一則長總結全包 —— 長度比 10-30×,
+        # 任何長度比守門都會放掉它們。只壓 tg 副本、canonical 原句永在,真引用
+        # 場景(長文引自己先前短句)畫面仍完整,不會消字。比對上限 600+1800:
+        # 長總結可達 3000 字,短句可能落在後段,長方窗要夠深。
         s, l = (body_norm, c) if len(body_norm) <= len(c) else (c, body_norm)
-        if len(s) >= 40 and len(l) <= len(s) * 3:
-            sm = difflib.SequenceMatcher(None, s[:600], l[:600])
+        if len(s) >= 24:
+            sm = difflib.SequenceMatcher(None, s[:600], l[:1800])
             cover = sum(b.size for b in sm.get_matching_blocks()) / min(len(s), 600)
             if cover >= 0.90:
                 return True
