@@ -2119,6 +2119,24 @@ def _dedup_norm(t: str) -> str:
     return re.sub(r"\s+", "", _steps_stripped(t or ""))
 
 
+def _session_turn_in_flight(session: str) -> bool:
+    """本 session 是否有 app 回合進行中 —— 活 turn 檢疫的判定源。
+
+    為什麼要檢疫(2026-08-04 晚間實抓):hermes agent 在長回合中會把進度短句
+    逐則發到 TG(state.db),但 canonical 總結要等回合收尾才落地 —— 收尾前
+    覆蓋壓重無從比對,進度句會先投遞到裝置本地庫,之後 server 端再怎麼壓重
+    也收不回來(手機上就是「短句講過、總結又整段重講」)。回合進行中先把
+    TG 側 assistant 新訊息扣住;收尾後 canonical 總結蓋得掉的自然被壓,
+    蓋不掉的(真訊息)照常放行,只延遲不丟失。"""
+    for (s, _cid), entry in list(_APP_TURN_INFLIGHT.items()):
+        if s != session:
+            continue
+        task = entry.get("task")
+        if task is not None and not task.done():
+            return True
+    return False
+
+
 def _dual_source_dup(body_norm: str, role: str, ts: float, canon_recent) -> bool:
     """canonical×state.db 雙寫壓重(同 role、±600s 窗)。
 
@@ -10793,9 +10811,16 @@ def _hp_merged_messages(session: str, limit: int = 200):
         # 完全相等 + 相似度模糊後備(措辭微漂也壓得掉),見 _dual_source_dup。
         return _dual_source_dup(_dedup_norm(m["content"]), m["role"],
                                 m["ts"] or 0, canon_recent)
+    # 活 turn 檢疫:回合進行中,TG 側 assistant 近訊(1 小時內)先不出頁,
+    # 等 canonical 總結落地後由覆蓋壓重定奪(見 _session_turn_in_flight)。
+    _quarantine = _session_turn_in_flight(session)
+    _q_now = time.time()
+    def _tg_quarantined(m) -> bool:
+        return (_quarantine and m["role"] == "assistant"
+                and (_q_now - (m["ts"] or 0)) < 3600)
     try:
         for m in _persona_history(home, limit):
-            if _tg_dup(m):
+            if _tg_dup(m) or _tg_quarantined(m):
                 continue
             out.append({"id": f"tg-{m['ts']}", "role": m["role"], "content": m["content"],
                         "attachments": m.get("attachments") or [], "ts": m["ts"],
@@ -13346,8 +13371,15 @@ async def app_get_messages(session: str, request: Request, limit: int = 200):
         # 完全相等 + 相似度模糊後備(措辭微漂也壓得掉),見 _dual_source_dup。
         return _dual_source_dup(_dedup_norm(m["content"]), m["role"],
                                 m["ts"] or 0, canon_recent)
+    # 活 turn 檢疫:回合進行中,TG 側 assistant 近訊(1 小時內)先不出頁,
+    # 等 canonical 總結落地後由覆蓋壓重定奪(見 _session_turn_in_flight)。
+    _quarantine = _session_turn_in_flight(session)
+    _q_now = time.time()
+    def _tg_quarantined(m) -> bool:
+        return (_quarantine and m["role"] == "assistant"
+                and (_q_now - (m["ts"] or 0)) < 3600)
     for m in _persona_history(home, limit):
-        if _tg_dup(m):
+        if _tg_dup(m) or _tg_quarantined(m):
             continue
         out.append({"id": f"tg-{m['ts']}", "role": m["role"], "content": m["content"],
                     "attachments": m.get("attachments") or [], "ts": m["ts"],
