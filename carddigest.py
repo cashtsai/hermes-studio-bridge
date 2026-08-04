@@ -293,6 +293,34 @@ def _blocks_text(content) -> str:
     return ""
 
 
+# CC lane 圖片附件(2026-08-04):agent 看圖(Read 圖片檔)在 Pocket 一直是隱形的
+# —— tool_result 的 image block 被 _blocks_text 丟掉,只剩 harness 的
+# `[Image: original WxH, displayed at …]` 座標說明文字被鏡射成醜泡泡。
+# 修法:tool_use 帶圖片副檔名路徑 → 多產一張 attachment 卡(app 端 kind 已實作,
+# 走與 CX 圖附件同一條 path→bridge 解析線;檔案本體由既有 media capture 歸檔,
+# scratchpad 清了也調得回)。座標說明行則直接濾掉。
+# 限制(後續切片):MCP 工具直回 base64、無檔案路徑的圖(如 Chrome 截圖不落地)
+# 仍不可見 — 那要 media store 開 bytes 入口,v1 先不做。
+_IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".heic", ".bmp")
+_IMAGE_MIME = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+               ".gif": "image/gif", ".webp": "image/webp", ".heic": "image/heic",
+               ".bmp": "image/bmp"}
+_IMG_CAVEAT_RE = re.compile(r"^\[Image: original \d+x\d+.*?\]$", re.M)
+
+
+def _image_path_in(inp) -> str:
+    """tool_use input 裡的圖片檔路徑(file_path/path 擇一);不是圖 → ''。"""
+    if not isinstance(inp, dict):
+        return ""
+    p = str(inp.get("file_path") or inp.get("path") or "")
+    return p if p.lower().endswith(_IMAGE_EXTS) else ""
+
+
+def _strip_image_caveat(text: str) -> str:
+    """去掉 harness 的圖片座標說明行(那是給模型的,不是給人看的)。"""
+    return _IMG_CAVEAT_RE.sub("", text).strip()
+
+
 def cc_event_to_cards(d: dict, uid: str, turn_id: str = "") -> list[dict]:
     """一行 CC transcript jsonl 事件 → 0..n 張卡。
 
@@ -314,6 +342,9 @@ def cc_event_to_cards(d: dict, uid: str, turn_id: str = "") -> list[dict]:
         if isinstance(content, str):
             head = content.lstrip()[:80]
             if any(tag in head for tag in PLUMBING_TAGS):
+                return []
+            content = _strip_image_caveat(content)
+            if not content:            # 整則只有座標說明 → 不出卡
                 return []
             cards.append(make_card(cid(0), turn_id, "user", "text",
                                    {"text": content, "fallback_text": content}, ts))
@@ -363,6 +394,17 @@ def cc_event_to_cards(d: dict, uid: str, turn_id: str = "") -> list[dict]:
                     body["patch"] = patch
                 cards.append(make_card(cid(i), turn_id, "assistant", "tool_call",
                                        body, ts))
+                # agent 看圖(Read/工具帶圖片路徑)→ 補一張 attachment 卡,
+                # Pocket 直接顯示縮圖(見檔頭「CC lane 圖片附件」說明)。
+                img = _image_path_in(inp)
+                if img:
+                    fname = img.rsplit("/", 1)[-1]
+                    ext = "." + fname.rsplit(".", 1)[-1].lower() if "." in fname else ""
+                    cards.append(make_card(
+                        f"{cid(i)}-img", turn_id, "assistant", "attachment",
+                        {"filename": fname, "path": img,
+                         "mime": _IMAGE_MIME.get(ext, "image/png"),
+                         "fallback_text": f"🖼 {fname}"}, ts))
         return cards
 
     return []
