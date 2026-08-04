@@ -28,6 +28,7 @@ import secrets
 import shlex
 import signal
 import struct
+import shutil
 import subprocess
 import termios
 import threading
