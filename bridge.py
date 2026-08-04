@@ -2000,6 +2000,16 @@ async def _event_or_statedb_wait_all(seen_ver: int,
         await asyncio.sleep(0.2)
 
 
+_QUEUE_ACK_RE = re.compile(r"^\s*Queued for the next turn\.(\s*\(\d+ queued\))?\s*$")
+
+
+def _is_queue_ack(text: str) -> bool:
+    """persona runtime(ACP)忙碌時的排隊回執。它是狀態不是回覆 —— 落正典會
+    讓聊天頁一排「Queued for the next turn.」泡泡(2026-08-04 xcash 實抓 ×6),
+    真回覆本來就會在排到的回合帶出。只認**整則恰為回執**,嵌在長文中不動。"""
+    return bool(_QUEUE_ACK_RE.match(text or ""))
+
+
 def _canon_add(session: str, role: str, content: str, attachments=None,
                mid: str | None = None, status: str = "done",
                client_id: str | None = None, created_at: float | None = None,
@@ -14371,7 +14381,11 @@ def _persona_launch_turn(session: str, prompt: str, client_id, common_log: dict,
             await q.put(("error", str(e)))
         finally:
             reply_mid = ""
-            if state["acc"]:
+            if state["acc"] and _is_queue_ack(state["acc"]):
+                # 排隊回執是狀態不是回覆:不落正典、不鏡 TG(卡片流即時顯示不受影響)。
+                state["canonical_reply_ok"] = True
+                _log_event("queue_ack_skipped", session=session, client=client_id or "")
+            elif state["acc"]:
                 _schedule_media_capture(f"hermes:{session}", state["acc"])
                 reply_mid, reply_ok = _canon_add_retry(session, "assistant", state["acc"],
                                                        client_id=client_id)
