@@ -2181,9 +2181,12 @@ def _canon_messages(session: str, limit: int = 200):
         _log_exc("_canon_messages", _exc, expected=False, session=session)
         return []
     rows.reverse()
+    # 歷史殘留的排隊回執(#70 只擋新寫入)讀取時一併過濾 —— 與雙源壓重同款
+    # 「讀取端治歷史」策略,DB 保持唯讀不清資料。
     return [{"id": r[0], "role": r[1], "content": r[2],
              "attachments": json.loads(r[3] or "[]"), "ts": r[4],
-             "status": r[5], "client_id": r[6], "source": "app"} for r in rows]
+             "status": r[5], "client_id": r[6], "source": "app"}
+            for r in rows if not (r[1] == "assistant" and _is_queue_ack(r[2] or ""))]
 
 
 def _app_message_seq(m: dict) -> int:
