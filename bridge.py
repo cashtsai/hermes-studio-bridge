@@ -15830,9 +15830,16 @@ async def app_agents_auth(request: Request):
 
 @app.get("/health")
 async def health():
+    # turns_in_flight:給安全重啟腳本(scripts/bridge-safe-restart.sh)看的 ——
+    # 重啟會無聲殺掉進行中人格回合(2026-08-04 實害:連環部署殺了善彰的模型
+    # 測試回合),腳本等這個歸零才 kickstart。
+    inflight = sum(
+        1 for entry in list(_APP_TURN_INFLIGHT.values())
+        if entry.get("task") is not None and not entry["task"].done())
     return {"ok": True, "personas": list(PERSONAS),
             "subsessions": len(SUBSESSIONS),
-            "bg_tasks": len(_BG_TASKS)}
+            "bg_tasks": len(_BG_TASKS),
+            "turns_in_flight": inflight}
 
 
 # ───────────────────────── log rotation (issue #7 item 6) ──────────────────
