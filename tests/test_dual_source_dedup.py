@@ -57,3 +57,23 @@ if fails:
     print(f"{len(fails)} FAILED: {fails}")
     sys.exit(1)
 print("ALL PASS")
+
+# ---- 生產原文 fixtures(閾值校準的地板;縮寫素材曾誤判 0.90 可行) ----
+import json as _json
+_fx = _json.load(open(os.path.join(os.path.dirname(__file__), "fixtures_dup_pairs.json")))
+
+def _pair(items):
+    tg = max((i for i in items if i[0].startswith("tg-")), key=lambda i: len(i[2]))
+    canon = max((i for i in items if not i[0].startswith("tg-")), key=lambda i: len(i[2]))
+    return tg, canon
+
+for label, key in (("xcash 07/25", "xcash"), ("袁方 07/30", "yf")):
+    tg, canon = _pair(_fx[key])
+    recent = [(canon[1], "assistant", N(canon[2]))]
+    check(f"生產原文 {label} → 壓掉", D(N(tg[2]), "assistant", tg[1], recent))
+
+print()
+if fails:
+    print(f"{len(fails)} FAILED: {fails}")
+    sys.exit(1)
+print("ALL PASS (incl. fixtures)")

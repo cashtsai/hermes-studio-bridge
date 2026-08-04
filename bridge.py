@@ -2112,7 +2112,8 @@ def _dedup_norm(t: str) -> str:
 def _dual_source_dup(body_norm: str, role: str, ts: float, canon_recent) -> bool:
     """canonical×state.db 雙寫壓重(同 role、±600s 窗)。
 
-    先走完全相等(便宜快路);對不上再走相似度 ≥0.90 模糊比對 —— 兩份落稿
+    先走完全相等(便宜快路);對不上再走**覆蓋率 ≥0.90**(短方內容按序出現
+    在長方的比例;生產實對 0.993/1.000,對齊式 ratio 只有 0.69-0.86 不可用) —— 兩份落稿
     會有**措辭微漂**(2026-08-04 xcash/袁方實例:「對話上下文」vs「上下文」、
     開頭多兩個換行),完全相等永遠對不上 → 同一句在 app 畫面兩顆氣泡,
     這正是「人格常回覆重複內容」的病根。長度差 >20% 先短路,只比前 400 字,
@@ -2125,9 +2126,17 @@ def _dual_source_dup(body_norm: str, role: str, ts: float, canon_recent) -> bool
             continue
         if c == body_norm:
             return True
-        if abs(len(c) - len(body_norm)) * 5 <= max(len(c), len(body_norm)) and \
-           difflib.SequenceMatcher(None, c[:400], body_norm[:400]).ratio() >= 0.90:
-            return True
+        # 模糊後備用**覆蓋率**,不是對齊相似度:生產實對顯示兩份是「同核心文
+        # + 前綴/後綴增生」(canonical 多開場白/附錄、TG 被長度截尾),對齊窗
+        # ratio 會把增生當相異扣到 0.69-0.75;covering(短方內容按序出現在長方
+        # 的比例)才是對的度量 — xcash 07/25 = 0.993、袁方 07/30 = 1.000。
+        # 守門:短方 ≥40 字(太短誤撞)、長方 ≤3× 短方(整段被引用不是重複)。
+        s, l = (body_norm, c) if len(body_norm) <= len(c) else (c, body_norm)
+        if len(s) >= 40 and len(l) <= len(s) * 3:
+            sm = difflib.SequenceMatcher(None, s[:600], l[:600])
+            cover = sum(b.size for b in sm.get_matching_blocks()) / min(len(s), 600)
+            if cover >= 0.90:
+                return True
     return False
 
 
