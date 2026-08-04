@@ -10818,6 +10818,35 @@ async def _hp_card_digest(session: str):
 
 OPENCLAW = openclaw_provider.OpenClawClient(log=_log_event)
 _OC_CARD_DIGESTS: dict = {}      # sessionKey -> carddigest.OpenClawDigest
+
+# B(即時推播):openclaw 訊息版本計數 + 等待者,給 /app/v1/messages/events 的
+# openclaw 分支用 —— gateway 事件一到就喚醒 SSE、重抓 chat.history 吐新訊息,取代
+# app 端慢輪詢(消「送出後等很久」)。同 canonical 的 _CANON_VER/_canon_wait 手法。
+_OC_MSG_VER: dict = {}       # sessionKey -> 單調遞增版本
+_OC_MSG_WAITERS: dict = {}   # sessionKey -> list[asyncio.Future]
+
+
+def _oc_msg_notify(key: str) -> None:
+    _OC_MSG_VER[key] = _OC_MSG_VER.get(key, 0) + 1
+    for fut in _OC_MSG_WAITERS.get(key) or []:
+        if not fut.done():
+            fut.set_result(True)
+    _OC_MSG_WAITERS[key] = []
+
+
+async def _oc_msg_wait(key: str, seen_ver: int, timeout: float) -> None:
+    if _OC_MSG_VER.get(key, 0) != seen_ver:
+        return
+    fut = asyncio.get_running_loop().create_future()
+    _OC_MSG_WAITERS.setdefault(key, []).append(fut)
+    try:
+        await asyncio.wait_for(fut, timeout=timeout)
+    except asyncio.TimeoutError:
+        pass
+    finally:
+        lst = _OC_MSG_WAITERS.get(key)
+        if lst and fut in lst:
+            lst.remove(fut)
 _OC_CARD_SEED_MSGS = 200         # 冷載種子:chat.history 訊息數
 _OC_HEARTBEAT_RUNS: "collections.OrderedDict" = collections.OrderedDict()
 _OC_HEARTBEAT_RUNS_MAX = 256     # runId → heartbeat 旗標(推播過濾用)
@@ -10853,6 +10882,8 @@ def _oc_events_feed(event: str, payload: dict) -> None:
         d = _OC_CARD_DIGESTS.get(key)
         if d is not None:
             d.handle(event, payload)
+        if event in ("chat", "agent"):
+            _oc_msg_notify(key)   # B:喚醒該 session 的 events SSE(即時推播)
         if event == "chat" and payload.get("state") == "final":
             _oc_push_final(key, payload)
     except Exception as e:  # noqa: BLE001 — 單筆事件毒丸不斷流
@@ -13319,6 +13350,45 @@ async def app_get_message_status(session: str, request: Request,
 
 
 @app.get("/app/v1/messages/events")
+async def _oc_events_gen(session: str, key: str, since: int, follow: bool):
+    """B:openclaw 版 events SSE —— gateway 事件驅動(_oc_msg_notify)喚醒後重抓
+    chat.history 吐新訊息,取代 app 端慢輪詢。事件形狀與 persona 完全一致
+    (`_app_message_event`,seq = ts×1000),app 既有 events 消費者直接吃。
+    15s 兜底重掃(防漏信號),配置不良/拉歷史失敗不斷流。"""
+    cursor = int(since or 0)
+    deadline = time.monotonic() + (120.0 if follow else 0.0)
+    seen_ver = -1
+    last_scan = 0.0
+    while True:
+        sent = False
+        ver = _OC_MSG_VER.get(key, 0)
+        if ver != seen_ver or time.monotonic() - last_scan >= 15.0:
+            last_scan = time.monotonic()
+            seen_ver = ver
+            try:
+                data = await _openclaw_v1_messages(session, 80)
+            except Exception as e:  # noqa: BLE001 — 拉歷史失敗不斷流,下輪再試
+                _log_event("oc_events_gen_history_error", error=str(e)[:160])
+                data = {"messages": []}
+            for msg in data.get("messages") or []:
+                seq = _app_message_seq(msg)
+                if seq <= cursor:
+                    continue
+                event = _app_message_event(msg)
+                cursor = max(cursor, int(event["seq"]))
+                yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+                sent = True
+        if not follow:
+            yield "data: [DONE]\n\n"
+            return
+        if not sent:
+            yield ": keepalive\n\n"
+        if time.monotonic() >= deadline:
+            yield "data: [DONE]\n\n"
+            return
+        await _oc_msg_wait(key, seen_ver, SSE_KEEPALIVE_SECS)
+
+
 async def app_get_message_events(session: str, request: Request,
                                  since: int = 0, follow: bool = True):
     """SSE feed for canonical persona messages.
@@ -13326,10 +13396,19 @@ async def app_get_message_events(session: str, request: Request,
     This is intentionally backed by the canonical store instead of an in-memory
     queue, so it survives bridge restarts and covers turns that completed after
     the client disconnected.
+
+    openclaw session(v1 pseudo-persona)改走 gateway 事件驅動的即時 SSE
+    (`_oc_events_gen`,B),不靠 app 慢輪詢。
     """
     _check_auth(request)
     if session not in PERSONAS:
-        raise http_err(400, "SESSION_NOT_FOUND", "unknown session")
+        oc_key = _openclaw_key_from_session_id(session)
+        if oc_key is None:
+            raise http_err(400, "SESSION_NOT_FOUND", "unknown session")
+        if not OPENCLAW.configured():
+            raise http_err(404, "SESSION_NOT_FOUND", "openclaw not configured")
+        return StreamingResponse(_oc_events_gen(session, oc_key, since, follow),
+                                 media_type="text/event-stream")
 
     async def gen():
         cursor = int(since or 0)
