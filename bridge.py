@@ -3047,7 +3047,7 @@ _TOOL_ERROR_TEXT_RES = (
     re.compile(r"\b(blocked|permission denied|unauthorized|forbidden)\b", re.I),
     re.compile(r"\bhttp error\s+(401|403|429|5\d\d)\b", re.I),
     re.compile(r"\bremote did not return json\b", re.I),
-    re.compile(r"\b(no space left on device|timed out|timeout)\b", re.I),
+    re.compile(r"\b(no space left on device|timed out)\b", re.I),   # 裸 timeout 太泛(timeout=90 之類的程式碼就中),留 timed out
     re.compile(r"(^|\n)\s*(file not found|not found):", re.I),
     re.compile(r"(^|\n)\s*--- stderr ---", re.I),
 )
@@ -3071,6 +3071,11 @@ def _tool_error_like(raw: str) -> bool:
     """
     text = str(raw or "").strip()
     if not text:
+        return False
+    # 源碼傾印護欄(2026-08-05):agent 把整支腳本讀進工具輸出時(shebang 開頭),
+    # 內文的 timeout=/SystemExit/HTTPError 全是程式碼不是錯誤 —— 潘天晴 cron 讀
+    # FED_Revision CLI 原始碼被誤報成「工具錯誤」堆滿報告中心,就是這型。
+    if text.startswith("#!"):
         return False
     payload = _tool_error_payload(text)
     if payload:
@@ -10427,6 +10432,30 @@ def _cc_card_uid(d: dict, jsonl_path: str, lineno: int) -> str:
     return f"{fh}-L{lineno}"
 
 
+def _cc_image_sink(session_id: str):
+    """carddigest 的 base64 圖入庫回呼:decode → media store capture_bytes →
+    回 {media_id, download_url, filename, mime} 給 attachment 卡。單張失敗回
+    None(carddigest 端不斷流)。MCP 直回圖(無檔案路徑)因此也進得了 Pocket。"""
+    import base64 as _b64
+    def sink(mime: str, b64data: str):
+        try:
+            data = _b64.b64decode(b64data)
+            ext = {"image/png": ".png", "image/jpeg": ".jpg",
+                   "image/gif": ".gif", "image/webp": ".webp"}.get(mime, ".png")
+            item = _media_store().capture_bytes(
+                session_id, data,
+                filename=f"cc-image{ext}", mime=mime, kind="image")
+            out = _media_wire_item(item)
+            return {"media_id": out.get("media_id"),
+                    "download_url": out.get("download_url"),
+                    "filename": out.get("filename"), "mime": mime}
+        except Exception as e:  # noqa: BLE001
+            _log_event("cc_image_sink_failed", error=type(e).__name__,
+                       error_message=str(e)[:120])
+            return None
+    return sink
+
+
 def _cc_digest_lines(store, lines, jsonl_path: str, start_lineno: int) -> int:
     """把 jsonl 行灌進卡片庫;回傳新增/更新的卡數。順手維護人話 label 素材。"""
     n = 0
@@ -10442,7 +10471,9 @@ def _cc_digest_lines(store, lines, jsonl_path: str, start_lineno: int) -> int:
             continue
         media_payloads.append(d)
         uid = _cc_card_uid(d, jsonl_path, start_lineno + off)
-        for card in carddigest.cc_event_to_cards(d, uid, turn_id=store.turn_id):
+        for card in carddigest.cc_event_to_cards(
+                d, uid, turn_id=store.turn_id,
+                image_sink=_cc_image_sink(getattr(store, "media_session_id", "") or "cc")):
             card = carddigest.merge_input_accepted_echo(store, card)
             store.upsert_card(card)
             n += 1
@@ -15825,9 +15856,16 @@ async def app_agents_auth(request: Request):
 
 @app.get("/health")
 async def health():
+    # turns_in_flight:給安全重啟腳本(scripts/bridge-safe-restart.sh)看的 ——
+    # 重啟會無聲殺掉進行中人格回合(2026-08-04 實害:連環部署殺了善彰的模型
+    # 測試回合),腳本等這個歸零才 kickstart。
+    inflight = sum(
+        1 for entry in list(_APP_TURN_INFLIGHT.values())
+        if entry.get("task") is not None and not entry["task"].done())
     return {"ok": True, "personas": list(PERSONAS),
             "subsessions": len(SUBSESSIONS),
-            "bg_tasks": len(_BG_TASKS)}
+            "bg_tasks": len(_BG_TASKS),
+            "turns_in_flight": inflight}
 
 
 # ───────────────────────── log rotation (issue #7 item 6) ──────────────────
