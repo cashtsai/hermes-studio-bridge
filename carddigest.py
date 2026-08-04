@@ -321,7 +321,8 @@ def _strip_image_caveat(text: str) -> str:
     return _IMG_CAVEAT_RE.sub("", text).strip()
 
 
-def cc_event_to_cards(d: dict, uid: str, turn_id: str = "") -> list[dict]:
+def cc_event_to_cards(d: dict, uid: str, turn_id: str = "",
+                      image_sink=None) -> list[dict]:
     """一行 CC transcript jsonl 事件 → 0..n 張卡。
 
     uid = 該事件的穩定識別（jsonl 的 'uuid'；缺了用檔案行號 fallback）——
@@ -351,6 +352,32 @@ def cc_event_to_cards(d: dict, uid: str, turn_id: str = "") -> list[dict]:
         elif isinstance(content, list):
             for i, b in enumerate(content):
                 if isinstance(b, dict) and b.get("type") == "tool_result":
+                    # base64 圖(MCP 工具直回、無檔案路徑;如 Chrome 截圖不落地):
+                    # 有 image_sink(bridge 綁 media store capture_bytes)就入庫,
+                    # 出 attachment 卡帶 media_id/download_url — 與路徑圖同一條
+                    # 渲染線。sink 缺席(單元測試/舊呼叫端)行為不變。
+                    if image_sink is not None:
+                        for j, blk in enumerate(b.get("content") or []):
+                            if not (isinstance(blk, dict) and blk.get("type") == "image"):
+                                continue
+                            srcb = blk.get("source") or {}
+                            if srcb.get("type") != "base64" or not srcb.get("data"):
+                                continue
+                            try:
+                                ref = image_sink(srcb.get("media_type") or "image/png",
+                                                 srcb["data"])
+                            except Exception:  # noqa: BLE001 — 單張失敗不斷流
+                                ref = None
+                            if ref:
+                                cards.append(make_card(
+                                    f"{cid(i)}-b64-{j}", turn_id, "assistant",
+                                    "attachment",
+                                    {"filename": ref.get("filename") or "image.png",
+                                     "mime": ref.get("mime") or "image/png",
+                                     "media_id": ref.get("media_id"),
+                                     "download_url": ref.get("download_url"),
+                                     "fallback_text": f"🖼 {ref.get('filename') or 'image'}"},
+                                    ts))
                     txt = _blocks_text(b.get("content"))
                     if txt:
                         short = txt[:_TOOL_RESULT_MAX]

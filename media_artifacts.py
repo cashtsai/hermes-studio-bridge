@@ -409,6 +409,79 @@ class MediaArtifactStore:
             ).fetchone()
         return self.public_item(self._row_item(row))
 
+    def capture_bytes(
+        self,
+        session_id: str,
+        data: bytes,
+        *,
+        filename: str = "",
+        mime: str = "",
+        kind: str = "",
+    ) -> dict:
+        """記憶體位元組直接入庫(MCP 工具直回 base64 圖、無檔案路徑的場景)。
+
+        content-addressed:source_ref = bytes:sha256:<digest> — 同 session 同內容
+        冪等(digest 重放不重複落盤),blob 與 capture_path 共用同一個以雜湊
+        定址的存放區。"""
+        session_id = str(session_id or "").strip()
+        if not session_id or not data:
+            raise ValueError("session_id and data are required")
+        if len(data) > self.max_bytes:
+            raise OverflowError("artifact exceeds configured limit")
+        now = time.time()
+        value = hashlib.sha256(data).hexdigest()
+        source_ref = f"bytes:sha256:{value}"
+        media_id = self._media_id(session_id, source_ref)
+        previous = self._existing_available(session_id, source_ref)
+        if previous:
+            return self._preserve_available(
+                previous, filename=filename, mime=mime, kind=kind
+            )
+        guessed_name = filename or f"image-{value[:12]}"
+        guessed_mime = mime or mimetypes.guess_type(guessed_name)[0] or ""
+        item_kind = (
+            media_kind(guessed_name, guessed_mime)
+            if kind in {"", "file", "attachment"}
+            else kind
+        )
+        stored_relpath = str(Path("blobs") / value[:2] / value)
+        destination = self.root / stored_relpath
+        self._ensure_schema()
+        destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(destination.parent, 0o700)
+        if not destination.exists():
+            temporary = self.blob_root / (
+                f".incoming.{os.getpid()}.{threading.get_ident()}.{time.time_ns()}"
+            )
+            with open(temporary, "xb") as target:
+                target.write(data)
+            os.chmod(temporary, 0o600)
+            os.replace(temporary, destination)
+        with closing(self._connect()) as conn, conn:
+            conn.execute(
+                """
+                INSERT INTO artifacts(
+                    media_id, session_id, source_ref, source_kind, filename,
+                    mime, media_kind, byte_size, sha256, stored_relpath,
+                    available, unavailable_reason, created_at, updated_at
+                ) VALUES (?, ?, ?, 'bytes', ?, ?, ?, ?, ?, ?, 1, NULL, ?, ?)
+                ON CONFLICT(session_id, source_ref) DO UPDATE SET
+                    filename = excluded.filename,
+                    mime = excluded.mime,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    media_id, session_id, source_ref, guessed_name, guessed_mime,
+                    item_kind, len(data), value, stored_relpath, now, now,
+                ),
+            )
+            conn.commit()
+            row = conn.execute(
+                "SELECT rowid AS cursor, * FROM artifacts WHERE media_id = ?",
+                (media_id,),
+            ).fetchone()
+        return self.public_item(self._row_item(row))
+
     def capture_url(
         self,
         session_id: str,
@@ -574,7 +647,8 @@ class MediaArtifactStore:
             return None
         item = self._row_item(row)
         path = item.get("_stored_path")
-        if item["source_kind"] != "path" or not item["available"] or not path:
+        # bytes 列(capture_bytes:MCP 直回圖)與 path 列同樣有 blob,可下載。
+        if item["source_kind"] not in ("path", "bytes") or not item["available"] or not path:
             return None
         if not os.path.isfile(path):
             return None

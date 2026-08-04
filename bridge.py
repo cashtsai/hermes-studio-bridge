@@ -10432,6 +10432,30 @@ def _cc_card_uid(d: dict, jsonl_path: str, lineno: int) -> str:
     return f"{fh}-L{lineno}"
 
 
+def _cc_image_sink(session_id: str):
+    """carddigest 的 base64 圖入庫回呼:decode → media store capture_bytes →
+    回 {media_id, download_url, filename, mime} 給 attachment 卡。單張失敗回
+    None(carddigest 端不斷流)。MCP 直回圖(無檔案路徑)因此也進得了 Pocket。"""
+    import base64 as _b64
+    def sink(mime: str, b64data: str):
+        try:
+            data = _b64.b64decode(b64data)
+            ext = {"image/png": ".png", "image/jpeg": ".jpg",
+                   "image/gif": ".gif", "image/webp": ".webp"}.get(mime, ".png")
+            item = _media_store().capture_bytes(
+                session_id, data,
+                filename=f"cc-image{ext}", mime=mime, kind="image")
+            out = _media_wire_item(item)
+            return {"media_id": out.get("media_id"),
+                    "download_url": out.get("download_url"),
+                    "filename": out.get("filename"), "mime": mime}
+        except Exception as e:  # noqa: BLE001
+            _log_event("cc_image_sink_failed", error=type(e).__name__,
+                       error_message=str(e)[:120])
+            return None
+    return sink
+
+
 def _cc_digest_lines(store, lines, jsonl_path: str, start_lineno: int) -> int:
     """把 jsonl 行灌進卡片庫;回傳新增/更新的卡數。順手維護人話 label 素材。"""
     n = 0
@@ -10447,7 +10471,9 @@ def _cc_digest_lines(store, lines, jsonl_path: str, start_lineno: int) -> int:
             continue
         media_payloads.append(d)
         uid = _cc_card_uid(d, jsonl_path, start_lineno + off)
-        for card in carddigest.cc_event_to_cards(d, uid, turn_id=store.turn_id):
+        for card in carddigest.cc_event_to_cards(
+                d, uid, turn_id=store.turn_id,
+                image_sink=_cc_image_sink(getattr(store, "media_session_id", "") or "cc")):
             card = carddigest.merge_input_accepted_echo(store, card)
             store.upsert_card(card)
             n += 1
