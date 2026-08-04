@@ -934,26 +934,20 @@ REPORT_CONTEXT_ITEM_CHARS = 5000
 HIDDEN_REPORT_SOURCES = {"hermes-tool-error", "bridge-health"}
 HIDDEN_REPORT_NAMES = {"agent-tool-error", "bridge-health"}
 HIDDEN_REPORT_LABELS = {"錯誤報告", "Bridge 健康警報", "Bridge 復原", "Bridge 警告"}
-# 工具錯誤家族有逃生門(POCKET_ENABLE_TOOL_ERROR_REPORTS=1 放行進 app);
-# bridge-health 家族永遠隱藏。逃生門若不在寫入閘(_report_upsert)前生效,
-# flag 開了報告也會被 upsert 吞掉 → 死碼,所以三個判斷都要看同一面旗。
+# 診斷報告要留在報告中心,但不能混進人格聊天/事件流/長期記憶。
+# POCKET_ENABLE_TOOL_ERROR_REPORTS=0 只關掉工具錯誤掃描;已在庫裡的診斷報告
+# 仍可從報告中心查閱,方便排查歷史問題。
 TOOL_ERROR_HIDDEN_SOURCES = {"hermes-tool-error"}
 TOOL_ERROR_HIDDEN_NAMES = {"agent-tool-error"}
 TOOL_ERROR_HIDDEN_LABELS = {"錯誤報告"}
 TOOL_ERROR_REPORTS_ENABLED = os.environ.get(
-    "POCKET_ENABLE_TOOL_ERROR_REPORTS", "0").strip().lower() in {"1", "true", "yes", "on"}
+    "POCKET_ENABLE_TOOL_ERROR_REPORTS", "1").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _is_hidden_report(report: dict) -> bool:
     source = str(report.get("external_source") or "").strip()
     name = str(report.get("name") or "").strip()
     label = str(report.get("label") or "").strip()
-    if TOOL_ERROR_REPORTS_ENABLED:
-        return (
-            source in HIDDEN_REPORT_SOURCES - TOOL_ERROR_HIDDEN_SOURCES
-            or name in HIDDEN_REPORT_NAMES - TOOL_ERROR_HIDDEN_NAMES
-            or label in HIDDEN_REPORT_LABELS - TOOL_ERROR_HIDDEN_LABELS
-        )
     return (
         source in HIDDEN_REPORT_SOURCES
         or name in HIDDEN_REPORT_NAMES
@@ -970,8 +964,6 @@ def _is_hidden_report_message(message: dict) -> bool:
             or text.startswith("📰 **Bridge 復原**")
             or text.startswith("📰 **Bridge 警告**")):
         return True
-    if TOOL_ERROR_REPORTS_ENABLED:
-        return False
     return text.startswith("📰 **錯誤報告**") or "工具錯誤" in text
 
 
@@ -2875,15 +2867,11 @@ def _report_upsert(session: str, report: dict) -> str:
     label = report.get("label") or ""
     name = report.get("name") or ""
     external_source = report.get("external_source") or "hermes-cron"
-    if _is_hidden_report({
+    is_diagnostic = _is_hidden_report({
         "label": label,
         "name": name,
         "external_source": external_source,
-    }):
-        _log_event("report_event_hidden",
-                   session=session, label=label, name=name,
-                   external_source=external_source)
-        return ""
+    })
     # actions 是 payload 的一部分:呼叫端每次 upsert 帶完整清單(更新即整組
     # 替換);cron 同步線從不帶 → 寫 NULL,而 cron 報告本來就沒有行動,無損。
     actions = _report_actions_normalize(report.get("actions"))
@@ -2908,15 +2896,21 @@ def _report_upsert(session: str, report: dict) -> str:
         # Sync engine P1:cron 晨報寫入點鏡射進 event_log(雙寫過渡)。形狀走
         # _report_msg_shape = app 在 /app/v1/messages 看到的同一種報告訊息;
         # 改稿(同 rid 新內容)→ 新鍵 → 追加新事件,同 message id 覆蓋。
-        _event_mirror_messages(session, [_report_msg_shape({
-            "id": rid, "label": label, "content": content, "ts": ts,
-        })])
+        if not is_diagnostic:
+            _event_mirror_messages(session, [_report_msg_shape({
+                "id": rid, "label": label, "content": content, "ts": ts,
+            })])
+        else:
+            _log_event("report_event_diagnostic",
+                       session=session, label=label, name=name,
+                       external_source=external_source)
         return rid
     finally:
         con.close()
 
 
-def _report_events(session: str, limit: int = 20, newest_first: bool = False):
+def _report_events(session: str, limit: int = 20, newest_first: bool = False,
+                   include_diagnostics: bool = True):
     import sqlite3
     order = "DESC" if newest_first else "ASC"
     try:
@@ -2937,7 +2931,9 @@ def _report_events(session: str, limit: int = 20, newest_first: bool = False):
         "id": r[0], "label": r[1], "name": r[2], "content": r[3],
         "ts": r[4], "external_source": r[5], "external_id": r[6],
     } for r in rows]
-    return [r for r in events if not _is_hidden_report(r)][:limit]
+    if not include_diagnostics:
+        events = [r for r in events if not _is_hidden_report(r)]
+    return events[:limit]
 
 
 def _report_msg_shape(r: dict) -> dict:
@@ -2956,7 +2952,8 @@ def _report_messages(session: str, limit: int = 100):
     (2026-07-15 修:人格列表與對話凍結在舊訊息的根因之一)。
     呼叫端(preview 合併/兩處對話合併)都會事後按 ts 重排,順序不影響。"""
     return [_report_msg_shape(r)
-            for r in _report_events(session, limit, newest_first=True)]
+            for r in _report_events(session, limit, newest_first=True,
+                                    include_diagnostics=False)]
 
 
 TOOL_ERROR_REPORT_SOURCE = "hermes-tool-error"
@@ -2967,14 +2964,18 @@ TOOL_ERROR_REPORT_MAX_AGE = float(os.environ.get(
     "POCKET_TOOL_ERROR_REPORT_MAX_AGE", str(7 * 86400)))
 TOOL_ERROR_REPORT_SCAN_MULTIPLIER = 8
 TOOL_ERROR_DETAIL_CHARS = 5000
-_TOOL_ERROR_PATTERNS = (
-    "traceback", "[exit ", "exit_code\": 1", "exit_code\": -",
-    "\"status\": \"error\"", "'status': 'error'", "status=error",
-    "\"ok\": false", "'ok': false", "error:", " error", "failed",
-    "failure", "exception", "timed out", "timeout", "blocked:",
-    "permission denied", "forbidden", "unauthorized", "http error 403",
-    "403", "401", "remote did not return json", "no space left",
-    "file not found", "not found:", "stderr ---",
+_TOOL_ERROR_TEXT_RES = (
+    re.compile(r"traceback \(most recent call last\):", re.I),
+    re.compile(r"\[exit\s+-?[1-9]\d*\]", re.I),
+    re.compile(r"\bexit[_ ]?code\s*[:=]\s*-?[1-9]\d*\b", re.I),
+    re.compile(r"\bstatus\s*[:=]\s*(error|failed|failure)\b", re.I),
+    re.compile(r"\bok\s*[:=]\s*false\b", re.I),
+    re.compile(r"\b(blocked|permission denied|unauthorized|forbidden)\b", re.I),
+    re.compile(r"\bhttp error\s+(401|403|429|5\d\d)\b", re.I),
+    re.compile(r"\bremote did not return json\b", re.I),
+    re.compile(r"\b(no space left on device|timed out|timeout)\b", re.I),
+    re.compile(r"(^|\n)\s*(file not found|not found):", re.I),
+    re.compile(r"(^|\n)\s*--- stderr ---", re.I),
 )
 
 
@@ -3013,8 +3014,9 @@ def _tool_error_like(raw: str) -> bool:
         err = payload.get("error")
         if err not in (None, "", False):
             return True
+        return False
     low = text.lower()
-    return any(p in low for p in _TOOL_ERROR_PATTERNS)
+    return any(rx.search(low) for rx in _TOOL_ERROR_TEXT_RES)
 
 
 def _tool_error_summary(raw: str) -> str:
@@ -5413,6 +5415,20 @@ def _terminal_enabled() -> bool:
         not in ("0", "false", "no", "off", "")
 
 
+def _terminal_tmux_bin() -> str | None:
+    return shutil.which(TMUX_BIN) or shutil.which("tmux")
+
+
+def _terminal_capabilities() -> dict:
+    tmux_bin = _terminal_tmux_bin()
+    return {
+        "enabled": _terminal_enabled(),
+        "backend": "tmux" if tmux_bin else "shell",
+        "persistent": bool(tmux_bin),
+        "reattach": bool(tmux_bin),
+    }
+
+
 def _ws_bearer_token(websocket: WebSocket) -> str:
     """Same token as every other /app/v1/* call: Authorization: Bearer <t>, or
     ?token=<t> query fallback (the contract lets the bridge accept either, since
@@ -5471,7 +5487,8 @@ async def app_v1_terminal(websocket: WebSocket):
     # server keeps the session alive for the next attach. No ?session → a stable
     # default, so even the current single-terminal UX becomes persistent.
     raw_sess = (websocket.query_params.get("session") or "").strip()
-    if raw_sess and await _tmux_alive(raw_sess):
+    tmux_bin = _terminal_tmux_bin()
+    if tmux_bin and raw_sess and await _tmux_alive(raw_sess):
         # 既有 tmux session(如 ccsess 的 "Ops"/"FLiPER")→ 直接 attach 進去,
         # 讓 app 的 SSH 連線能接到那個跑著 Claude Code/Codex 的 session。
         sess = raw_sess
@@ -5488,8 +5505,10 @@ async def app_v1_terminal(websocket: WebSocket):
         return
 
     try:
+        argv = ([tmux_bin, "new-session", "-A", "-s", sess, "-c", home]
+                if tmux_bin else [shell, "-l"])
         proc = subprocess.Popen(
-            [TMUX_BIN, "new-session", "-A", "-s", sess, "-c", home],
+            argv,
             preexec_fn=os.setsid,               # own session+pgroup → killpg reaps only the client
             stdin=slave_fd, stdout=slave_fd, stderr=slave_fd,
             cwd=home, env=env, close_fds=True,
@@ -5502,7 +5521,9 @@ async def app_v1_terminal(websocket: WebSocket):
         await websocket.close()
         return
     os.close(slave_fd)  # parent keeps only the master end
-    _log_event("terminal_open", device=_short_hash(token), shell=shell, tmux=sess)  # no keystrokes/output
+    _log_event("terminal_open", device=_short_hash(token), shell=shell,
+               tmux=sess if tmux_bin else None,
+               mode="tmux" if tmux_bin else "shell")  # no keystrokes/output
 
     loop = asyncio.get_running_loop()
 
@@ -11167,9 +11188,9 @@ def _notice_for_report(session: str, report: dict) -> None:
     報告內容修訂不會把已 ack 的通知翻回 pending。"""
     import sqlite3
     name = report.get("name") or ""
-    is_tool_error = (TOOL_ERROR_REPORTS_ENABLED
-                     and report.get("external_source") == TOOL_ERROR_REPORT_SOURCE)
-    if name not in NOTICE_REPORT_JOBS.get(session, ()) and not is_tool_error:
+    if _is_hidden_report(report):
+        return
+    if name not in NOTICE_REPORT_JOBS.get(session, ()):
         return
     rid = str(report.get("id") or "")
     if not rid:
@@ -11425,8 +11446,10 @@ def _sync_persona_reports(session: str, limit: int = 50) -> list[dict]:
             _log_event("report_event_write_failed", session=session,
                        report_id=r.get("id"), label=r.get("label"),
                        error=type(e).__name__, error_message=str(e)[:160])
-    latest = _report_events(session, max(limit, REPORT_MEMORY_ITEMS), newest_first=True)
-    _write_report_memory(session, latest)
+    latest = _report_events(session, max(limit, REPORT_MEMORY_ITEMS), newest_first=True,
+                            include_diagnostics=True)
+    visible_latest = [r for r in latest if not _is_hidden_report(r)]
+    _write_report_memory(session, visible_latest)
     if upserted:
         _log_event("report_events_synced", session=session, count=upserted)
     return latest
@@ -11998,6 +12021,7 @@ async def capabilities(request: Request):
                          "push_register", "dashboard", "openclaw_config"] +
                         (["terminal"] if POCKET_TERMINAL_ENABLED else []) +
                         (["openclaw_provider"] if OPENCLAW.configured() else []),
+            "terminal": _terminal_capabilities(),
             "endpoints": ["/app/v1/sessions", "/app/v1/messages", "/reports",
                           "/app/v1/uploads",
                           "/app/v1/reactions", "/app/v1/pins",
@@ -12959,25 +12983,29 @@ def _report_lookup(rid: str):
               "external_source": row[6] or "", "external_id": row[7] or "",
               # 舊列 NULL → [](app 端「無 actions 區塊不出現」的約定)。
               "actions": _report_actions_loads(row[8])}
-    return None if _is_hidden_report(report) else report
+    return report
 
 
 @app.get("/app/v1/reports")
-async def app_get_reports(session: str, request: Request, limit: int = 20):
+async def app_get_reports(session: str, request: Request, limit: int = 20,
+                          include_diagnostics: bool = True):
     """報告列表(唯讀,給日後的報告總覽用):某人格最新 limit 筆,newest-first。
     只回 metadata + 200 字 preview,全文走單筆端點 —— 列表不揹整包長文。
-    不在這裡觸發 _sync_persona_reports:報告要進得了卡片流本來就得先同步
-    (messages/卡片 follower 都會做),這條保持零寫入。"""
+    報告中心是聊天外的獨立入口,所以讀列表前會先同步一次 cron/tool report;
+    診斷報告仍只留在報告中心,不會鏡射進聊天事件流。"""
     _check_auth(request)
     if session not in PERSONAS:
         raise http_err(400, "SESSION_NOT_FOUND", "unknown persona session")
     limit = max(1, min(int(limit or 20), 100))
-    rows = _report_events(session, limit, newest_first=True)
+    _sync_persona_reports(session, max(limit, 50))
+    rows = _report_events(session, limit, newest_first=True,
+                          include_diagnostics=include_diagnostics)
     return {"reports": [{
         "id": r["id"], "session": session, "label": r["label"] or "",
         "name": r["name"] or "", "ts": r["ts"],
         "external_source": r["external_source"] or "",
         "external_id": r["external_id"] or "",
+        "diagnostic": _is_hidden_report(r),
         "preview": _clip_text(r["content"] or "", 200),
         "chars": len(r["content"] or ""),
     } for r in rows]}

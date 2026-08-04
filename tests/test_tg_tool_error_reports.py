@@ -2,12 +2,12 @@
 
 驗證:
 1. role=tool 的 error-like 訊息會被轉成 report_events 錯誤報告。
-2. 同一筆 tool error 重複同步不新增 report / notice。
-3. status=success + exit_code=0 的正常 tool result 不進錯誤報告。
+2. 同一筆 tool error 重複同步不新增 report。
+3. status=success + exit_code=0 的正常 tool result 就算內文含 error/failed
+   字樣也不進錯誤報告。
 
-feat/hide-internal-reports 後,工具錯誤報告預設不進 app(隱藏閘),本檔驗的
-是 POCKET_ENABLE_TOOL_ERROR_REPORTS=1 逃生門下的完整舊行為;預設(flag off)
-的隱藏行為由 tests/test_hidden_reports.py 覆蓋。
+feat/diagnostic-report-center 後,工具錯誤報告進報告中心,但不進人格聊天,
+也不再產生「知道了」notice。
 """
 import json
 import os
@@ -77,6 +77,15 @@ con.execute(
                 ensure_ascii=False),
      "terminal", now - 15),
 )
+con.execute(
+    "INSERT INTO messages(session_id,role,content,tool_name,timestamp) VALUES(?,?,?,?,?)",
+    ("tg-session", "tool",
+     json.dumps({"status": "success",
+                 "output": "source file mentions error handlers and failed states",
+                 "exit_code": 0, "error": None},
+                ensure_ascii=False),
+     "terminal", now - 14),
+)
 error_payload = {
     "status": "error",
     "output": "Traceback (most recent call last): HTTP Error 403: Forbidden",
@@ -130,7 +139,7 @@ notice1 = db.execute(
 ).fetchone()[0]
 db.close()
 check("report_events 寫入兩筆", count1 == 2)
-check("錯誤報告建立通知中心 notice", notice1 == 2)
+check("錯誤報告不建立通知中心 notice", notice1 == 0)
 
 bridge._sync_persona_reports("pantianqing", 20)
 db = sqlite3.connect(bridge.CANON_DB)
@@ -143,7 +152,7 @@ notice2 = db.execute(
 ).fetchone()[0]
 db.close()
 check("重複同步不新增 report", count2 == count1)
-check("重複同步不新增 notice", notice2 == notice1)
+check("重複同步仍不新增 notice", notice2 == notice1)
 
 print()
 if fails:
