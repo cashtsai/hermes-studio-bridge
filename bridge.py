@@ -3047,7 +3047,7 @@ _TOOL_ERROR_TEXT_RES = (
     re.compile(r"\b(blocked|permission denied|unauthorized|forbidden)\b", re.I),
     re.compile(r"\bhttp error\s+(401|403|429|5\d\d)\b", re.I),
     re.compile(r"\bremote did not return json\b", re.I),
-    re.compile(r"\b(no space left on device|timed out|timeout)\b", re.I),
+    re.compile(r"\b(no space left on device|timed out)\b", re.I),   # 裸 timeout 太泛(timeout=90 之類的程式碼就中),留 timed out
     re.compile(r"(^|\n)\s*(file not found|not found):", re.I),
     re.compile(r"(^|\n)\s*--- stderr ---", re.I),
 )
@@ -3071,6 +3071,11 @@ def _tool_error_like(raw: str) -> bool:
     """
     text = str(raw or "").strip()
     if not text:
+        return False
+    # 源碼傾印護欄(2026-08-05):agent 把整支腳本讀進工具輸出時(shebang 開頭),
+    # 內文的 timeout=/SystemExit/HTTPError 全是程式碼不是錯誤 —— 潘天晴 cron 讀
+    # FED_Revision CLI 原始碼被誤報成「工具錯誤」堆滿報告中心,就是這型。
+    if text.startswith("#!"):
         return False
     payload = _tool_error_payload(text)
     if payload:
