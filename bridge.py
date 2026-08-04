@@ -13349,7 +13349,6 @@ async def app_get_message_status(session: str, request: Request,
     return _app_turn_status(session, client_id or None, acp_busy=acp.is_busy())
 
 
-@app.get("/app/v1/messages/events")
 async def _oc_events_gen(session: str, key: str, since: int, follow: bool):
     """B:openclaw 版 events SSE —— gateway 事件驅動(_oc_msg_notify)喚醒後重抓
     chat.history 吐新訊息,取代 app 端慢輪詢。事件形狀與 persona 完全一致
@@ -13389,6 +13388,7 @@ async def _oc_events_gen(session: str, key: str, since: int, follow: bool):
         await _oc_msg_wait(key, seen_ver, SSE_KEEPALIVE_SECS)
 
 
+@app.get("/app/v1/messages/events")
 async def app_get_message_events(session: str, request: Request,
                                  since: int = 0, follow: bool = True):
     """SSE feed for canonical persona messages.
