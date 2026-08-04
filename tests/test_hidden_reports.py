@@ -1,10 +1,11 @@
-"""內部報告隱藏(feat/hide-internal-reports)測試。
+"""診斷報告分流(feat/diagnostic-report-center)測試。
 
 鎖住三道閘門,防止文案/欄位一改就靜默失效:
-1. `_is_hidden_report`:source/name/label 三種命中都要擋,一般報告不受影響。
-2. `_report_upsert`:隱藏報告不落 report_events、回空 id。
-3. `_report_events` / `_event_since`:已在庫裡的隱藏資料(歷史殘留)讀取時過濾。
-4. `TOOL_ERROR_REPORTS_ENABLED` 預設關(環境變數沒開就不混入工具錯誤報告)。
+1. `_is_hidden_report`:source/name/label 三種命中都要視為診斷,一般報告不受影響。
+2. `_report_upsert`:診斷報告要落 report_events,但不能鏡射成聊天訊息。
+3. `_report_events(..., include_diagnostics=False)` / `_event_since`:
+   對話流與歷史殘留事件讀取時過濾。
+4. `TOOL_ERROR_REPORTS_ENABLED` 預設開,但只控制新工具錯誤掃描是否產生報告。
 
 ⚠️ `_is_hidden_report_message` 靠「📰 **錯誤報告**」等字串前綴比對——
 `TOOL_ERROR_REPORT_LABEL` 或報告文案改字,這裡的測試就該同步紅掉。
@@ -98,7 +99,7 @@ class ReportUpsertGateTest(HiddenReportsBase):
         finally:
             con.close()
 
-    def test_hidden_report_not_persisted(self):
+    def test_diagnostic_report_persisted_but_not_chat_message(self):
         before = self._count()
         rid = bridge._report_upsert("yuanfang", {
             "label": bridge.TOOL_ERROR_REPORT_LABEL,
@@ -106,8 +107,15 @@ class ReportUpsertGateTest(HiddenReportsBase):
             "external_source": bridge.TOOL_ERROR_REPORT_SOURCE,
             "external_id": "te-1", "content": "工具錯誤內容", "ts": time.time(),
         })
-        self.assertEqual(rid, "")
-        self.assertEqual(self._count(), before)
+        self.assertTrue(rid)
+        self.assertEqual(self._count(), before + 1)
+        rows = bridge._report_events("yuanfang", limit=10)
+        self.assertIn("te-1", [r["external_id"] for r in rows])
+        hidden_rows = bridge._report_events("yuanfang", limit=10,
+                                            include_diagnostics=False)
+        self.assertNotIn("te-1", [r["external_id"] for r in hidden_rows])
+        msgs = bridge._report_messages("yuanfang", limit=10)
+        self.assertNotIn(rid, [m["id"].replace("rep-", "") for m in msgs])
 
     def test_normal_report_persisted(self):
         rid = bridge._report_upsert("yuanfang", {
@@ -145,7 +153,12 @@ class ReadPathFilterTest(HiddenReportsBase):
         rows = bridge._report_events("yuanfang", limit=10)
         ids = [r["id"] for r in rows]
         self.assertIn("rep-ok", ids)
-        self.assertNotIn("rep-hid", ids)
+        self.assertIn("rep-hid", ids)
+        visible_rows = bridge._report_events("yuanfang", limit=10,
+                                             include_diagnostics=False)
+        visible_ids = [r["id"] for r in visible_rows]
+        self.assertIn("rep-ok", visible_ids)
+        self.assertNotIn("rep-hid", visible_ids)
 
     def test_event_since_filters_hidden_message(self):
         bridge._event_append("yuanfang", "message", {"message": {
@@ -164,28 +177,25 @@ class ReadPathFilterTest(HiddenReportsBase):
 
 
 class ToolErrorFlagTest(unittest.TestCase):
-    def test_disabled_by_default(self):
-        # 環境沒開 POCKET_ENABLE_TOOL_ERROR_REPORTS,同步線不混入工具錯誤報告
-        if os.environ.get("POCKET_ENABLE_TOOL_ERROR_REPORTS"):
-            self.skipTest("環境已顯式開啟,略過預設值檢查")
-        self.assertFalse(bridge.TOOL_ERROR_REPORTS_ENABLED)
+    def test_enabled_by_default(self):
+        # 預設產生診斷報告,但只進報告中心,不混入人格聊天。
+        if os.environ.get("POCKET_ENABLE_TOOL_ERROR_REPORTS") == "0":
+            self.skipTest("環境已顯式關閉,略過預設值檢查")
+        self.assertTrue(bridge.TOOL_ERROR_REPORTS_ENABLED)
 
-    def test_escape_hatch_unhides_tool_errors_only(self):
-        """flag 開 → 工具錯誤家族放行,bridge-health 家族仍然隱藏。"""
+    def test_flag_does_not_change_diagnostic_classification(self):
+        """flag 只控制掃描產生與否,不改變診斷報告的分流身份。"""
         orig = bridge.TOOL_ERROR_REPORTS_ENABLED
-        bridge.TOOL_ERROR_REPORTS_ENABLED = True
         try:
-            self.assertFalse(bridge._is_hidden_report(
-                {"external_source": "hermes-tool-error",
-                 "name": "agent-tool-error", "label": "錯誤報告"}))
-            self.assertTrue(bridge._is_hidden_report(
-                {"external_source": "bridge-health"}))
-            self.assertTrue(bridge._is_hidden_report(
-                {"label": "Bridge 健康警報"}))
-            self.assertFalse(bridge._is_hidden_report_message(
-                {"id": "rep-x", "content": "📰 **錯誤報告**\n內容"}))
-            self.assertTrue(bridge._is_hidden_report_message(
-                {"id": "rep-x", "content": "📰 **Bridge 健康警報**\n內容"}))
+            for enabled in (False, True):
+                bridge.TOOL_ERROR_REPORTS_ENABLED = enabled
+                self.assertTrue(bridge._is_hidden_report(
+                    {"external_source": "hermes-tool-error",
+                     "name": "agent-tool-error", "label": "錯誤報告"}))
+                self.assertTrue(bridge._is_hidden_report(
+                    {"external_source": "bridge-health"}))
+                self.assertTrue(bridge._is_hidden_report_message(
+                    {"id": "rep-x", "content": "📰 **錯誤報告**\n內容"}))
         finally:
             bridge.TOOL_ERROR_REPORTS_ENABLED = orig
 
