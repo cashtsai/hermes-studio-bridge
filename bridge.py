@@ -20,6 +20,7 @@ import glob
 import hashlib
 import hmac
 import json
+import difflib
 import mimetypes
 import os
 import pty
@@ -2100,6 +2101,34 @@ def _steps_stripped(t: str) -> str:
     if body.startswith(tg_outbound.USER_PREFIX):
         body = body[len(tg_outbound.USER_PREFIX):].lstrip()
     return body
+
+
+def _dedup_norm(t: str) -> str:
+    """雙源壓重的比對鍵:剝附錄(_steps_stripped)後再拆掉**所有空白**。
+    canonical 與 state.db 兩份落稿常見開頭多換行/空白微漂,字面比對就漏。"""
+    return re.sub(r"\s+", "", _steps_stripped(t or ""))
+
+
+def _dual_source_dup(body_norm: str, role: str, ts: float, canon_recent) -> bool:
+    """canonical×state.db 雙寫壓重(同 role、±600s 窗)。
+
+    先走完全相等(便宜快路);對不上再走相似度 ≥0.90 模糊比對 —— 兩份落稿
+    會有**措辭微漂**(2026-08-04 xcash/袁方實例:「對話上下文」vs「上下文」、
+    開頭多兩個換行),完全相等永遠對不上 → 同一句在 app 畫面兩顆氣泡,
+    這正是「人格常回覆重複內容」的病根。長度差 >20% 先短路,只比前 400 字,
+    不白付 SequenceMatcher;canon_recent 量級 = 單頁 limit,成本可忽略。
+    純 TG 舊訊息(canonical 無副本)與相隔久遠的同文照舊保留。"""
+    if not body_norm:
+        return False
+    for cts, r, c in canon_recent:
+        if r != role or abs(ts - cts) >= 600 or not c:
+            continue
+        if c == body_norm:
+            return True
+        if abs(len(c) - len(body_norm)) * 5 <= max(len(c), len(body_norm)) and \
+           difflib.SequenceMatcher(None, c[:400], body_norm[:400]).ratio() >= 0.90:
+            return True
+    return False
 
 
 def _tg_mirror_out(session: str, role: str, raw_body: str, mid: str) -> None:
@@ -10732,13 +10761,12 @@ def _hp_merged_messages(session: str, limit: int = 200):
     # canonical 後,state.db 掃描會再掃到同一句 —— 同 role+同文+10 分鐘內
     # 視為同一則,壓掉 tg 側。app 端純 TG 舊訊息(canonical 無副本)不受影響。
     canon_recent = [((m.get("ts") or 0), m.get("role"),
-                     _steps_stripped(m.get("content") or ""))
+                     _dedup_norm(m.get("content") or ""))
                     for m in out if m.get("role") in ("user", "assistant")]
     def _tg_dup(m) -> bool:
-        body = _steps_stripped(m["content"])
-        ts = m["ts"] or 0
-        return bool(body) and any(r == m["role"] and c == body and abs(ts - cts) < 600
-                                  for cts, r, c in canon_recent)
+        # 完全相等 + 相似度模糊後備(措辭微漂也壓得掉),見 _dual_source_dup。
+        return _dual_source_dup(_dedup_norm(m["content"]), m["role"],
+                                m["ts"] or 0, canon_recent)
     try:
         for m in _persona_history(home, limit):
             if _tg_dup(m):
@@ -13286,13 +13314,12 @@ async def app_get_messages(session: str, request: Request, limit: int = 200):
     # 在源頭壓掉 tg 側重複:同 role、剝附錄後正文相同、時間差 10 分鐘內,
     # 視為同一則。純 TG 對話(canonical 無副本)與相隔久遠的同文不受影響。
     canon_recent = [((m.get("ts") or 0), m.get("role"),
-                     _steps_stripped(m.get("content") or ""))
+                     _dedup_norm(m.get("content") or ""))
                     for m in out if m.get("role") in ("user", "assistant")]
     def _tg_dup(m) -> bool:
-        body = _steps_stripped(m["content"])
-        ts = m["ts"] or 0
-        return bool(body) and any(r == m["role"] and c == body and abs(ts - cts) < 600
-                                  for cts, r, c in canon_recent)
+        # 完全相等 + 相似度模糊後備(措辭微漂也壓得掉),見 _dual_source_dup。
+        return _dual_source_dup(_dedup_norm(m["content"]), m["role"],
+                                m["ts"] or 0, canon_recent)
     for m in _persona_history(home, limit):
         if _tg_dup(m):
             continue
