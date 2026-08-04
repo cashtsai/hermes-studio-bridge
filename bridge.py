@@ -10896,6 +10896,216 @@ OPENCLAW.on_event = _oc_events_feed
 OPENCLAW.on_reconnect = _oc_reseed_on_reconnect
 
 
+def _openclaw_default_v2_row() -> dict:
+    return {"id": "openclaw:agent:main:main", "provider": "openclaw",
+            "title": "OpenClaw", "subtitle": None, "status": "idle",
+            "last_event_at": None,
+            "capabilities": ["input", "interrupt", "attachments", "replay", "follow"],
+            "meta": {"default": True}}
+
+
+async def _openclaw_v2_rows(limit: int = 20) -> list:
+    if not OPENCLAW.configured():
+        return []
+    res = await OPENCLAW.call("sessions.list", {"limit": limit}, timeout=10.0)
+    rows = [openclaw_provider.session_v2_row(row)
+            for row in (res or {}).get("sessions", [])[:limit]]
+    if not rows:
+        rows = [_openclaw_default_v2_row()]
+    return rows
+
+
+async def _openclaw_v1_sessions() -> list:
+    """Legacy home/session list shape for clients that do not consume v2 yet.
+
+    OpenClaw is not a Hermes persona registry.  Still, a fresh OpenClaw install
+    needs one obvious conversation entry; expose the gateway's main session as a
+    provider session so old clients have somewhere to send the first message.
+    """
+    try:
+        rows = await _openclaw_v2_rows(20)
+    except Exception as e:  # noqa: BLE001
+        _log_event("openclaw_v1_session_list_failed", error=type(e).__name__,
+                   error_message=str(e)[:160])
+        return []
+    out = []
+    for row in rows:
+        title = row.get("title") or "OpenClaw"
+        if title == "main":
+            title = "OpenClaw"
+        subtitle = row.get("subtitle") or "OpenClaw gateway"
+        out.append({"id": row.get("id"), "type": "openclaw", "provider": "openclaw",
+                    "name": title, "preview": subtitle,
+                    "lastAt": row.get("last_event_at"), "status": row.get("status", "idle"),
+                    "capabilities": row.get("capabilities") or []})
+    return out
+
+
+async def _openclaw_v1_personas() -> list:
+    """Virtual persona-list entry for legacy clients.
+
+    The mobile tab historically reads `/app/v1/personas`, but product-wise that
+    tab is now "the active connection's entries": Hermes exposes personas,
+    OpenClaw exposes its main provider session.  Use id `openclaw` so old v1
+    message routes can map it to `openclaw:agent:main:main`.
+    """
+    sessions = await _openclaw_v1_sessions()
+    preview = (sessions[0].get("preview") if sessions else None) or "OpenClaw gateway"
+    status = (sessions[0].get("status") if sessions else None) or "idle"
+    return [{
+        "id": "openclaw",
+        "name": "OpenClaw",
+        "profile": "main",
+        "home": "",
+        "enabled": True,
+        "deleted": False,
+        "builtin": True,
+        "username": "",
+        "avatar_rev": 0,
+        "provider": "openclaw",
+        "type": "openclaw",
+        "session_id": "openclaw:agent:main:main",
+        "preview": preview,
+        "status": status,
+    }]
+
+
+def _openclaw_key_from_session_id(session_id: str) -> str | None:
+    sid = str(session_id or "").strip()
+    if sid.startswith("openclaw:"):
+        return sid.split(":", 1)[1] or None
+    if sid == "openclaw":
+        return _oc_safe_session_key("agent:main:main")
+    return None
+
+
+def _openclaw_message_text(msg: dict) -> str:
+    try:
+        return carddigest._oc_msg_text(msg.get("content")).strip()
+    except Exception:  # noqa: BLE001
+        content = msg.get("content")
+        if isinstance(content, str):
+            return content.strip()
+        if isinstance(content, list):
+            parts = []
+            for part in content:
+                if isinstance(part, str):
+                    parts.append(part)
+                elif isinstance(part, dict):
+                    parts.append(str(part.get("text") or part.get("content") or ""))
+            return "\n".join(p for p in parts if p).strip()
+        return str(content or "").strip()
+
+
+def _openclaw_message_ts(msg: dict) -> float:
+    for key in ("createdAt", "updatedAt", "ts", "timestamp"):
+        val = msg.get(key)
+        if isinstance(val, (int, float)) and val > 0:
+            return float(val) / 1000.0 if val > 1e11 else float(val)
+    return time.time()
+
+
+def _openclaw_message_role(msg: dict) -> str:
+    raw = str(msg.get("role") or msg.get("speaker") or msg.get("source") or "").lower()
+    if raw in ("user", "human"):
+        return "user"
+    if raw in ("assistant", "agent", "tool"):
+        return "assistant"
+    if msg.get("fromUser") is True:
+        return "user"
+    return "assistant"
+
+
+def _openclaw_v1_message(session_key: str, msg: dict, idx: int) -> dict:
+    mid = str(msg.get("id") or msg.get("messageId") or msg.get("runId")
+              or f"oc-{hashlib.sha1((session_key + ':' + str(idx) + ':' + _openclaw_message_text(msg)).encode()).hexdigest()[:16]}")
+    return {"id": mid, "role": _openclaw_message_role(msg),
+            "content": _openclaw_message_text(msg),
+            "attachments": [], "ts": _openclaw_message_ts(msg),
+            "client_id": msg.get("clientId") or None,
+            "provider": "openclaw", "session": f"openclaw:{session_key}"}
+
+
+async def _openclaw_v1_messages(session_id: str, limit: int = 200) -> dict:
+    key = _openclaw_key_from_session_id(session_id)
+    if not key:
+        raise http_err(400, "SESSION_NOT_FOUND", "unknown openclaw session")
+    try:
+        res = await OPENCLAW.call("chat.history", {"sessionKey": key,
+                                                   "limit": max(1, min(limit, 500))},
+                                  timeout=10.0)
+    except openclaw_provider.OpenClawError as e:
+        _oc_http_error(e)
+    messages = [_openclaw_v1_message(key, msg, i)
+                for i, msg in enumerate((res or {}).get("messages") or [])]
+    return {"messages": messages}
+
+
+async def _openclaw_v1_post_message(body: dict, request: Request):
+    session_id = str(body.get("session") or "openclaw:agent:main:main")
+    key = _openclaw_key_from_session_id(session_id)
+    if not key:
+        raise http_err(400, "SESSION_NOT_FOUND", "unknown openclaw session")
+    content = (body.get("content") or body.get("text") or "").strip()
+    attachments = body.get("attachments") or []
+    client_id = body.get("client_id")
+    dry_run = bool(body.get("dry_run"))
+    cid = "ocmsg-" + uuid.uuid4().hex[:20]
+    created = int(time.time())
+
+    def chunk(delta, finish=None, **extra):
+        payload = {"id": cid, "object": "chat.completion.chunk", "created": created,
+                   "model": session_id,
+                   "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}
+        payload.update(extra)
+        return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+    async def agen():
+        yield chunk({"role": "assistant", "content": ""})
+        try:
+            if dry_run:
+                res = {"run_id": "dry-run"}
+            else:
+                res = await _oc_input_core(
+                    key, f"openclaw:{key}",
+                    {"content": content, "attachments": attachments,
+                     "client_id": client_id})
+            yield chunk({}, None, status={"state": "accepted",
+                                          "label": "OpenClaw 已收到，正在處理。"},
+                        accepted=True, dry_run=dry_run, run_id=res.get("run_id"))
+            yield chunk({}, "stop", accepted=True, dry_run=dry_run,
+                        run_id=res.get("run_id"))
+        except HTTPException as e:
+            yield chunk({"content": f"⚠️ OpenClaw 連線失敗：{e.detail}"},
+                        "stop", error=True)
+        except Exception as e:  # noqa: BLE001
+            _log_event("openclaw_v1_post_failed", error=type(e).__name__,
+                       error_message=str(e)[:160], client=_client_host(request))
+            yield chunk({"content": f"⚠️ OpenClaw 連線失敗：{type(e).__name__}"},
+                        "stop", error=True)
+        yield "data: [DONE]\n\n"
+
+    return StreamingResponse(
+        agen(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache, no-transform",
+                 "X-Accel-Buffering": "no"},
+    )
+
+def _dashboard_active_provider() -> str:
+    """Provider chosen by PocketConnect's first-run installer.
+
+    Clean installs may have more than one runtime present over time (for
+    example the tester tries Hermes, then OpenClaw). Dashboard should reflect
+    the active provider selected for this bridge, not every stale runtime or
+    legacy Hermes health template that happens to exist on disk.
+    """
+    raw = (os.environ.get("POCKET_ACTIVE_PROVIDER")
+           or os.environ.get("POCKET_PROVIDER")
+           or "").strip().lower()
+    return raw if raw in ("hermes", "openclaw", "none") else "auto"
+
+
 def _oc_ensure_pump() -> None:
     """常駐事件泵(單例):配置存在才有意義;未配置時 run_forever 便宜輪空。"""
     t = _OC_PUMP_TASK[0]
@@ -13001,6 +13211,8 @@ async def app_get_messages(session: str, request: Request, limit: int = 200):
     with the Telegram history (Hermes state.db), ordered by time — so every
     device sees the same interleaved conversation."""
     _check_auth(request)
+    if _openclaw_key_from_session_id(session):
+        return await _openclaw_v1_messages(session, limit)
     if session not in PERSONAS:
         raise http_err(400, "SESSION_NOT_FOUND", "unknown session")
     out = _canon_messages(session, limit)
@@ -13775,6 +13987,11 @@ async def personas_list(request: Request):
     should offer is exactly the entries with enabled && !deleted (== the live
     PERSONAS routing table)."""
     _check_auth(request)
+    # OpenClaw 部署(PocketConnect 設 POCKET_ACTIVE_PROVIDER=openclaw)的人格分頁
+    # 顯示 gateway 主 session。刻意用「明確 openclaw」而非快照的 _provider_enabled
+    # (auto 模式對兩個 provider 都回 True,會讓沒設 env 的 Hermes 主機被劫持)。
+    if _dashboard_active_provider() == "openclaw":
+        return {"personas": await _openclaw_v1_personas()}
     rows = {r[0]: r for r in _personas_db_rows()}
     out = []
     for pid, (disp, home) in _PERSONAS_BUILTIN.items():
@@ -14052,6 +14269,8 @@ async def app_post_message(request: Request):
     _check_auth(request)
     body = await request.json()
     session = body.get("session") or "xcash"
+    if _openclaw_key_from_session_id(session):
+        return await _openclaw_v1_post_message(body, request)
     if session not in PERSONAS:
         raise http_err(400, "SESSION_NOT_FOUND", "unknown session")
     content = (body.get("content") or "").strip()
