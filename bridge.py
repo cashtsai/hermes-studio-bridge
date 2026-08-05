@@ -7767,6 +7767,45 @@ async def cc_session_archive(name: str, request: Request):
     return {"ok": True, "archived": True}
 
 
+_CC_COMPRESS_RUNNING: dict = {}   # name -> started_ts(防重複點;compress 要跑數分鐘)
+
+
+@app.post("/ccsessions/{name}/compress")
+async def cc_session_compress(name: str, request: Request):
+    """使用者主動觸發 `ccsess compress <name>`(自建工具:壓接力包落盤 → 清
+    context → 重啟接回)。跑數分鐘,故 fire-and-forget:立即回 started,
+    進度由 session 重啟本身呈現(app 端 status 會看到斷線→回來)。"""
+    _check_auth(request)
+    if not any(row[0] == name for row in _cc_conf_rows()):
+        raise http_err(404, "SESSION_NOT_FOUND", "unknown session")
+    now = time.time()
+    started = _CC_COMPRESS_RUNNING.get(name, 0)
+    if started and now - started < 900:
+        raise http_err(409, "COMPRESS_RUNNING",
+                       f"{name} 壓縮已在進行({int(now - started)}s 前啟動)")
+    _CC_COMPRESS_RUNNING[name] = now
+
+    async def _run():
+        try:
+            p = await asyncio.create_subprocess_exec(
+                os.path.expanduser("~/.local/bin/ccsess"), "compress", name,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+            out, _ = await asyncio.wait_for(p.communicate(), 1200)
+            _log_event("cc_compress_done", session=name, rc=p.returncode,
+                       tail=(out or b"").decode("utf-8", "replace")[-200:])
+        except Exception as e:  # noqa: BLE001
+            _log_event("cc_compress_failed", session=name,
+                       error=type(e).__name__, error_message=str(e)[:160])
+        finally:
+            _CC_COMPRESS_RUNNING.pop(name, None)
+
+    task = asyncio.get_running_loop().create_task(_run())
+    _BG_TASKS.add(task)
+    task.add_done_callback(_BG_TASKS.discard)
+    return {"ok": True, "session": name, "action": "compress", "started": True,
+            "message": f"已啟動 {name} 壓縮(接力包→清 context→重啟),session 會短暫離線再回來"}
+
+
 @app.post("/ccsessions/{name}/login")
 async def cc_session_login(name: str, request: Request):
     """Open Claude Code's official login flow for a managed session.
