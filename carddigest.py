@@ -511,8 +511,48 @@ def _cx_tool_label(item: dict) -> str:
     return ""
 
 
+def _cx_coerce_ts(v):
+    """codex turn/item 時間 → epoch 秒;吃 epoch(秒或毫秒)或 ISO8601 字串。"""
+    if isinstance(v, (int, float)) and v > 0:
+        return float(v) / 1000.0 if v > 1e12 else float(v)   # 毫秒 → 秒
+    if isinstance(v, str) and v.strip():
+        try:
+            from datetime import datetime
+            return datetime.fromisoformat(v.strip().replace("Z", "+00:00")).timestamp()
+        except Exception:
+            return None
+    return None
+
+
+def _cx_item_ts(turn: dict, item: dict):
+    """回放歷史時撈原始時間戳,避免每張卡被 make_card 蓋成 now(歷史訊息時間全變
+    「現在」的根因)。app-server 欄位名不一,逐一試常見鍵;都沒有回 None
+    (→ 沿用 now,不比現狀差)。"""
+    for src in (item, turn):
+        if not isinstance(src, dict):
+            continue
+        for k in ("timestamp", "ts", "createdAt", "created_at", "startedAt",
+                  "started_at", "completedAt", "completed_at", "time", "at"):
+            got = _cx_coerce_ts(src.get(k))
+            if got:
+                return got
+    return None
+
+
 def codex_item_to_cards(item: dict, turn_id: str = "",
-                        phase: str = "completed") -> list[dict]:
+                        phase: str = "completed",
+                        ts: float | None = None) -> list[dict]:
+    """回放/串流 codex item → 卡片。ts 有值(回放歷史,由 _cx_item_ts 撈到)就
+    覆蓋每張卡時間戳,避免歷史全被蓋成現在;None(即時串流)維持 now(正確)。"""
+    cards = _codex_item_to_cards_raw(item, turn_id, phase)
+    if ts:
+        for c in cards:
+            c["ts"] = ts
+    return cards
+
+
+def _codex_item_to_cards_raw(item: dict, turn_id: str = "",
+                             phase: str = "completed") -> list[dict]:
     """一個 codex app-server item → 0..n 張卡。
 
     item id 是 app-server 的穩定識別 → 卡 id 由它衍生；同一 item 的
@@ -732,7 +772,10 @@ class CodexThreadDigest(ApprovalCardMixin):
         for turn in turns or []:
             tid = str(turn.get("id") or "")
             for item in (turn.get("items") or []):
-                for card in codex_item_to_cards(item, turn_id=tid):
+                # 回放歷史:帶入該 turn/item 的原始時間戳,別讓 make_card 蓋成 now
+                # (「歷史訊息時間全變現在」根因)。撈不到就 None → 維持原行為。
+                ts = _cx_item_ts(turn, item)
+                for card in codex_item_to_cards(item, turn_id=tid, ts=ts):
                     card = merge_input_accepted_echo(self.store, card)
                     card = dedupe_transcript_message(self.store, card)
                     if not emit_unchanged and self._same_card(
