@@ -357,6 +357,37 @@ Rules:
   them for delivery/working UI and must not persist them as assistant text.
 - The stream ends with `data: [DONE]`.
 
+### `POST /app/v1/uploads/file`
+
+Uploads one composer attachment as a bearer-authenticated multipart request.
+Pocket uses this endpoint before sending a persona, Claude Code, or Codex turn
+so the client can show byte-level progress and send only a local `path` in the
+turn payload.
+
+Multipart fields:
+
+- `file`: required raw file bytes.
+- `kind`: optional `image|file|audio` (defaults to `file`).
+- `filename`: optional display filename; falls back to the multipart filename.
+- `mime`: optional MIME type; falls back to the multipart content type.
+
+The per-file limit is **2 GiB**. The bridge streams the request to its upload
+directory and removes a partial file when the limit is exceeded. A successful
+response is `{ok: true, attachment: {kind, filename, mime, path, size}}`.
+The legacy `POST /app/v1/uploads` base64 batch endpoint remains available for
+older clients and offline replay.
+
+### `POST /app/v1/uploads/raw`
+
+The current Pocket client uses this endpoint for file-backed attachments. The
+request body is the raw file stream (`application/octet-stream`); the bridge
+does not parse multipart and does not base64-decode the body. Metadata is sent
+in `X-Pocket-Kind`, `X-Pocket-Mime`, and `X-Pocket-Filename-B64` headers. The
+filename header is ASCII-safe for non-ASCII names because it contains standard
+Base64 UTF-8 bytes. The response shape and **2 GiB** per-file limit match the
+multipart endpoint. This route is also exempt from the legacy JSON body-size
+guard, while enforcing the same streaming file cap.
+
 ### Hermes media capabilities and settings
 
 Pocket does not select or call Whisper/OCR providers directly. The dependency
