@@ -134,6 +134,23 @@ class CxDupScenarioTests(unittest.TestCase):
         d.seed_turns(turns, emit_unchanged=False)
         self.assertEqual(d.store.seq, seq_after_first)
 
+    def test_seed期間live事件在歷史之後重播(self):
+        """冷載 await turns/list 時 live 先到,仍須維持舊→新順序。"""
+        d = self._digest()
+        d.seeding = True
+        d.handle("turn/started", {"turn": {"id": "turn-live"}})
+        d.handle("item/completed", {"item": _user_item("live-user", "今天的訊息")})
+        d.feed_approval({"id": "approval-live", "title": "等待確認",
+                         "thread_id": "turn-live"})
+        d.seed_turns([{"id": "turn-old",
+                       "items": [_user_item("old-user", "6/15 的舊訊息")]}])
+        d.finish_seed()
+        users = _user_cards(d.store)
+        self.assertEqual([c["id"] for c in users],
+                         ["card-cx-old-user", "card-cx-live-user"])
+        self.assertIn("card-cx-appr-approval-live", d.store.cards)
+        self.assertFalse(d.seeding)
+
 
 class BridgeWiringTest(unittest.TestCase):
     """接線層:cc 修過同款 race 但 cx 沒接上,就是這次的病因之一 —
