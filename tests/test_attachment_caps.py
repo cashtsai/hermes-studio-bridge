@@ -4,6 +4,7 @@ import os
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 _TMP = tempfile.mkdtemp(prefix="caps-canon-")
 os.environ.setdefault("POCKET_CANON_DB", os.path.join(_TMP, "canonical.db"))
@@ -14,6 +15,9 @@ from fastapi import HTTPException  # noqa: E402
 
 
 class TestAttGuard(unittest.TestCase):
+    def test_production_file_cap_is_2_gib(self):
+        self.assertEqual(bridge._ATT_MAX_FILE_BYTES, 2 * 1024 * 1024 * 1024)
+
     def test_within_limit_pass(self):
         bridge._att_guard([{}] * bridge._ATT_MAX_COUNT)   # 不炸
         bridge._att_guard(None)
@@ -48,8 +52,10 @@ class TestSaveDataURICap(unittest.TestCase):
         bridge.UPLOAD_DIR = self._orig
 
     def test_oversize_rejected(self):
-        big = base64.b64encode(b"x" * (bridge._ATT_MAX_FILE_BYTES + 1024)).decode()
-        self.assertIsNone(bridge._save_data_uri(f"data:text/plain;base64,{big}", "big.txt"))
+        # Keep the test small; the production cap is intentionally 2GiB.
+        with patch.object(bridge, "_ATT_MAX_FILE_BYTES", 1024):
+            big = base64.b64encode(b"x" * (bridge._ATT_MAX_FILE_BYTES + 1024)).decode()
+            self.assertIsNone(bridge._save_data_uri(f"data:text/plain;base64,{big}", "big.txt"))
 
     def test_normal_saved(self):
         uri = "data:text/plain;base64," + base64.b64encode(b"hello").decode()

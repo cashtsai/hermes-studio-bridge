@@ -14,6 +14,7 @@ import os
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 _TMP = tempfile.mkdtemp(prefix="upload-file-canon-")
 os.environ["HOME"] = tempfile.mkdtemp(prefix="upload-file-home-")
@@ -66,10 +67,12 @@ class UploadFileEndpointTest(unittest.TestCase):
     def test_over_single_file_cap_is_413_and_leaves_no_partial(self):
         """超限要中止 **並刪掉半套檔**。留下截斷檔比直接失敗更糟 —— 它看起來
         像上傳成功了,之後誰都分不出那是壞檔。"""
-        big = b"\0" * (bridge._ATT_MAX_FILE_BYTES + 1024)
-        r = self.client.post("/app/v1/uploads/file", headers=AUTH,
-                             files={"file": ("huge.mov", big, "video/quicktime")},
-                             data={"kind": "file"})
+        # Keep the test small; the production cap is intentionally 2GiB.
+        with patch.object(bridge, "_ATT_MAX_FILE_BYTES", 64 * 1024):
+            big = b"\0" * (bridge._ATT_MAX_FILE_BYTES + 1024)
+            r = self.client.post("/app/v1/uploads/file", headers=AUTH,
+                                 files={"file": ("huge.mov", big, "video/quicktime")},
+                                 data={"kind": "file"})
         self.assertEqual(r.status_code, 413)
         self.assertEqual(self._new_files(), set(), "超限卻留下了檔案")
 
@@ -77,6 +80,37 @@ class UploadFileEndpointTest(unittest.TestCase):
         r = self.client.post("/app/v1/uploads/file",
                              files={"file": ("a.txt", b"hi", "text/plain")})
         self.assertIn(r.status_code, (401, 403))
+
+    def test_raw_stream_saves_bytes_and_decodes_filename_metadata(self):
+        import base64
+        raw = b"raw stream bytes"
+        headers = {
+            **AUTH,
+            "Content-Type": "application/octet-stream",
+            "X-Pocket-Kind": "file",
+            "X-Pocket-Mime": "application/octet-stream",
+            "X-Pocket-Filename-B64": base64.b64encode("簡報.bin".encode()).decode(),
+        }
+        # Raw attachment streams bypass the legacy JSON body guard.
+        with patch.object(bridge, "_BODY_MAX_BYTES", 1):
+            r = self.client.post("/app/v1/uploads/raw", headers=headers, content=raw)
+        self.assertEqual(r.status_code, 200, r.text)
+        att = r.json()["attachment"]
+        self.assertEqual(att["filename"], "簡報.bin")
+        self.assertEqual(att["size"], len(raw))
+        with open(att["path"], "rb") as f:
+            self.assertEqual(f.read(), raw)
+
+    def test_raw_stream_over_cap_is_413_and_leaves_no_partial(self):
+        with patch.object(bridge, "_ATT_MAX_FILE_BYTES", 64 * 1024):
+            raw = b"\0" * (bridge._ATT_MAX_FILE_BYTES + 1024)
+            r = self.client.post("/app/v1/uploads/raw", headers={
+                **AUTH,
+                "Content-Type": "application/octet-stream",
+                "X-Pocket-Filename-B64": "aGlnZS5iaW4=",
+            }, content=raw)
+        self.assertEqual(r.status_code, 413)
+        self.assertEqual(self._new_files(), set(), "raw 超限卻留下了檔案")
 
     def test_legacy_batch_endpoint_still_works(self):
         """舊端點不准被動到:舊版 app 還在用,離線補送也走同一支。"""

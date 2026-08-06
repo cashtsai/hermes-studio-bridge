@@ -532,7 +532,11 @@ async def _body_size_guard(request: Request, call_next):
         cl = int(request.headers.get("content-length") or 0)
     except ValueError:
         cl = 0
-    if cl > _BODY_MAX_BYTES:
+    content_type = (request.headers.get("content-type") or "").lower()
+    is_attachment_stream = request.url.path == "/app/v1/uploads/raw" or (
+        request.url.path == "/app/v1/uploads/file" and content_type.startswith("multipart/")
+    )
+    if cl > _BODY_MAX_BYTES and not is_attachment_stream:
         return JSONResponse(status_code=413,
                             content={"error": {"code": "BODY_TOO_LARGE",
                                                "message": f"body 上限 {_BODY_MAX_BYTES} bytes"}})
@@ -690,10 +694,12 @@ _MIME_EXT = {"image/jpeg": ".jpg", "image/png": ".png", "image/gif": ".gif",
 
 
 # 附件上限(修復單「附件限制」bridge 端):count 與 /app/v1/uploads 既有 12 件
-# 一致,推廣到所有直送口;單檔上限給 app 檔案路 8MB 的 4 倍餘裕;全域 body
-# 上限是記憶體防爆閥(12 檔 × 32MB 的 base64 膨脹仍在其下)。
+# 一致,推廣到所有直送口;單檔上限與 Pocket 對齊 2GiB。一般 app 上傳走
+# /app/v1/uploads/raw 的原始串流路徑,舊版則走 /app/v1/uploads/file multipart;
+# 全域 body 仍是 legacy JSON
+# base64 路徑的記憶體防爆閥。
 _ATT_MAX_COUNT = 12
-_ATT_MAX_FILE_BYTES = 32 * 1024 * 1024
+_ATT_MAX_FILE_BYTES = 2 * 1024 * 1024 * 1024
 _BODY_MAX_BYTES = 768 * 1024 * 1024
 
 
@@ -11984,7 +11990,7 @@ async def app_upload_file(request: Request,
     這裡只是多一條路,不是取代。
 
     串流落盤:一次讀 1MB,不把整個檔案堆進記憶體(舊路徑得先把整包 base64 讀進
-    來再 decode,一支 32MB 的影片瞬間吃掉近百 MB)。超過單檔上限就中止並刪掉
+    來再 decode,大型影片也只會由 multipart parser 串流落盤)。超過單檔上限就中止並刪掉
     半套檔案 —— 不留下一個「看起來上傳好了」的截斷檔。
     """
     _check_auth(request)
@@ -12019,6 +12025,70 @@ async def app_upload_file(request: Request,
                client=_client_host(request))
     return {"ok": True, "attachment": {
         "kind": kind or "file",
+        "filename": name,
+        "mime": content_type,
+        "path": str(path),
+        "size": written,
+    }}
+
+
+@app.post("/app/v1/uploads/raw")
+async def app_upload_raw(request: Request):
+    """Upload one raw file stream without multipart or base64 buffering.
+
+    Pocket sends the file directly from disk with URLSession.upload(fromFile:),
+    so a 2GiB attachment never needs a second in-memory representation or a
+    temporary multipart body. Metadata travels in ASCII-safe headers.
+    """
+    _check_auth(request)
+    try:
+        encoded_name = request.headers.get("x-pocket-filename-b64") or ""
+        name = base64.b64decode(encoded_name, validate=True).decode("utf-8") if encoded_name else ""
+    except (ValueError, UnicodeDecodeError):
+        raise HTTPException(status_code=400, detail="invalid filename metadata")
+    name = (name or request.headers.get("x-pocket-filename") or "file").strip()
+    kind = (request.headers.get("x-pocket-kind") or "file").strip()
+    if kind not in {"image", "file", "audio"}:
+        kind = "file"
+    content_type = (request.headers.get("x-pocket-mime") or
+                    request.headers.get("content-type") or
+                    "application/octet-stream").strip()
+    try:
+        content_length = int(request.headers.get("content-length") or 0)
+    except ValueError:
+        content_length = 0
+    if content_length > _ATT_MAX_FILE_BYTES:
+        raise http_err(413, "ATTACHMENT_TOO_LARGE",
+                       f"超過單檔上限 {_ATT_MAX_FILE_BYTES} bytes")
+
+    path = _upload_dest_path(name, content_type)
+    written = 0
+    try:
+        with open(path, "wb") as out:
+            async for chunk in request.stream():
+                if not chunk:
+                    continue
+                written += len(chunk)
+                if written > _ATT_MAX_FILE_BYTES:
+                    raise _UploadTooLarge()
+                out.write(chunk)
+    except _UploadTooLarge:
+        _unlink_quietly(path)
+        _log_event("app_upload_raw_rejected", reason="too_large",
+                   filename=name[:80], mime=content_type[:60],
+                   limit=_ATT_MAX_FILE_BYTES)
+        raise http_err(413, "ATTACHMENT_TOO_LARGE",
+                       f"超過單檔上限 {_ATT_MAX_FILE_BYTES} bytes")
+    except Exception as exc:  # noqa: BLE001
+        _unlink_quietly(path)
+        _log_event("app_upload_raw_failed", filename=name[:80],
+                   error=type(exc).__name__, error_message=str(exc)[:160])
+        raise HTTPException(status_code=500, detail="upload failed")
+    _log_event("app_upload_raw_saved", filename=name[:80],
+               mime=content_type[:60], bytes=written,
+               client=_client_host(request))
+    return {"ok": True, "attachment": {
+        "kind": kind,
         "filename": name,
         "mime": content_type,
         "path": str(path),
