@@ -2656,10 +2656,10 @@ async def _delegation_runtime_status(row) -> str:
     provider = d.get("provider") or ""
     if provider == "codex":
         tid = d.get("codex_thread_id") or d.get("provider_session_id") or ""
-        if tid and CODEX_APP.pending_approval_for_thread(tid):
-            return "waiting_approval"
-        if tid and CODEX_APP.is_active(tid):
-            return "running"
+        if tid:
+            runtime = CODEX_APP.runtime_status(tid, d.get("status") or "")
+            if runtime != "idle":
+                return runtime
         if d.get("status") in ("failed", "archived"):
             return d.get("status")
         return "idle"
@@ -2684,7 +2684,8 @@ async def _delegation_app_sessions() -> list:
             "tool": d.get("provider"),
             "preview": (d.get("objective") or "")[:160],
             "lastAt": d.get("updated_at"),
-            "status": d.get("status"),
+            "status": st,
+            "runtime_status": st,
             "work_order": d.get("work_order"),
             "provider_session_id": d.get("provider_session_id"),
             "takeover": d.get("takeover"),
@@ -2711,7 +2712,7 @@ async def _delegation_v2_sessions() -> list:
             "provider": d.get("provider"),
             "title": d["display_title"],
             "subtitle": f"{d.get('parent_persona')} · {d.get('cwd')}",
-            "status": d.get("status"),
+            "status": st,
             "last_event_at": d.get("updated_at"),
             "capabilities": caps,
             "meta": {"delegation": d, "work_order": d.get("work_order"),
@@ -4055,10 +4056,15 @@ class CodexAppServerClient:
         self.thread_events = collections.defaultdict(list)
         self.thread_event_generations = collections.defaultdict(int)
         self.active_turns = {}
+        self.turn_started_at = {}
+        self.turn_terminal_at = {}
+        self.turn_watchdogs = {}
         self.last_event_at = {}
         self.thread_errors = {}
         self.loaded_threads = set()
         self.remote_status = None
+        self.app_server_error = ""
+        self.server_started_at = 0.0
         self._streamed_item_ids = set()
         self.pending_approvals = {}
         self.pending_approvals_by_thread = collections.defaultdict(dict)
@@ -4096,6 +4102,7 @@ class CodexAppServerClient:
         self.pending_approvals.clear()
         self.pending_approvals_by_thread.clear()
         self._expire_stale_codex_approvals()
+        self.app_server_error = ""
         codex_bin = _resolve_codex_bin()   # 每次 spawn 重新解析:桌面 app 更新後路徑會變
         self.spawned_bin = codex_bin
         try:
@@ -4117,6 +4124,7 @@ class CodexAppServerClient:
             raise CodexAppServerError(f"codex binary unavailable: {codex_bin}") from e
         self._reader_task = asyncio.create_task(self._read_stdout())
         self._stderr_task = asyncio.create_task(self._read_stderr())
+        self.server_started_at = time.time()
         init = await self._call_started_locked(
             "initialize",
             {
@@ -4177,9 +4185,10 @@ class CodexAppServerClient:
         await self.proc.stdin.drain()
 
     async def _read_stdout(self):
+        proc = self.proc
         try:
-            while self.proc and self.proc.stdout:
-                raw = await self.proc.stdout.readline()
+            while proc and proc.stdout:
+                raw = await proc.stdout.readline()
                 if not raw:
                     break
                 try:
@@ -4211,6 +4220,28 @@ class CodexAppServerClient:
             _log_event("codex_app_server_reader_failed", error=type(e).__name__,
                        error_message=str(e)[:160])
         finally:
+            stopped_at = time.time()
+            active = list(self.active_turns)
+            self.app_server_error = "codex app-server stopped"
+            for tid in active:
+                self.thread_errors[tid] = self.app_server_error
+                self.active_turns.pop(tid, None)
+                self.turn_terminal_at[tid] = stopped_at
+                self.last_event_at[tid] = stopped_at
+                self._append(tid, ("text", "\n⚠️ Codex app-server 已掉線，這回合已中止。\n"))
+                task = self.turn_watchdogs.pop(tid, None)
+                if task and task is not asyncio.current_task():
+                    task.cancel()
+                try:
+                    t = asyncio.create_task(_delegation_codex_completed(
+                        tid, True, self.app_server_error))
+                    _BG_TASKS.add(t)
+                    t.add_done_callback(_BG_TASKS.discard)
+                except RuntimeError:
+                    pass
+            self.loaded_threads.clear()
+            if self.proc is proc:
+                self.proc = None
             for fut in list(self._pending.values()):
                 if not fut.done():
                     fut.set_exception(CodexAppServerError("codex app-server stopped"))
@@ -4565,12 +4596,19 @@ class CodexAppServerClient:
         if method == "turn/started" and tid:
             turn = params.get("turn") or {}
             self.active_turns[tid] = turn.get("id") or True
+            self.turn_started_at[tid] = time.time()
+            self.turn_terminal_at.pop(tid, None)
             self.last_event_at[tid] = time.time()
             self.thread_errors.pop(tid, None)
+            self._start_turn_watchdog(tid)
             _codex_history_invalidate(tid)   # cached /history page is now stale
             return
         if method == "turn/completed" and tid:
             self.active_turns.pop(tid, None)
+            self.turn_terminal_at[tid] = time.time()
+            watchdog = self.turn_watchdogs.pop(tid, None)
+            if watchdog and watchdog is not asyncio.current_task():
+                watchdog.cancel()
             self.last_event_at[tid] = time.time()
             _codex_history_invalidate(tid)   # cached /history page is now stale
             self._drop_thread_approvals(tid)
@@ -4580,7 +4618,7 @@ class CodexAppServerClient:
                 msg = err.get("message", err)
                 self.thread_errors[tid] = str(msg)
                 self._append(tid, ("text", f"\n⚠️ Codex turn failed: {msg}\n"))
-            else:
+            elif not self.thread_errors.get(tid, "").startswith("Codex turn stalled"):
                 self.thread_errors.pop(tid, None)
             # M1:是委派 thread → 回流父對話(running→idle/failed 轉換內部去重)。
             try:
@@ -4659,6 +4697,10 @@ class CodexAppServerClient:
         res = await self.call("turn/start", params, timeout=30.0)
         turn = (res or {}).get("turn") or {}
         self.active_turns[thread_id] = turn.get("id") or True
+        self.turn_started_at[thread_id] = time.time()
+        self.turn_terminal_at.pop(thread_id, None)
+        self.last_event_at[thread_id] = time.time()
+        self._start_turn_watchdog(thread_id)
         return res
 
     async def interrupt_turn(self, thread_id: str):
@@ -4670,11 +4712,81 @@ class CodexAppServerClient:
             "turnId": turn_id,
         }, timeout=15.0)
 
+    def _start_turn_watchdog(self, thread_id: str) -> None:
+        previous = self.turn_watchdogs.pop(thread_id, None)
+        if previous:
+            previous.cancel()
+        self.turn_watchdogs[thread_id] = asyncio.create_task(
+            self._watch_turn(thread_id))
+
+    async def _watch_turn(self, thread_id: str) -> None:
+        """Interrupt a live turn that stopped emitting events.
+
+        A live process is not proof that a turn is healthy. Without this
+        watchdog a detached app-server turn leaves the UI permanently busy and
+        prevents the next input from being accepted.
+        """
+        try:
+            while self.is_active(thread_id):
+                await asyncio.sleep(min(5.0, max(1.0, CODEX_TURN_STALL_SECS / 10)))
+                if not self.is_active(thread_id):
+                    return
+                last = self.last_event_at.get(
+                    thread_id, self.turn_started_at.get(thread_id, time.time()))
+                if time.time() - last < CODEX_TURN_STALL_SECS:
+                    continue
+                message = "Codex turn stalled (no provider event)"
+                self.thread_errors[thread_id] = message
+                self.last_event_at[thread_id] = time.time()
+                self._append(thread_id, ("text", "\n⚠️ Codex 回合卡住，已逾時中止。\n"))
+                try:
+                    await asyncio.wait_for(self.interrupt_turn(thread_id), timeout=15.0)
+                except Exception as exc:  # noqa: BLE001
+                    _log_event("codex_turn_interrupt_after_stall_failed",
+                               thread=thread_id[:16], error=type(exc).__name__)
+                self.active_turns.pop(thread_id, None)
+                self.turn_terminal_at[thread_id] = time.time()
+                try:
+                    t = asyncio.create_task(_delegation_codex_completed(
+                        thread_id, True, message))
+                    _BG_TASKS.add(t)
+                    t.add_done_callback(_BG_TASKS.discard)
+                except RuntimeError:
+                    pass
+                return
+        except asyncio.CancelledError:
+            return
+        finally:
+            if self.turn_watchdogs.get(thread_id) is asyncio.current_task():
+                self.turn_watchdogs.pop(thread_id, None)
+
     def events_for(self, thread_id: str) -> list:
         return self.thread_events.get(thread_id, [])
 
     def is_active(self, thread_id: str) -> bool:
         return thread_id in self.active_turns
+
+    def is_server_alive(self) -> bool:
+        return bool(self.proc and self.proc.returncode is None)
+
+    def runtime_status(self, thread_id: str, raw_status: str = "") -> str:
+        if self.pending_approval_for_thread(thread_id):
+            return "waiting_approval"
+        if self.is_active(thread_id):
+            last = self.last_event_at.get(
+                thread_id, self.turn_started_at.get(thread_id, time.time()))
+            if time.time() - last >= CODEX_TURN_STALL_SECS:
+                return "stalled"
+            return "running"
+        error = self.thread_errors.get(thread_id, "")
+        if error:
+            return "failed"
+        if thread_id in self.turn_terminal_at:
+            return "done"
+        raw = (raw_status or "").lower()
+        if raw in {"completed", "done", "success"}:
+            return "done"
+        return "idle"
 
 
 CODEX_APP = CodexAppServerClient()
@@ -4711,6 +4823,10 @@ def _codex_usage_map(tu) -> dict | None:
 def _codex_enrich_summary(summary: dict) -> dict:
     tid = summary.get("thread_id") or summary.get("id") or ""
     summary["activeTurn"] = CODEX_APP.is_active(tid)
+    summary["appServerAlive"] = CODEX_APP.is_server_alive()
+    summary["runtimeStatus"] = CODEX_APP.runtime_status(
+        tid, summary.get("status") or "")
+    summary["status"] = summary["runtimeStatus"]
     usage = _codex_usage_map(CODEX_APP.token_usage.get(tid))
     if usage:
         summary["usage"] = usage
@@ -4745,18 +4861,44 @@ def _codex_source_label(source) -> str:
     return "unknown"
 
 
+def _codex_is_child_thread(thread: dict) -> bool:
+    """Keep ephemeral/subagent threads out of the main operator list.
+
+    `codex exec` creates a normal top-level state-db row, so the provider's
+    source field alone cannot express parent/child ownership. These records
+    remain available through `include_children=true` for debugging.
+    """
+    source = thread.get("source")
+    source_text = str(source or "").lower()
+    source_label = _codex_source_label(source).lower()
+    thread_source = str(thread.get("threadSource") or
+                        thread.get("thread_source") or "").lower()
+    cwd = os.path.realpath(str(thread.get("cwd") or ""))
+    if "guardian" in source_text or "subagent" in source_text:
+        return True
+    if source_label in {"subagent", "guardian"} or thread_source == "subagent":
+        return True
+    # The translation test burst was launched from /private/tmp. Keep this
+    # rule narrow so normal exec-backed maintenance under /Users/xcash stays
+    # visible in the main list.
+    return cwd == "/private/tmp" or cwd.startswith("/private/tmp/")
+
+
 def _codex_session_summary(thread: dict) -> dict:
     tid = thread.get("id") or ""
     name = (thread.get("name") or "").strip()
     preview = (thread.get("preview") or "").strip()
+    provider_status = _codex_status_type(thread.get("status"))
     out = {
         "name": name or preview[:180] or (tid[:12] or "codex"),
         "thread_id": tid,
         "session_id": thread.get("sessionId") or "",
         "workdir": thread.get("cwd") or "",
         "preview": preview[:180],
-        "status": _codex_status_type(thread.get("status")),
+        "status": provider_status,
+        "providerStatus": provider_status,
         "source": _codex_source_label(thread.get("source")),
+        "child": _codex_is_child_thread(thread),
         "updatedAt": thread.get("updatedAt"),
         "modelProvider": thread.get("modelProvider") or "",
     }
@@ -4932,6 +5074,11 @@ async def codex_status(request: Request):
 # duplicates — same pattern as _PANE_CACHE for tmux capture-pane.
 _CODEX_HISTORY_TTL = 4.0
 _CODEX_HISTORY_CACHE: dict = {}   # (thread_id, limit, cursor) -> (cached_at_monotonic, payload)
+# A provider can keep its process alive while a turn has stopped emitting
+# events. Treat that as a stalled turn, interrupt it, and expose the state
+# instead of leaving Pocket's spinner up forever.
+CODEX_TURN_STALL_SECS = float(os.environ.get("CODEX_TURN_STALL_SECS", "300"))
+_CODEX_LIST_MAX_PAGES = 8
 
 
 def _codex_history_invalidate(thread_id: str) -> None:
@@ -4971,10 +5118,14 @@ async def _codex_warm_threads(thread_ids: list) -> None:
 
 @app.get("/codexsessions")
 async def codex_sessions(request: Request, limit: int = 40, cwd: str | None = None,
-                         archived: bool = False, cursor: str | None = None):
+                         archived: bool = False, cursor: str | None = None,
+                         include_children: bool = False):
     _check_auth(request)
+    wanted = max(1, min(limit, 100))
     params = {
-        "limit": max(1, min(limit, 100)),
+        # The provider may return a burst of hidden /private/tmp exec threads
+        # first, so fetch enough rows to fill the visible page after filtering.
+        "limit": min(100, max(wanted, 40)),
         "archived": archived,
         "sourceKinds": ["cli", "vscode", "exec", "appServer"],
         "sortKey": "updated_at",
@@ -4983,11 +5134,29 @@ async def codex_sessions(request: Request, limit: int = 40, cwd: str | None = No
     }
     if cwd:
         params["cwd"] = cwd
-    if cursor:
-        params["cursor"] = cursor
     try:
-        res = await CODEX_APP.call("thread/list", params, timeout=45.0)
-        data = list((res or {}).get("data", []))
+        data = []
+        hidden_children = 0
+        next_cursor = cursor
+        pages = 0
+        while len(data) < wanted and pages < _CODEX_LIST_MAX_PAGES:
+            if next_cursor:
+                params["cursor"] = next_cursor
+            else:
+                params.pop("cursor", None)
+            res = await CODEX_APP.call("thread/list", params, timeout=45.0)
+            batch = list((res or {}).get("data", []))
+            if include_children:
+                data.extend(batch)
+            else:
+                visible = [t for t in batch if not _codex_is_child_thread(t)]
+                hidden_children += len(batch) - len(visible)
+                data.extend(visible)
+            next_cursor = (res or {}).get("nextCursor")
+            pages += 1
+            if not next_cursor or not batch:
+                break
+        data = data[:wanted]
         # B3: warm the few most-recent threads in the background (fire and
         # forget — the list response is NOT delayed by this).
         warm_ids = [t.get("id") for t in data[:4] if t.get("id")]
@@ -4998,7 +5167,9 @@ async def codex_sessions(request: Request, limit: int = 40, cwd: str | None = No
         return {
             "sessions": [_codex_enrich_summary(_codex_session_summary(t))
                          for t in data],
-            "nextCursor": (res or {}).get("nextCursor"),
+            "nextCursor": next_cursor,
+            "includeChildren": include_children,
+            "hiddenChildren": hidden_children,
         }
     except Exception as e:  # noqa: BLE001
         _codex_http_error(e)
@@ -15640,15 +15811,21 @@ async def _weather_fetch_cities(cities=None) -> list:
         r = await client.get(
             "https://api.open-meteo.com/v1/forecast",
             params={"latitude": lat, "longitude": lon,
+                    # precip_prob 改用日「均」而非日「最高」:雨季(台北/曼谷八月)
+                    # 幾乎每天都有某一小時飆到 90-100%,用 _max 就天天顯示 90-100%、
+                    # 誇張且無資訊量(2026-08-07 善彰回報)。_mean 是更代表「整天下雨
+                    # 機會」的單一數字。另附 precipitation_sum(當日雨量 mm)供 app
+                    # 日後顯示「其實只是短陣雨」用。
                     "daily": "temperature_2m_max,temperature_2m_min,"
-                             "precipitation_probability_max",
+                             "precipitation_probability_mean,precipitation_sum",
                     "timezone": tz, "forecast_days": 1})
         r.raise_for_status()
         d = (r.json() or {}).get("daily") or {}
         return {"id": cid, "name": name,
                 "temp_max": (d.get("temperature_2m_max") or [None])[0],
                 "temp_min": (d.get("temperature_2m_min") or [None])[0],
-                "precip_prob": (d.get("precipitation_probability_max") or [None])[0]}
+                "precip_prob": (d.get("precipitation_probability_mean") or [None])[0],
+                "precip_mm": (d.get("precipitation_sum") or [None])[0]}
 
     async with httpx.AsyncClient(timeout=8) as client:
         return list(await asyncio.gather(
