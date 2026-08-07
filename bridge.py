@@ -10940,10 +10940,7 @@ def _cx_cards_feed_approval(record: dict, resolved: str = "") -> None:
     d = _CX_CARD_DIGESTS.get(str(record.get("thread_id") or ""))
     if not d:
         return
-    if resolved:
-        d.resolve_approval(record, resolved)
-    else:
-        d.handle_approval(record)
+    d.feed_approval(record, resolved)
 
 
 def _input_attachment_summary(attachments) -> list[dict]:
@@ -11007,12 +11004,18 @@ async def _cx_seed_card_digest(thread_id: str, d, required: bool = False) -> Non
             _media_capture_sync, f"codex:{thread_id}", turns
         )
         d.seed_turns(turns, emit_unchanged=required)
+        # Seed 期間先收到的 live notification 必須在 canonical 舊→新卡片
+        # 落地後重播，否則 live 卡會先佔住 order 尾端，舊歷史反而接在今天後面。
+        d.finish_seed()
         rec = CODEX_APP.pending_approval_for_thread(thread_id)
         if rec:
             d.handle_approval(rec)
         d.seeded = True
         d.last_seed_at = now
     except Exception as e:  # noqa: BLE001
+        # 即使 canonical seed 失敗，也不能丟掉等待中的 live 事件；讓事件先
+        # 正常落地，下一次 request 再重試 seed。
+        d.finish_seed()
         if required:
             d.seeded = False   # 下次請求重試 seed
             _log_event("cx_card_seed_error", thread=thread_id[:16],
