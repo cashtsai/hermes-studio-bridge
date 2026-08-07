@@ -6449,13 +6449,34 @@ def _persona_preview_merged(session: str, home: str):
     already keeps report_events fresh — so this is just a few cheap read-only
     sqlite queries, safe to run on every /sessions poll."""
     msgs = []
+    canon = []
     try:
-        msgs.extend(_canon_messages(session, 30))          # app turns (canonical.db)
+        canon = _canon_messages(session, 30)               # app turns (canonical.db)
+        msgs.extend(canon)
     except Exception as _exc:  # noqa: BLE001
         _log_exc("_persona_preview_merged", _exc, expected=True)
         pass
     try:
-        msgs.extend(_persona_history(home, 30))            # Telegram (state.db), user-cleaned
+        # ⚠️ TG 側要套**與卡片流同一組過濾**(`_persona_messages` / v2 卡片流的
+        # `_tg_dup` + `_tg_quarantined`)。少套這層 = 預覽顯示一則點進去找不到
+        # 的訊息 —— 使用者體感是「App 弄丟我的訊息」(0806 巡檢 S1)。
+        # ① 雙寫壓重:同一句在 canonical 與 state.db 各留一份,卡片流壓掉 TG 那
+        #    份;預覽若不壓,兩份文字微漂時會挑到卡片流不會顯示的那一份。
+        # ② 活 turn 檢疫:回合進行中的 TG assistant 近訊(1h 內)卡片流先不出頁,
+        #    等 canonical 總結落地;預覽照顯示就會領先畫面一則。
+        canon_recent = [((m.get("ts") or 0), m.get("role"),
+                         _dedup_norm(m.get("content") or ""))
+                        for m in canon if m.get("role") in ("user", "assistant")]
+        quarantine = _session_turn_in_flight(session)
+        q_now = time.time()
+        for m in _persona_history(home, 30):               # Telegram (state.db), user-cleaned
+            if _dual_source_dup(_dedup_norm(m.get("content") or ""), m.get("role"),
+                                m.get("ts") or 0, canon_recent):
+                continue
+            if (quarantine and m.get("role") == "assistant"
+                    and (q_now - (m.get("ts") or 0)) < 3600):
+                continue
+            msgs.append(m)
     except Exception as _exc:  # noqa: BLE001
         _log_exc("_persona_preview_merged#2", _exc, expected=True)
         pass
