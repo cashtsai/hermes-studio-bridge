@@ -746,6 +746,10 @@ class CodexThreadDigest(ApprovalCardMixin):
         self.prompt = None                     # pending approval title（label 素材）
         self.seeded = False
         self.seeding = False
+        # 冷載 seed 會 await app-server 的 turns/list。期間仍可能收到 live
+        # notification；先記下並在 canonical 舊→新卡片落地後依到達順序重播，
+        # 避免「最新 live 在前、較舊 seed 歷史被 append 到尾端」污染對話順序。
+        self._seed_pending: list[tuple[str, object, object]] = []
         self.last_seed_at = 0.0
 
     def _status(self):
@@ -784,8 +788,38 @@ class CodexThreadDigest(ApprovalCardMixin):
                         continue
                     self.store.upsert_card(card)
 
+    def feed_approval(self, record: dict, resolved: str = "") -> None:
+        """Seed 期間也延後 approval 卡，保留 live 與歷史的到達順序。"""
+        if self.seeding:
+            self._seed_pending.append(("approval", dict(record or {}), resolved))
+            return
+        if resolved:
+            self.resolve_approval(record, resolved)
+        else:
+            self.handle_approval(record)
+
+    def finish_seed(self) -> None:
+        """Canonical seed 完成後，依序重播等待中的 live/approval 事件。"""
+        pending = self._seed_pending
+        self._seed_pending = []
+        # 這段同步執行，不會在兩個 replay event 之間被 asyncio 插入新的
+        # bridge notification；先關閉閘門再重播，避免事件再次進 queue。
+        self.seeding = False
+        for kind, first, second in pending:
+            if kind == "event":
+                self.handle(str(first), second if isinstance(second, dict) else {})
+            elif kind == "approval":
+                record = first if isinstance(first, dict) else {}
+                if second:
+                    self.resolve_approval(record, str(second))
+                else:
+                    self.handle_approval(record)
+
     def handle(self, method: str, params: dict):
         """一則 app-server 通知 → 卡片/turn/status 事件。"""
+        if self.seeding:
+            self._seed_pending.append(("event", method, dict(params or {})))
+            return
         if method == "turn/started":
             turn = params.get("turn") or {}
             self.store.turn_id = str(turn.get("id") or "")
