@@ -7644,9 +7644,31 @@ def _cc_scan_jsonl(jsonl):
     return (usage, plan)
 
 
-def _cc_pending_ask(jsonl):
+def _cc_match_question(qs, current):
+    """多題 AskUserQuestion 對齊:jsonl 整組只有一個 tool_use,要三題全答完才寫
+    tool_result,所以無法從 jsonl 判斷「現在問到第幾題」。唯一反映畫面現況的訊號是
+    即時 pane 選單(current)。用 pane 的選項 label 比對每一題的 options,挑最吻合的
+    那題。pane label 會被終端寬度截斷,故雙向 startswith 比對。比不出來(pane 還沒
+    渲染或都不吻合)回 None,呼叫端落回 qs[0](維持原行為)。"""
+    if not current or len(qs) <= 1:
+        return None
+    pane = [p for p in (str((o or {}).get("label") or "").strip()
+                        for o in (current.get("options") or [])) if p]
+    if not pane:
+        return None
+    def _score(q):
+        labels = [str((op or {}).get("label") or "").strip()
+                  for op in (q.get("options") or []) if op]
+        return sum(1 for p in pane
+                   if any(l and (l.startswith(p) or p.startswith(l)) for l in labels))
+    best = max(qs, key=_score)
+    return best if _score(best) > 0 else None
+
+
+def _cc_pending_ask(jsonl, current=None):
     """讀 jsonl 尾巴,找「已發出但還沒被回答」的 AskUserQuestion(tool_use 無對應
     tool_result)→ 回完整結構化 ask(問題全文 + 每個選項 label+description)。
+    多題時用 current(即時 pane 選單)對齊到畫面上正在問的那題,而非永遠第一題。
 
     這是 _cc_prompt 螢幕擷取的內容取代:終端只渲染截斷的 label(砍到終端寬/一行),
     jsonl 的 tool_use input 有全文,app 才判斷得了(否則使用者得回 Claude app 看)。
@@ -7680,7 +7702,7 @@ def _cc_pending_ask(jsonl):
                 qs = (b.get("input") or {}).get("questions") or []
                 if not qs:
                     continue
-                q0 = qs[0]        # app 的 CCPrompt 是單問;多問先送第一題(multi 標記)
+                q0 = _cc_match_question(qs, current) or qs[0]   # 對齊畫面上那題;比不出來落回第一題
                 opts = []
                 for i, op in enumerate(q0.get("options") or []):
                     if not isinstance(op, dict):
@@ -7693,7 +7715,8 @@ def _cc_pending_ask(jsonl):
                 return {"kind": "menu", "semantic": "question",
                         "title": str(q0.get("question") or "").strip(),
                         "header": str(q0.get("header") or "").strip() or None,
-                        "options": opts, "multi": len(qs) > 1}
+                        "options": opts, "multi": len(qs) > 1,
+                        "q_index": qs.index(q0), "q_total": len(qs)}
     return None
 
 
@@ -9433,7 +9456,7 @@ async def _cc_status_core(name: str) -> dict:
     # pane 漏抓且沒在忙 → 也用 jsonl 補上(修「沒跳出來」);忙碌時不補,避免被跳脫的
     # 殘留 ask 誤觸。權限 y/n(非 tool_use)仍走 pane-scrape。
     if jsonl:
-        ask = _cc_pending_ask(jsonl)
+        ask = _cc_pending_ask(jsonl, current=prompt if isinstance(prompt, dict) else None)
         if ask and (
             (isinstance(prompt, dict) and prompt.get("semantic") == "question")
             or (prompt is None and not busy)
@@ -9515,7 +9538,9 @@ async def _cc_key_core(name: str, raw: str) -> dict:
             or (prompt_now is None and not busy_now)
         ):
             jsonl = await _cc_session_jsonl(name, row[1])
-            ask = _cc_pending_ask(jsonl) if jsonl else None
+            ask = _cc_pending_ask(
+                jsonl, current=prompt_now if isinstance(prompt_now, dict) else None
+            ) if jsonl else None
             if ask:
                 prompt_now = ask
         valid_keys = {str(o.get("key") or "").lower()
