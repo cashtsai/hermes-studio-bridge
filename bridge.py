@@ -846,10 +846,12 @@ async def _transcribe_attachments(
 
 
 # ── 會議逐字稿第一段修飾(善彰 2026-08-08:Pocket 會議錄音)───────────────
-# STT 原稿常有缺標點、同音錯字、斷句錯誤。摘要前先用本地 ollama 通用模型
-# (qwen3.5:27b-mlx;實測比 coder 更會修中文同音錯字)做一段「只修標點/錯字、
-# 不改語意」的清稿。失敗一律回原稿,絕不擋錄音→摘要主流程。
-_MEETING_POLISH_MODEL = os.environ.get("MEETING_POLISH_MODEL", "qwen3.5:27b-mlx")
+# STT 原稿常有缺標點、同音錯字、斷句錯誤。摘要前先用本地 ollama 模型做一段
+# 「只修標點/錯字、不改語意」的清稿。失敗一律回原稿,絕不擋錄音→摘要主流程。
+# 模型 = mistral-small3.2(2026-08-08 實測選定):18s、保留繁體、不破壞語意,
+# 修主要錯字+標點。qwen3.5:27b 雖能多修冷僻同音字(慣老闆)但 211s 太慢;
+# qwen3:4b 改壞語意;gpt-oss:20b 轉簡體。要換極致品質版設 MEETING_POLISH_MODEL。
+_MEETING_POLISH_MODEL = os.environ.get("MEETING_POLISH_MODEL", "mistral-small3.2:latest")
 _MEETING_POLISH_PROMPT = (
     "你是逐字稿校對。下面是一段中文會議語音的自動轉錄稿,可能有:缺標點、"
     "同音錯字、口語冗詞、斷句錯誤。請只做「標點與錯字修飾」:\n"
