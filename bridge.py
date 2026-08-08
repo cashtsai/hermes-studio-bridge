@@ -857,6 +857,10 @@ _MEETING_POLISH_PROMPT = (
     "同音錯字、口語冗詞、斷句錯誤。請只做「標點與錯字修飾」:\n"
     "- 加上正確標點與段落斷句\n- 修明顯的同音/辨識錯字\n"
     "- 不改變原意、不增刪內容、不摘要、不翻譯\n- 不確定的字保留原樣\n"
+    "- 專有名詞音近時優先對到這些正確寫法(缺的照聽打):STT、TTS、LLM、OCR、"
+    "API、MCP、Hermes、Pocket、PocketAgent、Ollama、Whisper、Codex、Claude Code、"
+    "FLiPER、Rakutai、一樂拉麵、Culture Supply、新想、"
+    "袁方、潘天晴、水鏡先生、XCash、善彰\n"
     "只輸出修飾後的逐字稿,不要任何說明。\n\n逐字稿:\n"
 )
 
@@ -13745,6 +13749,29 @@ async def app_get_reports(session: str, request: Request, limit: int = 20,
         "preview": _clip_text(r["content"] or "", 200),
         "chars": len(r["content"] or ""),
     } for r in rows]}
+
+
+@app.get("/app/v1/meetings")
+async def app_get_meetings(request: Request, limit: int = 50):
+    """會議記錄列表(Pocket 儀表板會議錄音)——跨所有人格聚合
+    external_source='meeting-recorder' 的逐字稿報告,newest-first。會議可能送給
+    不同人格摘要,故不綁單一 session;回 session 讓 app 能跳回該人格對話。
+    metadata + 200 字 preview,全文走既有 /app/v1/reports/{id}。"""
+    _check_auth(request)
+    limit = max(1, min(int(limit or 50), 200))
+    items = []
+    for pid in list(PERSONAS.keys()):
+        for r in _report_events(pid, max(limit, 50), newest_first=True):
+            if (r.get("external_source") or "") != "meeting-recorder":
+                continue
+            items.append({
+                "id": r["id"], "session": pid, "label": r["label"] or "",
+                "name": r["name"] or "", "ts": r["ts"],
+                "preview": _clip_text(r["content"] or "", 200),
+                "chars": len(r["content"] or ""),
+            })
+    items.sort(key=lambda x: x["ts"] or 0, reverse=True)
+    return {"meetings": items[:limit]}
 
 
 @app.get("/app/v1/reports/{report_id}")
