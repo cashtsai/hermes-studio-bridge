@@ -6,3 +6,7 @@ __pycache__/
 *.pyc
 *.p8
 credentials/
+
+# bridge 執行期輪替 log(不進版控)
+bridge.out.log*
+bridge.err.log*

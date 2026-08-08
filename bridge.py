@@ -845,6 +845,65 @@ async def _transcribe_attachments(
     return " ".join(texts).strip()
 
 
+# ── 會議逐字稿第一段修飾(善彰 2026-08-08:Pocket 會議錄音)───────────────
+# STT 原稿常有缺標點、同音錯字、斷句錯誤。摘要前先用本地 ollama 模型做一段
+# 「只修標點/錯字、不改語意」的清稿。失敗一律回原稿,絕不擋錄音→摘要主流程。
+# 模型 = mistral-small3.2(2026-08-08 實測選定):18s、保留繁體、不破壞語意,
+# 修主要錯字+標點。qwen3.5:27b 雖能多修冷僻同音字(慣老闆)但 211s 太慢;
+# qwen3:4b 改壞語意;gpt-oss:20b 轉簡體。要換極致品質版設 MEETING_POLISH_MODEL。
+_MEETING_POLISH_MODEL = os.environ.get("MEETING_POLISH_MODEL", "mistral-small3.2:latest")
+_MEETING_POLISH_PROMPT = (
+    "你是逐字稿校對。下面是一段中文會議語音的自動轉錄稿,可能有:缺標點、"
+    "同音錯字、口語冗詞、斷句錯誤。請只做「標點與錯字修飾」:\n"
+    "- 加上正確標點與段落斷句\n- 修明顯的同音/辨識錯字\n"
+    "- 不改變原意、不增刪內容、不摘要、不翻譯\n- 不確定的字保留原樣\n"
+    "- 專有名詞音近時優先對到這些正確寫法(缺的照聽打):STT、TTS、LLM、OCR、"
+    "API、MCP、Hermes、Pocket、PocketAgent、Ollama、Whisper、Codex、Claude Code、"
+    "FLiPER、Rakutai、一樂拉麵、Culture Supply、新想、"
+    "袁方、潘天晴、水鏡先生、XCash、善彰\n"
+    "只輸出修飾後的逐字稿,不要任何說明。\n\n逐字稿:\n"
+)
+
+
+async def _polish_transcript(text: str) -> str:
+    """本地模型清稿(標點+錯字);失敗/逾時回原字,絕不擋摘要主流程。
+
+    速度護欄(2026-08-08:首版清稿把回合前置拖到 272s,體感當機):
+    - num_ctx 依逐字稿長度給,不吃模型預設的 262144 大 context(建 KV cache 是
+      冷載入耗時大宗;一段逐字稿 8k~40k token 綽綽有餘)。
+    - 90s 硬上限(asyncio.wait_for):逾時就用原始逐字稿往下走,寧可少一段清稿
+      也不讓使用者枯等。keep_alive 拉長,連錄多段時第二段起省冷載入。
+    """
+    if not text.strip():
+        return text
+    # 中文 1 字約 1.2~1.5 token;輸入+輸出約 3x。夾在 8192~40960。
+    num_ctx = min(40960, max(8192, len(text) * 3 + 2048))
+
+    async def _run() -> str:
+        import httpx
+        async with httpx.AsyncClient(timeout=120) as client:
+            r = await client.post(
+                "http://127.0.0.1:11434/api/chat",
+                json={"model": _MEETING_POLISH_MODEL, "stream": False,
+                      "keep_alive": "15m",
+                      "messages": [{"role": "user",
+                                    "content": _MEETING_POLISH_PROMPT + text}],
+                      "options": {"temperature": 0.2, "num_ctx": num_ctx}})
+            r.raise_for_status()
+            return ((r.json().get("message") or {}).get("content") or "").strip()
+
+    try:
+        out = await asyncio.wait_for(_run(), timeout=90)
+        return out or text
+    except asyncio.TimeoutError:
+        _log_event("meeting_polish_timeout", chars=len(text), num_ctx=num_ctx)
+        return text
+    except Exception as e:  # noqa: BLE001
+        _log_event("meeting_polish_failed",
+                   error=type(e).__name__, error_message=str(e)[:200])
+        return text
+
+
 def _extract_user_parts(messages: list):
     """Last user message → (text, image_paths, [(label, file_path)]). Persists
     any attachments to UPLOAD_DIR."""
@@ -13692,6 +13751,29 @@ async def app_get_reports(session: str, request: Request, limit: int = 20,
     } for r in rows]}
 
 
+@app.get("/app/v1/meetings")
+async def app_get_meetings(request: Request, limit: int = 50):
+    """會議記錄列表(Pocket 儀表板會議錄音)——跨所有人格聚合
+    external_source='meeting-recorder' 的逐字稿報告,newest-first。會議可能送給
+    不同人格摘要,故不綁單一 session;回 session 讓 app 能跳回該人格對話。
+    metadata + 200 字 preview,全文走既有 /app/v1/reports/{id}。"""
+    _check_auth(request)
+    limit = max(1, min(int(limit or 50), 200))
+    items = []
+    for pid in list(PERSONAS.keys()):
+        for r in _report_events(pid, max(limit, 50), newest_first=True):
+            if (r.get("external_source") or "") != "meeting-recorder":
+                continue
+            items.append({
+                "id": r["id"], "session": pid, "label": r["label"] or "",
+                "name": r["name"] or "", "ts": r["ts"],
+                "preview": _clip_text(r["content"] or "", 200),
+                "chars": len(r["content"] or ""),
+            })
+    items.sort(key=lambda x: x["ts"] or 0, reverse=True)
+    return {"meetings": items[:limit]}
+
+
 @app.get("/app/v1/reports/{report_id}")
 async def app_get_report(report_id: str, request: Request):
     """單筆報告全文(唯讀)— Pocket 原生報告閱讀器的資料源。report_id 收
@@ -14677,7 +14759,29 @@ async def _persona_prepare_turn(session: str, content: str, attachments: list,
         attachments, persona_home, stt_lang
     )
     if voice_text:
-        content = (content + "\n" + voice_text).strip() if content else voice_text
+        # 會議錄音(檔名 meeting-*,Pocket 儀表板錄音):先本地模型修飾標點/錯字,
+        # 存成報告(app 卡片流即出現「會議逐字稿」報告卡=可點的逐字稿連結),再把
+        # 修飾稿餵人格出摘要。一般語音訊息(iOS voice message 等)不走此路,維持
+        # 原「轉寫併入 content」行為。修飾/存報告任一失敗都回退,不擋摘要主流程。
+        is_meeting = any(
+            isinstance(a, dict) and a.get("kind") == "audio"
+            and str(a.get("filename") or "").startswith("meeting-")
+            for a in attachments
+        )
+        if is_meeting:
+            polished = await _polish_transcript(voice_text)
+            title = "會議記錄 " + time.strftime("%m/%d %H:%M")
+            try:
+                await asyncio.to_thread(_report_upsert, session, {
+                    "content": polished, "label": "會議逐字稿", "name": title,
+                    "external_source": "meeting-recorder", "ts": time.time(),
+                })
+            except Exception as e:  # noqa: BLE001
+                _log_event("meeting_report_failed",
+                           error=type(e).__name__, error_message=str(e)[:200])
+            content = (content + "\n\n" + polished).strip() if content else polished
+        else:
+            content = (content + "\n" + voice_text).strip() if content else voice_text
 
     parts = []
     if content:
