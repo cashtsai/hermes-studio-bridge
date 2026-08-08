@@ -845,6 +845,42 @@ async def _transcribe_attachments(
     return " ".join(texts).strip()
 
 
+# ── 會議逐字稿第一段修飾(善彰 2026-08-08:Pocket 會議錄音)───────────────
+# STT 原稿常有缺標點、同音錯字、斷句錯誤。摘要前先用本地 ollama 通用模型
+# (qwen3.5:27b-mlx;實測比 coder 更會修中文同音錯字)做一段「只修標點/錯字、
+# 不改語意」的清稿。失敗一律回原稿,絕不擋錄音→摘要主流程。
+_MEETING_POLISH_MODEL = os.environ.get("MEETING_POLISH_MODEL", "qwen3.5:27b-mlx")
+_MEETING_POLISH_PROMPT = (
+    "你是逐字稿校對。下面是一段中文會議語音的自動轉錄稿,可能有:缺標點、"
+    "同音錯字、口語冗詞、斷句錯誤。請只做「標點與錯字修飾」:\n"
+    "- 加上正確標點與段落斷句\n- 修明顯的同音/辨識錯字\n"
+    "- 不改變原意、不增刪內容、不摘要、不翻譯\n- 不確定的字保留原樣\n"
+    "只輸出修飾後的逐字稿,不要任何說明。\n\n逐字稿:\n"
+)
+
+
+async def _polish_transcript(text: str) -> str:
+    """本地模型清稿(標點+錯字);失敗回原字。"""
+    if not text.strip():
+        return text
+    import httpx
+    try:
+        async with httpx.AsyncClient(timeout=600) as client:
+            r = await client.post(
+                "http://127.0.0.1:11434/api/chat",
+                json={"model": _MEETING_POLISH_MODEL, "stream": False,
+                      "messages": [{"role": "user",
+                                    "content": _MEETING_POLISH_PROMPT + text}],
+                      "options": {"temperature": 0.2}})
+            r.raise_for_status()
+            out = ((r.json().get("message") or {}).get("content") or "").strip()
+            return out or text
+    except Exception as e:  # noqa: BLE001
+        _log_event("meeting_polish_failed",
+                   error=type(e).__name__, error_message=str(e)[:200])
+        return text
+
+
 def _extract_user_parts(messages: list):
     """Last user message → (text, image_paths, [(label, file_path)]). Persists
     any attachments to UPLOAD_DIR."""
@@ -14677,7 +14713,29 @@ async def _persona_prepare_turn(session: str, content: str, attachments: list,
         attachments, persona_home, stt_lang
     )
     if voice_text:
-        content = (content + "\n" + voice_text).strip() if content else voice_text
+        # 會議錄音(檔名 meeting-*,Pocket 儀表板錄音):先本地模型修飾標點/錯字,
+        # 存成報告(app 卡片流即出現「會議逐字稿」報告卡=可點的逐字稿連結),再把
+        # 修飾稿餵人格出摘要。一般語音訊息(iOS voice message 等)不走此路,維持
+        # 原「轉寫併入 content」行為。修飾/存報告任一失敗都回退,不擋摘要主流程。
+        is_meeting = any(
+            isinstance(a, dict) and a.get("kind") == "audio"
+            and str(a.get("filename") or "").startswith("meeting-")
+            for a in attachments
+        )
+        if is_meeting:
+            polished = await _polish_transcript(voice_text)
+            title = "會議記錄 " + time.strftime("%m/%d %H:%M")
+            try:
+                await asyncio.to_thread(_report_upsert, session, {
+                    "content": polished, "label": "會議逐字稿", "name": title,
+                    "external_source": "meeting-recorder", "ts": time.time(),
+                })
+            except Exception as e:  # noqa: BLE001
+                _log_event("meeting_report_failed",
+                           error=type(e).__name__, error_message=str(e)[:200])
+            content = (content + "\n\n" + polished).strip() if content else polished
+        else:
+            content = (content + "\n" + voice_text).strip() if content else voice_text
 
     parts = []
     if content:
