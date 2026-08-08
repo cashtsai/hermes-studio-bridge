@@ -860,21 +860,38 @@ _MEETING_POLISH_PROMPT = (
 
 
 async def _polish_transcript(text: str) -> str:
-    """本地模型清稿(標點+錯字);失敗回原字。"""
+    """本地模型清稿(標點+錯字);失敗/逾時回原字,絕不擋摘要主流程。
+
+    速度護欄(2026-08-08:首版清稿把回合前置拖到 272s,體感當機):
+    - num_ctx 依逐字稿長度給,不吃模型預設的 262144 大 context(建 KV cache 是
+      冷載入耗時大宗;一段逐字稿 8k~40k token 綽綽有餘)。
+    - 90s 硬上限(asyncio.wait_for):逾時就用原始逐字稿往下走,寧可少一段清稿
+      也不讓使用者枯等。keep_alive 拉長,連錄多段時第二段起省冷載入。
+    """
     if not text.strip():
         return text
-    import httpx
-    try:
-        async with httpx.AsyncClient(timeout=600) as client:
+    # 中文 1 字約 1.2~1.5 token;輸入+輸出約 3x。夾在 8192~40960。
+    num_ctx = min(40960, max(8192, len(text) * 3 + 2048))
+
+    async def _run() -> str:
+        import httpx
+        async with httpx.AsyncClient(timeout=120) as client:
             r = await client.post(
                 "http://127.0.0.1:11434/api/chat",
                 json={"model": _MEETING_POLISH_MODEL, "stream": False,
+                      "keep_alive": "15m",
                       "messages": [{"role": "user",
                                     "content": _MEETING_POLISH_PROMPT + text}],
-                      "options": {"temperature": 0.2}})
+                      "options": {"temperature": 0.2, "num_ctx": num_ctx}})
             r.raise_for_status()
-            out = ((r.json().get("message") or {}).get("content") or "").strip()
-            return out or text
+            return ((r.json().get("message") or {}).get("content") or "").strip()
+
+    try:
+        out = await asyncio.wait_for(_run(), timeout=90)
+        return out or text
+    except asyncio.TimeoutError:
+        _log_event("meeting_polish_timeout", chars=len(text), num_ctx=num_ctx)
+        return text
     except Exception as e:  # noqa: BLE001
         _log_event("meeting_polish_failed",
                    error=type(e).__name__, error_message=str(e)[:200])
