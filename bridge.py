@@ -10987,17 +10987,23 @@ async def _cc_card_follower(name: str, workdir: str):
                 if not busy and time.time() < getattr(store, "queued_until", 0.0):
                     # input 已送達但 session 還沒接手(忙上一輪/思考中):
                     # 不用 idle 蓋掉「已排入佇列」,避免 UI 誤示「待命」死寂。
-                    store.set_status({"busy": True, "mode": st.get("mode"),
-                                      "prompt": st.get("prompt"),
-                                      "phase": "queued",
-                                      "label": "已排入佇列,等待接手…"})
+                    status = {"busy": True, "mode": st.get("mode"),
+                              "prompt": st.get("prompt"),
+                              "phase": "queued",
+                              "label": "已排入佇列,等待接手…"}
                 else:
                     label = carddigest.cc_status_label(busy, st.get("prompt"),
                                                        store.last_tool, store.saw_output)
-                    store.set_status({"busy": busy, "mode": st.get("mode"),
-                                      "prompt": st.get("prompt"),
-                                      "phase": "run" if busy else "idle",
-                                      "label": label})
+                    status = {"busy": busy, "mode": st.get("mode"),
+                              "prompt": st.get("prompt"),
+                              "phase": "run" if busy else "idle",
+                              "label": label}
+                # v1 /ccsessions status 已算好的 usage {used,size} 順手帶進
+                # v2 session.status(同形,app ContextUsage decoder 直接吃;
+                # 有才帶 —— 缺鍵 = 舊行為,不會把 None 灌給 app)。
+                if st.get("usage"):
+                    status["usage"] = st["usage"]
+                store.set_status(status)
         except Exception as e:  # noqa: BLE001
             _log_event("cc_card_follower_error", session=name, error=str(e)[:200])
             await asyncio.sleep(2.0)
@@ -11851,6 +11857,7 @@ async def v2_session_events(session_id: str, request: Request, since_seq: int = 
     async def gen():
         cursor = since_seq
         store.subscribers += 1
+        waker = store.attach_waker()   # _push 落 ring 即刻喚醒(取代 0.5s 輪詢)
         # issue #7 項目 4:這條原本是全檔唯一「完全沒有出口」的 stream ——
         # 沒有 deadline、沒有 idle 上限,一路 while True。客戶端半死(TCP 沒收
         # FIN,is_disconnected 永遠 False)就永久佔著一個 task + 一個 subscriber
@@ -11863,11 +11870,12 @@ async def v2_session_events(session_id: str, request: Request, since_seq: int = 
         # 必定回傳空 backlog 然後續流 —— 零漏事件。真的漏不掉的情形(bridge
         # 重啟過、ring 滾過)本來就回 410,app 走 snapshot 冷載,行為不變。
         last_event = time.monotonic()
+        last_sent = last_event
+        keepalive = max(1.0, float(SSE_KEEPALIVE_SECS))
         try:
             for ev in backlog:
                 yield f"data: {json.dumps(ev, ensure_ascii=False)}\n\n"
                 cursor = ev["seq"]
-            idle = 0.0
             while True:
                 if await request.is_disconnected():
                     break
@@ -11882,15 +11890,29 @@ async def v2_session_events(session_id: str, request: Request, since_seq: int = 
                     for ev in fresh:
                         yield f"data: {json.dumps(ev, ensure_ascii=False)}\n\n"
                         cursor = ev["seq"]
-                    idle = 0.0
                     last_event = time.monotonic()
-                else:
-                    await asyncio.sleep(0.5)
-                    idle += 0.5
-                    if idle >= max(1.0, float(SSE_KEEPALIVE_SECS)):
-                        idle = 0.0
-                        yield f"data: {json.dumps(store.ping(), ensure_ascii=False)}\n\n"
+                    last_sent = last_event
+                    continue    # 灌流時整批 drain 完再回頭檢查 —— 不逐事件空轉
+                # 已追平 → 事件驅動等待。順序鐵律:先 clear 再重驗 seq。
+                # 單事件圈下 clear 與 wait 之間沒有 await,不可能漏訊號;
+                # 上面 yield 期間落地的 _push 則由這個 re-check 接住。
+                waker.clear()
+                if store.seq > cursor:
+                    continue
+                now = time.monotonic()
+                if now - last_sent >= keepalive:
+                    yield f"data: {json.dumps(store.ping(), ensure_ascii=False)}\n\n"
+                    last_sent = now
+                try:
+                    # 有事件 → waker 秒醒(取代舊 0.5s 輪詢的量化延遲);
+                    # 沒事件 → 準時 timeout 去補 keepalive,節奏不變。
+                    await asyncio.wait_for(
+                        waker.wait(),
+                        timeout=max(0.05, keepalive - (time.monotonic() - last_sent)))
+                except asyncio.TimeoutError:
+                    pass
         finally:
+            store.detach_waker(waker)
             store.subscribers -= 1
 
     return StreamingResponse(gen(), media_type="text/event-stream")

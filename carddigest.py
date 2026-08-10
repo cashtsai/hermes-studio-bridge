@@ -13,6 +13,7 @@ S2（codex app-server 事件）/ S3（persona stream）之後各自加一個
 它，舊 client 永不壞。
 """
 
+import asyncio
 import json
 import hashlib
 import re
@@ -911,6 +912,11 @@ class SessionCardStore(ApprovalCardMixin):
         self.tail_pos = 0
         self.tail_lineno = 0
         self.tail_partial = ""
+        # SSE 喚醒器:每個訂閱者一顆 asyncio.Event(_push 落 ring 當下全部
+        # set,serve loop 不再 0.5s 輪詢)。不共用單顆 Event 是因為多消費者
+        # 的 set/clear 有競態(A clear 掉 B 還沒看到的訊號);每人一顆 +
+        # 「clear 後重驗 seq」就完全不會漏。單事件圈,不需要鎖。
+        self._wakers: set = set()
 
     def _push(self, etype: str, data: dict) -> dict:
         self.seq += 1
@@ -918,7 +924,18 @@ class SessionCardStore(ApprovalCardMixin):
         self.events.append(ev)
         if len(self.events) > self.ring_max:
             del self.events[:len(self.events) - self.ring_max]
+        for w in self._wakers:      # 事件落地即刻喚醒所有 SSE 訂閱者
+            w.set()
         return ev
+
+    def attach_waker(self) -> "asyncio.Event":
+        """SSE 訂閱者註冊喚醒器;斷線務必 detach_waker(不然洩漏)。"""
+        w = asyncio.Event()
+        self._wakers.add(w)
+        return w
+
+    def detach_waker(self, w) -> None:
+        self._wakers.discard(w)
 
     def upsert_card(self, card: dict) -> dict:
         prev = self.cards.get(card["id"])
