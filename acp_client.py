@@ -80,11 +80,31 @@ def canonical_telegram_session(home: str):
     """The session id the TG gateway is CURRENTLY driving for this persona.
 
     Thin accessor over :func:`canonical_telegram_entry` (the session-pinning
-    path only ever needs the id). None when there is no mapping — caller falls
-    back to the state.db heuristic.
+    path only ever needs the id). A stale mapping is ignored when its target
+    is archived or pinned to an Anthropic model; the caller then starts a
+    fresh session from the persona's current configuration.
     """
     found = canonical_telegram_entry(home)
-    return found[1].get("session_id") if found else None
+    sid = found[1].get("session_id") if found else None
+    if not sid:
+        return None
+    import sqlite3
+    db = os.path.join(home, "state.db")
+    if not os.path.exists(db):
+        return None
+    try:
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=5)
+        row = con.execute(
+            "SELECT source, archived, model FROM sessions WHERE id = ? LIMIT 1",
+            (sid,),
+        ).fetchone()
+        con.close()
+        if not row or row[0] != "telegram" or row[1]:
+            return None
+        model = (row[2] or "").lower()
+        return None if model.startswith("claude") else sid
+    except Exception:
+        return None
 
 
 class ACPSession:
@@ -188,21 +208,18 @@ class ACPSession:
             return None
         try:
             con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=5)
-            # Richest TELEGRAM session. Restricted by source: the old any-source
-            # variant could pick a fat acp/cli session, which is exactly the
-            # wrong place to write the persona's canonical conversation.
+            # Only reuse a live, non-Anthropic Telegram session. When the
+            # gateway map is missing, reviving the richest historical session
+            # can pin Pocket to an exhausted Claude credential. If no safe
+            # session exists, the caller creates a fresh session using the
+            # persona's current default model.
             cur = con.execute(
                 "SELECT id FROM sessions "
                 "WHERE message_count > 5 AND source = 'telegram' "
-                "ORDER BY message_count DESC LIMIT 1")
+                "AND archived = 0 "
+                "AND (model IS NULL OR lower(model) NOT LIKE 'claude%') "
+                "ORDER BY COALESCE(ended_at, started_at) DESC LIMIT 1")
             row = cur.fetchone()
-            if not row:
-                # fallback: any non-cron session with messages
-                cur = con.execute(
-                    "SELECT id FROM sessions "
-                    "WHERE message_count > 0 AND source != 'cron' "
-                    "ORDER BY started_at DESC LIMIT 1")
-                row = cur.fetchone()
             con.close()
             return row[0] if row else None
         except Exception:
