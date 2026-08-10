@@ -2202,6 +2202,32 @@ def _session_turn_in_flight(session: str) -> bool:
     return False
 
 
+def _session_turn_started_at(session: str) -> float | None:
+    """本 session 目前進行中回合裡最早的**牆鐘**起始時戳(沒有活回合 → None)。
+
+    活 turn 檢疫要擋的是「這個回合的回覆」的 TG 進度句副本 —— 那必然發生在
+    回合開始**之後**。以前檢疫窗寫死「距今 1h 內全部 TG assistant」(見呼叫端),
+    連回合開始前、早就是既定歷史的訊息也一起扣住,使用者體感是「一小時內講過
+    的話開著回合時全消失、收尾才回來」。改用回合起始時戳當下界,只檢疫真正可能
+    是本回合重複的那些。"""
+    starts = [e.get("wall") for (s, _cid), e in list(_APP_TURN_INFLIGHT.items())
+              if s == session and e.get("task") is not None
+              and not e["task"].done() and e.get("wall")]
+    return min(starts) if starts else None
+
+
+_TG_QUARANTINE_GRACE = 120.0   # TG 寫入時戳與回合牆鐘起始的時鐘偏移容差
+
+
+def _tg_assistant_in_quarantine(turn_started_at, role, ts) -> bool:
+    """回合進行中,只扣住「回合起始之後(含 grace)」的 TG assistant 訊息 ——
+    那才可能是本回合回覆的進度句副本。turn_started_at=None(無活回合)或回合
+    起始前的既定歷史一律放行。取代舊的「距今 1h 內全部 TG assistant」窗。"""
+    if turn_started_at is None or role != "assistant":
+        return False
+    return (ts or 0) >= turn_started_at - _TG_QUARANTINE_GRACE
+
+
 def _dual_source_dup(body_norm: str, role: str, ts: float, canon_recent) -> bool:
     """canonical×state.db 雙寫壓重(同 role、±600s 窗)。
 
@@ -6526,14 +6552,12 @@ def _persona_preview_merged(session: str, home: str):
         canon_recent = [((m.get("ts") or 0), m.get("role"),
                          _dedup_norm(m.get("content") or ""))
                         for m in canon if m.get("role") in ("user", "assistant")]
-        quarantine = _session_turn_in_flight(session)
-        q_now = time.time()
+        turn_started = _session_turn_started_at(session)
         for m in _persona_history(home, 30):               # Telegram (state.db), user-cleaned
             if _dual_source_dup(_dedup_norm(m.get("content") or ""), m.get("role"),
                                 m.get("ts") or 0, canon_recent):
                 continue
-            if (quarantine and m.get("role") == "assistant"
-                    and (q_now - (m.get("ts") or 0)) < 3600):
+            if _tg_assistant_in_quarantine(turn_started, m.get("role"), m.get("ts") or 0):
                 continue
             msgs.append(m)
     except Exception as _exc:  # noqa: BLE001
@@ -10599,7 +10623,7 @@ async def _v2_persona_input(session: str, session_id: str, body: dict,
                 _APP_TURN_INFLIGHT.pop(k, None)
             if _APP_TURN_INFLIGHT.get((session, client_id)) is not None:
                 return {"ok": True, "session_id": session_id, "in_flight": True}
-            inflight_entry = {"ts": _now, "task": None, "state": None}
+            inflight_entry = {"ts": _now, "wall": time.time(), "task": None, "state": None}
             _APP_TURN_INFLIGHT[(session, client_id)] = inflight_entry
 
     try:
@@ -11166,13 +11190,12 @@ def _hp_merged_messages(session: str, limit: int = 200):
         # 完全相等 + 相似度模糊後備(措辭微漂也壓得掉),見 _dual_source_dup。
         return _dual_source_dup(_dedup_norm(m["content"]), m["role"],
                                 m["ts"] or 0, canon_recent)
-    # 活 turn 檢疫:回合進行中,TG 側 assistant 近訊(1 小時內)先不出頁,
-    # 等 canonical 總結落地後由覆蓋壓重定奪(見 _session_turn_in_flight)。
-    _quarantine = _session_turn_in_flight(session)
-    _q_now = time.time()
+    # 活 turn 檢疫:回合進行中,只扣住「回合起始之後」的 TG assistant(可能是
+    # 本回合回覆的進度句副本),等 canonical 總結落地由壓重定奪。起始前的既定
+    # 歷史照常放行(見 _session_turn_started_at)。
+    _turn_started = _session_turn_started_at(session)
     def _tg_quarantined(m) -> bool:
-        return (_quarantine and m["role"] == "assistant"
-                and (_q_now - (m["ts"] or 0)) < 3600)
+        return _tg_assistant_in_quarantine(_turn_started, m["role"], m["ts"] or 0)
     try:
         for m in _persona_history(home, limit):
             if _tg_dup(m) or _tg_quarantined(m):
@@ -12115,9 +12138,12 @@ def _sync_persona_reports(session: str, limit: int = 50) -> list[dict]:
         try:
             if _report_upsert(session, r):
                 upserted += 1
-                # A3-3:名單內的新報告 → kind=notice approval(進通知中心/
-                # 卡片流;approval id 錨在 report id,重同步/改稿不重建)。
-                _notice_for_report(session, r)
+                # 2026-08-10 移除:報告不再自動生 kind=notice「知道了」approval。
+                # 報告本體已經走 TG/推播送達、且在對話裡本來就有一張報告卡,這顆
+                # 「知道了」是多餘的已讀動作 —— 按下去 POST 決議會擾動人格卡片流
+                # (使用者回報「按知道了就回覆斷線」)。改為不建立(_notice_for_report
+                #  仍保留,供未來明確需要通知中心入口時再接;晨報 job 名單見
+                #  NOTICE_REPORT_JOBS)。
         except Exception as e:  # noqa: BLE001
             _log_event("report_event_write_failed", session=session,
                        report_id=r.get("id"), label=r.get("label"),
@@ -13813,13 +13839,12 @@ async def app_get_messages(session: str, request: Request, limit: int = 200):
         # 完全相等 + 相似度模糊後備(措辭微漂也壓得掉),見 _dual_source_dup。
         return _dual_source_dup(_dedup_norm(m["content"]), m["role"],
                                 m["ts"] or 0, canon_recent)
-    # 活 turn 檢疫:回合進行中,TG 側 assistant 近訊(1 小時內)先不出頁,
-    # 等 canonical 總結落地後由覆蓋壓重定奪(見 _session_turn_in_flight)。
-    _quarantine = _session_turn_in_flight(session)
-    _q_now = time.time()
+    # 活 turn 檢疫:回合進行中,只扣住「回合起始之後」的 TG assistant(可能是
+    # 本回合回覆的進度句副本),等 canonical 總結落地由壓重定奪。起始前的既定
+    # 歷史照常放行(見 _session_turn_started_at)。
+    _turn_started = _session_turn_started_at(session)
     def _tg_quarantined(m) -> bool:
-        return (_quarantine and m["role"] == "assistant"
-                and (_q_now - (m["ts"] or 0)) < 3600)
+        return _tg_assistant_in_quarantine(_turn_started, m["role"], m["ts"] or 0)
     for m in _persona_history(home, limit):
         if _tg_dup(m) or _tg_quarantined(m):
             continue
@@ -13969,19 +13994,25 @@ async def app_get_message_events(session: str, request: Request,
     async def gen():
         cursor = int(since or 0)
         deadline = time.monotonic() + (120.0 if follow else 0.0)
-        last_ver = -1    # 首輪必掃(補客戶端斷線期間的積壓)
-        last_scan = 0.0  # 保險絲:就算沒收到信號,至少每 30s 重掃一次
-                         # (防未來新增的 canonical 寫入點忘了掛 _canon_notify)
+        last_ver = -1        # canonical 版本(首輪必掃,補斷線期積壓)
+        last_state_ver = -1  # state.db stat 版本(TG/cron 剛寫入)
+        last_scan = 0.0      # 保險絲:沒收到信號至少每 30s 重掃一次
         while True:
             sent = False
             ver = _CANON_VER.get(session, 0)
-            if ver != last_ver or time.monotonic() - last_scan >= 30.0:
+            sver = _STATEDB_VER.get(session, 0)
+            # 重掃條件:canonical 變 OR state.db 變(TG/cron 寫入)OR 30s 保險絲。
+            # 以前只盯 canonical → 純 TG 訊息(pocket_mirror 以 push=False 寫入、
+            # 不 bump canonical 版本)只能等 30s 兜底,是「TG 同步斷斷續續」主因。
+            # 現在掛 state.db watcher 版本,TG 一寫入 ~0.2s 醒;掃描源也從
+            # canonical-only 換成 `_hp_merged_messages`(canonical ⊕ TG ⊕ 晨報,
+            # 去重/檢疫在合併函式內),與 GET /app/v1/messages 同源 → 即時流看得到 TG。
+            if (ver != last_ver or sver != last_state_ver
+                    or time.monotonic() - last_scan >= 30.0):
                 last_scan = time.monotonic()
-                # 真推送:只有 canonical 寫入過才重掃 DB。原本每 2 秒
-                # 每 follower 讀 80 則+JSON parse 的空轉,是 bridge 閒置
-                # 負載的大宗(N persona × M 裝置全天在跑)。
                 last_ver = ver
-                for msg in _canon_messages(session, 80):
+                last_state_ver = sver
+                for msg in _hp_merged_messages(session, 80):
                     seq = _app_message_seq(msg)
                     if seq <= cursor:
                         continue
@@ -13998,8 +14029,9 @@ async def app_get_message_events(session: str, request: Request,
                 yield "data: [DONE]\n\n"
                 return
             try:
-                await asyncio.wait_for(_canon_wait(session, last_ver),
-                                       timeout=SSE_KEEPALIVE_SECS)
+                await asyncio.wait_for(
+                    _canon_or_statedb_wait(session, last_ver, last_state_ver),
+                    timeout=SSE_KEEPALIVE_SECS)
             except asyncio.TimeoutError:
                 pass
 
@@ -15018,7 +15050,7 @@ async def app_post_message(request: Request):
                 _APP_TURN_INFLIGHT.pop(k, None)   # TTL cleanup on each access
             attached = _APP_TURN_INFLIGHT.get(inflight_key)
             if attached is None:
-                inflight_entry = {"ts": _now, "task": None, "state": None}
+                inflight_entry = {"ts": _now, "wall": time.time(), "task": None, "state": None}
                 _APP_TURN_INFLIGHT[inflight_key] = inflight_entry
 
     if attached is not None:
