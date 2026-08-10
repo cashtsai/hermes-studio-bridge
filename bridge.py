@@ -10777,6 +10777,280 @@ def _cc_card_uid(d: dict, jsonl_path: str, lineno: int) -> str:
     return f"{fh}-L{lineno}"
 
 
+# ─────────── CC token 級串流(pane-diff 草稿卡,旗標 CC_TOKEN_STREAM=1)───────
+# CC 是唯一沒有即時打字感的 provider:jsonl 只在訊息塊「完成」時落一行,
+# 助手回覆整段彈出、還晚 ~1-1.5s(1Hz tail)。Codex/persona 早就用
+# card.upsert rev++ final:false 在同一張卡上流 token,app 已會渲染。
+#
+# 做法(A 案,pane-diff):有訂閱者且 turn 忙碌時,把 pane 擷取頻率提到
+# ~250ms,前後兩張 capture 做「附加文字」diff,萃取新增的助手 prose,
+# 以 final:false 草稿卡漸進 upsert;jsonl 的正典訊息行到達時,正典卡
+# **接管草稿卡的 id**(同 id、rev++、final:true → app 原位換文,零重複)。
+#
+# 不走 B 案(--output-format stream-json):該旗標只在 `-p` print 模式下有效
+# (見 _claude_argv 的 headless 子代理),會整個取代互動式 TUI —— tmux 控制面
+# (send-keys 輸入、審批選單、Esc 中斷、shift+tab 模式切換、--remote-control)
+# 全部報廢。claude 也沒有「TUI 照跑、另開 token 流」的旗標;hooks 只有
+# UserPromptSubmit/Stop,沒有 delta。故 B 案否決。
+#
+# 保守鐵律:diff 對不上(重繪/rewrap/整屏捲動超出視窗)就跳過該 tick 重定
+# 基線,寧可少流一段也不出垃圾;萃取失敗只影響草稿,正典卡永遠會到。
+
+_CC_STREAM_INTERVAL = min(1.0, max(0.1, float(
+    os.environ.get("CC_TOKEN_STREAM_INTERVAL", "0.25"))))  # busy 時擷取節奏
+_CC_STREAM_TAIL_WINDOW = 240     # 舊內容尾端錨定窗(捲動後重新對齊用)
+_CC_STREAM_MAX_TICK = 4000       # 單 tick 附加上限;超過視同重繪,跳過
+_CC_STREAM_MAX_DRAFT = 12000     # 草稿文字上限;飽和後停止增長,等正典卡
+_CC_STREAM_FINAL_GRACE = 4.0     # turn 結束後等正典卡接管的寬限秒數
+
+# 尾端 UI 雜訊(輸入框上方):spinner/狀態行、快捷鍵列、分隔線。
+_CC_STREAM_CHROME_RE = re.compile(
+    r"^\s*(?:[✻✽✶✢✳∗＊·✦✧].*|esc to interrupt.*|\? for shortcuts.*"
+    r"|⏵⏵.*|[─╌╍]{4,}\s*)$", re.IGNORECASE)
+_CC_STREAM_BOX_TOP_RE = re.compile(r"^\s*╭")
+# 「⏺ ToolName(args…)」的工具呼叫塊;誤把 prose 當工具只會少流(正典補),
+# 反向誤判才會把垃圾塞進草稿 —— 所以規則從寬。
+_CC_STREAM_TOOL_RE = re.compile(r"^[A-Za-z][\w.:-]{0,60}\(")
+_CC_STREAM_ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")  # 防禦性(capture -p 本不帶)
+
+
+def _cc_token_stream_enabled() -> bool:
+    """旗標每次呼叫讀 env:預設 OFF,merge 零風險;善彰可在 plist 加
+    CC_TOKEN_STREAM=1 後重啟啟用(per-restart 開關)。"""
+    return str(os.environ.get("CC_TOKEN_STREAM", "")).strip().lower() in (
+        "1", "true", "yes", "on")
+
+
+def _cc_stream_content(pane: str):
+    """pane 擷取 → 對話區純文字;認不出版面(找不到輸入框)回 None,
+    呼叫端跳過該 tick(保守優先)。"""
+    if not pane:
+        return None
+    pane = _CC_STREAM_ANSI_RE.sub("", pane)
+    lines = [ln.rstrip() for ln in pane.splitlines()]
+    box_top = None
+    for i, ln in enumerate(lines):
+        if _CC_STREAM_BOX_TOP_RE.match(ln):
+            box_top = i                     # 取最後一個 ╭ ── 即最下方的輸入框
+    if box_top is None:
+        return None
+    content = lines[:box_top]
+    # 尾端往上剝:空行、spinner/狀態行、busy 計時行(輸入框上那圈雜訊,
+    # 每張 capture 都在變,不剝乾淨 diff 永遠對不上)。
+    while content:
+        tail = content[-1]
+        if not tail.strip() or _CC_STREAM_CHROME_RE.match(tail) \
+                or _CC_BUSY_RE.search(tail):
+            content.pop()
+            continue
+        break
+    return "\n".join(content)
+
+
+def _cc_stream_diff_append(prev: str, new: str):
+    """回 (appended, ok)。ok=False = 對不上(重繪/rewrap),呼叫端重定基線。
+    附加型變化(token 打字、換行)→ new 以 prev 開頭;pane 捲動把頂部擠掉
+    → 用 prev 尾端錨定窗在 new 裡重新對齊。"""
+    if new == prev:
+        return "", True
+    if new.startswith(prev):
+        return new[len(prev):], True
+    # 錨定窗由大到小重試:pane 很短(prev 整串 < 大窗)時,大窗等於整串,
+    # 頂部一捲就永遠對不上 —— 縮窗到還留在畫面上的尾端即可重新對齊。
+    for win in (_CC_STREAM_TAIL_WINDOW, _CC_STREAM_TAIL_WINDOW // 2, 64):
+        tail = prev[-win:]
+        if not tail:
+            continue
+        i = new.rfind(tail)
+        if i != -1:
+            return new[i + len(tail):], True
+    return "", False
+
+
+class CCPaneStream:
+    """每 session 一份的 pane-diff 萃取狀態機(純邏輯,無 I/O,可單測)。
+
+    feed(pane) → (draft_text, changed):維護基線、辨識「⏺ prose / ⏺ Tool(...) /
+    ⎿ 結果 / > 使用者回顯」塊別,只累積助手 prose 進草稿。"""
+
+    def __init__(self):
+        self.baseline = None      # 上一張 content 文字(None = 未定基線)
+        self.in_prose = False     # 目前塊是否為助手 prose
+        self.draft = ""           # 累積草稿
+        self.draft_id = ""        # 開著的草稿卡 id("" = 無)
+        self.draft_turn = ""      # 草稿所屬 turn
+        self.final_deadline = 0.0 # turn 結束後的定稿期限(0 = 未武裝)
+        self._seq = 0             # 草稿卡 id 流水號(跨 turn 不重複)
+
+    # ── 生命週期 ──
+    def begin_turn(self):
+        self.draft = ""
+        self.draft_id = ""
+        self.draft_turn = ""
+        self.in_prose = False
+        self.final_deadline = 0.0
+
+    def resolve_draft(self):
+        """正典卡接管(或定稿)後關閉草稿。in_prose 一併關:同塊殘尾不再
+        另起片段草稿,新 prose 要等下一個 ⏺ 標記。"""
+        self.draft = ""
+        self.draft_id = ""
+        self.draft_turn = ""
+        self.in_prose = False
+        self.final_deadline = 0.0
+
+    def next_draft_id(self, turn_id: str) -> str:
+        self._seq += 1
+        self.draft_id = f"card-cc-stream-{self._seq}-{turn_id or 'noturn'}"
+        self.draft_turn = turn_id
+        return self.draft_id
+
+    # ── 萃取 ──
+    def feed(self, pane: str):
+        before = self.draft
+        content = _cc_stream_content(pane)
+        if content is None:
+            return self.draft, False          # 版面認不出 → 跳過
+        if self.baseline is None:
+            self.baseline = content
+            return self.draft, False
+        appended, ok = _cc_stream_diff_append(self.baseline, content)
+        self.baseline = content
+        if not ok or not appended:
+            return self.draft, False          # 重繪 → 重定基線,不出垃圾
+        if len(appended) > _CC_STREAM_MAX_TICK:
+            return self.draft, False          # 不合理暴增,多半是重繪
+        self._consume(appended)
+        return self.draft, self.draft != before
+
+    def _consume(self, appended: str):
+        parts = appended.split("\n")
+        # parts[0] 是「同一行長出來的字」(token 打字最常見),接在目前塊上。
+        if parts[0] and self.in_prose:
+            self._grow(parts[0], newline=False)
+        for ln in parts[1:]:
+            self._line(ln)
+
+    def _line(self, ln: str):
+        t = ln.strip()
+        if not t:
+            return          # 空行:不動草稿(段落以換行 join 呈現即可)
+        ch = t[0]
+        if ch in "⏺●":
+            rest = t[1:].strip()
+            if _CC_STREAM_TOOL_RE.match(rest):
+                self.in_prose = False          # 工具呼叫塊
+            else:
+                self.in_prose = True
+                if rest:
+                    self._grow(rest, newline=True)
+        elif ch in "⎿>│╭╰❯":
+            self.in_prose = False              # 工具結果/使用者回顯/框線
+        elif _CC_STREAM_CHROME_RE.match(ln) or _CC_BUSY_RE.search(ln):
+            return                             # 漏網雜訊:忽略,不翻塊別
+        else:
+            if self.in_prose:
+                self._grow(t, newline=True)
+
+    def _grow(self, piece: str, newline: bool):
+        if len(self.draft) >= _CC_STREAM_MAX_DRAFT:
+            return                             # 飽和:停止增長,等正典卡
+        if newline and self.draft and not self.draft.endswith("\n"):
+            piece = "\n" + piece
+        self.draft = (self.draft + piece)[:_CC_STREAM_MAX_DRAFT]
+
+
+def _cc_stream_state(store) -> CCPaneStream:
+    st = getattr(store, "cc_stream", None)
+    if st is None:
+        st = store.cc_stream = CCPaneStream()
+    return st
+
+
+def _cc_stream_upsert_draft(store, st: CCPaneStream, draft: str):
+    if not st.draft_id:
+        st.next_draft_id(store.turn_id)
+    st.draft = draft
+    store.upsert_card(carddigest.make_card(
+        st.draft_id, st.draft_turn or store.turn_id, "assistant", "markdown",
+        {"text": draft, "fallback_text": draft, "origin": "pane.stream"},
+        final=False))
+
+
+def _cc_stream_reconcile(store, card: dict) -> dict:
+    """jsonl 正典助手 markdown 卡落地 → 接管開著的草稿卡 id。
+    app 端同 id、rev++、final:true → 原位換成正典全文,草稿無痕退場。
+    只碰「還不在庫裡」的新卡;重放/rev 遞增路徑原樣通過。"""
+    st = getattr(store, "cc_stream", None)
+    if not st or not st.draft_id:
+        return card
+    if (isinstance(card, dict) and card.get("role") == "assistant"
+            and card.get("kind") == "markdown"
+            and card.get("id") not in getattr(store, "cards", {})):
+        out = dict(card)
+        out["id"] = st.draft_id
+        st.resolve_draft()
+        return out
+    return card
+
+
+def _cc_stream_finalize(store, st: CCPaneStream):
+    """正典卡遲遲不來(被 digest 濾掉等)→ 草稿自行定稿,不讓 app 永遠
+    掛著 final:false 的「打字中」。文字以庫裡那張卡為準(st.draft 只是
+    extractor 的工作副本)。"""
+    if st.draft_id:
+        prev = (getattr(store, "cards", {}) or {}).get(st.draft_id) or {}
+        text = (st.draft or (prev.get("body") or {}).get("text") or "").strip()
+        if text:
+            store.upsert_card(carddigest.make_card(
+                st.draft_id, st.draft_turn or store.turn_id, "assistant",
+                "markdown",
+                {"text": text, "fallback_text": text,
+                 "origin": "pane.stream"}))
+    st.resolve_draft()
+
+
+def _cc_stream_on_turn_begin(store):
+    st = _cc_stream_state(store)
+    if st.draft_id:
+        _cc_stream_finalize(store, st)   # 上一 turn 的殘稿先定稿再歸零
+    st.begin_turn()
+
+
+def _cc_stream_on_turn_end(store):
+    st = getattr(store, "cc_stream", None)
+    if st and st.draft_id:
+        st.final_deadline = time.time() + _CC_STREAM_FINAL_GRACE
+
+
+def _cc_stream_finalize_expired(store):
+    st = getattr(store, "cc_stream", None)
+    if st and st.draft_id and st.final_deadline \
+            and time.time() > st.final_deadline:
+        _cc_stream_finalize(store, st)
+
+
+async def _cc_stream_subticks(name: str, store):
+    """busy + 有訂閱者時的快節奏子迴圈:總長約 1s(取代外圈那次 sleep),
+    每 _CC_STREAM_INTERVAL 抓一張新鮮 pane、diff、upsert 草稿。
+    任何一 tick 例外只記 log 並提前收工 —— 絕不外洩打死 follower。"""
+    ticks = max(1, int(round(1.0 / _CC_STREAM_INTERVAL)))
+    for _ in range(ticks):
+        await asyncio.sleep(_CC_STREAM_INTERVAL)
+        if store.subscribers <= 0:
+            return                         # 訂閱者中途走光 → 立刻停
+        try:
+            st = _cc_stream_state(store)
+            pane = await _cc_capture_pane_fresh(name)
+            draft, changed = st.feed(pane)
+            if changed and draft.strip():
+                _cc_stream_upsert_draft(store, st, draft)
+        except Exception as e:  # noqa: BLE001
+            _log_event("cc_stream_tick_error", session=name,
+                       error=type(e).__name__, error_message=str(e)[:160])
+            return
+
+
 def _cc_image_sink(session_id: str):
     """carddigest 的 base64 圖入庫回呼:decode → media store capture_bytes →
     回 {media_id, download_url, filename, mime} 給 attachment 卡。單張失敗回
@@ -10820,6 +11094,8 @@ def _cc_digest_lines(store, lines, jsonl_path: str, start_lineno: int) -> int:
                 d, uid, turn_id=store.turn_id,
                 image_sink=_cc_image_sink(getattr(store, "media_session_id", "") or "cc")):
             card = carddigest.merge_input_accepted_echo(store, card)
+            # CC_TOKEN_STREAM:正典助手卡接管 pane-diff 草稿卡的 id(原位換文)。
+            card = _cc_stream_reconcile(store, card)
             store.upsert_card(card)
             n += 1
             if card["kind"] == "tool_call":
@@ -10876,7 +11152,7 @@ async def _cc_card_follower(name: str, workdir: str):
     await _cc_card_seed(store, name, workdir)
     prev_busy = None
     while True:
-        await asyncio.sleep(1.0)
+        streamed = False
         try:
             cur = await _cc_session_jsonl(name, workdir)
             if cur != store.tail_file:               # session 換了新 jsonl
@@ -10916,9 +11192,13 @@ async def _cc_card_follower(name: str, workdir: str):
                         store.saw_output = False
                         store.last_tool = ""
                         store.push_turn("begin", store.turn_id)
+                        if _cc_token_stream_enabled():
+                            _cc_stream_on_turn_begin(store)
                     else:
                         store.push_turn("end", store.turn_id)
                         store.turn_id = ""
+                        if _cc_token_stream_enabled():
+                            _cc_stream_on_turn_end(store)
                 prev_busy = busy
                 if not busy and time.time() < getattr(store, "queued_until", 0.0):
                     # input 已送達但 session 還沒接手(忙上一輪/思考中):
@@ -10934,9 +11214,19 @@ async def _cc_card_follower(name: str, workdir: str):
                                       "prompt": st.get("prompt"),
                                       "phase": "run" if busy else "idle",
                                       "label": label})
+                # CC_TOKEN_STREAM(預設 OFF):busy + 有訂閱者才啟動快節奏
+                # pane-diff 子迴圈(約 1s,取代外圈 sleep);idle/無人看零成本。
+                if _cc_token_stream_enabled():
+                    _cc_stream_finalize_expired(store)
+                    if busy:
+                        streamed = True
+                        await _cc_stream_subticks(name, store)
         except Exception as e:  # noqa: BLE001
             _log_event("cc_card_follower_error", session=name, error=str(e)[:200])
             await asyncio.sleep(2.0)
+            continue
+        if not streamed:
+            await asyncio.sleep(1.0)
 
 
 def _ensure_cc_card_follower(name: str, workdir: str):
