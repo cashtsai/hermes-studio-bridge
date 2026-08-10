@@ -4969,6 +4969,51 @@ def _codex_is_child_thread(thread: dict) -> bool:
     return cwd == "/private/tmp" or cwd.startswith("/private/tmp/")
 
 
+async def _codex_v2_visible_threads(wanted: int = 20) -> list[dict]:
+    """Return the main Codex threads for the v2 control-plane list.
+
+    Codex can place a large burst of guardian/subagent threads at the head of
+    ``thread/list``.  Fetching only the first ``wanted`` provider rows made
+    older operator threads, including the XCash lane, disappear from Pocket.
+    Keep the provider page large and paginate until the visible quota is full.
+    """
+    wanted = max(1, min(int(wanted or 20), 100))
+    params = {
+        "limit": min(100, max(wanted, 40)),
+        "archived": False,
+        "sourceKinds": ["cli", "vscode", "exec", "appServer"],
+        "sortKey": "updated_at",
+        "sortDirection": "desc",
+        "useStateDbOnly": False,
+    }
+    global _CODEX_V2_VISIBLE_CACHE
+    visible: list[dict] = []
+    cursor = None
+    try:
+        for _ in range(_CODEX_LIST_MAX_PAGES):
+            if cursor:
+                params["cursor"] = cursor
+            else:
+                params.pop("cursor", None)
+            res = await CODEX_APP.call("thread/list", params, timeout=10.0)
+            batch = list((res or {}).get("data", []))
+            visible.extend(t for t in batch if not _codex_is_child_thread(t))
+            if len(visible) >= wanted:
+                break
+            cursor = (res or {}).get("nextCursor")
+            if not cursor or not batch:
+                break
+    except Exception as e:  # noqa: BLE001
+        if _CODEX_V2_VISIBLE_CACHE:
+            _log_event("codex_thread_list_stale", surface="v2",
+                       count=len(_CODEX_V2_VISIBLE_CACHE),
+                       error=type(e).__name__)
+            return _CODEX_V2_VISIBLE_CACHE[:wanted]
+        raise
+    _CODEX_V2_VISIBLE_CACHE = [dict(t) for t in visible]
+    return visible[:wanted]
+
+
 def _codex_session_summary(thread: dict) -> dict:
     tid = thread.get("id") or ""
     name = (thread.get("name") or "").strip()
@@ -5164,6 +5209,8 @@ _CODEX_HISTORY_CACHE: dict = {}   # (thread_id, limit, cursor) -> (cached_at_mon
 # instead of leaving Pocket's spinner up forever.
 CODEX_TURN_STALL_SECS = float(os.environ.get("CODEX_TURN_STALL_SECS", "300"))
 _CODEX_LIST_MAX_PAGES = 8
+_CODEX_SESSION_LIST_CACHE: dict = {}
+_CODEX_V2_VISIBLE_CACHE: list[dict] = []
 
 
 def _codex_history_invalidate(thread_id: str) -> None:
@@ -5219,6 +5266,7 @@ async def codex_sessions(request: Request, limit: int = 40, cwd: str | None = No
     }
     if cwd:
         params["cwd"] = cwd
+    cache_key = (bool(archived), cwd or "", bool(include_children))
     try:
         data = []
         hidden_children = 0
@@ -5242,6 +5290,13 @@ async def codex_sessions(request: Request, limit: int = 40, cwd: str | None = No
             if not next_cursor or not batch:
                 break
         data = data[:wanted]
+        # Keep only the first page as a read-only fallback. A later cursor page
+        # must never overwrite the main-list cache with a partial history page.
+        if cursor is None:
+            _CODEX_SESSION_LIST_CACHE[cache_key] = {
+                "data": [dict(t) for t in data],
+                "hidden_children": hidden_children,
+            }
         # B3: warm the few most-recent threads in the background (fire and
         # forget — the list response is NOT delayed by this).
         warm_ids = [t.get("id") for t in data[:4] if t.get("id")]
@@ -5257,6 +5312,18 @@ async def codex_sessions(request: Request, limit: int = 40, cwd: str | None = No
             "hiddenChildren": hidden_children,
         }
     except Exception as e:  # noqa: BLE001
+        cached = _CODEX_SESSION_LIST_CACHE.get(cache_key) if cursor is None else None
+        if cached and cached.get("data"):
+            _log_event("codex_thread_list_stale", surface="codexsessions",
+                       count=len(cached["data"]), error=type(e).__name__)
+            return {
+                "sessions": [_codex_enrich_summary(_codex_session_summary(t))
+                             for t in cached["data"][:wanted]],
+                "nextCursor": None,
+                "includeChildren": include_children,
+                "hiddenChildren": cached.get("hidden_children", 0),
+                "stale": True,
+            }
         _codex_http_error(e)
 
 
@@ -10420,10 +10487,7 @@ async def v2_sessions(request: Request, provider: str = "", status: str = ""):
                     "meta": ({"approval": pend} if pend else {})})
     delegated_codex_ids = _delegated_codex_thread_ids()
     try:
-        res = await CODEX_APP.call("thread/list",
-                                   {"limit": 20, "archived": False, "sortKey": "updated_at",
-                                    "sortDirection": "desc", "useStateDbOnly": False}, timeout=10.0)
-        for t in (res or {}).get("data", [])[:20]:
+        for t in await _codex_v2_visible_threads(20):
             s = _codex_enrich_summary(_codex_session_summary(t))
             if (s.get("thread_id") or s.get("id")) in delegated_codex_ids:
                 continue
