@@ -39,6 +39,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
+import agent_registry
 import media_artifacts
 import hermes_media
 import openclaw_provider
@@ -5376,7 +5377,18 @@ async def codex_session_archive(thread_id: str, request: Request):
         pass
     _check_auth(request)
     archived = body.get("archived", True)
-    # Try the known method names in order (the app server build varies).
+    try:
+        method = await _codex_thread_set_archived(thread_id, bool(archived))
+    except Exception as e:  # noqa: BLE001
+        _codex_http_error(e)
+    return {"ok": True, "method": method}
+
+
+async def _codex_thread_set_archived(thread_id: str, archived: bool = True) -> str:
+    """Archive/unarchive a Codex thread via the app server, trying the known
+    method names in order (the app server build varies). Shared by the archive
+    endpoint and the registry reaper. Returns the method that worked; raises
+    the last error when every variant fails."""
     last = None
     methods = (
         (
@@ -5394,11 +5406,11 @@ async def codex_session_archive(thread_id: str, request: Request):
     for method, params in methods:
         try:
             await CODEX_APP.call(method, params, timeout=15.0)
-            return {"ok": True, "method": method}
+            return method
         except Exception as e:  # noqa: BLE001
             _log_exc("codex_session_archive#2", e, expected=True)
             last = e
-    _codex_http_error(last or Exception("archive failed"))
+    raise last or Exception("archive failed")
 
 
 @app.post("/codexsessions")
@@ -5418,6 +5430,9 @@ async def codex_session_create(request: Request):
     }
     if body.get("model"):
         params["model"] = body.get("model")
+    # 戶政(藍圖 §3.1):thread/start 之前先過配額——超額 429,不生孤兒 thread。
+    reg_parent, reg_cls, reg_purpose = _registry_spawn_fields(body, default_cls="task")
+    _registry_precheck_or_429(reg_parent, reg_cls)
     try:
         res = await CODEX_APP.call("thread/start", params, timeout=30.0)
         thread = (res or {}).get("thread") or {}
@@ -5425,6 +5440,9 @@ async def codex_session_create(request: Request):
         if not thread_id:
             raise CodexAppServerError("thread/start returned no thread id")
         CODEX_APP.loaded_threads.add(thread_id)
+        _registry_register(f"codex:{thread_id}", provider="codex",
+                           name=text[:40] or thread_id, purpose=reg_purpose,
+                           cls=reg_cls, parent=reg_parent)
         await CODEX_APP.start_turn(thread_id, input_items,
                                    client_id=body.get("client_id"), cwd=cwd)
         _cx_feed_input_accepted(
@@ -6150,6 +6168,7 @@ async def codex_session_input(thread_id: str, request: Request):
     # 就送不出訊息了)。
     _check_auth(request)
     body = await _json_body(request)
+    _registry_call_safe("touch", f"codex:{thread_id}")   # 戶政:活動記帳
     input_items = await _codex_input_items((body.get("text") or "").strip(),
                                            body.get("attachments") or [])
     if not input_items:
@@ -6431,6 +6450,9 @@ async def _stream_agent(sid: str, argv: list, cwd: str, fail_label: str):
                 _log_exc("_stream_agent.kill", _exc, expected=True, sid=sid)
         if sub.get("status") != "stalled":
             sub["status"] = "done"
+            # 戶政:headless dispatch 行程結束 = 真正完工(不是 turn 完成的
+            # 過度激進判定)→ 記 done,由 reaper 下一輪照寬限歸檔。
+            _registry_call_safe("mark_done", sid)
         sub["lastAt"] = time.time()
         # Isolated dispatch: reclaim the worktree if the agent left it clean.
         if sub.get("worktree"):
@@ -6456,6 +6478,9 @@ async def _run_dispatch(sid: str, tool: str, task: str, cwd: str, isolate: bool 
             sub["worktree"] = wt
             sub["base_cwd"] = cwd   # fall back here if the worktree is reclaimed
             sub["cwd"] = wt   # follow-ups stay in the same isolated tree
+            # 戶政:worktree 實際路徑落籍——reaper 只收「登記過路徑」的樹,
+            # 絕不用猜的(藍圖 §3.2)。
+            _registry_call_safe("set_worktree", sid, wt)
             sub["output"].append(("text", f"_(隔離工作區 worktree:`{wt}` · 分支 `pocket/{sid}`)_\n\n"))
     if tool == "codex":
         argv = [_resolve_codex_bin(), "exec", "--json", task]
@@ -8493,11 +8518,16 @@ async def cc_session_create(request: Request):
     # pin(`ccsess model <name> <model>`),讓企劃/大局思考類任務可指定旗艦
     # 模型、機械性任務指定輕量模型,不必全域切換 delegation.model。
     cc_model = (body.get("model") or "").strip()
+    # 戶政(藍圖 §3.1):配額前檢在真正 spawn 之前——超額就地 429,不留孤兒。
+    reg_parent, reg_cls, reg_purpose = _registry_spawn_fields(body, default_cls="task")
+    _registry_precheck_or_429(reg_parent, reg_cls)
     _cc_write_remote_control_pin(name)
     new_args = ["new", name, wd] + ([cc_model] if cc_model else [])
     await _run_ccsess(*new_args)
     _cc_mark_app_owned(name)   # 這條是 app 開的 → 只有它的審核會進 app(見 _cc_approval_watcher)
     ready = await _cc_wait_ready(name)
+    _registry_register(f"claude_code:{name}", provider="claude_code", name=name,
+                       purpose=reg_purpose, cls=reg_cls, parent=reg_parent)
     return {"ok": True, "session": {"name": name, "workdir": wd,
                                     "status": "running" if ready else "starting",
                                     "model": cc_model or None}}
@@ -8832,6 +8862,7 @@ async def cc_session_input(name: str, request: Request):
 async def _cc_input_core(name: str, body: dict) -> dict:
     """cc 輸入核心 — /ccsessions/{name}/input 與 v2 統一路由 input 共用。
     附件轉存＋語音轉寫＋tmux bracketed paste。"""
+    _registry_call_safe("touch", f"claude_code:{name}")   # 戶政:活動記帳
     text = (body.get("text") or body.get("content") or "").strip()
     client_id = str(body.get("client_id") or "").strip()
     _att_guard(body.get("attachments"))   # 修復單「附件限制」:直送口件數閥
@@ -10627,6 +10658,10 @@ async def v2_session_input(session_id: str, request: Request):
     _check_auth(request)
     body = await _json_body(request)
     src = _v2_card_source(session_id)
+    # 戶政:任何 turn 輸入 = 活著的證據(active⇄idle 的 idle 判定基準)。
+    _registry_call_safe("touch", session_id)
+    if src[0] == "cx" and not session_id.startswith("codex:"):
+        _registry_call_safe("touch", f"codex:{src[1]}")
     if src[0] == "cc":
         res = await _cc_input_core(src[1], body)
         return {"session_id": session_id, **res}
@@ -13934,6 +13969,12 @@ async def app_delegation_create(request: Request):
                                 detail="parent already has 3 running children")
     did = "dlg-" + uuid.uuid4().hex[:16]
     now = time.time()
+    # 戶政(藍圖 §3.1):registry 配額前檢(depth/子額/全域 task 上限)。
+    # 家譜:互調鏈掛父 delegation,人手派工掛發起人格(persistent 常駐)。
+    reg_parent = (f"delegation:{parent_dlg_id}" if parent_dlg_id
+                  else f"hermes:{parent}")
+    reg_cls = _registry_class_of(body, default_cls="task")
+    _registry_precheck_or_429(reg_parent, reg_cls)
     prompt = _delegation_prompt(work_order, parent, title, objective, cwd, body)
     provider_session_id = ""
     codex_thread_id = ""
@@ -14034,6 +14075,12 @@ async def app_delegation_create(request: Request):
         _delegation_insert(row)
     except Exception as e:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=f"delegation registry write failed: {e}")
+    _registry_register(
+        f"delegation:{did}", provider=provider, name=title,
+        purpose=(body.get("purpose") or "").strip() or objective[:200],
+        cls=reg_cls, parent=reg_parent,
+        meta={"work_order": work_order, "cc_session_name": cc_session_name,
+              "codex_thread_id": codex_thread_id})
     _log_event("delegation_created",
                work_order=work_order,
                parent_persona=parent,
@@ -16155,11 +16202,19 @@ async def dispatch(request: Request):
     isolate = bool(body.get("isolate"))
     if not task:
         raise http_err(400, "TASK_REQUIRED", "task required")
+    # 戶政(藍圖 §3.1):派工前過配額;headless dispatch 屬短命工,預設 task。
+    reg_parent = (str(body.get("parent_session") or "").strip()
+                  or (f"hermes:{parent}" if parent in PERSONAS else None))
+    reg_cls = _registry_class_of(body, default_cls="task")
+    _registry_precheck_or_429(reg_parent, reg_cls)
     sid = "sub-" + uuid.uuid4().hex[:16]
     SUBSESSIONS[sid] = {"name": task[:40], "parent": parent, "tool": tool,
                         "status": "running", "lastAt": time.time(), "cwd": cwd,
                         "proc": None, "output": [("text", f"**任務:** {task}\n\n")]}
     _subsession_persist(sid)   # issue #5: registered rows survive a restart
+    _registry_register(sid, provider="dispatch", name=task[:40],
+                       purpose=(body.get("purpose") or "").strip() or task[:200],
+                       cls=reg_cls, parent=reg_parent)
     asyncio.create_task(_run_dispatch(sid, tool, task, cwd, isolate))
     return {"session_id": sid, "type": "subprocess", "tool": tool, "parent": parent}
 
@@ -16773,6 +16828,424 @@ async def _housekeeping_loop():
             # logs too, which is the failure this issue exists to prevent.
             _log_exc("_housekeeping_loop.reap", _exc, expected=True)
         await asyncio.sleep(_LOG_ROTATE_CHECK_SECS)
+
+
+# ═════════════ Agent Registry 治理層(藍圖 AGENT_INTEROP §3,戶政系統)═════════════
+# 善彰的痛:「子程序不知道怎麼管理,常跑一堆出來,session 管理混亂」。
+# 這一段給每個 bridge 創建的 session 出生登記(purpose/class/parent)、
+# 生命週期(active⇄idle→archived)、配額(藍圖 §3.3)與收屍人(reaper)。
+# 資料面在 agent_registry.py(獨立 sqlite,絕不碰 canonical.db/state.db);
+# 這裡是 provider 接線:busy 信號、SSE 訂閱數、teardown 與 API。
+# 治理 opt-in:只管「經創建 hook 登記」的 session;既有/旁路 session 在視圖
+# 標 registered:false,reaper 永遠不碰(活水道零風險)。
+
+REGISTRY = agent_registry.AgentRegistry(
+    os.environ.get("POCKET_REGISTRY_DB")
+    or os.path.join(_POCKET_DIR, "agent-registry.db"))
+_REGISTRY_SWEEP_SECS = float(os.environ.get("REGISTRY_SWEEP_SECS", "600"))
+
+
+def _registry_reaper_enabled() -> bool:
+    """Destructive teardown 開關(預設關)。記帳與 API 恆開;真正殺東西
+    (ccsess archive/tmux kill、codex archive、worktree remove)只在
+    REGISTRY_REAPER=1 才做。呼叫時讀 env,不快取——測試/運維可即時切。"""
+    return os.environ.get("REGISTRY_REAPER", "0").strip().lower() in (
+        "1", "true", "yes", "on")
+
+
+def _registry_call_safe(method: str, *args) -> None:
+    """熱路徑記帳(touch/mark_done/set_worktree):registry 故障絕不影響
+    本業——輸入照送、派工照跑,只留痕。"""
+    try:
+        getattr(REGISTRY, method)(*args)
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc(f"_registry_call_safe.{method}", _exc, expected=True)
+
+
+def _registry_class_of(body: dict, default_cls: str = "task") -> str:
+    cls = str(body.get("class") or body.get("session_class") or "").strip().lower()
+    return cls if cls in agent_registry.CLASSES else default_cls
+
+
+def _registry_spawn_fields(body: dict, default_cls: str = "task"):
+    """創建 hook 共用:(parent, class, purpose)。purpose 缺 → 預設
+    「未註明用途」+ 警告 log(藍圖 §3.1 拒絕空值的軟著陸——不破壞現有
+    client,但 log 催促帶上)。parent 傳裸 persona id 時正規化成 hermes:{id}。"""
+    parent = str(body.get("parent_session") or body.get("parent") or "").strip() or None
+    if parent and ":" not in parent and not parent.startswith("sub-") \
+            and parent in PERSONAS:
+        parent = f"hermes:{parent}"
+    cls = _registry_class_of(body, default_cls)
+    purpose = str(body.get("purpose") or "").strip()
+    if not purpose:
+        _log_event("registry_purpose_missing", cls=cls, parent=parent or "")
+        purpose = agent_registry.DEFAULT_PURPOSE
+    return parent, cls, purpose
+
+
+def _registry_precheck_or_429(parent: str | None, cls: str) -> None:
+    """配額前檢(藍圖 §3.3):超額就地拒(429 + 人話原因),不排隊。
+    registry 自身故障不擋 spawn(治理層壞了不能把本業拖下水)。"""
+    try:
+        REGISTRY.precheck(parent, cls)
+    except agent_registry.QuotaExceeded as e:
+        _log_event("registry_quota_rejected", parent=parent or "", cls=cls,
+                   reason=e.reason)
+        raise http_err(429, "REGISTRY_QUOTA", e.reason)
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("_registry_precheck_or_429", _exc, expected=True)
+
+
+def _registry_register(sid: str, *, provider: str, name: str = "",
+                       purpose: str = "", cls: str = "task",
+                       parent: str | None = None, meta: dict | None = None):
+    """出生登記(spawn 成功後補戶口;配額已在 precheck 把關)。失敗只留痕。"""
+    try:
+        row = REGISTRY.register(sid, provider=provider, name=name,
+                                purpose=purpose, cls=cls, parent=parent,
+                                meta=meta, enforce_quota=False)
+        _log_event("registry_registered", session=sid, provider=provider,
+                   cls=row.get("class"), parent=parent or "")
+        return row
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("_registry_register", _exc, expected=True, session=sid)
+        return None
+
+
+def _registry_ensure_personas() -> None:
+    """hermes 常駐人格 = 白名單 persistent,自動落籍(藍圖 §3.1:persistent
+    永不自動收)。register 冪等,重啟/人格 CRUD 後重跑無害。"""
+    for mid, (disp, _home) in PERSONAS.items():
+        try:
+            REGISTRY.register(f"hermes:{mid}", provider="hermes", name=disp,
+                              purpose=f"常駐人格:{disp}", cls="persistent",
+                              enforce_quota=False)
+        except Exception as _exc:  # noqa: BLE001
+            _log_exc("_registry_ensure_personas", _exc, expected=True)
+
+
+# ── provider 接線:busy 信號 / SSE 訂閱數 / 卡片流 ───────────────────────
+
+def _registry_provider_ref(sid: str) -> tuple:
+    """registry id → (kind, ref):cc=ccsess 名、cx=thread id、hp=persona、
+    dlg=delegation id(provider 座標在 meta)、sub=dispatch 子行程。"""
+    if sid.startswith("claude_code:"):
+        return ("cc", sid.split(":", 1)[1])
+    if sid.startswith("codex:"):
+        return ("cx", sid.split(":", 1)[1])
+    if sid.startswith("hermes:"):
+        return ("hp", sid.split(":", 1)[1])
+    if sid.startswith("delegation:"):
+        return ("dlg", sid.split(":", 1)[1])
+    if sid.startswith("sub-"):
+        return ("sub", sid)
+    return ("?", sid)
+
+
+async def _registry_is_busy(sid: str) -> bool:
+    """provider 現成 busy 信號(藍圖 §3.2)。last_active 只在 input 時記帳,
+    長 turn 進行中沒有新 input 會被誤判 idle——收屍前用這裡雙重確認。
+    探測失敗一律當忙:收屍寧可保守,晚收十分鐘沒事,錯殺不可回復。"""
+    kind, ref = _registry_provider_ref(sid)
+    try:
+        if kind == "cc":
+            st, _ = await _v2_cc_state(ref)
+            return st in ("running", "waiting_approval")
+        if kind == "cx":
+            d = _CX_CARD_DIGESTS.get(ref)
+            return bool(d and getattr(d.store, "turn_id", ""))
+        if kind == "sub":
+            sub = SUBSESSIONS.get(ref)
+            return bool(sub and sub.get("status") == "running")
+        if kind == "dlg":
+            meta = (REGISTRY.get(sid) or {}).get("meta") or {}
+            if meta.get("cc_session_name"):
+                st, _ = await _v2_cc_state(meta["cc_session_name"])
+                return st in ("running", "waiting_approval")
+            d = _CX_CARD_DIGESTS.get(meta.get("codex_thread_id") or "")
+            return bool(d and getattr(d.store, "turn_id", ""))
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("_registry_is_busy", _exc, expected=True)
+        return True
+    return False
+
+
+def _registry_card_store(sid: str):
+    """已存在的卡片 store(絕不為了發卡新建;沒人看過的 session 不建 store
+    ——同 _cc_cards_feed_approval 的原則)。"""
+    kind, ref = _registry_provider_ref(sid)
+    try:
+        if kind == "cc":
+            return _CC_CARD_STORES.get(ref)
+        if kind == "cx":
+            d = _CX_CARD_DIGESTS.get(ref)
+            return d.store if d else None
+        if kind == "dlg":
+            meta = (REGISTRY.get(sid) or {}).get("meta") or {}
+            if meta.get("cc_session_name"):
+                return _CC_CARD_STORES.get(meta["cc_session_name"])
+            d = _CX_CARD_DIGESTS.get(meta.get("codex_thread_id") or "")
+            return d.store if d else None
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("_registry_card_store", _exc, expected=True)
+    return None
+
+
+def _registry_subscribers(sid: str) -> int:
+    store = _registry_card_store(sid)
+    return int(getattr(store, "subscribers", 0) or 0) if store else 0
+
+
+def _registry_emit_reap_warning(row: dict) -> None:
+    """收屍前的「⏳ 即將回收」卡(藍圖 §3.2):有 SSE 訂閱者在看 → 發卡
+    並跳過本輪(寬限一個 sweep 週期,Pocket 可一鍵續命)。卡 id 對 session
+    固定,重複警告只 rev++ 原卡,不洗版。"""
+    sid = row["id"]
+    store = _registry_card_store(sid)
+    if store is None:
+        return
+    mins = max(1, int(_REGISTRY_SWEEP_SECS // 60))
+    txt = (f"⏳ 即將回收:「{row.get('purpose') or sid}」已閒置且壽命(TTL)到期,"
+           f"約 {mins} 分鐘後歸檔。要續命請在編隊視圖延長 TTL 或改班 persistent。")
+    try:
+        digest = hashlib.sha1(sid.encode("utf-8")).hexdigest()[:12]
+        store.upsert_card(carddigest.make_card(
+            f"card-registry-reap-{digest}", "", "assistant", "text",
+            {"text": txt, "origin": "registry.reap_warning"}))
+        _log_event("registry_reap_warned", session=sid)
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("_registry_emit_reap_warning", _exc, expected=True)
+
+
+async def _registry_teardown(row: dict) -> None:
+    """Destructive GC(只在 REGISTRY_REAPER=1 由呼叫端把關):
+    CC → `ccsess archive`(存 scrollback + tmux kill,走既有安全路徑);
+    codex → app-server archive(既有 fallback 鏈);worktree 只收 spawn 時
+    「登記過路徑」的樹(dirty 樹由 _worktree_try_remove 鐵律保護,絕不硬刪);
+    hermes persona 永不(persistent 根本進不到這裡)。失敗只留痕不重試。"""
+    sid = row["id"]
+    if not row.get("registered"):
+        return                        # 鐵律 double-guard:未登記絕不動
+    kind, ref = _registry_provider_ref(sid)
+    meta = row.get("meta") or {}
+    try:
+        if kind == "cc":
+            await _run_ccsess("archive", ref)
+        elif kind == "cx":
+            await _codex_thread_set_archived(ref, True)
+        elif kind == "dlg":
+            if meta.get("cc_session_name"):
+                await _run_ccsess("archive", meta["cc_session_name"])
+            elif meta.get("codex_thread_id"):
+                await _codex_thread_set_archived(meta["codex_thread_id"], True)
+        elif kind == "hp":
+            return                    # persona 永不 teardown
+        _log_event("registry_teardown", session=sid, kind=kind)
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("_registry_teardown", _exc, expected=True, session=sid)
+    wt = row.get("worktree")
+    if wt:
+        await _worktree_try_remove(sid, wt, "registry_reap")
+
+
+async def _registry_archive_batch(cands: list, reason: str, *,
+                                  respect_subscribers: bool) -> list:
+    """歸檔一批候選:busy 雙確認 → 跳過並記活動;有訂閱者(reaper 路徑)→
+    警告卡 + 寬限一輪。記帳(標 archived)恆做;teardown 看旗標。"""
+    out = []
+    for r in cands:
+        sid = r["id"]
+        if not r.get("registered"):
+            continue                  # 鐵律:未登記絕不收
+        if await _registry_is_busy(sid):
+            _registry_call_safe("touch", sid)
+            continue
+        if respect_subscribers and _registry_subscribers(sid) > 0:
+            _registry_emit_reap_warning(r)
+            continue
+        REGISTRY.archive(sid, reason)
+        _log_event("registry_archived", session=sid, reason=reason,
+                   cls=r.get("class"), teardown=_registry_reaper_enabled())
+        if _registry_reaper_enabled():
+            await _registry_teardown(r)
+        out.append(sid)
+    return out
+
+
+async def _registry_reap_once() -> list:
+    """一輪收屍:idle 且 TTL 到期的 task/ephemeral → archived(藍圖 §3.2;
+    「turn 完成就 done」太激進,不做)。persistent 與未登記結構上進不了候選。"""
+    return await _registry_archive_batch(
+        REGISTRY.sweep_candidates(require_expired=True),
+        reason="reaper", respect_subscribers=True)
+
+
+async def _registry_reaper_loop():
+    """收屍人:每 10 分鐘巡一次(REGISTRY_SWEEP_SECS 可調)。絕不能死
+    ——任何例外只留痕,下一輪照巡。"""
+    while True:
+        await asyncio.sleep(_REGISTRY_SWEEP_SECS)
+        try:
+            await _registry_reap_once()
+        except Exception as _exc:  # noqa: BLE001
+            _log_exc("_registry_reaper_loop", _exc, expected=True)
+
+
+# ── Registry API(APP_BRIDGE_CONTRACT 追加面;app 編隊視圖 §3.4 的資料源)──
+
+def _registry_public_row(row: dict, children: dict, by_id: dict,
+                         now: float) -> dict:
+    return {
+        "id": row["id"], "provider": row["provider"], "name": row["name"],
+        "purpose": row["purpose"], "class": row["class"],
+        "parent": row.get("parent"),
+        "state": REGISTRY.effective_state(row, now),
+        "created_ts": row["created_ts"], "last_active_ts": row["last_active_ts"],
+        "ttl_secs": row["ttl_secs"],
+        "budget": {"max_children": row.get("max_children") or REGISTRY.max_children},
+        "registered": bool(row.get("registered")),
+        "children": children.get(row["id"], []),
+        "expires_ts": REGISTRY.expires_ts(row),
+        "orphan": REGISTRY.is_orphan(row, by_id),
+    }
+
+
+def _registry_legacy_row(sid: str, provider: str, name: str) -> dict:
+    """既有/旁路 session(沒經創建 hook):看得到、管不到——registered:false,
+    reaper 永不碰。欄位補齊成同一形狀,app 端渲染不用分家。"""
+    return {"id": sid, "provider": provider, "name": name,
+            "purpose": None, "class": None, "parent": None, "state": None,
+            "created_ts": None, "last_active_ts": None, "ttl_secs": None,
+            "budget": {"max_children": REGISTRY.max_children},
+            "registered": False, "children": [], "expires_ts": None,
+            "orphan": False}
+
+
+async def _registry_legacy_rows(known_ids: set) -> list:
+    """盤點旁路 session:ccsess 設定檔、dispatch 子行程、codex 可見 threads
+    (app-server 掛了就略過,不讓治理視圖跟著掛)。"""
+    out = []
+    try:
+        for name, _workdir, enabled in _cc_conf_rows():
+            if enabled != "1":
+                continue
+            sid = f"claude_code:{name}"
+            if sid not in known_ids:
+                out.append(_registry_legacy_row(sid, "claude_code", name))
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("_registry_legacy_rows#cc", _exc, expected=True)
+    for sid, sub in list(SUBSESSIONS.items()):
+        if sid not in known_ids:
+            out.append(_registry_legacy_row(sid, "dispatch",
+                                            sub.get("name") or sid))
+    try:
+        threads = await asyncio.wait_for(_codex_v2_visible_threads(20), 8.0)
+        for t in threads:
+            s = _codex_session_summary(t)
+            tid = s.get("thread_id") or s.get("id") or ""
+            sid = f"codex:{tid}"
+            if tid and sid not in known_ids:
+                out.append(_registry_legacy_row(sid, "codex",
+                                                s.get("name") or tid))
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("_registry_legacy_rows#cx", _exc, expected=True)
+    return out
+
+
+@app.get("/app/v2/registry")
+async def v2_registry_list(request: Request, include_archived: int = 0):
+    """編隊視圖資料源:登記戶(含 children/expires/orphan)+ 旁路 session
+    (registered:false)。defaults 給 app 顯示配額/TTL 預設。"""
+    _check_auth(request)
+    _registry_ensure_personas()
+    now = time.time()
+    all_rows = REGISTRY.list_rows(include_archived=True)
+    by_id = {r["id"]: r for r in all_rows}
+    children = REGISTRY.children_ids(
+        [r for r in all_rows if r.get("state") != "archived"])
+    shown = all_rows if include_archived else \
+        [r for r in all_rows if r.get("state") != "archived"]
+    sessions = [_registry_public_row(r, children, by_id, now) for r in shown]
+    sessions.extend(await _registry_legacy_rows(set(by_id)))
+    return {"sessions": sessions,
+            "defaults": {"task_ttl": int(REGISTRY.task_ttl),
+                         "ephemeral_ttl": int(REGISTRY.ephemeral_ttl),
+                         "max_children": REGISTRY.max_children}}
+
+
+@app.post("/app/v2/registry/sweep")
+async def v2_registry_sweep(request: Request):
+    """🧹收工鈕(藍圖 §3.4):一鍵歸檔所有 idle 的 task/ephemeral(不等
+    TTL——人按了收工就是要收)。active 的不動;未登記的碰不到。
+    註:此路由必須宣告在 /app/v2/registry/{sid} 之前,否則 "sweep" 會被
+    當成 session id 吃掉。"""
+    _check_auth(request)
+    archived = await _registry_archive_batch(
+        REGISTRY.sweep_candidates(require_expired=False),
+        reason="sweep", respect_subscribers=False)
+    return {"archived": archived}
+
+
+@app.post("/app/v2/registry/{sid}/archive")
+async def v2_registry_archive_one(sid: str, request: Request):
+    """手動歸檔單一 session。記帳恆做;destructive teardown 看 REGISTRY_REAPER。"""
+    _check_auth(request)
+    row = REGISTRY.get(sid)
+    if row is None:
+        raise http_err(404, "SESSION_NOT_FOUND",
+                       "registry 沒有這個 session(旁路 session 不受治理)")
+    REGISTRY.archive(sid, "manual")
+    _log_event("registry_archived", session=sid, reason="manual",
+               cls=row.get("class"), teardown=_registry_reaper_enabled())
+    teardown = False
+    if _registry_reaper_enabled():
+        await _registry_teardown(row)
+        teardown = True
+    return {"ok": True, "archived": True, "teardown": teardown}
+
+
+@app.post("/app/v2/registry/{sid}")
+async def v2_registry_update(sid: str, request: Request):
+    """續命/改班:body {purpose?, class?, ttl_extend_secs?}。
+    ttl_extend_secs = 保證「從現在起至少再活 N 秒」。"""
+    _check_auth(request)
+    body = await _json_body(request)
+    if REGISTRY.get(sid) is None:
+        raise http_err(404, "SESSION_NOT_FOUND",
+                       "registry 沒有這個 session(旁路 session 不受治理)")
+    cls = body.get("class")
+    if cls is not None and cls not in agent_registry.CLASSES:
+        raise HTTPException(status_code=400,
+                            detail="class 必須是 persistent|task|ephemeral")
+    ttl_extend = body.get("ttl_extend_secs")
+    if ttl_extend is not None:
+        try:
+            ttl_extend = float(ttl_extend)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400,
+                                detail="ttl_extend_secs 必須是數字(秒)")
+    row = REGISTRY.update(sid, purpose=body.get("purpose"), cls=cls,
+                          ttl_extend_secs=ttl_extend)
+    _log_event("registry_updated", session=sid,
+               cls=cls or "", extended=bool(ttl_extend))
+    now = time.time()
+    all_rows = REGISTRY.list_rows(include_archived=True)
+    by_id = {r["id"]: r for r in all_rows}
+    children = REGISTRY.children_ids(
+        [r for r in all_rows if r.get("state") != "archived"])
+    return {"ok": True,
+            "session": _registry_public_row(row, children, by_id, now)}
+
+
+@app.on_event("startup")
+async def _start_agent_registry():
+    _registry_ensure_personas()
+    task = asyncio.create_task(_registry_reaper_loop())
+    _BG_TASKS.add(task)
+    task.add_done_callback(_BG_TASKS.discard)
+    _log_event("registry_started", db=REGISTRY.db_path,
+               reaper=_registry_reaper_enabled(),
+               sweep_secs=_REGISTRY_SWEEP_SECS)
 
 
 @app.on_event("startup")

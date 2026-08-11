@@ -1,0 +1,410 @@
+"""Agent Registry — session 戶政系統(藍圖 AGENT_INTEROP_BLUEPRINT §3)。
+
+善彰的痛點:「子程序不知道怎麼管理,常跑一堆出來,session 管理混亂」——
+spawn 有生無滅:沒有出生登記、沒有壽命、沒有收屍。這個模組是治理層的
+資料面:每個 session 的出生登記(purpose/class/parent)、生命週期狀態、
+TTL 與配額。**純資料 + 純同步**,不 import bridge、不碰任何 provider;
+收屍(tmux kill / worktree remove / codex archive)是 bridge 側 reaper 的事,
+這裡只負責記帳與挑候選人。
+
+儲存:獨立 sqlite(預設 ~/.pocket/agent-registry.db,env POCKET_REGISTRY_DB
+可覆寫)。**絕不**寫 production 的 canonical.db / state.db —— registry 掛了
+最多是治理失憶,聊天資料零風險。
+
+治理是 opt-in:只有「經 bridge 創建路徑登記」的 session(registered=1)受
+生命週期管理;既有/旁路 session 在 registry 視圖標 registered=false,
+reaper 永遠不碰(善彰的活水道零風險)。
+"""
+from __future__ import annotations
+
+import json
+import os
+import sqlite3
+import threading
+import time
+
+# class → 預設 TTL(秒)。persistent 無壽命(None);env 可調。
+CLASSES = ("persistent", "task", "ephemeral")
+STATES = ("active", "idle", "done", "archived")
+
+DEFAULT_PURPOSE = "未註明用途"
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, "") or default)
+    except ValueError:
+        return default
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, "") or default)
+    except ValueError:
+        return default
+
+
+class QuotaExceeded(Exception):
+    """配額超限 —— reason 是給人看的 zh-TW 一句話(藍圖 §3.3:超額直接拒,
+    附人話原因,不排隊)。bridge 側轉成 HTTP 429。"""
+
+    def __init__(self, reason: str):
+        super().__init__(reason)
+        self.reason = reason
+
+
+class AgentRegistry:
+    """sqlite-backed session 戶口名簿。執行緒安全(單一 Lock 串行化;
+    量小到不值得更細的鎖)。所有時間都是 epoch 秒。"""
+
+    def __init__(self, db_path: str, *,
+                 task_ttl: float | None = None,
+                 ephemeral_ttl: float | None = None,
+                 max_children: int | None = None,
+                 task_cap: int | None = None,
+                 max_depth: int | None = None,
+                 idle_secs: float | None = None):
+        self.db_path = os.path.expanduser(db_path)
+        self.task_ttl = task_ttl if task_ttl is not None \
+            else _env_float("REGISTRY_TASK_TTL", 86400.0)
+        self.ephemeral_ttl = ephemeral_ttl if ephemeral_ttl is not None \
+            else _env_float("REGISTRY_EPHEMERAL_TTL", 7200.0)
+        self.max_children = max_children if max_children is not None \
+            else _env_int("REGISTRY_MAX_CHILDREN", 3)
+        self.task_cap = task_cap if task_cap is not None \
+            else _env_int("REGISTRY_TASK_CAP", 12)
+        self.max_depth = max_depth if max_depth is not None \
+            else _env_int("REGISTRY_MAX_DEPTH", 2)
+        self.idle_secs = idle_secs if idle_secs is not None \
+            else _env_float("REGISTRY_IDLE_SECS", 600.0)
+        self._lock = threading.Lock()
+        self._init_db()
+
+    # ── 存儲 ────────────────────────────────────────────────────────────
+    def _connect(self) -> sqlite3.Connection:
+        con = sqlite3.connect(self.db_path, timeout=30)
+        con.row_factory = sqlite3.Row
+        con.execute("PRAGMA journal_mode=WAL")
+        con.execute("PRAGMA busy_timeout=30000")
+        return con
+
+    def _init_db(self) -> None:
+        os.makedirs(os.path.dirname(self.db_path) or ".", exist_ok=True)
+        con = self._connect()
+        try:
+            con.execute("""CREATE TABLE IF NOT EXISTS sessions(
+                id TEXT PRIMARY KEY,
+                provider TEXT NOT NULL,
+                name TEXT NOT NULL DEFAULT '',
+                purpose TEXT NOT NULL DEFAULT '',
+                class TEXT NOT NULL DEFAULT 'task',
+                parent TEXT,
+                state TEXT NOT NULL DEFAULT 'active',
+                depth INTEGER NOT NULL DEFAULT 0,
+                created_ts REAL NOT NULL,
+                last_active_ts REAL NOT NULL,
+                ttl_secs REAL,
+                max_children INTEGER,
+                registered INTEGER NOT NULL DEFAULT 1,
+                worktree TEXT,
+                archived_ts REAL,
+                archive_reason TEXT,
+                meta TEXT NOT NULL DEFAULT '{}')""")
+            con.execute("CREATE INDEX IF NOT EXISTS idx_reg_parent ON sessions(parent)")
+            con.execute("CREATE INDEX IF NOT EXISTS idx_reg_state ON sessions(state)")
+            con.commit()
+        finally:
+            con.close()
+
+    # ── 讀取輔助 ────────────────────────────────────────────────────────
+    def default_ttl(self, cls: str) -> float | None:
+        if cls == "task":
+            return self.task_ttl
+        if cls == "ephemeral":
+            return self.ephemeral_ttl
+        return None    # persistent:無壽命
+
+    @staticmethod
+    def _row_dict(row) -> dict:
+        d = dict(row)
+        try:
+            d["meta"] = json.loads(d.get("meta") or "{}")
+        except ValueError:
+            d["meta"] = {}
+        d["registered"] = bool(d.get("registered"))
+        return d
+
+    def expires_ts(self, row: dict) -> float | None:
+        """到期時刻 = last_active + ttl。persistent(ttl None)永不到期。"""
+        ttl = row.get("ttl_secs")
+        if ttl is None or row.get("class") == "persistent":
+            return None
+        return float(row["last_active_ts"]) + float(ttl)
+
+    def effective_state(self, row: dict, now: float | None = None) -> str:
+        """讀取時計算的呈現狀態:archived/done 照存;其餘依活動時間折算
+        active⇄idle(藍圖 §3.2:無 turn 超過 idle_secs → idle)。"""
+        now = time.time() if now is None else now
+        st = row.get("state") or "active"
+        if st in ("archived", "done"):
+            return st
+        if now - float(row.get("last_active_ts") or 0) > self.idle_secs:
+            return "idle"
+        return "active"
+
+    # ── 出生登記 ─────────────────────────────────────────────────────────
+    def precheck(self, parent: str | None, cls: str) -> int:
+        """配額前檢(藍圖 §3.3)——在真正 spawn(codex thread/start、ccsess
+        new…)**之前**呼叫,超額就地拒絕,不留半個孤兒。回傳新 session 的
+        depth。persistent(白名單常駐)不受配額限制。"""
+        with self._lock:
+            return self._precheck_locked(parent, cls)
+
+    def _precheck_locked(self, parent: str | None, cls: str) -> int:
+        con = self._connect()
+        try:
+            depth = 0
+            if parent:
+                prow = con.execute(
+                    "SELECT * FROM sessions WHERE id=?", (parent,)).fetchone()
+                if prow is not None:
+                    depth = int(prow["depth"]) + 1
+            if cls == "persistent":
+                return depth
+            if depth > self.max_depth:
+                raise QuotaExceeded(
+                    f"超過配額:派生深度已達上限 {self.max_depth} 層"
+                    f"(A→B→C 止步),不可再往下生子 session")
+            if parent:
+                n = con.execute(
+                    "SELECT COUNT(*) FROM sessions WHERE parent=? "
+                    "AND state != 'archived' AND registered=1",
+                    (parent,)).fetchone()[0]
+                cap = self._parent_max_children(con, parent)
+                if n >= cap:
+                    raise QuotaExceeded(
+                        f"超過配額:{parent} 名下已有 {n} 個未歸檔子 session"
+                        f"(上限 {cap});請先歸檔或 🧹收工 再派新工")
+            if cls == "task":
+                n = con.execute(
+                    "SELECT COUNT(*) FROM sessions WHERE class='task' "
+                    "AND state != 'archived' AND registered=1").fetchone()[0]
+                if n >= self.task_cap:
+                    raise QuotaExceeded(
+                        f"超過配額:全域 task 類 session 已達 {n} 個"
+                        f"(上限 {self.task_cap});請先 🧹收工 釋放額度")
+            return depth
+        finally:
+            con.close()
+
+    def _parent_max_children(self, con, parent_id: str) -> int:
+        row = con.execute("SELECT max_children FROM sessions WHERE id=?",
+                          (parent_id,)).fetchone()
+        if row is not None and row["max_children"]:
+            return int(row["max_children"])
+        return self.max_children
+
+    def register(self, sid: str, *, provider: str, name: str = "",
+                 purpose: str = "", cls: str = "task",
+                 parent: str | None = None, ttl_secs: float | None = None,
+                 worktree: str | None = None, registered: bool = True,
+                 meta: dict | None = None, enforce_quota: bool = True) -> dict:
+        """出生登記。已存在同 id → 冪等回傳既有戶口(persona 每次開機
+        re-register 不炸)。enforce_quota=False 給「spawn 已發生、只補記帳」
+        的路徑(如 codex thread 已 start)——配額該在 spawn 前用 precheck。"""
+        if cls not in CLASSES:
+            cls = "task"
+        purpose = (purpose or "").strip() or DEFAULT_PURPOSE
+        now = time.time()
+        with self._lock:
+            con = self._connect()
+            try:
+                existing = con.execute(
+                    "SELECT * FROM sessions WHERE id=?", (sid,)).fetchone()
+                if existing is not None:
+                    return self._row_dict(existing)
+                depth = 0
+                if enforce_quota and registered:
+                    depth = self._precheck_locked(parent, cls)
+                elif parent:
+                    prow = con.execute("SELECT depth FROM sessions WHERE id=?",
+                                       (parent,)).fetchone()
+                    depth = int(prow["depth"]) + 1 if prow is not None else 0
+                if ttl_secs is None:
+                    ttl_secs = self.default_ttl(cls)
+                con.execute(
+                    """INSERT INTO sessions(id, provider, name, purpose, class,
+                       parent, state, depth, created_ts, last_active_ts,
+                       ttl_secs, max_children, registered, worktree, meta)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (sid, provider, name, purpose, cls, parent or None,
+                     "active", depth, now, now, ttl_secs, None,
+                     1 if registered else 0, worktree,
+                     json.dumps(meta or {}, ensure_ascii=False)))
+                con.commit()
+                return self.get(sid) or {}
+            finally:
+                con.close()
+
+    # ── 日常記帳 ─────────────────────────────────────────────────────────
+    def get(self, sid: str) -> dict | None:
+        con = self._connect()
+        try:
+            row = con.execute("SELECT * FROM sessions WHERE id=?",
+                              (sid,)).fetchone()
+            return self._row_dict(row) if row is not None else None
+        finally:
+            con.close()
+
+    def touch(self, sid: str) -> None:
+        """有 turn 活動 → 更新 last_active_ts + 回 active(archived 不復活;
+        未登記 id 靜默略過——touch 掛在輸入熱路徑上,不能因記帳丟例外)。"""
+        with self._lock:
+            con = self._connect()
+            try:
+                con.execute(
+                    "UPDATE sessions SET last_active_ts=?, "
+                    "state = CASE WHEN state IN ('idle','done') THEN 'active' "
+                    "ELSE state END WHERE id=? AND state != 'archived'",
+                    (time.time(), sid))
+                con.commit()
+            finally:
+                con.close()
+
+    def set_worktree(self, sid: str, worktree: str) -> None:
+        """spawn 時記下 worktree 實際路徑 —— reaper 只收「登記過路徑」的
+        worktree,絕不用猜的(藍圖 §3.2 GC 連帶收乾淨的安全前提)。"""
+        with self._lock:
+            con = self._connect()
+            try:
+                con.execute("UPDATE sessions SET worktree=? WHERE id=?",
+                            (worktree, sid))
+                con.commit()
+            finally:
+                con.close()
+
+    def update(self, sid: str, *, purpose: str | None = None,
+               cls: str | None = None,
+               ttl_extend_secs: float | None = None) -> dict | None:
+        """續命/改班(POST /app/v2/registry/{id})。ttl_extend_secs:保證
+        「從現在起至少再活 N 秒」——新到期 = max(原到期, now) + N。"""
+        with self._lock:
+            con = self._connect()
+            try:
+                row = con.execute("SELECT * FROM sessions WHERE id=?",
+                                  (sid,)).fetchone()
+                if row is None:
+                    return None
+                d = self._row_dict(row)
+                sets, args = [], []
+                if purpose is not None and purpose.strip():
+                    sets.append("purpose=?")
+                    args.append(purpose.strip())
+                if cls is not None and cls in CLASSES and cls != d["class"]:
+                    sets.append("class=?")
+                    args.append(cls)
+                    # 改班 → TTL 跟著班別走:persistent 摘壽命;task/ephemeral
+                    # 從 persistent 轉回來時補預設壽命。
+                    sets.append("ttl_secs=?")
+                    args.append(self.default_ttl(cls))
+                    d["class"], d["ttl_secs"] = cls, self.default_ttl(cls)
+                if ttl_extend_secs is not None and ttl_extend_secs > 0 \
+                        and d["class"] != "persistent":
+                    now = time.time()
+                    cur_exp = self.expires_ts(d)
+                    new_exp = max(cur_exp or now, now) + float(ttl_extend_secs)
+                    sets.append("ttl_secs=?")
+                    args.append(new_exp - float(d["last_active_ts"]))
+                if sets:
+                    args.append(sid)
+                    con.execute(
+                        f"UPDATE sessions SET {', '.join(sets)} WHERE id=?", args)
+                    con.commit()
+                fresh = con.execute("SELECT * FROM sessions WHERE id=?",
+                                    (sid,)).fetchone()
+                return self._row_dict(fresh)
+            finally:
+                con.close()
+
+    def archive(self, sid: str, reason: str = "manual") -> dict | None:
+        """記帳面歸檔(destructive teardown 是 bridge reaper 的事)。"""
+        with self._lock:
+            con = self._connect()
+            try:
+                row = con.execute("SELECT * FROM sessions WHERE id=?",
+                                  (sid,)).fetchone()
+                if row is None:
+                    return None
+                if row["state"] != "archived":
+                    con.execute(
+                        "UPDATE sessions SET state='archived', archived_ts=?, "
+                        "archive_reason=? WHERE id=?",
+                        (time.time(), reason, sid))
+                    con.commit()
+                fresh = con.execute("SELECT * FROM sessions WHERE id=?",
+                                    (sid,)).fetchone()
+                return self._row_dict(fresh)
+            finally:
+                con.close()
+
+    def mark_done(self, sid: str) -> None:
+        with self._lock:
+            con = self._connect()
+            try:
+                con.execute("UPDATE sessions SET state='done' "
+                            "WHERE id=? AND state != 'archived'", (sid,))
+                con.commit()
+            finally:
+                con.close()
+
+    # ── 視圖與收屍候選 ───────────────────────────────────────────────────
+    def list_rows(self, include_archived: bool = False) -> list[dict]:
+        con = self._connect()
+        try:
+            q = "SELECT * FROM sessions"
+            if not include_archived:
+                q += " WHERE state != 'archived'"
+            q += " ORDER BY created_ts"
+            return [self._row_dict(r) for r in con.execute(q).fetchall()]
+        finally:
+            con.close()
+
+    def children_ids(self, rows: list[dict]) -> dict[str, list[str]]:
+        out: dict[str, list[str]] = {}
+        for r in rows:
+            p = r.get("parent")
+            if p:
+                out.setdefault(p, []).append(r["id"])
+        return out
+
+    def is_orphan(self, row: dict, by_id: dict[str, dict]) -> bool:
+        """孤兒 = parent 已 archived(或戶口已消失)但自己還沒歸檔
+        (藍圖 §3.4 標紅提醒)。無 parent(人手動/常駐)不算。"""
+        p = row.get("parent")
+        if not p or row.get("state") == "archived":
+            return False
+        prow = by_id.get(p) or self.get(p)
+        return prow is None or prow.get("state") == "archived"
+
+    def sweep_candidates(self, now: float | None = None, *,
+                         require_expired: bool = True) -> list[dict]:
+        """收屍候選:**只看 registered=1**(opt-in 治理;legacy 免疫)、
+        只收 task/ephemeral(persistent 永不自動收)、目前非 active。
+        require_expired=True(reaper):idle **且** TTL 到期才收;
+        require_expired=False(🧹收工 sweep):idle 即收,不等 TTL。"""
+        now = time.time() if now is None else now
+        out = []
+        for r in self.list_rows():
+            if not r.get("registered"):
+                continue                      # 鐵律:未登記絕不收
+            if r.get("class") not in ("task", "ephemeral"):
+                continue                      # persistent 永不自動歸檔
+            eff = self.effective_state(r, now)
+            if eff == "active":
+                continue
+            if require_expired and eff != "done":
+                exp = self.expires_ts(r)
+                if exp is None or now < exp:
+                    continue                  # 還沒到期,再等等
+            out.append(r)
+        return out
