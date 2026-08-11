@@ -5723,12 +5723,23 @@ async def pair_new(request: Request):
         body = {}
     required_account = request.url.path.startswith("/app/v1/")
     user = _account_user_from_request(request, body, required=required_account)
-    code = _pair_mint_code((user or {}).get("apple_user_id"))
-    return {"code": code, "ttl": int(_PAIR_CODE_TTL),
+    ttl = _pair_clamp_ttl(body.get("ttl"))
+    code = _pair_mint_code((user or {}).get("apple_user_id"), ttl=ttl)
+    return {"code": code, "ttl": ttl,
             "account_bound": bool(user)}
 
 
-def _pair_mint_code(apple_user_id=None) -> str:
+def _pair_clamp_ttl(raw) -> int:
+    """配對碼 TTL:預設 5 分鐘;免掃碼的「配對連結」場景(雲端主機把連結傳到
+    手機再點)人工傳遞有延遲,允許放寬 —— 上限 30 分鐘,下限 1 分鐘。"""
+    try:
+        ttl = int(raw)
+    except (TypeError, ValueError):
+        return int(_PAIR_CODE_TTL)
+    return max(60, min(1800, ttl))
+
+
+def _pair_mint_code(apple_user_id=None, ttl=None) -> str:
     """鑄一枚一次性配對碼(/pair/new 與本機 /pair/qr 頁共用)。"""
     now = time.monotonic()
     code = secrets.token_urlsafe(9)
@@ -5736,7 +5747,7 @@ def _pair_mint_code(apple_user_id=None) -> str:
         for c in [c for c, v in _PAIR_CODES.items() if _pair_code_meta(v)["expiry"] < now]:
             _PAIR_CODES.pop(c, None)          # prune expired
         _PAIR_CODES[code] = {
-            "expiry": now + _PAIR_CODE_TTL,
+            "expiry": now + (ttl or _PAIR_CODE_TTL),
             "apple_user_id": apple_user_id,
         }
     return code
@@ -5929,12 +5940,14 @@ def _pair_host_candidates(force: bool = False):
 
 @app.get("/pair/qr.json")
 async def pair_qr_json(request: Request):
-    """鑄新碼 + 組 payload + 產 QR SVG,一次回齊(頁面 TTL 到期後再打一次換新碼)。"""
+    """鑄新碼 + 組 payload + 產 QR SVG,一次回齊(頁面 TTL 到期後再打一次換新碼)。
+    ?ttl= 放寬碼效期(配對連結場景;夾 60..1800s)。"""
     _pair_local_only(request)
     hosts, has_ts = _pair_host_candidates(force=True)
     if not hosts:
         return {"ok": False, "error": "no reachable host candidate (headless + no net?)"}
-    code = _pair_mint_code(None)
+    ttl = _pair_clamp_ttl(request.query_params.get("ttl"))
+    code = _pair_mint_code(None, ttl=ttl)
     # v1 相容鍵 scheme/host 取最後一個候選(= 公網保底,語意同 pocket-pair.py);
     # 新 app 走 hosts 依序自動選路。
     tail = urllib.parse.urlsplit(hosts[-1])
@@ -5952,7 +5965,7 @@ async def pair_qr_json(request: Request):
     except Exception as _exc:  # noqa: BLE001
         _log_exc("pair_qr_svg", _exc, expected=True)   # 沒 qrcode 套件時 payload 仍可手動輸入
     return {"ok": True, "payload": payload, "svg": svg, "hosts": hosts,
-            "ttl": int(_PAIR_CODE_TTL), "tailscale": has_ts,
+            "ttl": ttl, "tailscale": has_ts,
             "tunnel": _pair_tunnel_url()}
 
 

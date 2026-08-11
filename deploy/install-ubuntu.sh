@@ -243,6 +243,14 @@ PAIR_URL="http://127.0.0.1:$BRIDGE_PORT/pair/qr"
 echo
 echo "✅ 龍蝦主機就緒。用 Pocket App 掃碼配對:"
 echo "   $PAIR_URL"
+# 雲端/headless 免掃碼:直接給配對連結(30 分鐘有效),傳到手機點開即配。
+PAIR_LINK="$(curl -fsS -m 8 "http://127.0.0.1:$BRIDGE_PORT/pair/qr.json?ttl=1800" 2>/dev/null \
+  | python3 -c 'import json,sys;d=json.load(sys.stdin);print(d.get("payload","") if d.get("ok") else "")' 2>/dev/null || true)"
+if [ -n "$PAIR_LINK" ]; then
+  echo
+  echo "📎 免掃碼(雲端主機):把下面這條配對連結傳到手機(iMessage/mail 皆可),點開即配對(30 分鐘內有效):"
+  echo "   $PAIR_LINK"
+fi
 if ! command -v tailscale >/dev/null; then
   echo
   echo "💡 建議:除了公網通道,自己用 Tailscale 建私網(外出連線最穩、免固定 IP):"
