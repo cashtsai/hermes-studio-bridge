@@ -42,6 +42,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import agent_call as agent_call_policy
+import agent_context as agent_context_policy
 import agent_registry
 import host_discovery
 from harness import distill as harness_distill
@@ -19042,7 +19043,9 @@ def _agent_call_collect_reply(store, since_seq: int) -> str:
             continue
         body = card.get("body") or {}
         origin = str(body.get("origin") or "")
-        if origin.startswith("agent_call") or origin == "registry.reap_warning":
+        if (origin.startswith("agent_call")
+                or origin.startswith("agent_context")     # 👁 上下文讀取 audit 卡
+                or origin == "registry.reap_warning"):
             continue
         t = str(body.get("text") or body.get("fallback_text") or "").strip()
         if not t:
@@ -19771,6 +19774,494 @@ async def _start_harness():
                model=harness_model.distill_model(),
                ingest_secs=_HARNESS_INGEST_SECS,
                distill_hour=_HARNESS_DISTILL_HOUR)
+# ═════════ 跨 session 上下文互讀 agent_context(接手/協作的資訊落差)═════════
+# agent_call 解決「A 叫得動 B」;這裡解決「A 看得懂 B 在幹嘛」——cc/cx 接手
+# 或並行時,不用再靠人肉貼上下文。三種模式,由便宜到貴:
+#   summary  蒸餾過的交接簡報(本機 Ollama;依 (session, last_seq) 快取)
+#   recent   最近 N 張卡的 fallback_text(原文,封頂)
+#   search   在「這個 caller 讀得到的範圍內」找關鍵字(原文片段,封頂)
+# 護欄(agent_context.py):AGENT_CONTEXT=1 旗標(預設 OFF → 404)、default DENY
+# 的三來源放行(母子邊/context_targets 規則/agent_call 放行隱含 summary)、
+# **強制遮罩**(連餵給模型的素材都先遮)、每 caller 速率上限、回應字元硬上限。
+# 每次讀取往**被讀的 session** 落一張「👁 上下文讀取」卡 —— 誰讀了誰看得見。
+# 資料源全部是現成的(卡片流 ring:CC jsonl / codex thread / persona 都已由
+# _v2_card_store 統一 seed),這裡不新增任何紀錄機制、不寫 canonical.db。
+
+_AGENT_CONTEXT_SUMMARY_CACHE: dict = {}   # target -> {seq, text, ts}
+_AGENT_CONTEXT_HITS: dict = {}            # caller -> [ts,…](速率窗)
+
+
+def _agent_context_enabled() -> bool:
+    """旗標每次呼叫讀 env:預設 OFF,merge 零風險(同 AGENT_CALL 慣例)。"""
+    return str(os.environ.get("AGENT_CONTEXT", "")).strip().lower() in (
+        "1", "true", "yes", "on")
+
+
+def _agent_context_require_enabled() -> None:
+    if not _agent_context_enabled():
+        raise http_err(404, "AGENT_CONTEXT_DISABLED",
+                       "agent_context 未啟用(需 AGENT_CONTEXT=1 + 政策檔)")
+
+
+def _agent_context_rate_check(caller: str) -> None:
+    """每 caller 每分鐘 N 次(預設 30)。被拒的讀取也記次數 —— 不然探測政策
+    邊界是免費的。"""
+    limit = agent_context_policy.rate_per_min()
+    if limit <= 0:
+        return
+    now = time.time()
+    hits = [t for t in _AGENT_CONTEXT_HITS.get(caller, []) if now - t < 60.0]
+    if len(hits) >= limit:
+        _AGENT_CONTEXT_HITS[caller] = hits
+        _log_event("agent_context_rate_limited", caller=caller, limit=limit)
+        raise http_err(429, "AGENT_CONTEXT_RATE_LIMITED",
+                       f"上下文讀取太頻繁({caller} 每分鐘上限 {limit} 次);"
+                       f"請改用 summary(有快取)或稍後再試")
+    hits.append(now)
+    _AGENT_CONTEXT_HITS[caller] = hits
+    if len(_AGENT_CONTEXT_HITS) > 500:      # 冷 caller 的空窗回收
+        for k in [k for k, v in _AGENT_CONTEXT_HITS.items() if not v]:
+            _AGENT_CONTEXT_HITS.pop(k, None)
+
+
+def _agent_context_warm_store(sid: str):
+    """**已在記憶體裡**的卡片流。search 掃全範圍時只看熱 store:為了搜尋去冷
+    載入整台機器的 session(seed jsonl / 拉 codex 歷史)會把一個回合拖垮,
+    而且會把沒人在看的 session 全部叫醒。明示單一 target 時才走 _v2_card_store。"""
+    store = _registry_card_store(sid)
+    if store is not None:
+        return store
+    try:
+        kind, ref = _registry_provider_ref(sid)
+        if kind == "hp":
+            d = _HP_CARD_DIGESTS.get(ref)
+            return d.store if d else None
+        if sid.startswith("openclaw:"):
+            d = _OC_CARD_DIGESTS.get(_oc_safe_session_key(sid.split(":", 1)[1]))
+            return d.store if d else None
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("_agent_context_warm_store", _exc, expected=True, session=sid)
+    return None
+
+
+def _agent_context_card_text(card: dict) -> str:
+    """一張卡的可讀文字。**自己的 audit 卡不算內容** —— 不然讀取行為會污染
+    下一次讀到的內容,還會讓摘要快取每讀必失效。"""
+    body = card.get("body") or {}
+    if str(body.get("origin") or "").startswith("agent_context"):
+        return ""
+    return str(body.get("fallback_text") or body.get("text") or "").strip()
+
+
+def _agent_context_source_seq(store) -> int:
+    """快取鍵用的「內容 seq」= 排除 audit 卡之後的最大 seq。
+
+    直接用 `store.seq` 會壞事:每次讀取都會落一張 audit 卡把 seq 推高,快取
+    永遠 miss,summary 就變成每次都燒一次模型。這裡只認真正的內容事件。
+    """
+    seq = 0
+    for ev in getattr(store, "events", None) or []:
+        if ev.get("type") == "card.upsert":
+            card = (ev.get("data") or {}).get("card") or {}
+            if str(((card.get("body") or {}).get("origin") or "")).startswith(
+                    "agent_context"):
+                continue
+        seq = max(seq, int(ev.get("seq") or 0))
+    return seq
+
+
+def _agent_context_lines(store, limit: int) -> list:
+    """最近 limit 張有文字的卡 → 已遮罩的行(時間順)。"""
+    order = list(getattr(store, "order", None) or [])
+    cards = getattr(store, "cards", None) or {}
+    out: list = []
+    for cid in reversed(order):
+        card = cards.get(cid) or {}
+        text = _agent_context_card_text(card)
+        if not text:
+            continue
+        out.append(agent_context_policy.card_line(
+            card.get("role") or "", text, card.get("ts")))
+        if len(out) >= max(1, limit):
+            break
+    out.reverse()
+    return out
+
+
+def _agent_context_search_store(store, sid: str, query: str,
+                                max_hits: int) -> list:
+    """單一 store 的子字串搜尋(新→舊掃,回時間順;片段已遮罩)。"""
+    order = list(getattr(store, "order", None) or [])
+    cards = getattr(store, "cards", None) or {}
+    hits: list = []
+    for cid in reversed(order):
+        card = cards.get(cid) or {}
+        text = _agent_context_card_text(card)
+        if not text:
+            continue
+        frag = agent_context_policy.match_snippet(text, query)
+        if frag is None:
+            continue
+        hits.append({"session": sid, "ts": card.get("ts"),
+                     "role": card.get("role") or "", "snippet": frag})
+        if len(hits) >= max(1, max_hits):
+            break
+    hits.reverse()
+    return hits
+
+
+async def _agent_context_meta(sid: str) -> dict:
+    """回應的固定欄位:戶口(purpose/provider/parent/model)+ 現況(busy)。"""
+    row = REGISTRY.get(sid) or {}
+    meta = row.get("meta") or {}
+    spawn = meta.get("spawn_config") if isinstance(
+        meta.get("spawn_config"), dict) else {}
+    model = str(meta.get("model") or spawn.get("model") or "").strip()
+    return {"id": sid,
+            "provider": row.get("provider") or (sid.split(":", 1)[0]
+                                                if ":" in sid else ""),
+            "purpose": agent_context_policy.redact_text(row.get("purpose") or ""),
+            "parent": row.get("parent") or None,
+            "class": row.get("class") or None,
+            "model": model or None,
+            "worktree": row.get("worktree") or None,
+            "busy": await _registry_is_busy(sid),
+            "last_active_ts": row.get("last_active_ts")}
+
+
+def _agent_context_family(caller: str, target: str) -> bool:
+    return agent_context_policy.is_family_edge(
+        REGISTRY.get(caller), REGISTRY.get(target), caller, target)
+
+
+# ── 蒸餾:本機 Ollama(理由與 harness/model.py 同,見下)────────────────
+# bridge 現有「送文字給模型、拿文字回來」的路只有四條,能用的只有第一條:
+#   1. 本機 Ollama(`_polish_transcript` 那條)—— 真無狀態、無金鑰、本機免費 ✅
+#   2. `acp_full()` ACP persona pool —— **綁善彰真正的 Telegram canonical
+#      session**:摘要提示詞會噴到他手機上,還會搶 `self._lock` 卡住真人回合 ❌
+#   3. `run_hermes()` —— 同上,刻意打同一個 canonical session ❌
+#   4. headless `claude -p` dispatch —— 會建 SUBSESSIONS/worktree/registry
+#      配額,為了一段摘要生一個子 agent,層級完全不對 ❌
+# (2/3 已逐條核對過 bridge 現碼:ACPSession 持有 persona 的 canonical
+#  session,POOL 依 persona 復用同一條連線。)所以走第一條。
+# feat/continual-harness 的 `harness.model.ollama_text()` 是同一段的抽象版;
+# 那棵樹合併後,這裡應改成 import 它,不要留兩份 Ollama 呼叫。
+
+def _agent_context_model_name() -> str:
+    return (os.environ.get("AGENT_CONTEXT_MODEL", "").strip()
+            or os.environ.get("HARNESS_MODEL", "").strip()
+            or os.environ.get("MEETING_POLISH_MODEL", "").strip()
+            or "mistral-small3.2:latest")
+
+
+def _agent_context_model_timeout() -> float:
+    try:
+        return float(os.environ.get("AGENT_CONTEXT_MODEL_TIMEOUT", "") or 60.0)
+    except ValueError:
+        return 60.0
+
+
+async def _agent_context_summarize(material: str) -> str:
+    """一發式本機蒸餾。**失敗一律回空字串**,由呼叫端 fail-soft 退成抽取式
+    摘要 —— 模型掛了不該讓「讀不到隊友在幹嘛」變成硬錯誤。"""
+    prompt = agent_context_policy.SUMMARY_PROMPT + material
+    num_ctx = min(40960, max(8192, len(prompt) * 2 + 2048))
+
+    async def _run() -> str:
+        import httpx
+        base = (os.environ.get("OLLAMA_URL", "").strip()
+                or "http://127.0.0.1:11434").rstrip("/")
+        async with httpx.AsyncClient(timeout=120) as client:
+            r = await client.post(
+                base + "/api/chat",
+                json={"model": _agent_context_model_name(), "stream": False,
+                      "keep_alive": "15m",
+                      "messages": [{"role": "user", "content": prompt}],
+                      "options": {"temperature": 0.2, "num_ctx": num_ctx}})
+            r.raise_for_status()
+            return ((r.json().get("message") or {}).get("content") or "").strip()
+
+    try:
+        return await asyncio.wait_for(_run(),
+                                      timeout=_agent_context_model_timeout())
+    except asyncio.TimeoutError:
+        _log_event("agent_context_summary_timeout", chars=len(prompt))
+        return ""
+    except Exception as e:  # noqa: BLE001
+        _log_event("agent_context_summary_failed", error=type(e).__name__,
+                   error_message=str(e)[:200])
+        return ""
+
+
+async def _agent_context_summary(target: str, meta: dict,
+                                 store) -> tuple[str, int, bool]:
+    """摘要 + 快取。回 (text, source_seq, cached)。
+
+    快取鍵 = (session, 內容 seq):目標沒有新動靜就重複用同一份,重讀免費;
+    一有新卡片(seq 前進)即失效。fail-soft 的抽取式退路**不進快取**,
+    否則模型復活後還會拿到那份沒蒸餾過的。
+    """
+    src_seq = _agent_context_source_seq(store)
+    ent = _AGENT_CONTEXT_SUMMARY_CACHE.get(target)
+    if ent and ent.get("seq") == src_seq and ent.get("text"):
+        return (ent["text"], src_seq, True)
+    lines = _agent_context_lines(
+        store, agent_context_policy.summary_material_cards())
+    material = agent_context_policy.build_summary_material(meta, lines)
+    raw = await _agent_context_summarize(material)
+    # 模型輸出再遮一次:素材已遮過,但模型可能從別處(系統提示、幻覺)吐出
+    # key 形狀的字串。遮罩是結構性的,不靠「上游應該已經乾淨了」。
+    text = agent_context_policy.redact_text(raw or "").strip()
+    if not text:
+        return (agent_context_policy.fallback_summary(meta, lines),
+                src_seq, False)
+    _AGENT_CONTEXT_SUMMARY_CACHE[target] = {"seq": src_seq, "text": text,
+                                            "ts": time.time()}
+    cap = agent_context_policy.cache_max_entries()
+    if len(_AGENT_CONTEXT_SUMMARY_CACHE) > cap:
+        for k, _v in sorted(_AGENT_CONTEXT_SUMMARY_CACHE.items(),
+                            key=lambda kv: kv[1].get("ts") or 0)[:len(
+                                _AGENT_CONTEXT_SUMMARY_CACHE) - cap]:
+            _AGENT_CONTEXT_SUMMARY_CACHE.pop(k, None)
+    return (text, src_seq, False)
+
+
+async def _agent_context_audit(caller: str, target: str, mode: str,
+                               read_id: str, note: str = "",
+                               create_store: bool = True) -> None:
+    """audit 卡落**被讀的 session**:使用者在 Pocket 上看得到誰讀了自己。
+    kind "text" + fallback_text(舊 app 照純文字渲染),origin=agent_context
+    (回覆收割與內容擷取都會跳過它)。單邊失敗只留痕不擋事。"""
+    txt = f"👁 {caller} 讀取了本 session 的上下文({mode})"
+    if note:
+        txt += f"|{note}"
+    try:
+        store = (await _v2_card_store(target)) if create_store \
+            else _agent_context_warm_store(target)
+        if store is None:
+            return
+        store.upsert_card(carddigest.make_card(
+            f"card-agentctx-{read_id}", "", "assistant", "text",
+            {"text": txt, "fallback_text": txt, "origin": "agent_context",
+             "caller": caller, "target": target, "mode": mode,
+             "read_id": read_id}))
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("_agent_context_audit", _exc, expected=True, session=target)
+
+
+async def _agent_context_deny(caller: str, target: str, mode: str,
+                              reason: str) -> None:
+    """拒絕:落 log(誰想讀誰、被什麼擋下)、對已有 store 的目標落一張留痕卡
+    (不為一張拒絕卡冷載入目標),丟 403。"""
+    _log_event("agent_context_denied", caller=caller, target=target,
+               mode=mode, reason=reason[:200])
+    await _agent_context_audit(caller, target, mode,
+                               "deny-" + uuid.uuid4().hex[:8],
+                               note="(已被政策拒絕,未取得任何內容)",
+                               create_store=False)
+    raise http_err(403, "AGENT_CONTEXT_DENIED", reason)
+
+
+def _agent_context_candidates() -> list:
+    """search 全範圍的候選 session:registry 未歸檔戶口 + 常駐人格。
+    只回 id;能不能讀、有沒有熱 store 由呼叫端再過濾。"""
+    _registry_ensure_personas()
+    return sorted({r["id"] for r in REGISTRY.list_rows()
+                   if r.get("state") != "archived"})
+
+
+@app.post("/app/v2/agent_context")
+async def v2_agent_context(request: Request):
+    """跨 session 上下文互讀。body:
+    {caller: session_id, target: session_id(search 可省略 = 全可讀範圍),
+     mode: summary|recent|search, query?(search 必填), limit?}。
+
+    caller 自報身分(信任邊界 = bridge token,與 agent_call 同);audit 卡與
+    log 都以此記名。回應固定含 target/purpose/provider/model/busy/
+    last_active_ts/content/truncated/source_seq。
+    """
+    _check_auth(request)
+    _agent_context_require_enabled()
+    body = await _json_body(request)
+    caller = _agent_call_normalize_sid(str(body.get("caller") or ""))
+    target = _agent_call_normalize_sid(str(body.get("target") or ""))
+    mode = str(body.get("mode") or "summary").strip() or "summary"
+    query = str(body.get("query") or "").strip()
+    if mode not in agent_context_policy.MODES:
+        raise http_err(400, "AGENT_CONTEXT_BAD_MODE",
+                       f"mode 必須是 {'|'.join(agent_context_policy.MODES)}")
+    if not caller:
+        raise http_err(400, "AGENT_CONTEXT_BAD_REQUEST", "caller 必填")
+    if mode != "search" and not target:
+        raise http_err(400, "AGENT_CONTEXT_BAD_REQUEST",
+                       f"{mode} 模式的 target 必填")
+    if mode == "search" and not query:
+        raise http_err(400, "AGENT_CONTEXT_BAD_REQUEST", "search 模式 query 必填")
+    if target and caller == target:
+        raise http_err(400, "AGENT_CONTEXT_SELF",
+                       "不能讀自己的上下文(自己的卡片流走 /app/v2/sessions)")
+    try:
+        _v2_card_source(caller)
+    except HTTPException:
+        raise http_err(400, "AGENT_CONTEXT_BAD_CALLER",
+                       f"caller 不是已知 session:{caller}")
+    _agent_context_rate_check(caller)
+    policy = agent_context_policy.load_policy()
+    read_id = "ctx-" + uuid.uuid4().hex[:12]
+    try:
+        limit = int(body.get("limit") or 0)
+    except (TypeError, ValueError):
+        limit = 0
+
+    # ── search 全範圍:掃「這個 caller 讀得到」的熱 store ────────────────
+    if mode == "search" and not target:
+        return await _agent_context_search_all(caller, query, policy, limit,
+                                               read_id)
+
+    # ── 單一 target ────────────────────────────────────────────────────
+    try:
+        _v2_card_source(target)
+    except HTTPException:
+        raise http_err(404, "AGENT_CONTEXT_TARGET_NOT_FOUND",
+                       f"target 不是既有 session:{target}")
+    ok, basis = agent_context_policy.decide(
+        policy, caller, target, mode,
+        family=_agent_context_family(caller, target))
+    if not ok:
+        await _agent_context_deny(caller, target, mode, basis)
+    store = await _v2_card_store(target)
+    meta = await _agent_context_meta(target)
+    hits: list = []
+    cached = False
+    if mode == "summary":
+        content, src_seq, cached = await _agent_context_summary(
+            target, meta, store)
+    elif mode == "recent":
+        n = limit or agent_context_policy.recent_limit_default()
+        n = max(1, min(n, agent_context_policy.recent_limit_max()))
+        src_seq = _agent_context_source_seq(store)
+        lines = _agent_context_lines(store, n)
+        content = "\n".join(lines) if lines else "(這個 session 的卡片流是空的)"
+    else:                                    # search(單一 target 範圍)
+        n = limit or agent_context_policy.search_max_hits()
+        n = max(1, min(n, agent_context_policy.search_max_hits()))
+        src_seq = _agent_context_source_seq(store)
+        hits = _agent_context_search_store(store, target, query, n)
+        content = _agent_context_hits_text(hits, query)
+    content, truncated = agent_context_policy.clip(
+        content, agent_context_policy.max_chars())
+    _log_event("agent_context_read", read=read_id, caller=caller,
+               target=target, mode=mode, basis=basis, cached=cached,
+               chars=len(content), truncated=truncated, source_seq=src_seq)
+    _registry_call_safe("touch", caller)
+    await _agent_context_audit(caller, target, mode, read_id)
+    return {"ok": True, "read_id": read_id, "mode": mode, "target": target,
+            "purpose": meta["purpose"], "provider": meta["provider"],
+            "model": meta["model"], "busy": meta["busy"],
+            "last_active_ts": meta["last_active_ts"],
+            "content": content, "truncated": truncated,
+            "source_seq": src_seq, "cached": cached, "basis": basis,
+            "hits": hits}
+
+
+def _agent_context_hits_text(hits: list, query: str) -> str:
+    if not hits:
+        return f"(在可讀範圍內找不到「{query}」)"
+    return "\n".join(
+        agent_context_policy.card_line(
+            f"{h['session']} {h.get('role') or ''}".strip(),
+            h["snippet"], h.get("ts"))
+        for h in hits)
+
+
+async def _agent_context_search_all(caller: str, query: str, policy: dict,
+                                    limit: int, read_id: str) -> dict:
+    """跨 session 搜尋 —— **範圍即權限**:讀不到的 session 連命中都看不到。
+
+    只掃熱 store(見 `_agent_context_warm_store`),命中的 session 各落一張
+    audit 卡(沒命中的沒外流內容,不打擾)。
+    """
+    max_hits = agent_context_policy.search_max_hits()
+    n = max(1, min(limit or max_hits, max_hits))
+    scanned = 0
+    hits: list = []
+    scope: list = []
+    for sid in _agent_context_candidates():
+        if scanned >= agent_context_policy.search_max_sessions():
+            break
+        if sid == caller:
+            continue
+        ok, _reason = agent_context_policy.decide(
+            policy, caller, sid, "search",
+            family=_agent_context_family(caller, sid))
+        if not ok:
+            continue
+        store = _agent_context_warm_store(sid)
+        if store is None:
+            continue
+        scope.append(sid)
+        scanned += 1
+        hits.extend(_agent_context_search_store(store, sid, query,
+                                                max(1, n - len(hits))))
+        if len(hits) >= n:
+            break
+    hits.sort(key=lambda h: float(h.get("ts") or 0))
+    hits = hits[:n]
+    content, truncated = agent_context_policy.clip(
+        _agent_context_hits_text(hits, query),
+        agent_context_policy.max_chars())
+    _log_event("agent_context_read", read=read_id, caller=caller, target="*",
+               mode="search", scanned=scanned, hits=len(hits),
+               chars=len(content), truncated=truncated)
+    _registry_call_safe("touch", caller)
+    for sid in dict.fromkeys(h["session"] for h in hits):
+        await _agent_context_audit(caller, sid, "search", read_id,
+                                   note=f"關鍵字「{query[:40]}」",
+                                   create_store=False)
+    return {"ok": True, "read_id": read_id, "mode": "search", "target": "*",
+            "purpose": "", "provider": "", "model": None, "busy": False,
+            "last_active_ts": None, "content": content,
+            "truncated": truncated, "source_seq": 0, "cached": False,
+            "basis": "scope", "hits": hits, "scope": scope}
+
+
+@app.get("/app/v2/agent_context_targets")
+async def v2_agent_context_targets(request: Request, caller: str = "",
+                                   mode: str = ""):
+    """這個 caller 讀得到誰、各自能讀到什麼程度(空 mode = 逐模式列出)。
+    給 agent 自己盤點用,也給善彰驗證政策有沒有設對。"""
+    _check_auth(request)
+    _agent_context_require_enabled()
+    caller = _agent_call_normalize_sid(caller)
+    if not caller:
+        raise http_err(400, "AGENT_CONTEXT_BAD_REQUEST", "caller 必填")
+    if mode and mode not in agent_context_policy.MODES:
+        raise http_err(400, "AGENT_CONTEXT_BAD_MODE",
+                       f"mode 必須是 {'|'.join(agent_context_policy.MODES)}")
+    policy = agent_context_policy.load_policy()
+    modes = (mode,) if mode else agent_context_policy.MODES
+    out = []
+    for sid in _agent_context_candidates():
+        if sid == caller:
+            continue
+        fam = _agent_context_family(caller, sid)
+        allowed = [m for m in modes
+                   if agent_context_policy.decide(policy, caller, sid, m,
+                                                  family=fam)[0]]
+        if not allowed:
+            continue
+        row = REGISTRY.get(sid) or {}
+        out.append({"id": sid, "provider": row.get("provider"),
+                    "purpose": agent_context_policy.redact_text(
+                        row.get("purpose") or ""),
+                    "modes": allowed, "family": fam})
+    return {"caller": caller, "targets": out,
+            "policy_path": agent_context_policy.policy_path(),
+            "tiering": {"family": list(agent_context_policy.family_modes()),
+                        "context_rule_default": list(
+                            agent_context_policy.rule_default_modes()),
+                        "agent_call_implies": list(
+                            agent_context_policy.call_implies_modes())}}
 
 
 @app.on_event("startup")
