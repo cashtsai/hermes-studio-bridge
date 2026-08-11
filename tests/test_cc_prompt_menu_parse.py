@@ -99,6 +99,83 @@ class CCPromptMenuParseTests(unittest.TestCase):
         self.assertIsNone(bridge._cc_prompt(
             REAL_PANE + "\n· Fermenting… (1m 51s · ↓ 6.5k tokens)\n"))
 
+    def test_single_select_pane_is_not_multiselect(self):
+        self.assertFalse(bridge._cc_prompt(REAL_PANE)["multiselect"])
+
+
+# 實機擷取(tmux capture-pane,Pocket-Droid,2026-08-11)。多選版面(multiSelect):
+# 選項帶 [ ] checkbox、說明行只縮 2 格(單選版縮 5 格)、多題 header 是「← ☐ … →」
+# 頁籤列。舊解析器在這個版面上把 2 格縮排的說明誤判成問題本文 → 標題變成選項 4
+# 的說明、選項 1-4 全丟,App 只剩「[ ] Type something」+「Chat about this」兩顆爛按鈕。
+MULTISELECT_PANE = """────────────────────────────────────────────────────────────────────────────────
+←  ☐ 追 122 範圍  ✔ Submit  →
+
+Build 122 這輪要實作哪些?(可複選;Fleet view 我建議 defer 到 bridge 部署
+registry)
+
+❯ 1. [ ] Markdown 保真 a+c+d (清單/h5h6/diff行內)
+  清單(平+巢狀)+任務清單 + h5/h6 + diff 逐字著色。使用者天天看得到、低風險、無
+  bridge 依賴。建議必做。
+  2. [ ] 送出耐久性 e
+  outbox 落盤 + 啟動補送 + 持久化 failed flag。修「app 被殺未送訊息靜默消失」的
+  correctness bug。中、低風險,有現成 CardStore 落盤範式可抄。
+  3. [ ] 程式碼語法上色 b
+  淨新的 tokenizer 子系統(iOS ~459
+  行)。使用者可見但份量大、自成一塊。可獨立後續做。
+  4. [ ] 串流增量渲染 g + CC/CX v2 f
+  g=串流長卡 perf(O(n²)→O(n));f=CC/CX 控制面切 v2(input/interrupt/mode/model)。f
+  有回歸風險且需先驗 bridge 是否收 CC/CX v2 session id。
+  5. [ ] Type something
+     Submit
+────────────────────────────────────────────────────────────────────────────────
+  6. Chat about this
+
+Enter to select · ↑/↓ to navigate · Esc to cancel
+"""
+
+
+class CCMultiSelectMenuParseTests(unittest.TestCase):
+    """回歸:2026-08-11 的實際炸法 —— 多選版面 2 格縮排說明被當成問題本文。"""
+
+    def test_title_is_the_question_not_an_option_description(self):
+        p = bridge._cc_prompt(MULTISELECT_PANE)
+        self.assertIsNotNone(p)
+        self.assertIn("Build 122 這輪要實作哪些?", p["title"])
+        # 炸開當下的實際症狀:標題被換成選項 4 的說明
+        self.assertNotIn("g=串流長卡", p["title"])
+
+    def test_all_six_options_survive(self):
+        opts = bridge._cc_prompt(MULTISELECT_PANE)["options"]
+        self.assertEqual([o["key"] for o in opts],
+                         ["1", "2", "3", "4", "5", "6"])
+
+    def test_checkbox_prefix_is_stripped_and_flagged(self):
+        p = bridge._cc_prompt(MULTISELECT_PANE)
+        self.assertTrue(p["multiselect"])
+        labels = [o["label"] for o in p["options"]]
+        for lbl in labels:
+            self.assertFalse(lbl.startswith("["), lbl)
+        self.assertEqual(labels[0], "Markdown 保真 a+c+d (清單/h5h6/diff行內)")
+        self.assertEqual(labels[4], "Type something")
+        self.assertEqual(labels[5], "Chat about this")
+
+    def test_two_space_descriptions_attach_to_their_option(self):
+        opts = bridge._cc_prompt(MULTISELECT_PANE)["options"]
+        self.assertIn("低風險、無 bridge 依賴", opts[0]["description"])
+        self.assertIn("CardStore 落盤範式可抄", opts[1]["description"])
+        # 說明折行要接起來(選項 3 的說明在「459 / 行)」處折行)
+        self.assertIn("iOS ~459 行", opts[2]["description"])
+        self.assertIn("f 有回歸風險", opts[3]["description"])
+
+    def test_tab_chip_row_never_leaks_into_the_title(self):
+        p = bridge._cc_prompt(MULTISELECT_PANE)
+        self.assertNotIn("追 122 範圍", p["title"])
+        self.assertNotIn("Submit", p["title"])
+
+    def test_wrapped_question_lines_join(self):
+        p = bridge._cc_prompt(MULTISELECT_PANE)
+        self.assertIn("bridge 部署 registry)", p["title"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -8084,6 +8084,7 @@ def _cc_pending_ask(jsonl, current=None):
                         "title": str(q0.get("question") or "").strip(),
                         "header": str(q0.get("header") or "").strip() or None,
                         "options": opts, "multi": len(qs) > 1,
+                        "multiselect": bool(q0.get("multiSelect")),
                         "q_index": qs.index(q0), "q_total": len(qs)}
     return None
 
@@ -9351,8 +9352,15 @@ def _cc_opt_match(raw: str):
     return _CC_OPT_NUM_RE.match(raw.strip().lstrip(_CC_MARKER_CHARS).strip())
 
 
+_CC_CHECKBOX_RE = re.compile(r"^\[[ xX✔✓]?\]\s*")
+
+
+def _cc_indent(raw: str) -> int:
+    return len(raw) - len(raw.lstrip(" "))
+
+
 def _cc_menu_from_footer(lines: list[str], footer_i: int):
-    """從 "Enter to select" footer 往上收選單區塊 → (title, options)。
+    """從 "Enter to select" footer 往上收選單區塊 → (title, options, multiselect)。
 
     為什麼要這樣收:舊版固定往上掃 `lines[-28:]`,會掃進**對話正文**。2026-07-29
     實際炸開 —— 我方訊息裡有「1. …2. …3. …4. 草稿存附件 …」的編號段落,整段被
@@ -9374,24 +9382,32 @@ def _cc_menu_from_footer(lines: list[str], footer_i: int):
         Enter to select · …
 
     所以界線是「第一個非縮排、非編號、非框線的普通文字」= 問題本身,停在那。
+
+    縮排門檻是 **≥2 格**,不是舊版的 ≥4 格:AskUserQuestion 的多選版面
+    (multiSelect,選項帶 [ ] checkbox)說明行只縮 2 格,舊門檻把說明行誤判成
+    問題本文 → 往上掃提早停,標題變成某選項的說明、之上的選項全部丟失
+    (2026-08-11 實機炸開:六個選項只剩「[ ] Type something」+「Chat about
+    this」)。單選版面說明縮 5 格,兩種門檻都吃;問題本文與其折行永遠貼 0 格,
+    所以 2 格是安全界線。
     """
     i = footer_i - 1
     block_start = footer_i
     while i >= 0:
         raw = lines[i]
         s = raw.strip()
-        if not s or _cc_is_border(s) or _cc_opt_match(raw) or raw[:4].strip() == "":
-            # 空行 / 框線 / 編號選項 / 縮排說明 —— 都還在選單區塊裡
+        if not s or _cc_is_border(s) or _cc_opt_match(raw) or _cc_indent(raw) >= 2:
+            # 空行 / 框線 / 編號選項 / 縮排的說明行 —— 都還在選單區塊裡
             block_start = i
             i -= 1
             continue
         break                                  # 撞到問題本文 → 區塊到此為止
 
-    # 問題可能折成多行:繼續往上收連續的普通文字,停在空行/框線/header chip。
+    # 問題可能折成多行:繼續往上收連續的普通文字,停在空行/框線/header chip
+    # (多題時 chip 長成「←  ☐ 標籤  ✔ Submit  →」的頁籤列,以 ← 或 ☐ 開頭)。
     title_lines: list[str] = []
     while i >= 0:
         s = lines[i].strip()
-        if not s or _cc_is_border(s) or s[0] in "☐☑" or _cc_opt_match(lines[i]):
+        if (not s or _cc_is_border(s) or s[0] in "☐☑←" or _cc_opt_match(lines[i])):
             break
         title_lines.insert(0, s)
         i -= 1
@@ -9399,6 +9415,7 @@ def _cc_menu_from_footer(lines: list[str], footer_i: int):
     # 區塊內正向掃一次:編號行 = 選項,其後縮排行 = 該選項的說明。
     options: list[dict] = []
     seen_keys: set[str] = set()
+    multiselect = False
     for raw in lines[block_start:footer_i]:
         m = _cc_opt_match(raw)
         if m:
@@ -9406,13 +9423,17 @@ def _cc_menu_from_footer(lines: list[str], footer_i: int):
             if key in seen_keys:               # 同號重複 → 只留第一個
                 continue                       # (假選項與真選項撞號會顯示兩次)
             seen_keys.add(key)
-            options.append({"key": key, "label": m.group(2).strip(), "description": ""})
+            label = m.group(2).strip()
+            if _CC_CHECKBOX_RE.match(label):   # 多選版面:label 帶 [ ]/[x] 勾選框
+                multiselect = True             # → 剝掉殘渣,App 端才不會把
+                label = _CC_CHECKBOX_RE.sub("", label).strip()  # 「[ ] …」當標籤渲染
+            options.append({"key": key, "label": label, "description": ""})
             continue
         s = raw.strip()
-        if s and not _cc_is_border(s) and raw[:4].strip() == "" and options:
+        if s and not _cc_is_border(s) and _cc_indent(raw) >= 2 and options:
             prev = options[-1]                 # 縮排續行 → 併進上一個選項的說明
             prev["description"] = (prev["description"] + " " + s).strip()
-    return " ".join(title_lines)[:280], options
+    return " ".join(title_lines)[:280], options, multiselect
 
 
 def _cc_jsonl_sid(path: str | None) -> str:
@@ -9606,13 +9627,13 @@ def _cc_prompt(pane: str):
     if "enter to select" in tail_low:
         footer_i = max(i for i, ln in enumerate(lines)
                        if "enter to select" in ln.lower())
-        title, opts = _cc_menu_from_footer(lines, footer_i)
+        title, opts, multiselect = _cc_menu_from_footer(lines, footer_i)
         if len(opts) >= 2:
             # A1 semantic:泛選單(AskUserQuestion 等)= Approval Hub 的 question,
             # 不是 permission — app 端永不再用 label 猜語意。kind 欄位維持
             # "menu"(app 現行相容),語意走新增的 semantic 欄位。
             return {"kind": "menu", "semantic": "question", "title": title,
-                    "options": opts[:8]}
+                    "options": opts[:8], "multiselect": multiselect}
     has_context = any(k in tail_low for k in ("wants to", "do you want", "proceed?", "would you like"))
     if has_context:
         opts = []
