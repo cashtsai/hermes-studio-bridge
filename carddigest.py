@@ -652,6 +652,13 @@ def _codex_item_to_cards_raw(item: dict, turn_id: str = "",
             body = {"text": text, "fallback_text": text or "附件"}
             if attachments:
                 body["attachments"] = attachments
+            # bridge 送 turn/start 時有帶 clientUserMessageId,回放的 item 也帶得回來
+            # —— 但這裡一直沒取,於是 codex 的 echo 卡從來沒有 client_id,任何拿
+            # client_id 對位 echo 的客戶端都會永遠對不到(只能退回脆弱的文字比對)。
+            cid_echo = (item.get("clientUserMessageId")
+                        or item.get("clientMessageId") or "")
+            if cid_echo:
+                body["client_id"] = str(cid_echo)
             cards.append(make_card(cid, turn_id, "user", "text",
                                    body))
         return cards
@@ -828,11 +835,33 @@ class CodexThreadDigest(ApprovalCardMixin):
         self.last_seed_at = 0.0
 
     def _status(self):
+        # phase 的契約(app `TerminalCardStore.statusPhase`):
+        #   queued = 「訊息已收下、session **還沒**接手」
+        # **不可以**拿來表示「正在跑、而且後面還有排隊」——app 的 WorkingBar
+        # (回合進行中唯一的停止鍵)在 phase=="queued" 時是隱藏的
+        # (CodexCardSessionView / AgentCardSessionView 皆然),而且
+        # `noteServerBusy(busy && phase != "queued")` 也會把 busy 當成善意謊言
+        # 不予採信。真的在跑卻標成 queued → 使用者只要排一則後續,當前回合的
+        # 停止鍵就消失,再也停不下來。
+        #
+        # 所以:在跑就是 run,積壓量走**獨立欄位** queue_depth,人話寫進 label。
+        # 「收下了但還沒開跑」(depth>0 且 not busy)才是 queued 的原義,保留。
+        depth = int(getattr(self, "queue_depth", 0) or 0)
+        if self.busy:
+            phase = "run"
+        elif depth:
+            phase = "queued"
+        else:
+            phase = "idle"
+        label = cc_status_label(self.busy, self.prompt,
+                                self.store.last_tool, self.store.saw_output)
+        if depth and not self.busy:
+            label = "已排入佇列,等待接手…"
+        elif depth:
+            label = f"{label} · 另有 {depth} 則排隊"
         self.store.set_status({
             "busy": self.busy, "mode": None, "prompt": self.prompt,
-            "phase": "run" if self.busy else "idle",
-            "label": cc_status_label(self.busy, self.prompt,
-                                     self.store.last_tool, self.store.saw_output),
+            "phase": phase, "queue_depth": depth, "label": label,
         })
 
     @staticmethod
