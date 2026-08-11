@@ -4146,6 +4146,9 @@ class CodexAppServerClient:
         self._stderr_task = None
         self.thread_events = collections.defaultdict(list)
         self.thread_event_generations = collections.defaultdict(int)
+        # 忙碌時的待送佇列(CX 排隊層)。CC 早就有「一定收下、回 queued」的語意,
+        # CX 卻是直送 app-server 撞牆回 4xx → app 標「送出失敗」。這裡補上對稱行為。
+        self.pending_inputs = collections.defaultdict(list)
         self.active_turns = {}
         self.turn_started_at = {}
         self.turn_terminal_at = {}
@@ -4697,6 +4700,13 @@ class CodexAppServerClient:
         if method == "turn/completed" and tid:
             self.active_turns.pop(tid, None)
             self.turn_terminal_at[tid] = time.time()
+            if self.pending_inputs.get(tid):     # 這輪結束 → 送出排隊中的下一則
+                try:
+                    t = asyncio.create_task(self.drain_pending(tid))
+                    _BG_TASKS.add(t)
+                    t.add_done_callback(_BG_TASKS.discard)
+                except RuntimeError:
+                    pass
             watchdog = self.turn_watchdogs.pop(tid, None)
             if watchdog and watchdog is not asyncio.current_task():
                 watchdog.cancel()
@@ -4777,8 +4787,11 @@ class CodexAppServerClient:
 
     async def start_turn(self, thread_id: str, input_items: list, client_id: str | None = None,
                          cwd: str | None = None):
-        self.thread_event_generations[thread_id] += 1
-        self.thread_events[thread_id].clear()
+        # 事件緩衝的清空與 generation 跳號**只能在 turn/start 真的成功之後**做。
+        # 2026-08-11 事故:原本擺在最前面,於是「上一輪還在跑時再送一則」——
+        # 即使 resume/turn start 隨後失敗(409/502),當前正在跑那輪的事件已經被
+        # 清空、generation 已跳號 → 串流斷掉、畫面變空白。送不出去是一回事,
+        # 把別人正在跑的那輪弄壞是另一回事,後者嚴重得多。
         await self.ensure_thread_loaded(thread_id, cwd=cwd)
         params = {"threadId": thread_id, "input": input_items}
         if client_id:
@@ -4786,6 +4799,8 @@ class CodexAppServerClient:
         if cwd:
             params["cwd"] = cwd
         res = await self.call("turn/start", params, timeout=30.0)
+        self.thread_event_generations[thread_id] += 1
+        self.thread_events[thread_id].clear()
         turn = (res or {}).get("turn") or {}
         self.active_turns[thread_id] = turn.get("id") or True
         self.turn_started_at[thread_id] = time.time()
@@ -4837,6 +4852,13 @@ class CodexAppServerClient:
                                thread=thread_id[:16], error=type(exc).__name__)
                 self.active_turns.pop(thread_id, None)
                 self.turn_terminal_at[thread_id] = time.time()
+                if self.pending_inputs.get(thread_id):   # 卡住中止也要放行佇列
+                    try:
+                        t = asyncio.create_task(self.drain_pending(thread_id))
+                        _BG_TASKS.add(t)
+                        t.add_done_callback(_BG_TASKS.discard)
+                    except RuntimeError:
+                        pass
                 try:
                     t = asyncio.create_task(_delegation_codex_completed(
                         thread_id, True, message))
@@ -4856,6 +4878,37 @@ class CodexAppServerClient:
 
     def is_active(self, thread_id: str) -> bool:
         return thread_id in self.active_turns
+
+    # ── CX 排隊層 ────────────────────────────────────────────────────────
+    # 契約與 CC 對稱:忙碌時「一定收下」並回 delivery=queued,turn 結束自動送出。
+    # 不回 4xx —— app 端沒有辦法分辨「真的失敗」與「只是還在忙」,一律紅字。
+    def enqueue_input(self, thread_id: str, input_items: list,
+                      client_id: str | None = None, cwd: str | None = None) -> int:
+        self.pending_inputs[thread_id].append(
+            {"input": input_items, "client_id": client_id, "cwd": cwd})
+        return len(self.pending_inputs[thread_id])
+
+    def pending_count(self, thread_id: str) -> int:
+        return len(self.pending_inputs.get(thread_id) or [])
+
+    async def drain_pending(self, thread_id: str) -> None:
+        """turn 結束後送出佇列裡的下一則(一次一則:codex 是單 writer)。
+        失敗不吞:把該則丟掉並記錄,否則會永遠卡在隊首反覆撞同一面牆。"""
+        while self.pending_inputs.get(thread_id):
+            if self.is_active(thread_id):
+                return                      # 新的一輪已經開跑,交給它結束時再 drain
+            item = self.pending_inputs[thread_id].pop(0)
+            try:
+                await self.start_turn(thread_id, item["input"],
+                                      client_id=item.get("client_id"),
+                                      cwd=item.get("cwd"))
+                _log_event("codex_pending_input_sent", thread=thread_id[:16],
+                           remaining=len(self.pending_inputs.get(thread_id) or []))
+                _cx_sync_queue_depth(thread_id)
+                return                      # 開跑了 → 下一則等這輪結束
+            except Exception as exc:        # noqa: BLE001
+                _log_event("codex_pending_input_failed", thread=thread_id[:16],
+                           error=type(exc).__name__, error_message=str(exc)[:200])
 
     def is_server_alive(self) -> bool:
         return bool(self.proc and self.proc.returncode is None)
@@ -5189,8 +5242,12 @@ def _codex_http_error(e: Exception):
     if isinstance(e, (asyncio.TimeoutError, TimeoutError)):
         raise http_err(504, "PROVIDER_TIMEOUT", "codex app-server timeout", str(e))
     if isinstance(e, CodexAppServerError):
-        code = 409 if e.code == -32600 else 502
-        raise HTTPException(status_code=code, detail=str(e))
+        if e.code == -32600:
+            # 舊版一律 409 + 裸訊息,app 端把它顯示成「會話目前沒有在執行」——
+            # 真相通常相反(上一輪正在跑)。給結構化 code 讓 app 講對話。
+            raise http_err(409, "CX_TURN_IN_FLIGHT",
+                           "codex thread is busy with another turn", str(e))
+        raise HTTPException(status_code=502, detail=str(e))
     raise HTTPException(status_code=502, detail=str(e))
 
 
@@ -6715,14 +6772,30 @@ async def codex_session_input(thread_id: str, request: Request):
     if not input_items:
         raise HTTPException(status_code=400, detail="empty")
     _codex_history_invalidate(thread_id)     # new user turn → history changed
+    text = _codex_user_input_text(input_items)
+    # 上一輪還在跑 → 收下入佇列(delivery=queued),**絕不回 4xx**。
+    # 舊行為是直送 app-server 撞牆 → 409/502 → app 紅字「送出失敗」,而且 409 的
+    # 人話還是「會話目前沒有在執行」,跟真相完全相反。CC 早有 queued 語意,對齊之。
+    if CODEX_APP.is_active(thread_id):
+        depth = CODEX_APP.enqueue_input(thread_id, input_items,
+                                        client_id=body.get("client_id"),
+                                        cwd=body.get("cwd"))
+        _cx_feed_input_accepted(
+            thread_id, body.get("client_id"), text,
+            body.get("attachments") or [], typed_text=text,
+            create_if_missing=True, queued=True)
+        return {"ok": True, "thread_id": thread_id, "turn": None,
+                "delivery": "queued", "queue_depth": depth}
     try:
         res = await CODEX_APP.start_turn(thread_id, input_items,
                                          client_id=body.get("client_id"),
                                          cwd=body.get("cwd"))
         _cx_feed_input_accepted(
-            thread_id, body.get("client_id"), _codex_user_input_text(input_items),
-            body.get("attachments") or [], typed_text=_codex_user_input_text(input_items))
-        return {"ok": True, "thread_id": thread_id, "turn": (res or {}).get("turn")}
+            thread_id, body.get("client_id"), text,
+            body.get("attachments") or [], typed_text=text,
+            create_if_missing=True)
+        return {"ok": True, "thread_id": thread_id, "turn": (res or {}).get("turn"),
+                "delivery": "accepted"}
     except Exception as e:  # noqa: BLE001
         _codex_http_error(e)
 
@@ -11236,15 +11309,23 @@ async def v2_session_input(session_id: str, request: Request):
         if not content and not attachments:
             raise HTTPException(status_code=400, detail="empty")
         items = await _codex_input_items(content, attachments)
+        text = _codex_user_input_text(items)
+        if CODEX_APP.is_active(src[1]):        # 忙碌 → 入佇列(同 v1,不回 4xx)
+            depth = CODEX_APP.enqueue_input(src[1], items,
+                                            client_id=body.get("client_id"))
+            _cx_feed_input_accepted(src[1], body.get("client_id"), text, attachments,
+                                    typed_text=text, create_if_missing=True, queued=True)
+            return {"ok": True, "session_id": session_id, "accepted": True,
+                    "delivery": "queued", "queue_depth": depth}
         try:
             await CODEX_APP.start_turn(src[1], items,
                                        client_id=body.get("client_id"))
         except CodexAppServerError as e:
             _codex_http_error(e)
-        _cx_feed_input_accepted(
-            src[1], body.get("client_id"), _codex_user_input_text(items),
-            attachments, typed_text=_codex_user_input_text(items))
-        return {"ok": True, "session_id": session_id, "accepted": True}
+        _cx_feed_input_accepted(src[1], body.get("client_id"), text, attachments,
+                                typed_text=text, create_if_missing=True)
+        return {"ok": True, "session_id": session_id, "accepted": True,
+                "delivery": "accepted"}
     return await _v2_persona_input(src[1], session_id, body, request)
 
 
@@ -11998,9 +12079,22 @@ def _input_attachment_summary(attachments) -> list[dict]:
     return out
 
 
+def _cx_sync_queue_depth(thread_id: str) -> None:
+    """把 CX 佇列深度同步進卡片流 digest,狀態卡才畫得出「已排入佇列」。"""
+    d = _CX_CARD_DIGESTS.get(thread_id)
+    if d is None:
+        return
+    try:
+        d.queue_depth = CODEX_APP.pending_count(thread_id)
+        d._status()
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("_cx_sync_queue_depth", _exc, expected=True)
+
+
 def _cx_feed_input_accepted(thread_id: str, client_id: str | None, text: str,
                             attachments=None, typed_text: str | None = None,
-                            create_if_missing: bool = False) -> None:
+                            create_if_missing: bool = False,
+                            queued: bool = False) -> None:
     if not thread_id:
         return
     d = _CX_CARD_DIGESTS.get(thread_id)
@@ -12011,6 +12105,10 @@ def _cx_feed_input_accepted(thread_id: str, client_id: str | None, text: str,
     card = carddigest.make_input_accepted_card(
         "codex", client_id, text, attachments=_input_attachment_summary(attachments),
         typed_text=typed_text)
+    if queued:
+        # 排隊中的那則:讓 app 顯示「已排入佇列」而不是「已送達」。
+        (card.get("body") or {})["delivery"] = "queued"
+        d.queue_depth = CODEX_APP.pending_count(thread_id)
     # start_turn 先 await 才走到這裡:live userMessage 事件常在等待期間已把
     # transcript 回顯 digest 成卡(card-cx-<uuid>),accepted 晚到再開一張=
     # 同句兩顆泡泡。CC 同款 race 用 absorb 反向合併,cx 一直沒接上。

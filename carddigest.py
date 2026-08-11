@@ -578,6 +578,13 @@ def _codex_item_to_cards_raw(item: dict, turn_id: str = "",
             body = {"text": text, "fallback_text": text or "附件"}
             if attachments:
                 body["attachments"] = attachments
+            # bridge 送 turn/start 時有帶 clientUserMessageId,回放的 item 也帶得回來
+            # —— 但這裡一直沒取,於是 codex 的 echo 卡從來沒有 client_id,任何拿
+            # client_id 對位 echo 的客戶端都會永遠對不到(只能退回脆弱的文字比對)。
+            cid_echo = (item.get("clientUserMessageId")
+                        or item.get("clientMessageId") or "")
+            if cid_echo:
+                body["client_id"] = str(cid_echo)
             cards.append(make_card(cid, turn_id, "user", "text",
                                    body))
         return cards
@@ -754,11 +761,16 @@ class CodexThreadDigest(ApprovalCardMixin):
         self.last_seed_at = 0.0
 
     def _status(self):
+        # queued:忙碌中收下了新訊息(CX 排隊層)。契約與 CC 對齊 —— app 據此顯示
+        # 「已排入佇列」而不是把送出當成失敗。queue_depth 由 bridge 灌進來。
+        queued = bool(getattr(self, "queue_depth", 0)) and self.busy
         self.store.set_status({
             "busy": self.busy, "mode": None, "prompt": self.prompt,
-            "phase": "run" if self.busy else "idle",
-            "label": cc_status_label(self.busy, self.prompt,
-                                     self.store.last_tool, self.store.saw_output),
+            "phase": "queued" if queued else ("run" if self.busy else "idle"),
+            "queue_depth": getattr(self, "queue_depth", 0),
+            "label": ("已排入佇列,等待接手…" if queued
+                      else cc_status_label(self.busy, self.prompt,
+                                           self.store.last_tool, self.store.saw_output)),
         })
 
     @staticmethod
