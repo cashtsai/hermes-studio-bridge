@@ -1,0 +1,9 @@
+{
+  "_comment": "agent_call allowlist 政策範例。複製到 ~/.pocket/agent-call-policy.json(或 env AGENT_CALL_POLICY 指定路徑)後,配合 bridge env AGENT_CALL=1 啟用。default DENY:沒被規則命中的 (caller, target) 一律拒絕。pattern 用 fnmatch 萬用字元。",
+  "_example": "下例:袁方可調所有 CC lane;tirith(CC)可回調袁方與所有 codex thread。",
+  "version": 1,
+  "rules": [
+    {"caller": "hermes:yuanfang", "targets": ["claude_code:*"]},
+    {"caller": "claude_code:tirith", "targets": ["hermes:yuanfang", "codex:*"]}
+  ]
+}
