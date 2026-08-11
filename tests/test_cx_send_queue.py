@@ -134,16 +134,35 @@ class EchoClientIdTests(unittest.TestCase):
 
 
 class QueuedStatusTests(unittest.TestCase):
-    """狀態卡要能表達 queued(app 據此顯示「已排入佇列」而不是失敗)。"""
+    """狀態卡要能表達積壓,但 **不可以** 借用 phase="queued" 來表達。
 
-    def test_status_reports_queued_when_busy_with_pending(self):
+    app 契約(`TerminalCardStore.statusPhase`)裡 queued = 「訊息已收下、session
+    還沒接手」,而 `CodexCardSessionView` / `AgentCardSessionView` 都在
+    `statusPhase == "queued"` 時**隱藏 WorkingBar**(回合中唯一的停止鍵),
+    `noteServerBusy(busy && phase != "queued")` 也會忽略 busy。把「正在跑且有
+    積壓」標成 queued → 使用者一排後續訊息,當前回合就再也停不下來。
+    """
+
+    def test_running_with_backlog_stays_run(self):
         d = carddigest.CodexThreadDigest()
         d.busy = True
         d.queue_depth = 2
         d._status()
         st = d.store.status
+        self.assertEqual(st.get("phase"), "run",
+                         "正在跑卻標 queued → app 隱藏停止鍵,回合停不下來")
+        self.assertEqual(st.get("queue_depth"), 2, "積壓要走自己的欄位")
+        self.assertIn("2", st.get("label", ""), "積壓要在 label 講人話")
+        self.assertIn("排隊", st.get("label", ""))
+
+    def test_accepted_but_not_started_is_queued(self):
+        """queued 的原義(收下了、還沒開跑)保留。"""
+        d = carddigest.CodexThreadDigest()
+        d.busy = False
+        d.queue_depth = 1
+        d._status()
+        st = d.store.status
         self.assertEqual(st.get("phase"), "queued")
-        self.assertEqual(st.get("queue_depth"), 2)
         self.assertIn("排入佇列", st.get("label", ""))
 
     def test_busy_without_queue_is_plain_run(self):
@@ -151,6 +170,233 @@ class QueuedStatusTests(unittest.TestCase):
         d.busy = True
         d._status()
         self.assertEqual(d.store.status.get("phase"), "run")
+        self.assertEqual(d.store.status.get("queue_depth"), 0)
+
+    def test_idle_is_idle(self):
+        d = carddigest.CodexThreadDigest()
+        d._status()
+        self.assertEqual(d.store.status.get("phase"), "idle")
+
+
+class QueueDepthSyncTests(unittest.TestCase):
+    """佇列整批失敗清空時,depth 也必須歸零(否則狀態列永遠掛著「另有 N 則排隊」)。"""
+
+    def setUp(self):
+        self.saved_app = bridge.CODEX_APP
+        self.saved_digests = dict(bridge._CX_CARD_DIGESTS)
+
+    def tearDown(self):
+        bridge.CODEX_APP = self.saved_app
+        bridge._CX_CARD_DIGESTS.clear()
+        bridge._CX_CARD_DIGESTS.update(self.saved_digests)
+
+    def test_depth_returns_to_zero_after_whole_queue_fails(self):
+        c = fresh_client(fail_start=True)
+        bridge.CODEX_APP = c
+        d = bridge._CX_CARD_DIGESTS["t1"] = carddigest.CodexThreadDigest()
+        d.busy = True
+        c.enqueue_input("t1", [{"type": "text", "text": "一"}], text="一")
+        c.enqueue_input("t1", [{"type": "text", "text": "二"}], text="二")
+        bridge._cx_sync_queue_depth("t1")
+        self.assertEqual(d.queue_depth, 2)
+
+        run(c.drain_pending("t1"))       # 兩則都失敗 → 佇列清空
+
+        self.assertEqual(c.pending_count("t1"), 0)
+        self.assertEqual(d.queue_depth, 0,
+                         "整批失敗後 depth 卡著不歸零 → 狀態列永遠掛著排隊字樣")
+
+    def test_dropped_message_surfaces_an_error_card(self):
+        """被丟掉的訊息不能靜默消失 —— 使用者的泡泡還停在「已排入下一輪」。"""
+        c = fresh_client(fail_start=True)
+        bridge.CODEX_APP = c
+        d = bridge._CX_CARD_DIGESTS["t1"] = carddigest.CodexThreadDigest()
+        c.enqueue_input("t1", [{"type": "text", "text": "會被丟掉"}], text="會被丟掉")
+
+        run(c.drain_pending("t1"))
+
+        texts = [(card.get("body") or {}).get("text", "")
+                 for card in d.store.cards.values()]
+        self.assertTrue(any("丟棄" in t for t in texts),
+                        f"排隊訊息被丟掉卻沒有任何卡片告知使用者:{texts}")
+        self.assertTrue(any("會被丟掉" in t for t in texts), "錯誤卡要帶原文摘要")
+
+
+class InterruptErrorCodeTests(unittest.TestCase):
+    """M-8:interrupt 的「沒有回合可中斷」不能被翻成「上一輪正在跑」。"""
+
+    def test_no_active_turn_maps_to_its_own_code(self):
+        c = fresh_client()
+        with self.assertRaises(bridge.CodexAppServerError) as ctx:
+            run(c.interrupt_turn("t1"))
+        self.assertEqual(ctx.exception.code, bridge._CX_NO_ACTIVE_TURN_CODE)
+        with self.assertRaises(bridge.BridgeError) as http_ctx:
+            bridge._codex_http_error(ctx.exception)
+        self.assertEqual(http_ctx.exception.status_code, 409)
+        self.assertEqual(http_ctx.exception.code, "CX_NO_ACTIVE_TURN",
+                         "沒有回合可中斷卻回報 CX_TURN_IN_FLIGHT → 與事實完全相反")
+
+    def test_busy_error_still_maps_to_in_flight(self):
+        err = bridge.CodexAppServerError("busy", code=-32600)
+        with self.assertRaises(bridge.BridgeError) as http_ctx:
+            bridge._codex_http_error(err)
+        self.assertEqual(http_ctx.exception.code, "CX_TURN_IN_FLIGHT")
+
+
+class InputDedupTests(unittest.TestCase):
+    """H-4:排隊層拿掉 409 那面「意外的防護牆」之後,重試 = 保證重複執行。
+
+    重試路徑不是假設性的:app 端 90s client timeout 重送、OfflineOutbox 自動
+    補送、retryPending 可連點。同一個 client_id 在 TTL 內只能真的執行一次。
+    """
+
+    def setUp(self):
+        bridge._CX_INPUT_INFLIGHT.clear()
+
+    tearDown = setUp
+
+    def test_second_request_with_same_client_id_does_not_execute_again(self):
+        async def scenario():
+            entry, prior = await bridge._cx_input_claim("t1", "cid-1")
+            self.assertIsNotNone(entry)
+            self.assertIsNone(prior)
+            bridge._cx_input_settle(entry, {"delivery": "accepted", "queued": False})
+
+            entry2, prior2 = await bridge._cx_input_claim("t1", "cid-1")
+            self.assertIsNone(entry2, "同一個 client_id 又拿到 claim → 會送第二次")
+            self.assertIsNotNone(prior2)
+            return await bridge._cx_input_replay(prior2)
+
+        replayed = run(scenario())
+        self.assertEqual(replayed.get("delivery"), "accepted",
+                         "重複請求要回原本那一次的結果")
+
+    def test_queued_result_is_replayed_too(self):
+        """入佇列那條路也要去重,否則同一則會被排進佇列兩次 = 真的送兩次。"""
+        async def scenario():
+            entry, _ = await bridge._cx_input_claim("t1", "cid-q")
+            bridge._cx_input_settle(entry, {"delivery": "queued", "queued": True,
+                                            "queue_depth": 1})
+            _, prior = await bridge._cx_input_claim("t1", "cid-q")
+            return await bridge._cx_input_replay(prior)
+
+        replayed = run(scenario())
+        self.assertTrue(replayed.get("queued"))
+        self.assertEqual(replayed.get("queue_depth"), 1)
+
+    def test_failed_first_attempt_releases_the_claim(self):
+        """第一次失敗要放掉 claim,否則重試被自己擋整整一個 TTL(issue #9 同款坑)。"""
+        async def scenario():
+            entry, _ = await bridge._cx_input_claim("t1", "cid-err")
+            bridge._cx_input_release(entry)
+            return await bridge._cx_input_claim("t1", "cid-err")
+
+        entry2, prior2 = run(scenario())
+        self.assertIsNotNone(entry2, "失敗後重試被自己的 claim 擋住 → 永遠送不出去")
+        self.assertIsNone(prior2)
+
+    def test_different_client_ids_are_independent(self):
+        async def scenario():
+            e1, _ = await bridge._cx_input_claim("t1", "cid-a")
+            e2, p2 = await bridge._cx_input_claim("t1", "cid-b")
+            return e1, e2, p2
+
+        e1, e2, p2 = run(scenario())
+        self.assertIsNotNone(e1)
+        self.assertIsNotNone(e2, "不同 client_id 不該互相擋")
+        self.assertIsNone(p2)
+
+    def test_no_client_id_is_not_deduped(self):
+        """沒帶 client_id 就無從去重(維持原行為,不能悄悄把訊息吃掉)。"""
+        async def scenario():
+            return await bridge._cx_input_claim("t1", None)
+
+        entry, prior = run(scenario())
+        self.assertIsNone(entry)
+        self.assertIsNone(prior)
+
+
+class InputAckShapeTests(unittest.TestCase):
+    """B-2:app 解的是 **boolean `queued`**(`StudioBridgeV2.InputAck`),
+    不是字串 `delivery`。persona 的 v2 input 早就回 `"queued": queued`,
+    CX 少了它 → app 永遠當成沒排隊,泡泡不會標「⏳ 已排入下一輪」。"""
+
+    def setUp(self):
+        self.saved_app = bridge.CODEX_APP
+        self.saved_digests = dict(bridge._CX_CARD_DIGESTS)
+        bridge._CX_INPUT_INFLIGHT.clear()
+
+    def tearDown(self):
+        bridge.CODEX_APP = self.saved_app
+        bridge._CX_CARD_DIGESTS.clear()
+        bridge._CX_CARD_DIGESTS.update(self.saved_digests)
+        bridge._CX_INPUT_INFLIGHT.clear()
+
+    def _post(self, body, active):
+        c = fresh_client()
+        if active:
+            c.active_turns["t1"] = "turn-running"
+        bridge.CODEX_APP = c
+
+        class Req:
+            headers: dict = {}
+
+            async def json(self):
+                return body
+
+        async def scenario():
+            return await bridge.codex_session_input("t1", Req())
+
+        real_auth, real_body = bridge._check_auth, bridge._json_body
+
+        async def fake_body(_req):
+            return body
+
+        bridge._check_auth = lambda *_a, **_k: None
+        bridge._json_body = fake_body
+        try:
+            return run(scenario())
+        finally:
+            bridge._check_auth, bridge._json_body = real_auth, real_body
+
+    def test_queued_path_returns_boolean_queued_true(self):
+        res = self._post({"text": "排隊那則", "client_id": "cid-1"}, active=True)
+        self.assertEqual(res.get("delivery"), "queued")
+        self.assertIs(res.get("queued"), True,
+                      "少了 boolean queued → app 的 InputAck 永遠當成沒排隊")
+        self.assertEqual(res.get("queue_depth"), 1)
+
+    def test_direct_path_returns_boolean_queued_false(self):
+        res = self._post({"text": "直送那則", "client_id": "cid-2"}, active=False)
+        self.assertEqual(res.get("delivery"), "accepted")
+        self.assertIs(res.get("queued"), False)
+
+    def test_retry_with_same_client_id_does_not_send_twice(self):
+        """端到端:同一個 client_id 送兩次,app-server 只能被打一次。"""
+        c = fresh_client()
+        bridge.CODEX_APP = c
+        body = {"text": "重試", "client_id": "cid-dup"}
+
+        class Req:
+            headers: dict = {}
+
+        real_auth, real_body = bridge._check_auth, bridge._json_body
+
+        async def fake_body(_req):
+            return body
+
+        bridge._check_auth = lambda *_a, **_k: None
+        bridge._json_body = fake_body
+        try:
+            first = run(bridge.codex_session_input("t1", Req()))
+            second = run(bridge.codex_session_input("t1", Req()))
+        finally:
+            bridge._check_auth, bridge._json_body = real_auth, real_body
+
+        self.assertEqual(c.call.calls.count("turn/start"), 1,
+                         "同一個 client_id 打了兩次 turn/start = 真的執行兩次")
+        self.assertTrue(second.get("duplicate"))
+        self.assertEqual(second.get("delivery"), first.get("delivery"))
 
 
 if __name__ == "__main__":
