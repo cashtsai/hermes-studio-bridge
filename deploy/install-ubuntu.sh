@@ -5,8 +5,9 @@ set -euo pipefail
 # 把一台閒置 Ubuntu 機器裝成可被 Pocket App QR 配對的 agent 主機:
 #   bridge(FastAPI/uvicorn) + OpenClaw gateway(Node) [+ Hermes 選配]
 #   + cloudflared quick tunnel(公網保底) + systemd user units(開機自啟)
-# 結尾開 http://127.0.0.1:8081/pair/qr 掃碼配對;頁面會建議安裝 Tailscale
-# (公網之外自建私網,外出連線最穩)。
+# 結尾開 http://127.0.0.1:8081/pair/qr?boot=<code> 掃碼配對(boot code 為
+# 安裝時產生的一次性閘門,詳見 bridge.py _pair_check_boot);頁面會建議安裝
+# Tailscale(公網之外自建私網,外出連線最穩)。
 #
 # 與 mac 版共用同一套 env 覆蓋契約(POCKET_BRIDGE_LABEL/INSTALL_ROOT/
 # POCKET_PROVIDER/OPENCLAW_*/HERMES_*),差異只在平台黏合層:
@@ -42,6 +43,13 @@ OPENCLAW_NODE_VERSION="${OPENCLAW_NODE_VERSION:-24.18.0}"
 OPENCLAW_INSTALL_DIR="${OPENCLAW_INSTALL_DIR:-$HOME/apps/openclaw-clean}"
 TUNNEL_URL_FILE="${POCKET_TUNNEL_URL_FILE:-$HOME/.pocket/tunnel-url}"
 INSTALL_TUNNEL="${POCKET_INSTALL_TUNNEL:-1}"
+# cloudflared 版本釘死(同 node/openclaw 的釘法;latest 會讓安裝不可重現)
+CLOUDFLARED_VERSION="${CLOUDFLARED_VERSION:-2026.7.3}"
+# 配對頁 boot code(/pair/qr 的閘門;tunnel 下 loopback 不可信,見 bridge.py)
+PAIR_BOOT_CODE_FILE="${PAIR_BOOT_CODE_FILE:-$HOME/.pocket/pair-boot-code}"
+# bridge 綁定位址:預設只綁 loopback —— tunnel 是唯一預期入口。
+# 若要讓 LAN 裝置直連(不經 tunnel/Tailscale),明確覆蓋 POCKET_BRIDGE_BIND=0.0.0.0。
+BRIDGE_BIND="${POCKET_BRIDGE_BIND:-127.0.0.1}"
 
 case "$(uname -m)" in
   x86_64)  NODE_ARCH=linux-x64;  CF_ARCH=amd64 ;;
@@ -78,7 +86,18 @@ else
 fi
 grep -q '^POCKET_BRIDGE_PORT=' "$ENV_FILE" || printf 'POCKET_BRIDGE_PORT=%s\n' "$BRIDGE_PORT" >> "$ENV_FILE"
 grep -q '^POCKET_TUNNEL_URL_FILE=' "$ENV_FILE" || printf 'POCKET_TUNNEL_URL_FILE=%s\n' "$TUNNEL_URL_FILE" >> "$ENV_FILE"
+grep -q '^PAIR_BOOT_CODE_FILE=' "$ENV_FILE" || printf 'PAIR_BOOT_CODE_FILE=%s\n' "$PAIR_BOOT_CODE_FILE" >> "$ENV_FILE"
 chmod 600 "$ENV_FILE"
+
+# ── 配對 boot code(既有就沿用;bridge 啟動也會自產,這裡先產好以便印連結) ──
+if [ ! -s "$PAIR_BOOT_CODE_FILE" ]; then
+  log_step "產生配對 boot code"
+  mkdir -p "$(dirname "$PAIR_BOOT_CODE_FILE")"
+  (umask 077; python3 -c 'import secrets;print(secrets.token_urlsafe(16))' > "$PAIR_BOOT_CODE_FILE")
+fi
+chmod 600 "$PAIR_BOOT_CODE_FILE"
+PAIR_BOOT_CODE="$(head -n1 "$PAIR_BOOT_CODE_FILE" | tr -d '[:space:]')"
+[ -n "$PAIR_BOOT_CODE" ] || die "boot code 產生失敗($PAIR_BOOT_CODE_FILE)"
 
 # ── bridge 本體 + venv ────────────────────────────────────────────────────
 log_step "安裝 bridge 到 $INSTALL_ROOT"
@@ -142,9 +161,9 @@ if [ "$INSTALL_TUNNEL" = "1" ] && [ ! -x "$CLOUDFLARED_BIN" ]; then
   if command -v cloudflared >/dev/null; then
     CLOUDFLARED_BIN="$(command -v cloudflared)"
   else
-    log_step "下載 cloudflared($CF_ARCH)"
+    log_step "下載 cloudflared $CLOUDFLARED_VERSION($CF_ARCH)"
     mkdir -p "$HOME/.local/bin"
-    curl -fsSL "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-$CF_ARCH" -o "$CLOUDFLARED_BIN"
+    curl -fsSL "https://github.com/cloudflare/cloudflared/releases/download/$CLOUDFLARED_VERSION/cloudflared-linux-$CF_ARCH" -o "$CLOUDFLARED_BIN"
     chmod +x "$CLOUDFLARED_BIN"
   fi
 fi
@@ -162,7 +181,9 @@ After=network-online.target
 WorkingDirectory=$INSTALL_ROOT
 EnvironmentFile=$ENV_FILE
 Environment=PATH=$NODE_ROOT/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
-ExecStart=$BRIDGE_VENV/bin/python -m uvicorn bridge:app --host 0.0.0.0 --port $BRIDGE_PORT --timeout-graceful-shutdown 3
+# 預設只綁 loopback:對外唯一入口是 cloudflared tunnel(或自建 Tailscale)。
+# 要開 LAN 直連請以 POCKET_BRIDGE_BIND=0.0.0.0 重跑安裝器(明確選擇,不是預設)。
+ExecStart=$BRIDGE_VENV/bin/python -m uvicorn bridge:app --host $BRIDGE_BIND --port $BRIDGE_PORT --timeout-graceful-shutdown 3
 Restart=always
 RestartSec=3
 
@@ -239,12 +260,27 @@ for _ in $(seq 1 30); do
 done
 curl -fsS -m 2 "http://127.0.0.1:$BRIDGE_PORT/health" >/dev/null || die "bridge 未起來;journalctl --user -u $BRIDGE_LABEL -n 50 查原因"
 
-PAIR_URL="http://127.0.0.1:$BRIDGE_PORT/pair/qr"
+# 配對頁連結一律內嵌 boot code(頁面/qr.json 缺碼會 403;連結本身即憑證,勿外流)
+PAIR_URL="http://127.0.0.1:$BRIDGE_PORT/pair/qr?boot=$PAIR_BOOT_CODE"
 echo
 echo "✅ 龍蝦主機就緒。用 Pocket App 掃碼配對:"
 echo "   $PAIR_URL"
+# tunnel 版配對頁(等 quick tunnel URL 落檔;雲端主機從手機瀏覽器直接開這條)
+if [ "$INSTALL_TUNNEL" = "1" ]; then
+  TUNNEL_URL=""
+  for _ in $(seq 1 20); do
+    TUNNEL_URL="$(head -n1 "$TUNNEL_URL_FILE" 2>/dev/null | tr -d '[:space:]')"
+    [ -n "$TUNNEL_URL" ] && break
+    sleep 1
+  done
+  if [ -n "$TUNNEL_URL" ]; then
+    echo
+    echo "🌐 公網配對頁(含 boot code,連結即憑證,只傳給自己的裝置):"
+    echo "   $TUNNEL_URL/pair/qr?boot=$PAIR_BOOT_CODE"
+  fi
+fi
 # 雲端/headless 免掃碼:直接給配對連結(30 分鐘有效),傳到手機點開即配。
-PAIR_LINK="$(curl -fsS -m 8 "http://127.0.0.1:$BRIDGE_PORT/pair/qr.json?ttl=1800" 2>/dev/null \
+PAIR_LINK="$(curl -fsS -m 8 "http://127.0.0.1:$BRIDGE_PORT/pair/qr.json?ttl=1800&boot=$PAIR_BOOT_CODE" 2>/dev/null \
   | python3 -c 'import json,sys;d=json.load(sys.stdin);print(d.get("payload","") if d.get("ok") else "")' 2>/dev/null || true)"
 if [ -n "$PAIR_LINK" ]; then
   echo

@@ -5865,6 +5865,74 @@ def _pair_local_only(request: Request) -> None:
         raise HTTPException(status_code=403, detail="local only")
 
 
+# ── 一次性 boot code:/pair/qr 的真正閘門 ─────────────────────────────────
+# _pair_local_only 在 cloudflared tunnel 部署下形同虛設:tunnel 把公網流量
+# proxy 進 127.0.0.1,每個公網訪客看起來都像 loopback → 任何拿到 tunnel URL
+# 的人都能開 /pair/qr 鑄配對碼 → /pair/claim 換 device token → 接管整台主機
+# (含終端 PTY)。因此 /pair/qr 與 /pair/qr.json 必須帶 ?boot=<code>:
+# 值放磁碟(chmod 600),只有摸得到這台機器的人(或安裝器印出的連結)才有。
+# _pair_local_only 保留當 defense-in-depth 第二層,但 boot code 才是真閘。
+_PAIR_BOOT_CODE_FILE = os.path.expanduser(
+    os.environ.get("PAIR_BOOT_CODE_FILE", "~/.pocket/pair-boot-code"))
+_PAIR_BOOT_CODE_LOCK = threading.Lock()
+_PAIR_BOOT_CODE_CACHE = {"code": ""}
+
+
+def _pair_boot_code() -> str:
+    """讀取(或首次啟動時產生)boot code;檔案 0600、一機一碼、重啟不變。"""
+    with _PAIR_BOOT_CODE_LOCK:
+        if _PAIR_BOOT_CODE_CACHE["code"]:
+            return _PAIR_BOOT_CODE_CACHE["code"]
+        path = _PAIR_BOOT_CODE_FILE
+        code = ""
+        try:
+            with open(path, encoding="utf-8") as f:
+                code = f.read().strip()
+        except FileNotFoundError:
+            pass
+        except Exception as _exc:  # noqa: BLE001
+            _log_exc("pair_boot_code_read", _exc, expected=True)
+        if not code:
+            code = secrets.token_urlsafe(16)
+            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(code + "\n")
+        _PAIR_BOOT_CODE_CACHE["code"] = code
+        return code
+
+
+def _pair_check_boot(request: Request) -> None:
+    """boot code 閘:缺/錯一律 403(錯誤形狀同其他 pair 4xx)。常數時間比較。"""
+    supplied = (request.query_params.get("boot") or "").strip()
+    if not supplied or not hmac.compare_digest(supplied, _pair_boot_code()):
+        raise HTTPException(status_code=403, detail="invalid boot code")
+
+
+try:  # 啟動即產生/載入,安裝器與人工查檔都能立刻拿到同一枚碼
+    _pair_boot_code()
+except Exception as _exc:  # noqa: BLE001
+    _log_exc("pair_boot_code_init", _exc, expected=True)
+
+
+# /pair/qr.json 鑄碼節流:配對是人手點一下的低頻動作,10/min 綽綽有餘,
+# 卻能擋住拿到 boot code 後的自動化狂鑄(縮小暴力面)。
+_PAIR_QR_MINT_LIMIT = 10
+_PAIR_QR_MINT_WINDOW = 60.0
+_PAIR_QR_MINTS = collections.deque()
+
+
+def _pair_qr_check_mint_rate() -> None:
+    now = time.monotonic()
+    with _PAIR_LOCK:
+        while _PAIR_QR_MINTS and now - _PAIR_QR_MINTS[0] > _PAIR_QR_MINT_WINDOW:
+            _PAIR_QR_MINTS.popleft()
+        if len(_PAIR_QR_MINTS) >= _PAIR_QR_MINT_LIMIT:
+            raise HTTPException(status_code=429,
+                                detail="too many pairing code requests; slow down")
+        _PAIR_QR_MINTS.append(now)
+
+
 def _pair_lan_ip():
     """UDP connect 戲法拿本機對外私網 IP(不真的發包),跨平台、免 ipconfig/ip。"""
     try:
@@ -5942,7 +6010,9 @@ def _pair_host_candidates(force: bool = False):
 async def pair_qr_json(request: Request):
     """鑄新碼 + 組 payload + 產 QR SVG,一次回齊(頁面 TTL 到期後再打一次換新碼)。
     ?ttl= 放寬碼效期(配對連結場景;夾 60..1800s)。"""
-    _pair_local_only(request)
+    _pair_check_boot(request)       # 真閘:一次性 boot code(tunnel 下 loopback 不可信)
+    _pair_local_only(request)       # defense-in-depth 第二層
+    _pair_qr_check_mint_rate()      # 鑄碼節流 10/min
     hosts, has_ts = _pair_host_candidates(force=True)
     if not hosts:
         return {"ok": False, "error": "no reachable host candidate (headless + no net?)"}
@@ -5993,7 +6063,11 @@ p.sub{margin:0 0 20px;opacity:.7}
 <script>
 let timer=null;
 async function load(){
-  const r=await fetch('/pair/qr.json');const d=await r.json();
+  // boot code 隨頁面網址帶入,轉發給 qr.json(缺/錯會 403)
+  const boot=new URLSearchParams(location.search).get('boot')||'';
+  const r=await fetch('/pair/qr.json?boot='+encodeURIComponent(boot));const d=await r.json();
+  if(r.status===403){document.getElementById('qr').textContent='boot code 無效 — 請用安裝器印出的完整連結開啟本頁';return}
+  if(r.status===429){document.getElementById('qr').textContent='產碼太頻繁,稍候再試';return}
   if(!d.ok){document.getElementById('qr').textContent=d.error||'失敗';return}
   document.getElementById('qr').innerHTML=d.svg||('<small style="word-break:break-all">'+d.payload+'</small>');
   document.getElementById('hosts').innerHTML='連線候選(依序自動選路):<br>'+d.hosts.map(h=>'· '+h).join('<br>');
@@ -6014,7 +6088,8 @@ load();
 
 @app.get("/pair/qr")
 async def pair_qr_page(request: Request):
-    _pair_local_only(request)
+    _pair_check_boot(request)       # 真閘:一次性 boot code(tunnel 下 loopback 不可信)
+    _pair_local_only(request)       # defense-in-depth 第二層
     return HTMLResponse(_PAIR_QR_HTML)
 
 
