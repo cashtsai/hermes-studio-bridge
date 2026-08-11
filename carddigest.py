@@ -1270,8 +1270,26 @@ class OpenClawDigest(ApprovalCardMixin):
         self.run_text: dict[str, str] = {}   # runId → 累積正文
         self.busy = False
         self.active_run = ""                 # busy 的 run 對位(見 _handle_agent)
+        self.ended_runs: dict = {}           # 已收尾 runId(有界,見 _mark_run_ended)
         self.prompt = None
         self.seeded = False
+
+    # 已收尾 run 的記憶上限(只為擋遲送事件,不需長記憶)
+    _ENDED_RUNS_MAX = 64
+
+    def _mark_run_ended(self, run: str):
+        """記下「這個 run 已經收尾」——gateway 會把同一 run 的事件遲送
+        (lifecycle end 之後才到的 chat delta,實測),收尾後的遲送事件
+        不得再把狀態拉回忙碌。以 dict 當有界 LRU。"""
+        if not run:
+            return
+        self.ended_runs.pop(run, None)
+        self.ended_runs[run] = True
+        while len(self.ended_runs) > self._ENDED_RUNS_MAX:
+            self.ended_runs.pop(next(iter(self.ended_runs)))
+
+    def _run_ended(self, run: str) -> bool:
+        return bool(run) and run in self.ended_runs
 
     def _status(self):
         self.store.set_status({
@@ -1342,9 +1360,14 @@ class OpenClawDigest(ApprovalCardMixin):
             self.run_text[run] = full
             # delta 還在流 = 一定忙(防禦:lifecycle start 沒到/被舊 run 的
             # end 誤清時,靠這裡自癒 —— 實測 gateway 會把舊 run 的 end 遲送)。
-            self.busy = True
-            if run:
-                self.active_run = run
+            # 但自癒同樣要 run 對位(比照 _handle_agent 的收尾守衛):已經收尾
+            # 的 run,其遲送 delta 不得把 busy 從待命拉回「回覆中」——那會卡死
+            # 到下一回合才解(實測 seq:turn end → idle → final → 遲送 delta →
+            # 永久回覆中)。未知/新 run 仍照舊自癒。
+            if not self._run_ended(run):
+                self.busy = True
+                if run:
+                    self.active_run = run
             self.store.saw_output = True
             self.store.last_tool = ""
             self.store.upsert_card(make_card(
@@ -1354,6 +1377,10 @@ class OpenClawDigest(ApprovalCardMixin):
         elif state == "final":
             full = text or self.run_text.pop(run, "")
             self.run_text.pop(run, None)
+            if msg:
+                # 「帶 message 的 final」才是回合定稿(裸 final 只是 ack,
+                # SPEC §3)——定稿後這個 run 的遲送 delta 一律視為 stale。
+                self._mark_run_ended(run)
             if full:
                 self.store.upsert_card(make_card(
                     cid, self.store.turn_id, "assistant", "markdown",
@@ -1361,8 +1388,14 @@ class OpenClawDigest(ApprovalCardMixin):
                     ts=_oc_ts(msg.get("timestamp"))))
         elif state in ("error", "aborted"):
             self.run_text.pop(run, None)
-            emsg = str(p.get("errorMessage") or text
-                       or ("已中斷" if state == "aborted" else "OpenClaw 回合失敗"))
+            self._mark_run_ended(run)
+            if state == "aborted":
+                # 中斷卡固定講「已中斷」:abort payload 常挾帶已產出的半截
+                # 正文,那份文字主卡上已經有了,拿它當錯誤訊息會被讀成假錯誤
+                # (實測「⚠️ 1\n2」)。只有真的錯誤訊息才蓋掉標籤。
+                emsg = str(p.get("errorMessage") or "").strip() or "已中斷"
+            else:
+                emsg = str(p.get("errorMessage") or text or "OpenClaw 回合失敗")
             self.store.upsert_card(make_card(
                 f"{cid}-err", self.store.turn_id, "system", "text",
                 {"text": f"⚠️ {emsg}", "fallback_text": f"⚠️ {emsg}"}))
@@ -1378,6 +1411,7 @@ class OpenClawDigest(ApprovalCardMixin):
             if ph == "start":
                 self.busy = True
                 self.active_run = run
+                self.ended_runs.pop(run, None)   # 防禦:runId 若被重用
                 self.store.turn_id = f"turn-{run or 'oc'}"
                 self.store.saw_output = False
                 self.store.last_tool = ""
@@ -1386,6 +1420,9 @@ class OpenClawDigest(ApprovalCardMixin):
             elif ph in ("end", "error"):
                 # run 對位:舊 run 的 end 可能在新 run start 之後才到
                 # (abort 收尾遲送,實測),不能清掉新 run 的 busy。
+                # 但不論是不是當前 run,這個 run 確實收尾了 → 先記帳,
+                # 讓它之後的遲送 delta 不會復活 busy。
+                self._mark_run_ended(run)
                 if run and self.active_run and run != self.active_run:
                     return
                 if ph == "error" and data.get("error"):
