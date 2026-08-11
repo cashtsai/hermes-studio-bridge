@@ -5038,6 +5038,13 @@ def _codex_session_summary(thread: dict) -> dict:
         "updatedAt": thread.get("updatedAt"),
         "modelProvider": thread.get("modelProvider") or "",
     }
+    # 設定面板讀回:當前 model / 審核策略 / effort / sandbox(thread/read 有才帶,
+    # 缺 = 不帶欄,舊 app 容忍)。命名對齊 app-server 的 thread 物件。
+    for src, dst in (("model", "model"), ("approvalPolicy", "approvalPolicy"),
+                     ("reasoningEffort", "effort"), ("sandboxMode", "sandbox")):
+        val = thread.get(src)
+        if val:
+            out[dst] = val
     # 0.142.2 returns tokenUsage: null from thread/list, but map it when a
     # future version populates it; the live overlay in _codex_enrich_summary
     # (thread/tokenUsage/updated) wins either way.
@@ -5433,8 +5440,21 @@ async def codex_session_create(request: Request):
         "ephemeral": False,
         "threadSource": "user",
     }
-    if body.get("model"):
-        params["model"] = body.get("model")
+    # spawn config(設計 §2.1):cx thread 走共用 app-server,能逐 thread 設的是
+    # model/approvalPolicy(runtime 亦可,見 /settings);effort/sandbox 以
+    # camelCase 透傳(app-server 不認會忽略)。api_key/profile 無法逐 thread 注入
+    # (共用 app-server 一份 auth)→ 要 BYO key 請走 /dispatch 的 codex exec 子程序。
+    try:
+        spawn_cfg = _spawn_config_validate(body.get("config"), "cx")
+    except SpawnConfigError as e:
+        raise HTTPException(status_code=400, detail=e.detail)
+    if body.get("model") and not spawn_cfg.get("model"):
+        spawn_cfg = {**spawn_cfg, "model": body.get("model")}
+    params.update(_spawn_cx_thread_params(spawn_cfg))
+    cx_unsupported = [k for k in ("api_key", "profile") if spawn_cfg.get(k)]
+    redacted = _spawn_config_redacted(spawn_cfg)
+    if redacted:
+        _log_event("codex_spawn_config", **redacted)
     # 戶政(藍圖 §3.1):thread/start 之前先過配額——超額 429,不生孤兒 thread。
     reg_parent, reg_cls, reg_purpose = _registry_spawn_fields(body, default_cls="task")
     _registry_precheck_or_429(reg_parent, reg_cls)
@@ -5454,8 +5474,13 @@ async def codex_session_create(request: Request):
             thread_id, body.get("client_id"), _codex_user_input_text(input_items),
             attachments, typed_text=_codex_user_input_text(input_items),
             create_if_missing=True)
-        return {"ok": True, "thread_id": thread_id,
-                "session": _codex_enrich_summary(_codex_session_summary(thread))}
+        resp = {"ok": True, "thread_id": thread_id,
+                "session": _codex_enrich_summary(_codex_session_summary(thread)),
+                "spawn_config": _spawn_config_public(spawn_cfg)}
+        if cx_unsupported:
+            # 明說哪些欄位共用 app-server 吃不下,app 可提示改走 dispatch。
+            resp["spawn_config_unsupported"] = cx_unsupported
+        return resp
     except Exception as e:  # noqa: BLE001
         _codex_http_error(e)
 
@@ -6737,6 +6762,31 @@ _CODEX_APPROVAL_POLICIES = ("untrusted", "on-failure", "on-request",
                             "granular", "never")
 
 
+@app.get("/codexsessions/{thread_id}/settings")
+async def codex_session_settings_read(thread_id: str, request: Request):
+    """讀回 per-thread 當前設定(model/approvalPolicy/effort/sandbox)給設定面板。
+    來源 = thread/read;缺欄 = 不帶(舊 app 容忍)。runtime 可改的欄:model、
+    approvalPolicy(見同路徑 POST);effort/sandbox 目前 spawn-only。"""
+    _check_auth(request)
+    try:
+        res = await CODEX_APP.call("thread/read", {
+            "threadId": thread_id,
+            "includeTurns": False,
+        }, timeout=20.0)
+        thread = (res or {}).get("thread") or {}
+    except Exception as e:  # noqa: BLE001
+        _codex_http_error(e)
+    settings = {}
+    for src, dst in (("model", "model"), ("approvalPolicy", "approvalPolicy"),
+                     ("reasoningEffort", "effort"), ("sandboxMode", "sandbox")):
+        val = thread.get(src)
+        if val:
+            settings[dst] = val
+    return {"thread_id": thread_id, "settings": settings,
+            "runtime_settable": ["model", "approvalPolicy"],
+            "approval_policies": list(_CODEX_APPROVAL_POLICIES)}
+
+
 @app.post("/codexsessions/{thread_id}/settings")
 async def codex_session_settings(thread_id: str, request: Request):
     """Update per-thread Codex settings. body {"model": str?,
@@ -6899,9 +6949,295 @@ async def codex_session_stream(thread_id: str, request: Request, replay: int = 2
     return StreamingResponse(gen(), media_type="text/event-stream")
 
 
-def _claude_argv(parent: str, prompt: str, resume: str | None = None):
+# ═══════════════ cc/cx spawn config「全集控制面」(設計 §2.1/§2.2)═══════════
+# 一份 config dict → 正確的 CLI flags / codex app-server 參數 / 注入 env。
+# 這裡全是純函式(端點只負責驗證 + 呼叫),讓「派子程序時用這個配置」以及
+# 未來 Harness 的 Subagent 設定共用同一份翻譯層。
+#
+# 鐵則:api_key 全程「只進該子程序的 env」,永不進 _log_event、永不進
+# canonical.db、永不落明文檔(除既有 0600 host-local secret 慣例)。
+#
+# runtime vs spawn-only(每 provider):
+#   cc:模型/審核方法 = runtime(/model、/mode 已在);effort/budget/fallback/
+#      append-system-prompt = launch-only(且 budget/fallback 只在 --print
+#      headless 生效,互動 TUI 不吃)。
+#   cx:模型/approvalPolicy = runtime(/settings 已在,thread/settings/update);
+#      effort/sandbox/profile/api_key = launch-only,且只有 `codex exec` 子程序
+#      (走 /dispatch)吃得到——共用 app-server 的 thread 無法逐 thread 注入 key。
+
+_SPAWN_CC_EFFORTS = ("low", "medium", "high", "xhigh", "max")
+# claude --permission-mode 的 CLI enum(與互動 TUI 的 _CC_MODES 不同,別混用)
+_SPAWN_CC_PERMISSION_MODES = ("acceptEdits", "auto", "manual", "plan",
+                              "bypassPermissions")
+_SPAWN_CX_EFFORTS = ("minimal", "low", "medium", "high", "xhigh")
+_SPAWN_CX_SANDBOXES = ("read-only", "workspace-write", "danger-full-access")
+# cx 審核策略沿用既有 _CODEX_APPROVAL_POLICIES(單一真相,與 /settings 對齊)。
+
+
+class SpawnConfigError(ValueError):
+    """spawn config 驗證失敗;`.detail` 為要回給 app 的 zh-TW 人話(400)。"""
+
+    def __init__(self, detail: str):
+        super().__init__(detail)
+        self.detail = detail
+
+
+def _spawn_fmt_usd(v) -> str:
+    s = ("%.4f" % float(v)).rstrip("0").rstrip(".")
+    return s or "0"
+
+
+def _spawn_config_validate(raw, provider: str) -> dict:
+    """把 app 傳來的 config 正規化成內部 dict。
+
+    - None / 缺欄 = 沿用今天行為(舊 app 不帶 config 完全不受影響)。
+    - 未知欄位一律忽略(前向相容:新 app 多帶的欄不會炸舊 bridge,反之亦然)。
+    - 任何 enum 違規 → SpawnConfigError(呼叫端翻 400 + zh-TW)。
+    provider: "cc"(claude_code / dispatch claude)或 "cx"(codex)。
+    """
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise SpawnConfigError("config 必須是物件(JSON object)")
+    cfg: dict = {}
+
+    # --- 字串欄 ---
+    for k in ("model", "fallback_model", "append_system_prompt", "api_key",
+              "profile"):
+        v = raw.get(k)
+        if v is None:
+            continue
+        if not isinstance(v, str):
+            raise SpawnConfigError(f"{k} 必須是字串")
+        if k == "append_system_prompt":
+            if v.strip() == "":
+                continue
+            cfg[k] = v            # 系統提示保留原樣(含換行)
+        else:
+            v = v.strip()
+            if v == "":
+                continue
+            cfg[k] = v
+
+    # --- 花費上限(美元)---
+    b = raw.get("max_budget_usd")
+    if b is not None:
+        if isinstance(b, bool) or not isinstance(b, (int, float)):
+            raise SpawnConfigError("max_budget_usd 必須是數字(美元)")
+        if b <= 0:
+            raise SpawnConfigError("max_budget_usd 必須大於 0")
+        cfg["max_budget_usd"] = float(b)
+
+    # --- effort(enum 依 provider 不同)---
+    e = raw.get("effort")
+    if e is not None:
+        e = str(e).strip()
+        allowed = _SPAWN_CC_EFFORTS if provider == "cc" else _SPAWN_CX_EFFORTS
+        if e not in allowed:
+            raise SpawnConfigError(
+                f"effort 需為 {'/'.join(allowed)} 其一(收到 {e!r})")
+        cfg["effort"] = e
+
+    # --- 審核 ---
+    if provider == "cc":
+        pm = raw.get("permission_mode")
+        if pm is not None:
+            pm = str(pm).strip()
+            if pm not in _SPAWN_CC_PERMISSION_MODES:
+                raise SpawnConfigError(
+                    "permission_mode 需為 "
+                    f"{'/'.join(_SPAWN_CC_PERMISSION_MODES)} 其一(收到 {pm!r})")
+            cfg["permission_mode"] = pm
+    else:  # cx
+        ap = raw.get("approval_policy")
+        if ap is None:
+            ap = raw.get("approvalPolicy")   # 容錯:app 傳 camelCase 也接
+        if ap is not None:
+            ap = str(ap).strip()
+            if ap not in _CODEX_APPROVAL_POLICIES:
+                raise SpawnConfigError(
+                    "approval_policy 需為 "
+                    f"{'/'.join(_CODEX_APPROVAL_POLICIES)} 其一(收到 {ap!r})")
+            cfg["approval_policy"] = ap
+        sb = raw.get("sandbox")
+        if sb is not None:
+            sb = str(sb).strip()
+            if sb not in _SPAWN_CX_SANDBOXES:
+                raise SpawnConfigError(
+                    "sandbox 需為 "
+                    f"{'/'.join(_SPAWN_CX_SANDBOXES)} 其一(收到 {sb!r})")
+            cfg["sandbox"] = sb
+
+    return cfg
+
+
+def _spawn_cc_flags(cfg: dict) -> list:
+    """config → claude CLI flags(headless `-p` 子程序用)。不含 api_key(走 env)。
+    注意 --max-budget-usd / --fallback-model 只在 --print 模式生效(headless 有、
+    互動 TUI 無)。"""
+    argv: list = []
+    if cfg.get("model"):
+        argv += ["--model", cfg["model"]]
+    if cfg.get("effort"):
+        argv += ["--effort", cfg["effort"]]
+    if cfg.get("permission_mode"):
+        argv += ["--permission-mode", cfg["permission_mode"]]
+    if cfg.get("max_budget_usd") is not None:
+        argv += ["--max-budget-usd", _spawn_fmt_usd(cfg["max_budget_usd"])]
+    if cfg.get("fallback_model"):
+        argv += ["--fallback-model", cfg["fallback_model"]]
+    if cfg.get("append_system_prompt"):
+        argv += ["--append-system-prompt", cfg["append_system_prompt"]]
+    return argv
+
+
+def _spawn_cx_exec_flags(cfg: dict) -> list:
+    """config → `codex exec` flags(headless dispatch 子程序用)。api_key 走 env。"""
+    argv: list = []
+    if cfg.get("model"):
+        argv += ["-m", cfg["model"]]
+    if cfg.get("approval_policy"):
+        argv += ["-a", cfg["approval_policy"]]
+    if cfg.get("sandbox"):
+        argv += ["-s", cfg["sandbox"]]
+    if cfg.get("effort"):
+        argv += ["-c", f"model_reasoning_effort={cfg['effort']}"]
+    if cfg.get("profile"):
+        argv += ["-p", cfg["profile"]]
+    return argv
+
+
+def _spawn_cx_thread_params(cfg: dict) -> dict:
+    """config → codex app-server `thread/start` 額外參數(共用 app-server 的
+    thread 路徑)。app-server 已實測吃 model / approvalPolicy;effort / sandbox
+    以 camelCase 透傳,app-server 不認得的欄位會被忽略(前向相容)。"""
+    params: dict = {}
+    if cfg.get("model"):
+        params["model"] = cfg["model"]
+    if cfg.get("approval_policy"):
+        params["approvalPolicy"] = cfg["approval_policy"]
+    if cfg.get("effort"):
+        params["reasoningEffort"] = cfg["effort"]
+    if cfg.get("sandbox"):
+        params["sandboxMode"] = cfg["sandbox"]
+    return params
+
+
+def _spawn_env(cfg: dict, provider: str, base_env=None) -> dict:
+    """回傳注入了 BYO api_key 的 env(只給這一個子程序)。無 key → 原封不動的 env
+    (= 沿用主機自己的 auth)。key 只寫進 env,絕不進 log。"""
+    env = dict(base_env if base_env is not None else os.environ)
+    key = cfg.get("api_key")
+    if key:
+        if provider == "cc":
+            env["ANTHROPIC_API_KEY"] = key
+        else:
+            env["OPENAI_API_KEY"] = key
+    return env
+
+
+def _spawn_config_redacted(cfg: dict) -> dict:
+    """log 安全版:api_key → 遮罩。任何 _log_event 都必須先過這個。"""
+    if not cfg:
+        return {}
+    out = dict(cfg)
+    if out.get("api_key"):
+        out["api_key"] = "***redacted***"
+    return out
+
+
+def _spawn_config_public(cfg: dict) -> dict:
+    """回給 app 讀回的設定(status/settings)。api_key 完全不回,只回布林
+    has_api_key,讓面板能顯示「已帶自備金鑰」但拿不到明文。"""
+    if not cfg:
+        return {}
+    out = {k: v for k, v in cfg.items() if k != "api_key"}
+    if cfg.get("api_key"):
+        out["has_api_key"] = True
+    return out
+
+
+# ── cc 互動 session(ccsess)的 launch-config pin 持久化 ──────────────────
+# ccsess 的 claude_cmd() 在 launch 時逐檔讀 pin(model pin 已在)。這裡把 spawn
+# config 落成同慣例的側寫檔,交給 ccsess 於下次啟動翻成 flags;api_key 落 0600
+# secret 檔(不進 conf、不進 log)。bridge 只負責「寫 pin + 讀回」,honor 由
+# ccsess 端(companion change)完成——缺 companion 時 model pin 仍照舊生效。
+CCSESS_SPAWN_DIR = os.path.expanduser("~/.config/ccsess/spawn")
+CCSESS_SECRET_DIR = os.path.expanduser("~/.config/ccsess/secret")
+
+
+def _cc_write_spawn_pins(name: str, cfg: dict) -> dict:
+    """把 launch-time config 落到 ccsess pin。回傳 redacted 版(供 log/回應)。"""
+    redacted = _spawn_config_redacted(cfg)
+    # model 走既有 pin(_run_ccsess new 已處理);這裡只落其餘 launch flags。
+    flag_cfg = {k: v for k, v in cfg.items() if k not in ("api_key",)}
+    try:
+        os.makedirs(CCSESS_SPAWN_DIR, exist_ok=True)
+        path = os.path.join(CCSESS_SPAWN_DIR, name + ".json")
+        if flag_cfg:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(flag_cfg, f, ensure_ascii=False)
+        elif os.path.exists(path):
+            os.remove(path)
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("_cc_write_spawn_pins.flags", _exc, expected=True)
+    # api_key → 0600 secret 檔(host-local,永不外洩)。
+    key = cfg.get("api_key")
+    try:
+        os.makedirs(CCSESS_SECRET_DIR, exist_ok=True)
+        os.chmod(CCSESS_SECRET_DIR, 0o700)
+        spath = os.path.join(CCSESS_SECRET_DIR, name)
+        if key:
+            fd = os.open(spath, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            try:
+                os.write(fd, key.encode("utf-8"))
+            finally:
+                os.close(fd)
+        elif os.path.exists(spath):
+            os.remove(spath)
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("_cc_write_spawn_pins.secret", _exc, expected=True)
+    return redacted
+
+
+def _cc_read_spawn_config(name: str) -> dict:
+    """讀回某 cc session 的 launch config(status 讀回用)。含 model pin +
+    spawn.json;api_key 不回明文,只回 has_api_key 布林。"""
+    out: dict = {}
+    try:
+        mpath = os.path.expanduser(f"~/.config/ccsess/model/{name}")
+        if os.path.exists(mpath):
+            with open(mpath, encoding="utf-8") as f:
+                m = f.read().strip()
+            if m:
+                out["model"] = m
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("_cc_read_spawn_config.model", _exc, expected=True)
+    try:
+        path = os.path.join(CCSESS_SPAWN_DIR, name + ".json")
+        if os.path.exists(path):
+            with open(path, encoding="utf-8") as f:
+                out.update(json.load(f) or {})
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("_cc_read_spawn_config.flags", _exc, expected=True)
+    try:
+        if os.path.exists(os.path.join(CCSESS_SECRET_DIR, name)):
+            out["has_api_key"] = True
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("_cc_read_spawn_config.secret", _exc, expected=True)
+    return out
+
+
+# headless dispatch 子程序的 BYO key/config(記憶體 only,永不持久化/log)。
+_SPAWN_SECRETS: dict = {}
+
+
+def _claude_argv(parent: str, prompt: str, resume: str | None = None,
+                 config: dict | None = None):
     """Build a headless Claude Code argv. `resume` continues an existing CC
-    session id so follow-up turns keep the sub-agent's full context."""
+    session id so follow-up turns keep the sub-agent's full context.
+    `config` = 已驗證的 spawn config(model/effort/permission_mode/budget/
+    fallback/append-system-prompt);api_key 不進 argv(走 env)。"""
     mem_home = home_for(parent or "yuanfang")
     mcp_cfg = json.dumps({"mcpServers": {"studio-memory": {
         "command": "python3",
@@ -6911,9 +7247,14 @@ def _claude_argv(parent: str, prompt: str, resume: str | None = None):
     hint = ("你可以用 studio-memory MCP 的 read_memory / search_memory 讀善彰的"
             "Hermes 長期記憶(身份、持倉、專案、人脈),做任務前先讀以對齊脈絡;"
             "有值得長期記住的新事實再用 write_memory 寫回。")
+    cfg = config or {}
+    perm = cfg.get("permission_mode") or "bypassPermissions"
     argv = [CLAUDE_BIN, "-p", prompt, "--output-format", "stream-json", "--verbose",
-            "--permission-mode", "bypassPermissions",
+            "--permission-mode", perm,
             "--mcp-config", mcp_cfg, "--append-system-prompt", hint]
+    # spawn config 的其餘 flags(permission-mode 已在上面併入,不重複)。
+    extra = {k: v for k, v in cfg.items() if k != "permission_mode"}
+    argv += _spawn_cc_flags(extra)
     if resume:
         argv += ["--resume", resume]
     return argv
@@ -6925,17 +7266,18 @@ def _claude_argv(parent: str, prompt: str, resume: str | None = None):
 _AGENT_STALL_SECS = float(os.environ.get("BRIDGE_AGENT_STALL_SECS", "1800"))
 
 
-async def _stream_agent(sid: str, argv: list, cwd: str, fail_label: str):
+async def _stream_agent(sid: str, argv: list, cwd: str, fail_label: str,
+                        env: dict | None = None):
     """Run a sub-agent subprocess, append its transcript to the sub's output
     buffer, capture the Claude Code session id (for later --resume), and mark
-    the sub done when it exits."""
+    the sub done when it exits. `env` 覆寫子程序環境(BYO api_key 注入用)。"""
     sub = SUBSESSIONS[sid]
     out = sub["output"]
     proc = None
     try:
         proc = await asyncio.create_subprocess_exec(
             *argv, cwd=cwd, stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.DEVNULL)
+            stderr=asyncio.subprocess.DEVNULL, env=env)
         sub["proc"] = proc
         while True:
             # No-progress watchdog: a wedged provider (network black-hole, dead
@@ -7009,9 +7351,13 @@ async def _stream_agent(sid: str, argv: list, cwd: str, fail_label: str):
             {"kind": "task_done", "session_id": sid}))
 
 
-async def _run_dispatch(sid: str, tool: str, task: str, cwd: str, isolate: bool = False):
-    """Spawn a headless Claude Code / Codex sub-agent for the initial task."""
+async def _run_dispatch(sid: str, tool: str, task: str, cwd: str, isolate: bool = False,
+                        config: dict | None = None):
+    """Spawn a headless Claude Code / Codex sub-agent for the initial task.
+    `config` = 已驗證 spawn config(含 BYO api_key,只在此進子程序 env)。"""
     sub = SUBSESSIONS[sid]
+    cfg = config or _SPAWN_SECRETS.get(sid) or {}
+    provider = "cx" if tool == "codex" else "cc"
     run_cwd = cwd
     if isolate:
         wt = await _make_worktree(cwd, sid)
@@ -7025,10 +7371,11 @@ async def _run_dispatch(sid: str, tool: str, task: str, cwd: str, isolate: bool 
             _registry_call_safe("set_worktree", sid, wt)
             sub["output"].append(("text", f"_(隔離工作區 worktree:`{wt}` · 分支 `pocket/{sid}`)_\n\n"))
     if tool == "codex":
-        argv = [_resolve_codex_bin(), "exec", "--json", task]
+        argv = [_resolve_codex_bin(), "exec"] + _spawn_cx_exec_flags(cfg) + ["--json", task]
     else:
-        argv = _claude_argv(sub.get("parent", "yuanfang"), task)
-    await _stream_agent(sid, argv, run_cwd, "dispatch 失敗")
+        argv = _claude_argv(sub.get("parent", "yuanfang"), task, config=cfg)
+    env = _spawn_env(cfg, provider)
+    await _stream_agent(sid, argv, run_cwd, "dispatch 失敗", env=env)
 
 
 async def _run_resume(sid: str, prompt: str):
@@ -7036,11 +7383,15 @@ async def _run_resume(sid: str, prompt: str):
     the sub-agent keeps its full prior context."""
     sub = SUBSESSIONS[sid]
     cwd = sub.get("cwd") or HOME_ROOT
+    cfg = _SPAWN_SECRETS.get(sid) or {}   # 沿用開派時的 spawn config + BYO key
     if sub.get("tool") == "codex":
-        argv = [_resolve_codex_bin(), "exec", "--json", prompt]   # codex: new exec in same cwd
+        argv = [_resolve_codex_bin(), "exec"] + _spawn_cx_exec_flags(cfg) + ["--json", prompt]
+        env = _spawn_env(cfg, "cx")
     else:
-        argv = _claude_argv(sub.get("parent", "yuanfang"), prompt, resume=sub.get("cc_session"))
-    await _stream_agent(sid, argv, cwd, "追問失敗")
+        argv = _claude_argv(sub.get("parent", "yuanfang"), prompt,
+                            resume=sub.get("cc_session"), config=cfg)
+        env = _spawn_env(cfg, "cc")
+    await _stream_agent(sid, argv, cwd, "追問失敗", env=env)
 
 
 def _parse_agent_event(ev: dict):
@@ -9060,11 +9411,23 @@ async def cc_session_create(request: Request):
     # P0 派工分級(2026-07-10):model 參數對應 ccsess 的 per-session model
     # pin(`ccsess model <name> <model>`),讓企劃/大局思考類任務可指定旗艦
     # 模型、機械性任務指定輕量模型,不必全域切換 delegation.model。
-    cc_model = (body.get("model") or "").strip()
+    # spawn config(設計 §2.1):派互動 cc session 時套的 launch 配置。
+    # config.model 覆寫舊的 body.model;其餘 flags 落 ccsess pin(companion
+    # 端 honor)。api_key 落 0600 secret 檔。舊 app 不帶 config → 完全照舊。
+    try:
+        spawn_cfg = _spawn_config_validate(body.get("config"), "cc")
+    except SpawnConfigError as e:
+        raise HTTPException(status_code=400, detail=e.detail)
+    cc_model = (spawn_cfg.get("model") or body.get("model") or "").strip()
+    if cc_model:
+        spawn_cfg = {**spawn_cfg, "model": cc_model}
     # 戶政(藍圖 §3.1):配額前檢在真正 spawn 之前——超額就地 429,不留孤兒。
     reg_parent, reg_cls, reg_purpose = _registry_spawn_fields(body, default_cls="task")
     _registry_precheck_or_429(reg_parent, reg_cls)
     _cc_write_remote_control_pin(name)
+    redacted = _cc_write_spawn_pins(name, spawn_cfg) if spawn_cfg else {}
+    if redacted:
+        _log_event("cc_spawn_config", session=name, **redacted)
     new_args = ["new", name, wd] + ([cc_model] if cc_model else [])
     await _run_ccsess(*new_args)
     _cc_mark_app_owned(name)   # 這條是 app 開的 → 只有它的審核會進 app(見 _cc_approval_watcher)
@@ -9073,7 +9436,8 @@ async def cc_session_create(request: Request):
                        purpose=reg_purpose, cls=reg_cls, parent=reg_parent)
     return {"ok": True, "session": {"name": name, "workdir": wd,
                                     "status": "running" if ready else "starting",
-                                    "model": cc_model or None}}
+                                    "model": cc_model or None,
+                                    "spawn_config": _spawn_config_public(spawn_cfg)}}
 
 
 @app.put("/app/v1/owned-cc-sessions")
@@ -10416,8 +10780,18 @@ async def cc_session_status(name: str, request: Request):
     if not any(r[0] == name for r in _cc_conf_rows()):
         raise http_err(404, "SESSION_NOT_FOUND", "unknown session")
     st = await _cc_status_core(name)
+    # 讀回這條 session 的 launch config(model/effort/permission_mode/…);
+    # 舊 app 不看這欄不受影響,缺欄 = nil。api_key 只回 has_api_key 布林。
+    cfg = _cc_read_spawn_config(name)
+    if cfg:
+        st["spawn_config"] = cfg
+        if cfg.get("model") and not st.get("model"):
+            st["model"] = cfg["model"]
     if not st["running"]:
-        return {"busy": False, "running": False}
+        base = {"busy": False, "running": False}
+        if cfg:
+            base["spawn_config"] = cfg
+        return base
     return st
 
 
@@ -16765,6 +17139,13 @@ async def dispatch(request: Request):
     isolate = bool(body.get("isolate"))
     if not task:
         raise http_err(400, "TASK_REQUIRED", "task required")
+    # spawn config(設計 §2.1/§2.2):派子程序時套的完整配置 + BYO api_key。
+    # 這是唯一真正吃 CLI flags + env 注入的路徑(headless 子程序)。
+    try:
+        spawn_cfg = _spawn_config_validate(
+            body.get("config"), "cx" if tool == "codex" else "cc")
+    except SpawnConfigError as e:
+        raise HTTPException(status_code=400, detail=e.detail)
     # 戶政(藍圖 §3.1):派工前過配額;headless dispatch 屬短命工,預設 task。
     reg_parent = (str(body.get("parent_session") or "").strip()
                   or (f"hermes:{parent}" if parent in PERSONAS else None))
@@ -16773,15 +17154,23 @@ async def dispatch(request: Request):
         _registry_validate_parent(reg_parent)   # addendum 1:明給的 parent 必須存在
     _registry_precheck_or_429(reg_parent, reg_cls)
     sid = "sub-" + uuid.uuid4().hex[:16]
+    redacted = _spawn_config_redacted(spawn_cfg)
     SUBSESSIONS[sid] = {"name": task[:40], "parent": parent, "tool": tool,
                         "status": "running", "lastAt": time.time(), "cwd": cwd,
-                        "proc": None, "output": [("text", f"**任務:** {task}\n\n")]}
+                        "proc": None, "output": [("text", f"**任務:** {task}\n\n")],
+                        "spawn_config": _spawn_config_public(spawn_cfg)}
+    # 完整 config(含 api_key)只放記憶體,供追問 resume 重建 env;絕不持久化。
+    if spawn_cfg:
+        _SPAWN_SECRETS[sid] = spawn_cfg
     _subsession_persist(sid)   # issue #5: registered rows survive a restart
     _registry_register(sid, provider="dispatch", name=task[:40],
                        purpose=(body.get("purpose") or "").strip() or task[:200],
                        cls=reg_cls, parent=reg_parent)
-    asyncio.create_task(_run_dispatch(sid, tool, task, cwd, isolate))
-    return {"session_id": sid, "type": "subprocess", "tool": tool, "parent": parent}
+    if redacted:
+        _log_event("dispatch_spawn_config", sid=sid, tool=tool, **redacted)
+    asyncio.create_task(_run_dispatch(sid, tool, task, cwd, isolate, config=spawn_cfg))
+    return {"session_id": sid, "type": "subprocess", "tool": tool, "parent": parent,
+            "spawn_config": _spawn_config_public(spawn_cfg)}
 
 
 async def _make_worktree(base: str, sid: str):
