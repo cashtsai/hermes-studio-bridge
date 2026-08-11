@@ -32,6 +32,7 @@ import socket
 import struct
 import shutil
 import subprocess
+import sys
 import termios
 import threading
 import time
@@ -5753,6 +5754,31 @@ def _pair_mint_code(apple_user_id=None, ttl=None) -> str:
     return code
 
 
+def _pair_issue_device_token(name: str, platform: str, claim_user_id=None,
+                             extra: dict | None = None):
+    """發一枚 device token(/pair/claim 與 /pair/claim-voucher 共用內核)。
+    呼叫端先完成各自的授權驗證(一次性碼 / voucher 簽章);這裡只負責鑄 token、
+    落地 token store —— 兩條路發出的 token 形狀完全相同,app 端後續路徑零分岔。"""
+    with _PAIR_LOCK:
+        token = "pdev-" + secrets.token_urlsafe(32)
+        device = None
+        if claim_user_id:
+            device = _account_device_put(claim_user_id, token, platform=platform, label=name)
+        entry = {
+            "name": name,
+            "platform": platform,
+            "created": time.time(),
+            "last_seen": time.time(),
+            "apple_user_id": claim_user_id,
+            "device_id": (device or {}).get("device_id"),
+        }
+        if extra:
+            entry.update(extra)
+        _DEVICE_TOKENS[token] = entry
+        _save_device_tokens(_DEVICE_TOKENS)
+    return token, device
+
+
 @app.post("/app/v1/pair/claim")
 @app.post("/pair/claim")
 async def pair_claim(request: Request):
@@ -5789,19 +5815,7 @@ async def pair_claim(request: Request):
         if not code or not meta["expiry"] or meta["expiry"] < time.monotonic():
             _pair_code_reject(request)
         _PAIR_CODES.pop(code, None)           # one-time
-        token = "pdev-" + secrets.token_urlsafe(32)
-        device = None
-        if claim_user_id:
-            device = _account_device_put(claim_user_id, token, platform=platform, label=name)
-        _DEVICE_TOKENS[token] = {
-            "name": name,
-            "platform": platform,
-            "created": time.time(),
-            "last_seen": time.time(),
-            "apple_user_id": claim_user_id,
-            "device_id": (device or {}).get("device_id"),
-        }
-        _save_device_tokens(_DEVICE_TOKENS)
+    token, device = _pair_issue_device_token(name, platform, claim_user_id)
     _log_event("pair_claim",
                device=name,
                platform=platform,
@@ -6091,6 +6105,269 @@ async def pair_qr_page(request: Request):
     _pair_check_boot(request)       # 真閘:一次性 boot code(tunnel 下 loopback 不可信)
     _pair_local_only(request)       # defense-in-depth 第二層
     return HTMLResponse(_PAIR_QR_HTML)
+
+
+# ═════════════ Pocket ID(Pairing V3):enroll + heartbeat + voucher claim ═════════════
+# 藍圖:studio-os/docs/PAIRING_V3_POCKET_ID_20260811.md。
+# 主機向 pocket-id 服務(id.pocket.shan.house)註冊+心跳;手機登入後「用選的」
+# 配對:App 從 pocket-id 拿一張短效 Ed25519 voucher,直接對主機
+# /pair/claim-voucher 換 device token。pocket-id 只當電話簿+公證人 ——
+# 它從頭到尾拿不到 device token,被打穿最多洩「誰有哪些主機」。
+# 全段 env 閘:POCKET_ID_URL 沒設 → 完全靜默(不註冊、不心跳、voucher 路由 404)。
+
+POCKET_ID_URL = (os.environ.get("POCKET_ID_URL") or "").strip().rstrip("/")
+POCKET_ID_ENROLL_TOKEN = (os.environ.get("POCKET_ID_ENROLL_TOKEN") or "").strip()
+_POCKET_ID_STATE_PATH = os.path.expanduser(
+    os.environ.get("POCKET_ID_STATE_FILE", "~/.pocket/pocket-id-enrollment.json"))
+_POCKET_ID_HEARTBEAT_SECS = float(os.environ.get("POCKET_ID_HEARTBEAT_SECS", "60"))
+_POCKET_ID_EXP_SKEW = 120.0     # voucher exp 容忍的時鐘偏移(秒)
+_POCKET_ID_LOCK = threading.Lock()
+_POCKET_ID_CACHE = {"loaded": False, "state": {}}   # 磁碟 enrollment 的行程內快取
+_POCKET_ID_NONCES: dict = {}    # nonce -> 淘汰時刻(epoch);in-memory 防重放
+
+
+def _pocket_id_state() -> dict:
+    """讀取(lazy)已存的 enrollment:{host_id, host_secret, pocket_id_pubkey, url}。
+    空 dict = 未註冊。"""
+    with _POCKET_ID_LOCK:
+        if not _POCKET_ID_CACHE["loaded"]:
+            st: dict = {}
+            try:
+                with open(_POCKET_ID_STATE_PATH, encoding="utf-8") as f:
+                    loaded = json.load(f)
+                st = loaded if isinstance(loaded, dict) else {}
+            except FileNotFoundError:
+                pass
+            except Exception as _exc:  # noqa: BLE001
+                _log_exc("pocket_id_state_load", _exc, expected=True)
+            _POCKET_ID_CACHE["state"] = st
+            _POCKET_ID_CACHE["loaded"] = True
+        return dict(_POCKET_ID_CACHE["state"])
+
+
+def _pocket_id_save_state(state: dict) -> None:
+    """enrollment 落地(0600:host_secret 等同這台主機在 pocket-id 的身分)。"""
+    os.makedirs(os.path.dirname(_POCKET_ID_STATE_PATH) or ".", exist_ok=True)
+    tmp = _POCKET_ID_STATE_PATH + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, _POCKET_ID_STATE_PATH)
+    with _POCKET_ID_LOCK:
+        _POCKET_ID_CACHE["state"] = dict(state)
+        _POCKET_ID_CACHE["loaded"] = True
+
+
+def _pocket_id_clear_state(reason: str) -> None:
+    try:
+        os.remove(_POCKET_ID_STATE_PATH)
+        _log_event("pocket_id_unenrolled", reason=reason)
+    except FileNotFoundError:
+        pass
+    except OSError as _exc:
+        _log_exc("pocket_id_state_clear", _exc, expected=True)
+    with _POCKET_ID_LOCK:
+        _POCKET_ID_CACHE["state"] = {}
+        _POCKET_ID_CACHE["loaded"] = True
+
+
+def _pocket_id_boot() -> None:
+    """開機期 enrollment 治理:POCKET_ID_RESET=1 或 env 撤掉 → 清除本機註冊;
+    stored url 與現行 env 不符 → 也視同過期(那是別家 pocket-id 的身分)。"""
+    reset = os.environ.get("POCKET_ID_RESET", "").strip().lower() in (
+        "1", "true", "yes", "on")
+    st = _pocket_id_state()
+    if st and (reset or not POCKET_ID_URL):
+        _pocket_id_clear_state("reset" if reset else "url_removed")
+    elif st and st.get("url") and st.get("url") != POCKET_ID_URL:
+        _pocket_id_clear_state("url_changed")
+
+
+def _pocket_id_platform() -> str:
+    return {"darwin": "macos", "win32": "windows"}.get(sys.platform, "linux")
+
+
+def _pocket_id_host_name() -> str:
+    return (os.environ.get("POCKET_HOST_NAME") or "").strip() \
+        or socket.gethostname() or "pocket-host"
+
+
+def _pocket_id_candidates() -> list:
+    """API contract 的 candidates:[{scheme,host}] —— 與 /pair/qr 廣告的同一份
+    連線候選(私網 → tailnet → tunnel 優先序)。"""
+    hosts, _ts = _pair_host_candidates(force=True)
+    out = []
+    for h in hosts:
+        u = urllib.parse.urlsplit(h)
+        if u.scheme and u.netloc:
+            out.append({"scheme": u.scheme, "host": u.netloc})
+    return out
+
+
+async def _pocket_id_api(path: str, payload: dict) -> dict:
+    import httpx
+    async with httpx.AsyncClient(timeout=15) as client:
+        r = await client.post(POCKET_ID_URL + path, json=payload)
+        r.raise_for_status()
+        return r.json()
+
+
+async def _pocket_id_register() -> None:
+    """一次性 enroll:帶 POCKET_ID_ENROLL_TOKEN 註冊,存回 host 身分 + 服務公鑰。"""
+    data = await _pocket_id_api("/v1/hosts/register", {
+        "enroll_token": POCKET_ID_ENROLL_TOKEN,
+        "name": _pocket_id_host_name(),
+        "platform": _pocket_id_platform(),
+        "candidates": _pocket_id_candidates(),
+        "capabilities": _host_capabilities(),
+    })
+    _pocket_id_save_state({
+        "host_id": data["host_id"],
+        "host_secret": data["host_secret"],
+        "pocket_id_pubkey": data["pocket_id_pubkey"],
+        "url": POCKET_ID_URL,
+    })
+    _log_event("pocket_id_enrolled", url=POCKET_ID_URL,
+               host_id_hash=_short_hash(str(data["host_id"])))
+
+
+async def _pocket_id_heartbeat() -> None:
+    st = _pocket_id_state()
+    await _pocket_id_api("/v1/hosts/heartbeat", {
+        "host_id": st.get("host_id"),
+        "host_secret": st.get("host_secret"),
+        "candidates": _pocket_id_candidates(),
+        "capabilities": _host_capabilities(),
+    })
+
+
+async def _pocket_id_loop() -> None:
+    """常駐:未註冊 → 先 enroll;之後每 60s 心跳(candidates/capabilities 都會
+    重新探測)。任何失敗只記一次 log、指數退避重試 —— 絕不弄死 bridge。"""
+    backoff = 60.0
+    fail_logged = False
+    while True:
+        try:
+            if not _pocket_id_state():
+                if not POCKET_ID_ENROLL_TOKEN:
+                    _log_event("pocket_id_idle",
+                               reason="no enrollment and no POCKET_ID_ENROLL_TOKEN")
+                    return
+                await _pocket_id_register()
+            await _pocket_id_heartbeat()
+            if fail_logged:
+                _log_event("pocket_id_recovered", url=POCKET_ID_URL)
+                fail_logged = False
+            backoff = 60.0
+            await asyncio.sleep(_POCKET_ID_HEARTBEAT_SECS)
+        except asyncio.CancelledError:
+            raise
+        except Exception as _exc:  # noqa: BLE001
+            if not fail_logged:
+                _log_exc("pocket_id_loop", _exc, expected=True)
+                fail_logged = True
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 3600.0)
+
+
+@app.on_event("startup")
+async def _start_pocket_id():
+    _pocket_id_boot()
+    if not POCKET_ID_URL:
+        return          # 預設關:env 沒設 → 這段功能完全不存在,合併零風險
+    task = asyncio.create_task(_pocket_id_loop())
+    _BG_TASKS.add(task)
+    task.add_done_callback(_BG_TASKS.discard)
+    _log_event("pocket_id_started", url=POCKET_ID_URL,
+               enrolled=bool(_pocket_id_state()))
+
+
+def _pocket_id_verify_voucher(voucher: str) -> dict:
+    """驗一張 pocket-id voucher:base64url(payload).base64url(sig),Ed25519 簽章
+    + host_id 綁定 + exp(120s 偏移容忍)+ nonce 防重放。任何一關失敗 → 403;
+    未註冊 → 404(graceful absence,app 據此整面隱藏)。"""
+    st = _pocket_id_state()
+    if not st.get("pocket_id_pubkey") or not st.get("host_id"):
+        _log_event("pair_claim_voucher_rejected", reason="not_enrolled")
+        raise http_err(404, "POCKET_ID_NOT_ENROLLED",
+                       "此主機未啟用 Pocket ID 配對")
+
+    def _fail(reason: str, message: str) -> HTTPException:
+        _log_event("pair_claim_voucher_rejected", reason=reason)
+        return http_err(403, "VOUCHER_INVALID", message)
+
+    parts = voucher.split(".")
+    if len(parts) != 2 or not parts[0] or not parts[1]:
+        raise _fail("malformed", "voucher 格式錯誤")
+    try:
+        payload_bytes = _b64u_decode(parts[0])
+        sig = _b64u_decode(parts[1])
+    except Exception:  # noqa: BLE001
+        raise _fail("bad_base64", "voucher 編碼無法解析")
+    try:
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+        pub = Ed25519PublicKey.from_public_bytes(
+            base64.b64decode(st["pocket_id_pubkey"]))
+        pub.verify(sig, payload_bytes)
+    except Exception:  # noqa: BLE001  (InvalidSignature / 壞公鑰,一律同形 403)
+        raise _fail("bad_signature", "voucher 簽章驗證失敗")
+    try:
+        payload = json.loads(payload_bytes)
+    except Exception:  # noqa: BLE001
+        raise _fail("bad_payload", "voucher 內容無法解析")
+    if not isinstance(payload, dict):
+        raise _fail("bad_payload", "voucher 內容無法解析")
+    if str(payload.get("host_id") or "") != str(st["host_id"]):
+        raise _fail("host_mismatch", "voucher 不是簽發給這台主機")
+    try:
+        exp = float(payload.get("exp"))
+    except (TypeError, ValueError):
+        exp = 0.0
+    now = time.time()
+    if now > exp + _POCKET_ID_EXP_SKEW:
+        raise _fail("expired", "voucher 已過期,請回 App 重新選取主機")
+    nonce = str(payload.get("nonce") or "")
+    if not nonce:
+        raise _fail("no_nonce", "voucher 缺少 nonce")
+    with _POCKET_ID_LOCK:
+        for n in [n for n, drop in _POCKET_ID_NONCES.items() if drop < now]:
+            _POCKET_ID_NONCES.pop(n, None)      # prune 過期 nonce,dict 不外洩
+        replayed = nonce in _POCKET_ID_NONCES
+        if not replayed:
+            _POCKET_ID_NONCES[nonce] = exp + _POCKET_ID_EXP_SKEW + 60.0
+    if replayed:
+        raise _fail("replay", "voucher 已被使用(重放防護)")
+    return payload
+
+
+@app.post("/pair/claim-voucher")
+async def pair_claim_voucher(request: Request):
+    """Pairing V3:手機出示 pocket-id 簽發的短效 voucher 直接配對 —— 免掃 QR、
+    免 boot code(voucher 本身就是授權)。驗過即發 device token,token 形狀與
+    /pair/claim 完全相同,app 既有的 post-claim 路徑零改動。"""
+    try:
+        body = await request.json()
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("pair_claim_voucher", _exc, expected=True)
+        body = {}
+    voucher = str(body.get("voucher") or "").strip()
+    name = (str(body.get("device_name") or "iPhone"))[:60]
+    platform = (str(body.get("platform") or "ios"))[:32]
+    if not voucher:
+        _log_event("pair_claim_voucher_rejected", reason="missing")
+        raise http_err(403, "VOUCHER_INVALID", "缺少 voucher")
+    payload = _pocket_id_verify_voucher(voucher)
+    account_id = str(payload.get("account_id") or "")
+    token, device = _pair_issue_device_token(
+        name, platform, None,
+        extra={"pocket_account_id": account_id})
+    _log_event("pair_claim_voucher",
+               device=name, platform=platform,
+               account_hash=_short_hash(account_id),
+               token_hash=_short_hash(token))
+    return {"token": token,
+            "device_id": (device or {}).get("device_id"),
+            "account_bound": False}
 
 
 # --- In-app terminal (bridge PTY) --------------------------------------------
