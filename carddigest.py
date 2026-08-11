@@ -33,13 +33,37 @@ def _epoch(ts) -> float:
     return time.time()
 
 
+TS_DEFAULT_KEY = "ts_default"
+"""內部旗標:標記這張卡的 ts 是「呼叫端明確給的權威時間」還是「make_card 補的
+now」。`upsert_card` 只信任明確給的時間,補的 now 一律不覆寫既有卡的時間 ——
+原本兩者混在一起無法分辨,才需要用 min() 一律夾住,而 min() 又跟
+`_same_card` 的「ts 差 > 1s 就算變更」互相打架成 livelock(見 upsert_card)。
+旗標會在 `upsert_card` 落地前被 `_take_ts_default()` 摘掉,不會外流給 app。"""
+
+
+def _mark_ts(card: dict, explicit: bool) -> dict:
+    """標記/清除 TS_DEFAULT_KEY。呼叫端覆寫過 ts 之後要記得標成 explicit。"""
+    if explicit:
+        card.pop(TS_DEFAULT_KEY, None)
+    else:
+        card[TS_DEFAULT_KEY] = True
+    return card
+
+
+def _take_ts_default(card: dict) -> bool:
+    """摘掉旗標並回傳:True = 這張卡的 ts 只是 make_card 補的 now,不具權威性。"""
+    return bool(card.pop(TS_DEFAULT_KEY, False))
+
+
 def make_card(cid: str, turn_id: str, role: str, kind: str, body: dict,
               ts: float | None = None, rev: int = 1, final: bool = True) -> dict:
     body = dict(body or {})
     body.setdefault("fallback_text", body.get("text") or "")
-    return {"id": cid, "turn_id": turn_id, "role": role, "kind": kind,
-            "rev": rev, "final": final, "ts": ts if ts is not None else time.time(),
+    explicit_ts = ts is not None
+    card = {"id": cid, "turn_id": turn_id, "role": role, "kind": kind,
+            "rev": rev, "final": final, "ts": ts if explicit_ts else time.time(),
             "body": body}
+    return _mark_ts(card, explicit_ts)
 
 
 def _norm_visible_text(text: str) -> str:
@@ -80,8 +104,11 @@ def make_input_accepted_card(source: str, client_id: str | None, text: str,
         body["typed_text"] = typed
     if attachments:
         body["attachments"] = [dict(a) for a in attachments if isinstance(a, dict)]
-    return make_card(f"card-{source_key}-input-{digest}", turn_id, "user", "text",
+    card = make_card(f"card-{source_key}-input-{digest}", turn_id, "user", "text",
                      body, ts=stamp, final=True)
+    # stamp 在 ts=None 時其實就是 now(只為了算 digest key 才提前取),
+    # 不能因此謊報成權威時間 → 照原本的 ts 有無決定旗標。
+    return _mark_ts(card, ts is not None)
 
 
 def absorb_echo_into_accepted(store, card: dict) -> dict:
@@ -595,6 +622,7 @@ def codex_item_to_cards(item: dict, turn_id: str = "",
     if ts:
         for c in cards:
             c["ts"] = ts
+            _mark_ts(c, True)          # 呼叫端給的權威時間,不是 make_card 補的 now
     return cards
 
 
@@ -815,14 +843,26 @@ class CodexThreadDigest(ApprovalCardMixin):
             d = dict(c or {})
             d.pop("rev", None)
             d.pop("ts", None)
+            d.pop(TS_DEFAULT_KEY, None)
             return d
-        # ts 也要納入比較(容忍 1 秒抖動):原本無條件 pop 掉 → 內容相同但時間錯的
-        # 卡在 emit_unchanged=False 的 reseed 會被判定 unchanged 而跳過,
+        # ts 也要納入比較:原本無條件 pop 掉 → 內容相同但時間錯的卡在
+        # emit_unchanged=False 的 reseed 會被判定 unchanged 而跳過,
         # **帶著正確歷史時間的卡永遠寫不進去**,時間一旦錯就再也修不回來。
+        #
+        # 但判準必須與 upsert_card 的 ts 政策**完全一致**:只有在「upsert 真的
+        # 會改動 ts」時才算變更。否則 reseed 判 changed → upsert 又把 ts 夾回
+        # 原值 → 下一輪 reseed 再判 changed…… 每 8 秒無限重播、rev 無限成長
+        # (livelock;實測 rev 1→2→3→4→5 而 ts 紋風不動)。
+        # upsert 政策 = 只接受「更早的權威時間」,故:
+        #   - 補的 now(TS_DEFAULT_KEY):upsert 不會動 ts → 不算變更
+        #   - 權威時間但比既有的晚:min() 會夾回既有值 → 不算變更
+        #   - 權威時間且比既有的早 > 1s:upsert 會採用 → 算變更
         prev_ts, new_ts = prev.get("ts"), card.get("ts")
-        if isinstance(prev_ts, (int, float)) and isinstance(new_ts, (int, float)):
-            if abs(prev_ts - new_ts) > 1.0:
-                return False
+        if (not card.get(TS_DEFAULT_KEY)
+                and isinstance(prev_ts, (int, float))
+                and isinstance(new_ts, (int, float))
+                and new_ts < prev_ts - 1.0):
+            return False
         return comparable(prev) == comparable(card)
 
     def seed_turns(self, turns: list, emit_unchanged: bool = True):
@@ -1001,18 +1041,29 @@ class SessionCardStore(ApprovalCardMixin):
         self._wakers.discard(w)
 
     def upsert_card(self, card: dict) -> dict:
+        # 旗標是 carddigest 內部用的,落地/發事件前一律摘掉,不外流給 app。
+        ts_defaulted = _take_ts_default(card)
         prev = self.cards.get(card["id"])
         if prev:
             # 重放同一事件 → rev 遞增，app 以最高 rev 原位替換。
             card = dict(card)
             card["rev"] = max(card.get("rev", 1), prev.get("rev", 1) + 1)
-            # ts 只能往前、不能往後:同一則訊息的 started→delta→completed 會反覆
-            # upsert,而新卡多半沒帶 ts(=make_card 蓋成 now)。原本直接採新卡的
-            # ts,於是每次重發都把歷史時間拉到「現在」;卡片又是照 ts 排序的,
-            # 順序也跟著錯。取較早者 → 歷史時間一旦正確就不再被覆蓋。
+            # ts 政策:同一則訊息的 started→delta→completed 會反覆 upsert,而新卡
+            # 多半沒帶 ts(=make_card 蓋成 now)。原本直接採新卡的 ts,於是每次重發
+            # 都把歷史時間拉到「現在」;卡片又是照 ts 排序的,順序也跟著錯。
+            #   1. 補的 now(TS_DEFAULT_KEY)完全沒有權威性 → 一律沿用既有時間。
+            #   2. 呼叫端明確給的權威時間才納入比較,且只能往前不能往後(min):
+            #      reseed 撈到的正確歷史時間可以把先前寫錯的 now 修回去,但
+            #      turn 級內插算出來的「較晚」時間不該把既有的正確時間往後推。
+            # 註:區分 1/2 正是加 TS_DEFAULT_KEY 的原因 —— 舊版分不出來只好一律
+            # min(),而「一律 min()」跟 _same_card 的 abs() 判準會互相打架成
+            # livelock(reseed 判 changed → min 夾回 → 再判 changed …)。
             prev_ts, new_ts = prev.get("ts"), card.get("ts")
-            if isinstance(prev_ts, (int, float)) and isinstance(new_ts, (int, float)):
-                card["ts"] = min(prev_ts, new_ts)
+            if isinstance(prev_ts, (int, float)):
+                if ts_defaulted:
+                    card["ts"] = prev_ts
+                elif isinstance(new_ts, (int, float)):
+                    card["ts"] = min(prev_ts, new_ts)
         else:
             self.order.append(card["id"])
             if len(self.order) > self.cards_max:
