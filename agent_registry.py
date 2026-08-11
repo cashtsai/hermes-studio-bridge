@@ -268,6 +268,110 @@ class AgentRegistry:
             finally:
                 con.close()
 
+    # ── 收編 / 釋放(全機發現面 §2.3 的狀態機)────────────────────────────
+    def adopt(self, sid: str, *, provider: str, name: str = "",
+              purpose: str = "", cls: str | None = None,
+              parent: str | None = None, worktree: str | None = None,
+              meta: dict | None = None) -> dict:
+        """把「發現但未管」的 session 轉成 registered=1 的正式戶口。
+
+        三種入口一律回同一形狀(冪等,重複收編不炸):
+        - 沒戶口 → 新登記。**不套配額**:行程早就在跑了,配額擋下來只會
+          留下一個「看得到、管不到」的孤兒,與收編的目的正好相反。
+        - 有戶口但 registered=0(legacy/旁路)→ 原地轉正,補 purpose/class/TTL。
+        - 已 registered=1 → 只補有給的欄位,不動出生時間。
+
+        `state='archived'` 的戶口遇到收編會復活:人明確表示這條還活著、
+        要管它,記帳面沒有理由繼續當它是死的。
+        """
+        if cls is not None and cls not in CLASSES:
+            cls = "task"
+        now = time.time()
+        with self._lock:
+            con = self._connect()
+            try:
+                row = con.execute("SELECT * FROM sessions WHERE id=?",
+                                  (sid,)).fetchone()
+                if row is None:
+                    eff_cls = cls or "task"
+                    depth = 0
+                    if parent:
+                        prow = con.execute(
+                            "SELECT depth FROM sessions WHERE id=?",
+                            (parent,)).fetchone()
+                        depth = int(prow["depth"]) + 1 if prow is not None else 0
+                    m = dict(meta or {})
+                    m.setdefault("adopted_ts", now)
+                    con.execute(
+                        """INSERT INTO sessions(id, provider, name, purpose,
+                           class, parent, state, depth, created_ts,
+                           last_active_ts, ttl_secs, max_children, registered,
+                           worktree, meta) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        (sid, provider, name,
+                         (purpose or "").strip() or DEFAULT_PURPOSE, eff_cls,
+                         parent or None, "active", depth, now, now,
+                         self.default_ttl(eff_cls), None, 1, worktree,
+                         json.dumps(m, ensure_ascii=False)))
+                    con.commit()
+                else:
+                    d = self._row_dict(row)
+                    sets = ["registered=1", "last_active_ts=?"]
+                    args: list = [now]
+                    if d.get("state") == "archived":
+                        sets += ["state='active'", "archived_ts=NULL",
+                                 "archive_reason=NULL"]
+                    if name and not d.get("name"):
+                        sets.append("name=?")
+                        args.append(name)
+                    if (purpose or "").strip():
+                        sets.append("purpose=?")
+                        args.append(purpose.strip())
+                    if cls is not None:
+                        sets += ["class=?", "ttl_secs=?"]
+                        args += [cls, self.default_ttl(cls)]
+                    elif not d.get("registered") and d.get("ttl_secs") is None \
+                            and (d.get("class") or "task") != "persistent":
+                        # 轉正的 legacy 戶口沒有壽命 → 補上該班別的預設
+                        sets.append("ttl_secs=?")
+                        args.append(self.default_ttl(d.get("class") or "task"))
+                    if worktree and not d.get("worktree"):
+                        sets.append("worktree=?")
+                        args.append(worktree)
+                    m = dict(d.get("meta") or {})
+                    m.setdefault("adopted_ts", now)
+                    if meta:
+                        m.update(meta)
+                    sets.append("meta=?")
+                    args.append(json.dumps(m, ensure_ascii=False))
+                    args.append(sid)
+                    con.execute(
+                        f"UPDATE sessions SET {', '.join(sets)} WHERE id=?", args)
+                    con.commit()
+                fresh = con.execute("SELECT * FROM sessions WHERE id=?",
+                                    (sid,)).fetchone()
+                return self._row_dict(fresh)
+            finally:
+                con.close()
+
+    def release(self, sid: str) -> dict | None:
+        """收編的逆操作:registered=0。**戶口留著**(歷史/家譜不消失),
+        而 registered=0 本身就是 reaper 的免疫標記(`sweep_candidates` 第一
+        條就是跳過未登記)——釋放後這條再也不會被自動收屍。"""
+        with self._lock:
+            con = self._connect()
+            try:
+                row = con.execute("SELECT id FROM sessions WHERE id=?",
+                                  (sid,)).fetchone()
+                if row is None:
+                    return None
+                con.execute("UPDATE sessions SET registered=0 WHERE id=?", (sid,))
+                con.commit()
+                fresh = con.execute("SELECT * FROM sessions WHERE id=?",
+                                    (sid,)).fetchone()
+                return self._row_dict(fresh)
+            finally:
+                con.close()
+
     # ── 日常記帳 ─────────────────────────────────────────────────────────
     def get(self, sid: str) -> dict | None:
         con = self._connect()
