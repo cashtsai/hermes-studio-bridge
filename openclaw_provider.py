@@ -320,8 +320,8 @@ def session_status(row: dict) -> str:
 
 def session_v2_row(row: dict) -> dict:
     """sessions.list 的 SessionRow → /app/v2/sessions 的統一 Session 形狀。
-    caps 依 SPEC §4:v1 = input/interrupt/replay/follow(attachments/approve
-    明示缺席)。"""
+    caps 依 SPEC §4:input/interrupt/attachments/replay/follow/approve
+    (`keys` 明示缺席 —— OpenClaw 無 TUI 概念)。"""
     key = str(row.get("key") or "")
     updated = row.get("updatedAt")
     last = None
@@ -333,5 +333,6 @@ def session_v2_row(row: dict) -> dict:
             "subtitle": model or None,
             "status": session_status(row),
             "last_event_at": last,
-            "capabilities": ["input", "interrupt", "attachments", "replay", "follow"],
+            "capabilities": ["input", "interrupt", "attachments", "replay",
+                             "follow", "approve"],
             "meta": {}}

@@ -59,7 +59,7 @@ openclaw gateway run --port 19801 --bind loopback --auth token --allow-unconfigu
 |---|---|---|
 | `sessions.list` | `{limit?,offset?,search?,archived?,includeLastMessage?,includeDerivedTitles?,...}` | `{sessions:[SessionRow], count, totalCount, hasMore, defaults:{modelProvider,model,...}}` |
 | `chat.history` | `{sessionKey, limit?≤1000, offset?, maxChars?≤5e5}` | `{sessionKey, sessionId, messages:[Msg], sessionInfo:{...}}` |
-| `chat.send` | `{sessionKey, message, idempotencyKey!, attachments?:[...], deliver?, timeoutMs?, ...}` | `{runId, status:"started"}`（立即回，回覆走事件） |
+| `chat.send` | `{sessionKey, message, idempotencyKey!, attachments?:[{type?,mimeType?,fileName?,content(base64)!}], deliver?, timeoutMs?, ...}` | `{runId, status:"started"}`（立即回，回覆走事件） |
 | `chat.abort` | `{sessionKey, runId?, preserveSideRuns?}` | ok |
 | `sessions.reset` / `sessions.delete` | `{sessionKey…}`（**需 `operator.admin`**，v1 不用） | — |
 | `agent` / `agent.wait` | 派回合（另一形態，v1 不用；chat.send 已含完整流） |
@@ -74,6 +74,29 @@ SessionRow 關鍵欄位（實測）：
  "modelProvider":"ollama","model":"qwen3:4b","totalTokens":16009,
  "origin":{"provider":"webchat","surface":"webchat"},"lastChannel":"webchat"}
 ```
+
+**`chat.send.attachments[]` 的實際受理形狀**（2026-08-11 讀靶機
+`dist` 的 `normalizeRpcAttachmentsToChatAttachments`／
+`parseMessageWithAttachments` 實證，取代先前「schema 是 `Type.Unknown[]`
+所以形狀不明」的說法）：
+
+```jsonc
+{"type": "image",              // 選填，只當標籤/檔名 fallback
+ "mimeType": "image/png",      // 選填；gateway 會 sniff，不合再以 sniff 為準
+ "fileName": "shot.png",       // 選填
+ "content": "<base64>"}        // 必填(也吃 data URL 前綴，會被剝掉)
+```
+
+- 也接受 Anthropic 風格 `{source:{type:"base64", media_type, data}}`。
+- **坑**：normalize 最後 `.filter(a => a.content)` —— **沒有 `content` 的件
+  被 gateway 靜默丟棄**。所以 `url` 型附件等於不存在，bridge 一律自己讀檔
+  轉 base64 再送。
+- 大小：預設每件 20MB（`agents.defaults.mediaMaxMb`），影像另有 6MiB 硬閥；
+  整個 WS 訊框受 `policy.maxPayload`（靶機 26MB）限制。超限 `chat.send` 回
+  `INVALID_REQUEST`（落盤失敗回 `UNAVAILABLE`），bridge 端先擋並回 413。
+- 影像 ≤2MB 走 inline image block 進模型；其餘（含非影像）落 gateway
+  `media://inbound/{id}` 並在 message 尾端補 `[media attached: …]`。
+- `message` 與 `attachments` 只要其一有值即受理（純附件合法）。
 
 - `sessionKey` 形如 `agent:{agentId}:{name}`（預設 `agent:main:main`）；也接受
   短名 `main`（server 自行歸一）。**bridge 一律存/傳完整 key**。
@@ -105,8 +128,15 @@ v1 直接吃全域廣播 + 以 `sessionKey` 分流）。
   → 對映 turn begin/end 與錯誤卡。
 - `assistant`：`data:{text:"累積全文", delta:"增量"}` → 串流正文
   （同 runId 累積 upsert 同一張卡）。
-- `tool`：`data:{name?, args?, ...}`（靶機純聊天未觸發；防禦性解析,
-  未知 shape 全落 fallback_text）→ tool_call 卡。
+- `tool`：`data.phase` ∈ `start | update | result`（**沒有 `end`**；
+  2026-08-11 讀靶機 dist `selection-*.js` 實證）。
+  - `start`：`{phase, name, toolCallId, args}` → tool_call 卡
+  - `update`：`{phase, name, toolCallId, partialResult}` → 同卡 upsert
+  - `result`：`{phase, name, toolCallId, result, isError, meta?,
+    toolErrorSummary?}`（原生 item backend 另帶 `itemId`/`status`）
+    → **tool_result 卡**（`card-oc-{runId}-t{toolCallId}-r`）
+  - `result.result` 已被 gateway `sanitizeToolResult` 剝掉 image base64，
+    形狀不保證 → 未知形狀退 JSON 字串，不整包丟掉。
 - `compaction`：`data.phase start/end` — 內部整理，不出卡。
 - 共同欄位：`runId, sessionKey, sessionId, agentId, seq, ts, isHeartbeat`。
 
@@ -139,20 +169,54 @@ v1 直接吃全域廣播 + 以 `sessionKey` 分流）。
 | `input` | `chat.send`（idempotencyKey 必填 → 天然冪等） | ✅ |
 | `interrupt` | `chat.abort {sessionKey}`(忙碌判定雙軌:digest busy OR sessions.list `hasActiveRun` —— send 剛排隊、lifecycle 未 start 的窗口實測踩過) | ✅ |
 | `replay` / `follow` | `chat.history` seed + 事件流 → SessionCardStore ring | ✅ |
-| `attachments` | `chat.send.attachments[]`（`{type,url|content(base64),mimeType,fileName}`） | ⛔ v1 不宣告（媒體管線見 §7 已知限制） |
-| `approve` | `exec.approval.*` 存在但屬 gateway exec 審批（agent 執行系統指令時才觸發;靶機純聊天流無法穩定驗證） | ⛔ v1 不宣告 |
+| `attachments` | `chat.send.attachments[]`（`{type?,mimeType?,fileName?,content(base64)!}`） | ✅（bridge 讀檔轉 base64 送出；讀不到/超限一律報錯，不靜默丟） |
+| `approve` | `exec.approval.*` / `plugin.approval.*`（gateway exec 與外掛審批） | ✅（→ Approval Hub + approval 卡） |
 | `keys` | 無 TUI 概念 | ⛔ |
 
 四 provider 能力矩陣（v2 `/app/v2/sessions` 宣告）：
 
-| | claude_code | codex | hermes | openclaw(v1) |
+| | claude_code | codex | hermes | openclaw |
 |---|---|---|---|---|
 | input | ✅ | ✅ | ✅ | ✅ |
 | interrupt | ✅ | ✅ | ✅(ACP cancel) | ✅(chat.abort) |
 | keys | ✅(tmux) | — | — | — |
-| attachments | ✅ | ✅ | ✅ | —（TODO v2） |
+| attachments | ✅ | ✅ | ✅ | ✅(chat.send.attachments) |
 | replay/follow | ✅ | ✅ | ✅ | ✅ |
-| approve | 條件 | 條件 | ✅ | —（TODO：exec.approval.* 接 Approval Hub） |
+| approve | 條件 | 條件 | ✅ | ✅(exec/plugin.approval.*) |
+
+### 4.1 審批（`exec.approval.*` / `plugin.approval.*`）
+
+2026-08-11 讀靶機 `dist`（`approval-shared-*.js`、`exec-approval-*.js`、
+`plugin-approval-*.js`）實證的線上形狀：
+
+| 方向 | 名稱 | 形狀 |
+|---|---|---|
+| event | `exec.approval.requested` / `plugin.approval.requested` | `{id, request{…}, createdAtMs, expiresAtMs}` |
+| event | `exec.approval.resolved` / `plugin.approval.resolved` | `{id, decision, resolvedBy, ts, request}` |
+| method | `exec.approval.resolve` / `plugin.approval.resolve` | params `{id, decision}` → `{ok:true}` |
+| method | `exec.approval.list` / `plugin.approval.list` | 無參數 → **裸陣列**，元素同 requested payload |
+
+- `decision` ∈ `allow-once` / `allow-always` / `deny`（**沒有** `approved: bool`
+  形態）。每筆的可用集合在 `request.allowedDecisions`：`ask=="always"` 時
+  只有 `["allow-once","deny"]`；送不允許的值回 `INVALID_REQUEST`
+  + `details.reason=APPROVAL_ALLOW_ALWAYS_UNAVAILABLE`。
+- 同一個 decision 重送是冪等（`{ok:true}`）；不同 decision 回
+  `approval already resolved`。
+- exec 的 `request`：`{command, commandPreview?, commandArgv?, cwd, host,
+  nodeId, agentId, sessionKey, security, ask, warningText, commandAnalysis,
+  allowedDecisions, systemRunPlan, …}`。plugin 的 `request`：
+  `{pluginId, title, description, severity, toolName, toolCallId,
+  allowedDecisions, agentId, sessionKey, …}`。
+- **兩族事件都要 `operator.approvals` scope**（bridge 握手已申請，§1）。
+- **坑**：決議者自己收不到 `*.resolved` 廣播（gateway 以 connId 排除），
+  所以 bridge 決議完必須自己收尾卡片，不能等事件回來。
+- **坑**：`request.sessionKey` 可能是 `null`（非 session 觸發的 exec）——
+  這種待審沒有可歸屬的對話，只進審核中心、不出卡。
+- bridge 對映：pending → canonical `approvals` 表（`provider="openclaw"`,
+  `session_id="openclaw:{sessionKey}"`, `kind="permission"`,
+  `options` = allowedDecisions）＋ approval 卡＋推播；決議走統一路由
+  `POST /app/v2/sessions/{id}/approve {approval_id, key}`。
+- 重連補洞：`*.approval.list` 重掃（事件無 `since` 重放，§6-4）。
 
 ## 5. Bridge 對映設計（openclaw_provider.py）
 
@@ -171,7 +235,13 @@ v1 直接吃全域廣播 + 以 `sessionKey` 分流）。
   - seed：`chat.history`（濾 compaction/heartbeat 雜訊）→ `card-oc-h-{mid}`
   - live：`chat` delta/final → `card-oc-{runId}` 累積 upsert;
     `agent.lifecycle` → turn begin/end + status label;
-    `agent.tool` → `card-oc-{runId}-t{n}` tool_call 卡
+    `agent.tool` → `card-oc-{runId}-t{n}` tool_call 卡 +
+    `…-t{n}-r` tool_result 卡（§3）
+  - **非文字 block**：`message.content` 的 `image`/`audio`/`file` block
+    不再被丟掉 —— 轉成卡片 `body.attachments` 摘要
+    （`{kind, mime?, filename?, size?, omitted?}`）＋ `fallback_text`。
+    純圖片訊息因此不會再整則消失。
+  - 審批：`exec/plugin.approval.requested` → approval 卡（§4.1）
   - 錯誤：`chat.state=error` → system text 卡 ⚠️
 - **推播**：`chat.state=final && message && !isHeartbeat` → `push_notify`
   （標題 = session 顯示名 `OpenClaw · {key 短名}`，body = 正文前 140 字，
@@ -182,12 +252,16 @@ v1 直接吃全域廣播 + 以 `sessionKey` 分流）。
 
 ## 6. 已知限制（v1 明示不做）
 
-1. **approve 缺席**：OpenClaw 的 `exec.approval.*` 是 gateway/node exec
-   審批，觸發條件（agent 跑系統指令 + exec 政策 ask）在靶機聊天流中
-   無法穩定重現;v1 不宣告 `approve`，Approval Hub 接線留 TODO。
-2. **attachments 缺席**：`chat.send.attachments` schema 為
-   `Type.Unknown[]`（形狀鬆），且媒體回讀（agent 產物 → artifacts.download）
-   需要另一條封存管線;v1 收發都不宣告，卡片附件欄照 fallback 呈現。
+1. ~~**approve 缺席**~~ → 2026-08-11 已接（見 §4.1）。**仍未做**：靶機端
+   端到端實跑未驗證（觸發條件 = agent 跑系統指令 + exec 政策 ask，靶機
+   純聊天流無法穩定重現），形狀依 dist 原始碼判讀；`allow-always` 的
+   persistence 語意（寫進 host 的 `exec-approvals.json` allowlist）由
+   gateway 自理，bridge 不碰。
+2. **attachments 送得出去、收不回來**：`chat.send.attachments` 已接（§2/§4），
+   但**回讀方向**仍缺：`chat.history` / `chat` 事件會把 image/audio 的
+   base64 剝成 `{omitted:true, bytes:N}`，真正的位元組要另走
+   `media://inbound/{id}` → artifacts 下載管線。v1 對這類 block 只出
+   附件摘要（`fallback_text` 帶得出來，不再整則消失），不入 media store。
 3. **sessions.reset/delete 需 operator.admin**：v1 連線只申請
    read/write/approvals，不提供刪除/重置 UI。
 4. **事件無 since 補洞**：gateway 事件 `seq` 是連線內序號，斷線期間事件

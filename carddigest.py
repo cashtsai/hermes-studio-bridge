@@ -1239,6 +1239,100 @@ def _oc_msg_text(content) -> str:
     return ""
 
 
+_OC_BLOCK_ICON = {"image": "🖼️", "audio": "🎧", "video": "🎬",
+                  "document": "📄", "file": "📎"}
+
+
+def _oc_msg_nontext(content) -> list[dict]:
+    """message.content 裡**非 text** 的 block → 附件摘要列。
+
+    `_oc_msg_text` 只留 text,其餘全丟 —— 純圖片訊息因此在 `message_card`
+    的 `if not text: return` 整則消失。這裡把它們撈出來當附件摘要,讓卡片
+    至少帶得出 fallback_text,不再憑空不見。
+    """
+    out = []
+    if not isinstance(content, list):
+        return out
+    for b in content:
+        if not isinstance(b, dict):
+            continue
+        btype = str(b.get("type") or "")
+        if btype == "text" or not btype:
+            continue
+        src = b.get("source") if isinstance(b.get("source"), dict) else {}
+        row = {"kind": btype}
+        mime = (b.get("mimeType") or b.get("mediaType") or b.get("contentType")
+                or src.get("media_type") or src.get("mediaType"))
+        if mime:
+            row["mime"] = str(mime)
+        name = (b.get("fileName") or b.get("filename") or b.get("name")
+                or b.get("path") or b.get("url") or src.get("path"))
+        if name:
+            row["filename"] = str(name)
+        # chat.history / chat 事件會把 image/audio 的 base64 剝掉,只留
+        # {omitted:true, bytes:N}(靶機 session-transcript-path 實證)。
+        size = (b.get("size") or b.get("sizeBytes") or b.get("bytes")
+                or src.get("bytes"))
+        if isinstance(size, (int, float)):
+            row["size"] = int(size)
+        if b.get("omitted") or src.get("omitted"):
+            row["omitted"] = True
+        out.append(row)
+    return out
+
+
+_OC_TOOL_ERROR_STATUS = {"failed", "error", "cancelled", "canceled",
+                         "aborted", "incomplete", "timeout"}
+
+
+def _oc_status_is_error(status) -> bool:
+    return isinstance(status, str) and status.strip().lower() in _OC_TOOL_ERROR_STATUS
+
+
+def _oc_tool_result_text(result) -> str:
+    """`agent` tool result 的 `result`(形狀不保證)→ 可讀文字。
+
+    gateway 的 `sanitizeToolResult` 會把 image block 的 base64 剝掉,所以
+    這裡拿到的一定是可安全字串化的東西;未知形狀退 JSON,絕不整個丟掉。
+    """
+    if result is None:
+        return ""
+    if isinstance(result, str):
+        return result.strip()
+    if isinstance(result, list):
+        text = _oc_msg_text(result).strip()
+        return text or _att_fallback_text(_oc_msg_nontext(result))
+    if isinstance(result, dict):
+        for k in ("text", "output", "stdout", "message", "summary", "content"):
+            v = result.get(k)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+            if isinstance(v, list):
+                text = _oc_msg_text(v).strip()
+                if text:
+                    return text
+        try:
+            return json.dumps(result, ensure_ascii=False)
+        except (TypeError, ValueError):
+            return str(result)
+    return str(result)
+
+
+def _att_fallback_text(atts: list) -> str:
+    """附件摘要 → 一行人話 fallback(卡片沒正文時的唯一可讀內容)。"""
+    if not atts:
+        return ""
+    bits = []
+    for a in atts:
+        kind = str(a.get("kind") or "")
+        mime = str(a.get("mime") or "")
+        icon = _OC_BLOCK_ICON.get(kind) or (
+            "🖼️" if mime.startswith("image/") else "📎")
+        label = str(a.get("filename") or "") or kind or mime or "附件"
+        bits.append(f"{icon} {label}")
+    return " ".join(bits)
+
+
 def _oc_ts(ms) -> float | None:
     """OpenClaw timestamp 是 epoch 毫秒;解不動回 None(make_card 用當下)。"""
     try:
@@ -1309,7 +1403,8 @@ class OpenClawDigest(ApprovalCardMixin):
         if role not in ("user", "assistant"):
             return
         text = _oc_msg_text(m.get("content"))
-        if not text:
+        atts = _oc_msg_nontext(m.get("content"))
+        if not text and not atts:
             return
         mid = str(oc.get("id") or "")
         if not mid:
@@ -1319,9 +1414,13 @@ class OpenClawDigest(ApprovalCardMixin):
             return
         self.known_mids.add(mid)
         kind = "text" if role == "user" else "markdown"
+        body = {"text": text,
+                "fallback_text": text or _att_fallback_text(atts)}
+        if atts:
+            body["attachments"] = atts
         self.store.upsert_card(make_card(
-            f"card-oc-h-{mid}", "", role, kind,
-            {"text": text, "fallback_text": text}, ts=_oc_ts(m.get("timestamp"))))
+            f"card-oc-h-{mid}", "", role, kind, body,
+            ts=_oc_ts(m.get("timestamp"))))
 
     def seed_messages(self, msgs: list):
         for m in msgs or []:
@@ -1329,15 +1428,22 @@ class OpenClawDigest(ApprovalCardMixin):
 
     # ── live 事件(bridge 的 OC 客戶端餵)──
 
-    def user_card(self, text: str, mid: str):
+    def user_card(self, text: str, mid: str, attachments: list | None = None):
         """bridge input 路由的即時 user 回顯卡(openclaw 無 canonical 寫入點,
-        chat 事件也只帶 assistant 訊息 → app 送話由這裡出卡)。"""
-        if not text or mid in self.known_mids:
+        chat 事件也只帶 assistant 訊息 → app 送話由這裡出卡)。
+
+        純附件(text 空、attachments 有)一樣要出卡 —— 不然使用者送出去的圖
+        連在自己這邊都看不到。"""
+        atts = [dict(a) for a in (attachments or []) if isinstance(a, dict)]
+        if (not text and not atts) or mid in self.known_mids:
             return
         self.known_mids.add(mid)
+        body = {"text": text,
+                "fallback_text": text or _att_fallback_text(atts)}
+        if atts:
+            body["attachments"] = atts
         self.store.upsert_card(make_card(
-            f"card-oc-u-{mid}", self.store.turn_id, "user", "text",
-            {"text": text, "fallback_text": text}))
+            f"card-oc-u-{mid}", self.store.turn_id, "user", "text", body))
 
     def handle(self, event: str, payload: dict):
         if not isinstance(payload, dict):
@@ -1381,10 +1487,14 @@ class OpenClawDigest(ApprovalCardMixin):
                 # 「帶 message 的 final」才是回合定稿(裸 final 只是 ack,
                 # SPEC §3)——定稿後這個 run 的遲送 delta 一律視為 stale。
                 self._mark_run_ended(run)
-            if full:
+            atts = _oc_msg_nontext(msg.get("content"))
+            if full or atts:
+                body = {"text": full,
+                        "fallback_text": full or _att_fallback_text(atts)}
+                if atts:
+                    body["attachments"] = atts
                 self.store.upsert_card(make_card(
-                    cid, self.store.turn_id, "assistant", "markdown",
-                    {"text": full, "fallback_text": full},
+                    cid, self.store.turn_id, "assistant", "markdown", body,
                     ts=_oc_ts(msg.get("timestamp"))))
         elif state in ("error", "aborted"):
             self.run_text.pop(run, None)
@@ -1439,23 +1549,56 @@ class OpenClawDigest(ApprovalCardMixin):
                 self._status()
             # finishing / fallback_step:中間態,不出卡不收 turn
         elif stream == "tool":
-            name = str(data.get("name") or data.get("tool") or
-                       data.get("toolName") or "tool")
-            args = data.get("args") or data.get("input") or {}
-            summary = ""
-            if isinstance(args, dict):
-                summary = next((str(v) for v in args.values()
-                                if isinstance(v, (str, int))), "")
-            elif isinstance(args, str):
-                summary = args
-            summary = summary.splitlines()[0][:_CMD_MAX] if summary else ""
-            tid = str(data.get("toolCallId") or data.get("id") or
-                      f"{self.store.seq}")
-            self.store.last_tool = name
-            fb = f"› 🔧 {name}" + (f" `{summary}`" if summary else "")
-            self.store.upsert_card(make_card(
-                f"card-oc-{run or 'run'}-t{tid}", self.store.turn_id,
-                "assistant", "tool_call",
-                {"tool": name, "summary": summary, "fallback_text": fb}))
-            self._status()
+            self._handle_tool(run, data)
         # assistant 流:與 chat delta 同一份正文,刻意不雙出(見類 docstring)
+
+    def _handle_tool(self, run: str, data: dict):
+        """`agent` 事件 stream=tool。
+
+        gateway 的 phase 是 `start | update | result`(2026-08-11 讀靶機 dist
+        `selection-*.js` 實證,**沒有 end**)。之前不分 phase 一律出 tool_call
+        卡 → result 事件變成第二張沒有 args 的 tool_call 卡,而工具「回了什麼」
+        永遠看不到。現在 start/update 上 tool_call、result 另出 tool_result。
+        """
+        phase = str(data.get("phase") or "")
+        name = str(data.get("name") or data.get("tool") or
+                   data.get("toolName") or "tool")
+        tid = str(data.get("toolCallId") or data.get("itemId") or
+                  data.get("id") or f"{self.store.seq}")
+        cid = f"card-oc-{run or 'run'}-t{tid}"
+        if phase == "result":
+            is_err = bool(data.get("isError")) or \
+                _oc_status_is_error(data.get("status"))
+            text = _oc_tool_result_text(data.get("result"))
+            if not text:
+                text = str(data.get("toolErrorSummary") or data.get("meta") or "")
+            if not text:
+                text = "(工具無輸出)" if not is_err else "(工具失敗,無訊息)"
+            short = text[:_TOOL_RESULT_MAX]
+            if len(text) > _TOOL_RESULT_MAX:
+                short += "\n…(截斷)"
+            mark = "⚠️ " if is_err else ""
+            self.store.upsert_card(make_card(
+                f"{cid}-r", self.store.turn_id, "assistant", "tool_result",
+                {"text": short, "tool": name, "is_error": is_err,
+                 "fallback_text": f"↳ {mark}{name}\n{short[:1000]}"}))
+            self.store.saw_output = True
+            self.store.last_tool = ""
+            self._status()
+            return
+        args = data.get("args") or data.get("input") or {}
+        summary = ""
+        if isinstance(args, dict):
+            summary = next((str(v) for v in args.values()
+                            if isinstance(v, (str, int))), "")
+        elif isinstance(args, str):
+            summary = args
+        if not summary and phase == "update":
+            summary = _oc_tool_result_text(data.get("partialResult"))
+        summary = summary.splitlines()[0][:_CMD_MAX] if summary else ""
+        self.store.last_tool = name
+        fb = f"› 🔧 {name}" + (f" `{summary}`" if summary else "")
+        self.store.upsert_card(make_card(
+            cid, self.store.turn_id, "assistant", "tool_call",
+            {"tool": name, "summary": summary, "fallback_text": fb}))
+        self._status()
