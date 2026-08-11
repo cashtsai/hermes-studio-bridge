@@ -46,6 +46,22 @@ class RecordingClient(bridge.CodexAppServerClient):
         return [m for m in self.sent if m.get("id") == request_id]
 
 
+def reset_auth_throttle():
+    """把「認證失敗限流器」的行程全域狀態歸零。
+
+    `_check_auth` 每次認證失敗就往模組級的 `_AUTH_FAILS` deque 記一筆，
+    同一個 60s 視窗內超過 `_AUTH_FAIL_MAX`(12) 之後改回 **429**。那個 deque
+    是行程全域的，所以全套 `unittest discover` 一起跑時，前面任何打過認證
+    失敗路徑的測試(例如 test_upload_file_endpoint)都會先把額度用掉，輪到
+    後面的測試時預期的 401/400/409 全變成 429 —— 過不過取決於執行順序。
+
+    正式限流行為不動(那是對的),只在測試側把狀態清乾淨。
+    """
+    with bridge._AUTH_LOCK:
+        bridge._AUTH_FAILS.clear()
+        bridge._AUTH_FAIL_AGG.clear()
+
+
 def _run(coro):
     return asyncio.new_event_loop().run_until_complete(coro)
 
@@ -306,7 +322,12 @@ class TestAnswerEndpoint(unittest.TestCase):
 
     def setUp(self):
         from fastapi.testclient import TestClient
-        self.auth = {"Authorization": "Bearer " + os.environ["BRIDGE_TOKEN"]}
+        # 全套跑時額度可能已被別的測試耗光 → 401/400/409 會變 429。
+        reset_auth_throttle()
+        # 讀 bridge.BRIDGE_TOKEN 而不是 os.environ:全套跑時 bridge 可能已被
+        # 別的測試模組先 import 過，那時的 env 才是生效值，本檔的
+        # setdefault 只在「本檔第一個 import bridge」時算數。
+        self.auth = {"Authorization": "Bearer " + bridge.BRIDGE_TOKEN}
         self.client = RecordingClient()
         self._real = bridge.CODEX_APP
         bridge.CODEX_APP = self.client
@@ -317,6 +338,8 @@ class TestAnswerEndpoint(unittest.TestCase):
 
     def tearDown(self):
         bridge.CODEX_APP = self._real
+        # 本檔自己打出來的認證失敗也不要留給後面的測試。
+        reset_auth_throttle()
 
     def test_answer_with_keys_list(self):
         r = self.http.post("/codexsessions/t-2/answer",

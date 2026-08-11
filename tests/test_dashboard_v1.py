@@ -78,6 +78,17 @@ def _stub_light(monkey_self):
 
 
 class TestAuth(unittest.TestCase):
+    def setUp(self):
+        # 認證失敗限流器(`_AUTH_FAILS`)是行程全域的:同視窗內失敗超過
+        # `_AUTH_FAIL_MAX` 之後改回 429，這題期待的 401 在全套一起跑時會
+        # 被前面的測試耗掉額度而變成 429(單檔跑卻是綠的)。只清測試側
+        # 狀態，不動正式限流行為。
+        with bridge._AUTH_LOCK:
+            bridge._AUTH_FAILS.clear()
+            bridge._AUTH_FAIL_AGG.clear()
+
+    tearDown = setUp
+
     def test_bad_token_401(self):
         restore = _stub_light(self)
         try:

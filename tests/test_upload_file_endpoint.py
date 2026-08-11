@@ -28,10 +28,24 @@ from fastapi.testclient import TestClient  # noqa: E402
 AUTH = {"Authorization": "Bearer test-unit-token"}
 
 
+def _reset_auth_throttle():
+    """認證失敗限流器(`_AUTH_FAILS`)是行程全域的 —— 同視窗內失敗超過
+    `_AUTH_FAIL_MAX` 就改回 429，於是 test_requires_auth 期待的 401 在
+    全套 `unittest discover` 一起跑時會變成 429(單檔跑卻是綠的)。
+    只在測試側歸零，不動正式限流行為。"""
+    with bridge._AUTH_LOCK:
+        bridge._AUTH_FAILS.clear()
+        bridge._AUTH_FAIL_AGG.clear()
+
+
 class UploadFileEndpointTest(unittest.TestCase):
     def setUp(self):
+        _reset_auth_throttle()
         self.client = TestClient(bridge.app)
         self.before = set(self._uploads())
+
+    def tearDown(self):
+        _reset_auth_throttle()
 
     def _uploads(self):
         try:
