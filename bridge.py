@@ -44,6 +44,10 @@ from pathlib import Path
 import agent_call as agent_call_policy
 import agent_registry
 import host_discovery
+from harness import distill as harness_distill
+from harness import model as harness_model
+from harness import store as harness_store
+from harness import trajectory as harness_traj
 import media_artifacts
 import hermes_media
 import openclaw_provider
@@ -884,21 +888,14 @@ async def _polish_transcript(text: str) -> str:
     # 中文 1 字約 1.2~1.5 token;輸入+輸出約 3x。夾在 8192~40960。
     num_ctx = min(40960, max(8192, len(text) * 3 + 2048))
 
-    async def _run() -> str:
-        import httpx
-        async with httpx.AsyncClient(timeout=120) as client:
-            r = await client.post(
-                "http://127.0.0.1:11434/api/chat",
-                json={"model": _MEETING_POLISH_MODEL, "stream": False,
-                      "keep_alive": "15m",
-                      "messages": [{"role": "user",
-                                    "content": _MEETING_POLISH_PROMPT + text}],
-                      "options": {"temperature": 0.2, "num_ctx": num_ctx}})
-            r.raise_for_status()
-            return ((r.json().get("message") or {}).get("content") or "").strip()
-
+    # 2026-08-11:這段本機 Ollama 呼叫被 Continual Harness 的夜批蒸餾共用,
+    # 抽到 harness/model.py 當**唯一實作**(model/num_ctx/timeout/keep_alive/
+    # temperature 逐項保持原值,行為不變)。fail-soft 語意刻意留在這裡 ——
+    # 清稿要「失敗回原稿」,蒸餾要「失敗記一筆跑批錯誤」,不該由共用層代決。
     try:
-        out = await asyncio.wait_for(_run(), timeout=90)
+        out = await harness_model.ollama_text(
+            _MEETING_POLISH_PROMPT + text, model=_MEETING_POLISH_MODEL,
+            num_ctx=num_ctx, timeout=90, temperature=0.2, keep_alive="15m")
         return out or text
     except asyncio.TimeoutError:
         _log_event("meeting_polish_timeout", chars=len(text), num_ctx=num_ctx)
@@ -13495,6 +13492,10 @@ def _sync_persona_reports(session: str, limit: int = 50) -> list[dict]:
     reports = _persona_reports(session, limit)
     if TOOL_ERROR_REPORTS_ENABLED:
         reports.extend(_persona_tool_error_reports(session, min(limit, 20)))
+    # Continual Harness 的待審提案段(HARNESS=1 才有;關著時回空陣列)。
+    # 掛在這裡而不是改寫 cron 晨報本文:改本文會動到內容雜湊,`_report_upsert`
+    # 每次都當成新報告重新鏡射一則聊天訊息 —— 這裡走獨立 report,一天一則。
+    reports.extend(_persona_harness_reports(session))
     if not reports:
         return _report_events(session, limit, newest_first=True)
     upserted = 0
@@ -19080,6 +19081,452 @@ async def v2_agent_targets(request: Request, caller: str = ""):
                     "busy": await _registry_is_busy(sid)})
     return {"caller": caller, "targets": out,
             "policy_path": agent_call_policy.policy_path()}
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Continual Harness(藍圖 AGENT_INTEROP §2 / 子程序設計 §0)—— 累積層接線
+# ══════════════════════════════════════════════════════════════════════════
+# Prime Agent 的洞見:贏在累積,不在執行。每回合軌跡回寫 Prompt/Memory/
+# Skill/Subagent 四庫,節點下次開工站在上次的肩膀上。
+#
+# 善彰的鐵律:**夜批蒸餾 + 晨報人審,不搞自動自改**。所以:
+#   - 蒸餾器只產 state=proposed,沒有任何自動生效路徑
+#   - approve 只在人打 HTTP 時發生(`_harness_store().approve` 的唯一呼叫點)
+#   - prompt 提案核准 → 寫進該節點的 ccsess spawn pin,**下次** spawn 才吃到
+#     (不重啟、不干擾進行中的工作)
+#
+# 資料面在 harness/ 套件(獨立 sqlite,env HARNESS_DB,預設 ~/.pocket/
+# harness.db)。**canonical.db / state.db 一律 mode=ro 唯讀**;harness 整個
+# 炸掉最多是少一晚提案,聊天資料零風險。
+#
+# 旗標:HARNESS=1 才開,預設 OFF(merge = 零風險)——關閉時端點 404、
+# 背景蒸餾/收集任務完全不啟動、晨報不加 harness 段。
+
+_HARNESS_STORE = None
+_HARNESS_INGEST_SECS = float(os.environ.get("HARNESS_INGEST_SECS", "300"))
+_HARNESS_DISTILL_HOUR = int(os.environ.get("HARNESS_DISTILL_HOUR", "4"))
+_HARNESS_DISTILL_HOURS = float(os.environ.get("HARNESS_DISTILL_HOURS", "24"))
+_HARNESS_REPORT_LABEL = "蒸餾提案"
+_HARNESS_REPORT_NAME = "harness-proposals"
+
+
+def _harness_enabled() -> bool:
+    """旗標每次呼叫讀 env(同 AGENT_CALL 慣例):預設 OFF,merge 零風險。"""
+    return str(os.environ.get("HARNESS", "")).strip().lower() in (
+        "1", "true", "yes", "on")
+
+
+def _harness_require_enabled() -> None:
+    if not _harness_enabled():
+        raise http_err(404, "HARNESS_DISABLED",
+                       "Continual Harness 未啟用(需 HARNESS=1)")
+
+
+def _harness_store():
+    """惰性建庫 —— 旗標關著時連 DB 檔都不會被建出來。"""
+    global _HARNESS_STORE
+    if _HARNESS_STORE is None:
+        _HARNESS_STORE = harness_store.HarnessStore(
+            os.environ.get("HARNESS_DB")
+            or os.path.join(_POCKET_DIR, "harness.db"))
+    return _HARNESS_STORE
+
+
+# ── 軌跡收集(唯讀:卡片流 ring + registry meta)───────────────────────────
+
+def _harness_node_meta(sid: str) -> dict:
+    """registry 的節點中繼:purpose / provider / node_config(已去密)。
+
+    node_config 走現成的 `_spawn_config_public()`(api_key 連遮罩版都不給,
+    只留 has_api_key 布林),再由 `trajectory.redact_config()` 擋第二道。
+    """
+    row = REGISTRY.get(sid) or {}
+    provider = str(row.get("provider") or "")
+    cfg: dict = {}
+    src = None
+    try:
+        src = _v2_card_source(sid)
+    except Exception:  # noqa: BLE001 — 認不得的 id 就沒有 spawn config
+        src = None
+    if src and src[0] == "cc":
+        try:
+            cfg = _spawn_config_public(_cc_read_spawn_config(src[1]))
+        except Exception as _exc:  # noqa: BLE001
+            _log_exc("_harness_node_meta.cfg", _exc, expected=True)
+    meta = {"purpose": str(row.get("purpose") or ""),
+            "provider": provider or (src[0] if src else ""),
+            "node_config": cfg,
+            "parent": row.get("parent") or "",
+            "class": row.get("class") or ""}
+    return meta
+
+
+async def _harness_ingest_session(sid: str) -> int:
+    """把某個 session 卡片流 ring 裡的完成回合正規化後落 harness DB。
+
+    冪等:trajectory id = sha1(session|turn),重放同一段 ring 只會更新同一
+    列。所以「每 N 分鐘掃一次」這種粗暴做法不會產生重複軌跡,也不需要在
+    turn.end 熱路徑上掛鉤子(掛鉤子 = 動到 production 最敏感的那條線)。
+    """
+    if not _harness_enabled():
+        return 0
+    try:
+        store = await _v2_card_store(sid)
+    except Exception as _exc:  # noqa: BLE001 — 認不得/取不到就跳過
+        _log_exc("_harness_ingest_session.store", _exc, expected=True)
+        return 0
+    meta = _harness_node_meta(sid)
+    try:
+        trajs = harness_traj.from_card_events(
+            list(getattr(store, "events", []) or []), session_id=sid,
+            provider=meta["provider"], purpose=meta["purpose"],
+            node_config=meta["node_config"])
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("_harness_ingest_session.normalize", _exc, expected=True)
+        return 0
+    live_turn = str(getattr(store, "turn_id", "") or "")
+    hs = _harness_store()
+    n = 0
+    for t in trajs:
+        if t["turn_id"] and t["turn_id"] == live_turn:
+            continue          # 進行中的回合不落庫(軌跡還沒寫完)
+        try:
+            hs.put_trajectory(t)
+            n += 1
+        except Exception as _exc:  # noqa: BLE001
+            _log_exc("_harness_ingest_session.put", _exc, expected=True)
+    return n
+
+
+async def _harness_ingest_sweep() -> int:
+    """巡一輪所有活著的登記節點,收軌跡。只讀,不動任何 provider 狀態。"""
+    total = 0
+    for row in REGISTRY.list_rows():
+        if row.get("state") == "archived":
+            continue
+        total += await _harness_ingest_session(row["id"])
+    return total
+
+
+async def _harness_ingest_loop() -> None:
+    while True:
+        try:
+            await asyncio.sleep(_HARNESS_INGEST_SECS)
+            if not _harness_enabled():
+                continue
+            n = await _harness_ingest_sweep()
+            if n:
+                _log_event("harness_ingest", trajectories=n)
+        except asyncio.CancelledError:
+            raise
+        except Exception as _exc:  # noqa: BLE001
+            _log_exc("_harness_ingest_loop", _exc, expected=True)
+
+
+# ── 夜批(排程)────────────────────────────────────────────────────────────
+
+async def _harness_run_distill(hours: float | None = None,
+                               dry_run: bool = False) -> dict:
+    """跑一輪蒸餾(收軌跡 → 蒸餾 → 落提案)。模型走 harness/model.py 的
+    本機 Ollama —— 與會議清稿同一條線,不新增任何雲端依賴/金鑰。"""
+    await _harness_ingest_sweep()
+    out = await harness_distill.run(
+        _harness_store(), hours=hours or _HARNESS_DISTILL_HOURS,
+        current_prompt=_harness_current_prompt, dry_run=dry_run)
+    _log_event("harness_distilled", trajectories=out["trajectories"],
+               groups=out["groups"], proposals=len(out["proposals"]),
+               errors=len(out["errors"]), dry_run=dry_run)
+    return out
+
+
+async def _harness_distill_loop() -> None:
+    """夜批排程:每小時醒一次,到 HARNESS_DISTILL_HOUR(預設凌晨 4 點)就跑。
+
+    刻意不用 cron:bridge 是常駐行程,自己數鐘點最簡單、也最容易在晨報上
+    回報「昨晚跑了沒」。同一天只跑一次(用 last_run 的日期擋)。
+    """
+    while True:
+        try:
+            await asyncio.sleep(3600)
+            if not _harness_enabled():
+                continue
+            now = time.localtime()
+            if now.tm_hour != _HARNESS_DISTILL_HOUR:
+                continue
+            last = _harness_store().last_run()
+            if last and time.localtime(last["started_ts"]).tm_yday == now.tm_yday:
+                continue
+            await _harness_run_distill()
+        except asyncio.CancelledError:
+            raise
+        except Exception as _exc:  # noqa: BLE001
+            _log_exc("_harness_distill_loop", _exc, expected=True)
+
+
+# ── prompt 提案 → spawn-config pin(核准後才走,閉環)──────────────────────
+
+def _harness_current_prompt(node: str) -> str:
+    """該節點現行的 append_system_prompt(做 diff 預覽用)。"""
+    try:
+        return str(_cc_read_spawn_config(node).get("append_system_prompt") or "")
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("_harness_current_prompt", _exc, expected=True)
+        return ""
+
+
+def _harness_apply_prompt(node: str, fragment: str) -> str:
+    """把核准的片段寫進該節點的 ccsess spawn pin,**下次** spawn 生效。
+
+    ⚠️ 刻意不呼叫 `_cc_write_spawn_pins()`:那支在 cfg 沒有 api_key 時會
+    **刪掉** BYO key 的 0600 secret 檔。這裡是局部更新(只動
+    append_system_prompt),絕不能連帶砍掉使用者自帶的金鑰。所以只讀寫
+    flags 檔本身,secret 檔一根汗毛都不碰。
+
+    回傳給人看的一句話(寫進提案的 apply_note)。
+    """
+    fragment = str(fragment or "").strip()
+    if not fragment:
+        return "片段是空的,未寫入"
+    path = os.path.join(CCSESS_SPAWN_DIR, node + ".json")
+    cfg: dict = {}
+    try:
+        if os.path.exists(path):
+            with open(path, encoding="utf-8") as f:
+                cfg = json.load(f) or {}
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("_harness_apply_prompt.read", _exc, expected=True)
+        cfg = {}
+    cfg.pop("api_key", None)          # 防禦:flags 檔本來就不該有金鑰
+    cfg.pop("has_api_key", None)
+    cfg["append_system_prompt"] = fragment
+    # 走現成的驗證(enum/長度/型別),壞值不落地
+    cfg = _spawn_config_validate(cfg, "cc")
+    os.makedirs(CCSESS_SPAWN_DIR, exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, ensure_ascii=False)
+    os.replace(tmp, path)
+    _log_event("harness_prompt_pinned", node=node, chars=len(fragment))
+    return f"已寫入 {node} 的 spawn pin,下次開此節點的子程序時生效"
+
+
+def _harness_apply(row: dict) -> str:
+    """核准後的落地動作。目前只有 prompt 庫有現成的機械可以閉環;
+    memory/skill/route 先進庫等消費端(v0 誠實邊界,見 docs)。"""
+    if row.get("store") != "prompt":
+        return ""
+    node = str(row.get("node") or "")
+    provider = str(row.get("provider") or "")
+    if not node:
+        return ""
+    if provider and provider not in ("cc", "claude_code"):
+        return (f"{provider} 沒有持久的 spawn pin,片段已核准但需在派工時"
+                "手動帶入(v0 限制)")
+    return _harness_apply_prompt(node, str(row.get("fragment") or ""))
+
+
+# ── 端點(晨報審核面)──────────────────────────────────────────────────────
+
+def _harness_public(row: dict) -> dict:
+    """回給 app/晨報的提案形狀。內容早在正規化階段就過遮罩,這裡不再改寫。"""
+    out = {k: row.get(k) for k in
+           ("id", "store", "scope", "key", "version", "state", "rationale",
+            "evidence", "preview", "created_ts", "updated_ts", "decided_ts",
+            "decided_by", "applied", "apply_note", "meta")}
+    _pfx, extra = harness_store.STORES[row["store"]]
+    out["payload"] = {name: row.get(name) for name, _d in extra}
+    return out
+
+
+@app.get("/app/v2/harness/proposals")
+async def v2_harness_proposals(request: Request, state: str = "proposed",
+                               store: str | None = None,
+                               scope: str | None = None, limit: int = 100):
+    """待審提案清單(晨報與 Pocket 審核頁的資料源)。
+
+    state 給空字串 = 全部狀態。每筆帶 rationale(為什麼)、evidence
+    (哪幾條軌跡)、preview(會變成什麼)—— 人審要的三件事。
+    """
+    _check_auth(request)
+    _harness_require_enabled()
+    if store and store not in harness_store.STORES:
+        raise HTTPException(status_code=400,
+                            detail=f"store 需為 {'/'.join(harness_store.STORES)} 其一")
+    if state and state not in harness_store.STATES:
+        raise HTTPException(status_code=400,
+                            detail=f"state 需為 {'/'.join(harness_store.STATES)} 其一")
+    rows = _harness_store().list(store=store, state=state or None, scope=scope,
+                                 limit=max(1, min(limit, 500)))
+    return {"proposals": [_harness_public(r) for r in rows],
+            "stores": list(harness_store.STORES),
+            "last_run": _harness_store().last_run()}
+
+
+@app.post("/app/v2/harness/proposals/{pid}/approve")
+async def v2_harness_approve(pid: str, request: Request):
+    """人審通過:proposed → approved → active,並執行落地動作。
+
+    **這是整個 harness 唯一會讓東西生效的入口,而且只有人打得到。**
+    prompt 提案核准 = 片段寫進該節點 spawn pin,下次 spawn 就吃到 ——
+    與既有的 spawn-config 機械閉環。
+    """
+    _check_auth(request)
+    _harness_require_enabled()
+    body = await _json_body(request)
+    by = str(body.get("by") or "human")[:60]
+    hs = _harness_store()
+    row = hs.get(pid)
+    if row is None:
+        raise http_err(404, "HARNESS_PROPOSAL_NOT_FOUND", "找不到這筆提案")
+    try:
+        row = hs.approve(pid, by=by)
+    except harness_store.StateError as exc:
+        raise http_err(409, "HARNESS_STATE", exc.detail)
+    note = ""
+    try:
+        note = _harness_apply(row)
+    except Exception as exc:  # noqa: BLE001 — 落地失敗不回滾核准,但要說清楚
+        note = f"核准了,但落地失敗:{type(exc).__name__}: {exc}"[:300]
+        _log_exc("_harness_apply", exc, expected=True)
+    if note:
+        hs.mark_applied(pid, note)
+        row = hs.get(pid)
+    _log_event("harness_approved", proposal=pid, store=row["store"],
+               key=row["key"], by=by, applied=bool(note))
+    return {"ok": True, "proposal": _harness_public(row), "applied_note": note}
+
+
+@app.post("/app/v2/harness/proposals/{pid}/reject")
+async def v2_harness_reject(pid: str, request: Request):
+    """人審否決。理由留在 apply_note,下次蒸餾出同樣的東西時看得到前科。"""
+    _check_auth(request)
+    _harness_require_enabled()
+    body = await _json_body(request)
+    hs = _harness_store()
+    if hs.get(pid) is None:
+        raise http_err(404, "HARNESS_PROPOSAL_NOT_FOUND", "找不到這筆提案")
+    try:
+        row = hs.reject(pid, by=str(body.get("by") or "human")[:60],
+                        reason=str(body.get("reason") or "")[:500])
+    except harness_store.StateError as exc:
+        raise http_err(409, "HARNESS_STATE", exc.detail)
+    _log_event("harness_rejected", proposal=pid, store=row["store"], key=row["key"])
+    return {"ok": True, "proposal": _harness_public(row)}
+
+
+@app.post("/app/v2/harness/distill")
+async def v2_harness_distill(request: Request):
+    """手動催一輪夜批(驗收/補跑用)。body {hours?, dry_run?}。"""
+    _check_auth(request)
+    _harness_require_enabled()
+    body = await _json_body(request)
+    try:
+        hours = float(body.get("hours") or _HARNESS_DISTILL_HOURS)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="hours 必須是數字(小時)")
+    out = await _harness_run_distill(hours=hours, dry_run=bool(body.get("dry_run")))
+    return {"ok": True, "trajectories": out["trajectories"],
+            "groups": out["groups"], "proposals": len(out["proposals"]),
+            "written": out["written"], "errors": out["errors"],
+            "dry_run": out["dry_run"]}
+
+
+@app.get("/app/v2/harness/status")
+async def v2_harness_status(request: Request):
+    """旗標/庫況一覽(善彰開燈後第一個該看的)。"""
+    _check_auth(request)
+    _harness_require_enabled()
+    hs = _harness_store()
+    counts = {s: len(hs.list(store=s, state="proposed", limit=500))
+              for s in harness_store.STORES}
+    active = {s: len(hs.active(s)) for s in harness_store.STORES}
+    return {"enabled": True, "db": hs.db_path,
+            "model": harness_model.distill_model(),
+            "distill_hour": _HARNESS_DISTILL_HOUR,
+            "pending": counts, "active": active,
+            "last_run": hs.last_run()}
+
+
+# ── 晨報段(善彰已經在看的地方)────────────────────────────────────────────
+
+def _harness_report_content(pending: list, last_run: dict | None) -> str:
+    """待審提案 → 晨報 markdown。照 `_tool_error_report_content` 的樣式。"""
+    lines = ["## 蒸餾提案待審", ""]
+    if last_run:
+        lines.append(
+            f"- 昨夜蒸餾:{_fmt_ts(last_run.get('started_ts') or 0)}"
+            f",看了 {last_run.get('trajectories') or 0} 條軌跡"
+            f",提了 {last_run.get('proposals') or 0} 案")
+        if last_run.get("error"):
+            lines.append(f"- ⚠️ 跑批有錯:{_clip_text(last_run['error'], 200)}")
+    if not pending:
+        lines += ["", "目前沒有待審提案。"]
+        return "\n".join(lines).strip()
+    lines += [f"- 待審 **{len(pending)}** 筆(核准前不會有任何東西生效)", ""]
+    label = {"memory": "記憶", "skill": "技能", "prompt": "系統提示",
+             "subagent_route": "路由"}
+    for p in pending[:12]:
+        lines += [
+            f"### [{label.get(p['store'], p['store'])}] {p['key']}",
+            f"- 範圍:`{p['scope']}` · 版本 v{p['version']}",
+            f"- 理由:{p.get('rationale') or '(無)'}",
+            f"- 證據:{len(p.get('evidence') or [])} 條軌跡",
+            "",
+            "```diff",
+            _fenced_text(p.get("preview") or "", 800),
+            "```",
+            "",
+        ]
+    if len(pending) > 12:
+        lines.append(f"…另有 {len(pending) - 12} 筆,請到 Pocket 的蒸餾提案頁查看。")
+    lines += ["", f"核准/否決:`POST /app/v2/harness/proposals/<id>/approve|reject`"]
+    return "\n".join(lines).strip()
+
+
+def _persona_harness_reports(persona: str, limit: int = 1) -> list[dict]:
+    """晨報的 harness 段(report_events 產出者,接在 `_sync_persona_reports`)。
+
+    旗標關著、或沒有任何待審提案且昨夜沒跑批 → 回空(不打擾)。
+    external_id 以日期為鍵:一天最多一則,夜批跑完更新內容,不會洗版。
+    """
+    if not _harness_enabled():
+        return []
+    try:
+        hs = _harness_store()
+        pending = hs.list(state="proposed", limit=200)
+        last = hs.last_run()
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("_persona_harness_reports", _exc, expected=True)
+        return []
+    if not pending and not last:
+        return []
+    day = time.strftime("%Y-%m-%d")
+    external_id = f"harness:{persona}:{day}"
+    ts = time.time()
+    return [{"id": _report_id(persona, _HARNESS_REPORT_NAME, day, ts),
+             "external_id": external_id,
+             "external_source": "harness",
+             "session_id": f"harness-{day}",
+             "label": _HARNESS_REPORT_LABEL,
+             "name": _HARNESS_REPORT_NAME,
+             "content": _harness_report_content(pending, last),
+             "ts": ts}]
+
+
+@app.on_event("startup")
+async def _start_harness():
+    """旗標關著就完全不啟動任何背景工作(zero risk),也不建 DB 檔。"""
+    if not _harness_enabled():
+        _log_event("harness_disabled")
+        return
+    for coro in (_harness_ingest_loop(), _harness_distill_loop()):
+        task = asyncio.create_task(coro)
+        _BG_TASKS.add(task)
+        task.add_done_callback(_BG_TASKS.discard)
+    _log_event("harness_started", db=_harness_store().db_path,
+               model=harness_model.distill_model(),
+               ingest_secs=_HARNESS_INGEST_SECS,
+               distill_hour=_HARNESS_DISTILL_HOUR)
 
 
 @app.on_event("startup")
