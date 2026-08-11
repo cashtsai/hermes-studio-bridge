@@ -28,6 +28,7 @@ import re
 import secrets
 import shlex
 import signal
+import socket
 import struct
 import shutil
 import subprocess
@@ -3963,7 +3964,8 @@ async def chat_completions(request: Request):
     })
 
 
-CLAUDE_BIN = "/Users/xcash/.local/bin/claude"
+CLAUDE_BIN = os.path.expanduser(os.environ.get("CLAUDE_BIN", "")) or (
+    shutil.which("claude") or os.path.expanduser("~/.local/bin/claude"))
 # 用能讀「新版 thread」的 codex 當 app-server。VS Code 用 codex 0.142 建 thread,
 # 舊的 standalone 0.137(~/.local/bin/codex)一讀其 full turns(thread/turns/list
 # itemsView=full)就 crash → UPSTREAM_FAILED「codex app-server stopped」,整條 stdio
@@ -3977,10 +3979,11 @@ def _resolve_codex_bin() -> str:
     for c in (os.environ.get("CODEX_BIN"),
               "/Applications/Codex.app/Contents/Resources/codex",
               "/Applications/ChatGPT.app/Contents/Resources/codex",
-              os.path.expanduser("~/.local/bin/codex")):
+              os.path.expanduser("~/.local/bin/codex"),
+              shutil.which("codex")):
         if c and os.path.exists(c):
             return c
-    return "/Users/xcash/.local/bin/codex"
+    return os.path.expanduser("~/.local/bin/codex")
 
 
 CODEX_BIN = _resolve_codex_bin()   # 僅供顯示/預設;spawn 走 _resolve_codex_bin()
@@ -5720,17 +5723,34 @@ async def pair_new(request: Request):
         body = {}
     required_account = request.url.path.startswith("/app/v1/")
     user = _account_user_from_request(request, body, required=required_account)
+    ttl = _pair_clamp_ttl(body.get("ttl"))
+    code = _pair_mint_code((user or {}).get("apple_user_id"), ttl=ttl)
+    return {"code": code, "ttl": ttl,
+            "account_bound": bool(user)}
+
+
+def _pair_clamp_ttl(raw) -> int:
+    """配對碼 TTL:預設 5 分鐘;免掃碼的「配對連結」場景(雲端主機把連結傳到
+    手機再點)人工傳遞有延遲,允許放寬 —— 上限 30 分鐘,下限 1 分鐘。"""
+    try:
+        ttl = int(raw)
+    except (TypeError, ValueError):
+        return int(_PAIR_CODE_TTL)
+    return max(60, min(1800, ttl))
+
+
+def _pair_mint_code(apple_user_id=None, ttl=None) -> str:
+    """鑄一枚一次性配對碼(/pair/new 與本機 /pair/qr 頁共用)。"""
     now = time.monotonic()
     code = secrets.token_urlsafe(9)
     with _PAIR_LOCK:
         for c in [c for c, v in _PAIR_CODES.items() if _pair_code_meta(v)["expiry"] < now]:
             _PAIR_CODES.pop(c, None)          # prune expired
         _PAIR_CODES[code] = {
-            "expiry": now + _PAIR_CODE_TTL,
-            "apple_user_id": (user or {}).get("apple_user_id"),
+            "expiry": now + (ttl or _PAIR_CODE_TTL),
+            "apple_user_id": apple_user_id,
         }
-    return {"code": code, "ttl": int(_PAIR_CODE_TTL),
-            "account_bound": bool(user)}
+    return code
 
 
 @app.post("/app/v1/pair/claim")
@@ -5828,6 +5848,249 @@ async def pair_revoke(request: Request):
         if removed:
             _save_device_tokens(_DEVICE_TOKENS)
     return {"revoked": removed}
+
+
+# ───────────── 本機配對頁 /pair/qr(龍蝦主機三平台共用,取代 pocket-pair.py 桌面依賴)─────────────
+# 安裝器最後一步開瀏覽器指到這裡;只服務 127.0.0.1(配對碼等同短效憑證,不上網段)。
+# host 候選探測全走純 Python/跨平台指令,mac/ubuntu 同一份。
+
+_PAIR_HOSTS_CACHE = {"ts": 0.0, "hosts": [], "tailscale": False}
+_BRIDGE_PORT = int(os.environ.get("POCKET_BRIDGE_PORT", "8081"))
+_POCKET_TUNNEL_URL_FILE = os.path.expanduser(
+    os.environ.get("POCKET_TUNNEL_URL_FILE", "~/.pocket/tunnel-url"))
+
+
+def _pair_local_only(request: Request) -> None:
+    if _client_host(request) not in ("127.0.0.1", "::1", "localhost"):
+        raise HTTPException(status_code=403, detail="local only")
+
+
+# ── 一次性 boot code:/pair/qr 的真正閘門 ─────────────────────────────────
+# _pair_local_only 在 cloudflared tunnel 部署下形同虛設:tunnel 把公網流量
+# proxy 進 127.0.0.1,每個公網訪客看起來都像 loopback → 任何拿到 tunnel URL
+# 的人都能開 /pair/qr 鑄配對碼 → /pair/claim 換 device token → 接管整台主機
+# (含終端 PTY)。因此 /pair/qr 與 /pair/qr.json 必須帶 ?boot=<code>:
+# 值放磁碟(chmod 600),只有摸得到這台機器的人(或安裝器印出的連結)才有。
+# _pair_local_only 保留當 defense-in-depth 第二層,但 boot code 才是真閘。
+_PAIR_BOOT_CODE_FILE = os.path.expanduser(
+    os.environ.get("PAIR_BOOT_CODE_FILE", "~/.pocket/pair-boot-code"))
+_PAIR_BOOT_CODE_LOCK = threading.Lock()
+_PAIR_BOOT_CODE_CACHE = {"code": ""}
+
+
+def _pair_boot_code() -> str:
+    """讀取(或首次啟動時產生)boot code;檔案 0600、一機一碼、重啟不變。"""
+    with _PAIR_BOOT_CODE_LOCK:
+        if _PAIR_BOOT_CODE_CACHE["code"]:
+            return _PAIR_BOOT_CODE_CACHE["code"]
+        path = _PAIR_BOOT_CODE_FILE
+        code = ""
+        try:
+            with open(path, encoding="utf-8") as f:
+                code = f.read().strip()
+        except FileNotFoundError:
+            pass
+        except Exception as _exc:  # noqa: BLE001
+            _log_exc("pair_boot_code_read", _exc, expected=True)
+        if not code:
+            code = secrets.token_urlsafe(16)
+            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(code + "\n")
+        _PAIR_BOOT_CODE_CACHE["code"] = code
+        return code
+
+
+def _pair_check_boot(request: Request) -> None:
+    """boot code 閘:缺/錯一律 403(錯誤形狀同其他 pair 4xx)。常數時間比較。"""
+    supplied = (request.query_params.get("boot") or "").strip()
+    if not supplied or not hmac.compare_digest(supplied, _pair_boot_code()):
+        raise HTTPException(status_code=403, detail="invalid boot code")
+
+
+try:  # 啟動即產生/載入,安裝器與人工查檔都能立刻拿到同一枚碼
+    _pair_boot_code()
+except Exception as _exc:  # noqa: BLE001
+    _log_exc("pair_boot_code_init", _exc, expected=True)
+
+
+# /pair/qr.json 鑄碼節流:配對是人手點一下的低頻動作,10/min 綽綽有餘,
+# 卻能擋住拿到 boot code 後的自動化狂鑄(縮小暴力面)。
+_PAIR_QR_MINT_LIMIT = 10
+_PAIR_QR_MINT_WINDOW = 60.0
+_PAIR_QR_MINTS = collections.deque()
+
+
+def _pair_qr_check_mint_rate() -> None:
+    now = time.monotonic()
+    with _PAIR_LOCK:
+        while _PAIR_QR_MINTS and now - _PAIR_QR_MINTS[0] > _PAIR_QR_MINT_WINDOW:
+            _PAIR_QR_MINTS.popleft()
+        if len(_PAIR_QR_MINTS) >= _PAIR_QR_MINT_LIMIT:
+            raise HTTPException(status_code=429,
+                                detail="too many pairing code requests; slow down")
+        _PAIR_QR_MINTS.append(now)
+
+
+def _pair_lan_ip():
+    """UDP connect 戲法拿本機對外私網 IP(不真的發包),跨平台、免 ipconfig/ip。"""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.connect(("8.8.8.8", 80))
+            ip = s.getsockname()[0]
+        finally:
+            s.close()
+        return ip if ip and not ip.startswith("127.") else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _pair_tailscale_host():
+    """tailnet MagicDNS 名(兩端都在 tailnet 時最穩的私網路徑)。PATH 優先,
+    mac App 內建路徑保底;沒裝/沒起 → None(頁面據此顯示安裝建議)。"""
+    for ts in (shutil.which("tailscale"),
+               "/Applications/Tailscale.app/Contents/MacOS/Tailscale"):
+        if not ts or not os.path.exists(ts):
+            continue
+        try:
+            out = subprocess.run([ts, "status", "--json"],
+                                 capture_output=True, text=True, timeout=3)
+            if out.returncode != 0:
+                continue
+            self_ = json.loads(out.stdout).get("Self") or {}
+            dns = (self_.get("DNSName") or "").rstrip(".")
+            if dns:
+                return dns
+            ips = self_.get("TailscaleIPs") or []
+            if ips:
+                return str(ips[0])
+        except Exception:  # noqa: BLE001
+            continue
+    return None
+
+
+def _pair_tunnel_url():
+    """公網保底 URL。優先 env POCKET_TUNNEL_URL(named tunnel/funnel);否則讀
+    POCKET_TUNNEL_URL_FILE —— Ubuntu 安裝器的 cloudflared quick-tunnel unit 會把
+    當前 trycloudflare URL 寫進去(URL 會漂,檔案由 unit 維護)。"""
+    env = (os.environ.get("POCKET_TUNNEL_URL") or "").strip()
+    if env:
+        return env
+    try:
+        with open(_POCKET_TUNNEL_URL_FILE, encoding="utf-8") as f:
+            url = f.read().strip()
+        return url or None
+    except OSError:
+        return None
+
+
+def _pair_host_candidates(force: bool = False):
+    """依優先序的連線候選(同 pocket-pair.py 的 QR payload v2 語意):
+    1) 私網直連 2) tailnet 3) 公網 tunnel。快取 30s,tailscale 探測不便宜。"""
+    now = time.monotonic()
+    if not force and _PAIR_HOSTS_CACHE["hosts"] and now - _PAIR_HOSTS_CACHE["ts"] < 30:
+        return list(_PAIR_HOSTS_CACHE["hosts"]), _PAIR_HOSTS_CACHE["tailscale"]
+    hosts = []
+    lan = _pair_lan_ip()
+    if lan:
+        hosts.append("http://%s:%d" % (lan, _BRIDGE_PORT))
+    ts = _pair_tailscale_host()
+    if ts:
+        hosts.append("https://%s" % ts)
+    tunnel = _pair_tunnel_url()
+    if tunnel:
+        hosts.append(tunnel)
+    _PAIR_HOSTS_CACHE.update({"ts": now, "hosts": list(hosts), "tailscale": bool(ts)})
+    return hosts, bool(ts)
+
+
+@app.get("/pair/qr.json")
+async def pair_qr_json(request: Request):
+    """鑄新碼 + 組 payload + 產 QR SVG,一次回齊(頁面 TTL 到期後再打一次換新碼)。
+    ?ttl= 放寬碼效期(配對連結場景;夾 60..1800s)。"""
+    _pair_check_boot(request)       # 真閘:一次性 boot code(tunnel 下 loopback 不可信)
+    _pair_local_only(request)       # defense-in-depth 第二層
+    _pair_qr_check_mint_rate()      # 鑄碼節流 10/min
+    hosts, has_ts = _pair_host_candidates(force=True)
+    if not hosts:
+        return {"ok": False, "error": "no reachable host candidate (headless + no net?)"}
+    ttl = _pair_clamp_ttl(request.query_params.get("ttl"))
+    code = _pair_mint_code(None, ttl=ttl)
+    # v1 相容鍵 scheme/host 取最後一個候選(= 公網保底,語意同 pocket-pair.py);
+    # 新 app 走 hosts 依序自動選路。
+    tail = urllib.parse.urlsplit(hosts[-1])
+    payload = "pocket://pair?scheme=%s&host=%s&hosts=%s&code=%s" % (
+        urllib.parse.quote(tail.scheme), urllib.parse.quote(tail.netloc),
+        urllib.parse.quote(",".join(hosts)), urllib.parse.quote(code))
+    svg = ""
+    try:
+        import qrcode
+        from qrcode.image.svg import SvgPathImage
+        qr = qrcode.QRCode(border=2, error_correction=qrcode.constants.ERROR_CORRECT_M)
+        qr.add_data(payload)
+        img = qr.make_image(image_factory=SvgPathImage)
+        svg = img.to_string().decode("utf-8")
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("pair_qr_svg", _exc, expected=True)   # 沒 qrcode 套件時 payload 仍可手動輸入
+    return {"ok": True, "payload": payload, "svg": svg, "hosts": hosts,
+            "ttl": ttl, "tailscale": has_ts,
+            "tunnel": _pair_tunnel_url()}
+
+
+_PAIR_QR_HTML = """<!doctype html><html lang="zh-Hant"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Pocket 配對</title><style>
+:root{color-scheme:light dark;font-family:-apple-system,system-ui,"Noto Sans TC",sans-serif}
+body{margin:0;display:flex;justify-content:center;padding:32px 16px}
+main{max-width:520px;width:100%}h1{font-size:1.35rem;margin:0 0 4px}
+p.sub{margin:0 0 20px;opacity:.7}
+#qr{width:280px;height:280px;margin:0 auto;display:block;border-radius:12px;background:#fff;padding:12px;box-sizing:content-box}
+#qr svg{width:100%;height:100%}
+.meta{text-align:center;margin:12px 0 20px;font-variant-numeric:tabular-nums}
+.hosts{font-size:.85rem;opacity:.75;line-height:1.6;word-break:break-all}
+.tsbox{border:1px solid color-mix(in srgb,currentColor 25%,transparent);border-radius:10px;padding:14px 16px;margin-top:20px;font-size:.9rem;line-height:1.55}
+.tsbox code{user-select:all;background:color-mix(in srgb,currentColor 12%,transparent);padding:1px 6px;border-radius:5px}
+.ok{opacity:.75}button{margin-left:8px}
+</style></head><body><main>
+<h1>用 Pocket 掃碼配對</h1>
+<p class="sub">開 Pocket App → 新增主機 → 掃描下方 QR。配對碼一次性,逾時會自動換新。</p>
+<div id="qr">載入中…</div>
+<div class="meta"><span id="ttl"></span><button onclick="load()">重新產生</button></div>
+<div class="hosts" id="hosts"></div>
+<div class="tsbox" id="ts"></div>
+<script>
+let timer=null;
+async function load(){
+  // boot code 隨頁面網址帶入,轉發給 qr.json(缺/錯會 403)
+  const boot=new URLSearchParams(location.search).get('boot')||'';
+  const r=await fetch('/pair/qr.json?boot='+encodeURIComponent(boot));const d=await r.json();
+  if(r.status===403){document.getElementById('qr').textContent='boot code 無效 — 請用安裝器印出的完整連結開啟本頁';return}
+  if(r.status===429){document.getElementById('qr').textContent='產碼太頻繁,稍候再試';return}
+  if(!d.ok){document.getElementById('qr').textContent=d.error||'失敗';return}
+  document.getElementById('qr').innerHTML=d.svg||('<small style="word-break:break-all">'+d.payload+'</small>');
+  document.getElementById('hosts').innerHTML='連線候選(依序自動選路):<br>'+d.hosts.map(h=>'· '+h).join('<br>');
+  const ts=document.getElementById('ts');
+  if(d.tailscale){ts.className='tsbox ok';ts.innerHTML='✓ 偵測到 Tailscale 私網 —— 出門在外走 tailnet,最穩最快。'}
+  else{ts.innerHTML='建議安裝 <b>Tailscale</b>:除了公網通道外,自己建一條私網 —— 免設定、免固定 IP,'+
+    '手機與這台主機同入 tailnet 後,外出連線走私網最穩。<br>Ubuntu 一行安裝:'+
+    '<code>curl -fsSL https://tailscale.com/install.sh | sh</code> 之後執行 <code>sudo tailscale up</code>,'+
+    '再回本頁「重新產生」。'}
+  let left=d.ttl;clearInterval(timer);
+  const t=document.getElementById('ttl');
+  timer=setInterval(()=>{left--;t.textContent='配對碼有效 '+Math.floor(left/60)+':'+String(left%60).padStart(2,'0');
+    if(left<=0){clearInterval(timer);load()}},1000);
+}
+load();
+</script></main></body></html>"""
+
+
+@app.get("/pair/qr")
+async def pair_qr_page(request: Request):
+    _pair_check_boot(request)       # 真閘:一次性 boot code(tunnel 下 loopback 不可信)
+    _pair_local_only(request)       # defense-in-depth 第二層
+    return HTMLResponse(_PAIR_QR_HTML)
 
 
 # --- In-app terminal (bridge PTY) --------------------------------------------
@@ -6365,7 +6628,8 @@ def _claude_argv(parent: str, prompt: str, resume: str | None = None):
     mem_home = home_for(parent or "yuanfang")
     mcp_cfg = json.dumps({"mcpServers": {"studio-memory": {
         "command": "python3",
-        "args": ["/Users/xcash/apps/hermes-openwebui-bridge/studio_memory_mcp.py"],
+        "args": [os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                              "studio_memory_mcp.py")],
         "env": {"STUDIO_MEMORY_HOME": mem_home}}}}, ensure_ascii=False)
     hint = ("你可以用 studio-memory MCP 的 read_memory / search_memory 讀善彰的"
             "Hermes 長期記憶(身份、持倉、專案、人脈),做任務前先讀以對齊脈絡;"
@@ -16780,6 +17044,20 @@ async def app_agents_auth(request: Request):
     return await _agent_auth_status()
 
 
+def _host_capabilities() -> dict:
+    """這台龍蝦主機支援哪些 provider — 給 app 依能力顯示/隱藏功能,而不是
+    讓不支援的功能看起來像壞掉(Windows/精簡安裝沒有 tmux/CC 時尤其重要)。
+    全部只做便宜的存在性檢查,不 spawn 任何行程。"""
+    has_tmux = bool(shutil.which(TMUX_BIN) or shutil.which("tmux"))
+    return {
+        "cc": has_tmux and os.path.exists(CLAUDE_BIN),
+        "cx": os.path.exists(_resolve_codex_bin()),
+        "hermes": os.path.exists(HERMES_BIN),
+        "openclaw": OPENCLAW.configured(),
+        "terminal": POCKET_TERMINAL_ENABLED,
+    }
+
+
 @app.get("/health")
 async def health():
     # turns_in_flight:給安全重啟腳本(scripts/bridge-safe-restart.sh)看的 ——
@@ -16791,7 +17069,8 @@ async def health():
     return {"ok": True, "personas": list(PERSONAS),
             "subsessions": len(SUBSESSIONS),
             "bg_tasks": len(_BG_TASKS),
-            "turns_in_flight": inflight}
+            "turns_in_flight": inflight,
+            "capabilities": _host_capabilities()}
 
 
 # ───────────────────────── log rotation (issue #7 item 6) ──────────────────

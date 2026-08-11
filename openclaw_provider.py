@@ -333,5 +333,5 @@ def session_v2_row(row: dict) -> dict:
             "subtitle": model or None,
             "status": session_status(row),
             "last_event_at": last,
-            "capabilities": ["input", "interrupt", "replay", "follow"],
+            "capabilities": ["input", "interrupt", "attachments", "replay", "follow"],
             "meta": {}}

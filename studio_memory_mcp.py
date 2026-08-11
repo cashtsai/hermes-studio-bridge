@@ -12,7 +12,8 @@ import json
 import os
 import sys
 
-HOME = os.environ.get("STUDIO_MEMORY_HOME", "/Users/xcash/apps/hermes-agent/home")
+HOME = os.environ.get("STUDIO_MEMORY_HOME",
+                      os.path.expanduser("~/apps/hermes-agent/home"))
 MEMDIR = os.path.join(HOME, "memories")
 
 TOOLS = [
