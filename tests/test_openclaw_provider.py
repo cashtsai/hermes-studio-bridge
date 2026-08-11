@@ -160,6 +160,114 @@ class DigestTests(unittest.TestCase):
                            "data": {"phase": "end", "stopReason": "stop"}})
         self.assertFalse(d.busy)
 
+    def test_late_delta_after_run_end_does_not_resurrect_busy(self):
+        """實測坑(卡死在「回覆中」):同一 run 收尾後 gateway 仍會遲送 delta,
+        原本 delta 的 busy 自癒沒有 run 對位 → 把待命拉回回覆中,直到下一
+        回合才解。實測 seq:turn end → idle → final 卡 → 遲送 delta → 卡死。"""
+        d = cd.OpenClawDigest()
+        d.handle("agent", {"runId": "r1", "stream": "lifecycle",
+                           "data": {"phase": "start"}})
+        d.handle("chat", {"runId": "r1", "state": "delta", "deltaText": "1"})
+        d.handle("agent", {"runId": "r1", "stream": "lifecycle",
+                           "data": {"phase": "end", "stopReason": "stop"}})
+        self.assertFalse(d.busy)
+        d.handle("chat", {"runId": "r1", "state": "final",
+                          "message": {"role": "assistant",
+                                      "content": [{"type": "text", "text": "1\n2"}]}})
+        # ↓ 收尾後的遲送 delta
+        d.handle("chat", {"runId": "r1", "state": "delta", "deltaText": "2",
+                          "message": {"role": "assistant",
+                                      "content": [{"type": "text", "text": "1\n2"}]}})
+        self.assertFalse(d.busy)
+        self.assertEqual(d.active_run, "")
+        self.assertEqual(d.store.status.get("phase"), "idle")
+        self.assertEqual(d.store.status.get("label"), "待命")
+
+    def test_late_delta_after_abort_does_not_resurrect_busy(self):
+        """中斷後 gateway 會把殘留 delta 補送 —— 同樣不能把 busy 拉回來,
+        否則使用者按了中斷卻永遠停在「回覆中」。"""
+        d = cd.OpenClawDigest()
+        d.handle("chat", {"runId": "rf", "state": "delta", "deltaText": "ha"})
+        self.assertTrue(d.busy)
+        d.handle("chat", {"runId": "rf", "state": "aborted"})
+        self.assertFalse(d.busy)
+        d.handle("chat", {"runId": "rf", "state": "delta", "deltaText": "i"})
+        self.assertFalse(d.busy)
+        # 帶 message 的 final 同樣算收尾(SPEC §3 的完成語意)
+        self.assertIn("rf", d.ended_runs)
+        d2 = cd.OpenClawDigest()
+        d2.handle("chat", {"runId": "rg", "state": "final",
+                           "message": {"role": "assistant",
+                                       "content": [{"type": "text", "text": "hi"}]}})
+        self.assertIn("rg", d2.ended_runs)
+
+    def test_bare_final_does_not_end_run(self):
+        """裸 final(無 message)只是 ack(SPEC §3),不是收尾 —— 之後的 delta
+        仍要能自癒 busy,不可過度修正成永遠不顯示「回覆中」。"""
+        d = cd.OpenClawDigest()
+        d.handle("chat", {"runId": "rb", "state": "final"})
+        d.handle("chat", {"runId": "rb", "state": "delta", "deltaText": "yo"})
+        self.assertTrue(d.busy)
+        self.assertEqual(d.active_run, "rb")
+
+    def test_new_run_first_delta_still_sets_busy(self):
+        """對位守衛只擋已收尾的那個 run:新 run 的第一則 delta 照樣要顯示忙碌
+        (lifecycle start 漏接時的自癒路徑不能被鎖死)。"""
+        d = cd.OpenClawDigest()
+        d.handle("agent", {"runId": "r1", "stream": "lifecycle",
+                           "data": {"phase": "start"}})
+        d.handle("agent", {"runId": "r1", "stream": "lifecycle",
+                           "data": {"phase": "end", "stopReason": "stop"}})
+        self.assertFalse(d.busy)
+        d.handle("chat", {"runId": "r2", "state": "delta", "deltaText": "新回合"})
+        self.assertTrue(d.busy)
+        self.assertEqual(d.active_run, "r2")
+        self.assertEqual(d.store.status.get("phase"), "run")
+        # runId 缺失(無法對位)時也要保留自癒
+        d2 = cd.OpenClawDigest()
+        d2.handle("chat", {"state": "delta", "deltaText": "x"})
+        self.assertTrue(d2.busy)
+
+    def test_aborted_with_partial_text_shows_interrupted(self):
+        """實測坑:abort payload 挾帶半截正文,錯誤卡原本會顯示「⚠️ 1\\n2」
+        (那份文字主卡已經有了)→ 讀起來像假錯誤。中斷一律講「已中斷」。"""
+        d = cd.OpenClawDigest()
+        d.handle("chat", {"runId": "ra", "state": "delta", "deltaText": "1\n2"})
+        d.handle("chat", {"runId": "ra", "state": "aborted",
+                          "message": {"role": "assistant",
+                                      "content": [{"type": "text", "text": "1\n2"}]}})
+        err = [c for c in d.store.snapshot()["cards"] if c["role"] == "system"]
+        self.assertEqual(len(err), 1)
+        self.assertEqual(err[0]["body"]["text"], "⚠️ 已中斷")
+        self.assertNotIn("1\n2", err[0]["body"]["text"])
+        self.assertFalse(d.busy)
+
+    def test_aborted_with_real_error_message_kept(self):
+        d = cd.OpenClawDigest()
+        d.handle("chat", {"runId": "ra2", "state": "aborted",
+                          "errorMessage": "aborted by operator",
+                          "message": {"role": "assistant",
+                                      "content": [{"type": "text", "text": "半截"}]}})
+        err = [c for c in d.store.snapshot()["cards"] if c["role"] == "system"][0]
+        self.assertIn("aborted by operator", err["body"]["text"])
+
+    def test_error_path_unchanged(self):
+        """真錯誤不受影響:errorMessage 優先,缺了才用 message 正文,再缺才預設。"""
+        d = cd.OpenClawDigest()
+        d.handle("chat", {"runId": "e1", "state": "error",
+                          "errorMessage": "model not found",
+                          "message": {"role": "assistant",
+                                      "content": [{"type": "text", "text": "⚠️ 內文"}]}})
+        d.handle("chat", {"runId": "e2", "state": "error",
+                          "message": {"role": "assistant",
+                                      "content": [{"type": "text",
+                                                   "text": "ollama 連不上"}]}})
+        d.handle("chat", {"runId": "e3", "state": "error"})
+        texts = [c["body"]["text"] for c in d.store.snapshot()["cards"]
+                 if c["role"] == "system"]
+        self.assertEqual(texts, ["⚠️ model not found", "⚠️ ollama 連不上",
+                                 "⚠️ OpenClaw 回合失敗"])
+
     def test_tool_stream_card(self):
         d = cd.OpenClawDigest()
         d.handle("agent", {"runId": "r7", "stream": "tool",
