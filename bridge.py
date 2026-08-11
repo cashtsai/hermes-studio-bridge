@@ -28,6 +28,7 @@ import re
 import secrets
 import shlex
 import signal
+import socket
 import struct
 import shutil
 import subprocess
@@ -5722,6 +5723,13 @@ async def pair_new(request: Request):
         body = {}
     required_account = request.url.path.startswith("/app/v1/")
     user = _account_user_from_request(request, body, required=required_account)
+    code = _pair_mint_code((user or {}).get("apple_user_id"))
+    return {"code": code, "ttl": int(_PAIR_CODE_TTL),
+            "account_bound": bool(user)}
+
+
+def _pair_mint_code(apple_user_id=None) -> str:
+    """鑄一枚一次性配對碼(/pair/new 與本機 /pair/qr 頁共用)。"""
     now = time.monotonic()
     code = secrets.token_urlsafe(9)
     with _PAIR_LOCK:
@@ -5729,10 +5737,9 @@ async def pair_new(request: Request):
             _PAIR_CODES.pop(c, None)          # prune expired
         _PAIR_CODES[code] = {
             "expiry": now + _PAIR_CODE_TTL,
-            "apple_user_id": (user or {}).get("apple_user_id"),
+            "apple_user_id": apple_user_id,
         }
-    return {"code": code, "ttl": int(_PAIR_CODE_TTL),
-            "account_bound": bool(user)}
+    return code
 
 
 @app.post("/app/v1/pair/claim")
@@ -5830,6 +5837,172 @@ async def pair_revoke(request: Request):
         if removed:
             _save_device_tokens(_DEVICE_TOKENS)
     return {"revoked": removed}
+
+
+# ───────────── 本機配對頁 /pair/qr(龍蝦主機三平台共用,取代 pocket-pair.py 桌面依賴)─────────────
+# 安裝器最後一步開瀏覽器指到這裡;只服務 127.0.0.1(配對碼等同短效憑證,不上網段)。
+# host 候選探測全走純 Python/跨平台指令,mac/ubuntu 同一份。
+
+_PAIR_HOSTS_CACHE = {"ts": 0.0, "hosts": [], "tailscale": False}
+_BRIDGE_PORT = int(os.environ.get("POCKET_BRIDGE_PORT", "8081"))
+_POCKET_TUNNEL_URL_FILE = os.path.expanduser(
+    os.environ.get("POCKET_TUNNEL_URL_FILE", "~/.pocket/tunnel-url"))
+
+
+def _pair_local_only(request: Request) -> None:
+    if _client_host(request) not in ("127.0.0.1", "::1", "localhost"):
+        raise HTTPException(status_code=403, detail="local only")
+
+
+def _pair_lan_ip():
+    """UDP connect 戲法拿本機對外私網 IP(不真的發包),跨平台、免 ipconfig/ip。"""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.connect(("8.8.8.8", 80))
+            ip = s.getsockname()[0]
+        finally:
+            s.close()
+        return ip if ip and not ip.startswith("127.") else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _pair_tailscale_host():
+    """tailnet MagicDNS 名(兩端都在 tailnet 時最穩的私網路徑)。PATH 優先,
+    mac App 內建路徑保底;沒裝/沒起 → None(頁面據此顯示安裝建議)。"""
+    for ts in (shutil.which("tailscale"),
+               "/Applications/Tailscale.app/Contents/MacOS/Tailscale"):
+        if not ts or not os.path.exists(ts):
+            continue
+        try:
+            out = subprocess.run([ts, "status", "--json"],
+                                 capture_output=True, text=True, timeout=3)
+            if out.returncode != 0:
+                continue
+            self_ = json.loads(out.stdout).get("Self") or {}
+            dns = (self_.get("DNSName") or "").rstrip(".")
+            if dns:
+                return dns
+            ips = self_.get("TailscaleIPs") or []
+            if ips:
+                return str(ips[0])
+        except Exception:  # noqa: BLE001
+            continue
+    return None
+
+
+def _pair_tunnel_url():
+    """公網保底 URL。優先 env POCKET_TUNNEL_URL(named tunnel/funnel);否則讀
+    POCKET_TUNNEL_URL_FILE —— Ubuntu 安裝器的 cloudflared quick-tunnel unit 會把
+    當前 trycloudflare URL 寫進去(URL 會漂,檔案由 unit 維護)。"""
+    env = (os.environ.get("POCKET_TUNNEL_URL") or "").strip()
+    if env:
+        return env
+    try:
+        with open(_POCKET_TUNNEL_URL_FILE, encoding="utf-8") as f:
+            url = f.read().strip()
+        return url or None
+    except OSError:
+        return None
+
+
+def _pair_host_candidates(force: bool = False):
+    """依優先序的連線候選(同 pocket-pair.py 的 QR payload v2 語意):
+    1) 私網直連 2) tailnet 3) 公網 tunnel。快取 30s,tailscale 探測不便宜。"""
+    now = time.monotonic()
+    if not force and _PAIR_HOSTS_CACHE["hosts"] and now - _PAIR_HOSTS_CACHE["ts"] < 30:
+        return list(_PAIR_HOSTS_CACHE["hosts"]), _PAIR_HOSTS_CACHE["tailscale"]
+    hosts = []
+    lan = _pair_lan_ip()
+    if lan:
+        hosts.append("http://%s:%d" % (lan, _BRIDGE_PORT))
+    ts = _pair_tailscale_host()
+    if ts:
+        hosts.append("https://%s" % ts)
+    tunnel = _pair_tunnel_url()
+    if tunnel:
+        hosts.append(tunnel)
+    _PAIR_HOSTS_CACHE.update({"ts": now, "hosts": list(hosts), "tailscale": bool(ts)})
+    return hosts, bool(ts)
+
+
+@app.get("/pair/qr.json")
+async def pair_qr_json(request: Request):
+    """鑄新碼 + 組 payload + 產 QR SVG,一次回齊(頁面 TTL 到期後再打一次換新碼)。"""
+    _pair_local_only(request)
+    hosts, has_ts = _pair_host_candidates(force=True)
+    if not hosts:
+        return {"ok": False, "error": "no reachable host candidate (headless + no net?)"}
+    code = _pair_mint_code(None)
+    # v1 相容鍵 scheme/host 取最後一個候選(= 公網保底,語意同 pocket-pair.py);
+    # 新 app 走 hosts 依序自動選路。
+    tail = urllib.parse.urlsplit(hosts[-1])
+    payload = "pocket://pair?scheme=%s&host=%s&hosts=%s&code=%s" % (
+        urllib.parse.quote(tail.scheme), urllib.parse.quote(tail.netloc),
+        urllib.parse.quote(",".join(hosts)), urllib.parse.quote(code))
+    svg = ""
+    try:
+        import qrcode
+        from qrcode.image.svg import SvgPathImage
+        qr = qrcode.QRCode(border=2, error_correction=qrcode.constants.ERROR_CORRECT_M)
+        qr.add_data(payload)
+        img = qr.make_image(image_factory=SvgPathImage)
+        svg = img.to_string().decode("utf-8")
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("pair_qr_svg", _exc, expected=True)   # 沒 qrcode 套件時 payload 仍可手動輸入
+    return {"ok": True, "payload": payload, "svg": svg, "hosts": hosts,
+            "ttl": int(_PAIR_CODE_TTL), "tailscale": has_ts,
+            "tunnel": _pair_tunnel_url()}
+
+
+_PAIR_QR_HTML = """<!doctype html><html lang="zh-Hant"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Pocket 配對</title><style>
+:root{color-scheme:light dark;font-family:-apple-system,system-ui,"Noto Sans TC",sans-serif}
+body{margin:0;display:flex;justify-content:center;padding:32px 16px}
+main{max-width:520px;width:100%}h1{font-size:1.35rem;margin:0 0 4px}
+p.sub{margin:0 0 20px;opacity:.7}
+#qr{width:280px;height:280px;margin:0 auto;display:block;border-radius:12px;background:#fff;padding:12px;box-sizing:content-box}
+#qr svg{width:100%;height:100%}
+.meta{text-align:center;margin:12px 0 20px;font-variant-numeric:tabular-nums}
+.hosts{font-size:.85rem;opacity:.75;line-height:1.6;word-break:break-all}
+.tsbox{border:1px solid color-mix(in srgb,currentColor 25%,transparent);border-radius:10px;padding:14px 16px;margin-top:20px;font-size:.9rem;line-height:1.55}
+.tsbox code{user-select:all;background:color-mix(in srgb,currentColor 12%,transparent);padding:1px 6px;border-radius:5px}
+.ok{opacity:.75}button{margin-left:8px}
+</style></head><body><main>
+<h1>用 Pocket 掃碼配對</h1>
+<p class="sub">開 Pocket App → 新增主機 → 掃描下方 QR。配對碼一次性,逾時會自動換新。</p>
+<div id="qr">載入中…</div>
+<div class="meta"><span id="ttl"></span><button onclick="load()">重新產生</button></div>
+<div class="hosts" id="hosts"></div>
+<div class="tsbox" id="ts"></div>
+<script>
+let timer=null;
+async function load(){
+  const r=await fetch('/pair/qr.json');const d=await r.json();
+  if(!d.ok){document.getElementById('qr').textContent=d.error||'失敗';return}
+  document.getElementById('qr').innerHTML=d.svg||('<small style="word-break:break-all">'+d.payload+'</small>');
+  document.getElementById('hosts').innerHTML='連線候選(依序自動選路):<br>'+d.hosts.map(h=>'· '+h).join('<br>');
+  const ts=document.getElementById('ts');
+  if(d.tailscale){ts.className='tsbox ok';ts.innerHTML='✓ 偵測到 Tailscale 私網 —— 出門在外走 tailnet,最穩最快。'}
+  else{ts.innerHTML='建議安裝 <b>Tailscale</b>:除了公網通道外,自己建一條私網 —— 免設定、免固定 IP,'+
+    '手機與這台主機同入 tailnet 後,外出連線走私網最穩。<br>Ubuntu 一行安裝:'+
+    '<code>curl -fsSL https://tailscale.com/install.sh | sh</code> 之後執行 <code>sudo tailscale up</code>,'+
+    '再回本頁「重新產生」。'}
+  let left=d.ttl;clearInterval(timer);
+  const t=document.getElementById('ttl');
+  timer=setInterval(()=>{left--;t.textContent='配對碼有效 '+Math.floor(left/60)+':'+String(left%60).padStart(2,'0');
+    if(left<=0){clearInterval(timer);load()}},1000);
+}
+load();
+</script></main></body></html>"""
+
+
+@app.get("/pair/qr")
+async def pair_qr_page(request: Request):
+    _pair_local_only(request)
+    return HTMLResponse(_PAIR_QR_HTML)
 
 
 # --- In-app terminal (bridge PTY) --------------------------------------------
