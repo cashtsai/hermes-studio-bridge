@@ -9169,10 +9169,16 @@ def _cc_pending_ask(jsonl, current=None):
                                  "description": str(op.get("description") or "").strip()})
                 if len(opts) < 2:
                     continue
+                # 不再送 `multi`(= 原 ask 有多題)。它與 `multiselect`(= 這一題
+                # 可複選)只差兩個字、語意完全不同,是現成的誤讀陷阱;而它承載的
+                # 資訊 `q_total > 1` 已經表達得更清楚,且 q_total 在**真正會執行**
+                # 的 pane 路徑上也有(本 jsonl 路徑實測從不命中:掃全部 transcript,
+                # 288 次 AskUserQuestion、0 筆懸空 tool_use,CC 是答完才 flush)。
+                # app 端宣告了 `multi` 但沒有任何渲染端消費 → 兩端皆死,直接拿掉。
                 return {"kind": "menu", "semantic": "question",
                         "title": str(q0.get("question") or "").strip(),
                         "header": str(q0.get("header") or "").strip() or None,
-                        "options": opts, "multi": len(qs) > 1,
+                        "options": opts,
                         "multiselect": bool(q0.get("multiSelect")),
                         "q_index": qs.index(q0), "q_total": len(qs)}
     return None
