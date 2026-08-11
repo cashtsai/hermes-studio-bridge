@@ -4130,6 +4130,164 @@ class CodexAppServerError(RuntimeError):
         self.code = code
 
 
+# ─────────── codex app-server：server → client request（ServerRequest）───────────
+# codex 二進位 `ServerRequest` 全集（strings 抽出的 serde variant 表）:
+#   item/commandExecution/requestApproval   item/fileChange/requestApproval
+#   execCommandApproval  applyPatchApproval        ← 舊 v1 名字（bridge 早就接了）
+#   item/tool/call                                 ← DynamicToolCall（plugin 工具）
+#   item/tool/requestUserInput                     ← ToolRequestUserInput
+#   mcpServer/elicitation/request                  ← MCP elicitation
+#   item/permissions/requestApproval               ← PermissionsRequestApproval
+#   currentTime/read  attestation/generate  account/chatgptAuthTokens/refresh
+# 之前除了前四個以外一律回 JSON-RPC -32601 → codex 端把它當「client 壞掉」，
+# 整個 turn 直接失敗。實機 log 已抓到 item/tool/call 被拒（2026-08-07 ×3）。
+CODEX_APPROVAL_REQUEST_METHODS = (
+    "execCommandApproval",
+    "applyPatchApproval",
+    "item/commandExecution/requestApproval",
+    "item/fileChange/requestApproval",
+)
+CODEX_QUESTION_REQUEST_METHODS = (
+    "item/tool/requestUserInput",
+    "mcpServer/elicitation/request",
+)
+
+
+def _codex_rfc3339_now() -> str:
+    """CurrentTimeReadResponse.currentTimeAt（1 element，RFC3339 UTC）。"""
+    return datetime.now(timezone.utc).isoformat(
+        timespec="milliseconds").replace("+00:00", "Z")
+
+
+def _codex_safe_question_result(method: str) -> dict:
+    """讀不懂 / 沒人回答時，該 method 的「不打斷 turn」安全回覆。
+
+    形狀取自 codex app-server v2 schema（ToolRequestUserInputResponse{answers}、
+    McpServerElicitationRequestResponse{action,content,_meta}），與 OpenClaw
+    的 `defaultServerRequestResponse` 一致。
+    """
+    if method == "item/tool/requestUserInput":
+        return {"answers": {}}
+    if method == "mcpServer/elicitation/request":
+        return {"action": "decline", "content": None, "_meta": None}
+    if method == "item/tool/call":
+        return {"contentItems": [{"type": "inputText",
+                                  "text": "This client did not handle the tool call."}],
+                "success": False}
+    if method == "item/permissions/requestApproval":
+        return {"permissions": {}, "scope": "turn"}
+    return {}
+
+
+def _codex_read_user_input_questions(params: dict) -> list[dict]:
+    """ToolRequestUserInputParams.questions[] → 正規化清單。
+
+    wire 欄位（codex WireToolRequestUserInputParams）:
+      threadId / turnId / itemId / questions / isBlocking / autoResolutionMs
+    question: id / header / question / isOther / isSecret / options[{label,description}]
+    """
+    raw = params.get("questions")
+    if not isinstance(raw, list):
+        return []
+    out = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        qid = item.get("id")
+        header = item.get("header")
+        question = item.get("question")
+        if not isinstance(qid, str) or not qid:
+            continue
+        options = []
+        for opt in (item.get("options") or []) if isinstance(item.get("options"), list) else []:
+            if not isinstance(opt, dict):
+                continue
+            label = opt.get("label")
+            if isinstance(label, str) and label:
+                options.append({"label": label,
+                                "description": str(opt.get("description") or "")})
+        out.append({"id": qid,
+                    "header": header if isinstance(header, str) else "",
+                    "question": question if isinstance(question, str) else "",
+                    "isOther": item.get("isOther") is True,
+                    "isSecret": item.get("isSecret") is True,
+                    "options": options})
+    return out
+
+
+def _codex_user_input_detail(questions: list[dict]) -> str:
+    lines = []
+    for idx, q in enumerate(questions):
+        if len(questions) > 1:
+            lines.append(f"{idx + 1}. {q.get('header') or ''}".strip())
+        elif q.get("header"):
+            lines.append(str(q["header"]))
+        if q.get("question"):
+            lines.append(str(q["question"]))
+        for opt_idx, opt in enumerate(q.get("options") or []):
+            desc = opt.get("description") or ""
+            lines.append(f"{opt_idx + 1}. {opt['label']}" + (f" — {desc}" if desc else ""))
+        if q.get("isOther"):
+            lines.append("其他:可自行輸入答案。")
+        lines.append("")
+    return "\n".join(lines).strip()
+
+
+def _codex_build_user_input_answers(record: dict, key: str, text: str) -> dict:
+    """ToolRequestUserInputResponse = {answers: {qid: {answers: [str, ...]}}}
+
+    （形狀對齊 OpenClaw `buildAgentHarnessUserInputAnswers`。）只有第一題
+    能用選項鈕回答（卡片一次只有一組選項）；其餘題目回空陣列 = 未作答。
+    """
+    questions = record.get("questions") or []
+    if not questions:
+        return {"answers": {}}
+    first = questions[0]
+    answer = ""
+    if key and key.startswith("opt"):
+        try:
+            idx = int(key[3:])
+        except ValueError:
+            idx = -1
+        opts = first.get("options") or []
+        if 0 <= idx < len(opts):
+            answer = opts[idx]["label"]
+    elif key == "deny":
+        answer = ""
+    if not answer and text:
+        # 自由輸入:對得上選項就用選項 label（codex 期待原字串），否則原文。
+        trimmed = text.strip()
+        match = next((o["label"] for o in (first.get("options") or [])
+                      if o["label"].lower() == trimmed.lower()), "")
+        if match:
+            answer = match
+        elif first.get("isOther") or not first.get("options"):
+            answer = trimmed
+    answers = {q["id"]: {"answers": []} for q in questions}
+    if answer:
+        answers[first["id"]] = {"answers": [answer]}
+    return {"answers": answers}
+
+
+def _codex_build_elicitation_response(record: dict, key: str) -> dict:
+    """McpServerElicitationRequestResponse = {action, content, _meta}（3 elements）。
+
+    accept 只在「requestedSchema 沒有欄位要填」時成立；有欄位卻無法對應
+    （bridge 沒有表單填寫 UI）就退成 decline —— 與 OpenClaw 同款保守處理，
+    寧可 decline 也不要送半套 content 讓 MCP server 拿到壞資料。
+    """
+    if not key or key == "deny":
+        return {"action": "decline", "content": None, "_meta": None}
+    schema = record.get("requested_schema")
+    props = schema.get("properties") if isinstance(schema, dict) else None
+    if isinstance(props, dict) and props:
+        _log_event("codex_elicitation_accept_unmappable",
+                   approval_id=record.get("id"),
+                   fields=",".join(sorted(str(k) for k in props.keys()))[:200])
+        return {"action": "decline", "content": None, "_meta": None}
+    return {"action": "accept", "content": None, "_meta": None}
+
+
 class CodexAppServerClient:
     """Small JSON-RPC client for `codex app-server --stdio`.
 
@@ -4160,6 +4318,9 @@ class CodexAppServerClient:
         self._streamed_item_ids = set()
         self.pending_approvals = {}
         self.pending_approvals_by_thread = collections.defaultdict(dict)
+        # (thread_id, tool) 去重：同一條 thread 的同一個 plugin 工具只在
+        # 對話裡提示一次「這裡跑不動」，模型連打時不洗版。
+        self._dynamic_tool_notices = set()
         # wave 2: live token usage per thread (thread/tokenUsage/updated) —
         # thread/list reports tokenUsage: null, so this is the only source.
         self.token_usage = {}
@@ -4364,21 +4525,245 @@ class CodexAppServerClient:
     async def _handle_server_message(self, msg: dict):
         method = msg.get("method")
         if "id" in msg:
-            if method in (
-                "execCommandApproval",
-                "applyPatchApproval",
-                "item/commandExecution/requestApproval",
-                "item/fileChange/requestApproval",
-            ):
+            params = msg.get("params") if isinstance(msg.get("params"), dict) else {}
+            if method in CODEX_APPROVAL_REQUEST_METHODS:
                 self._handle_approval_request(msg)
                 return
+            if method == "currentTime/read":
+                # 瑣碎且無副作用:直接照 CurrentTimeReadResponse{currentTimeAt}
+                # 正確回覆。回 -32601 只會讓需要時鐘的 turn 平白失敗。
+                await self._write_server_result_safe(
+                    msg.get("id"), {"currentTimeAt": _codex_rfc3339_now()})
+                return
+            if method == "item/tool/call":
+                await self._handle_dynamic_tool_call(msg)
+                return
+            if method in CODEX_QUESTION_REQUEST_METHODS:
+                await self._handle_question_request(msg)
+                return
+            if method == "item/permissions/requestApproval":
+                # 模型要求「這回合放寬權限」。bridge 沒有把 8 欄位的
+                # PermissionsRequestApprovalParams 安全回授的能力，所以一律
+                # 回「不加授任何權限」（= OpenClaw supervisor 的 safe answer）。
+                # 語意上等同拒絕，但 turn 活著，後續指令頂多吃到正常的權限
+                # 錯誤，而不是整回合 -32601 陣亡。
+                _log_event("codex_permissions_request_not_granted",
+                           thread_id_hash=_short_hash(str(params.get("threadId") or "")),
+                           turn_id_hash=_short_hash(str(params.get("turnId") or "")),
+                           id_hash=_short_hash(str(msg.get("id"))),
+                           param_keys=",".join(sorted(str(k) for k in params.keys()))[:200])
+                await self._write_server_result_safe(
+                    msg.get("id"), _codex_safe_question_result(method))
+                return
+            # 仍未支援:attestation/generate、account/chatgptAuthTokens/refresh
+            # （codex 自己在 exec mode 也是回錯，bridge 沒有能力代簽/換 token）。
+            # log 要夠診斷:方法、thread、params 欄位名。
             _log_event("codex_app_server_unhandled_request",
                        method=str(method or "")[:120],
-                       id_hash=_short_hash(str(msg.get("id"))))
+                       id_hash=_short_hash(str(msg.get("id"))),
+                       thread_id_hash=_short_hash(str(params.get("threadId") or "")),
+                       turn_id_hash=_short_hash(str(params.get("turnId") or "")),
+                       param_keys=",".join(sorted(str(k) for k in params.keys()))[:200])
             await self._write_server_error(msg.get("id"), -32601,
                                            f"server request not implemented: {method}")
             return
         self._handle_notification(msg)
+
+    # ───────── item/tool/call（DynamicToolCall）─────────
+    async def _handle_dynamic_tool_call(self, msg: dict):
+        """Codex 要 client 代跑一個 dynamic tool（使用者 config.toml 裡那批
+        plugin：documents/spreadsheets/computer-use/chrome/browser…）。
+
+        bridge 不是 plugin runtime 宿主 —— 那些工具的實作住在桌面 Codex/
+        ChatGPT.app 的 plugin runtime 裡，bridge 這條 stdio client 沒有能力
+        執行它們。但**回 -32601 會讓整個 turn 失敗**（實機 log:2026-08-07
+        同日三次），而回一個 DynamicToolCallResponse{contentItems,success:false}
+        只會讓模型看到「這個工具失敗了」然後自己換路走 —— turn 活著。
+        """
+        params = msg.get("params") if isinstance(msg.get("params"), dict) else {}
+        thread_id = str(params.get("threadId") or "")
+        tool = str(params.get("tool") or "")
+        namespace = params.get("namespace")
+        call_id = str(params.get("callId") or "")
+        label = f"{namespace}/{tool}" if namespace else tool
+        _log_event("codex_dynamic_tool_call_unsupported",
+                   tool=tool[:120],
+                   namespace=str(namespace or "")[:120],
+                   thread_id_hash=_short_hash(thread_id),
+                   turn_id_hash=_short_hash(str(params.get("turnId") or "")),
+                   call_id_hash=_short_hash(call_id),
+                   id_hash=_short_hash(str(msg.get("id"))))
+        await self._write_server_result_safe(msg.get("id"), {
+            "contentItems": [{
+                "type": "inputText",
+                "text": (f"Tool `{label or 'unknown'}` is not available in this "
+                         "session. It is provided by a Codex plugin whose runtime "
+                         "only exists in the desktop Codex client; this thread is "
+                         "driven by the Pocket/Hermes bridge, which cannot execute "
+                         "plugin tools. Do not retry this tool — use built-in tools "
+                         "(shell, file edits) or ask the user to run it from the "
+                         "desktop Codex app."),
+            }],
+            "success": False,
+        })
+        # 同一個 thread 的同一個工具只提示一次，避免模型連打時洗版。
+        if thread_id and (thread_id, label) not in self._dynamic_tool_notices:
+            if len(self._dynamic_tool_notices) > 500:
+                self._dynamic_tool_notices.clear()
+            self._dynamic_tool_notices.add((thread_id, label))
+            self._append(thread_id, ("text",
+                                     f"\n⚠️ Codex plugin 工具 `{label}` 在 Pocket 開的 "
+                                     "thread 無法執行（plugin runtime 只在桌面 Codex 裡）。"
+                                     "這回合已回報工具失敗，turn 不會中斷。\n"))
+
+    # ───────── 問使用者問題（requestUserInput / MCP elicitation）─────────
+    async def _handle_question_request(self, msg: dict):
+        """`item/tool/requestUserInput` 與 `mcpServer/elicitation/request`
+        語意上都是「問使用者一題」，翻成既有的 approval/question 卡走卡片流；
+        使用者的答案透過 `/app/v1/approvals/{id}/decision` 或
+        `POST /codexsessions/{thread_id}/answer` 回到 app-server。
+
+        建卡失敗（例如 params 讀不懂）也**不能**丟 -32601 —— 一律退回該
+        method 的安全預設回覆（空答案 / decline），turn 才活得下來。
+        """
+        method = str(msg.get("method") or "")
+        params = msg.get("params") if isinstance(msg.get("params"), dict) else {}
+        try:
+            record = self._build_question_record(msg, method, params)
+        except Exception as e:  # noqa: BLE001
+            record = None
+            _log_event("codex_question_request_parse_failed",
+                       method=method[:120], error=type(e).__name__,
+                       error_message=str(e)[:160])
+        if not record:
+            _log_event("codex_question_request_fallback",
+                       method=method[:120],
+                       id_hash=_short_hash(str(msg.get("id"))),
+                       param_keys=",".join(sorted(str(k) for k in params.keys()))[:200])
+            await self._write_server_result_safe(
+                msg.get("id"), _codex_safe_question_result(method))
+            return
+        self._register_pending_request(record)
+        _log_event("codex_question_request",
+                   approval_id=record["id"], method=method[:120],
+                   thread_id_hash=_short_hash(record.get("thread_id") or ""),
+                   request_id_hash=_short_hash(str(msg.get("id"))),
+                   options=len(record.get("options") or []))
+        auto_ms = record.get("auto_resolution_ms")
+        if isinstance(auto_ms, (int, float)) and auto_ms > 0:
+            self._arm_question_auto_resolution(record["id"], float(auto_ms) / 1000.0)
+
+    def _build_question_record(self, msg: dict, method: str, params: dict) -> dict | None:
+        thread_id = str(params.get("threadId") or "")
+        request_id = msg.get("id")
+        created = time.time()
+        stable = json.dumps([thread_id, method, request_id], sort_keys=True,
+                            ensure_ascii=False, default=str)
+        approval_id = "codex-" + hashlib.sha1(stable.encode("utf-8", "replace")).hexdigest()[:24]
+        if method == "item/tool/requestUserInput":
+            questions = _codex_read_user_input_questions(params)
+            if not questions:
+                return None
+            first = questions[0]
+            options = [{"key": f"opt{i}", "label": opt["label"],
+                        "style": "primary" if i == 0 else "secondary",
+                        "send": opt["label"]}
+                       for i, opt in enumerate(first.get("options") or [])]
+            options.append({"key": "deny", "label": "略過", "style": "deny"})
+            title = first.get("header") or "Codex 需要你的回答"
+            detail = _codex_user_input_detail(questions)
+            extra = {"questions": questions,
+                     "auto_resolution_ms": params.get("autoResolutionMs")}
+        elif method == "mcpServer/elicitation/request":
+            server_name = str(params.get("serverName") or "MCP server")
+            message = str(params.get("message") or "")
+            title = f"{server_name} 需要你的確認"
+            detail = "\n".join(x for x in [title, message,
+                                           f"mode: {params.get('mode')}"
+                                           if params.get("mode") else ""] if x)
+            options = [{"key": "approve", "label": "允許", "style": "primary"},
+                       {"key": "deny", "label": "拒絕", "style": "deny"}]
+            extra = {"requested_schema": params.get("requestedSchema")}
+        else:
+            return None
+        record = {
+            "id": approval_id,
+            "request_id": request_id,
+            "method": method,
+            "params": params,
+            "thread_id": thread_id,
+            "kind": "question",
+            "title": title,
+            "source": f"codex:{thread_id}" if thread_id else "codex",
+            "risk": "low",
+            "detail": detail,
+            "created_at": created,
+            "options": options,
+        }
+        record.update(extra)
+        return record
+
+    def _arm_question_auto_resolution(self, approval_id: str, delay: float) -> None:
+        """codex 自己宣告的 autoResolutionMs 到了就替使用者回空答案，
+        免得沒人看手機時 turn 永遠掛著。"""
+        async def _run():
+            try:
+                await asyncio.sleep(max(1.0, delay))
+                record = self.pending_approvals.get(approval_id)
+                if not record:
+                    return
+                await self.answer_question(approval_id, key="", text="",
+                                           auto=True)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:  # noqa: BLE001
+                _log_event("codex_question_auto_resolution_failed",
+                           approval_id=approval_id, error=type(e).__name__,
+                           error_message=str(e)[:160])
+        try:
+            task = asyncio.create_task(_run())
+            _BG_TASKS.add(task)
+            task.add_done_callback(_BG_TASKS.discard)
+        except RuntimeError:
+            pass
+
+    async def answer_question(self, approval_id: str, key: str = "",
+                              text: str = "", auto: bool = False) -> dict:
+        """question 類 server request（requestUserInput / elicitation）決議。"""
+        record = self.pending_approvals.get(approval_id)
+        if not record:
+            raise CodexAppServerError("codex question is no longer pending", code=404)
+        result = self._question_response_result(record, key, text)
+        await self._write_server_result(record.get("request_id"), result)
+        self.pending_approvals.pop(approval_id, None)
+        thread_id = record.get("thread_id") or ""
+        if thread_id:
+            self.pending_approvals_by_thread.get(thread_id, {}).pop(approval_id, None)
+            self.last_event_at[thread_id] = time.time()
+        status = "answered"
+        try:
+            self._approval_db_decide(approval_id, status, result)
+        except Exception as e:  # noqa: BLE001
+            _log_event("codex_approval_db_decide_failed",
+                       approval_id=approval_id,
+                       error=type(e).__name__, error_message=str(e)[:160])
+        try:
+            _cx_cards_feed_approval(record, resolved=status)
+        except Exception as e:  # noqa: BLE001
+            _log_event("cx_cards_feed_error", error=str(e)[:160])
+        _log_event("codex_question_decision", approval_id=approval_id,
+                   method=record.get("method"), key=key or "", auto=auto,
+                   thread_id_hash=_short_hash(thread_id))
+        return {"id": approval_id, "status": status, "result": result,
+                "thread_id": thread_id, "method": record.get("method")}
+
+    def _question_response_result(self, record: dict, key: str, text: str) -> dict:
+        method = record.get("method")
+        if method == "item/tool/requestUserInput":
+            return _codex_build_user_input_answers(record, key, text)
+        if method == "mcpServer/elicitation/request":
+            return _codex_build_elicitation_response(record, key)
+        return {}
 
     async def _write_server_error(self, request_id, code: int, message: str):
         try:
@@ -4400,6 +4785,17 @@ class CodexAppServerClient:
                 raise CodexAppServerError("codex app-server is not running")
             await self._write_locked({"jsonrpc": "2.0", "id": request_id,
                                       "result": result})
+
+    async def _write_server_result_safe(self, request_id, result: dict) -> bool:
+        """回覆 server request，寫不出去就吞掉（app-server 已掉線的路徑，
+        呼叫端是 reader task，丟例外只會把整條 reader 打死）。"""
+        try:
+            await self._write_server_result(request_id, result)
+            return True
+        except Exception as e:  # noqa: BLE001
+            _log_event("codex_app_server_result_response_failed",
+                       error=type(e).__name__, error_message=str(e)[:160])
+            return False
 
     def _approval_thread_id(self, method: str, params: dict) -> str:
         if method in ("execCommandApproval", "applyPatchApproval"):
@@ -4455,6 +4851,7 @@ class CodexAppServerClient:
         return {
             "id": record.get("id"),
             "method": record.get("method"),
+            "kind": record.get("kind") or "permission",
             "title": record.get("title"),
             "detail": record.get("detail"),
             "risk": record.get("risk"),
@@ -4480,7 +4877,8 @@ class CodexAppServerClient:
                         "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                         (record["id"], record["title"], record["source"], record["risk"],
                          record["detail"], now, now + 3600, "pending", None, None, None,
-                         src if ":" in src else None, "codex", "permission",
+                         src if ":" in src else None, "codex",
+                         str(record.get("kind") or "permission"),
                          json.dumps(options, ensure_ascii=False) if options else None))
             con.commit()
             con.close()
@@ -4542,6 +4940,19 @@ class CodexAppServerClient:
                 {"key": "approve_for_session", "label": "本次全允許", "style": "secondary"})
         record["options"].append(
             {"key": "deny", "label": "拒絕", "style": "deny"})
+        self._register_pending_request(record)
+        _log_event("codex_approval_request",
+                   approval_id=approval_id,
+                   method=method,
+                   thread_id_hash=_short_hash(thread_id),
+                   request_id_hash=_short_hash(str(request_id)))
+
+    def _register_pending_request(self, record: dict) -> None:
+        """pending server request（approval / question 共用）→ 記憶體、
+        approvals DB、卡片流、推播。三條路徑各自 best-effort。"""
+        approval_id = record["id"]
+        thread_id = record.get("thread_id") or ""
+        created = record.get("created_at") or time.time()
         self.pending_approvals[approval_id] = record
         if thread_id:
             self.pending_approvals_by_thread[thread_id][approval_id] = record
@@ -4564,11 +4975,6 @@ class CodexAppServerClient:
                            f"codex:{thread_id}" if thread_id else "codex")
         except Exception as e:  # noqa: BLE001
             _log_event("approval_push_error", error=str(e)[:160])
-        _log_event("codex_approval_request",
-                   approval_id=approval_id,
-                   method=method,
-                   thread_id_hash=_short_hash(thread_id),
-                   request_id_hash=_short_hash(str(request_id)))
 
     def pending_approval_for_thread(self, thread_id: str) -> dict | None:
         if not thread_id:
@@ -4578,6 +4984,20 @@ class CodexAppServerClient:
             if aid in self.pending_approvals:
                 return record
             pending.pop(aid, None)
+        return None
+
+    def pending_question_for_thread(self, thread_id: str) -> dict | None:
+        """該 thread 上還沒回答的 question 類 server request（給
+        `POST /codexsessions/{thread_id}/answer` 用）。"""
+        if not thread_id:
+            return None
+        pending = self.pending_approvals_by_thread.get(thread_id) or {}
+        for aid, record in list(pending.items()):
+            if aid not in self.pending_approvals:
+                pending.pop(aid, None)
+                continue
+            if record.get("kind") == "question":
+                return record
         return None
 
     def _drop_approval(self, approval_id: str, status: str = "expired") -> dict | None:
@@ -6826,6 +7246,49 @@ async def codex_session_interrupt(thread_id: str, request: Request):
         return {"ok": True, "thread_id": thread_id}
     except Exception as e:  # noqa: BLE001
         _codex_http_error(e)
+
+
+@app.post("/codexsessions/{thread_id}/answer")
+async def codex_session_answer(thread_id: str, request: Request):
+    """回答 codex 的 question 類 server request（`item/tool/requestUserInput`
+    / `mcpServer/elicitation/request`）。
+
+    body 形狀刻意與 CC 那條 `POST /ccsessions/{name}/answer` 對齊:
+        {"keys": ["opt0"], "text": "自由輸入（選填）", "submit": true}
+    `keys` 只取第一個（codex 的卡一次只帶一組選項）；`key` 單數也吃。
+    沒有 pending question → 409。
+    """
+    _check_auth(request)
+    try:
+        b = await request.json()
+    except Exception:  # noqa: BLE001
+        b = {}
+    if not isinstance(b, dict):
+        b = {}
+    keys = b.get("keys")
+    if isinstance(keys, list) and keys:
+        key = str(keys[0] or "")
+    else:
+        key = str(b.get("key") or "")
+    text = str(b.get("text") or b.get("answer") or "")
+    record = CODEX_APP.pending_question_for_thread(thread_id)
+    if not record:
+        raise http_err(409, "QUESTION_NOT_PENDING",
+                       "no pending Codex question for thread")
+    okeys = [str(o.get("key") or "") for o in (record.get("options") or [])]
+    if key and key not in okeys:
+        raise http_err(400, "UNKNOWN_KEY", f"key 必須是 {okeys} 之一")
+    if not key and not text:
+        raise http_err(400, "MISSING_ANSWER", "需要 keys 或 text 其中之一")
+    try:
+        result = await CODEX_APP.answer_question(record["id"], key=key, text=text)
+    except CodexAppServerError as e:
+        if e.code == 404:
+            raise http_err(409, "QUESTION_NOT_PENDING",
+                           "Codex question is no longer live")
+        _codex_http_error(e)
+    return {"ok": True, "thread_id": thread_id, "id": record["id"],
+            "status": result["status"], "key": key, "result": result["result"]}
 
 
 @app.get("/codexsessions/{thread_id}/history")
@@ -17063,6 +17526,20 @@ async def _approval_decide_core(aid: str, b: dict) -> dict:
                    status=decision, key=key)
         return {"id": aid, "status": decision, "key": key}
     if d and src.startswith("codex"):
+        # question 類 server request(item/tool/requestUserInput /
+        # mcpServer/elicitation/request)不是二元核准 —— key 就是答案，
+        # 另有自由輸入 text。走 answer_question，狀態落 answered。
+        if (d.get("kind") or "") == "question":
+            try:
+                result = await CODEX_APP.answer_question(
+                    aid, key=key, text=str(b.get("text") or b.get("answer") or ""))
+                return {"id": aid, "status": result["status"],
+                        "key": key, "result": result["result"]}
+            except CodexAppServerError as e:
+                if e.code == 404:
+                    raise http_err(409, "APPROVAL_NOT_PENDING",
+                                   "Codex question is no longer live")
+                _codex_http_error(e)
         # {key} → app-server 決議參數;approve_for_session 映射 Codex 原生
         # acceptForSession(_approval_response_result 既有機制)。codex 線的
         # 狀態字彙(approved/rejected)相容期不動 — 卡片流/記憶體 record 同源。
