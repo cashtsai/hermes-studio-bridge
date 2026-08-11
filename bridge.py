@@ -1108,7 +1108,10 @@ def _canon_init():
         # session_id/provider/kind/options 與 source 並存(source 相容期保留原樣);
         # options 存建立方宣告的鍵(JSON 文字)。回填帶 IS NULL 守門,冪等。
         # hermes 舊列的 source 是自由字串 → session_id 不硬造(拍板:留 NULL)。
-        for _col in ("session_id", "provider", "kind", "options"):
+        # meta:提示層級的加值欄位(JSON 文字)。CC 的 AskUserQuestion 多選版面
+        # 需要帶 multiselect / q_index / q_total —— 這些不是 per-option 資訊,
+        # 塞不進 options 陣列,也不該埋進 detail 純文字。缺欄 = 舊列,讀出 None。
+        for _col in ("session_id", "provider", "kind", "options", "meta"):
             if _col not in approval_cols:
                 con.execute(f"ALTER TABLE approvals ADD COLUMN {_col} TEXT")
         con.execute("UPDATE approvals SET provider=CASE"
@@ -10274,10 +10277,107 @@ def _cc_opt_match(raw: str):
 
 
 _CC_CHECKBOX_RE = re.compile(r"^\[[ xX✔✓]?\]\s*")
+_CC_CHECKED_RE = re.compile(r"^\[[xX✔✓]\]")        # 已勾選(未勾選是 "[ ]")
+
+# ── AskUserQuestion 多選版面(multiSelect)的版面常數 ───────────────────────────
+# 全部經 Claude Code 2.1.207 實機驗證(2026-08-11,獨立 tmux session)並與該版
+# binary 內的 TUI 原始碼對照過:
+#
+#   ←  ☐ Fruits  ☐ Drinks  ☐ Desserts  ✔ Submit  →   ← 多題頁籤列(單題也有)
+#   問題本文
+#   ❯ 1. [ ] 選項一        數字鍵 = 切換勾選(不移動游標、不送出)
+#     2. [✔] 選項二
+#     4. [ ] Type something  自由輸入列(永遠是最後一列)
+#   ❯    Submit            內嵌送出鈕;聚焦時 "❯"+4 空格、未聚焦時 5 空格
+#   ────
+#     5. Chat about this   在送出鈕之外,不屬於多選清單
+#
+# 送出鈕文字:停在最後一題是 "Submit",還有後續題目時是 "Next"。
+_CC_SUBMIT_ROW_RE = re.compile(r"^(❯)?[ ]{4,6}(Submit|Next)[ ]*$")
+_CC_CHIP_ON = "☒☑"          # 該題已有作答(figures.checkboxOn 在此機器上是 ☒)
+_CC_CHIP_OFF = "☐"
+_CC_CHIP_ANY = _CC_CHIP_ON + _CC_CHIP_OFF
+_CC_SGR_RE = re.compile(r"\x1b\[([0-9;]*)m")
+_CC_TAB_BAR_SCAN = 30       # 頁籤列離選單很近,不必掃整個 pane
 
 
 def _cc_indent(raw: str) -> int:
     return len(raw) - len(raw.lstrip(" "))
+
+
+def _cc_submit_row(lines: list[str], footer_i: int):
+    """多選版面的內嵌送出鈕 → {"line","label","focused"};沒有回 None。
+
+    這一列是 bridge 對外唯一的送出途徑:它不帶編號(`_cc_opt_match` 不認),
+    舊版還會被當成「上一個選項的說明」黏進 description。
+    """
+    for i in range(max(0, footer_i - 20), footer_i):
+        m = _CC_SUBMIT_ROW_RE.match(lines[i].rstrip())
+        if m:
+            return {"line": i, "label": m.group(2), "focused": bool(m.group(1))}
+    return None
+
+
+def _cc_strip_sgr(s: str) -> str:
+    return _CC_SGR_RE.sub("", s)
+
+
+def _cc_tab_bar(raw: str) -> dict | None:
+    """頁籤列(形如 `←  ☒ Fruits  ☐ Drinks  ✔ Submit  →`)→ 題數/題號。
+
+    - `q_total` = 題目 chip 數,永遠可靠。
+    - `q_headers` = 每題的短標籤(同一個 ask 的各題之間穩定 → 拿來當 ask 簽名)。
+    - `q_index` **只在能確定時才給**:純文字擷取分不出「停在第 1 題但已作答」與
+      「停在第 2 題尚未作答」——兩者的 plain text 完全相同(2026-08-11 實機
+      對照確認)。真正的游標是 ANSI 背景色,只有 `capture-pane -pe` 才看得到;
+      呼叫端若餵帶跳脫碼的行,這裡就解得出精確題號,否則回 None(不猜)。
+    """
+    plain = _cc_strip_sgr(raw).strip()
+    if not plain:
+        return None
+    head = plain.lstrip("←").lstrip()
+    if not head or head[0] not in _CC_CHIP_ANY:
+        return None                      # 不是頁籤列
+    headers: list[str] = []
+    answered: list[bool] = []
+    for m in re.finditer(f"[{_CC_CHIP_ANY}] ", plain):
+        rest = plain[m.end():]
+        cut = re.search(f"\\s\\s+[{_CC_CHIP_ANY}✔]|\\s+→\\s*$", rest)
+        headers.append((rest[:cut.start()] if cut else rest).strip())
+        answered.append(plain[m.start()] in _CC_CHIP_ON)
+    if not headers:
+        return None
+    out = {"q_total": len(headers), "q_headers": headers,
+           "q_answered": answered, "q_index": None}
+    # ANSI 路徑:目前這一格有背景色(48;…)→ 就是所在題。
+    if "\x1b[" in raw:
+        bg = False
+        pos = 0
+        state = {"idx": None, "chip": -1}
+
+        def _eat(seg: str, on: bool) -> None:
+            for ch in seg:
+                if ch in _CC_CHIP_ANY:
+                    state["chip"] += 1
+                    if on and state["idx"] is None:
+                        state["idx"] = state["chip"]
+
+        for m in _CC_SGR_RE.finditer(raw):
+            _eat(raw[pos:m.start()], bg)
+            for p in (m.group(1) or "0").split(";"):
+                if p in ("", "0", "49"):
+                    bg = False                     # reset / 預設背景
+                elif p == "48" or (len(p) == 2 and p[0] == "4") or p[:3] in (
+                        "100", "101", "102", "103", "104", "105", "106", "107"):
+                    bg = True                      # 40-47 / 48;5;N / 100-107
+            pos = m.end()
+        _eat(raw[pos:], bg)
+        idx = state["idx"]
+        if idx is not None and idx < len(headers):
+            out["q_index"] = idx
+    if out["q_index"] is None and len(headers) == 1:
+        out["q_index"] = 0
+    return out
 
 
 def _cc_menu_from_footer(lines: list[str], footer_i: int):
@@ -10316,8 +10416,12 @@ def _cc_menu_from_footer(lines: list[str], footer_i: int):
     while i >= 0:
         raw = lines[i]
         s = raw.strip()
-        if not s or _cc_is_border(s) or _cc_opt_match(raw) or _cc_indent(raw) >= 2:
-            # 空行 / 框線 / 編號選項 / 縮排的說明行 —— 都還在選單區塊裡
+        if (not s or _cc_is_border(s) or _cc_opt_match(raw)
+                or _cc_indent(raw) >= 2 or _CC_SUBMIT_ROW_RE.match(raw.rstrip())):
+            # 空行 / 框線 / 編號選項 / 縮排的說明行 / 內嵌送出鈕 —— 都還在選單
+            # 區塊裡。送出鈕被游標選到時長成「❯    Submit」= 0 格縮排,不列進來
+            # 的話往上掃會提早停,整個選單連同問題一起消失(游標一走到送出鈕,
+            # App 的卡片就整張不見)。
             block_start = i
             i -= 1
             continue
@@ -10345,12 +10449,20 @@ def _cc_menu_from_footer(lines: list[str], footer_i: int):
                 continue                       # (假選項與真選項撞號會顯示兩次)
             seen_keys.add(key)
             label = m.group(2).strip()
+            checked = None
             if _CC_CHECKBOX_RE.match(label):   # 多選版面:label 帶 [ ]/[x] 勾選框
                 multiselect = True             # → 剝掉殘渣,App 端才不會把
+                checked = bool(_CC_CHECKED_RE.match(label))     # 目前的勾選狀態
                 label = _CC_CHECKBOX_RE.sub("", label).strip()  # 「[ ] …」當標籤渲染
-            options.append({"key": key, "label": label, "description": ""})
+            opt = {"key": key, "label": label, "description": ""}
+            if checked is not None:
+                opt["checked"] = checked
+            options.append(opt)
             continue
         s = raw.strip()
+        if _CC_SUBMIT_ROW_RE.match(raw.rstrip()):
+            continue                           # 內嵌送出鈕不是誰的說明(舊版會把
+            # 「     Submit」黏成上一個選項的 description)
         if s and not _cc_is_border(s) and _cc_indent(raw) >= 2 and options:
             prev = options[-1]                 # 縮排續行 → 併進上一個選項的說明
             prev["description"] = (prev["description"] + " " + s).strip()
@@ -10553,8 +10665,24 @@ def _cc_prompt(pane: str):
             # A1 semantic:泛選單(AskUserQuestion 等)= Approval Hub 的 question,
             # 不是 permission — app 端永不再用 label 猜語意。kind 欄位維持
             # "menu"(app 現行相容),語意走新增的 semantic 欄位。
-            return {"kind": "menu", "semantic": "question", "title": title,
-                    "options": opts[:8], "multiselect": multiselect}
+            out = {"kind": "menu", "semantic": "question", "title": title,
+                   "options": opts[:8], "multiselect": multiselect}
+            # 送出鈕(多選版面才有)+ 頁籤列題號 —— jsonl 路徑在現行 CC 永遠不會
+            # 命中(CC 是答完才 flush transcript,掃過全部 jsonl:288 次
+            # AskUserQuestion 問答、0 筆懸空 tool_use),所以 q_index/q_total
+            # 只能從 pane 解,否則 runtime 永遠是空的。
+            sub = _cc_submit_row(lines, footer_i)
+            if sub:
+                out["submit_label"] = sub["label"]
+                out["submit_focused"] = sub["focused"]
+            for raw in reversed(lines[max(0, footer_i - _CC_TAB_BAR_SCAN):footer_i]):
+                bar = _cc_tab_bar(raw)
+                if bar:
+                    out["q_total"] = bar["q_total"]
+                    out["q_index"] = bar["q_index"]
+                    out["q_headers"] = bar["q_headers"]
+                    break
+            return out
     has_context = any(k in tail_low for k in ("wants to", "do you want", "proceed?", "would you like"))
     if has_context:
         opts = []
@@ -10733,6 +10861,31 @@ async def tg_mirror_event(request: Request):
     return {"ok": ok, "session": session, "id": mid, "stored": ok}
 
 
+async def _cc_refine_q_index(name: str, prompt) -> None:
+    """多題 ask 的題號補件 —— 只在純文字解不出來時才多花一次 capture。
+
+    純文字的頁籤列在「停在 Q1 且已作答」與「停在 Q2 尚未作答」兩種狀態下
+    完全一樣(2026-08-11 實機對照:兩次都是 `←  ☒ Fruits  ☐ Drinks  ☐ Desserts
+    ✔ Submit  →`)。真正的游標是 ANSI 背景色,得用 `capture-pane -pe` 才看得到。
+    單題 / 最後一題的常見情形 `_cc_tab_bar` 已經解得出來,不會走到這裡。
+    """
+    if not isinstance(prompt, dict):
+        return
+    if (prompt.get("q_total") or 0) < 2 or prompt.get("q_index") is not None:
+        return
+    try:
+        rc, pane_e, _ = await _tmux_run("capture-pane", "-pe", "-t", name)
+        if rc:
+            return
+        for raw in reversed(pane_e.splitlines()):
+            bar = _cc_tab_bar(raw)
+            if bar and bar.get("q_index") is not None:
+                prompt["q_index"] = bar["q_index"]
+                return
+    except Exception as e:  # noqa: BLE001
+        _log_event("cc_qindex_refine_error", session=name, error=str(e)[:160])
+
+
 async def _cc_status_core(name: str) -> dict:
     """CC session 的 busy/mode/prompt 判讀 — /ccsessions status 端點與
     Phase 0 卡片 follower 共用同一份真相。"""
@@ -10778,6 +10931,7 @@ async def _cc_status_core(name: str) -> dict:
             or (prompt is None and not busy)
         ):
             prompt = ask
+    await _cc_refine_q_index(name, prompt)
     st = {"busy": busy, "running": True, "mode": mode, "prompt": prompt}
     if jsonl:
         usage, plan = _cc_scan_jsonl(jsonl)
@@ -10897,6 +11051,324 @@ async def _cc_key_core(name: str, raw: str) -> dict:
     return {"ok": True}
 
 
+# ─────────── AskUserQuestion 多選作答(POST /ccsessions/{name}/answer)──────────
+# 為什麼不能沿用 /key:`_cc_key_core` 對 semantic=="question" 一律「送數字 +
+# 0.08s 後送 Enter」。那在**單選**版面是對的(數字本身就成交,Enter 是保險),
+# 但多選版面的語意完全不同 —— 數字只是「切換游標所在清單的第 N 格勾選」,
+# Enter 是「切換游標那一列」。數字+Enter 的結果會是「勾了 A 又順手切掉 B」
+# 或送出空選集,而且永遠不會真的送出(送出鈕在清單之外)。
+#
+# 以下每一條都是 2026-08-11 在獨立 tmux session(自己開的 claude 2.1.207,
+# 沒碰任何人正在用的 session)實機打過、逐格 capture-pane 對照確認的:
+#   1. 數字 1-9 = 切換第 N 列的勾選;游標不動、不送出。實測送 "1"、"3" 後
+#      畫面變 `[✔] Chips` / `[✔] Fruit`,游標仍在第 1 列。
+#   2. 游標停在「Type something」自由輸入列時,數字**會被打進輸入框**
+#      (實測畫面變成 `❯ 4. [✔] 1` —— 那個 "1" 是文字內容,不是勾選)。
+#      這正是任務書說的「盲送 = 打進聊天框的垃圾字」,所以送數字前先驗游標。
+#   3. Down 逐列往下走,走過最後一列(自由輸入列)再一次 Down 就聚焦到送出鈕,
+#      畫面從 `     Submit`(5 空格)變成 `❯    Submit`。**再往下就會連「Chat
+#      about this」一起聚焦,那時候按 Enter 會變成「找 Claude 聊聊」把整個提問
+#      取消掉** —— 2026-08-11 用本端點實跑時真的踩到了(重繪還沒完成就回讀,
+#      讀到上一格畫面 → 多按一次 Down → Enter 直接把 ask 取消)。所以每一次
+#      按鍵之後都**等畫面真的變了**再判斷,而不是睡固定秒數就當它好了。
+#   4. 送出鈕上按 Enter **不是最終送出**,是進「Review your answers /
+#      Ready to submit your answers?」確認頁;在該頁按 "1"(Submit answers)
+#      才真的成交(實測 CC 回 `User answered Claude's questions: · … → Chips, Fruit`)。
+#   5. 多題時送出鈕文字是 "Next"(推進到下一題),只有最後一題才是 "Submit"。
+#      Tab 在這個版面被外層頁籤列吃掉(會跳到下一題/Submit 頁籤),所以走 Down。
+_CC_ANSWER_KEY_GAP = 0.12      # 每個切換鍵之間的間隔(實測 0.5s 綽綽有餘)
+_CC_ANSWER_SETTLE = 0.06       # 回讀輪詢的間隔
+_CC_ANSWER_SETTLE_TRIES = 12   # 等重繪最多輪幾次(≈0.7s;逾時就用最後一張)
+_CC_ANSWER_CONFIRM_TRIES = 40  # 等確認頁收掉最多輪幾次(≈2.4s;CC 結案要一下)
+_CC_ANSWER_MAX_NAV = 14        # 走到送出鈕的最多 Down 次數(選項上限 8 + 緩衝)
+_CC_REVIEW_MARKERS = ("ready to submit your answers", "review your answers")
+
+
+async def _cc_fresh_prompt(name: str):
+    """強制拿最新畫面(不吃 5s 快取)→ (pane, prompt)。"""
+    _PANE_CACHE.pop(name, None)
+    pane = await _tmux_capture_cached(name)
+    return pane, _cc_prompt(pane)
+
+
+async def _cc_send(name: str, *args) -> None:
+    rc, _, err = await _tmux_run("send-keys", "-t", name, *args)
+    _PANE_CACHE.pop(name, None)
+    if rc:
+        raise http_err(502, "TMUX_FAILED", "tmux send-keys failed",
+                       err[:200] or "send-keys failed")
+
+
+async def _cc_send_and_redraw(name: str, *args, before: str = "", until=None,
+                              tries: int = 0):
+    """送一個鍵,然後**等畫面真的反映了那個鍵**再回讀 → (pane, prompt)。
+
+    兩層教訓,都是實跑踩出來的:
+    1. 固定 sleep 不夠 —— 重繪比 sleep 慢就會讀到按鍵前的畫面,導覽迴圈誤判
+       「還沒到」而多按一次;在送出鈕上多按一次 Down,游標就落到「Chat about
+       this」,再按 Enter 等於把整個提問取消掉。
+    2. 「整張 pane 變了」也不夠 —— 底部狀態列(`Claude | 5h 80% | 7d 23%`、
+       spinner)自己就會變,於是「畫面變了」在游標還沒動的時候就成立了,
+       第 1 點照樣重演。所以導覽時等的是**游標真的移動了**(`until`),
+       不是「有什麼東西變了」。
+    """
+    await _cc_send(name, *args)
+    pane = before
+    for _ in range(tries or _CC_ANSWER_SETTLE_TRIES):
+        await asyncio.sleep(_CC_ANSWER_SETTLE)
+        _PANE_CACHE.pop(name, None)
+        pane = await _tmux_capture_cached(name)
+        if until(pane) if until else (pane != before):
+            break
+    return pane, _cc_prompt(pane)
+
+
+def _cc_ms_focus_row(lines: list[str]):
+    """游標(❯)停在哪一列 → ("option"|"input"|"submit"|"other", key)。
+
+    多選清單的最後一列永遠是自由輸入列(TUI 原始碼 `[...options, inputOption]`),
+    停在那裡送數字會變成打字,所以要先認出來。
+
+    **「Chat about this」優先於送出鈕**:走過送出鈕之後,實機畫面上兩列都會
+    帶 ❯,但真正吃 Enter 的是 chat(按下去 = 取消整個提問)。誰先回報錯了,
+    後面就會在該退一格的時候直接按 Enter。
+    """
+    sub_i = None
+    sub_focused = False
+    for i, raw in enumerate(lines):
+        if _CC_SUBMIT_ROW_RE.match(raw.rstrip()):
+            sub_i = i
+            sub_focused = raw.lstrip().startswith("❯")
+    if sub_i is not None:
+        for raw in lines[sub_i + 1:]:
+            if raw.lstrip().startswith("❯") and _cc_opt_match(raw):
+                return "other", _cc_opt_match(raw).group(1)
+    if sub_focused:
+        return "submit", ""
+    last_opt_key = ""
+    for i, raw in enumerate(lines):
+        if sub_i is not None and i > sub_i:
+            break                       # 送出鈕以下(Chat about this)不屬於清單
+        m = _cc_opt_match(raw)
+        if m and _CC_CHECKBOX_RE.match(m.group(2).strip()):
+            last_opt_key = m.group(1)
+    for raw in lines:
+        if not raw.lstrip().startswith("❯"):
+            continue
+        m = _cc_opt_match(raw)
+        if not m:
+            continue
+        key = m.group(1)
+        if not _CC_CHECKBOX_RE.match(m.group(2).strip()):
+            return "other", key         # 例:游標在「Chat about this」
+        return ("input" if key == last_opt_key else "option"), key
+    return "other", ""
+
+
+def _cc_ms_checked(prompt: dict) -> set:
+    return {str(o.get("key")) for o in (prompt.get("options") or [])
+            if o.get("checked")}
+
+
+def _cc_answer_stale(prompt, keys: list[str]):
+    """提示還在嗎?這些 key 現在真的存在嗎?—— 不在就別盲送。"""
+    if not isinstance(prompt, dict) or prompt.get("semantic") != "question":
+        return "no live question prompt right now"
+    valid = {str(o.get("key") or "") for o in (prompt.get("options") or [])}
+    missing = [k for k in keys if k not in valid]
+    if missing:
+        return f"keys not on screen: {','.join(missing)}"
+    return ""
+
+
+@app.post("/ccsessions/{name}/answer")
+async def cc_session_answer(name: str, request: Request):
+    """AskUserQuestion 多選作答。body {"keys": ["1","3"], "submit": true}
+
+    - `keys` = 作答後**應該被勾選的完整集合**(不是「要按哪幾個鍵」)。因為
+      TUI 的數字是 toggle,若使用者已在終端機上先勾了東西,盲送 keys 會把它
+      切掉;所以這裡先讀畫面上的現況,只送「現況 ⊕ 目標」的差集。
+    - `submit=false` → 只勾選、不送出(版面留在原地,使用者可在終端機接手)。
+    - `submit=true` → 走到內嵌送出鈕按下去;最後一題會再過一次確認頁才成交,
+      非最後一題(鈕上寫 Next)則只推進到下一題,回 `submitted:false` +
+      `advanced:true`,由 app 接著答下一題。
+    """
+    _check_auth(request)
+    if not any(r[0] == name for r in _cc_conf_rows()):
+        raise http_err(404, "SESSION_NOT_FOUND", "unknown session")
+    body = await request.json()
+    raw_keys = body.get("keys")
+    if isinstance(raw_keys, str):
+        raw_keys = [raw_keys]
+    if not isinstance(raw_keys, list) or not raw_keys:
+        raise http_err(400, "KEYS_REQUIRED", "keys required (list of option keys)")
+    keys, seen = [], set()
+    for k in raw_keys:
+        k = str(k).strip()
+        if not k:
+            continue
+        if len(k) != 1 or not k.isdigit():
+            raise http_err(400, "BAD_KEY", "only single-digit option keys are supported",
+                           f"got {k!r}")
+        if k not in seen:
+            seen.add(k)
+            keys.append(k)
+    if not keys:
+        raise http_err(400, "KEYS_REQUIRED", "keys required (list of option keys)")
+    submit = body.get("submit")
+    submit = True if submit is None else bool(submit)
+    if not await _tmux_alive(name):
+        raise http_err(409, "SESSION_NOT_RUNNING", "session not running")
+
+    pane, prompt = await _cc_fresh_prompt(name)
+    why = _cc_answer_stale(prompt, keys)
+    if why:
+        raise http_err(409, "PROMPT_STALE", "no matching live prompt right now", why)
+    if not prompt.get("multiselect"):
+        # 單選版面:沒有勾選框、沒有送出鈕,語意與 /key 完全相同(數字即成交)。
+        # 讓 app 只維護一條作答路徑,但行為一字不改地沿用既有 /key。
+        if len(keys) > 1:
+            raise http_err(400, "NOT_MULTISELECT",
+                           "this prompt only accepts one option", "send a single key")
+        res = await _cc_key_core(name, keys[0])
+        return {"ok": True, "sent": keys, "submitted": True,
+                "multiselect": False, **{k: v for k, v in res.items() if k != "ok"}}
+
+    lines = pane.splitlines()
+    kind, _focus_key = _cc_ms_focus_row(lines)
+    if kind in ("input", "other"):
+        # 游標在自由輸入列 / Chat about this 上 —— 數字會被當成打字。Up 可以
+        # 把游標移開(TUI 原始碼:輸入列聚焦時 up 仍會傳給清單、chat 聚焦時
+        # up 先取消 chat 焦點)。移不開就不送,寧可回錯也不要打出垃圾字。
+        pane, prompt = await _cc_send_and_redraw(name, "Up", before=pane)
+        if _cc_answer_stale(prompt, keys):
+            raise http_err(409, "PROMPT_STALE", "prompt vanished while re-focusing")
+        kind, _focus_key = _cc_ms_focus_row(pane.splitlines())
+        if kind in ("input", "other"):
+            raise http_err(409, "FOCUS_UNSAFE",
+                           "cursor is on the free-text row — digits would be typed, not toggled",
+                           "move the cursor in the terminal and retry")
+
+    want = set(keys)
+    sent: list[str] = []
+    for _attempt in range(2):
+        have = _cc_ms_checked(prompt)
+        todo = sorted(want ^ have, key=int)
+        if not todo:
+            break
+        for k in todo:                      # 數字是 toggle → 只送「現況 ⊕ 目標」
+            expect = _cc_ms_checked(prompt) ^ {k}
+            pane, prompt = await _cc_send_and_redraw(
+                name, "-l", k, before=pane,
+                # 等的是「那一格真的翻了」。底部狀態列自己會變,拿整張 pane
+                # 比對會在勾選還沒重繪時就放行,下一輪算差集就算錯 → 又送一次
+                # → 把剛勾好的又切掉。
+                until=lambda p, _e=expect: _cc_ms_checked(_cc_prompt(p) or {}) == _e)
+            sent.append(k)
+            await asyncio.sleep(_CC_ANSWER_KEY_GAP)
+        if _cc_answer_stale(prompt, keys):
+            raise http_err(409, "PROMPT_STALE", "prompt vanished while toggling",
+                           f"sent={','.join(sent)}")
+    final = _cc_ms_checked(prompt)
+    if final != want:
+        # 回讀對不上就**不要**繼續送出 —— 送出一個錯的選集比不送出更糟。
+        _log_event("cc_answer_toggle_mismatch", session=name,
+                   want=sorted(want), got=sorted(final), sent=sent)
+        raise http_err(409, "TOGGLE_MISMATCH",
+                       "on-screen selection does not match the requested keys",
+                       f"want={','.join(sorted(want))} got={','.join(sorted(final))}")
+    out = {"ok": True, "sent": sent, "selected": sorted(final, key=int),
+           "multiselect": True, "submitted": False}
+    if prompt.get("q_total"):
+        out["q_total"] = prompt["q_total"]
+    if not submit:
+        return out
+    res = await _cc_multiselect_submit(name, pane, prompt)
+    out.update(res)
+    return out
+
+
+async def _cc_multiselect_submit(name: str, pane: str, prompt: dict) -> dict:
+    """走到內嵌送出鈕 → Enter → (最後一題)確認頁 → 成交。閉環驗證,不盲送。"""
+    label = prompt.get("submit_label") or ""
+    if not label:
+        raise http_err(409, "NO_SUBMIT_ROW",
+                       "this layout has no inline submit button",
+                       "selection kept; submit from the terminal")
+    # 導覽以「游標現在停在哪一列」為準,不看 `submit_focused` —— 走過頭時
+    # 送出鈕的 ❯ **不會消失**,「Chat about this」也跟著亮,兩列都帶 ❯;只看
+    # submit_focused 會在那個狀態下判定「到了」然後按 Enter,結果是把整個提問
+    # 取消掉(2026-08-11 實跑兩次都栽在這裡)。`_cc_ms_focus_row` 讓 chat 優先。
+    focus = _cc_ms_focus_row(pane.splitlines())
+    presses = 0
+    while focus[0] != "submit" and presses < _CC_ANSWER_MAX_NAV:
+        step = "Up" if focus[0] == "other" else "Down"     # 走過頭就退回來
+        pane, prompt2 = await _cc_send_and_redraw(
+            name, step, before=pane,
+            until=lambda p, _was=focus: _cc_ms_focus_row(p.splitlines()) != _was)
+        presses += 1
+        if not isinstance(prompt2, dict) or not prompt2.get("submit_label"):
+            raise http_err(409, "PROMPT_STALE",
+                           "the menu disappeared while walking to the submit button")
+        label = prompt2.get("submit_label") or label
+        focus = _cc_ms_focus_row(pane.splitlines())
+    if focus[0] != "submit":
+        raise http_err(409, "SUBMIT_UNREACHABLE",
+                       "could not focus the submit button",
+                       f"{presses} presses, cursor is on {focus[0]!r}")
+    # 按下送出鈕之後畫面會整頁換掉(確認頁 / 下一題),但 CC 要一點時間才畫完。
+    # 這裡等的是「真的換頁了」而不是「有東西變了」—— 否則會讀到按 Enter 前的
+    # 選單,把一次成功的送出誤報成「推進到下一題」(實跑踩過)。
+    title_before = str(prompt.get("title") or "")
+
+    def _moved_on(p: str) -> bool:
+        if any(m in p.lower() for m in _CC_REVIEW_MARKERS):
+            return True
+        q = _cc_prompt(p)
+        if not isinstance(q, dict) or q.get("semantic") != "question":
+            return True                       # 選單整個收掉了
+        return str(q.get("title") or "") != title_before
+
+    pane, after = await _cc_send_and_redraw(name, "Enter", before=pane,
+                                            until=_moved_on,
+                                            tries=_CC_ANSWER_CONFIRM_TRIES)
+    low = pane.lower()
+    if any(m in low for m in _CC_REVIEW_MARKERS):
+        # 確認頁:`❯ 1. Submit answers` / `  2. Cancel`(這一頁沒有 "Enter to
+        # select" footer,所以 _cc_prompt 看不到它,只能用文字認)。
+        confirm = next((ln for ln in pane.splitlines()
+                        if re.match(r"^\s*❯?\s*1\.\s+Submit answers\s*$", ln)), None)
+        if not confirm:
+            raise http_err(409, "REVIEW_UNEXPECTED",
+                           "review screen did not offer 'Submit answers'",
+                           "selection kept; confirm from the terminal")
+        # 「畫面變了」不等於「確認頁收掉了」:CC 要花約 1 秒才把提問結掉,期間
+        # 狀態列/spinner 已經在動,確認頁的字還在。實跑時就是這樣把一次**成功**
+        # 的送出回報成 submitted:false —— 所以這裡等的是「確認頁不見了」。
+        await _cc_send(name, "-l", "1")
+        still = True
+        for _ in range(_CC_ANSWER_CONFIRM_TRIES):
+            await asyncio.sleep(_CC_ANSWER_SETTLE)
+            _PANE_CACHE.pop(name, None)
+            pane2 = await _tmux_capture_cached(name)
+            still = any(m in pane2.lower() for m in _CC_REVIEW_MARKERS)
+            if not still:
+                break
+        _log_event("cc_answer_submitted", session=name, nav_presses=presses,
+                   confirmed=not still)
+        return {"submitted": not still, "submit_label": label,
+                "confirmed_review": True}
+    if isinstance(after, dict) and after.get("semantic") == "question":
+        # 還在選單裡 = 剛才那顆是 "Next",已推進到下一題(多題 ask)。
+        await _cc_refine_q_index(name, after)
+        return {"submitted": False, "advanced": True, "submit_label": label,
+                "q_total": after.get("q_total"), "q_index": after.get("q_index")}
+    # 既不是確認頁也不是選單 —— 版面已收掉,當成已送出但標注未確認。
+    _log_event("cc_answer_submitted", session=name, nav_presses=presses,
+               confirmed=False, note="menu_gone_without_review")
+    return {"submitted": True, "submit_label": label, "confirmed_review": False}
+
+
 # ─────────── 批次 3 斷點③:CC waiting_approval → approval feed + 推播 ────────
 # persona(Approval Center)/CX(app-server request)本來就有 approval 記錄;CC 的
 # 「審核」是 TUI prompt,這裡補一個常駐 watcher:prompt 出現 → 建記錄+推播,
@@ -10917,6 +11389,21 @@ def _cc_prompt_sig(prompt: dict) -> str:
                       [(o.get("key"), o.get("label"))
                        for o in prompt.get("options") or []]],
                      ensure_ascii=False, sort_keys=True)
+    return hashlib.sha1(raw.encode("utf-8", "replace")).hexdigest()[:16]
+
+
+def _cc_ask_sig(prompt: dict) -> str:
+    """「同一個 AskUserQuestion」的簽名 —— 跨題目穩定,答完 Q1 換 Q2 也不變。
+
+    用頁籤列的題目短標籤(`←  ☒ Fruits  ☐ Drinks  ✔ Submit  →`)+ 題數:
+    這兩者在整個 ask 的生命週期裡固定,只有勾選記號會變(已排除)。單題 ask
+    回空字串 —— 單題沒有「推進到下一題」的情境,走原本的建卡路徑就好。
+    """
+    total = prompt.get("q_total") or 0
+    headers = prompt.get("q_headers") or []
+    if total < 2 or not headers:
+        return ""
+    raw = json.dumps([total, headers], ensure_ascii=False)
     return hashlib.sha1(raw.encode("utf-8", "replace")).hexdigest()[:16]
 
 
@@ -11022,23 +11509,37 @@ def _cc_approval_set_status(aid: str, status: str) -> bool:
         return False
 
 
-def _cc_approval_create(name: str, prompt: dict) -> str:
-    import sqlite3
-    aid = "cc-" + uuid.uuid4().hex[:24]
+def _cc_approval_kind(prompt: dict) -> str:
+    # A1:語意在誕生點標好 — _cc_prompt 的分支即分類(泛選單=question、
+    # 權限/yesno=permission);permission 的鍵由 bridge 標 style,app 只渲染,
+    # 不再用 label 猜「哪顆是拒絕」。question 無 danger 語意(spec §2)。
+    return "question" if prompt.get("semantic") == "question" else "permission"
+
+
+def _cc_approval_payload(name: str, prompt: dict) -> dict:
+    """prompt → 審核記錄的可變欄位(title/detail/options/meta)。
+
+    2026-08-11:options 以前只寫 {key,label,style},把 `description` 整段丟掉,
+    而 CC 卡片流預設開,使用者在 Pocket 看到的就是這張卡 —— 等於「選項說明」
+    在最常走的那條路上永遠是空的。多選還多了 multiselect/q_index/q_total
+    三個決定 app 該畫單選還是複選、要不要顯示「第 2/3 題」的欄位。
+    """
     title = (prompt.get("title") or "").strip() or f"{name} 等待核准"
     opts_txt = " / ".join(str(o.get("label") or "")[:30]
                           for o in (prompt.get("options") or [])[:4])
     detail = f"session: {name}\n{title}" + (f"\n選項: {opts_txt}" if opts_txt else "")
-    # A1:語意在誕生點標好 — _cc_prompt 的分支即分類(泛選單=question、
-    # 權限/yesno=permission);permission 的鍵由 bridge 標 style,app 只渲染,
-    # 不再用 label 猜「哪顆是拒絕」。question 無 danger 語意(spec §2)。
-    kind = "question" if prompt.get("semantic") == "question" else "permission"
+    kind = _cc_approval_kind(prompt)
     options = []
-    for o in (prompt.get("options") or [])[:6]:
+    for o in (prompt.get("options") or [])[:8]:
         okey = str(o.get("key") or "").strip()
         if not okey:
             continue
         ent = {"key": okey, "label": str(o.get("label") or "")[:80]}
+        desc = str(o.get("description") or "").strip()
+        if desc:
+            ent["description"] = desc[:400]
+        if o.get("checked") is not None:
+            ent["checked"] = bool(o.get("checked"))
         if kind == "permission":
             lab = ent["label"].strip()
             if _CC_DENY_RE.match(lab):
@@ -11048,23 +11549,70 @@ def _cc_approval_create(name: str, prompt: dict) -> str:
             else:
                 ent["style"] = "secondary"
         options.append(ent)
+    meta = {}
+    if kind == "question":
+        meta["multiselect"] = bool(prompt.get("multiselect"))
+    for k in ("q_index", "q_total"):
+        if prompt.get(k) is not None:
+            meta[k] = prompt[k]
+    if prompt.get("q_headers"):
+        meta["q_headers"] = prompt["q_headers"]
+    return {"title": title, "detail": detail, "kind": kind, "options": options,
+            "meta": meta}
+
+
+def _cc_approval_create(name: str, prompt: dict) -> str:
+    import sqlite3
+    aid = "cc-" + uuid.uuid4().hex[:24]
+    p = _cc_approval_payload(name, prompt)
     now = time.time()
     con = sqlite3.connect(CANON_DB, timeout=30)
     try:
         con.execute("INSERT OR REPLACE INTO approvals"
                     "(id,title,source,risk,detail,created_at,expires_at,status,decided_at,result,callback,"
-                    "session_id,provider,kind,options) "
-                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                    (aid, title, f"claude_code:{name}",
-                     "high" if kind == "permission" else "low", detail,
+                    "session_id,provider,kind,options,meta) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (aid, p["title"], f"claude_code:{name}",
+                     "high" if p["kind"] == "permission" else "low", p["detail"],
                      now, now + _CC_APPROVAL_TTL, "pending", None, None, None,
-                     f"claude_code:{name}", "claude_code", kind,
-                     json.dumps(options, ensure_ascii=False) if options else None))
+                     f"claude_code:{name}", "claude_code", p["kind"],
+                     json.dumps(p["options"], ensure_ascii=False) if p["options"] else None,
+                     json.dumps(p["meta"], ensure_ascii=False) if p["meta"] else None))
         con.commit()
         con.close()
         return aid
     finally:
         con.close()
+
+
+def _cc_approval_update(aid: str, name: str, prompt: dict) -> bool:
+    """就地換掉 pending 審核的內容(同一個 ask 推進到下一題時用)。
+
+    為什麼不重建:`_cc_prompt_sig` 只吃 title+options,多題 ask 每答完一題,
+    畫面上的題目與選項就整組換掉 → sig 變 → 舊卡標 expired、新開一張卡、
+    再推播一次。三題 = 三次推播 + 兩張過期灰卡,而使用者從頭到尾只是在回答
+    同一個提問。同一個 ask 沿用同一個 approval id,App 手上的卡也不會變孤兒。
+    """
+    import sqlite3
+    p = _cc_approval_payload(name, prompt)
+    try:
+        con = sqlite3.connect(CANON_DB, timeout=30)
+        try:
+            cur = con.execute(
+                "UPDATE approvals SET title=?,detail=?,kind=?,options=?,meta=? "
+                "WHERE id=? AND status='pending'",
+                (p["title"], p["detail"], p["kind"],
+                 json.dumps(p["options"], ensure_ascii=False) if p["options"] else None,
+                 json.dumps(p["meta"], ensure_ascii=False) if p["meta"] else None,
+                 aid))
+            con.commit()
+            con.close()
+            return bool(cur.rowcount)
+        finally:
+            con.close()
+    except Exception as e:  # noqa: BLE001
+        _log_event("cc_approval_db_error", approval_id=aid, error=str(e)[:160])
+        return False
 
 
 # ── 2b:人格 choices 卡 → 審核中心(2026-07-16 XCash 拍板:所有 choices 卡進、
@@ -11270,6 +11818,21 @@ async def _cc_approval_watcher():
                     sig = _cc_prompt_sig(prompt)
                     if active and active["sig"] == sig:
                         continue                     # 同一個 prompt,已建過
+                    ask_sig = _cc_ask_sig(prompt)
+                    if (active and ask_sig and active.get("ask_sig") == ask_sig
+                            and _cc_approval_update(active["aid"], name, prompt)):
+                        # 同一個 ask 的下一題 → 就地換內容,不過期、不重建、不重推
+                        active["sig"] = sig
+                        try:
+                            _cc_cards_feed_approval(
+                                name, _approval_get_row(active["aid"]) or {})
+                        except Exception as e:  # noqa: BLE001
+                            _log_event("cc_cards_feed_error", error=str(e)[:160])
+                        _log_event("cc_approval_question_advanced", session=name,
+                                   approval_id=active["aid"],
+                                   q_index=prompt.get("q_index"),
+                                   q_total=prompt.get("q_total"))
+                        continue
                     if active:
                         _cc_approval_set_status(active["aid"], "expired")
                         try:
@@ -11283,12 +11846,14 @@ async def _cc_approval_watcher():
                     # 吃 409、TUI 收不到鍵)。認領到就沿用該 aid,不重推。
                     adopted = _cc_find_pending_aid(name, sig)
                     if adopted:
-                        _CC_APPROVAL_ACTIVE[name] = {"aid": adopted, "sig": sig}
+                        _CC_APPROVAL_ACTIVE[name] = {"aid": adopted, "sig": sig,
+                                                     "ask_sig": ask_sig}
                         _log_event("cc_approval_adopted", session=name,
                                    approval_id=adopted)
                         continue
                     aid = _cc_approval_create(name, prompt)
-                    _CC_APPROVAL_ACTIVE[name] = {"aid": aid, "sig": sig}
+                    _CC_APPROVAL_ACTIVE[name] = {"aid": aid, "sig": sig,
+                                                 "ask_sig": ask_sig}
                     opts = " / ".join(str(o.get("label") or "")[:20]
                                       for o in (prompt.get("options") or [])[:3])
                     _approval_push(aid, prompt.get("title") or f"{name} 等待核准",
@@ -16625,7 +17190,7 @@ async def _persona_interrupt_core(session: str) -> dict:
 
 # A1:讀取端共用的欄位序 — SELECT 一律用這一串,tuple 索引不漂移。
 _APPROVAL_COLS = ("id,title,source,risk,detail,created_at,expires_at,status,"
-                  "decided_at,result,session_id,provider,kind,options")
+                  "decided_at,result,session_id,provider,kind,options,meta")
 _APPROVAL_KINDS = ("permission", "question", "notice")
 
 
@@ -16657,13 +17222,22 @@ def _approval_row(r):
             options = json.loads(r[13])
         except (TypeError, ValueError):
             options = None
-    return {"id": r[0], "title": r[1], "source": r[2], "risk": r[3], "detail": r[4],
-            "created_at": r[5], "expires_at": r[6], "status": r[7],
-            "decided_at": r[8], "result": r[9],
-            "session_id": r[10] or (src if src.startswith(("claude_code:", "codex:")) else ""),
-            "provider": r[11] or _approval_provider_of(src),
-            "kind": kind,
-            "options": options or _approval_default_options(kind)}
+    meta = None
+    if len(r) > 14 and r[14]:
+        try:
+            meta = json.loads(r[14])
+        except (TypeError, ValueError):
+            meta = None
+    out = {"id": r[0], "title": r[1], "source": r[2], "risk": r[3], "detail": r[4],
+           "created_at": r[5], "expires_at": r[6], "status": r[7],
+           "decided_at": r[8], "result": r[9],
+           "session_id": r[10] or (src if src.startswith(("claude_code:", "codex:")) else ""),
+           "provider": r[11] or _approval_provider_of(src),
+           "kind": kind,
+           "options": options or _approval_default_options(kind)}
+    if isinstance(meta, dict) and meta:
+        out["meta"] = meta
+    return out
 
 
 def _approval_get_row(aid: str):

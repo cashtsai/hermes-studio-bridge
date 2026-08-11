@@ -706,6 +706,14 @@ class ApprovalCardMixin:
             # A3:加值欄位 —— app 靠它做 question 直選/notice 單鍵;
             # 不認得就忽略(fallback 原則)。
             body["kind"] = record["kind"]
+        meta = record.get("meta")
+        if isinstance(meta, dict):
+            # 提示層級加值欄位(CC AskUserQuestion):multiselect 決定 app 該畫
+            # 單選還是複選(以及要不要走 POST /ccsessions/{name}/answer),
+            # q_index/q_total 讓「第 2/3 題」顯示得出來。缺欄 = 舊卡,忽略即可。
+            for _k in ("multiselect", "q_index", "q_total", "q_headers"):
+                if meta.get(_k) is not None:
+                    body[_k] = meta[_k]
         store.upsert_card(make_card(
             f"{self._appr_prefix}{record['id']}", store.turn_id, "system",
             "approval", body, final=False))
