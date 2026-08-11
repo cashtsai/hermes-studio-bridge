@@ -19182,11 +19182,11 @@ async def v2_agent_call(request: Request):
     call_id = "call-" + uuid.uuid4().hex[:16]
     # ── 護欄 1:政策 allowlist(default DENY)──────────────────────────
     policy = agent_call_policy.load_policy()
-    if not agent_call_policy.allowed(policy, caller, target):
+    if not agent_call_policy.allowed(policy, caller, target, registry=REGISTRY):
         await _agent_call_deny(
             call_id, caller, target, mode, message, "AGENT_CALL_DENIED",
-            f"政策未放行 {caller} → {target}(default DENY;"
-            f"請在 {agent_call_policy.policy_path()} 加 allowlist 規則)", 403)
+            f"政策未放行 {caller} → {target}(default DENY;家譜直接母子邊自動放行,"
+            f"其餘請在 {agent_call_policy.policy_path()} 加 allowlist 規則)", 403)
     # ── 護欄 2:chain 深度/循環/預算 ──────────────────────────────────
     parent = None
     pid = str(body.get("parent_call_id") or "").strip()
@@ -19316,7 +19316,7 @@ async def v2_agent_targets(request: Request, caller: str = ""):
     for sid, r in sorted(by_id.items()):
         if sid == caller:
             continue
-        if not agent_call_policy.allowed(policy, caller, sid):
+        if not agent_call_policy.allowed(policy, caller, sid, registry=REGISTRY):
             continue
         out.append({"id": sid, "provider": r.get("provider"),
                     "purpose": r.get("purpose"),

@@ -113,10 +113,44 @@ def load_policy(path: str | None = None) -> dict:
     return {"rules": out}
 
 
-def allowed(policy: dict, caller: str, target: str) -> bool:
-    """(caller, target) 是否有任何規則放行。default DENY;自呼永遠拒。"""
+def is_family_edge(registry, caller: str, target: str) -> bool:
+    """caller 與 target 是否為 registry 家譜上的**直接**母子(任一方向)。
+
+    善彰 2026-08-11 定的鐵律:「cc/cx 互相調閱就是只有母子」—— 一個節點只能
+    叫自己的直接 parent 或自己生的直接 child,不得呼叫兄弟或樹上任意節點。
+    這比 fnmatch 白名單更嚴也更好推理:呼叫圖被綁死在家譜的樹邊上。parent 是
+    spawn 當下就落籍的事實,不需要人另外維護政策,沒有忘設政策的空窗。
+
+    registry 不可用/查不到 → False(這條路不放行),交給白名單那條自行判斷。
+    """
+    if not caller or not target or caller == target or registry is None:
+        return False
+    try:
+        crow = registry.get(caller)
+        if crow and (crow.get("parent") or "") == target:
+            return True          # target 是 caller 的直接 parent
+        trow = registry.get(target)
+        if trow and (trow.get("parent") or "") == caller:
+            return True          # target 是 caller 生的直接 child
+    except Exception:            # noqa: BLE001 — registry 掛了不該擋死整個調用面
+        return False
+    return False
+
+
+def allowed(policy: dict, caller: str, target: str, registry=None) -> bool:
+    """(caller, target) 是否放行。default DENY;自呼永遠拒。
+
+    兩條放行來源(任一命中即放行):
+      ① **家譜直接母子邊**(善彰鐵律;registry 事實,免政策維護)
+      ② 政策檔白名單 rules(fnmatch)
+
+    母子邊是**新增**的放行來源,不是限縮 —— 既有白名單行為一字不變。
+    若要把調用嚴格收成「只有母子」,把政策檔的 rules 清空即可。
+    """
     if not caller or not target or caller == target:
         return False
+    if is_family_edge(registry, caller, target):
+        return True
     for r in policy.get("rules") or []:
         if not fnmatch.fnmatchcase(caller, r["caller"]):
             continue
