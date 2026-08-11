@@ -876,3 +876,100 @@ app 端先行件（不等 bridge）：卡片渲染元件 + 傳輸層抽象
   detail?, options?, ttl_seconds?, callback_url?}`;`source` 為 `session_id` 舊名。
 - **hermes waiting_approval**:persona 有 pending 時 v2 sessions 該列
   `status=waiting_approval` + `meta.approval`(之前恆 idle)。
+
+## 13. 全機發現與收編(`/app/v2/discovery`,SUBPROCESS_HARNESS_DESIGN §2.3)
+
+> 善彰定調:Pocket 是那台機器的**指揮艙**,不是只管「從 Pocket 開的」。
+> 使用者自己在桌機/CLI 開的 session、BYO-key 開的、別家模型開的,一律
+> **發現 → 呈現 → 可收編**。
+
+### 13.1 `GET /app/v2/discovery?provider=&refresh=`
+
+四路 provider 一次掃完,~5 秒快取。`provider` 逗號分隔過濾(吃
+`cc`/`cx`/`oc` 別名);`refresh=1` 略過快取。
+
+```jsonc
+{
+  "items": [{
+    "id": "claude_code:amulet-hunter",   // = registry session id,收編/釋放用它
+    "provider": "claude_code|codex|hermes|dispatch|openclaw",
+    "name": "amulet-hunter",
+    "workdir": "/Users/xcash/apps/amulet-hunter",
+    "state": "managed|discovered",       // discovered = 看得到、還沒收編
+    "registry_state": "active|idle|done|archived|null",  // null = 還沒有戶口
+    "purpose": "…", "class": "task",     // 有戶口才有
+    "source": "ccsess|ccsess-disabled|tmux|cli|vscode|exec|appServer|persona|dispatch|gateway",
+    "since_ts": 1786355258.0,
+    "busy": false,                       // cx/oc/dispatch 有;cc 缺席(見下)
+    "model": "opus", "model_provider": "openai",
+    "has_api_key": false,                // BYO-key **只報有無**,永不含值
+    "alive": true, "tmux_session": "…", "pane_pid": 6756,   // 僅 cc
+    "permission_mode": "acceptEdits", "session_id": "…"     // 僅 cc,撈得到才有
+  }],
+  "providers": {"claude_code": {"ok": true, "count": 8},
+                "codex": {"ok": false, "count": 0, "error": "CodexAppServerError"}},
+  "counts": {"total": 12, "managed": 12, "discovered": 0},
+  "generated_ts": 1786447811.2
+}
+```
+
+- **單路掛掉只降級,不 500**:`providers[p].ok=false` 代表那一路掃描失敗
+  (該 slice 為空)。app 應顯示「cx 掃描失敗」,**不要**當成那邊沒有 session。
+- **`busy` 在 cc 缺席**:cc 的忙碌判定要 capture tmux pane,放進掃描會造成
+  pane capture 風暴。cc 的 busy 請用 `/app/v2/sessions` 或
+  `/app/v2/registry/{id}/children`(那裡已有 3 秒快取的 busy)。
+- **掃描面完全唯讀**:tmux list-panes / ps 快照 / `thread/list` /
+  `sessions.list`。零 spawn、零 kill、零 send-keys。
+
+### 13.2 每路能發現到什麼(以及誠實的限制)
+
+| provider | 發現方式 | 使用者自開的看得到? | 限制 |
+|---|---|---|---|
+| `claude_code` | `tmux list-panes -a` 掃全機,**pane pid 的行程樹**認 claude,比對 `~/.config/ccsess/sessions.conf` | ✅ | **不在 tmux 裡的 claude 發現不到、也控制不了**(沒有 pane 可控,設計如此) |
+| `codex` | `thread/list`(`sourceKinds: cli/vscode/exec/appServer`) | ✅ | guardian/subagent thread 依既有規則濾掉 |
+| `hermes` | bridge 自有 persona POOL | ✅ | 恆 `managed`(白名單 persistent) |
+| `dispatch` | bridge 自有 SUBSESSIONS(人格雙手) | ✅ | 恆 `managed` |
+| `openclaw` | gateway `sessions.list` | ✅ | 未配置 gateway → 該路為空 |
+
+> ⚠️ `pane_current_command` **不能**用來認 claude:實測它回的是版本字串
+> (如 `2.1.207`)。一律走 pane pid 的行程樹 cmdline。
+
+`state` 判定:cc = 在 `sessions.conf` 且 `enabled=1` → `managed`
+(`enabled=0` 卻還活著 → `discovered`,`source=ccsess-disabled`);
+cx/openclaw = registry 有登記戶口(bridge 開的)→ `managed`,否則
+`discovered`;hermes/dispatch 恆 `managed`。
+
+### 13.3 `POST /app/v2/discovery/{id}/adopt` body `{purpose?, class?}`
+
+收編 = **純記帳**,回 `{ok, already_adopted, conf_updated, session}`
+(`session` 與 `/app/v2/registry` 的 row 同形狀)。
+
+**安全保證(可依賴)**:
+- cc:只往 `~/.config/ccsess/sessions.conf` 加/啟用一行(**寫前先備份**成
+  `sessions.conf.bak.<epoch>`,註解與行序原樣保留)。**不重啟、不 kill、
+  不送任何按鍵** —— pane 上跑到一半的 turn 一秒都不會斷。
+- cx / hermes / openclaw:**純 registry 登記**(它們本來就打得到)。
+- 已在名單的同名 lane **不覆蓋既有 workdir**(那是使用者的權威設定),
+  只在 `enabled=0` 時把它打開。
+- **不套配額**:行程早就在跑了,配額擋下來只會留下一個「看得到、管不到」
+  的孤兒,與收編的目的相反。
+
+收編後該 session `registered:true`、有 purpose/class/TTL、進得了家譜、
+受治理(reaper 可管)。錯誤:未知 id → `404 DISCOVERY_ID_UNKNOWN`;
+`class` 不是 `persistent|task|ephemeral` → `400`;重複收編 → `200` 冪等
+(`already_adopted: true`,不重寫檔案、不重複備份)。
+
+### 13.4 `POST /app/v2/discovery/{id}/release` body `{remove_from_conf?}`
+
+收編的逆操作:registry `registered=0`。**戶口保留**(歷史/家譜不消失),
+而 `registered=0` 本身就是 reaper 的免疫標記 —— 釋放後這條再也不會被自動
+收屍。cc 預設**保留** ccsess 名單(釋放治理 ≠ 要它別再自癒);
+`remove_from_conf: true` 才連名單那行一起移除(一樣先備份)。
+一樣不 kill、不重啟。
+
+### 13.5 與 `GET /app/v2/registry` 的關係
+
+發現但未收編的 session 會出現在 `/app/v2/registry` 的
+`sessions[]` 裡、`registered:false`(1a 既有契約)——app 的 FleetView 可以
+直接把它們渲染成「**未登記**」區塊,點一下打 `…/adopt` 收編。
+收編成功後該 id 就從未登記區移到正式戶口列。

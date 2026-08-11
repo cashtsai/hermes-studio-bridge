@@ -43,6 +43,7 @@ from pathlib import Path
 
 import agent_call as agent_call_policy
 import agent_registry
+import host_discovery
 import media_artifacts
 import hermes_media
 import openclaw_provider
@@ -8290,31 +8291,44 @@ async def _cc_session_jsonl(name: str, workdir: str):
 
 
 def _cc_conf_rows():
-    rows = []
     try:
         with open(CCSESS_CONF) as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith("#"):
-                    continue
-                parts = line.split("|")
-                if len(parts) >= 3:
-                    rows.append((parts[0], parts[1], parts[2].strip()))
+            return host_discovery.parse_conf_rows(f.read())
     except Exception as _exc:  # noqa: BLE001
         _log_exc("_cc_conf_rows", _exc, expected=True)
-        pass
-    return rows
+        return []
 
 
-def _cc_conf_upsert(name: str, workdir: str, enabled: str = "1") -> None:
-    """Update sessions.conf with the same lock convention as ccsess.
+# 寫 sessions.conf 前先留一份備份(全機收編 §2.3:這個檔是使用者手寫的
+# 常駐名單,bridge 動它之前一定要有可回滾的副本)。只留最近幾份免得長草。
+_CC_CONF_BACKUP_KEEP = int(os.environ.get("CCSESS_CONF_BACKUP_KEEP", "5") or 5)
 
-    Used only for explicit `--resume <sid>` sessions when ccsess' same-workdir
-    guard rejects a fixed lane. Those launches do not rely on `--continue`, so
-    the original same-workdir footgun does not apply.
+
+def _cc_conf_backup() -> str | None:
+    """複製一份 `sessions.conf.bak.<epoch>`;沒有原檔就不用備份。"""
+    try:
+        if not os.path.exists(CCSESS_CONF):
+            return None
+        dst = f"{CCSESS_CONF}.bak.{int(time.time())}"
+        shutil.copy2(CCSESS_CONF, dst)
+        olds = sorted(glob.glob(CCSESS_CONF + ".bak.*"))
+        for old in olds[:-_CC_CONF_BACKUP_KEEP] if _CC_CONF_BACKUP_KEEP > 0 else []:
+            try:
+                os.remove(old)
+            except OSError:
+                pass
+        return dst
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("_cc_conf_backup", _exc, expected=True)
+        return None
+
+
+def _cc_conf_mutate(transform) -> None:
+    """Rewrite sessions.conf under the same lock convention as ccsess.
+
+    `transform(lines) -> lines` 是純文字轉換(host_discovery 那幾支),
+    註解與行序原樣保留 —— 這個檔是 ccsess CLI 與使用者共用的。
     """
-    if not name:
-        return
     os.makedirs(os.path.dirname(CCSESS_CONF), exist_ok=True)
     lock = CCSESS_CONF + ".lock"
     deadline = time.monotonic() + 5.0
@@ -8334,20 +8348,9 @@ def _cc_conf_upsert(name: str, workdir: str, enabled: str = "1") -> None:
                 lines = f.read().splitlines()
         except FileNotFoundError:
             lines = []
-        out = []
-        found = False
-        for line in lines:
-            if not line or line.startswith("#"):
-                out.append(line)
-                continue
-            parts = line.split("|")
-            if parts and parts[0] == name:
-                out.append(f"{name}|{workdir}|{enabled}")
-                found = True
-            else:
-                out.append(line)
-        if not found:
-            out.append(f"{name}|{workdir}|{enabled}")
+        out = transform(lines)
+        if out is None:
+            return
         tmp = f"{CCSESS_CONF}.{os.getpid()}.tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             f.write("\n".join(out).rstrip() + "\n")
@@ -8357,6 +8360,19 @@ def _cc_conf_upsert(name: str, workdir: str, enabled: str = "1") -> None:
             os.rmdir(lock)
         except OSError:
             pass
+
+
+def _cc_conf_upsert(name: str, workdir: str, enabled: str = "1") -> None:
+    """Update sessions.conf with the same lock convention as ccsess.
+
+    Used only for explicit `--resume <sid>` sessions when ccsess' same-workdir
+    guard rejects a fixed lane, and by 全機收編(§2.3). Those launches do not
+    rely on `--continue`, so the original same-workdir footgun does not apply.
+    """
+    if not name:
+        return
+    _cc_conf_mutate(lambda lines: host_discovery.conf_upsert_lines(
+        lines, name, workdir, enabled))
 
 
 async def _cc_register_explicit_resume(name: str, workdir: str) -> None:
@@ -18150,6 +18166,21 @@ async def _registry_legacy_rows(known_ids: set) -> list:
                                                 s.get("name") or tid))
     except Exception as _exc:  # noqa: BLE001
         _log_exc("_registry_legacy_rows#cx", _exc, expected=True)
+    # §2.3:全機發現面掃到、但還沒收編的 session 也要在治理視圖露臉,
+    # app 的「未登記」區塊才看得到使用者自己在桌機開的那些(非 ccsess 名單
+    # 的 tmux claude、openclaw gateway session…)。掃描掛了不影響上面幾段。
+    try:
+        seen = set(known_ids) | {r["id"] for r in out}
+        payload = _discovery_snapshot_nonblocking() or {}
+        for it in payload.get("items", []):
+            sid = it.get("id") or ""
+            if not sid or sid in seen:
+                continue
+            seen.add(sid)
+            out.append(_registry_legacy_row(sid, it.get("provider") or "",
+                                            it.get("name") or sid))
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("_registry_legacy_rows#discovery", _exc, expected=True)
     return out
 
 
@@ -18277,6 +18308,377 @@ async def v2_registry_update(sid: str, request: Request):
         [r for r in all_rows if r.get("state") != "archived"])
     return {"ok": True,
             "session": _registry_public_row(row, children, by_id, now)}
+
+
+# ═══════ 全機發現與收編(SUBPROCESS_HARNESS_DESIGN_20260811 §2.3)═══════
+# 善彰:「那台機器上面的 hermes/openclaw、cc/cx、使用者開的子程序,就是應該
+# 收進來,讓他可以看到並且管理。」Pocket 是那台機器的**指揮艙**,不是只管
+# 「從 Pocket 開的」——所以掃全機、標 managed/discovered、可一鍵收編。
+#
+# 安全前提(整段程式碼的紅線):
+# - 掃描面**只讀**:tmux list-panes / ps 快照 / thread/list / sessions.list,
+#   零 spawn、零 kill、零 send-keys、零 restart。
+# - 收編是**純記帳**:cc = 加 ccsess 名單 + 登記戶口;cx/hermes/oc = 純登記。
+#   pane 上跑到一半的工作完全不受影響。
+# - api key **只回報有無**(has_api_key),值永不進 payload / log / 快取。
+# - 任何一路 provider 掛掉只讓那一路變空,絕不讓整個 sweep 500。
+
+_DISCOVERY_TTL = float(os.environ.get("DISCOVERY_TTL", "5.0"))
+# 每路 provider 的硬上限。實測這台機器 1100+ 行程時一次 `ps -axo` 就要 2~3 秒,
+# cc 那路(tmux + ps 快照 + ps -E)冷啟動會逼近 8 秒 —— 給到 15 秒才不會把
+# 「掃得到但太慢」誤報成「這路掛了」。掃描結果有 ~5 秒快取,攤下來不貴。
+_DISCOVERY_SLICE_TIMEOUT = float(os.environ.get("DISCOVERY_SLICE_TIMEOUT", "15.0"))
+# env 探測(BYO-key 標示)可關:掃 ps -E 會把使用者的 key 讀進行程記憶體
+# 一瞬間,雖然只留 bool,仍給一個總開關。
+_DISCOVERY_ENV_PROBE = (os.environ.get("DISCOVERY_ENV_PROBE", "1").lower()
+                        not in ("0", "false", "no", "off"))
+_DISCOVERY_CACHE: dict = {"ts": 0.0, "payload": None, "refreshing": False}
+_DISCOVERY_LOCK = asyncio.Lock()
+
+
+async def _proc_env_has_api_key(pids, names) -> dict:
+    """這些 pid 有沒有帶 API key env → `{pid: bool}`。
+
+    ⚠️ 這是全程式唯一會看到使用者 key 明文的地方(macOS 沒有 /proc,只能
+    `ps -E`)。契約:blob 只在這個函式的區域變數裡存在一瞬間,函式**只回
+    bool**,不回傳、不記錄、不快取任何環境變數內容。
+    """
+    pids = sorted({int(p) for p in (pids or []) if p})
+    if not pids or not _DISCOVERY_ENV_PROBE:
+        return {}
+    flags: dict = {}
+    try:
+        p = await asyncio.create_subprocess_exec(
+            "/bin/ps", "-E", "-o", "pid=,command=",
+            "-p", ",".join(str(x) for x in pids),
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+        try:
+            out, _ = await asyncio.wait_for(p.communicate(), 5.0)
+        except asyncio.TimeoutError:
+            try:
+                p.kill()
+            except ProcessLookupError:
+                pass
+            return {}
+        for line in (out or b"").decode("utf-8", "replace").splitlines():
+            parts = line.strip().split(None, 1)
+            if len(parts) != 2 or not parts[0].isdigit():
+                continue
+            flags[int(parts[0])] = host_discovery.env_blob_has_key(parts[1], names)
+        del out                       # blob 到此為止,只有 bool 活下來
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("_proc_env_has_api_key", _exc, expected=True)
+        return {}
+    return flags
+
+
+async def _discovery_cc_items() -> list:
+    """cc:掃全機 tmux pane,比對 `~/.config/ccsess/sessions.conf`。
+
+    `pane_current_command` 實測回的是版本字串(如 `2.1.207`)而不是
+    `claude`,**不能**拿來認 agent —— 一律回頭掃 pane pid 的行程樹 cmdline
+    (`_ps_snapshot` 已有 5 秒快取,不額外增加 ps 壓力)。
+    """
+    rc, out, _err = await _tmux_run("list-panes", "-a", "-F",
+                                    host_discovery.TMUX_PANE_FORMAT)
+    if rc != 0:
+        return []                     # tmux server 沒起來 = 這路沒有東西可發現
+    panes = host_discovery.parse_tmux_panes(out)
+    procs = await _ps_snapshot()
+    kids = host_discovery.build_child_map(procs)
+    claude_by_pane: dict = {}
+    for pane in panes:
+        hit = host_discovery.find_agent_proc(
+            pane["pane_pid"], procs, kids, host_discovery.is_claude_cmdline)
+        if hit:
+            claude_by_pane[pane["pane_pid"]] = {"pid": hit[0], "cmdline": hit[1]}
+    api_flags = await _proc_env_has_api_key(
+        [v["pid"] for v in claude_by_pane.values()],
+        host_discovery.API_KEY_ENV_BY_PROVIDER[host_discovery.CC_PROVIDER])
+    return host_discovery.cc_discovery_items(
+        panes, _cc_conf_rows(), claude_by_pane,
+        api_key_by_pid=api_flags if api_flags else None)
+
+
+async def _discovery_cx_items(registered_ids: set) -> list:
+    """cx:`thread/list` 的 sourceKinds 已含 cli/vscode/exec/appServer,
+    使用者自己 `codex` 開的本來就看得到,這裡只是把它當「可收編」呈現。"""
+    threads = await _codex_v2_visible_threads(40)
+    return host_discovery.cx_discovery_items(
+        [_codex_session_summary(t) for t in threads], registered_ids)
+
+
+async def _discovery_openclaw_items(registered_ids: set) -> list:
+    if not OPENCLAW.configured():
+        return []
+    return host_discovery.openclaw_discovery_items(
+        await _openclaw_v2_rows(40), registered_ids)
+
+
+def _discovery_apply_registry(items: list, rows_by_id: dict) -> list:
+    """把 registry 戶口疊上發現面:登記過的一律 managed,並帶出
+    registry_state / purpose / class 讓 app 直接渲染,不用再打一次 registry。"""
+    for it in items:
+        row = rows_by_id.get(it["id"])
+        if row is None:
+            it["registry_state"] = None
+            continue
+        it["registry_state"] = REGISTRY.effective_state(row)
+        it["purpose"] = row.get("purpose")
+        it["class"] = row.get("class")
+        if row.get("registered") and row.get("state") != "archived":
+            it["state"] = host_discovery.STATE_MANAGED
+    return items
+
+
+async def _discovery_sweep(force: bool = False) -> dict:
+    """四路發現面的一次掃描(~5 秒 TTL 快取 + single-flight)。
+
+    四路各自 try/except:cx app-server 掛了不該讓 cc 的清單跟著消失。
+    `providers` 欄位誠實回報哪一路掛了,app 可以顯示「cx 掃描失敗」而不是
+    假裝那邊沒有 session。
+    """
+    now = time.monotonic()
+    cached = _DISCOVERY_CACHE.get("payload")
+    if cached is not None and not force and \
+            now - float(_DISCOVERY_CACHE.get("ts") or 0) < _DISCOVERY_TTL:
+        return cached
+    async with _DISCOVERY_LOCK:
+        now = time.monotonic()
+        cached = _DISCOVERY_CACHE.get("payload")
+        if cached is not None and not force and \
+                now - float(_DISCOVERY_CACHE.get("ts") or 0) < _DISCOVERY_TTL:
+            return cached          # 等鎖期間別人剛掃完,不重複打 provider
+        _registry_ensure_personas()
+        rows = REGISTRY.list_rows(include_archived=True)
+        rows_by_id = {r["id"]: r for r in rows}
+        registered_ids = {r["id"] for r in rows
+                          if r.get("registered") and r.get("state") != "archived"}
+
+        async def _hermes():
+            return host_discovery.hermes_discovery_items(
+                [(mid, disp) for mid, (disp, _home) in PERSONAS.items()])
+
+        async def _dispatch():
+            return host_discovery.dispatch_discovery_items(dict(SUBSESSIONS))
+
+        slices = [
+            (host_discovery.CC_PROVIDER, _discovery_cc_items()),
+            (host_discovery.CX_PROVIDER, _discovery_cx_items(registered_ids)),
+            (host_discovery.HERMES_PROVIDER, _hermes()),
+            (host_discovery.DISPATCH_PROVIDER, _dispatch()),
+            (host_discovery.OPENCLAW_PROVIDER,
+             _discovery_openclaw_items(registered_ids)),
+        ]
+        results = await asyncio.gather(
+            *(asyncio.wait_for(coro, _DISCOVERY_SLICE_TIMEOUT)
+              for _p, coro in slices), return_exceptions=True)
+        items, providers = [], {}
+        for (prov, _coro), res in zip(slices, results):
+            if isinstance(res, BaseException):
+                _log_exc(f"_discovery_sweep#{prov}", res, expected=True)
+                providers[prov] = {"ok": False, "count": 0,
+                                   "error": type(res).__name__}
+                continue
+            items.extend(res)
+            providers[prov] = {"ok": True, "count": len(res)}
+        _discovery_apply_registry(items, rows_by_id)
+        payload = {"items": items, "providers": providers,
+                   "generated_ts": time.time()}
+        _DISCOVERY_CACHE["ts"] = time.monotonic()
+        _DISCOVERY_CACHE["payload"] = payload
+        return payload
+
+
+def _discovery_snapshot_nonblocking() -> dict | None:
+    """治理視圖(`/app/v2/registry`)用的發現面快照:**只吃已經掃好的快取**,
+    過期就在背景補掃一次,當下先用舊的(沒有就回 None)。
+
+    /app/v2/registry 是 app 高頻 poll 的端點,不該為了發現面等一趟冷掃
+    (實測這台機器冷掃 ~3 秒,ps 一次就 2~3 秒)。發現面在治理視圖裡是
+    「附加的未登記區塊」,晚一輪出現完全可以接受。
+    """
+    payload = _DISCOVERY_CACHE.get("payload")
+    age = time.monotonic() - float(_DISCOVERY_CACHE.get("ts") or 0)
+    if payload is not None and age < _DISCOVERY_TTL:
+        return payload
+    if not _DISCOVERY_CACHE.get("refreshing"):
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return payload
+        _DISCOVERY_CACHE["refreshing"] = True
+
+        async def _refresh():
+            try:
+                await _discovery_sweep(force=True)
+            except Exception as _exc:  # noqa: BLE001
+                _log_exc("_discovery_background_refresh", _exc, expected=True)
+            finally:
+                _DISCOVERY_CACHE["refreshing"] = False
+
+        task = loop.create_task(_refresh())
+        _BG_TASKS.add(task)
+        task.add_done_callback(_BG_TASKS.discard)
+    return payload
+
+
+async def _discovery_find(sid: str) -> dict | None:
+    """找一筆發現面項目;快取沒有就強制重掃一次(剛開的 session 也收得到)。"""
+    for force in (False, True):
+        payload = await _discovery_sweep(force=force)
+        for it in payload.get("items", []):
+            if it.get("id") == sid:
+                return it
+    return None
+
+
+def _discovery_registry_view(row: dict) -> dict:
+    now = time.time()
+    all_rows = REGISTRY.list_rows(include_archived=True)
+    by_id = {r["id"]: r for r in all_rows}
+    children = REGISTRY.children_ids(
+        [r for r in all_rows if r.get("state") != "archived"])
+    return _registry_public_row(row, children, by_id, now)
+
+
+@app.get("/app/v2/discovery")
+async def v2_discovery(request: Request, refresh: int = 0, provider: str = ""):
+    """全機發現面:那台機器上**每一個** agent session,標好誰已經在管。
+
+    `state`:`managed`(已在治理內)/ `discovered`(看得到、還沒收編,
+    reaper 永不碰)。`provider=cc,codex` 可過濾(逗號分隔,也吃
+    claude_code/cx 別名)。`refresh=1` 略過 ~5 秒快取。
+    """
+    _check_auth(request)
+    payload = await _discovery_sweep(force=bool(refresh))
+    items = payload["items"]
+    if provider:
+        alias = {"cc": host_discovery.CC_PROVIDER, "cx": host_discovery.CX_PROVIDER,
+                 "oc": host_discovery.OPENCLAW_PROVIDER}
+        wanted = {alias.get(p.strip(), p.strip())
+                  for p in provider.split(",") if p.strip()}
+        items = [i for i in items if i.get("provider") in wanted]
+    return {"items": items, "providers": payload["providers"],
+            "generated_ts": payload["generated_ts"],
+            "counts": {"total": len(items),
+                       "managed": sum(1 for i in items
+                                      if i.get("state") == host_discovery.STATE_MANAGED),
+                       "discovered": sum(1 for i in items
+                                         if i.get("state") == host_discovery.STATE_DISCOVERED)}}
+
+
+def _cc_conf_adopt(name: str, workdir: str) -> bool:
+    """把這個 pane 寫進 ccsess 常駐名單(冪等)。回「有沒有真的動到檔案」。
+
+    **只動設定檔**:不 respawn、不 kill、不送任何按鍵。pane 上跑到一半的
+    turn 完全不受影響 —— 收編就只是把它列進名單而已。
+
+    已在名單的同名 session **不覆蓋 workdir**(那是既有 lane 的權威設定,
+    使用者可能刻意設成別的目錄),只在 enabled=0 時把它打開。
+    """
+    if not name:
+        return False
+    existing = {n: (wd, en) for n, wd, en in _cc_conf_rows()}
+    if name in existing:
+        wd, enabled = existing[name]
+        if enabled == "1":
+            return False              # 已經在管了,不寫、不備份
+        _cc_conf_backup()
+        _cc_conf_upsert(name, wd, "1")
+        return True
+    _cc_conf_backup()
+    _cc_conf_upsert(name, workdir or "", "1")
+    return True
+
+
+def _cc_conf_release(name: str) -> bool:
+    """釋放時的選配動作:把該行整條從名單移除(先備份)。預設不做。"""
+    if not name or not any(n == name for n, _wd, _en in _cc_conf_rows()):
+        return False
+    _cc_conf_backup()
+    removed = {"hit": False}
+
+    def _tx(lines):
+        out, hit = host_discovery.conf_remove_lines(lines, name)
+        removed["hit"] = hit
+        return out if hit else None
+
+    _cc_conf_mutate(_tx)
+    return removed["hit"]
+
+
+@app.post("/app/v2/discovery/{sid:path}/adopt")
+async def v2_discovery_adopt(sid: str, request: Request):
+    """收編:body `{purpose?, class?}`。
+
+    收編 = **記帳**,不是重啟。cc 只多寫一行 ccsess 名單(先備份),
+    cx/hermes/openclaw 純登記(它們本來就打得到)。收編後這條就有
+    purpose/class/TTL、進得了家譜、受治理 —— 但進行中的工作一秒都不會斷。
+
+    未知 id → 404;已收編 → 200 冪等。
+    """
+    _check_auth(request)
+    body = await _json_body(request)
+    cls = body.get("class")
+    if cls is not None and cls not in agent_registry.CLASSES:
+        raise HTTPException(status_code=400,
+                            detail="class 必須是 persistent|task|ephemeral")
+    item = await _discovery_find(sid)
+    if item is None:
+        raise http_err(404, "DISCOVERY_ID_UNKNOWN",
+                       "發現面沒有這個 session",
+                       f"unknown discovery id: {sid}")
+    prev = REGISTRY.get(sid)
+    already = bool(prev and prev.get("registered")
+                   and prev.get("state") != "archived")
+    conf_updated = False
+    if item.get("provider") == host_discovery.CC_PROVIDER:
+        conf_updated = _cc_conf_adopt(item.get("name") or "",
+                                      item.get("workdir") or "")
+    row = REGISTRY.adopt(
+        sid, provider=item.get("provider") or "", name=item.get("name") or sid,
+        purpose=body.get("purpose") or "", cls=cls,
+        parent=item.get("parent") or None,
+        worktree=item.get("workdir") or None,
+        meta={"adopted_source": item.get("source") or "discovery"})
+    _DISCOVERY_CACHE["ts"] = 0.0      # 下次 sweep 立刻反映新狀態
+    _log_event("discovery_adopted", session=sid,
+               provider=item.get("provider") or "", cls=cls or row.get("class"),
+               already=already, conf_updated=conf_updated)
+    return {"ok": True, "already_adopted": already,
+            "conf_updated": conf_updated,
+            "session": _discovery_registry_view(row)}
+
+
+@app.post("/app/v2/discovery/{sid:path}/release")
+async def v2_discovery_release(sid: str, request: Request):
+    """收編的逆操作:registry 取消登記(registered=0 → reaper 永不碰它)。
+
+    body `{remove_from_conf?}`:cc 預設**保留** ccsess 名單(釋放治理不等
+    於要它別再自癒);帶 true 才連名單那行一起移除(先備份)。
+    一樣不 kill、不重啟 —— 釋放只是不管它了,不是收掉它。
+    """
+    _check_auth(request)
+    body = await _json_body(request)
+    row = REGISTRY.get(sid)
+    item = await _discovery_find(sid) if row is None else None
+    if row is None and item is None:
+        raise http_err(404, "DISCOVERY_ID_UNKNOWN",
+                       "發現面與 registry 都沒有這個 session",
+                       f"unknown discovery id: {sid}")
+    conf_removed = False
+    want_remove = str(body.get("remove_from_conf", "")).strip().lower() \
+        in ("1", "true", "yes", "on")
+    if sid.startswith(host_discovery.CC_PROVIDER + ":") and want_remove:
+        conf_removed = _cc_conf_release(sid.split(":", 1)[1])
+    released = REGISTRY.release(sid)
+    _DISCOVERY_CACHE["ts"] = 0.0
+    _log_event("discovery_released", session=sid,
+               conf_removed=conf_removed, had_row=bool(row))
+    return {"ok": True, "released": released is not None,
+            "conf_removed": conf_removed,
+            "session": _discovery_registry_view(released) if released else None}
 
 
 # ═════════════ Agent 互調 agent_call(藍圖 AGENT_INTEROP §1,1c)═════════════
