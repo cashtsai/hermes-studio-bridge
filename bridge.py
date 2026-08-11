@@ -3347,7 +3347,7 @@ APNS_KEY_ID = os.environ.get("APNS_KEY_ID", "9XNQ4PS546")
 APNS_TEAM_ID = os.environ.get("APNS_TEAM_ID", "4F8B93R3SH")
 # 正式 app 是 Pocket kernel(com.pocketagent.kernel,見 ship-kernel.sh)。apns-topic
 # 必須對上 device token 所屬 app,否則 APNs 回 400 BadTopic / DeviceTokenNotForTopic
-# → 推播全滅(2026-07 之前寫成舊 SUN 的 com.pocketagent.ios,推播在正式版 100% 死)。
+# → 推播全滅(2026-07 之前寫成舊版 bundle id com.pocketagent.ios,正式版 100% 死)。
 # token-based(.p8)是 team 級,對同 team 任何 bundle 都有效,只要 topic 對。
 APNS_BUNDLE_ID = os.environ.get("APNS_BUNDLE_ID", "com.pocketagent.kernel")
 APNS_HOST = os.environ.get(
@@ -3568,7 +3568,7 @@ async def push_notify(title: str, body: str, data: dict | None = None,
                 sent += 1
             elif (code == 410 or "BadDeviceToken" in text or "Unregistered" in text
                   or "DeviceTokenNotForTopic" in text):
-                # DeviceTokenNotForTopic = 舊 SUN(.ios)遺留 token,對 .kernel 永遠不合 → 清掉。
+                # DeviceTokenNotForTopic = 舊版(.ios)遺留 token,對 .kernel 永遠不合 → 清掉。
                 _device_remove(tok)
                 failures.append({"code": code, "detail": "wrong-app/unregistered→pruned",
                                  "token": tok[:8]})
