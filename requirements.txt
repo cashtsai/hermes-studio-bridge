@@ -1,0 +1,14 @@
+# Pocket bridge runtime dependencies.
+# 依賴長期只隱含在 deploy/install-local-bridge.sh 的 pip install 行裡 —— 抽出來
+# 讓各平台安裝器(mac/ubuntu)與 CI 共用同一份真相。版本先不釘,與現行安裝行為
+# 一致;要釘版時在這裡釘,不要回去改安裝腳本。
+fastapi
+uvicorn
+httpx
+PyJWT
+cryptography
+websockets
+python-multipart
+eval_type_backport
+# /pair/qr 本機配對頁的 QR 產生(pocket-pair.py 既有依賴,正式收編)
+qrcode

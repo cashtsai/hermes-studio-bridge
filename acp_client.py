@@ -19,9 +19,21 @@ import json
 import os
 import uuid
 
-HERMES_BIN = "/Users/xcash/apps/hermes-agent/runtime/venv/bin/hermes"
+def _first_existing(paths, fallback):
+    for p in paths:
+        full = os.path.expanduser(p)
+        if os.path.exists(full):
+            return full
+    return os.path.expanduser(fallback)
+
+
+HERMES_BIN = os.path.expanduser(os.environ.get("HERMES_BIN", "")) or _first_existing(
+    ["~/apps/hermes-agent/runtime/venv/bin/hermes",
+     "~/apps/hermes-agent/venv/bin/hermes",
+     "~/.local/bin/hermes"],
+    "~/apps/hermes-agent/runtime/venv/bin/hermes")
 ACP_STREAM_LIMIT = 128 * 1024 * 1024
-LOBSTER_ROOT = "/Users/xcash/apps/lobster-tg"
+LOBSTER_ROOT = os.path.expanduser(os.environ.get("LOBSTER_ROOT", "~/apps/lobster-tg"))
 
 
 def workspace_cwd_for(key: str, home: str) -> str:

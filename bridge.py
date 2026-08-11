@@ -3963,7 +3963,8 @@ async def chat_completions(request: Request):
     })
 
 
-CLAUDE_BIN = "/Users/xcash/.local/bin/claude"
+CLAUDE_BIN = os.path.expanduser(os.environ.get("CLAUDE_BIN", "")) or (
+    shutil.which("claude") or os.path.expanduser("~/.local/bin/claude"))
 # 用能讀「新版 thread」的 codex 當 app-server。VS Code 用 codex 0.142 建 thread,
 # 舊的 standalone 0.137(~/.local/bin/codex)一讀其 full turns(thread/turns/list
 # itemsView=full)就 crash → UPSTREAM_FAILED「codex app-server stopped」,整條 stdio
@@ -3977,10 +3978,11 @@ def _resolve_codex_bin() -> str:
     for c in (os.environ.get("CODEX_BIN"),
               "/Applications/Codex.app/Contents/Resources/codex",
               "/Applications/ChatGPT.app/Contents/Resources/codex",
-              os.path.expanduser("~/.local/bin/codex")):
+              os.path.expanduser("~/.local/bin/codex"),
+              shutil.which("codex")):
         if c and os.path.exists(c):
             return c
-    return "/Users/xcash/.local/bin/codex"
+    return os.path.expanduser("~/.local/bin/codex")
 
 
 CODEX_BIN = _resolve_codex_bin()   # 僅供顯示/預設;spawn 走 _resolve_codex_bin()
@@ -6365,7 +6367,8 @@ def _claude_argv(parent: str, prompt: str, resume: str | None = None):
     mem_home = home_for(parent or "yuanfang")
     mcp_cfg = json.dumps({"mcpServers": {"studio-memory": {
         "command": "python3",
-        "args": ["/Users/xcash/apps/hermes-openwebui-bridge/studio_memory_mcp.py"],
+        "args": [os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                              "studio_memory_mcp.py")],
         "env": {"STUDIO_MEMORY_HOME": mem_home}}}}, ensure_ascii=False)
     hint = ("你可以用 studio-memory MCP 的 read_memory / search_memory 讀善彰的"
             "Hermes 長期記憶(身份、持倉、專案、人脈),做任務前先讀以對齊脈絡;"
@@ -16780,6 +16783,20 @@ async def app_agents_auth(request: Request):
     return await _agent_auth_status()
 
 
+def _host_capabilities() -> dict:
+    """這台龍蝦主機支援哪些 provider — 給 app 依能力顯示/隱藏功能,而不是
+    讓不支援的功能看起來像壞掉(Windows/精簡安裝沒有 tmux/CC 時尤其重要)。
+    全部只做便宜的存在性檢查,不 spawn 任何行程。"""
+    has_tmux = bool(shutil.which(TMUX_BIN) or shutil.which("tmux"))
+    return {
+        "cc": has_tmux and os.path.exists(CLAUDE_BIN),
+        "cx": os.path.exists(_resolve_codex_bin()),
+        "hermes": os.path.exists(HERMES_BIN),
+        "openclaw": OPENCLAW.configured(),
+        "terminal": POCKET_TERMINAL_ENABLED,
+    }
+
+
 @app.get("/health")
 async def health():
     # turns_in_flight:給安全重啟腳本(scripts/bridge-safe-restart.sh)看的 ——
@@ -16791,7 +16808,8 @@ async def health():
     return {"ok": True, "personas": list(PERSONAS),
             "subsessions": len(SUBSESSIONS),
             "bg_tasks": len(_BG_TASKS),
-            "turns_in_flight": inflight}
+            "turns_in_flight": inflight,
+            "capabilities": _host_capabilities()}
 
 
 # ───────────────────────── log rotation (issue #7 item 6) ──────────────────
