@@ -112,6 +112,28 @@ class AgentRegistry:
                 meta TEXT NOT NULL DEFAULT '{}')""")
             con.execute("CREATE INDEX IF NOT EXISTS idx_reg_parent ON sessions(parent)")
             con.execute("CREATE INDEX IF NOT EXISTS idx_reg_state ON sessions(state)")
+            # agent_call(1c)的 call 帳本:誰調了誰、chain 家譜(root/parent/
+            # depth)、結果。與 sessions 同庫 —— Pocket 編隊視圖一次查得到
+            # session 樹 + call 鏈;絕不碰 canonical.db/state.db。
+            con.execute("""CREATE TABLE IF NOT EXISTS agent_calls(
+                id TEXT PRIMARY KEY,
+                caller TEXT NOT NULL,
+                target TEXT NOT NULL,
+                mode TEXT NOT NULL,
+                message TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'running',
+                reply TEXT,
+                error TEXT,
+                root_call_id TEXT NOT NULL,
+                parent_call_id TEXT,
+                depth INTEGER NOT NULL DEFAULT 1,
+                created_ts REAL NOT NULL,
+                updated_ts REAL NOT NULL,
+                finished_ts REAL,
+                meta TEXT NOT NULL DEFAULT '{}')""")
+            con.execute("CREATE INDEX IF NOT EXISTS idx_ac_target ON agent_calls(target)")
+            con.execute("CREATE INDEX IF NOT EXISTS idx_ac_caller ON agent_calls(caller)")
+            con.execute("CREATE INDEX IF NOT EXISTS idx_ac_root ON agent_calls(root_call_id)")
             con.commit()
         finally:
             con.close()
@@ -408,3 +430,149 @@ class AgentRegistry:
                     continue                  # 還沒到期,再等等
             out.append(r)
         return out
+
+    # ── agent_call 帳本(1c:互調的 call 列,chain 家譜可查)────────────────
+    @staticmethod
+    def _call_row_dict(row) -> dict:
+        d = dict(row)
+        try:
+            d["meta"] = json.loads(d.get("meta") or "{}")
+        except ValueError:
+            d["meta"] = {}
+        return d
+
+    def call_create(self, call_id: str, *, caller: str, target: str,
+                    mode: str, message: str = "", status: str = "running",
+                    root_call_id: str | None = None,
+                    parent_call_id: str | None = None, depth: int = 1,
+                    error: str | None = None, meta: dict | None = None) -> dict:
+        """落一筆 call。root_call_id 缺省 = 自己是 root(chain 家譜起點)。
+        message 只留前 2000 字(帳本要能追責,但不是聊天備份)。"""
+        now = time.time()
+        with self._lock:
+            con = self._connect()
+            try:
+                con.execute(
+                    """INSERT INTO agent_calls(id, caller, target, mode, message,
+                       status, error, root_call_id, parent_call_id, depth,
+                       created_ts, updated_ts, finished_ts, meta)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (call_id, caller, target, mode, (message or "")[:2000],
+                     status, error, root_call_id or call_id,
+                     parent_call_id or None, int(depth), now, now,
+                     now if status != "running" else None,
+                     json.dumps(meta or {}, ensure_ascii=False)))
+                con.commit()
+            finally:
+                con.close()
+        return self.call_get(call_id) or {}
+
+    def call_update(self, call_id: str, *, status: str | None = None,
+                    reply: str | None = None, error: str | None = None,
+                    meta_merge: dict | None = None) -> dict | None:
+        with self._lock:
+            con = self._connect()
+            try:
+                row = con.execute("SELECT * FROM agent_calls WHERE id=?",
+                                  (call_id,)).fetchone()
+                if row is None:
+                    return None
+                d = self._call_row_dict(row)
+                sets, args = ["updated_ts=?"], [time.time()]
+                if status is not None:
+                    sets.append("status=?")
+                    args.append(status)
+                    if status != "running" and d.get("finished_ts") is None:
+                        sets.append("finished_ts=?")
+                        args.append(time.time())
+                if reply is not None:
+                    sets.append("reply=?")
+                    args.append(reply)
+                if error is not None:
+                    sets.append("error=?")
+                    args.append(error)
+                if meta_merge:
+                    m = dict(d.get("meta") or {})
+                    m.update(meta_merge)
+                    sets.append("meta=?")
+                    args.append(json.dumps(m, ensure_ascii=False))
+                args.append(call_id)
+                con.execute(f"UPDATE agent_calls SET {', '.join(sets)} WHERE id=?",
+                            args)
+                con.commit()
+                fresh = con.execute("SELECT * FROM agent_calls WHERE id=?",
+                                    (call_id,)).fetchone()
+                return self._call_row_dict(fresh)
+            finally:
+                con.close()
+
+    def call_get(self, call_id: str) -> dict | None:
+        con = self._connect()
+        try:
+            row = con.execute("SELECT * FROM agent_calls WHERE id=?",
+                              (call_id,)).fetchone()
+            return self._call_row_dict(row) if row is not None else None
+        finally:
+            con.close()
+
+    def call_list(self, session: str | None = None, root: str | None = None,
+                  limit: int = 50) -> list[dict]:
+        """查帳:某 session 參與的 call(caller 或 target)/ 某 chain 全列。
+        新→舊(Pocket 呼叫鏈視圖的資料源)。"""
+        con = self._connect()
+        try:
+            q, args = "SELECT * FROM agent_calls", []
+            conds = []
+            if session:
+                conds.append("(caller=? OR target=?)")
+                args += [session, session]
+            if root:
+                conds.append("root_call_id=?")
+                args.append(root)
+            if conds:
+                q += " WHERE " + " AND ".join(conds)
+            q += " ORDER BY created_ts DESC LIMIT ?"
+            args.append(max(1, int(limit)))
+            return [self._call_row_dict(r) for r in con.execute(q, args)]
+        finally:
+            con.close()
+
+    def call_active_for_target(self, target: str,
+                               recent_secs: float = 600.0) -> dict | None:
+        """chain 推斷:現在有沒有 call 正打在 `target` 身上?有 → target 發出
+        的新 call 視為同 chain 的下一層。running 恆算;sent/done(fire_and_
+        forget 或剛收割完)在 recent_secs 回看窗內也算 —— 投遞完成不代表
+        目標的 turn 結束,窗內的外呼大概率仍是奉命行事。"""
+        con = self._connect()
+        try:
+            row = con.execute(
+                "SELECT * FROM agent_calls WHERE target=? AND ("
+                " status='running' OR"
+                " (status IN ('sent','done') AND updated_ts >= ?))"
+                " ORDER BY created_ts DESC LIMIT 1",
+                (target, time.time() - float(recent_secs))).fetchone()
+            return self._call_row_dict(row) if row is not None else None
+        finally:
+            con.close()
+
+    def call_ancestors(self, call_row: dict, max_hops: int = 12) -> list[dict]:
+        """含自身往上追整條 chain(新→舊)。斷鏈/超 hop 就停,絕不無窮迴圈。"""
+        out, cur, seen = [], call_row, set()
+        while cur is not None and len(out) < max_hops:
+            cid = str(cur.get("id") or "")
+            if not cid or cid in seen:
+                break
+            seen.add(cid)
+            out.append(cur)
+            pid = str(cur.get("parent_call_id") or "")
+            cur = self.call_get(pid) if pid else None
+        return out
+
+    def call_chain_size(self, root_call_id: str) -> int:
+        con = self._connect()
+        try:
+            return int(con.execute(
+                "SELECT COUNT(*) FROM agent_calls WHERE root_call_id=?"
+                " AND status != 'denied'", (root_call_id,)).fetchone()[0])
+        finally:
+            con.close()

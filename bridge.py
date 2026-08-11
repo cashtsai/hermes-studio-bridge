@@ -39,6 +39,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
+import agent_call as agent_call_policy
 import agent_registry
 import media_artifacts
 import hermes_media
@@ -16206,6 +16207,8 @@ async def dispatch(request: Request):
     reg_parent = (str(body.get("parent_session") or "").strip()
                   or (f"hermes:{parent}" if parent in PERSONAS else None))
     reg_cls = _registry_class_of(body, default_cls="task")
+    if body.get("parent_session"):
+        _registry_validate_parent(reg_parent)   # addendum 1:明給的 parent 必須存在
     _registry_precheck_or_429(reg_parent, reg_cls)
     sid = "sub-" + uuid.uuid4().hex[:16]
     SUBSESSIONS[sid] = {"name": task[:40], "parent": parent, "tool": tool,
@@ -16880,7 +16883,36 @@ def _registry_spawn_fields(body: dict, default_cls: str = "task"):
     if not purpose:
         _log_event("registry_purpose_missing", cls=cls, parent=parent or "")
         purpose = agent_registry.DEFAULT_PURPOSE
+    _registry_validate_parent(parent)
     return parent, cls, purpose
+
+
+def _registry_validate_parent(parent: str | None) -> None:
+    """App 明給 parent 時的驗證(addendum 1):parent 必須是 registry 戶口或
+    可解析的 live session。旁路 live session(如既有 CC lane)→ 現場補一筆
+    registered=False 記帳戶口,家譜連得起來、reaper 永不碰;完全未知 → 400。
+    沒給 parent = 今日行為,零影響。"""
+    if not parent or REGISTRY.get(parent) is not None:
+        return
+    known = parent in SUBSESSIONS
+    if not known:
+        try:
+            _v2_card_source(parent)
+            known = True
+        except Exception:  # noqa: BLE001  (HTTPException/BridgeError 皆=未知)
+            known = False
+    if not known:
+        raise http_err(400, "REGISTRY_BAD_PARENT",
+                       f"parent 不是已知 session:{parent}")
+    provider = parent.split(":", 1)[0] if ":" in parent else "dispatch"
+    try:
+        REGISTRY.register(parent, provider=provider,
+                          name=parent.split(":", 1)[-1],
+                          purpose="(旁路 session,補記帳供家譜連結)",
+                          cls="task", registered=False, enforce_quota=False)
+        _log_event("registry_parent_backfilled", parent=parent)
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("_registry_validate_parent", _exc, expected=True)
 
 
 def _registry_precheck_or_429(parent: str | None, cls: str) -> None:
@@ -16957,6 +16989,9 @@ async def _registry_is_busy(sid: str) -> bool:
         if kind == "sub":
             sub = SUBSESSIONS.get(ref)
             return bool(sub and sub.get("status") == "running")
+        if kind == "hp":
+            s = POOL._sessions.get(ref)   # 只窺不生:不為測 busy 冷啟 ACP
+            return bool(s and s.is_busy())
         if kind == "dlg":
             meta = (REGISTRY.get(sid) or {}).get("meta") or {}
             if meta.get("cc_session_name"):
@@ -17186,6 +17221,47 @@ async def v2_registry_sweep(request: Request):
     return {"archived": archived}
 
 
+# addendum 2:Pocket 父 session 設定頁的「子程序」面板 poll 這裡。busy 是
+# provider 現成信號(與 reaper 同一套 _registry_is_busy),但 CC 的判定要
+# capture tmux pane —— 為避免 poll 造成 pane capture 風暴,加 3 秒 TTL 快取;
+# 面板可接受 ≤3s 的 busy 陳舊度(state/last_active_ts 恆為即時值)。
+_REGISTRY_BUSY_CACHE: dict = {}   # sid -> (monotonic_ts, busy)
+_REGISTRY_BUSY_TTL = float(os.environ.get("REGISTRY_BUSY_TTL", "3.0"))
+
+
+async def _registry_busy_cached(sid: str) -> bool:
+    ent = _REGISTRY_BUSY_CACHE.get(sid)
+    now = time.monotonic()
+    if ent is not None and now - ent[0] < _REGISTRY_BUSY_TTL:
+        return ent[1]
+    busy = await _registry_is_busy(sid)
+    _REGISTRY_BUSY_CACHE[sid] = (now, busy)
+    if len(_REGISTRY_BUSY_CACHE) > 500:      # poll 對象有限,防禦性封頂即可
+        _REGISTRY_BUSY_CACHE.clear()
+    return busy
+
+
+@app.get("/app/v2/registry/{sid}/children")
+async def v2_registry_children(sid: str, request: Request):
+    """某 parent 的子 session 清單 + 即時 busy(addendum 2)。
+    形狀:{children:[{id, provider, name, purpose, class, state, busy,
+    last_active_ts}]}。parent 本身不需在 registry(旁路 parent 名下也可能
+    有登記過的孩子);archived 的孩子不列。"""
+    _check_auth(request)
+    now = time.time()
+    out = []
+    for r in REGISTRY.list_rows():
+        if r.get("parent") != sid:
+            continue
+        out.append({"id": r["id"], "provider": r["provider"],
+                    "name": r["name"], "purpose": r["purpose"],
+                    "class": r["class"],
+                    "state": REGISTRY.effective_state(r, now),
+                    "busy": await _registry_busy_cached(r["id"]),
+                    "last_active_ts": r["last_active_ts"]})
+    return {"children": out}
+
+
 @app.post("/app/v2/registry/{sid}/archive")
 async def v2_registry_archive_one(sid: str, request: Request):
     """手動歸檔單一 session。記帳恆做;destructive teardown 看 REGISTRY_REAPER。"""
@@ -17235,6 +17311,407 @@ async def v2_registry_update(sid: str, request: Request):
         [r for r in all_rows if r.get("state") != "archived"])
     return {"ok": True,
             "session": _registry_public_row(row, children, by_id, now)}
+
+
+# ═════════════ Agent 互調 agent_call(藍圖 AGENT_INTEROP §1,1c)═════════════
+# bridge 是互調的**唯一 hub**:persona/cc/cx/openclaw 互相調用一律走
+# POST /app/v2/agent_call,內部打現成的 v2 統一輸入路徑(v2_session_input),
+# 不引入 agent 對 agent 直連(單一信任邊界、單一審計點)。
+# 護欄(agent_call.py):AGENT_CALL=1 旗標(預設 OFF)、政策檔 default DENY、
+# 深度 ≤2、循環拒絕、chain 預算;每次調用/回覆/拒絕落「🔗 代理互調」audit 卡
+# 進雙方卡片流。**絕不代審**:目標端 CC/CX approval 照常走,這裡沒有任何
+# 自動核准路徑。call 帳本落 registry DB(agent_calls 表,家譜可查)。
+
+_AGENT_CALL_WAITERS: dict = {}   # call_id -> asyncio.Task(background 收割人)
+
+
+def _agent_call_enabled() -> bool:
+    """旗標每次呼叫讀 env:預設 OFF,merge 零風險;善彰在 plist 加
+    AGENT_CALL=1 後重啟啟用(同 CC_TOKEN_STREAM 的開關慣例)。"""
+    return str(os.environ.get("AGENT_CALL", "")).strip().lower() in (
+        "1", "true", "yes", "on")
+
+
+def _agent_call_require_enabled() -> None:
+    if not _agent_call_enabled():
+        raise http_err(404, "AGENT_CALL_DISABLED",
+                       "agent_call 未啟用(需 AGENT_CALL=1 + 政策檔)")
+
+
+def _agent_call_timeout_default() -> float:
+    try:
+        return float(os.environ.get("AGENT_CALL_TIMEOUT", "") or 120.0)
+    except ValueError:
+        return 120.0
+
+
+def _agent_call_bg_timeout() -> float:
+    """background/await 轉背景後的收割窗上限(超過即 timeout 終態)。"""
+    try:
+        return float(os.environ.get("AGENT_CALL_BG_TIMEOUT", "") or 1800.0)
+    except ValueError:
+        return 1800.0
+
+
+def _agent_call_reply_max() -> int:
+    try:
+        return int(os.environ.get("AGENT_CALL_REPLY_MAX", "") or 4000)
+    except ValueError:
+        return 4000
+
+
+def _agent_call_normalize_sid(sid: str) -> str:
+    """裸 persona id → hermes:{id}(政策檔與 API 都收得了兩種寫法)。"""
+    sid = (sid or "").strip()
+    if sid and ":" not in sid and sid in PERSONAS:
+        return f"hermes:{sid}"
+    return sid
+
+
+def _agent_call_public(row: dict) -> dict:
+    return {"call_id": row["id"], "caller": row["caller"],
+            "target": row["target"], "mode": row["mode"],
+            "status": row["status"], "reply": row.get("reply"),
+            "error": row.get("error"),
+            "root_call_id": row.get("root_call_id"),
+            "parent_call_id": row.get("parent_call_id"),
+            "depth": row.get("depth"),
+            "created_ts": row.get("created_ts"),
+            "finished_ts": row.get("finished_ts")}
+
+
+class _AgentCallInputRequest:
+    """v2_session_input 的 Request 替身:沿用原請求的 headers(auth 原樣過
+    _check_auth)與來源位址,body 換成 bridge 代組的輸入。這樣 agent_call
+    是**真重用**統一輸入路徑(冪等/registry touch/各 provider 分支全走原碼),
+    不是複製一份。"""
+
+    def __init__(self, request: Request, body: dict):
+        self.headers = request.headers
+        self.client = request.client
+        self._body = body
+
+    async def json(self):
+        return self._body
+
+
+async def _agent_call_audit(call: dict, phase: str, text: str,
+                            sids: list) -> None:
+    """audit 卡:kind "text" + 「🔗 代理互調」前綴 + fallback_text(舊 app
+    照純文字渲染)。upsert 進每個 sid 的卡片流;單邊失敗只留痕不擋事。"""
+    txt = f"🔗 代理互調|{text}"
+    for sid in dict.fromkeys([s for s in sids if s]):
+        try:
+            store = await _v2_card_store(sid)
+            store.upsert_card(carddigest.make_card(
+                f"card-agentcall-{call['id']}-{phase}", "", "assistant", "text",
+                {"text": txt, "fallback_text": txt, "origin": "agent_call",
+                 "call_id": call["id"], "phase": phase,
+                 "caller": call["caller"], "target": call["target"],
+                 "mode": call["mode"]}))
+        except Exception as _exc:  # noqa: BLE001
+            _log_exc("_agent_call_audit", _exc, expected=True, session=sid)
+
+
+def _agent_call_collect_reply(store, since_seq: int) -> str:
+    """從目標卡片流收割回覆:since_seq 之後 assistant 的 text/markdown 卡
+    (排除 agent_call 自己的 audit 卡與 registry 警告卡),同卡多 rev 取最新,
+    合併後截到 AGENT_CALL_REPLY_MAX。"""
+    picked: dict = {}
+    order: list = []
+    for ev in store.events:
+        if ev["seq"] <= since_seq or ev.get("type") != "card.upsert":
+            continue
+        card = (ev.get("data") or {}).get("card") or {}
+        if card.get("role") != "assistant":
+            continue
+        if card.get("kind") not in ("text", "markdown"):
+            continue
+        body = card.get("body") or {}
+        origin = str(body.get("origin") or "")
+        if origin.startswith("agent_call") or origin == "registry.reap_warning":
+            continue
+        t = str(body.get("text") or body.get("fallback_text") or "").strip()
+        if not t:
+            continue
+        if card["id"] not in picked:
+            order.append(card["id"])
+        picked[card["id"]] = t
+    reply = "\n\n".join(picked[cid] for cid in order).strip()
+    cap = _agent_call_reply_max()
+    if len(reply) > cap:
+        reply = reply[:cap] + "…(回覆過長,已截斷)"
+    return reply
+
+
+async def _agent_call_waiter(call_id: str, caller: str, target: str,
+                             store, since_seq: int) -> dict | None:
+    """收割人:掛在目標卡片流上等 turn end → 收 assistant 回覆。
+    subscribers+1 讓 CC follower 願意巡 status/發 turn 事件(同 SSE 訂閱者
+    語意);絕不碰 approval —— 目標若停在待審,這裡就一路等到收割窗關。"""
+    deadline = time.time() + _agent_call_bg_timeout()
+    store.subscribers += 1
+    waker = store.attach_waker()
+    cursor = since_seq
+    end_seen = False
+    try:
+        while True:
+            fresh = [e for e in store.events if e["seq"] > cursor]
+            if fresh:
+                cursor = fresh[-1]["seq"]
+                if any(e.get("type") == "turn" and
+                       (e.get("data") or {}).get("state") == "end"
+                       for e in fresh):
+                    end_seen = True
+            if end_seen:
+                reply = _agent_call_collect_reply(store, since_seq)
+                if reply:
+                    row = REGISTRY.call_update(call_id, status="done",
+                                               reply=reply)
+                    _log_event("agent_call_done", call=call_id, caller=caller,
+                               target=target, reply_chars=len(reply))
+                    await _agent_call_audit(
+                        row, "reply",
+                        f"{target} 已回覆 {caller}(call {call_id[-8:]}):"
+                        f"{reply[:200]}", [caller, target])
+                    return row
+            remain = deadline - time.time()
+            if remain <= 0:
+                row = REGISTRY.call_update(
+                    call_id, status="timeout",
+                    error="收割窗內未等到目標回覆(turn 未完成或無文字輸出)")
+                _log_event("agent_call_timeout", call=call_id, caller=caller,
+                           target=target)
+                await _agent_call_audit(
+                    row, "timeout",
+                    f"{caller} → {target} 的調用(call {call_id[-8:]})逾時未收到"
+                    f"回覆;目標可能仍在執行或停在待審(審核照常需人工核准)",
+                    [caller, target])
+                return row
+            waker.clear()
+            try:
+                await asyncio.wait_for(waker.wait(),
+                                       timeout=min(5.0, max(0.1, remain)))
+            except asyncio.TimeoutError:
+                pass
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("_agent_call_waiter", _exc, call=call_id)
+        row = REGISTRY.call_update(call_id, status="error",
+                                   error=f"收割失敗:{_exc}")
+        return row
+    finally:
+        store.subscribers -= 1
+        store.detach_waker(waker)
+        _AGENT_CALL_WAITERS.pop(call_id, None)
+
+
+def _agent_call_record_denial(call_id: str, caller: str, target: str,
+                              mode: str, message: str, code: str,
+                              reason: str) -> dict:
+    row = REGISTRY.call_create(call_id, caller=caller, target=target,
+                               mode=mode, message=message, status="denied",
+                               error=reason)
+    _log_event("agent_call_denied", call=call_id, caller=caller,
+               target=target, code=code, reason=reason)
+    return row
+
+
+async def _agent_call_deny(call_id: str, caller: str, target: str, mode: str,
+                           message: str, code: str, reason: str,
+                           status: int) -> None:
+    """拒絕三件套:落帳(denied)、audit 卡(caller 必發;target 已有 store
+    才發,不為一張拒絕卡新建 store)、丟 HTTP。"""
+    row = _agent_call_record_denial(call_id, caller, target, mode, message,
+                                    code, reason)
+    sids = [caller]
+    if _registry_card_store(target) is not None:
+        sids.append(target)
+    await _agent_call_audit(row, "denied",
+                            f"拒絕 {caller} → {target}:{reason}", sids)
+    raise http_err(status, code, reason)
+
+
+@app.post("/app/v2/agent_call")
+async def v2_agent_call(request: Request):
+    """agent 互調入口(藍圖 §1)。body:
+    {caller: session_id, target: session_id|persona_id, message,
+     mode: fire_and_forget|await_reply|background, timeout_secs?,
+     parent_call_id?}。
+
+    caller 自報身分(信任邊界 = bridge token;audit 卡與帳本都以此記名)。
+    1c 只調**既有** session:target 解析不到 → 404,不代為 spawn(要生新
+    session 走既有派工路徑,配額由 registry precheck 把關)。"""
+    _check_auth(request)
+    _agent_call_require_enabled()
+    body = await _json_body(request)
+    caller = _agent_call_normalize_sid(str(body.get("caller") or ""))
+    target = _agent_call_normalize_sid(str(body.get("target") or ""))
+    message = str(body.get("message") or "").strip()
+    mode = str(body.get("mode") or "await_reply").strip() or "await_reply"
+    if mode not in agent_call_policy.MODES:
+        raise http_err(400, "AGENT_CALL_BAD_MODE",
+                       f"mode 必須是 {'|'.join(agent_call_policy.MODES)}")
+    if not caller or not target or not message:
+        raise http_err(400, "AGENT_CALL_BAD_REQUEST",
+                       "caller、target、message 皆為必填")
+    if caller == target:
+        raise http_err(400, "AGENT_CALL_SELF", "不能調用自己")
+    try:
+        _v2_card_source(caller)
+    except HTTPException:
+        raise http_err(400, "AGENT_CALL_BAD_CALLER",
+                       f"caller 不是已知 session:{caller}")
+    try:
+        _v2_card_source(target)
+    except HTTPException:
+        raise http_err(404, "AGENT_CALL_TARGET_NOT_FOUND",
+                       f"target 不是既有 session:{target}(1c 不代為 spawn;"
+                       f"要生新 session 請走派工路徑,配額由 registry 把關)")
+    call_id = "call-" + uuid.uuid4().hex[:16]
+    # ── 護欄 1:政策 allowlist(default DENY)──────────────────────────
+    policy = agent_call_policy.load_policy()
+    if not agent_call_policy.allowed(policy, caller, target):
+        await _agent_call_deny(
+            call_id, caller, target, mode, message, "AGENT_CALL_DENIED",
+            f"政策未放行 {caller} → {target}(default DENY;"
+            f"請在 {agent_call_policy.policy_path()} 加 allowlist 規則)", 403)
+    # ── 護欄 2:chain 深度/循環/預算 ──────────────────────────────────
+    parent = None
+    pid = str(body.get("parent_call_id") or "").strip()
+    if pid:
+        parent = REGISTRY.call_get(pid)
+        if parent is None:
+            raise http_err(400, "AGENT_CALL_BAD_PARENT",
+                           f"parent_call_id 不存在:{pid}")
+    else:
+        # 推斷:有 call 正打在 caller 身上 → caller 的外呼是同 chain 下一層。
+        parent = REGISTRY.call_active_for_target(
+            caller, agent_call_policy.chain_window_secs())
+    ancestors = REGISTRY.call_ancestors(parent) if parent else []
+    chain_size = REGISTRY.call_chain_size(
+        str(parent.get("root_call_id") or parent.get("id"))) if parent else 0
+    try:
+        root_id, parent_id, depth = agent_call_policy.check_chain(
+            parent, ancestors, chain_size, caller, target)
+    except agent_call_policy.CallDenied as e:
+        await _agent_call_deny(call_id, caller, target, mode, message,
+                               e.code, e.reason, 429)
+    row = REGISTRY.call_create(
+        call_id, caller=caller, target=target, mode=mode, message=message,
+        status="running", root_call_id=root_id, parent_call_id=parent_id,
+        depth=depth)
+    _log_event("agent_call_created", call=call_id, caller=caller,
+               target=target, mode=mode, depth=depth,
+               root=row.get("root_call_id"))
+    # 戶政:互調也是活著的證據(target 的 touch 由輸入路徑自己記)。
+    _registry_call_safe("touch", caller)
+    # audit 卡(request)雙邊落卡 —— Pocket 上看得到誰叫了誰、說了什麼。
+    await _agent_call_audit(
+        row, "request",
+        f"{caller} → {target}({mode},call {call_id[-8:]}):{message[:300]}",
+        [caller, target])
+    # await/background 需要先掛上目標卡片流,記住基準 seq 再投遞。
+    store = since_seq = None
+    if mode in ("await_reply", "background"):
+        store = await _v2_card_store(target)
+        since_seq = store.seq
+    # ── 投遞:真重用 v2 統一輸入路徑(不複製 provider 分支)────────────
+    content = f"[agent_call {caller} #{call_id[-8:]}] {message}"
+    shim = _AgentCallInputRequest(request, {"content": content,
+                                            "client_id": call_id})
+    try:
+        await v2_session_input(target, shim)
+    except HTTPException as e:
+        REGISTRY.call_update(call_id, status="error",
+                             error=f"投遞失敗:{e.detail}")
+        _log_event("agent_call_dispatch_failed", call=call_id, target=target,
+                   status=e.status_code, detail=str(e.detail)[:200])
+        await _agent_call_audit(row, "error",
+                                f"{caller} → {target} 投遞失敗:{e.detail}",
+                                [caller, target])
+        raise http_err(502, "AGENT_CALL_DISPATCH_FAILED",
+                       f"投遞到 {target} 失敗:{e.detail}")
+    if mode == "fire_and_forget":
+        REGISTRY.call_update(call_id, status="sent")
+        return {"ok": True, "call_id": call_id, "status": "sent"}
+    task = asyncio.create_task(
+        _agent_call_waiter(call_id, caller, target, store, since_seq))
+    _AGENT_CALL_WAITERS[call_id] = task
+    _BG_TASKS.add(task)
+    task.add_done_callback(_BG_TASKS.discard)
+    if mode == "background":
+        return {"ok": True, "call_id": call_id, "status": "running"}
+    # await_reply:同步等到 timeout_secs;逾時 call 轉背景繼續收割。
+    try:
+        timeout_secs = float(body.get("timeout_secs") or
+                             _agent_call_timeout_default())
+    except (TypeError, ValueError):
+        timeout_secs = _agent_call_timeout_default()
+    timeout_secs = max(1.0, min(timeout_secs, 600.0))
+    try:
+        await asyncio.wait_for(asyncio.shield(task), timeout=timeout_secs)
+    except asyncio.TimeoutError:
+        REGISTRY.call_update(call_id, meta_merge={"await_timed_out": True})
+        _log_event("agent_call_await_timeout", call=call_id, target=target,
+                   timeout_secs=timeout_secs)
+        return {"ok": True, "call_id": call_id, "status": "timeout",
+                "note": "await 逾時,call 轉為 background 繼續收割;"
+                        "稍後用 GET /app/v2/agent_call/{call_id} 取結果"}
+    fresh = REGISTRY.call_get(call_id) or row
+    return {"ok": True, **_agent_call_public(fresh)}
+
+
+@app.get("/app/v2/agent_call/{call_id}")
+async def v2_agent_call_result(call_id: str, request: Request):
+    """background/await-逾時 的收割端點(藍圖 §1 agent_result)。"""
+    _check_auth(request)
+    _agent_call_require_enabled()
+    row = REGISTRY.call_get(call_id)
+    if row is None:
+        raise http_err(404, "AGENT_CALL_NOT_FOUND", "沒有這筆 call")
+    return {"ok": True, **_agent_call_public(row)}
+
+
+@app.get("/app/v2/agent_calls")
+async def v2_agent_calls(request: Request, session: str = "", root: str = "",
+                         limit: int = 50):
+    """call 帳本查詢(Pocket 編隊視圖的呼叫鏈資料源):?session= 看某 session
+    參與的 call;?root= 看整條 chain。"""
+    _check_auth(request)
+    _agent_call_require_enabled()
+    rows = REGISTRY.call_list(
+        session=_agent_call_normalize_sid(session) or None,
+        root=root or None, limit=max(1, min(limit, 200)))
+    return {"calls": [_agent_call_public(r) for r in rows]}
+
+
+@app.get("/app/v2/agent_targets")
+async def v2_agent_targets(request: Request, caller: str = ""):
+    """該 caller 依政策可調用的對象(藍圖 §1 agent_list):id/provider/
+    purpose(registry 戶口)/busy(provider 現成信號)。"""
+    _check_auth(request)
+    _agent_call_require_enabled()
+    caller = _agent_call_normalize_sid(caller)
+    if not caller:
+        raise http_err(400, "AGENT_CALL_BAD_REQUEST", "caller 必填")
+    policy = agent_call_policy.load_policy()
+    _registry_ensure_personas()
+    rows = [r for r in REGISTRY.list_rows() if r.get("state") != "archived"]
+    by_id = {r["id"]: r for r in rows}
+    for lr in await _registry_legacy_rows(set(by_id)):
+        by_id[lr["id"]] = lr
+    out = []
+    for sid, r in sorted(by_id.items()):
+        if sid == caller:
+            continue
+        if not agent_call_policy.allowed(policy, caller, sid):
+            continue
+        out.append({"id": sid, "provider": r.get("provider"),
+                    "purpose": r.get("purpose"),
+                    "class": r.get("class"),
+                    "busy": await _registry_is_busy(sid)})
+    return {"caller": caller, "targets": out,
+            "policy_path": agent_call_policy.policy_path()}
 
 
 @app.on_event("startup")
