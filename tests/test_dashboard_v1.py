@@ -79,13 +79,16 @@ def _stub_light(monkey_self):
 
 class TestAuth(unittest.TestCase):
     def setUp(self):
-        # 認證失敗限流器(`_AUTH_FAILS`)是行程全域的:同視窗內失敗超過
-        # `_AUTH_FAIL_MAX` 之後改回 429，這題期待的 401 在全套一起跑時會
-        # 被前面的測試耗掉額度而變成 429(單檔跑卻是綠的)。只清測試側
-        # 狀態，不動正式限流行為。
+        # 認證失敗限流器是行程全域的:同視窗內失敗超過 `_AUTH_FAIL_MAX`
+        # 之後改回 429，這題期待的 401 在全套一起跑時會被前面的測試耗掉
+        # 額度而變成 429(單檔跑卻是綠的)。只清測試側狀態，不動正式限流
+        # 行為。容器名稱隨 main 演進過(全域 `_AUTH_FAILS` deque →
+        # per-client 分桶 `_AUTH_FAILS_BY_CLIENT`)，兩種名字都清。
         with bridge._AUTH_LOCK:
-            bridge._AUTH_FAILS.clear()
-            bridge._AUTH_FAIL_AGG.clear()
+            for attr in ("_AUTH_FAILS", "_AUTH_FAILS_BY_CLIENT", "_AUTH_FAIL_AGG"):
+                container = getattr(bridge, attr, None)
+                if container is not None:
+                    container.clear()
 
     tearDown = setUp
 

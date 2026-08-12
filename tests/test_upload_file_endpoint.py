@@ -29,13 +29,18 @@ AUTH = {"Authorization": "Bearer test-unit-token"}
 
 
 def _reset_auth_throttle():
-    """認證失敗限流器(`_AUTH_FAILS`)是行程全域的 —— 同視窗內失敗超過
-    `_AUTH_FAIL_MAX` 就改回 429，於是 test_requires_auth 期待的 401 在
-    全套 `unittest discover` 一起跑時會變成 429(單檔跑卻是綠的)。
-    只在測試側歸零，不動正式限流行為。"""
+    """認證失敗限流器是行程全域的 —— 同視窗內失敗超過 `_AUTH_FAIL_MAX`
+    就改回 429，於是 test_requires_auth 期待的 401 在全套
+    `unittest discover` 一起跑時會變成 429(單檔跑卻是綠的)。
+    只在測試側歸零，不動正式限流行為。
+
+    容器名稱隨 main 演進過(全域 `_AUTH_FAILS` deque → per-client 分桶
+    `_AUTH_FAILS_BY_CLIENT`)，兩種名字都清、都用 getattr 取。"""
     with bridge._AUTH_LOCK:
-        bridge._AUTH_FAILS.clear()
-        bridge._AUTH_FAIL_AGG.clear()
+        for attr in ("_AUTH_FAILS", "_AUTH_FAILS_BY_CLIENT", "_AUTH_FAIL_AGG"):
+            container = getattr(bridge, attr, None)
+            if container is not None:
+                container.clear()
 
 
 class UploadFileEndpointTest(unittest.TestCase):

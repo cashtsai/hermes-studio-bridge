@@ -51,17 +51,21 @@ class RecordingClient(bridge.CodexAppServerClient):
 def reset_auth_throttle():
     """把「認證失敗限流器」的行程全域狀態歸零。
 
-    `_check_auth` 每次認證失敗就往模組級的 `_AUTH_FAILS` deque 記一筆，
-    同一個 60s 視窗內超過 `_AUTH_FAIL_MAX`(12) 之後改回 **429**。那個 deque
-    是行程全域的，所以全套 `unittest discover` 一起跑時，前面任何打過認證
-    失敗路徑的測試(例如 test_upload_file_endpoint)都會先把額度用掉，輪到
-    後面的測試時預期的 401/400/409 全變成 429 —— 過不過取決於執行順序。
+    `_check_auth` 每次認證失敗就往模組級的表記一筆，同一個 60s 視窗內超過
+    `_AUTH_FAIL_MAX` 之後改回 **429**。那些表是行程全域的，所以全套
+    `unittest discover` 一起跑時，前面任何打過認證失敗路徑的測試(例如
+    test_upload_file_endpoint)都會先把額度用掉，輪到後面的測試時預期的
+    401/400/409 全變成 429 —— 過不過取決於執行順序。
 
     正式限流行為不動(那是對的),只在測試側把狀態清乾淨。
+    容器名稱隨 main 演進過(全域 `_AUTH_FAILS` deque → per-client 分桶
+    `_AUTH_FAILS_BY_CLIENT`),所以兩種名字都清、都用 getattr 取。
     """
     with bridge._AUTH_LOCK:
-        bridge._AUTH_FAILS.clear()
-        bridge._AUTH_FAIL_AGG.clear()
+        for attr in ("_AUTH_FAILS", "_AUTH_FAILS_BY_CLIENT", "_AUTH_FAIL_AGG"):
+            container = getattr(bridge, attr, None)
+            if container is not None:
+                container.clear()
 
 
 def _run(coro):
