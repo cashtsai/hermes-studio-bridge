@@ -1393,8 +1393,22 @@ _OC_BLOCK_ICON = {"image": "🖼️", "audio": "🎧", "video": "🎬",
                   "document": "📄", "file": "📎"}
 
 
+# 「哪些 block 算附件」用**白名單**判定,不是「非 text 就是附件」——
+# 後者會把 `thinking` / `redacted_thinking` / `tool_use` / `tool_result`
+# 全變成假附件,卡片上冒出「📎 thinking」這種東西。未知型別只有在帶了
+# 媒體線索(source / mime / 檔名 / url / omitted)時才收,兼顧未來新型別。
+_OC_MEDIA_BLOCK_TYPES = {"image", "audio", "video", "document", "file",
+                         "attachment", "media", "input_image", "input_audio",
+                         "input_file"}
+_OC_NON_MEDIA_BLOCK_TYPES = {"text", "thinking", "redacted_thinking",
+                             "reasoning", "tool_use", "tool_result",
+                             "server_tool_use", "web_search_tool_result",
+                             "mcp_tool_use", "mcp_tool_result",
+                             "citation", "citations"}
+
+
 def _oc_msg_nontext(content) -> list[dict]:
-    """message.content 裡**非 text** 的 block → 附件摘要列。
+    """message.content 裡的**媒體** block → 附件摘要列。
 
     `_oc_msg_text` 只留 text,其餘全丟 —— 純圖片訊息因此在 `message_card`
     的 `if not text: return` 整則消失。這裡把它們撈出來當附件摘要,讓卡片
@@ -1407,9 +1421,16 @@ def _oc_msg_nontext(content) -> list[dict]:
         if not isinstance(b, dict):
             continue
         btype = str(b.get("type") or "")
-        if btype == "text" or not btype:
+        if not btype or btype in _OC_NON_MEDIA_BLOCK_TYPES:
             continue
         src = b.get("source") if isinstance(b.get("source"), dict) else {}
+        if btype not in _OC_MEDIA_BLOCK_TYPES:
+            has_hint = bool(src or b.get("mimeType") or b.get("mediaType")
+                            or b.get("contentType") or b.get("fileName")
+                            or b.get("filename") or b.get("url")
+                            or b.get("omitted"))
+            if not has_hint:
+                continue
         row = {"kind": btype}
         mime = (b.get("mimeType") or b.get("mediaType") or b.get("contentType")
                 or src.get("media_type") or src.get("mediaType"))
@@ -1661,6 +1682,11 @@ class OpenClawDigest(ApprovalCardMixin):
                 {"text": f"⚠️ {emsg}", "fallback_text": f"⚠️ {emsg}"}))
             self.busy = False
             self.active_run = ""
+            # 回合被中斷/失敗時 gateway 不會補送 approval.resolved,
+            # `self.prompt` 沒清就會永遠掛著「等待核准」—— 卡片其實已經沒了,
+            # 使用者卻看到一個不會消失的待審標籤(比照 CodexThreadDigest
+            # 在 turn/completed 清 prompt)。
+            self.prompt = None
             self._status()
 
     def _handle_agent(self, run: str, p: dict):
@@ -1693,6 +1719,7 @@ class OpenClawDigest(ApprovalCardMixin):
                         {"text": f"⚠️ {emsg}", "fallback_text": f"⚠️ {emsg}"}))
                 self.busy = False
                 self.active_run = ""
+                self.prompt = None          # 同上:run 收尾 → 待審標籤不能殘留
                 self.store.push_turn("end", self.store.turn_id)
                 self.store.turn_id = ""
                 self.store.last_tool = ""

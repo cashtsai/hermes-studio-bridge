@@ -556,7 +556,10 @@ class BridgeWiringTests(unittest.TestCase):
 
     def test_events_feed_routes_and_heartbeat_filter(self):
         bridge.OPENCLAW = _FakeOC(configured=True)
-        d = bridge._OC_CARD_DIGESTS["agent:main:main"] = cd.OpenClawDigest()
+        # digest 照 production 建在**改道後**的 key 上(`_v2_card_source` →
+        # `_oc_safe_session_key`);gateway 事件帶的才是原始 key。
+        safe = bridge._oc_safe_session_key("agent:main:main")
+        d = bridge._OC_CARD_DIGESTS[safe] = cd.OpenClawDigest()
         pushed = []
         orig_push = bridge._oc_push_final
         bridge._oc_push_final = lambda key, payload: pushed.append(
@@ -572,7 +575,7 @@ class BridgeWiringTests(unittest.TestCase):
                 "state": "final",
                 "message": {"role": "assistant",
                             "content": [{"type": "text", "text": "done"}]}})
-            self.assertEqual(pushed, [("agent:main:main", "r-9")])
+            self.assertEqual(pushed, [(safe, "r-9")])
             self.assertTrue(d.store.snapshot()["cards"])
         finally:
             bridge._oc_push_final = orig_push
