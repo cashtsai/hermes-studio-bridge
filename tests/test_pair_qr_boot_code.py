@@ -24,6 +24,19 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import bridge  # noqa: E402
 from fastapi import HTTPException  # noqa: E402
 
+# 上面那行 os.environ 只在「本檔是第一個 import bridge 的人」時算數:
+# `_PAIR_BOOT_CODE_FILE` 是模組層常數,bridge import 當下就定死了;而且
+# bridge import 的最後就會呼叫一次 `_pair_boot_code()` 把碼讀進行程快取。
+# 全套 `unittest discover` 一起跑時 bridge 早被別的測試檔 import 過 → 本檔
+# 設的 env 變成 no-op,測試驗的是**真的** `~/.pocket/pair-boot-code`
+# (這台正在跑 production bridge)。
+#
+# 正式行為不動,只在測試側把模組常數綁回本檔的 tmp、順便把快取清掉,讓
+# 下一次 `_pair_boot_code()` 重鑄到 tmp:順序無關,也不再碰使用者家目錄。
+bridge._PAIR_BOOT_CODE_FILE = os.environ["PAIR_BOOT_CODE_FILE"]
+with bridge._PAIR_BOOT_CODE_LOCK:
+    bridge._PAIR_BOOT_CODE_CACHE["code"] = ""
+
 
 class _FakeReq:
     def __init__(self, query=None, host="127.0.0.1"):

@@ -25,7 +25,9 @@ from fastapi import HTTPException  # noqa: E402
 
 class _FakeReq:
     def __init__(self, token=None, query=None):
-        tok = token if token is not None else os.environ["BRIDGE_TOKEN"]
+        # 讀 bridge 真正在用的那份 token:全套跑時 bridge 可能已被別的測試檔
+        # 先 import,本檔開頭的 `os.environ.setdefault` 那時已經不算數。
+        tok = token if token is not None else bridge.BRIDGE_TOKEN
         self.headers = {"authorization": f"Bearer {tok}"}
         self.client = type("C", (), {"host": "127.0.0.1"})()
         self.query_params = dict(query or {})
@@ -48,10 +50,11 @@ def _insert_pending(aid, source="tg-post", created=None):
 
 
 def _stub_light(monkey_self):
-    """把外部依賴(cc tmux / codex / launchctl / 天氣)換成便宜假件,
-    只留 approvals/oracle 真路徑。回傳 restore closure。"""
+    """把外部依賴(cc tmux / codex / launchctl / 天氣 / CC·CX 登入探測)換成
+    便宜假件,只留 approvals/oracle 真路徑。回傳 restore closure。"""
     orig = (bridge._cc_sessions, bridge._dashboard_weather,
-            bridge._dashboard_gateways, bridge.CODEX_APP.call)
+            bridge._dashboard_gateways, bridge.CODEX_APP.call,
+            bridge._agent_auth_status)
 
     async def no_cc():
         return []
@@ -66,14 +69,27 @@ def _stub_light(monkey_self):
     async def no_codex(*a, **k):
         return {"data": []}
 
+    async def no_agent_auth():
+        # 真的 `_agent_auth_status()` 冷快取時會 `create_task` 去 spawn
+        # `claude auth status` / `codex login status`;那顆背景 task 常常還沒
+        # 結束,`asyncio.run()` 就進收尾去 cancel 它,子行程 reaper 撞上關掉的
+        # loop → 整個測試套件卡在 kevent 不動(全套跑時偶發、單檔跑碰不到,
+        # 因為快取通常已被別的測試暖過)。這裡本來就沒斷言 agents 欄位,
+        # 直接換成便宜假件:順序無關、不 spawn 任何真 CLI。
+        return {"claude": {"installed": False, "logged_in": None, "account": None},
+                "codex": {"installed": False, "logged_in": None, "account": None},
+                "checking": True}
+
     bridge._cc_sessions = no_cc
     bridge._dashboard_weather = no_weather
     bridge._dashboard_gateways = no_gw
     bridge.CODEX_APP.call = no_codex
+    bridge._agent_auth_status = no_agent_auth
 
     def restore():
         (bridge._cc_sessions, bridge._dashboard_weather,
-         bridge._dashboard_gateways, bridge.CODEX_APP.call) = orig
+         bridge._dashboard_gateways, bridge.CODEX_APP.call,
+         bridge._agent_auth_status) = orig
     return restore
 
 
