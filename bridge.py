@@ -4196,6 +4196,78 @@ class CodexAppServerError(RuntimeError):
         self.code = code
 
 
+# ── thread-store 寫入鎖衝突（桌面版 Codex/ChatGPT 佔用同一條 thread）──────────
+# 2026-08-10 實機診斷(善彰的機器):ChatGPT.app 自帶的 codex app-server
+# (`/Applications/ChatGPT.app/Contents/Resources/codex … app-server`)握著某些
+# thread 的 **writer lock**,bridge 這一顆 app-server 的 thread/resume 直接被拒。
+# 兩個訊號同時出現:
+#   1) JSON-RPC 回覆(**主訊號**,可靠、帶得到 thread id):
+#        {"error": {"code": -32600,
+#                   "message": "thread <uuid> already has an active writer"}}
+#   2) app-server stderr(輔助訊號,由 `codex_app_server_stderr` 收):
+#        "... ERROR codex_core::session::session: failed to initialize thread
+#         persistence: thread-store conflict: thread <uuid> already has an
+#         active writer"
+# 舊行為的三個坑,本 PR 全部修掉:
+#   • -32600 一律被翻成 CX_TURN_IN_FLIGHT(「上一輪正在跑」)—— 語意完全相反,
+#     使用者被引導去等一個根本不存在的回合。
+#   • warm loop 只記 `codex_thread_warm_failed` + error type,人話全丟。
+#   • 沒有任何 UI 訊號:點了沒反應、送出像是排隊卻永遠不動。
+# 註:-32600 是 codex 的泛用「Invalid request」碼(同碼也出現在 unknown
+# variant 之類的錯誤),所以判定**以訊息文字為準**,不能只看 code。
+_CX_THREAD_LOCK_MARKERS = ("already has an active writer", "thread-store conflict")
+_CX_THREAD_LOCKED_CODE = -32098          # bridge 內部 sentinel,不與 codex 撞碼
+_CX_UUID_PATTERN = (r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}"
+                    r"-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+# **貼著 marker 抓**,不能只做「訊息裡第一個 uuid」:stderr 行前面可能掛著
+# tracing span 欄位(`session{conversation_id=…}`),抓到第一個 uuid 就會把鎖
+# 記到**另一條無辜的 thread** 上 —— 那條會被掛 banner、停用輸入框、跳過 warm,
+# 真正被鎖的那條反而沒事。抓不到貼身的才退回泛用搜尋。
+_CX_THREAD_LOCK_ID_RE = re.compile(
+    r"thread[\s:]+(" + _CX_UUID_PATTERN + r")\s+already has an active writer",
+    re.IGNORECASE)
+_CX_THREAD_ID_RE = re.compile(_CX_UUID_PATTERN)
+# 鎖住之後的重試抑制窗:窗內不再打 thread/resume(否則 warm loop 幾秒一次的
+# 重試風暴會一路洗版到 log 爆掉),窗過了才允許再試一次 —— 那一次同時就是
+# 「桌面端有沒有放開」的探針,所以 banner 不需要重啟 bridge 就會自己消失。
+CODEX_THREAD_LOCK_RETRY_SECS = float(
+    os.environ.get("CODEX_THREAD_LOCK_RETRY_SECS", "300"))
+CX_THREAD_LOCKED_MESSAGE = (
+    "此對話正被桌面版 Codex/ChatGPT 佔用(thread 寫入鎖)。"
+    "請在桌面 app 關閉這個對話後再試,或改用另一條 session。")
+CX_THREAD_LOCKED_CARD_TEXT = "⚠️ " + CX_THREAD_LOCKED_MESSAGE
+CX_THREAD_UNLOCKED_CARD_TEXT = (
+    "✅ 桌面版 Codex/ChatGPT 已釋放這個對話的寫入鎖,現在可以正常送出了。")
+CX_THREAD_LOCKED_REASON = "thread_store_conflict"
+
+
+def _codex_thread_lock_text(text: str) -> bool:
+    low = str(text or "").lower()
+    return any(marker in low for marker in _CX_THREAD_LOCK_MARKERS)
+
+
+def _codex_thread_lock_conflict(exc) -> str | None:
+    """thread-store 寫入鎖衝突判定。
+
+    回傳值刻意分三態,不用 bool —— 呼叫端常常同時要問「是不是鎖」與「鎖的是
+    哪一條」:
+      • None → 不是這個狀況(一般 app-server 錯誤,**不可**誤判成鎖)
+      • ""   → 是鎖,但訊息裡抓不到 thread id
+      • uuid → 是鎖,且這是訊息裡帶的 thread id
+    """
+    if getattr(exc, "code", None) == _CX_THREAD_LOCKED_CODE:
+        message = str(exc or "")
+    else:
+        message = str(exc or "")
+        if not _codex_thread_lock_text(message):
+            return None
+    anchored = _CX_THREAD_LOCK_ID_RE.search(message)
+    if anchored:
+        return anchored.group(1)
+    found = _CX_THREAD_ID_RE.search(message)
+    return found.group(0) if found else ""
+
+
 # ─────────── codex app-server：server → client request（ServerRequest）───────────
 # codex 二進位 `ServerRequest` 全集（strings 抽出的 serde variant 表）:
 #   item/commandExecution/requestApproval   item/fileChange/requestApproval
@@ -4439,6 +4511,11 @@ class CodexAppServerClient:
         self.last_event_at = {}
         self.thread_errors = {}
         self.loaded_threads = set()
+        # thread-store 寫入鎖(被別的 codex app-server 佔用)。
+        # thread_id -> {"since": wall, "last_at": wall, "attempts": int,
+        #               "detail": str, "next_retry_at": monotonic}
+        # 只有「resume/turn 成功」才會清掉 → 狀態欄的 locked 旗標會自己翻回來。
+        self.thread_locks = {}
         self.remote_status = None
         self.app_server_error = ""
         self.server_started_at = 0.0
@@ -4636,9 +4713,32 @@ class CodexAppServerClient:
                 text = raw.decode("utf-8", "replace").strip()
                 if text and "WARNING: proceeding" not in text:
                     _log_event("codex_app_server_stderr", message=text[:240])
+                    self._note_stderr_thread_lock(text)
         except Exception as _exc:  # noqa: BLE001
             _log_exc("CodexAppServerClient._read_stderr", _exc, expected=True)
             pass
+
+    def _note_stderr_thread_lock(self, text: str) -> None:
+        """輔助訊號:app-server 把 thread-store 衝突也吐在 stderr,而且訊息本身
+        就帶 thread id,所以不需要另外做時間相關性猜測。主訊號仍是 JSON-RPC
+        error(見 `_codex_thread_lock_conflict`);這裡只是替「RPC 那條路沒被
+        呼叫端接住」的情況補一層;兩邊撞在一起時,log 由 `note_thread_locked`
+        的抑制窗去重、卡片由 `_cx_feed_thread_locked` 的 lock.since 去重。"""
+        thread_id = _codex_thread_lock_conflict(
+            CodexAppServerError(text)) if _codex_thread_lock_text(text) else None
+        if not thread_id:
+            return
+        if thread_id in self.loaded_threads:
+            # stderr 是獨立的 reader 協程,可能落在一堆 log 後面才被讀到。這條
+            # thread 現在已經 resume 成功(寫入權在我們手上)= 這是**過期**的
+            # 舊訊息;照單全收會把一條好好的 session 打回 locked、推一張假的
+            # 錯誤卡,而且鎖住 banner 整整一個抑制窗。
+            return
+        if self.note_thread_locked(thread_id, text):
+            _log_event("codex_thread_locked", thread=thread_id[:16],
+                       source="stderr", error_message=text[:200],
+                       suppress_secs=CODEX_THREAD_LOCK_RETRY_SECS)
+        _cx_feed_thread_locked(thread_id)
 
     def _append(self, thread_id: str, item):
         if not thread_id:
@@ -5412,8 +5512,21 @@ class CodexAppServerClient:
         params = {"threadId": thread_id, "excludeTurns": True}
         if cwd:
             params["cwd"] = cwd
-        await self.call("thread/resume", params, timeout=30.0)
+        try:
+            await self.call("thread/resume", params, timeout=30.0)
+        except BaseException as e:
+            if not isinstance(e, CodexAppServerError) or \
+                    _codex_thread_lock_conflict(e) is None:
+                # 非鎖的失敗:若這條 thread 本來就登記著鎖,窗一樣要重新上膛,
+                # 否則每次輪詢都會再放行一次重試(見 rearm_thread_lock_window)。
+                self.rearm_thread_lock_window(thread_id)
+                raise
+            raise self._thread_lock_error(thread_id, e) from e
         self.loaded_threads.add(thread_id)
+        # resume 成功 = 寫入權在我們手上 → 鎖一定已經放開,狀態翻回未鎖。
+        if self.clear_thread_lock(thread_id):
+            _log_event("codex_thread_unlocked", thread=thread_id[:16])
+            _cx_feed_thread_unlocked(thread_id)
 
     async def start_turn(self, thread_id: str, input_items: list, client_id: str | None = None,
                          cwd: str | None = None):
@@ -5428,7 +5541,13 @@ class CodexAppServerClient:
             params["clientUserMessageId"] = client_id
         if cwd:
             params["cwd"] = cwd
-        res = await self.call("turn/start", params, timeout=30.0)
+        try:
+            res = await self.call("turn/start", params, timeout=30.0)
+        except CodexAppServerError as e:
+            # resume 過關之後才被搶走寫入權(桌面 app 中途打開同一條)也走同一條路。
+            if _codex_thread_lock_conflict(e) is None:
+                raise
+            raise self._thread_lock_error(thread_id, e) from e
         self.thread_event_generations[thread_id] += 1
         self.thread_events[thread_id].clear()
         turn = (res or {}).get("turn") or {}
@@ -5558,6 +5677,83 @@ class CodexAppServerClient:
     def is_server_alive(self) -> bool:
         return bool(self.proc and self.proc.returncode is None)
 
+    # ── thread-store 寫入鎖狀態機 ─────────────────────────────────────────
+    def note_thread_locked(self, thread_id: str, detail: str = "") -> bool:
+        """記下「這條 thread 正被別的 codex app-server 鎖住」。
+
+        回傳 True = 這是一個**新的抑制窗**(第一次偵測、或上一個窗已經到期),
+        呼叫端該記一次 log、推一張卡;False = 還在窗內的重複偵測,安靜吞掉。
+        這就是止血 retry storm 的地方:同一條 thread 每 N 分鐘最多吵一次。
+        """
+        if not thread_id:
+            return False
+        now = time.monotonic()
+        rec = self.thread_locks.get(thread_id)
+        fresh = rec is None or now >= float(rec.get("next_retry_at") or 0.0)
+        if rec is None:
+            rec = self.thread_locks[thread_id] = {"since": time.time(),
+                                                  "attempts": 0}
+        rec["detail"] = str(detail or "")[:300]
+        rec["attempts"] = int(rec.get("attempts") or 0) + 1
+        rec["last_at"] = time.time()
+        rec["next_retry_at"] = now + CODEX_THREAD_LOCK_RETRY_SECS
+        # resume 失敗 = 這顆 app-server 並沒有接管這條 thread。留著 loaded 標記
+        # 會讓後續 start_turn 直接跳過 resume,以為自己拿得到寫入權。
+        self.loaded_threads.discard(thread_id)
+        return fresh
+
+    def rearm_thread_lock_window(self, thread_id: str) -> None:
+        """已知鎖住的 thread 重試又失敗(但**不是**鎖的錯:逾時、app-server 掉線
+        …)→ 照樣把抑制窗往後推。
+
+        少了這一步,抑制窗就只有「鎖類失敗」能重新上膛:窗一到期、重試撞上一個
+        非鎖錯誤,`next_retry_at` 永遠停在過去 → 之後每一次清單刷新/狀態輪詢都
+        再打一次 resume。那就是把原本的 retry storm 換一個入口再跑一次。
+        """
+        rec = self.thread_locks.get(thread_id)
+        if rec is not None:
+            rec["next_retry_at"] = time.monotonic() + CODEX_THREAD_LOCK_RETRY_SECS
+
+    def clear_thread_lock(self, thread_id: str) -> bool:
+        """鎖放開了(resume 成功)。回傳 True = 狀態真的從 locked 翻回來。"""
+        return self.thread_locks.pop(thread_id, None) is not None
+
+    def is_thread_locked(self, thread_id: str) -> bool:
+        return thread_id in self.thread_locks
+
+    def thread_lock_retry_due(self, thread_id: str) -> bool:
+        """鎖定中且抑制窗已過 → 允許再試一次(同時是「桌面端放開了沒」的探針)。"""
+        rec = self.thread_locks.get(thread_id)
+        return bool(rec) and time.monotonic() >= float(rec.get("next_retry_at") or 0.0)
+
+    def thread_lock_info(self, thread_id: str) -> dict | None:
+        """狀態端點/卡片流共用的 lock 描述;沒鎖 → None。"""
+        rec = self.thread_locks.get(thread_id)
+        if not rec:
+            return None
+        return {
+            "locked": True,
+            "reason": CX_THREAD_LOCKED_REASON,
+            "message": CX_THREAD_LOCKED_MESSAGE,
+            "since": rec.get("since"),
+            "last_at": rec.get("last_at"),
+            "attempts": int(rec.get("attempts") or 0),
+            "detail": rec.get("detail") or "",
+            "retry_after": max(0.0, round(
+                float(rec.get("next_retry_at") or 0.0) - time.monotonic(), 1)),
+        }
+
+    def _thread_lock_error(self, thread_id: str, exc: BaseException):
+        """把 thread-store 衝突翻成專屬 code,順手做「一個窗一次」的 log + 卡。"""
+        if self.note_thread_locked(thread_id, str(exc)):
+            _log_event("codex_thread_locked", thread=thread_id[:16],
+                       code=getattr(exc, "code", None),
+                       error_message=str(exc)[:200],
+                       suppress_secs=CODEX_THREAD_LOCK_RETRY_SECS)
+        # 卡片自己以 lock.since 去重,不必跟 log 的抑制窗綁在一起。
+        _cx_feed_thread_locked(thread_id)
+        return CodexAppServerError(str(exc), code=_CX_THREAD_LOCKED_CODE)
+
     def runtime_status(self, thread_id: str, raw_status: str = "") -> str:
         if self.pending_approval_for_thread(thread_id):
             return "waiting_approval"
@@ -5628,6 +5824,17 @@ def _codex_enrich_summary(summary: dict) -> dict:
         summary["lastEventAt"] = CODEX_APP.last_event_at[tid]
     if tid in CODEX_APP.thread_errors:
         summary["error"] = CODEX_APP.thread_errors[tid]
+    # thread-store 寫入鎖:`locked` **恆存在**(bool),app 才能無條件拿它決定
+    # banner 與輸入框的啟用狀態,不必分辨「沒有這個欄位」與「沒被鎖」。
+    # 刻意不動 `status` —— 那是既有 enum(idle/running/waiting_approval/…),
+    # 塞新值會讓舊 app 顯示成未知狀態;鎖是正交的旗標。
+    lock = CODEX_APP.thread_lock_info(tid)
+    summary["locked"] = bool(lock)
+    if lock:
+        summary["lockReason"] = lock["reason"]
+        summary["lockMessage"] = lock["message"]
+        summary["lockedSince"] = lock["since"]
+        summary["lock"] = lock
     return summary
 
 
@@ -5894,6 +6101,18 @@ def _codex_http_error(e: Exception):
     if isinstance(e, (asyncio.TimeoutError, TimeoutError)):
         raise http_err(504, "PROVIDER_TIMEOUT", "codex app-server timeout", str(e))
     if isinstance(e, CodexAppServerError):
+        locked_tid = _codex_thread_lock_conflict(e)
+        if locked_tid is not None:
+            # **必須排在 -32600 之前**:app-server 用同一個泛用碼回這個衝突,
+            # 落到下面就會被翻成 CX_TURN_IN_FLIGHT(「上一輪正在跑」)——語意
+            # 相反,使用者會去等一個不存在的回合(善彰就是這樣查了一整天)。
+            #
+            # 這裡是「使用者發起的請求」邊界,所以允許現場建 digest:他就算
+            # 還沒開過這條 session,回頭進來也該看到原因,而不是只有一個
+            # 已經被 app 吃掉的 409。
+            if locked_tid:
+                _cx_feed_thread_locked(locked_tid, create_if_missing=True)
+            raise http_err(409, "CX_THREAD_LOCKED", CX_THREAD_LOCKED_MESSAGE, str(e))
         if e.code == _CX_NO_ACTIVE_TURN_CODE:
             # interrupt 專用:真的沒有回合可中斷。必須跟下面的 CX_TURN_IN_FLIGHT
             # 分開,否則中斷端點會回報「上一輪正在跑」——與事實完全相反。
@@ -5966,9 +6185,19 @@ async def _codex_warm_threads(thread_ids: list) -> None:
     for tid in thread_ids:
         if not tid or tid in CODEX_APP.loaded_threads:
             continue
+        # thread-store 鎖住的 thread 原本每幾秒被重試一次(清單一刷就一輪),
+        # log 每次都寫一筆 codex_thread_warm_failed → 實機一天 2 萬多行。
+        # 抑制窗內直接跳過;窗過了才放行一次,那一次同時就是復原探針。
+        if CODEX_APP.is_thread_locked(tid) and not CODEX_APP.thread_lock_retry_due(tid):
+            continue
         try:
             await CODEX_APP.ensure_thread_loaded(tid)
             _log_event("codex_thread_warmed", thread=tid[:16])
+        except CodexAppServerError as e:
+            if getattr(e, "code", None) == _CX_THREAD_LOCKED_CODE:
+                continue    # 已由 _thread_lock_error 記過一次 log + 推過卡
+            _log_event("codex_thread_warm_failed", thread=tid[:16],
+                       error=type(e).__name__, error_message=str(e)[:200])
         except Exception as e:  # noqa: BLE001
             _log_event("codex_thread_warm_failed", thread=tid[:16],
                        error=type(e).__name__)
@@ -6062,7 +6291,14 @@ async def codex_session_status(thread_id: str, request: Request):
             "includeTurns": False,
         }, timeout=20.0)
         thread = (res or {}).get("thread") or {}
+        # provider 少回 id 的話,整個 runtime 疊加(activeTurn / locked / usage)
+        # 會對到空字串 thread → 狀態欄永遠是「一切正常」。請求本身就知道 id。
+        if not thread.get("id"):
+            thread = {**thread, "id": thread_id}
         summary = _codex_enrich_summary(_codex_session_summary(thread))
+        # 使用者停在被鎖的 session 上盯著 banner 時,這是唯一還會定期跑的請求
+        # → 借它當復原探針(抑制窗保證不會變成 retry storm)。
+        _codex_lock_recheck(thread_id)
         return {"session": summary}
     except Exception as e:  # noqa: BLE001
         _codex_http_error(e)
@@ -13078,12 +13314,20 @@ async def v2_sessions(request: Request, provider: str = "", status: str = ""):
                     pub = {**drow,
                            **{k: pub[k] for k in ("method", "thread_id") if k in pub},
                            "options": pub.get("options") or drow.get("options")}
+            # thread-store 寫入鎖:清單這一層也要看得出來,不然 app 只能在
+            # 使用者按下送出、吃到 409 之後才知道這條進不去。
+            lock = CODEX_APP.thread_lock_info(thread_id)
+            meta = {"approval": pub, "locked": bool(lock)}
+            if lock:
+                meta["lock"] = lock
+                _codex_lock_recheck(thread_id)
             out.append({"id": f"codex:{thread_id}", "provider": "codex",
                         "title": s.get("name") or "codex", "subtitle": s.get("workdir"),
                         "status": "waiting_approval" if approval else ("running" if active else "idle"),
                         "last_event_at": s.get("lastEventAt"),
                         "capabilities": caps,
-                        "meta": {"approval": pub}})
+                        "locked": bool(lock),
+                        "meta": meta})
     except Exception as e:  # noqa: BLE001
         # 不再無聲吞錯:codex app-server 掛掉時 CX 區直接消失、log 零痕跡,
         # 「CX 全空」查不到原因(2026-07-10 ChatGPT.app 併購式更新事故)。
@@ -14023,6 +14267,121 @@ def _cx_sync_queue_depth(thread_id: str) -> None:
         _log_exc("_cx_sync_queue_depth", _exc, expected=True)
 
 
+def _cx_sync_thread_lock(thread_id: str) -> None:
+    """把「被桌面版 Codex 鎖住」同步進卡片流的 session.status。
+
+    app 靠 `session.status.locked` 決定要不要掛 banner / 停用輸入框;鎖放開時
+    這裡把它翻回 False,banner 就會自己消失,不必重啟 bridge。"""
+    d = _CX_CARD_DIGESTS.get(thread_id)
+    if d is None:
+        return
+    try:
+        info = CODEX_APP.thread_lock_info(thread_id)
+        d.locked = bool(info)
+        d.lock_reason = (info or {}).get("reason") or ""
+        d.lock_message = (info or {}).get("message") or ""
+        d._status()
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("_cx_sync_thread_lock", _exc, expected=True)
+
+
+def _cx_feed_thread_locked(thread_id: str, create_if_missing: bool = False) -> None:
+    """thread 被別的 codex app-server 鎖住 → 推一張系統卡進**那條 session** 的
+    卡片流,並同步 status.locked。
+
+    為什麼一定要有卡:偵測點多半不是「使用者剛按送出」(warm loop、背景 stderr
+    都會走到),只回 409 的話畫面上什麼都不會變 —— 那正是原本「點了沒反應」的
+    症狀。
+
+    背景偵測(warm loop / stderr)**不替沒人開過的 thread 憑空建 digest**:那樣
+    一次會替 20 條沒人在看的 thread 建出未 seed 的 digest,之後所有 live
+    notification 都往裡面灌。使用者真的開這條 session 時,`_cx_card_digest` 會
+    補推同一張卡。`create_if_missing` 只給**使用者發起的請求**用(HTTP 打進來
+    的那一刻,他確實在等這條 session 的回應)。
+
+    去重以「這一次鎖定事件」(lock.since)為身分,所以重複偵測、或開 session 時
+    的補推,都只會有一張卡。"""
+    if not thread_id:
+        return
+    d = _CX_CARD_DIGESTS.get(thread_id)
+    if d is None:
+        if not create_if_missing:
+            return
+        d = _CX_CARD_DIGESTS[thread_id] = carddigest.CodexThreadDigest()
+    try:
+        info = CODEX_APP.thread_lock_info(thread_id)
+        if not info:
+            return
+        if getattr(d, "lock_card_since", None) != info["since"]:
+            d.lock_card_since = info["since"]
+            d.store.upsert_card(carddigest.make_card(
+                f"card-cx-locked-{d.store.seq}", d.store.turn_id, "system", "text",
+                {"text": CX_THREAD_LOCKED_CARD_TEXT,
+                 "fallback_text": CX_THREAD_LOCKED_CARD_TEXT,
+                 "error_code": "CX_THREAD_LOCKED",
+                 "reason": CX_THREAD_LOCKED_REASON}))
+        _cx_sync_thread_lock(thread_id)
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("_cx_feed_thread_locked", _exc, expected=True)
+
+
+def _cx_feed_thread_unlocked(thread_id: str) -> None:
+    """鎖放開了 → 翻回未鎖 + 推一張恢復卡。只在真的推過鎖定卡的 session 推,
+    否則使用者會看到一張「已釋放」卻從沒看過「被佔用」。"""
+    if not thread_id or thread_id not in _CX_CARD_DIGESTS:
+        return
+    try:
+        d = _CX_CARD_DIGESTS[thread_id]
+        if getattr(d, "lock_card_since", None) is None:
+            _cx_sync_thread_lock(thread_id)
+            return
+        d.lock_card_since = None
+        d.store.upsert_card(carddigest.make_card(
+            f"card-cx-unlocked-{d.store.seq}", d.store.turn_id, "system", "text",
+            {"text": CX_THREAD_UNLOCKED_CARD_TEXT,
+             "fallback_text": CX_THREAD_UNLOCKED_CARD_TEXT}))
+        _cx_sync_thread_lock(thread_id)
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("_cx_feed_thread_unlocked", _exc, expected=True)
+
+
+_CX_LOCK_PROBES: set = set()      # 正在跑的復原探針(thread_id)
+
+
+def _codex_lock_recheck(thread_id: str) -> None:
+    """鎖定中且抑制窗已過 → 背景補一次 resume 探針。
+
+    復原路徑的核心:使用者可能只是坐在 session 裡盯著 banner,沒有再按送出。
+    沒有這根探針,`locked` 就只能等下一次 warm loop(要 app 去拉清單)才翻回來。
+
+    兩道剎車缺一不可:
+      • 抑制窗(`thread_lock_retry_due`)—— 最多每 N 分鐘一次;
+      • in-flight 去重(`_CX_LOCK_PROBES`)—— resume 還沒回來之前窗還沒被推,
+        而 app 的狀態輪詢是幾秒一次;少了這道,一次 30s 的逾時就會累積出十幾條
+        併發 resume。
+    """
+    if not thread_id or thread_id in _CX_LOCK_PROBES:
+        return
+    if not CODEX_APP.thread_lock_retry_due(thread_id):
+        return
+
+    async def _probe():
+        try:
+            await CODEX_APP.ensure_thread_loaded(thread_id)
+        except Exception as _exc:  # noqa: BLE001
+            _log_exc("_codex_lock_recheck", _exc, expected=True)
+        finally:
+            _CX_LOCK_PROBES.discard(thread_id)
+
+    try:
+        task = asyncio.create_task(_probe())
+    except RuntimeError:
+        return
+    _CX_LOCK_PROBES.add(thread_id)
+    _BG_TASKS.add(task)
+    task.add_done_callback(_BG_TASKS.discard)
+
+
 def _cx_feed_queue_drop(thread_id: str, item: dict, exc: BaseException) -> None:
     """排隊中的訊息送不出去被丟掉 → 推一張錯誤卡。
 
@@ -14035,9 +14394,13 @@ def _cx_feed_queue_drop(thread_id: str, item: dict, exc: BaseException) -> None:
     try:
         text = str((item or {}).get("text") or "").strip()
         preview = (text[:60] + "…") if len(text) > 60 else text
+        # 被桌面版 Codex 鎖住是**可行動**的原因,不能只丟一個 exception 名字。
+        cause = (f"({type(exc).__name__})"
+                 if _codex_thread_lock_conflict(exc) is None
+                 else f"({CX_THREAD_LOCKED_MESSAGE})")
         msg = ("⚠️ 排隊中的訊息送不出去,已丟棄,請重送"
                + (f":「{preview}」" if preview else "")
-               + f"({type(exc).__name__})")
+               + cause)
         d.store.upsert_card(carddigest.make_card(
             f"card-cx-queue-drop-{d.store.seq}", d.store.turn_id, "system", "text",
             {"text": msg, "fallback_text": msg}))
@@ -14130,6 +14493,14 @@ async def _cx_card_digest(thread_id: str):
     if d is None:
         d = _CX_CARD_DIGESTS[thread_id] = carddigest.CodexThreadDigest()
     await _cx_seed_card_digest(thread_id, d, required=not d.seeded)
+    # 每次冷載/接流都把鎖狀態同步進 session.status:app 進到 session 的第一
+    # 個 snapshot 就帶著 locked,不必等下一次事件。若鎖是背景(warm loop /
+    # stderr)先偵測到的,那時沒有 digest 可推卡 —— 在這裡補上,使用者一進來
+    # 就看得到原因,而不是一個沒反應的輸入框。
+    if CODEX_APP.is_thread_locked(thread_id):
+        _cx_feed_thread_locked(thread_id)
+    else:
+        _cx_sync_thread_lock(thread_id)
     return d
 
 

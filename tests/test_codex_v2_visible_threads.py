@@ -45,6 +45,14 @@ class FailingCodexApp:
     def pending_approval_for_thread(self, thread_id):
         return None
 
+    def thread_lock_info(self, thread_id):
+        # thread-store 寫入鎖(fix/codex-thread-store-conflict):summary 疊加
+        # 會問這一個。這個 stub 模擬的是「app-server 整顆掛掉」,不是鎖。
+        return None
+
+    def thread_lock_retry_due(self, thread_id):
+        return False
+
 
 class TestCodexV2VisibleThreads(unittest.IsolatedAsyncioTestCase):
     async def test_paginates_past_guardian_burst(self):

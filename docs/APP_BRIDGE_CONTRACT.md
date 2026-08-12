@@ -715,9 +715,19 @@ GET /app/v2/sessions/{session_id}/events?since_seq=N&profile=phone     (SSE)
   - `card.upsert` — `{card}`（見 §6）。串流中的訊息＝同一 card id 反覆 upsert、
     `rev` 遞增、`final:false→true`。**app 只做替換渲染，永不解析 provider
     原始格式**。
-  - `session.status` — `{busy, mode, prompt, phase, label}`。`label` 是
+  - `session.status` — `{busy, mode, prompt, phase, label, locked}`。`label` 是
     **伺服器給的人話階段**（「思考中」「執行工具:Bash」「等待核准」「回覆中」）
     ——手機「即時跟到處理狀況」的直接載體，UI 原樣顯示。
+    `locked`（bool，**恆存在**）＝ 這條 codex thread 正被**另一顆** codex
+    app-server（桌面版 ChatGPT/Codex、VS Code）握著 thread-store 寫入鎖。
+    為 `true` 時另附 `lock_reason: "thread_store_conflict"` 與 `lock_message`
+    （zh-TW 人話，UI 原樣顯示）。**app 應據此掛 banner 並停用輸入框**——
+    否則使用者是對著一個必定回 409 的輸入框打字（2026-08-10 實機事故的症狀
+    就是「點了沒反應」）。鎖放開後 bridge 會把它翻回 `false` 並推一張恢復卡，
+    不需要重啟 bridge、不需要重進 session。
+    同一件事的其他出口：input 兩條路由回 `409 / CX_THREAD_LOCKED`；
+    `GET /codexsessions/{id}/status` 的 `session.locked` / `lockReason` /
+    `lockMessage`；`GET /app/v2/sessions` 每列的 `locked` 與 `meta.lock`。
   - `turn` — `{state: "begin"|"end"|"interrupted", turn_id}`。
   - `ping` — keepalive，統一 `SSE_KEEPALIVE_SECS`。
 - **真相原則**：SSE 為唯一真相；輪詢僅在 stream 斷線 >10s 時作 fallback，
