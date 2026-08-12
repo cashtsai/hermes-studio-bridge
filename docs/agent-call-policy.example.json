@@ -1,9 +1,18 @@
 {
   "_comment": "agent_call allowlist 政策範例。複製到 ~/.pocket/agent-call-policy.json(或 env AGENT_CALL_POLICY 指定路徑)後,配合 bridge env AGENT_CALL=1 啟用。default DENY:沒被規則命中的 (caller, target) 一律拒絕。pattern 用 fnmatch 萬用字元。",
   "_example": "下例:袁方可調所有 CC lane;tirith(CC)可回調袁方與所有 codex thread。",
+  "_context": "同一份檔案也是 agent_context(跨 session 上下文互讀,env AGENT_CONTEXT=1)的政策來源——不另立第二份政策檔。`targets` = 調用權(agent_call);`context_targets` = 讀取權(agent_context),可用 `modes` 指定允許的讀取模式(summary|recent|search),沒寫 modes 預設只給 summary(原文比摘要危險,要 raw 必須明寫)。",
+  "_context_tiering": "讀取權有三條放行來源,任一命中即放行該模式:(1) registry 家譜的母子邊 parent↔child —— 自動放行全部模式,不用寫規則(env AGENT_CONTEXT_FAMILY_MODES 可收緊);(2) 本檔的 context_targets 規則;(3) 既有 targets 調用權隱含 summary 讀取權(env AGENT_CONTEXT_CALL_MODES= 可關掉)。其餘一律 DENY。每次讀取都會在被讀的 session 卡片流落一張「👁 上下文讀取」卡。",
   "version": 1,
   "rules": [
     {"caller": "hermes:yuanfang", "targets": ["claude_code:*"]},
-    {"caller": "claude_code:tirith", "targets": ["hermes:yuanfang", "codex:*"]}
+    {"caller": "claude_code:tirith", "targets": ["hermes:yuanfang", "codex:*"]},
+
+    {"_": "所有 CC lane 之間互看摘要(接手時先看對方在做什麼,不給原文)",
+     "caller": "claude_code:*", "context_targets": ["claude_code:*", "codex:*"]},
+
+    {"_": "tirith 是主線,對 codex 線給到原文與搜尋",
+     "caller": "claude_code:tirith", "context_targets": ["codex:*"],
+     "modes": ["summary", "recent", "search"]}
   ]
 }

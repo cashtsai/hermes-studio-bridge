@@ -553,5 +553,75 @@ class TestRegistryAddendum(unittest.TestCase):
                              ["codex:busy1"])
 
 
+
+
+# ── 母子邊放行(善彰鐵律:cc/cx 互相調閱只有母子)─────────────────────
+
+class FamilyEdgeTests(unittest.TestCase):
+    """registry 家譜直接母子邊自動放行,不需政策維護。"""
+
+    class _FakeRegistry:
+        def __init__(self, rows): self.rows = rows
+        def get(self, sid): return self.rows.get(sid)
+
+    def _reg(self, **parents):
+        return self._FakeRegistry({sid: {"parent": p} for sid, p in parents.items()})
+
+    def test_child_can_call_parent(self):
+        reg = self._reg(**{"claude_code:child": "claude_code:mom"})
+        self.assertTrue(agent_call.allowed(
+            {"rules": []}, "claude_code:child", "claude_code:mom", registry=reg))
+
+    def test_parent_can_call_child(self):
+        reg = self._reg(**{"claude_code:child": "claude_code:mom"})
+        self.assertTrue(agent_call.allowed(
+            {"rules": []}, "claude_code:mom", "claude_code:child", registry=reg))
+
+    def test_siblings_denied(self):
+        reg = self._reg(**{"claude_code:a": "claude_code:mom",
+                           "claude_code:b": "claude_code:mom"})
+        self.assertFalse(agent_call.allowed(
+            {"rules": []}, "claude_code:a", "claude_code:b", registry=reg))
+
+    def test_grandparent_denied(self):
+        """深度 2 的孫不能直接叫爺爺 —— 只有**直接**母子邊算數。"""
+        reg = self._reg(**{"claude_code:kid": "claude_code:mom",
+                           "claude_code:mom": "hermes:yuanfang"})
+        self.assertFalse(agent_call.allowed(
+            {"rules": []}, "claude_code:kid", "hermes:yuanfang", registry=reg))
+
+    def test_stranger_denied(self):
+        reg = self._reg(**{"claude_code:a": "", "codex:b": ""})
+        self.assertFalse(agent_call.allowed(
+            {"rules": []}, "claude_code:a", "codex:b", registry=reg))
+
+    def test_self_call_denied_even_on_family_path(self):
+        reg = self._reg(**{"claude_code:a": "claude_code:a"})
+        self.assertFalse(agent_call.allowed(
+            {"rules": []}, "claude_code:a", "claude_code:a", registry=reg))
+
+    def test_registry_none_falls_back_to_allowlist(self):
+        """registry 不可用 → 舊行為(純白名單)完全不變。"""
+        pol = {"rules": [{"caller": "hermes:*", "targets": ["claude_code:*"]}]}
+        self.assertTrue(agent_call.allowed(
+            pol, "hermes:yuanfang", "claude_code:ops", registry=None))
+        self.assertFalse(agent_call.allowed(
+            {"rules": []}, "hermes:yuanfang", "claude_code:ops", registry=None))
+
+    def test_registry_exception_does_not_break_calls(self):
+        class Boom:
+            def get(self, sid): raise RuntimeError("registry down")
+        pol = {"rules": [{"caller": "hermes:*", "targets": ["claude_code:*"]}]}
+        self.assertTrue(agent_call.allowed(
+            pol, "hermes:yuanfang", "claude_code:ops", registry=Boom()))
+
+    def test_allowlist_still_works_alongside_family(self):
+        """母子邊是新增放行來源,既有白名單一字不變。"""
+        reg = self._reg(**{"claude_code:x": "hermes:y"})
+        pol = {"rules": [{"caller": "codex:*", "targets": ["claude_code:*"]}]}
+        self.assertTrue(agent_call.allowed(
+            pol, "codex:z", "claude_code:x", registry=reg))
+
+
 if __name__ == "__main__":
     unittest.main()
