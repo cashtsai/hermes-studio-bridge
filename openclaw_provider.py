@@ -90,6 +90,8 @@ class OpenClawClient:
 
     on_event(event:str, payload:dict) — chat/agent 事件(bridge 掛)。
     on_reconnect() — 重連握手成功後(bridge 重 seed 有訂閱者的 digest)。
+    on_connect(was_reconnect:bool) — **每次**握手成功後(含冷啟第一次;
+        bridge 用它補待審清單 —— 冷啟時 gateway 上既有的待審不能漏)。
     """
 
     def __init__(self, log=None):
@@ -103,6 +105,8 @@ class OpenClawClient:
         self._backoff = 1.0
         self.on_event = None
         self.on_reconnect = None
+        # 每次握手成功都呼叫(含冷啟第一次),參數 was_reconnect: bool。
+        self.on_connect = None
         self.server_info: dict = {}
 
     # ── 配置 ──
@@ -183,6 +187,14 @@ class OpenClawClient:
                 try:
                     self.on_reconnect()
                 except Exception:  # noqa: BLE001 — 重 seed 失敗不拖垮連線
+                    pass
+            if self.on_connect:
+                # **每次**握手成功都叫(含第一次)。待審清單補洞不能只在重連
+                # 做 —— bridge 冷啟時 gateway 上早就掛著的待審會被漏掉,
+                # 使用者在 app 裡完全看不到那筆、也永遠等不到。
+                try:
+                    self.on_connect(was_reconnect)
+                except Exception:  # noqa: BLE001
                     pass
             return ws
 
@@ -320,8 +332,8 @@ def session_status(row: dict) -> str:
 
 def session_v2_row(row: dict) -> dict:
     """sessions.list 的 SessionRow → /app/v2/sessions 的統一 Session 形狀。
-    caps 依 SPEC §4:v1 = input/interrupt/replay/follow(attachments/approve
-    明示缺席)。"""
+    caps 依 SPEC §4:input/interrupt/attachments/replay/follow/approve
+    (`keys` 明示缺席 —— OpenClaw 無 TUI 概念)。"""
     key = str(row.get("key") or "")
     updated = row.get("updatedAt")
     last = None
@@ -333,5 +345,6 @@ def session_v2_row(row: dict) -> dict:
             "subtitle": model or None,
             "status": session_status(row),
             "last_event_at": last,
-            "capabilities": ["input", "interrupt", "attachments", "replay", "follow"],
+            "capabilities": ["input", "interrupt", "attachments", "replay",
+                             "follow", "approve"],
             "meta": {}}

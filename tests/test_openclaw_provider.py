@@ -32,6 +32,12 @@ from fastapi import HTTPException  # noqa: E402
 
 class _FakeReq:
     def __init__(self, token=None):
+        # 註:discover 跑全套時 bridge 可能已被別的測試模組先匯入,
+        # `bridge.BRIDGE_TOKEN` 未必等於這裡的 env → 本模組多支測試會誤紅
+        # (baseline 就是紅的)。改讀 bridge.BRIDGE_TOKEN 可以修掉,但那會連帶
+        # 改變全域 `_AUTH_FAILS` 累積量,讓 test_robustness_pack 的
+        # test_4xx_flood_is_throttled 由 429×20 變成 401→429 兩種碼而翻紅。
+        # 兩者都是既有的測試間污染,不在本 PR 範圍,維持原狀。
         tok = token if token is not None else os.environ["BRIDGE_TOKEN"]
         self.headers = {"authorization": f"Bearer {tok}"}
         self.client = type("C", (), {"host": "127.0.0.1"})()
@@ -335,7 +341,8 @@ class ProviderHelperTests(unittest.TestCase):
         self.assertEqual(v2["title"], "main")
         self.assertEqual(v2["status"], "idle")
         self.assertEqual(v2["capabilities"],
-                         ["input", "interrupt", "replay", "follow"])
+                         ["input", "interrupt", "attachments", "replay",
+                          "follow", "approve"])
         self.assertLess(v2["last_event_at"], 1e11)
         row["hasActiveRun"] = True
         self.assertEqual(ocp.session_v2_row(row)["status"], "running")
@@ -429,12 +436,14 @@ class BridgeWiringTests(unittest.TestCase):
             _run(bridge._oc_input_core("agent:main:main", "x", {"content": ""}))
         self.assertEqual(cm.exception.status_code, 400)
 
-    def test_input_attachments_only_400(self):
+    def test_input_unreadable_attachment_400(self):
+        """取不到本機檔案的附件 → 明確報錯(不再靜默丟棄後送純文字)。"""
         bridge.OPENCLAW = _FakeOC(configured=True)
         with self.assertRaises(HTTPException) as cm:
             _run(bridge._oc_input_core("agent:main:main", "x",
                                        {"attachments": [{"kind": "image"}]}))
         self.assertEqual(cm.exception.status_code, 400)
+        self.assertEqual(cm.exception.code, "ATTACHMENT_UNREADABLE")
 
     def test_input_echoes_user_card_to_subscribed_digest(self):
         fake = _FakeOC(configured=True)
@@ -533,20 +542,24 @@ class BridgeWiringTests(unittest.TestCase):
         self.assertEqual(fake.calls[0][0], "chat.abort")
         self.assertEqual(fake.calls[0][1], {"sessionKey": "agent:main:dev"})
 
-    # approve 明示不支援
+    # approve:已支援(exec/plugin.approval.*),但 approval_id 必填
 
-    def test_approve_unsupported(self):
+    def test_approve_requires_approval_id(self):
         bridge.OPENCLAW = _FakeOC(configured=True)
         req = _FakeReq().set_json({"approve": True})
         with self.assertRaises(HTTPException) as cm:
             _run(bridge.v2_session_approve("openclaw:agent:main:main", req))
         self.assertEqual(cm.exception.status_code, 400)
+        self.assertEqual(cm.exception.code, "APPROVAL_ID_REQUIRED")
 
     # 事件 feed:heartbeat 推播過濾 + digest 分流
 
     def test_events_feed_routes_and_heartbeat_filter(self):
         bridge.OPENCLAW = _FakeOC(configured=True)
-        d = bridge._OC_CARD_DIGESTS["agent:main:main"] = cd.OpenClawDigest()
+        # digest 照 production 建在**改道後**的 key 上(`_v2_card_source` →
+        # `_oc_safe_session_key`);gateway 事件帶的才是原始 key。
+        safe = bridge._oc_safe_session_key("agent:main:main")
+        d = bridge._OC_CARD_DIGESTS[safe] = cd.OpenClawDigest()
         pushed = []
         orig_push = bridge._oc_push_final
         bridge._oc_push_final = lambda key, payload: pushed.append(
@@ -562,7 +575,7 @@ class BridgeWiringTests(unittest.TestCase):
                 "state": "final",
                 "message": {"role": "assistant",
                             "content": [{"type": "text", "text": "done"}]}})
-            self.assertEqual(pushed, [("agent:main:main", "r-9")])
+            self.assertEqual(pushed, [(safe, "r-9")])
             self.assertTrue(d.store.snapshot()["cards"])
         finally:
             bridge._oc_push_final = orig_push

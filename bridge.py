@@ -12343,8 +12343,16 @@ async def v2_sessions(request: Request, provider: str = "", status: str = ""):
     if OPENCLAW.configured():
         try:
             res = await OPENCLAW.call("sessions.list", {"limit": 20}, timeout=10.0)
+            # 待審中的 session 要看得出來(同 hermes/codex 線的 §7-5):
+            # 沒有這個,exec 審批一來 app 只看到 idle,使用者完全不知道在等他。
+            oc_pending = _openclaw_pending_by_session()
             for row in (res or {}).get("sessions", [])[:20]:
-                out.append(openclaw_provider.session_v2_row(row))
+                v2 = openclaw_provider.session_v2_row(row)
+                pend = oc_pending.get(v2["id"])
+                if pend:
+                    v2["status"] = "waiting_approval"
+                    v2["meta"] = {**(v2.get("meta") or {}), "approval": pend}
+                out.append(v2)
         except Exception as e:  # noqa: BLE001
             _log_event("v2_openclaw_list_failed", error=type(e).__name__,
                        error_message=str(e)[:200])
@@ -12420,9 +12428,15 @@ async def v2_session_approve(session_id: str, request: Request):
         result = await _approval_decide_core(aid, body)
         return {"ok": True, "session_id": session_id, **result}
     if src[0] == "oc":
-        # SPEC §6-1:openclaw v1 不宣告 approve(exec.approval.* 接線留 TODO)。
-        raise http_err(400, "UNSUPPORTED_PROVIDER",
-                       "openclaw 尚不支援 approve(capability 未宣告)")
+        # openclaw:exec/plugin 審批(gateway `*.approval.resolve`)。
+        # body {approval_id, key}(key ∈ allow-once|allow-always|deny);
+        # {approve: bool} 走同一條相容糖。
+        aid = str(body.get("approval_id") or "").strip()
+        if not aid:
+            raise http_err(400, "APPROVAL_ID_REQUIRED",
+                           "openclaw approve 需要 approval_id(approval 卡或 GET /app/v1/approvals)")
+        result = await _approval_decide_core(aid, body)
+        return {"ok": True, "session_id": session_id, **result}
     approved = _approval_bool_from_body(body)
     for_session = bool(body.get("for_session") or body.get("approve_for_session") or
                        body.get("remember"))
@@ -13591,11 +13605,473 @@ def _oc_http_error(e: Exception):
     raise HTTPException(status_code=502, detail=str(e))
 
 
+# ── OpenClaw 審批(exec / plugin)→ Approval Hub + approval 卡 ──────────────
+# 契約 SPEC §6-1 的 TODO 收尾。gateway 端形狀(2026-08-11 讀靶機 dist
+# `approval-shared-*.js` / `exec-approval-*.js` / `plugin-approval-*.js` 實證):
+#   event `exec.approval.requested`  payload {id, request{…}, createdAtMs, expiresAtMs}
+#   event `exec.approval.resolved`   payload {id, decision, resolvedBy, ts, request}
+#   method `exec.approval.resolve`   params {id, decision} → {ok:true}
+#   method `exec.approval.list`      無參數 → **裸陣列**,元素同 requested payload
+# `plugin.approval.*` 走同一份 helper,只有 request 內容不同(pluginId/title/
+# description/severity/toolName…),所以兩族共用一條路。
+# decision 只吃 `allow-once` / `allow-always` / `deny`;每筆的可用集合在
+# `request.allowedDecisions`(ask=="always" 時沒有 allow-always)。
+_OC_APPROVAL_EVENTS = {
+    "exec.approval.requested": ("exec.approval.resolve", "exec"),
+    "plugin.approval.requested": ("plugin.approval.resolve", "plugin"),
+}
+_OC_APPROVAL_RESOLVED_EVENTS = ("exec.approval.resolved", "plugin.approval.resolved")
+_OC_APPROVAL_LIST_METHODS = (("exec.approval.list", "exec.approval.resolve", "exec"),
+                             ("plugin.approval.list", "plugin.approval.resolve", "plugin"))
+_OC_APPROVAL_DECISIONS = ("allow-once", "allow-always", "deny")
+_OC_APPROVAL_LABELS = {"allow-once": ("允許一次", "primary"),
+                       "allow-always": ("永遠允許", "primary"),
+                       "deny": ("拒絕", "danger")}
+_OC_APPROVAL_TTL_FALLBACK = 300.0
+# approval id → resolve 用的 gateway method。DB 只存 source/session_id,
+# 記不住「這筆要打哪個 method」,所以另存一份記憶體對照(重連時重建)。
+_OC_APPROVAL_METHODS: dict = {}
+
+
+def _oc_approval_options(request: dict) -> list:
+    """request.allowedDecisions → 統一 approval 物件的 options(契約 §1)。
+    gateway 沒給就退三鍵全開 —— 送了不允許的 decision 只會被 gateway 打回,
+    不會誤放行。"""
+    allowed = [d for d in (request.get("allowedDecisions") or [])
+               if d in _OC_APPROVAL_DECISIONS] or list(_OC_APPROVAL_DECISIONS)
+    out = []
+    for d in _OC_APPROVAL_DECISIONS:      # 固定順序,不隨 gateway 排列漂移
+        if d not in allowed:
+            continue
+        label, style = _OC_APPROVAL_LABELS[d]
+        out.append({"key": d, "label": label, "style": style})
+    return out
+
+
+def _oc_approval_title(kind: str, request: dict) -> str:
+    if kind == "plugin":
+        return str(request.get("title")
+                   or request.get("toolName")
+                   or request.get("pluginId") or "OpenClaw 外掛請求核准")[:200]
+    cmd = str(request.get("command") or request.get("commandPreview") or "").strip()
+    cmd = cmd.splitlines()[0] if cmd else ""
+    host = str(request.get("host") or "") or "gateway"
+    return (f"OpenClaw 要在 {host} 執行:{cmd}" if cmd
+            else "OpenClaw 要執行系統指令")[:200]
+
+
+def _oc_approval_detail(kind: str, request: dict) -> str:
+    lines = []
+    if kind == "plugin":
+        for label, k in (("外掛", "pluginId"), ("工具", "toolName"),
+                         ("嚴重度", "severity")):
+            v = request.get(k)
+            if v:
+                lines.append(f"{label}:{v}")
+        desc = str(request.get("description") or "").strip()
+        if desc:
+            lines.append(desc)
+    else:
+        cmd = str(request.get("command") or request.get("commandPreview") or "").strip()
+        if cmd:
+            lines.append(cmd)
+        for label, k in (("cwd", "cwd"), ("host", "host"), ("node", "nodeId"),
+                         ("agent", "agentId")):
+            v = request.get(k)
+            if v:
+                lines.append(f"{label}:{v}")
+        warn = str(request.get("warningText") or "").strip()
+        if warn:
+            lines.append(f"⚠️ {warn}")
+        analysis = request.get("commandAnalysis")
+        if isinstance(analysis, dict):
+            for w in (analysis.get("warningLines") or [])[:5]:
+                lines.append(f"⚠️ {w}")
+    return "\n".join(str(x) for x in lines)[:400]
+
+
+def _oc_approval_risk(kind: str, request: dict) -> str:
+    if kind == "plugin":
+        sev = str(request.get("severity") or "").lower()
+        return {"critical": "high", "warning": "medium"}.get(sev, "low")
+    analysis = request.get("commandAnalysis")
+    if isinstance(analysis, dict) and (analysis.get("riskKinds")
+                                       or analysis.get("warningLines")):
+        return "high"
+    return "medium" if request.get("warningText") else "low"
+
+
+def _oc_approval_record(payload: dict, kind: str) -> dict | None:
+    """gateway requested payload → 統一 approval 物件(A1 wire shape)。"""
+    aid = str(payload.get("id") or "").strip()
+    if not aid:
+        return None
+    request = payload.get("request") if isinstance(payload.get("request"), dict) else {}
+    # M-1:gateway 事件帶的是**原始** sessionKey;bridge 這一側整條路
+    # (digest / v2 session id / 卡片流)用的都是 `_oc_safe_session_key()`
+    # 改道之後的 key。這裡不改道的話,`agent:main:main` 這種撞名 lane 的
+    # 審批卡會落在一個沒人訂閱的 key 上 → 卡片靜默消失,使用者只看到
+    # 「等待審批」卻沒有任何按鈕可按。
+    key = _oc_safe_session_key(str(request.get("sessionKey") or ""))
+    created = payload.get("createdAtMs")
+    expires = payload.get("expiresAtMs")
+    now = time.time()
+    created_at = created / 1000.0 if isinstance(created, (int, float)) and created else now
+    expires_at = (expires / 1000.0 if isinstance(expires, (int, float)) and expires
+                  else now + _OC_APPROVAL_TTL_FALLBACK)
+    return {"id": aid, "title": _oc_approval_title(kind, request),
+            "source": f"openclaw:{key}" if key else "openclaw",
+            "risk": _oc_approval_risk(kind, request),
+            "detail": _oc_approval_detail(kind, request),
+            "created_at": created_at, "expires_at": expires_at,
+            "status": "pending", "decided_at": None, "result": None,
+            "session_id": f"openclaw:{key}" if key else "",
+            "provider": "openclaw", "kind": "permission",
+            "options": _oc_approval_options(request),
+            "_session_key": key}
+
+
+def _oc_cards_feed_approval(key: str, record: dict, resolved: str = "") -> None:
+    """approval 建立/決議 → 對應 openclaw session 的 approval 卡。
+    沒人訂閱過的 session 不為了一張卡就建 digest(同 cc/cx 模式)。
+
+    M-1:這是所有審批卡的**唯一**出卡點,所以改道就收斂在這裡做一次 ——
+    不管呼叫端拿到的是 gateway 的原始 sessionKey(事件流)還是 DB 存的
+    session_id(決議路徑),一律先過 `_oc_safe_session_key()`,才對得上
+    `_v2_card_source` 建立 digest 時用的 key。
+    """
+    key = _oc_safe_session_key(key)
+    d = _OC_CARD_DIGESTS.get(key)
+    if d is None:
+        return
+    if resolved:
+        d.resolve_approval(record, resolved)
+    else:
+        d.handle_approval(record)
+    _oc_msg_notify(key)
+
+
+def _oc_approval_upsert(record: dict, method: str) -> bool:
+    """statement:pending approval 落 canonical approvals 表(讓審核中心 /
+    推播 / 過期全部沿用既有機制)+ 出卡。已存在的 id 不重寫、不復活。"""
+    import sqlite3
+    aid = record["id"]
+    _OC_APPROVAL_METHODS[aid] = method
+    con = sqlite3.connect(CANON_DB, timeout=30)
+    try:
+        row = con.execute("SELECT status FROM approvals WHERE id=?", (aid,)).fetchone()
+        if row:
+            con.close()
+            return row[0] == "pending"
+        con.execute("INSERT INTO approvals"
+                    "(id,title,source,risk,detail,created_at,expires_at,status,decided_at,result,callback,"
+                    "session_id,provider,kind,options) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (aid, record["title"], record["source"], record["risk"],
+                     record["detail"], record["created_at"], record["expires_at"],
+                     "pending", None, None, None, record["session_id"],
+                     "openclaw", "permission",
+                     json.dumps(record["options"], ensure_ascii=False)))
+        con.commit()
+        con.close()
+        return True
+    finally:
+        con.close()
+
+
+def _oc_approval_mark(aid: str, status: str, result: str = "") -> bool:
+    """DB 側收尾(gateway 已決議 / 本 bridge 決議完回寫)。回是否真的改到。"""
+    import sqlite3
+    con = sqlite3.connect(CANON_DB, timeout=30)
+    try:
+        cur = con.execute("UPDATE approvals SET status=?, decided_at=?, result=? "
+                          "WHERE id=? AND status='pending'",
+                          (status, time.time(), result, aid))
+        con.commit()
+        n = cur.rowcount
+        con.close()
+        return bool(n)
+    finally:
+        con.close()
+
+
+# ── H-2:openclaw 事件的 sqlite 一律不准跑在 WS 事件圈上 ────────────────
+# `_oc_events_feed` 是 openclaw WS reader 的**同步** callback，跑在 FastAPI
+# 的事件圈裡。裡面 `sqlite3.connect(CANON_DB, timeout=30)` + INSERT/UPDATE
+# 只要撞到別人的寫鎖，整條事件圈(所有 HTTP、所有 SSE、所有 provider)就
+# 凍結最多 30 秒 —— main 的 `_oc_events_feed` 完全沒有 DB I/O，這是本 PR
+# 新引進的風險，必須搬走。
+#
+# 用「單一 worker + FIFO queue」而不是各自 `create_task`:審批事件有順序
+# 相依(requested 必須先於 resolved 落庫)，並行化會讓 resolved 撲空。
+# 沒有 running loop(單元測試 / 匯入期)就原地同步跑，行為與舊版一致。
+_OC_DB_QUEUE: "asyncio.Queue | None" = None
+_OC_DB_WORKER: "asyncio.Task | None" = None
+_OC_DB_QUEUE_MAX = 2000
+
+
+async def _oc_db_worker() -> None:
+    while True:
+        make_coro = await _OC_DB_QUEUE.get()
+        try:
+            await make_coro()
+        except Exception as e:  # noqa: BLE001 — 單筆毒丸不斷流
+            _log_event("oc_events_feed_error", error=str(e)[:160])
+        finally:
+            _OC_DB_QUEUE.task_done()
+
+
+def _oc_queue_db_event(make_coro) -> bool:
+    """把「會碰 sqlite 的 openclaw 事件處理」排進序列化背景 worker。
+    回 False = 沒有 running loop，呼叫端請自己同步跑。"""
+    global _OC_DB_QUEUE, _OC_DB_WORKER
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return False
+    if _OC_DB_QUEUE is None:
+        _OC_DB_QUEUE = asyncio.Queue(maxsize=_OC_DB_QUEUE_MAX)
+    if _OC_DB_WORKER is None or _OC_DB_WORKER.done():
+        _OC_DB_WORKER = loop.create_task(_oc_db_worker())
+        _BG_TASKS.add(_OC_DB_WORKER)
+        _OC_DB_WORKER.add_done_callback(_BG_TASKS.discard)
+    try:
+        _OC_DB_QUEUE.put_nowait(make_coro)
+    except asyncio.QueueFull:
+        _log_event("oc_db_queue_full", depth=_OC_DB_QUEUE.qsize())
+        return False
+    return True
+
+
+def _oc_approval_requested_prepare(event: str, payload: dict):
+    method, kind = _OC_APPROVAL_EVENTS[event]
+    record = _oc_approval_record(payload, kind)
+    if record is None:
+        _log_event("oc_approval_malformed", gateway_event=event,
+                   payload_keys=",".join(sorted(payload.keys()))[:120])
+        return None
+    key = record.pop("_session_key")
+    return record, key, method, kind
+
+
+def _oc_approval_requested_finish(record: dict, key: str, kind: str) -> None:
+    """DB 落完之後的收尾(出卡 / log / 推播)—— 一定要留在事件圈上跑:
+    `_oc_approval_push` 靠 `asyncio.get_running_loop()` 判斷能不能推播,
+    搬進 worker thread 會靜默失去推播。"""
+    _oc_cards_feed_approval(key, record)
+    _log_event("oc_approval_pending", approval_id=record["id"], kind=kind,
+               session=key[:48], title=record["title"][:60],
+               options=",".join(o["key"] for o in record["options"]))
+    _oc_approval_push(record)
+
+
+def _oc_approval_requested(event: str, payload: dict) -> None:
+    """同步版(沒有 running loop 時才走這條)。"""
+    prep = _oc_approval_requested_prepare(event, payload)
+    if not prep:
+        return
+    record, key, method, kind = prep
+    if not _oc_approval_upsert(record, method):
+        return                                  # 已決議過的 id,不復活
+    _oc_approval_requested_finish(record, key, kind)
+
+
+async def _oc_approval_requested_async(event: str, payload: dict) -> None:
+    prep = _oc_approval_requested_prepare(event, payload)
+    if not prep:
+        return
+    record, key, method, kind = prep
+    if not await asyncio.to_thread(_oc_approval_upsert, record, method):
+        return
+    _oc_approval_requested_finish(record, key, kind)
+
+
+def _oc_approval_resolved_prepare(event: str, payload: dict):
+    aid = str(payload.get("id") or "").strip()
+    if not aid:
+        return None
+    decision = str(payload.get("decision") or "")
+    status = "denied" if decision == "deny" else "approved"
+    return aid, decision, status
+
+
+def _oc_approval_resolved_finish(event: str, payload: dict, aid: str,
+                                 decision: str, status: str) -> None:
+    _OC_APPROVAL_METHODS.pop(aid, None)
+    request = payload.get("request") if isinstance(payload.get("request"), dict) else {}
+    key = _oc_safe_session_key(str(request.get("sessionKey") or ""))
+    _oc_cards_feed_approval(key, {"id": aid, "title": _oc_approval_title(
+        "plugin" if event.startswith("plugin") else "exec", request)}, status)
+    _log_event("oc_approval_resolved_upstream", approval_id=aid,
+               decision=decision, status=status, session=key[:48],
+               resolved_by=str(payload.get("resolvedBy") or "")[:60])
+
+
+def _oc_approval_resolved(event: str, payload: dict) -> None:
+    """gateway 端(或別的 operator client)決議 → 同卡收尾 + DB 收尾。
+    本 bridge 自己決議時 gateway 不會回送這則(廣播排除決議者),所以
+    `_oc_approval_decide` 另外自己收尾 —— 兩條路都冪等。"""
+    prep = _oc_approval_resolved_prepare(event, payload)
+    if not prep:
+        return
+    aid, decision, status = prep
+    _oc_approval_mark(aid, status, decision)
+    _oc_approval_resolved_finish(event, payload, aid, decision, status)
+
+
+async def _oc_approval_resolved_async(event: str, payload: dict) -> None:
+    prep = _oc_approval_resolved_prepare(event, payload)
+    if not prep:
+        return
+    aid, decision, status = prep
+    await asyncio.to_thread(_oc_approval_mark, aid, status, decision)
+    _oc_approval_resolved_finish(event, payload, aid, decision, status)
+
+
+def _oc_approval_push(record: dict) -> None:
+    """待審推播(沿用審核中心既有 `_approval_push`,鎖屏動作鈕/巢形狀一致)。
+    無執行中 event loop(純 sync 匯入期/測試)則跳過。"""
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    try:
+        _approval_push(record["id"], record["title"], record["detail"],
+                       record.get("session_id") or "")
+    except Exception as e:  # noqa: BLE001 — 推播失敗不該讓待審整筆掉
+        _log_event("oc_approval_push_failed", approval_id=record.get("id"),
+                   error=type(e).__name__, error_message=str(e)[:160])
+
+
+def _oc_pending_approval_ids() -> set:
+    """DB 裡還掛著 pending 的 openclaw 待審 id(對帳用)。"""
+    import sqlite3
+    con = sqlite3.connect(CANON_DB, timeout=30)
+    try:
+        rows = con.execute("SELECT id FROM approvals WHERE provider='openclaw' "
+                           "AND status='pending'").fetchall()
+        return {r[0] for r in rows}
+    finally:
+        con.close()
+
+
+async def _oc_approvals_reseed() -> None:
+    """連上線就補洞(SPEC §6-4:gateway 事件無 since 重放)。
+    `*.approval.list` 無參數、回**裸陣列**。
+
+    兩件事:
+    1. **補**:斷線/未啟動期間新開的待審抓回來（冷啟也要做 —— 見
+       `_oc_on_connect`，否則 bridge 起來之前就在等的那筆永遠看不到）。
+    2. **對帳**:gateway 已經不列出、DB 卻還 pending 的，標成 expired。
+       只加不減的話，斷線期間被別的 operator 決議掉的待審會在審核中心變成
+       永遠按不動的殭屍列（按下去 gateway 回 "already resolved"）。
+       兩族都成功列出才敢對帳，否則寧可留著。
+    """
+    seen: set = set()
+    listed_all = True
+    for list_method, resolve_method, kind in _OC_APPROVAL_LIST_METHODS:
+        try:
+            res = await OPENCLAW.call(list_method, {}, timeout=10.0)
+        except Exception as e:  # noqa: BLE001 — 某族不存在/沒權限不該拖垮另一族
+            listed_all = False
+            _log_event("oc_approvals_reseed_failed", method=list_method,
+                       error=type(e).__name__, error_message=str(e)[:160])
+            continue
+        rows = res if isinstance(res, list) else (res or {}).get("approvals") or []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            record = _oc_approval_record(row, kind)
+            if record is None:
+                continue
+            key = record.pop("_session_key")
+            seen.add(record["id"])
+            # H-2:reseed 也跑在事件圈上（on_connect 建的 task），DB 一樣搬走。
+            if await asyncio.to_thread(_oc_approval_upsert, record, resolve_method):
+                _oc_cards_feed_approval(key, record)
+        _log_event("oc_approvals_reseeded", method=list_method, count=len(rows))
+    if not listed_all:
+        return
+    stale = await asyncio.to_thread(_oc_pending_approval_ids)
+    for aid in stale - seen:
+        if await asyncio.to_thread(_oc_approval_mark, aid, "expired"):
+            _OC_APPROVAL_METHODS.pop(aid, None)
+            _log_event("oc_approval_reconciled_expired", approval_id=aid)
+
+
+def _oc_on_connect(was_reconnect: bool) -> None:
+    """每次握手成功(含**冷啟第一次**)都補待審清單。
+
+    舊接線只掛 `on_reconnect` → bridge 冷啟時 gateway 上早就掛著的待審
+    完全看不到，使用者在 app 裡永遠等不到那張卡。
+    """
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    t = loop.create_task(_oc_approvals_reseed())
+    _BG_TASKS.add(t)
+    t.add_done_callback(_BG_TASKS.discard)
+
+
+async def _oc_approval_decide(aid: str, row: dict, b: dict) -> dict:
+    """統一決議路由的 openclaw 分支:key → gateway decision。
+
+    `{approve: bool}` 相容糖 → allow-once / deny(照 options 的 primary/danger
+    第一鍵取,與 `_approval_decide_core` 其他 provider 同語意)。
+    """
+    options = row.get("options") or _oc_approval_options({})
+    okeys = [str(o.get("key") or "") for o in options]
+    key = str(b.get("key") or "").strip()
+    if not key:
+        approve = _approval_bool_from_body(b)
+        want = "primary" if approve else "danger"
+        key = next((str(o.get("key")) for o in options if o.get("style") == want),
+                   "allow-once" if approve else "deny")
+    if key not in okeys:
+        raise http_err(400, "UNKNOWN_KEY", f"key 必須是 {okeys} 之一")
+    method = _OC_APPROVAL_METHODS.get(aid) or (
+        "plugin.approval.resolve" if aid.startswith("plugin:")
+        else "exec.approval.resolve")
+    try:
+        await OPENCLAW.call(method, {"id": aid, "decision": key}, timeout=15.0)
+    except openclaw_provider.OpenClawError as e:
+        if "already resolved" in str(e) or "unknown or expired" in str(e):
+            await asyncio.to_thread(_oc_approval_mark, aid, "expired")
+            raise http_err(409, "APPROVAL_NOT_PENDING",
+                           "OpenClaw 這筆審批已決議或已過期")
+        _oc_http_error(e)
+    status = "denied" if key == "deny" else "approved"
+    # H-2:HTTP handler 也在同一條事件圈上,同步 sqlite 一樣會凍結全服務。
+    if not await asyncio.to_thread(_oc_approval_mark, aid, status, key):
+        raise HTTPException(status_code=409, detail="already decided or expired")
+    _OC_APPROVAL_METHODS.pop(aid, None)
+    sid = str(row.get("session_id") or "")
+    _oc_cards_feed_approval(sid.split(":", 1)[1] if ":" in sid else "",
+                            row, status)
+    _log_event("oc_approval_decision", approval_id=aid, status=status,
+               key=key, method=method, session=sid[:48])
+    return {"id": aid, "status": status, "key": key}
+
+
 def _oc_events_feed(event: str, payload: dict) -> None:
     """OPENCLAW.on_event:gateway 廣播 → 依 sessionKey 分流到有訂閱過的
-    digest(沒人看過的 session 不建 digest,同 cx 模式);chat final 掛推播。"""
+    digest(沒人看過的 session 不建 digest,同 cx 模式);chat final 掛推播。
+    審批事件的 sessionKey 埋在 payload.request 裡,所以要在 sessionKey
+    守門之前先分流 —— 之前整族被靜默丟棄,Pocket 端於是永遠卡住不動。"""
     try:
-        key = str(payload.get("sessionKey") or "")
+        if event in _OC_APPROVAL_EVENTS:
+            # H-2:這兩族會寫 sqlite → 丟到序列化 worker，不在事件圈上等鎖。
+            if not _oc_queue_db_event(
+                    lambda: _oc_approval_requested_async(event, payload)):
+                _oc_approval_requested(event, payload)
+            return
+        if event in _OC_APPROVAL_RESOLVED_EVENTS:
+            if not _oc_queue_db_event(
+                    lambda: _oc_approval_resolved_async(event, payload)):
+                _oc_approval_resolved(event, payload)
+            return
+        key = _oc_safe_session_key(str(payload.get("sessionKey") or ""))
         if not key:
             return
         if event == "agent" and payload.get("isHeartbeat"):
@@ -13643,20 +14119,25 @@ def _oc_push_final(key: str, payload: dict) -> None:
 def _oc_reseed_on_reconnect() -> None:
     """斷線期間 gateway 事件不可重放(SPEC §6-4)→ 全部 digest 標記重 seed,
     下一次 cards/events 請求會重讀 chat.history 補洞(卡 id 穩定,重疊只是
-    rev 遞增)。"""
+    rev 遞增)。
+
+    待審清單的補洞**不在這裡**做 —— 改掛 `on_connect`,才連冷啟第一次也
+    補得到(卡在那裡等人按的審批不能因為 bridge 剛起來就人間蒸發)。"""
     for d in _OC_CARD_DIGESTS.values():
         d.seeded = False
 
 
 OPENCLAW.on_event = _oc_events_feed
 OPENCLAW.on_reconnect = _oc_reseed_on_reconnect
+OPENCLAW.on_connect = _oc_on_connect
 
 
 def _openclaw_default_v2_row() -> dict:
     return {"id": "openclaw:agent:main:main", "provider": "openclaw",
             "title": "OpenClaw", "subtitle": None, "status": "idle",
             "last_event_at": None,
-            "capabilities": ["input", "interrupt", "attachments", "replay", "follow"],
+            "capabilities": ["input", "interrupt", "attachments", "replay",
+                             "follow", "approve"],
             "meta": {"default": True}}
 
 
@@ -13896,34 +14377,170 @@ async def _oc_card_digest(key: str):
     return d
 
 
+# OpenClaw `chat.send.attachments[]` 的實際受理形狀(靶機 dist 實證,
+# `src/gateway/server-methods/attachment-normalize.ts` 的
+# `normalizeRpcAttachmentsToChatAttachments`):
+#   {type?: str, mimeType?: str, fileName?: str, content: base64 str}
+# 也吃 Anthropic 風格 `{source:{type:"base64", media_type, data}}`。
+# **關鍵**:該函式最後 `.filter(a => a.content)` —— 沒有 `content` 的件會被
+# gateway **靜默丟掉**。SPEC §2 舊表寫的 `url|content` 其中 `url` 是誤記,
+# bridge 一律自己把檔案讀成 base64 再送,絕不寄望 url。
+# 大小:gateway 預設 20MB/件(agents.defaults.mediaMaxMb),影像另有 6MiB 硬閥,
+# 且整個 WS 訊框受 policy.maxPayload(靶機 26MB)限制 —— 送太大等於斷線,
+# 所以 bridge 端先擋,擋下來一律報錯,不靜默丟。
+_OC_ATT_MAX_IMAGE_BYTES = 6 * 1024 * 1024
+_OC_ATT_MAX_FILE_BYTES = 20 * 1024 * 1024
+_OC_ATT_MAX_TOTAL_BYTES = 20 * 1024 * 1024
+
+
+def _oc_attachment_mime(a: dict, path: str | None = None) -> str:
+    """宣告 mime 優先，其次拿檔名/路徑猜 —— 落盤前就得知道套哪個上限。"""
+    declared = str(a.get("mime") or a.get("content_type")
+                   or a.get("mimeType") or "").strip()
+    if declared:
+        return declared
+    hint = path or str(a.get("filename") or a.get("fileName") or "")
+    return (mimetypes.guess_type(hint)[0] if hint else None) or "application/octet-stream"
+
+
+def _oc_attachment_cap(mime: str) -> int:
+    return (_OC_ATT_MAX_IMAGE_BYTES if mime.startswith("image/")
+            else _OC_ATT_MAX_FILE_BYTES)
+
+
+def _oc_safe_file_name(name: str) -> str:
+    """轉送給 gateway 的 `fileName` 淨化(不是本機落盤檔名 —— 那條已經有
+    `_upload_dest_path` 在淨化)。app 傳什麼就原封轉出去的話，
+    `../../etc/passwd` 這種名字會直接進到 OpenClaw 端的存檔邏輯裡。
+    規則與 `_upload_dest_path` 一致,避免兩邊漂移。"""
+    base = os.path.basename((name or "").replace("\\", "/"))
+    safe = re.sub(r"[^\w.\-]", "_", base).strip(".")
+    return safe or "file"
+
+
+def _oc_attachment_payload(a: dict, idx: int,
+                           budget_left: int = _OC_ATT_MAX_TOTAL_BYTES) -> tuple[dict, dict]:
+    """app 直送 attachment → (gateway chat.send 件, 卡片摘要件)。
+
+    失敗一律 raise(400/413)—— 這裡是「附件被靜默丟棄」那個資料遺失缺陷的
+    根治點:讀不到就吵,絕不回傳 None 讓呼叫端當沒事。
+
+    **H-1(live bridge 存活)**:量在前、讀在後。舊版先 `read_bytes()` 把整個
+    檔案吞進記憶體，才拿 `len(raw)` 比上限 —— 12 件 × 2GiB 宣告 = 最多 24GB
+    灌進 RAM 之後才回 413，production 的 bridge 早被 OOM killer 收走了。
+    """
+    if not isinstance(a, dict):
+        raise http_err(400, "ATTACHMENT_INVALID",
+                       f"attachments[{idx}] 不是物件")
+    filename = str(a.get("filename") or a.get("fileName") or "").strip()
+    cap = min(_oc_attachment_cap(_oc_attachment_mime(a)), max(budget_left, 0))
+    # ① data URI:不解碼就能估大小 → 超標的話連落盤都不做。
+    data_uri = str(a.get("data") or a.get("data_uri") or "")
+    if data_uri:
+        est = _data_uri_estimated_bytes(data_uri)
+        if est > cap:
+            raise http_err(413, "ATTACHMENT_TOO_LARGE",
+                           f"attachments[{idx}] {filename or 'file'} 約 {est} bytes "
+                           f"超過 OpenClaw 上限 {cap}(未落盤)")
+    path = _save_attachment(a, filename or "file")
+    if not path:
+        # data-URI 落盤失敗 / path 不在 UPLOAD_DIR / 只給了外部 url。
+        raise http_err(400, "ATTACHMENT_UNREADABLE",
+                       f"attachments[{idx}] 取不到本機檔案(需要 uploads 路徑或 data URI)")
+    mime = _oc_attachment_mime(a, path)
+    name = filename or os.path.basename(path)
+    cap = min(_oc_attachment_cap(mime), max(budget_left, 0))
+    # ② 先 stat 再讀 —— 舊版是 read_bytes() 完才比大小。
+    try:
+        size = os.path.getsize(path)
+    except OSError as e:
+        raise http_err(400, "ATTACHMENT_UNREADABLE",
+                       f"attachments[{idx}] 讀檔失敗:{type(e).__name__}") from e
+    if size > cap:
+        raise http_err(413, "ATTACHMENT_TOO_LARGE",
+                       f"attachments[{idx}] {name} {size} bytes 超過 OpenClaw 上限 {cap}")
+    # ③ 讀取本身也封頂 cap+1:就算檔案在 stat 之後被換掉/長大(TOCTOU),
+    #    也絕不會把超過上限的量吞進記憶體。
+    try:
+        with open(path, "rb") as fh:
+            raw = fh.read(cap + 1)
+    except OSError as e:
+        raise http_err(400, "ATTACHMENT_UNREADABLE",
+                       f"attachments[{idx}] 讀檔失敗:{type(e).__name__}") from e
+    if len(raw) > cap:
+        raise http_err(413, "ATTACHMENT_TOO_LARGE",
+                       f"attachments[{idx}] {name} 超過 OpenClaw 上限 {cap}")
+    size = len(raw)
+    kind = str(a.get("kind") or "").strip()
+    safe_name = _oc_safe_file_name(name)
+    item = {"type": kind or ("image" if mime.startswith("image/") else "file"),
+            "mimeType": mime, "fileName": safe_name,
+            "content": base64.b64encode(raw).decode("ascii")}
+    summary = {"filename": safe_name, "mime": mime, "size": size}
+    if kind:
+        summary["kind"] = kind
+    return item, summary
+
+
+def _oc_attachments_payload(attachments: list) -> tuple[list, list]:
+    """attachments[] → (chat.send 用的件, 卡片摘要);任一件失敗整包報錯。
+
+    總額度是**邊走邊扣**再往下傳的:第 N 件能讀多少取決於前 N-1 件用掉
+    多少 —— 「12 件各 19MB」在第 2 件就會 413，不會先全部讀進來再算總和。
+    """
+    items, summaries, total = [], [], 0
+    for i, a in enumerate(attachments or []):
+        left = _OC_ATT_MAX_TOTAL_BYTES - total
+        if left <= 0:
+            raise http_err(413, "ATTACHMENT_TOO_LARGE",
+                           f"attachments 合計超過 OpenClaw 上限 "
+                           f"{_OC_ATT_MAX_TOTAL_BYTES}")
+        item, summary = _oc_attachment_payload(a, i, budget_left=left)
+        total += summary["size"]
+        if total > _OC_ATT_MAX_TOTAL_BYTES:
+            raise http_err(413, "ATTACHMENT_TOO_LARGE",
+                           f"attachments 合計 {total} bytes 超過 OpenClaw 上限 "
+                           f"{_OC_ATT_MAX_TOTAL_BYTES}")
+        items.append(item)
+        summaries.append(summary)
+    return items, summaries
+
+
 async def _oc_input_core(key: str, session_id: str, body: dict) -> dict:
     """v2 input(oc):chat.send fire-and-forget,回覆走 S4 卡片事件流。
-    client_id → idempotencyKey(gateway 原生冪等,重試不重跑)。"""
+    client_id → idempotencyKey(gateway 原生冪等,重試不重跑)。
+
+    附件:真的送出去(SPEC §4)。gateway 的 chat.send 只要 `message` 或
+    `attachments` 其一有值就受理,所以純附件也放行。**任何送不出去的附件
+    一律報錯**——之前「有文字+有附件」時附件被靜默丟棄,app 顯示成功但
+    OpenClaw 端根本沒收到圖,是資料遺失不是顯示問題。
+    """
     content = (body.get("content") or body.get("text") or "").strip()
     attachments = body.get("attachments") or []
-    if attachments and not content:
-        # SPEC §6-2:v1 不宣告 attachments;純附件輸入直接拒絕,
-        # 文字夾附件則丟附件收文字(app 端 capability 缺席本來就不給附件 UI)。
-        raise http_err(400, "ATTACHMENTS_UNSUPPORTED",
-                       "openclaw v1 不支援附件輸入")
-    if not content:
+    _att_guard(attachments)
+    oc_atts, att_summary = _oc_attachments_payload(attachments)
+    if not content and not oc_atts:
         raise HTTPException(status_code=400, detail="empty")
     client_id = str(body.get("client_id") or "").strip()
     idem = f"pocket-{client_id}" if client_id else f"pocket-{uuid.uuid4().hex[:20]}"
+    params = {"sessionKey": key, "message": content, "idempotencyKey": idem}
+    if oc_atts:
+        params["attachments"] = oc_atts
     try:
-        res = await OPENCLAW.call("chat.send",
-                                  {"sessionKey": key, "message": content,
-                                   "idempotencyKey": idem})
+        res = await OPENCLAW.call("chat.send", params)
     except openclaw_provider.OpenClawError as e:
         _oc_http_error(e)
     d = _OC_CARD_DIGESTS.get(key)
     if d is not None:
         # user 回顯卡:openclaw 的 chat 事件只帶 assistant 訊息,app 送話
         # 在這裡即時出卡(idem 冪等 → 重試同 id 不雙份)。
-        d.user_card(content, idem)
+        d.user_card(content, idem, attachments=att_summary)
     _log_event("oc_input", session=key[:48], chars=len(content),
+               attachments=len(oc_atts),
+               attachment_bytes=sum(s["size"] for s in att_summary),
                run_id=str((res or {}).get("runId") or ""))
     return {"ok": True, "session_id": session_id, "accepted": True,
+            "attachments": len(oc_atts),
             "run_id": str((res or {}).get("runId") or "")}
 
 
@@ -17544,6 +18161,8 @@ def _approval_provider_of(source: str) -> str:
         return "claude_code"
     if source.startswith("codex"):
         return "codex"
+    if source.startswith("openclaw"):
+        return "openclaw"
     return "hermes"
 
 
@@ -17562,7 +18181,8 @@ def _approval_row(r):
     return {"id": r[0], "title": r[1], "source": r[2], "risk": r[3], "detail": r[4],
             "created_at": r[5], "expires_at": r[6], "status": r[7],
             "decided_at": r[8], "result": r[9],
-            "session_id": r[10] or (src if src.startswith(("claude_code:", "codex:")) else ""),
+            "session_id": r[10] or (src if src.startswith(
+                ("claude_code:", "codex:", "openclaw:")) else ""),
             "provider": r[11] or _approval_provider_of(src),
             "kind": kind,
             "options": options or _approval_default_options(kind)}
@@ -17605,6 +18225,30 @@ def _hermes_pending_by_session() -> dict:
     return out
 
 
+def _openclaw_pending_by_session() -> dict:
+    """openclaw 的 pending 待審(session_id='openclaw:{sessionKey}')→ 統一物件,
+    每 session 取最早一筆。v2 sessions 補 waiting_approval 用(同 hermes 線)。"""
+    import sqlite3
+    out = {}
+    try:
+        con = sqlite3.connect(CANON_DB, timeout=30)
+        try:
+            _approvals_expire(con)
+            con.commit()
+            rows = con.execute(
+                f"SELECT {_APPROVAL_COLS} FROM approvals WHERE status='pending'"
+                " AND session_id LIKE 'openclaw:%' ORDER BY created_at ASC").fetchall()
+            con.close()
+            for r in rows:
+                d = _approval_row(r)
+                out.setdefault(d["session_id"], d)
+        finally:
+            con.close()
+    except Exception as e:  # noqa: BLE001
+        _log_event("openclaw_pending_scan_failed", error=str(e)[:160])
+    return out
+
+
 def _approvals_expire(con):
     now = time.time()
     # A3:過期不只翻 DB 狀態,存在中的卡片流也要同卡收尾(不然 pending 卡
@@ -17626,6 +18270,10 @@ def _approvals_expire(con):
                 _hp_cards_feed_approval(sid, rec, resolved="expired")
             elif sid.startswith("claude_code:"):
                 _cc_cards_feed_approval(sid.split(":", 1)[1], rec,
+                                        resolved="expired")
+            elif sid.startswith("openclaw:"):
+                _OC_APPROVAL_METHODS.pop(aid, None)
+                _oc_cards_feed_approval(sid.split(":", 1)[1], rec,
                                         resolved="expired")
         except Exception as e:  # noqa: BLE001
             _log_event("approval_expire_feed_error", id=aid, error=str(e)[:160])
@@ -17964,6 +18612,11 @@ async def _approval_decide_core(aid: str, b: dict) -> dict:
         _log_event("cc_approval_decision", session=name, approval_id=aid,
                    status=decision, key=key)
         return {"id": aid, "status": decision, "key": key}
+    if d and src.startswith("openclaw"):
+        # openclaw 的審批真相在 gateway 手上(bridge 只是鏡像)——一定要先
+        # 打 `*.approval.resolve`,成功了才改 DB。反過來寫會出現「app 顯示
+        # 已核准、agent 還在那裡等」。
+        return await _oc_approval_decide(aid, d, b)
     if d and src.startswith("codex"):
         # question 類 server request(item/tool/requestUserInput /
         # mcpServer/elicitation/request)不是二元核准 —— key 就是答案，
