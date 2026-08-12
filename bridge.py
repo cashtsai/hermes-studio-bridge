@@ -4168,10 +4168,14 @@ CODEX_QUESTION_REQUEST_METHODS = (
 )
 
 
-def _codex_rfc3339_now() -> str:
-    """CurrentTimeReadResponse.currentTimeAt（1 element，RFC3339 UTC）。"""
-    return datetime.now(timezone.utc).isoformat(
-        timespec="milliseconds").replace("+00:00", "Z")
+def _codex_current_time_at() -> int:
+    """CurrentTimeReadResponse.currentTimeAt（1 element）。
+
+    型別以 codex 0.144.6 `app-server generate-json-schema` / 二進位 serde
+    字串表為準：`currentTimeAt: number`，doc 寫死「Current time as whole
+    Unix seconds」。先前送 RFC3339 字串會 deserialize 失敗，等於沒接。
+    """
+    return int(time.time())
 
 
 def _codex_safe_question_result(method: str) -> dict:
@@ -4190,8 +4194,26 @@ def _codex_safe_question_result(method: str) -> dict:
                                   "text": "This client did not handle the tool call."}],
                 "success": False}
     if method == "item/permissions/requestApproval":
-        return {"permissions": {}, "scope": "turn"}
+        return _codex_permissions_deny_result()
     return {}
+
+
+# PermissionsRequestApprovalResponse 是 **3 elements**(codex 0.144.6 二進位
+# serde 表:`struct PermissionsRequestApprovalResponse with 3 element`;
+# `app-server generate-json-schema` 也給同一份:permissions /
+# scope / strictAutoReview)。只送 2 欄會賭 serde 有沒有替
+# `strictAutoReview` 補 default —— 賭輸就是 deserialize 失敗、turn 陣亡,
+# 正是這個 PR 要修的那個病。三欄全帶在兩種解讀下都合法,所以一律帶滿。
+#   permissions      GrantedPermissionProfile{network?,fileSystem?}
+#                    → 兩個都給 null = 一項都不加授
+#   scope            PermissionGrantScope enum = "turn" | "session"
+#                    → "turn"(最窄)
+#   strictAutoReview bool|null,doc:「Review every subsequent command in this
+#                    turn before normal sandboxed execution.」→ true(最保守)
+def _codex_permissions_deny_result() -> dict:
+    return {"permissions": {"network": None, "fileSystem": None},
+            "scope": "turn",
+            "strictAutoReview": True}
 
 
 def _codex_read_user_input_questions(params: dict) -> list[dict]:
@@ -4282,6 +4304,42 @@ def _codex_build_user_input_answers(record: dict, key: str, text: str) -> dict:
     if answer:
         answers[first["id"]] = {"answers": [answer]}
     return {"answers": answers}
+
+
+CODEX_SECRET_ANSWER_PLACEHOLDER = "[redacted:secret]"
+
+
+def _codex_redact_secret_answers(record: dict, result: dict) -> dict:
+    """把 `isSecret` 題目的答案換成佔位字串，回傳新的 dict。
+
+    `ToolRequestUserInputQuestion.isSecret` 之前只被解析、沒被使用，導致使用者
+    貼進來的 API key / 密碼原文直接寫進 CANON_DB 的 `approvals.result`
+    （實測抓到 `sk-live-…` 明文）。真答案只准存在於「送給 app-server 的那一個
+    JSON-RPC frame」；任何會留痕的地方（DB、卡片流、log、HTTP 回應）一律用
+    這份遮罩版。
+    """
+    if record.get("method") != "item/tool/requestUserInput":
+        return result
+    secret_ids = {q.get("id") for q in (record.get("questions") or [])
+                  if isinstance(q, dict) and q.get("isSecret")}
+    if not secret_ids:
+        return result
+    answers = result.get("answers") if isinstance(result, dict) else None
+    if not isinstance(answers, dict):
+        return result
+    masked = {}
+    for qid, ans in answers.items():
+        vals = ans.get("answers") if isinstance(ans, dict) else None
+        if qid in secret_ids and isinstance(vals, list) and vals:
+            masked[qid] = {"answers": [CODEX_SECRET_ANSWER_PLACEHOLDER for _ in vals]}
+        else:
+            masked[qid] = ans
+    return {**result, "answers": masked}
+
+
+def _codex_record_has_secret(record: dict) -> bool:
+    return any(isinstance(q, dict) and q.get("isSecret")
+               for q in (record.get("questions") or []))
 
 
 def _codex_build_elicitation_response(record: dict, key: str) -> dict:
@@ -4551,7 +4609,7 @@ class CodexAppServerClient:
                 # 瑣碎且無副作用:直接照 CurrentTimeReadResponse{currentTimeAt}
                 # 正確回覆。回 -32601 只會讓需要時鐘的 turn 平白失敗。
                 await self._write_server_result_safe(
-                    msg.get("id"), {"currentTimeAt": _codex_rfc3339_now()})
+                    msg.get("id"), {"currentTimeAt": _codex_current_time_at()})
                 return
             if method == "item/tool/call":
                 await self._handle_dynamic_tool_call(msg)
@@ -4745,22 +4803,58 @@ class CodexAppServerClient:
         except RuntimeError:
             pass
 
-    async def answer_question(self, approval_id: str, key: str = "",
-                              text: str = "", auto: bool = False) -> dict:
-        """question 類 server request（requestUserInput / elicitation）決議。"""
-        record = self.pending_approvals.get(approval_id)
-        if not record:
-            raise CodexAppServerError("codex question is no longer pending", code=404)
-        result = self._question_response_result(record, key, text)
-        await self._write_server_result(record.get("request_id"), result)
-        self.pending_approvals.pop(approval_id, None)
+    def _claim_pending(self, approval_id: str) -> dict | None:
+        """把 pending server request 從記憶體「認領」出來（pop-before-write）。
+
+        先寫 response 再 pop 會讓同一個 JSON-RPC id 被回兩次（協定違規，實測
+        兩個 result frame）—— autoResolution timer 與使用者按鈕、卡片與
+        thread 層 API、兩台裝置同時按，都會撞。改成先 pop：只有第一個
+        claim 得到 record，第二個拿到 None → 409，永遠只寫一個 response。
+        """
+        record = self.pending_approvals.pop(approval_id, None)
+        if record is None:
+            return None
         thread_id = record.get("thread_id") or ""
         if thread_id:
             self.pending_approvals_by_thread.get(thread_id, {}).pop(approval_id, None)
+        return record
+
+    def _unclaim_pending(self, record: dict) -> None:
+        """認領後沒寫成功（app-server 掉線 / kind 不符）就放回去，
+        免得卡片變成死卡、使用者連重試的機會都沒有。"""
+        approval_id = record.get("id")
+        if not approval_id:
+            return
+        self.pending_approvals[approval_id] = record
+        thread_id = record.get("thread_id") or ""
+        if thread_id:
+            self.pending_approvals_by_thread[thread_id][approval_id] = record
+
+    async def answer_question(self, approval_id: str, key: str = "",
+                              text: str = "", auto: bool = False) -> dict:
+        """question 類 server request（requestUserInput / elicitation）決議。"""
+        record = self._claim_pending(approval_id)
+        if not record:
+            raise CodexAppServerError("codex question is no longer pending", code=404)
+        if (record.get("kind") or "") != "question":
+            self._unclaim_pending(record)
+            raise CodexAppServerError(
+                "這是 Codex 的審批請求（不是問答），請用 approve/deny 決議，"
+                "不要用作答介面。", code=409)
+        result = self._question_response_result(record, key, text)
+        try:
+            await self._write_server_result(record.get("request_id"), result)
+        except Exception:
+            self._unclaim_pending(record)
+            raise
+        # H2:isSecret 的答案只准出現在上面那個 frame,之後一律走遮罩版。
+        safe_result = _codex_redact_secret_answers(record, result)
+        thread_id = record.get("thread_id") or ""
+        if thread_id:
             self.last_event_at[thread_id] = time.time()
         status = "answered"
         try:
-            self._approval_db_decide(approval_id, status, result)
+            self._approval_db_decide(approval_id, status, safe_result)
         except Exception as e:  # noqa: BLE001
             _log_event("codex_approval_db_decide_failed",
                        approval_id=approval_id,
@@ -4771,8 +4865,9 @@ class CodexAppServerClient:
             _log_event("cx_cards_feed_error", error=str(e)[:160])
         _log_event("codex_question_decision", approval_id=approval_id,
                    method=record.get("method"), key=key or "", auto=auto,
+                   secret=_codex_record_has_secret(record),
                    thread_id_hash=_short_hash(thread_id))
-        return {"id": approval_id, "status": status, "result": result,
+        return {"id": approval_id, "status": status, "result": safe_result,
                 "thread_id": thread_id, "method": record.get("method")}
 
     def _question_response_result(self, record: dict, key: str, text: str) -> dict:
@@ -5065,15 +5160,28 @@ class CodexAppServerClient:
 
     async def decide_approval(self, approval_id: str, approved: bool,
                               for_session: bool = False) -> dict:
-        record = self.pending_approvals.get(approval_id)
+        record = self._claim_pending(approval_id)
         if not record:
             raise CodexAppServerError("codex approval is no longer pending", code=404)
+        # B1:kind guard。question 類（requestUserInput / MCP elicitation）的
+        # response 形狀是 {answers} / {action,content,_meta}，不是 {decision}；
+        # 用二元核准回它 → app-server deserialize 失敗 → 整個 turn 死掉，
+        # 而 DB 那列還被標成 approved（使用者看到「已允許」、實際 turn 陣亡）。
+        if (record.get("kind") or "") == "question":
+            self._unclaim_pending(record)
+            raise CodexAppServerError(
+                "這是 Codex 的『問答』請求（{}），不能用二元審批回覆；"
+                "請改用 POST /codexsessions/{{thread_id}}/answer 或帶 key 的 "
+                "approvals decision 作答。".format(record.get("method") or "question"),
+                code=409)
         result = self._approval_response_result(record, approved, for_session=for_session)
-        await self._write_server_result(record.get("request_id"), result)
-        self.pending_approvals.pop(approval_id, None)
+        try:
+            await self._write_server_result(record.get("request_id"), result)
+        except Exception:
+            self._unclaim_pending(record)
+            raise
         thread_id = record.get("thread_id") or ""
         if thread_id:
-            self.pending_approvals_by_thread.get(thread_id, {}).pop(approval_id, None)
             self.last_event_at[thread_id] = time.time()
         status = "approved" if approved else "rejected"
         try:
@@ -5097,11 +5205,46 @@ class CodexAppServerClient:
 
     async def decide_thread_approval(self, thread_id: str, approved: bool,
                                      for_session: bool = False) -> dict:
-        record = self.pending_approval_for_thread(thread_id)
-        if not record:
-            raise CodexAppServerError("no pending Codex approval for thread", code=404)
-        return await self.decide_approval(record["id"], approved,
-                                          for_session=for_session)
+        """thread 層的「按了允許/拒絕」。
+
+        B1:這條路只拿得到 thread，拿不到 approval_id，所以以前它抓到什麼就
+        用二元審批回什麼 —— 包含 question 類的 server request。那會送出
+        `{"decision": ...}` 去回一個期待 `{"answers": …}` 的
+        `ToolRequestUserInputResponse`，deserialize 直接失敗、turn 死掉。
+        現在先挑 approval 類；只剩 question 時依 method 路由到正確形狀，
+        對不上的（多選題的「允許」根本沒有對應答案）就回清楚的 zh-TW 409，
+        寧可讓 app 顯示錯誤，也不要把 turn 弄壞、還在 DB 留一列假的 approved。
+        """
+        record = None
+        pending = self.pending_approvals_by_thread.get(thread_id) or {}
+        for aid in list(pending.keys()):
+            cand = self.pending_approvals.get(aid)
+            if cand is None:
+                pending.pop(aid, None)
+                continue
+            if (cand.get("kind") or "") != "question":
+                record = cand
+                break
+        if record:
+            return await self.decide_approval(record["id"], approved,
+                                              for_session=for_session)
+        question = self.pending_question_for_thread(thread_id)
+        if question:
+            method = question.get("method") or ""
+            if method == "mcpServer/elicitation/request":
+                # elicitation 本來就是「允許/拒絕」二選一,語意可以無損對映。
+                return await self.answer_question(
+                    question["id"], key="approve" if approved else "deny")
+            if not approved:
+                # requestUserInput 的「拒絕」= 略過不答(deny),語意相符。
+                return await self.answer_question(question["id"], key="deny")
+            opts = ", ".join(str(o.get("key") or "") for o in (question.get("options") or []))
+            raise CodexAppServerError(
+                "這個 session 上等的是 Codex 的『問答』（{}），沒有「一律允許」"
+                "這種答案；請改用 POST /codexsessions/{}/answer 指定 keys（{}）"
+                "或 text 作答。".format(method or "question", thread_id, opts),
+                code=409)
+        raise CodexAppServerError("no pending Codex approval for thread", code=404)
 
     def _handle_notification(self, msg: dict):
         method = msg.get("method")
@@ -5705,6 +5848,12 @@ def _codex_http_error(e: Exception):
             # 分開,否則中斷端點會回報「上一輪正在跑」——與事實完全相反。
             raise http_err(409, "CX_NO_ACTIVE_TURN",
                            "no active codex turn to interrupt", str(e))
+        if e.code == 409:
+            # B1 kind guard:拿二元審批去回 question 類 server request。
+            # 這是呼叫端用錯介面,不是 provider 掛掉 —— 回 409 + 明確 code,
+            # 別讓 app 顯示成「bridge 壞了」。
+            raise http_err(409, "CX_WRONG_DECISION_SHAPE",
+                           "codex server request 需要作答而不是核准", str(e))
         if e.code == -32600:
             # 舊版一律 409 + 裸訊息,app 端把它顯示成「會話目前沒有在執行」——
             # 真相通常相反(上一輪正在跑)。給結構化 code 讓 app 講對話。

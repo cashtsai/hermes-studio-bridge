@@ -13,10 +13,12 @@ codex app-server v2 client 的實作）。
     python -m unittest tests.test_codex_server_requests
 """
 import asyncio
-import datetime
+import json
 import os
+import sqlite3
 import sys
 import tempfile
+import time
 import unittest
 
 _TMP = tempfile.mkdtemp(prefix="cxreq-canon-")
@@ -116,29 +118,52 @@ class TestDynamicToolCall(unittest.TestCase):
 
 
 class TestCurrentTimeRead(unittest.TestCase):
-    def test_answers_rfc3339_utc(self):
+    def test_answers_whole_unix_seconds(self):
+        """CurrentTimeReadResponse.currentTimeAt 是 **number**（整數 Unix 秒）。
+
+        來源:`codex app-server generate-json-schema` 與二進位 serde 表
+        （`CurrentTimeReadResponse.ts / currentTimeAt / : number,` +
+        doc「Current time as whole Unix seconds」）。之前送 RFC3339 字串
+        會 deserialize 失敗 —— 跟回 -32601 一樣打死 turn。
+        """
         client = RecordingClient()
+        before = int(time.time())
         _handle(client, {"jsonrpc": "2.0", "id": 5,
                          "method": "currentTime/read", "params": {}})
         result = client.replies_for(5)[0]["result"]
         # CurrentTimeReadResponse = {currentTimeAt}（binary: 1 element）
         self.assertEqual(list(result.keys()), ["currentTimeAt"])
         value = result["currentTimeAt"]
-        self.assertTrue(value.endswith("Z"), value)
-        parsed = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
-        self.assertEqual(parsed.tzinfo.utcoffset(parsed),
-                         datetime.timedelta(0))
+        self.assertIsInstance(value, int)
+        self.assertNotIsInstance(value, bool)
+        self.assertGreaterEqual(value, before)
+        self.assertLessEqual(value, int(time.time()) + 1)
 
 
 class TestPermissionsRequestApproval(unittest.TestCase):
     def test_grants_nothing_but_keeps_turn_alive(self):
+        """PermissionsRequestApprovalResponse 是 **3 elements**。
+
+        二進位 serde 表:`struct PermissionsRequestApprovalResponse with 3
+        element`;JSON Schema 同源:permissions(GrantedPermissionProfile)
+        / scope(PermissionGrantScope = "turn"|"session") / strictAutoReview
+        (bool|null)。只送 2 欄是在賭 serde 有沒有替 strictAutoReview 補
+        default —— 賭輸就是 deserialize 失敗、turn 陣亡（本 PR 要修的病）。
+        """
         client = RecordingClient()
         _handle(client, {"jsonrpc": "2.0", "id": 6,
                          "method": "item/permissions/requestApproval",
                          "params": {"threadId": "t-1", "turnId": "u-1"}})
         reply = client.replies_for(6)[0]
         self.assertNotIn("error", reply)
-        self.assertEqual(reply["result"], {"permissions": {}, "scope": "turn"})
+        result = reply["result"]
+        self.assertEqual(sorted(result.keys()),
+                         ["permissions", "scope", "strictAutoReview"])
+        # 一項權限都不加授
+        self.assertEqual(result["permissions"],
+                         {"network": None, "fileSystem": None})
+        self.assertEqual(result["scope"], "turn")
+        self.assertIsInstance(result["strictAutoReview"], bool)
 
 
 class TestRequestUserInput(unittest.TestCase):
@@ -418,7 +443,255 @@ class TestApprovalRegressions(unittest.TestCase):
         self.assertEqual(
             bridge._codex_safe_question_result("mcpServer/elicitation/request"),
             {"action": "decline", "content": None, "_meta": None})
+        self.assertEqual(
+            sorted(bridge._codex_safe_question_result(
+                "item/permissions/requestApproval").keys()),
+            ["permissions", "scope", "strictAutoReview"])
         self.assertEqual(bridge._codex_safe_question_result("nope"), {})
+
+
+# ═══════════════════ 修 review 抓到的阻斷缺陷（B1 / H1 / H2）═══════════════════
+
+def _question_client(request_id=61, params=None):
+    client = RecordingClient()
+    _handle(client, {"jsonrpc": "2.0", "id": request_id,
+                     "method": "item/tool/requestUserInput",
+                     "params": params or TestRequestUserInput.PARAMS})
+    return client
+
+
+class TestQuestionKindGuard(unittest.TestCase):
+    """B1（BLOCKER）:thread 層的二元審批不准回到 question 類 server request。
+
+    以前 `decide_thread_approval()` 只做「這個 thread 有沒有 pending」，
+    抓到 `item/tool/requestUserInput` 也照樣送 `{"decision": "approved"}`。
+    codex 端期待的是 `ToolRequestUserInputResponse{answers}`，deserialize
+    直接失敗 → **turn 死掉**（正是本 PR 要修的那個病），而且 approvals DB
+    那一列已經被寫成 approved，使用者看到「已允許」但實際上回合陣亡。
+    """
+
+    def test_binary_approve_does_not_corrupt_a_question(self):
+        client = _question_client()
+        record = client.pending_question_for_thread("t-2")
+        with self.assertRaises(bridge.CodexAppServerError) as ctx:
+            _run(client.decide_thread_approval("t-2", True))
+        self.assertEqual(ctx.exception.code, 409)
+        self.assertIn("問答", str(ctx.exception))
+        # 一個 frame 都不准送出去 —— turn 必須完好如初
+        self.assertEqual(client.replies_for(61), [])
+        # 卡片還在（使用者可以改用 /answer 作答），DB 也不准被標成 approved
+        self.assertIsNotNone(client.pending_question_for_thread("t-2"))
+        row = bridge._approval_get_row(record["id"])
+        self.assertEqual(row["status"], "pending")
+
+    def test_decide_approval_by_id_is_guarded_too(self):
+        """走 approval_id 的那條路（/app/v1/approvals/{id}/decision 的
+        fallback 分支）同樣要擋，否則換個入口一樣能弄壞 turn。"""
+        client = _question_client(request_id=62)
+        record = client.pending_question_for_thread("t-2")
+        with self.assertRaises(bridge.CodexAppServerError) as ctx:
+            _run(client.decide_approval(record["id"], True))
+        self.assertEqual(ctx.exception.code, 409)
+        self.assertEqual(client.replies_for(62), [])
+        self.assertIsNotNone(client.pending_question_for_thread("t-2"))
+
+    def test_answer_question_refuses_an_approval_record(self):
+        """反方向也要擋:拿作答介面去回二元審批。"""
+        client = RecordingClient()
+        _handle(client, {"jsonrpc": "2.0", "id": 63,
+                         "method": "item/commandExecution/requestApproval",
+                         "params": {"threadId": "t-9", "command": ["ls"]}})
+        record = client.pending_approval_for_thread("t-9")
+        with self.assertRaises(bridge.CodexAppServerError) as ctx:
+            _run(client.answer_question(record["id"], key="opt0"))
+        self.assertEqual(ctx.exception.code, 409)
+        self.assertEqual(client.replies_for(63), [])
+        self.assertIsNotNone(client.pending_approval_for_thread("t-9"))
+
+    def test_deny_is_routed_to_the_right_response_shape(self):
+        """「拒絕」在 requestUserInput 有等價語意（略過不答），可以無損路由。"""
+        client = _question_client(request_id=64)
+        out = _run(client.decide_thread_approval("t-2", False))
+        self.assertEqual(out["status"], "answered")
+        self.assertEqual(client.replies_for(64)[0]["result"],
+                         {"answers": {"q1": {"answers": []}}})
+
+    def test_elicitation_maps_binary_decision_losslessly(self):
+        """MCP elicitation 本來就是允許/拒絕二選一 → 兩個方向都路由得過去。"""
+        for approved, expect in ((True, "accept"), (False, "decline")):
+            client = RecordingClient()
+            _handle(client, {"jsonrpc": "2.0", "id": 65,
+                             "method": "mcpServer/elicitation/request",
+                             "params": {"threadId": "t-8", "serverName": "svc",
+                                        "message": "ok?", "requestedSchema": {}}})
+            out = _run(client.decide_thread_approval("t-8", approved))
+            self.assertEqual(out["status"], "answered")
+            self.assertEqual(client.replies_for(65)[0]["result"]["action"], expect)
+
+    def test_real_approval_wins_over_a_pending_question(self):
+        """同一個 thread 同時有審批卡與問答卡時，thread 層的允許要落在
+        審批卡上（以前是看 dict 順序，抓到誰算誰）。"""
+        client = RecordingClient()
+        _handle(client, {"jsonrpc": "2.0", "id": 66,
+                         "method": "item/tool/requestUserInput",
+                         "params": {**TestRequestUserInput.PARAMS,
+                                    "threadId": "t-7"}})
+        _handle(client, {"jsonrpc": "2.0", "id": 67,
+                         "method": "item/commandExecution/requestApproval",
+                         "params": {"threadId": "t-7", "command": ["ls"]}})
+        out = _run(client.decide_thread_approval("t-7", True))
+        self.assertEqual(out["status"], "approved")
+        self.assertEqual(client.replies_for(67)[0]["result"], {"decision": "accept"})
+        self.assertEqual(client.replies_for(66), [])          # 問答卡不准被動到
+        self.assertIsNotNone(client.pending_question_for_thread("t-7"))
+
+
+class TestSingleResponsePerRequestId(unittest.TestCase):
+    """H1:同一個 JSON-RPC id 只准有一個 response（協定違規會被 codex 當
+    client 壞掉）。以前是「先寫 response、再 pop pending」，兩條決議路徑
+    （卡片按鈕 / autoResolution timer / thread 層 API / 兩台裝置）撞在一起
+    就會各寫一個 result frame。"""
+
+    def test_second_decision_gets_404_not_a_second_frame(self):
+        client = _question_client(request_id=71)
+        record = client.pending_question_for_thread("t-2")
+        _run(client.answer_question(record["id"], key="opt0"))
+        with self.assertRaises(bridge.CodexAppServerError) as ctx:
+            _run(client.answer_question(record["id"], key="opt1"))
+        self.assertEqual(ctx.exception.code, 404)
+        self.assertEqual(len(client.replies_for(71)), 1)
+
+    def test_concurrent_answers_only_produce_one_frame(self):
+        """兩台裝置同一瞬間按下去（同一個 loop 內併發）。"""
+        client = _question_client(request_id=72)
+        record = client.pending_question_for_thread("t-2")
+
+        async def both():
+            return await asyncio.gather(
+                client.answer_question(record["id"], key="opt0"),
+                client.answer_question(record["id"], key="opt1"),
+                return_exceptions=True)
+
+        out = _run(both())
+        ok = [x for x in out if isinstance(x, dict)]
+        err = [x for x in out if isinstance(x, bridge.CodexAppServerError)]
+        self.assertEqual(len(ok), 1, out)
+        self.assertEqual(len(err), 1, out)
+        self.assertEqual(err[0].code, 404)
+        self.assertEqual(len(client.replies_for(72)), 1)
+
+    def test_auto_resolution_racing_a_manual_answer(self):
+        """autoResolutionMs 到期的自動作答 vs 使用者手動作答。"""
+        client = _question_client(request_id=73)
+        record = client.pending_question_for_thread("t-2")
+
+        async def race():
+            return await asyncio.gather(
+                client.answer_question(record["id"], key="opt0"),
+                client.answer_question(record["id"], key="", text="", auto=True),
+                return_exceptions=True)
+
+        _run(race())
+        self.assertEqual(len(client.replies_for(73)), 1)
+
+    def test_approval_side_is_single_response_too(self):
+        client = RecordingClient()
+        _handle(client, {"jsonrpc": "2.0", "id": 74,
+                         "method": "item/commandExecution/requestApproval",
+                         "params": {"threadId": "t-10", "command": ["ls"]}})
+        record = client.pending_approval_for_thread("t-10")
+        _run(client.decide_approval(record["id"], True))
+        with self.assertRaises(bridge.CodexAppServerError):
+            _run(client.decide_approval(record["id"], False))
+        self.assertEqual(len(client.replies_for(74)), 1)
+
+    def test_write_failure_puts_the_card_back(self):
+        """pop-before-write 不能讓「寫不出去」變成死卡:要放回 pending。"""
+        client = _question_client(request_id=75)
+        record = client.pending_question_for_thread("t-2")
+        client.proc = None          # app-server 掉線 → _write_server_result 丟例外
+        with self.assertRaises(bridge.CodexAppServerError):
+            _run(client.answer_question(record["id"], key="opt0"))
+        self.assertIsNotNone(client.pending_question_for_thread("t-2"))
+        client.proc = FakeProc()
+        _run(client.answer_question(record["id"], key="opt0"))
+        self.assertEqual(len(client.replies_for(75)), 1)
+
+
+class TestSecretAnswersNeverPersisted(unittest.TestCase):
+    """H2:`ToolRequestUserInputQuestion.isSecret` 之前只被解析、沒被使用，
+    使用者貼進來的 API key 直接以明文寫進 CANON_DB 的 `approvals.result`。"""
+
+    SECRET = "sk-live-51H8ZqREGRESSION0000"
+    PARAMS = {
+        "threadId": "t-secret", "turnId": "u-1", "itemId": "i-1",
+        "questions": [{
+            "id": "qk", "header": "貼上 API key", "question": "OpenAI key?",
+            "isOther": True, "isSecret": True, "options": [],
+        }, {
+            "id": "qn", "header": "環境", "question": "哪個環境?",
+            "isOther": True, "isSecret": False, "options": [],
+        }],
+    }
+
+    def _answered(self, request_id=81):
+        client = _question_client(request_id=request_id, params=self.PARAMS)
+        record = client.pending_question_for_thread("t-secret")
+        out = _run(client.answer_question(record["id"], key="", text=self.SECRET))
+        return client, record, out
+
+    def test_plaintext_reaches_app_server_but_nothing_else(self):
+        client, record, out = self._answered(81)
+        # app-server 那個 frame 必須拿到真答案，否則功能是壞的
+        self.assertEqual(client.replies_for(81)[0]["result"],
+                         {"answers": {"qk": {"answers": [self.SECRET]},
+                                      "qn": {"answers": []}}})
+        # 回給 caller 的、以及落庫的，都只能是佔位字串
+        self.assertEqual(out["result"]["answers"]["qk"]["answers"],
+                         [bridge.CODEX_SECRET_ANSWER_PLACEHOLDER])
+
+    def test_canon_db_has_no_plaintext_secret(self):
+        client, record, _ = self._answered(82)
+        con = sqlite3.connect(bridge.CANON_DB)
+        try:
+            row = con.execute("SELECT status, result FROM approvals WHERE id=?",
+                              (record["id"],)).fetchone()
+        finally:
+            con.close()
+        self.assertEqual(row[0], "answered")
+        self.assertNotIn(self.SECRET, row[1] or "")
+        self.assertIn(bridge.CODEX_SECRET_ANSWER_PLACEHOLDER, row[1] or "")
+        # 整張表掃一遍，確定沒有從別的欄位漏出去
+        con = sqlite3.connect(bridge.CANON_DB)
+        try:
+            dump = json.dumps(con.execute("SELECT * FROM approvals").fetchall(),
+                              ensure_ascii=False, default=str)
+        finally:
+            con.close()
+        self.assertNotIn(self.SECRET, dump)
+
+    def test_non_secret_answers_are_untouched(self):
+        client = _question_client(request_id=83, params=self.PARAMS)
+        record = client.pending_question_for_thread("t-secret")
+        params2 = {**self.PARAMS,
+                   "questions": [{**self.PARAMS["questions"][1]}]}
+        client2 = _question_client(request_id=84, params=params2)
+        rec2 = client2.pending_question_for_thread("t-secret")
+        out = _run(client2.answer_question(rec2["id"], key="", text="staging"))
+        self.assertEqual(out["result"], {"answers": {"qn": {"answers": ["staging"]}}})
+
+    def test_secret_stays_out_of_logs(self):
+        seen = []
+        real = bridge._log_event
+        bridge._log_event = lambda ev, **kw: (seen.append((ev, kw)), real(ev, **kw))[1]
+        try:
+            self._answered(85)
+        finally:
+            bridge._log_event = real
+        blob = json.dumps(seen, ensure_ascii=False, default=str)
+        self.assertNotIn(self.SECRET, blob)
+        self.assertTrue(any(ev == "codex_question_decision" and kw.get("secret") is True
+                            for ev, kw in seen), seen)
 
 
 if __name__ == "__main__":
