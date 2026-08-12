@@ -40,6 +40,15 @@ LOGDIR=$(mktemp -d "${TMPDIR:-/tmp}/bridge-tests-XXXXXX")
 # (openclaw_provider 的 _CONFIG_FILE 是模組常數,行程啟動就吃這個 env。)
 OPENCLAW_CONFIG_FILE=${OPENCLAW_CONFIG_FILE:-$LOGDIR/openclaw.json}
 export OPENCLAW_CONFIG_FILE
+# 同一類地雷,2026-08-12 抓到:`import bridge` 在模組層就 new 了一顆
+# AgentRegistry(建構子會建表),測試檔只要忘了自己蓋掉 env,就直接寫到
+# production 的 ~/.pocket/agent-registry.db。在 runner 這層一次擋掉。
+POCKET_REGISTRY_DB=${POCKET_REGISTRY_DB:-$LOGDIR/agent-registry.db}
+HARNESS_DB=${HARNESS_DB:-$LOGDIR/harness.db}
+export POCKET_REGISTRY_DB HARNESS_DB
+# codex 家目錄隔離:測試一律指到 tmp,永遠打不到 ~/.pocket/codex-home、~/.codex
+POCKET_CODEX_HOME=${POCKET_CODEX_HOME:-$LOGDIR/codex-home}
+export POCKET_CODEX_HOME
 export PYTHONPATH=.${PYTHONPATH:+:$PYTHONPATH}
 
 pass=0; fail=0; failed_list=''

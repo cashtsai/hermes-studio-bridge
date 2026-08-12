@@ -45,6 +45,7 @@ from pathlib import Path
 import agent_call as agent_call_policy
 import agent_context as agent_context_policy
 import agent_registry
+import codex_home
 import host_discovery
 from harness import distill as harness_distill
 from harness import model as harness_model
@@ -4081,6 +4082,67 @@ CODEX_APP_SERVER_MODE = os.environ.get("CODEX_APP_SERVER_MODE", "auto").strip().
 if CODEX_APP_SERVER_MODE not in CODEX_APP_SERVER_MODES:
     CODEX_APP_SERVER_MODE = "auto"
 
+# ─────────── codex 家目錄隔離(POCKET_CODEX_ISOLATED)───────────
+# 隔離 = bridge 用**自己的** CODEX_HOME(見 codex_home.py 的長註解)。
+# 它和傳輸模式的交互作用只有一條規則:**隔離開啟 ⇒ 一定得自己 spawn**。
+# 桌面版的 managed daemon 綁死在 ~/.codex,去接它就等於沒有隔離,thread-store
+# 的 writer lock 也會照樣被搶。所以:
+#
+#   隔離 \ 模式 │ auto              │ managed              │ stdio
+#   ───────────┼───────────────────┼──────────────────────┼──────────────
+#   off(預設) │ managed→stdio 退路 │ 只用 daemon,連不上就吵 │ 自己 spawn
+#              │ 家目錄=~/.codex    │ 家目錄=~/.codex       │ 家目錄=~/.codex
+#   on         │ stdio(不碰 socket)│ **衝突** → 隔離勝,記一則 │ stdio
+#              │ 家目錄=隔離        │ log,實際走 stdio+隔離   │ 家目錄=隔離
+#
+# 「隔離勝」而不是「大聲壞掉」的理由:兩個設定都是使用者明講的,但拒絕啟動
+# = CX 全滅(就是我們在修的那個病),而共用 store = 回到 writer lock 戰爭。
+# 隔離是比較強的安全性質,所以它贏,並且用 codex_isolation_mode_conflict 讓
+# 這件事在日誌裡看得見。
+_CODEX_ISOLATION_CONFLICT_LOGGED = False
+_CODEX_HOME_REPORT_LOGGED: dict = {}
+
+
+def _codex_isolated() -> bool:
+    return codex_home.isolation_enabled()
+
+
+def _codex_prepare_home() -> dict | None:
+    """隔離開啟 → 確保家目錄就緒,回子行程要用的 env;關閉 → 回 None。
+
+    每次呼叫都重跑 bootstrap(成本 = 一顆 7KB config 的 sha256),換到的是
+    「善彰改了 `~/.codex/config.toml`,bridge 下次起 app-server 就吃到新設定」。
+    只有在結論**變了**的時候才記 log,不然 60 秒一次的登入探測會洗版。
+    """
+    global _CODEX_HOME_REPORT_LOGGED
+    if not _codex_isolated():
+        return None
+    try:
+        report = codex_home.bootstrap()
+        summary = {k: v for k, v in report.items() if k != "source"}
+        if summary != _CODEX_HOME_REPORT_LOGGED:
+            _CODEX_HOME_REPORT_LOGGED = summary
+            _log_event("codex_isolated_home_ready", **summary)
+    except Exception as _exc:  # noqa: BLE001 — bootstrap 壞掉也要讓 codex 有機會自救
+        _log_exc("codex_isolated_home_bootstrap", _exc)
+    return codex_home.child_env()
+
+
+def _effective_app_server_mode() -> str:
+    """把「隔離旗標」和「傳輸模式」壓成一個實際要走的模式。"""
+    global _CODEX_ISOLATION_CONFLICT_LOGGED
+    mode = CODEX_APP_SERVER_MODE
+    if mode not in CODEX_APP_SERVER_MODES:
+        mode = "auto"
+    if not _codex_isolated():
+        return mode
+    if mode == "managed" and not _CODEX_ISOLATION_CONFLICT_LOGGED:
+        _CODEX_ISOLATION_CONFLICT_LOGGED = True
+        _log_event("codex_isolation_mode_conflict",
+                   requested_mode=mode, effective_mode="stdio",
+                   codex_home=codex_home.isolated_home())
+    return "stdio"
+
 
 def _is_clean_ws_closure(exc: BaseException) -> bool:
     """這個 WebSocket 例外是不是「對方好好地把連線關掉」?
@@ -4113,14 +4175,16 @@ _AGENT_AUTH_CACHE: dict = {"at": 0.0, "data": None}
 _AGENT_AUTH_REFRESHING = False
 
 
-async def _run_status_cli(argv: list[str], timeout: float = 10.0) -> tuple[int, str]:
+async def _run_status_cli(argv: list[str], timeout: float = 10.0,
+                          env: dict | None = None) -> tuple[int, str]:
     """跑一次狀態查詢 CLI,回 (exit_code, 合併輸出);逾時/失敗回 (-1, "")。"""
     try:
         proc = await asyncio.create_subprocess_exec(
             *argv,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
-            stdin=asyncio.subprocess.DEVNULL)
+            stdin=asyncio.subprocess.DEVNULL,
+            **({"env": env} if env is not None else {}))
     except Exception as _exc:  # noqa: BLE001 — 執行檔不在/不可執行
         _log_exc("_run_status_cli.spawn", _exc, expected=True,
                  argv0=(argv[0] if argv else ""))
@@ -4197,7 +4261,10 @@ async def _probe_agent_auth() -> dict:
     codex = {"installed": os.path.exists(codex_bin),
              "logged_in": False, "account": None}
     if codex["installed"]:
-        rc, out = await _run_status_cli([codex_bin, "login", "status"])
+        # 隔離開啟時要問「bridge 那個家目錄」登入了沒 —— 問共用家目錄會給出
+        # 假的綠燈(那是桌面 app 的登入狀態,不是 Pocket 真的能用的那份)。
+        rc, out = await _run_status_cli([codex_bin, "login", "status"],
+                                        env=_codex_prepare_home())
         codex["logged_in"], codex["account"] = _parse_codex_login(rc, out)
 
     return {"claude": claude, "codex": codex}
@@ -4541,6 +4608,8 @@ class CodexAppServerClient:
         self.ws = None
         self.transport = ""
         self.spawned_bin = ""
+        # 這一次連線實際用的 codex 家目錄(隔離時 = ~/.pocket/codex-home)。
+        self.codex_home = ""
         # 上一次「印出來」的傳輸種類,用來做 once-per-transition 的日誌節流。
         self._last_transport_logged = ""
         self._lock = asyncio.Lock()
@@ -4620,12 +4689,19 @@ class CodexAppServerClient:
         )
         self.transport = "unix-websocket"
         self.spawned_bin = "managed-daemon"
+        # managed daemon 綁死在共用家目錄 —— 走這條路就一定不是隔離模式
+        self.codex_home = codex_home.shared_home()
         self._reader_task = asyncio.create_task(self._read_websocket())
 
     async def _spawn_stdio_locked(self):
         """自己 spawn 一顆 `codex app-server --stdio`(沒有共用 daemon 時的退路)。"""
         codex_bin = _resolve_codex_bin()   # 每次 spawn 重新解析:桌面 app 更新後路徑會變
         self.spawned_bin = codex_bin
+        # 隔離關閉時 env 是 None,連 `env=` 參數都不會傳,spawn 呼叫與今天
+        # 逐字相同。
+        env = _codex_prepare_home()
+        self.codex_home = (codex_home.isolated_home() if env is not None
+                           else codex_home.shared_home())
         try:
             self.proc = await asyncio.create_subprocess_exec(
                 codex_bin, "app-server", "--stdio",
@@ -4639,6 +4715,7 @@ class CodexAppServerClient:
                 # and chunk exceed the limit」)→ reader task 死 → app-server「stopped」→ 整條
                 # codex 卡死(XCash 就是這樣)。放大到 128MB 吃得下含圖的大回應。
                 limit=128 * 1024 * 1024,
+                **({"env": env} if env is not None else {}),
             )
         except (FileNotFoundError, PermissionError) as e:
             _log_event("codex_spawn_failed", bin=codex_bin, error=type(e).__name__)
@@ -4653,15 +4730,15 @@ class CodexAppServerClient:
             return
         self._last_transport_logged = transport
         _log_event("codex_transport_selected", transport=transport,
-                   mode=CODEX_APP_SERVER_MODE, **fields)
+                   mode=CODEX_APP_SERVER_MODE,
+                   effective_mode=_effective_app_server_mode(),
+                   isolated=_codex_isolated(), **fields)
 
     async def _ensure_started_locked(self):
         if self.ws is not None or (self.proc and self.proc.returncode is None):
             return
         self.app_server_error = ""
-        mode = CODEX_APP_SERVER_MODE
-        if mode not in CODEX_APP_SERVER_MODES:
-            mode = "auto"
+        mode = _effective_app_server_mode()
         managed_error = None
         if mode in ("auto", "managed"):
             try:
@@ -4716,6 +4793,7 @@ class CodexAppServerClient:
         _log_event("codex_app_server_started",
                    user_agent=(init or {}).get("userAgent", ""),
                    codex_home=(init or {}).get("codexHome", ""),
+                   isolated=_codex_isolated(),
                    bin=self.spawned_bin, transport=self.transport)
 
     def _expire_stale_codex_approvals(self):
@@ -17231,6 +17309,8 @@ async def app_auth_apple_web_callback(request: Request):
 _USAGE_CACHE = {"ts": 0.0, "data": None}
 _USAGE_CACHE_TTL = 10.0  # 秒;擋掉 app 端高頻輪詢造成的重複 jsonl 全掃
 
+# 隔離關閉時就是 ~/.codex/sessions(與今天相同);開啟時要掃「隔離家目錄 +
+# 共用家目錄」兩處 —— rate limit 是帳號層級的事實,桌面 app 寫下的那筆一樣算數。
 CODEX_SESSIONS_DIR = os.path.expanduser("~/.codex/sessions")
 CLAUDE_STATUS_DIR = os.path.expanduser("~/.ai-usage/claude-status")
 CLAUDE_PROJECTS_DIR = os.path.expanduser("~/.claude/projects")
@@ -17302,11 +17382,23 @@ def _usage_tail_text(path, max_bytes=_USAGE_TAIL_BYTES):
         return ""
 
 
+def _codex_session_files():
+    """要掃的 codex rollout jsonl。隔離關閉時 = 今天的單一來源、完全同一份清單。"""
+    dirs = codex_home.sessions_dirs() if _codex_isolated() else [CODEX_SESSIONS_DIR]
+    if len(dirs) == 1:
+        return _usage_newest_files(dirs[0], "*.jsonl", _USAGE_MAX_CODEX_FILES)
+    paths = []
+    for root in dirs:
+        paths.extend(_usage_newest_files(root, "*.jsonl", _USAGE_MAX_CODEX_FILES))
+    paths.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+    return paths[:_USAGE_MAX_CODEX_FILES]
+
+
 def _codex_latest_rate_limits():
     """Newest {timestamp, rate_limits} token_count event across the most
     recently modified codex session files, or None if nothing usable found."""
     best = None  # (timestamp_str, rate_limits_dict)
-    for path in _usage_newest_files(CODEX_SESSIONS_DIR, "*.jsonl", _USAGE_MAX_CODEX_FILES):
+    for path in _codex_session_files():
         text = _usage_tail_text(path)
         if not text or '"token_count"' not in text:
             continue
