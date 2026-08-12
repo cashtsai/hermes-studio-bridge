@@ -14,6 +14,8 @@
 
 所以數字+Enter 的結果是「勾了 A 又順手切掉 B」,而且永遠不會真的送出。
 """
+import asyncio
+import contextlib
 import os
 import unittest
 from unittest import mock
@@ -104,6 +106,14 @@ TAB_ANSI_ON_Q1 = ("← \x1b[38;5;16m\x1b[48;5;153m ☒ Fruits \x1b[39m\x1b[49m"
                   " ☐ Drinks  ☐ Desserts  ✔ Submit  →")
 TAB_ANSI_ON_Q2 = ("\x1b[39m←  ☒ Fruits \x1b[38;5;16m\x1b[48;5;153m ☐ Drinks "
                   "\x1b[39m\x1b[49m ☐ Desserts  ✔ Submit  →")
+
+
+def _reset_answer_idem():
+    """清掉 `/answer` 的行程級冪等快取與 per-session 序列鎖。"""
+    bridge._CC_ANSWER_DONE.clear()
+    bridge._CC_ANSWER_LAST_SIG.clear()
+    bridge._CC_ANSWER_CLIENT.clear()
+    bridge._CC_SEQ_LOCKS.clear()
 
 
 class SubmitRowTests(unittest.TestCase):
@@ -438,6 +448,12 @@ class LaggyTmux(FakeTmux):
 class AnswerEndpointTests(unittest.IsolatedAsyncioTestCase):
     """端點行為 —— 用假 tmux 跑完整序列(真機驗證見 PR 說明)。"""
 
+    def setUp(self):
+        # 每個 test = 一次獨立的真實情境。`/answer` 的冪等快取是行程級的
+        # (同一個 prompt + 同一組 keys 在 TTL 內回原結果),不清就會讓
+        # 後面的測試拿到前一個測試的結果。
+        _reset_answer_idem()
+
     async def _answer(self, fake, body):
         req = mock.Mock()
         req.json = mock.AsyncMock(return_value=body)
@@ -588,7 +604,9 @@ class AnswerEndpointTests(unittest.IsolatedAsyncioTestCase):
                 return REAL_PANE
 
         fake = SingleSelect()
-        with mock.patch.object(bridge, "_cc_key_core",
+        # patch `_cc_key_core_locked`:`/answer` 外層已經拿著同一把
+        # per-session 序列鎖，再走公開的 `_cc_key_core` 會自己撞自己。
+        with mock.patch.object(bridge, "_cc_key_core_locked",
                                mock.AsyncMock(return_value={"ok": True})) as core:
             res = await self._answer(fake, {"keys": ["2"], "submit": True})
         core.assert_awaited_once_with("cc-x", "2")
@@ -632,6 +650,233 @@ class KeyEndpointUnchangedTests(unittest.IsolatedAsyncioTestCase):
             res = await bridge._cc_key_core("cc-x", "2")
         self.assertTrue(res["ok"])
         self.assertEqual(sent, [["-l", "2"], ["Enter"]])
+
+
+# ═════════════ 修 review 抓到的缺陷（併發鎖 / 冪等 / 假成功 / 預算）═════════
+
+class _SlowTmux(FakeTmux):
+    """每個按鍵都慢一點 —— 好讓兩個請求真的有機會交錯。"""
+
+    async def run(self, *args, **kw):
+        if args[0] == "send-keys":
+            await asyncio.sleep(0.02)
+        return await super().run(*args, **kw)
+
+
+def _answer_patches(fake, rows=(("cc-x", "/tmp", "1"),)):
+    return (mock.patch.object(bridge, "_tmux_run", fake.run),
+            mock.patch.object(bridge, "_cc_conf_rows", lambda: list(rows)),
+            mock.patch.object(bridge, "_tmux_alive",
+                              mock.AsyncMock(return_value=True)),
+            mock.patch.object(bridge, "_check_auth", lambda *_a, **_k: None),
+            mock.patch.object(bridge, "_CC_ANSWER_KEY_GAP", 0),
+            mock.patch.object(bridge, "_CC_ANSWER_SETTLE", 0))
+
+
+async def _post_answer(session: str, body: dict):
+    req = mock.Mock()
+    req.json = mock.AsyncMock(return_value=body)
+    bridge._PANE_CACHE.pop(session, None)
+    return await bridge.cc_session_answer(session, req)
+
+
+class ConcurrencyLockTests(unittest.IsolatedAsyncioTestCase):
+    """M-H:`/answer` 的送出序列最壞要按十幾個鍵、二十幾秒，中間完全沒有互斥。
+    兩台裝置、卡片 vs 輸入列、`/answer` 撞 `/key` —— 按鍵會交錯打進同一個
+    pane，數字是 toggle，交錯的結果是勾錯選項甚至在確認頁按到 Cancel。"""
+
+    def setUp(self):
+        _reset_answer_idem()
+
+    async def test_second_concurrent_answer_gets_409_not_interleaved_keys(self):
+        fake = _SlowTmux()
+        with contextlib.ExitStack() as st:
+            for p in _answer_patches(fake):
+                st.enter_context(p)
+            a = asyncio.create_task(_post_answer("cc-x", {"keys": ["1", "3"],
+                                                          "submit": False}))
+            await asyncio.sleep(0.01)          # 讓第一個真的開始跑
+            with self.assertRaises(bridge.BridgeError) as cm:
+                await _post_answer("cc-x", {"keys": ["2", "4"], "submit": False})
+            first = await a
+        self.assertEqual(cm.exception.status_code, 409)
+        self.assertEqual(cm.exception.code, "SESSION_BUSY_TYPING")
+        # 第一個請求完整跑完，勾選正是它要的那一組（沒有被第二個插花）
+        self.assertEqual(first["selected"], ["1", "3"])
+        self.assertEqual(fake.checked, {"1", "3"})
+
+    async def test_key_endpoint_cannot_interleave_into_an_answer(self):
+        """`/answer` 進行中，`/key` 也要被擋（同一把鎖）。"""
+        fake = _SlowTmux()
+        with contextlib.ExitStack() as st:
+            for p in _answer_patches(fake):
+                st.enter_context(p)
+            a = asyncio.create_task(_post_answer("cc-x", {"keys": ["1", "2", "3"],
+                                                          "submit": False}))
+            await asyncio.sleep(0.01)
+            with self.assertRaises(bridge.BridgeError) as cm:
+                await bridge._cc_key_core("cc-x", "5")
+            await a
+        self.assertEqual(cm.exception.status_code, 409)
+        self.assertEqual(cm.exception.code, "SESSION_BUSY_TYPING")
+        self.assertEqual(fake.checked, {"1", "2", "3"})
+
+    async def test_lock_is_released_even_when_the_sequence_fails(self):
+        fake = FakeTmux()
+        with contextlib.ExitStack() as st:
+            for p in _answer_patches(fake):
+                st.enter_context(p)
+            with self.assertRaises(bridge.BridgeError):
+                await _post_answer("cc-x", {"keys": ["9"], "submit": False})
+            res = await _post_answer("cc-x", {"keys": ["1"], "submit": False})
+        self.assertEqual(res["selected"], ["1"])
+        self.assertFalse(bridge._cc_seq_lock("cc-x").locked())
+
+    async def test_lock_is_per_session(self):
+        """不同 session 各自一把鎖，不能互相擋。"""
+        f1, f2 = _SlowTmux(), _SlowTmux()
+        rows = [("cc-a", "/tmp", "1"), ("cc-b", "/tmp", "1")]
+        with mock.patch.object(bridge, "_cc_conf_rows", lambda: rows), \
+             mock.patch.object(bridge, "_tmux_alive",
+                               mock.AsyncMock(return_value=True)), \
+             mock.patch.object(bridge, "_check_auth", lambda *_a, **_k: None), \
+             mock.patch.object(bridge, "_CC_ANSWER_KEY_GAP", 0), \
+             mock.patch.object(bridge, "_CC_ANSWER_SETTLE", 0):
+            async def call(sess, fake, keys):
+                with mock.patch.object(bridge, "_tmux_run", fake.run):
+                    return await _post_answer(sess, {"keys": keys, "submit": False})
+            r1, r2 = await asyncio.gather(call("cc-a", f1, ["1"]),
+                                          call("cc-b", f2, ["2"]))
+        self.assertEqual(r1["selected"], ["1"])
+        self.assertEqual(r2["selected"], ["2"])
+
+
+class IdempotencyTests(unittest.IsolatedAsyncioTestCase):
+    """M-H:序列最壞 ≈22s、app 端 timeout 15s → app 先放棄、使用者重試 →
+    同一組答案送兩次（第二次會答到下一題去）。端點必須冪等。"""
+
+    def setUp(self):
+        _reset_answer_idem()
+
+    async def _answer(self, fake, body):
+        with contextlib.ExitStack() as st:
+            for p in _answer_patches(fake):
+                st.enter_context(p)
+            return await _post_answer("cc-x", body)
+
+    async def test_same_keys_on_the_same_prompt_replays_instead_of_retoggling(self):
+        """雙擊:第二次不能再跑一輪 toggle —— 那會把剛勾好的整組切掉。"""
+        fake = FakeTmux()
+        first = await self._answer(fake, {"keys": ["1", "3"], "submit": False})
+        sent_after_first = list(fake.sent)
+        second = await self._answer(fake, {"keys": ["1", "3"], "submit": False})
+        self.assertTrue(second.get("replayed"))
+        self.assertEqual(second["selected"], first["selected"])
+        self.assertEqual(fake.sent, sent_after_first, "重播不該再送任何鍵")
+        self.assertEqual(fake.checked, {"1", "3"})
+
+    async def test_client_id_replays_after_the_prompt_is_gone(self):
+        """app timeout → 重送。那時 prompt 早就收掉了，只有 client_id 認得。"""
+        fake = FakeTmux()
+        first = await self._answer(fake, {"keys": ["2"], "submit": True,
+                                          "client_id": "dev-1"})
+        self.assertTrue(first["submitted"])
+        self.assertEqual(fake.stage, "done")     # 提問已結案，畫面沒 prompt 了
+        sent_after_first = list(fake.sent)
+        again = await self._answer(fake, {"keys": ["2"], "submit": True,
+                                          "client_id": "dev-1"})
+        self.assertTrue(again.get("replayed"))
+        self.assertTrue(again["submitted"])
+        self.assertEqual(fake.sent, sent_after_first, "重送不該再按任何鍵")
+
+    async def test_a_different_prompt_is_not_replayed(self):
+        """下一題剛好長得一樣也不能被誤判成重播（sig 換了就清快取）。"""
+        fake = FakeTmux()
+        await self._answer(fake, {"keys": ["1"], "submit": False})
+        fake2 = FakeTmux(options=4)          # 不同題（選項數不同 → sig 不同）
+        res = await self._answer(fake2, {"keys": ["1"], "submit": False})
+        self.assertFalse(res.get("replayed"))
+        self.assertEqual(fake2.checked, {"1"})
+
+    async def test_a_different_key_set_is_not_replayed(self):
+        fake = FakeTmux()
+        await self._answer(fake, {"keys": ["1"], "submit": False})
+        res = await self._answer(fake, {"keys": ["1", "2"], "submit": False})
+        self.assertFalse(res.get("replayed"))
+        self.assertEqual(fake.checked, {"1", "2"})
+
+    async def test_result_reports_its_time_budget(self):
+        """app 端要知道該把 timeout 設多大（`budget_secs`）。"""
+        fake = FakeTmux()
+        res = await self._answer(fake, {"keys": ["1"], "submit": False})
+        self.assertEqual(res["budget_secs"], bridge._CC_ANSWER_BUDGET_SECS)
+        # app 端 StudioBridge.swift 的 timeout 必須大於這個數(見 PR 說明)
+        self.assertGreaterEqual(bridge._CC_ANSWER_BUDGET_SECS, 25)
+
+
+class NotSubmittedIsNotA200Test(unittest.IsolatedAsyncioTestCase):
+    """M:確認頁沒收掉 = 這次沒成交。舊碼回 HTTP 200 + submitted:false，
+    呼叫端一律把 200 當成功、對使用者說「已送出」—— 使用者以為答完了，
+    CC 其實還停在確認頁等人按。"""
+
+    def setUp(self):
+        _reset_answer_idem()
+
+    async def test_unclosed_review_screen_is_a_409(self):
+        class StuckReview(FakeTmux):
+            def pane(self):
+                if self.stage == "done":
+                    return MS_REVIEW          # 確認頁永遠不收
+                return super().pane()
+
+        fake = StuckReview()
+        with contextlib.ExitStack() as st:
+            for p in _answer_patches(fake):
+                st.enter_context(p)
+            with self.assertRaises(bridge.BridgeError) as cm:
+                await _post_answer("cc-x", {"keys": ["1"], "submit": True})
+        self.assertEqual(cm.exception.status_code, 409)
+        self.assertEqual(cm.exception.code, "ANSWER_NOT_SUBMITTED")
+
+    async def test_next_button_is_still_a_200(self):
+        """「推進到下一題」不是失敗 —— 那條路必須維持 2xx。"""
+        fake = FakeTmux(label="Next")
+        with contextlib.ExitStack() as st:
+            for p in _answer_patches(fake):
+                st.enter_context(p)
+            res = await _post_answer("cc-x", {"keys": ["1"], "submit": True})
+        self.assertFalse(res["submitted"])
+        self.assertTrue(res["advanced"])
+
+
+class ApprovalUpdateTidyTests(unittest.TestCase):
+    """L:`_cc_approval_update` 舊碼 try 裡 close 完、finally 再 close 一次，
+    而且在**已關閉**的 cursor 上讀 `rowcount`。"""
+
+    def test_rowcount_is_read_before_close_and_reports_truthfully(self):
+        import sqlite3
+        import tempfile as _tf
+        db = os.path.join(_tf.mkdtemp(prefix="cc-appr-"), "canonical.db")
+        con = sqlite3.connect(db)
+        con.execute("CREATE TABLE approvals(id TEXT PRIMARY KEY, title TEXT, "
+                    "detail TEXT, kind TEXT, options TEXT, meta TEXT, status TEXT)")
+        con.execute("INSERT INTO approvals VALUES('a1','t','d','question',NULL,NULL,'pending')")
+        con.execute("INSERT INTO approvals VALUES('a2','t','d','question',NULL,NULL,'expired')")
+        con.commit()
+        con.close()
+        prompt = bridge._cc_prompt(MS_FRESH)
+        with mock.patch.object(bridge, "CANON_DB", db):
+            self.assertTrue(bridge._cc_approval_update("a1", "cc-x", prompt))
+            self.assertFalse(bridge._cc_approval_update("a2", "cc-x", prompt))
+            self.assertFalse(bridge._cc_approval_update("nope", "cc-x", prompt))
+        con = sqlite3.connect(db)
+        try:
+            row = con.execute("SELECT title, status FROM approvals "
+                              "WHERE id='a1'").fetchone()
+        finally:
+            con.close()
+        self.assertEqual(row[1], "pending")
+        self.assertNotEqual(row[0], "t")     # 真的有寫進去
 
 
 if __name__ == "__main__":

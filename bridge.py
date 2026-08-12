@@ -15,6 +15,7 @@ import asyncio
 import base64
 import carddigest
 import collections
+import contextlib
 import fcntl
 import glob
 import hashlib
@@ -11166,8 +11167,50 @@ async def cc_session_key(name: str, request: Request):
     return await _cc_key_core(name, raw)
 
 
+# ── 同一個 tmux pane 的「多鍵送出序列」互斥 ─────────────────────────────
+# `/answer` 的送出序列最壞要按十幾個鍵、花二十幾秒(toggle → 導覽 → Enter →
+# 確認頁),中間完全沒有互斥。兩台裝置、卡片 vs 輸入列、`/answer` 撞 `/key`
+# —— 都會把按鍵交錯打進**同一個 pane**:數字是 toggle,交錯的結果是勾錯
+# 選項,最糟的情況是在確認頁按到 Cancel、或多按一次 Down 把提問整個取消。
+# 搶不到就 **409**,不排隊:排隊只會讓第二個請求撐到 app 端 timeout 之後
+# 再重送一次,問題更大。
+_CC_SEQ_LOCKS: dict = {}
+
+
+def _cc_seq_lock(name: str) -> asyncio.Lock:
+    lock = _CC_SEQ_LOCKS.get(name)
+    if lock is None:
+        lock = asyncio.Lock()
+        _CC_SEQ_LOCKS[name] = lock
+    return lock
+
+
+@contextlib.asynccontextmanager
+async def _cc_seq_guard(name: str, what: str = "keys"):
+    """取得該 session 的按鍵序列鎖;已被佔用就 409。
+
+    `lock.locked()` 檢查與 `acquire()` 之間沒有讓權點(未競爭的
+    `Lock.acquire()` 不會 yield),所以在單執行緒事件圈上這是原子的。
+    """
+    lock = _cc_seq_lock(name)
+    if lock.locked():
+        raise http_err(409, "SESSION_BUSY_TYPING",
+                       "這個 session 正在送出另一組按鍵，請稍候再試",
+                       f"another key sequence is in flight (wanted: {what})")
+    await lock.acquire()
+    try:
+        yield
+    finally:
+        lock.release()
+
+
 async def _cc_key_core(name: str, raw: str) -> dict:
     """cc 控制鍵核心 — v1 與 v2 統一路由(key/approve)共用。"""
+    async with _cc_seq_guard(name, f"key:{raw}"):
+        return await _cc_key_core_locked(name, raw)
+
+
+async def _cc_key_core_locked(name: str, raw: str) -> dict:
     if not await _tmux_alive(name):
         raise http_err(409, "SESSION_NOT_RUNNING", "session not running")
     args = ["send-keys", "-t", name]
@@ -11261,6 +11304,83 @@ _CC_ANSWER_SETTLE_TRIES = 12   # 等重繪最多輪幾次(≈0.7s;逾時就用�
 _CC_ANSWER_CONFIRM_TRIES = 40  # 等確認頁收掉最多輪幾次(≈2.4s;CC 結案要一下)
 _CC_ANSWER_MAX_NAV = 14        # 走到送出鈕的最多 Down 次數(選項上限 8 + 緩衝)
 _CC_REVIEW_MARKERS = ("ready to submit your answers", "review your answers")
+
+# 整條序列的**時間預算**(app 端 client timeout 必須大於它,否則 app 先放棄、
+# 使用者重試 → 同一組答案被送兩次)。實測最壞情形:
+#   toggle 8 次 × (0.7 等重繪 + 0.12 間隔) ≈ 6.6s
+#   導覽 14 次 × 0.7                        ≈ 9.8s
+#   Enter 等換頁  40 × 0.06                 ≈ 2.4s
+#   確認頁「1」等收掉 40 × 0.06             ≈ 2.4s
+#   tmux capture/送鍵 的固定開銷            ≈ 幾百 ms
+# 合計 ≈ 21–22s;抓 28s 當硬預算,超過就中止並明確回報(不會半途留下亂鍵,
+# 因為每一步都閉環驗證過)。
+#   → **app 端 `StudioBridge.swift` 的 timeout 必須 ≥ 35s**(28 + 網路餘裕)。
+_CC_ANSWER_BUDGET_SECS = 28.0
+
+# 冪等:端點本身不冪等的話,「app 逾時 → 使用者重試」= 同一組答案被送兩次
+# (第二次會答到下一題去)。兩條互補的認人方式:
+#
+# 1. **同一個 prompt + 同一組 keys**(`_CC_ANSWER_DONE`):擋雙擊、擋卡片與
+#    輸入列同時送。只在「畫面上還是同一個 prompt」時有效 —— 一旦該 session
+#    的 live prompt 換了簽名就整批清掉,免得下一題剛好長得一樣被誤判成重播。
+# 2. **client_id**(`_CC_ANSWER_CLIENT`):擋 app 逾時後的重送 / OfflineOutbox
+#    補送 —— 那時 prompt 早就換頁了,只有呼叫端自帶的冪等鍵認得出來。
+#    與 `_APP_TURN_INFLIGHT` / `_CX_INPUT_INFLIGHT` 同一套慣例。
+_CC_ANSWER_DONE: dict = {}          # (name, sig, keys, submit) -> {"ts","res"}
+_CC_ANSWER_LAST_SIG: dict = {}      # name -> 上一次看到的 live prompt sig
+_CC_ANSWER_CLIENT: dict = {}        # (name, client_id) -> {"ts","res"}
+_CC_ANSWER_DONE_TTL = 120.0
+_CC_ANSWER_CLIENT_TTL = 600.0
+_CC_ANSWER_DONE_MAX = 256
+
+
+def _cc_answer_prune(store: dict, ttl: float) -> None:
+    now = time.time()
+    for k in [k for k, v in store.items() if now - v["ts"] > ttl]:
+        store.pop(k, None)
+    while len(store) > _CC_ANSWER_DONE_MAX:
+        store.pop(next(iter(store)), None)
+
+
+def _cc_answer_client_get(name: str, client_id: str):
+    if not client_id:
+        return None
+    _cc_answer_prune(_CC_ANSWER_CLIENT, _CC_ANSWER_CLIENT_TTL)
+    hit = _CC_ANSWER_CLIENT.get((name, client_id))
+    return dict(hit["res"], replayed=True) if hit else None
+
+
+def _cc_answer_idem_key(name: str, prompt: dict, keys: list, submit: bool) -> tuple:
+    """live prompt 換了就把這個 session 的舊快取全丟掉。
+
+    簽名比 `_cc_prompt_sig`(只吃 title+options)再多帶送出鈕文字與題號 ——
+    多題 ask 的兩題有可能長得一模一樣，只差在鈕上寫 Next 還是 Submit。
+    """
+    sig = "|".join([_cc_prompt_sig(prompt),
+                    str(prompt.get("submit_label") or ""),
+                    str(prompt.get("q_index") or ""),
+                    str(prompt.get("q_total") or "")])
+    if _CC_ANSWER_LAST_SIG.get(name) != sig:
+        for k in [k for k in _CC_ANSWER_DONE if k[0] == name]:
+            _CC_ANSWER_DONE.pop(k, None)
+        _CC_ANSWER_LAST_SIG[name] = sig
+    return (name, sig, ",".join(keys), bool(submit))
+
+
+def _cc_answer_idem_get(k: tuple):
+    _cc_answer_prune(_CC_ANSWER_DONE, _CC_ANSWER_DONE_TTL)
+    hit = _CC_ANSWER_DONE.get(k)
+    return dict(hit["res"], replayed=True) if hit else None
+
+
+def _cc_answer_idem_put(k: tuple, res: dict, name: str = "",
+                        client_id: str = "") -> None:
+    _CC_ANSWER_DONE[k] = {"ts": time.time(), "res": dict(res)}
+    _cc_answer_prune(_CC_ANSWER_DONE, _CC_ANSWER_DONE_TTL)
+    if client_id:
+        _CC_ANSWER_CLIENT[(name, client_id)] = {"ts": time.time(),
+                                                "res": dict(res)}
+        _cc_answer_prune(_CC_ANSWER_CLIENT, _CC_ANSWER_CLIENT_TTL)
 
 
 async def _cc_fresh_prompt(name: str):
@@ -11396,22 +11516,60 @@ async def cc_session_answer(name: str, request: Request):
         raise http_err(400, "KEYS_REQUIRED", "keys required (list of option keys)")
     submit = body.get("submit")
     submit = True if submit is None else bool(submit)
+    client_id = str(body.get("client_id") or "").strip()[:64]
+    # client_id 冪等要在拿鎖**之前**判 —— 逾時重送時第一次可能還在跑,
+    # 這時直接回原結果比 409「正在打字」對 app 更有用。
+    replay = _cc_answer_client_get(name, client_id)
+    if replay is not None:
+        _log_event("cc_answer_replayed", session=name, client_id=client_id)
+        return replay
     if not await _tmux_alive(name):
         raise http_err(409, "SESSION_NOT_RUNNING", "session not running")
+    async with _cc_seq_guard(name, "answer"):
+        replay = _cc_answer_client_get(name, client_id)
+        if replay is not None:
+            return replay
+        return await _cc_answer_locked(name, keys, submit, client_id)
+
+
+async def _cc_answer_locked(name: str, keys: list, submit: bool,
+                            client_id: str = "") -> dict:
+    started = time.monotonic()
+
+    def _budget_left() -> float:
+        return _CC_ANSWER_BUDGET_SECS - (time.monotonic() - started)
+
+    def _check_budget(stage: str) -> None:
+        if _budget_left() <= 0:
+            _log_event("cc_answer_budget_exceeded", session=name, stage=stage,
+                       budget=_CC_ANSWER_BUDGET_SECS)
+            raise http_err(504, "ANSWER_TIMEOUT",
+                           "作答序列超過時間預算，已中止（畫面上的勾選維持現狀）",
+                           f"stage={stage} budget={_CC_ANSWER_BUDGET_SECS}s")
 
     pane, prompt = await _cc_fresh_prompt(name)
     why = _cc_answer_stale(prompt, keys)
     if why:
         raise http_err(409, "PROMPT_STALE", "no matching live prompt right now", why)
+    idem = _cc_answer_idem_key(name, prompt, keys, submit)
+    hit = _cc_answer_idem_get(idem)
+    if hit is not None:
+        # 同一個 prompt 還在畫面上、同一組 keys 又送一次 = 雙擊/兩個入口
+        # 同時送。回原本那次的結果，不要再跑一輪 toggle 把勾選切掉。
+        _log_event("cc_answer_replayed", session=name, keys=",".join(keys))
+        return hit
     if not prompt.get("multiselect"):
         # 單選版面:沒有勾選框、沒有送出鈕,語意與 /key 完全相同(數字即成交)。
         # 讓 app 只維護一條作答路徑,但行為一字不改地沿用既有 /key。
+        # 用 `_locked` 版:序列鎖已經在外層拿著了,再拿一次會自己撞自己。
         if len(keys) > 1:
             raise http_err(400, "NOT_MULTISELECT",
                            "this prompt only accepts one option", "send a single key")
-        res = await _cc_key_core(name, keys[0])
-        return {"ok": True, "sent": keys, "submitted": True,
-                "multiselect": False, **{k: v for k, v in res.items() if k != "ok"}}
+        res = await _cc_key_core_locked(name, keys[0])
+        out = {"ok": True, "sent": keys, "submitted": True,
+               "multiselect": False, **{k: v for k, v in res.items() if k != "ok"}}
+        _cc_answer_idem_put(idem, out, name, client_id)
+        return out
 
     lines = pane.splitlines()
     kind, _focus_key = _cc_ms_focus_row(lines)
@@ -11436,6 +11594,7 @@ async def cc_session_answer(name: str, request: Request):
         if not todo:
             break
         for k in todo:                      # 數字是 toggle → 只送「現況 ⊕ 目標」
+            _check_budget("toggle")
             expect = _cc_ms_checked(prompt) ^ {k}
             pane, prompt = await _cc_send_and_redraw(
                 name, "-l", k, before=pane,
@@ -11457,17 +11616,32 @@ async def cc_session_answer(name: str, request: Request):
                        "on-screen selection does not match the requested keys",
                        f"want={','.join(sorted(want))} got={','.join(sorted(final))}")
     out = {"ok": True, "sent": sent, "selected": sorted(final, key=int),
-           "multiselect": True, "submitted": False}
+           "multiselect": True, "submitted": False,
+           "budget_secs": _CC_ANSWER_BUDGET_SECS}
     if prompt.get("q_total"):
         out["q_total"] = prompt["q_total"]
     if not submit:
+        _cc_answer_idem_put(idem, out, name, client_id)
         return out
-    res = await _cc_multiselect_submit(name, pane, prompt)
+    _check_budget("submit")
+    res = await _cc_multiselect_submit(name, pane, prompt, _check_budget)
     out.update(res)
+    if out.get("submitted") is False and not out.get("advanced"):
+        # 「確認頁沒收掉」= 這次**沒有成交**。舊碼回 HTTP 200 + submitted:false,
+        # 呼叫端一律把 200 當成功、對使用者說「已送出」—— 那是最壞的一種錯:
+        # 使用者以為答完了,CC 其實還停在確認頁等人按。改成 409,app 不可能誤判。
+        _log_event("cc_answer_not_submitted", session=name,
+                   selected=sorted(final, key=int), detail=str(res)[:160])
+        raise http_err(409, "ANSWER_NOT_SUBMITTED",
+                       "選項已勾好，但確認頁沒有收掉 —— 這次沒有送出，請在終端機確認",
+                       json.dumps({k: v for k, v in out.items() if k != "ok"},
+                                  ensure_ascii=False)[:400])
+    _cc_answer_idem_put(idem, out, name, client_id)
     return out
 
 
-async def _cc_multiselect_submit(name: str, pane: str, prompt: dict) -> dict:
+async def _cc_multiselect_submit(name: str, pane: str, prompt: dict,
+                                 check_budget=None) -> dict:
     """走到內嵌送出鈕 → Enter → (最後一題)確認頁 → 成交。閉環驗證,不盲送。"""
     label = prompt.get("submit_label") or ""
     if not label:
@@ -11481,6 +11655,8 @@ async def _cc_multiselect_submit(name: str, pane: str, prompt: dict) -> dict:
     focus = _cc_ms_focus_row(pane.splitlines())
     presses = 0
     while focus[0] != "submit" and presses < _CC_ANSWER_MAX_NAV:
+        if check_budget:
+            check_budget("navigate")
         step = "Up" if focus[0] == "other" else "Down"     # 走過頭就退回來
         pane, prompt2 = await _cc_send_and_redraw(
             name, step, before=pane,
@@ -11775,6 +11951,8 @@ def _cc_approval_update(aid: str, name: str, prompt: dict) -> bool:
     import sqlite3
     p = _cc_approval_payload(name, prompt)
     try:
+        # 只 close 一次(finally),而且 `cur.rowcount` 在 close **之前**讀 ——
+        # 舊碼 try 內 close 完再讀 rowcount,是在已關閉的 cursor 上取值。
         con = sqlite3.connect(CANON_DB, timeout=30)
         try:
             cur = con.execute(
@@ -11784,9 +11962,9 @@ def _cc_approval_update(aid: str, name: str, prompt: dict) -> bool:
                  json.dumps(p["options"], ensure_ascii=False) if p["options"] else None,
                  json.dumps(p["meta"], ensure_ascii=False) if p["meta"] else None,
                  aid))
+            changed = bool(cur.rowcount)
             con.commit()
-            con.close()
-            return bool(cur.rowcount)
+            return changed
         finally:
             con.close()
     except Exception as e:  # noqa: BLE001
