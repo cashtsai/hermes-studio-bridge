@@ -213,11 +213,41 @@ def _save_device_tokens(d: dict) -> None:
 # tokens can't lock out the real client (no self-inflicted DoS). With a long
 # random token, brute force is already infeasible; this mainly stops scanning
 # and log spam, and signals abuse via 429.
-_AUTH_FAILS: collections.deque = collections.deque()
+# 2026-08-12 多租戶強化(relay 對外開放前必修):
+#  ① 節流桶改 **per-client**。原本是單一全域 deque —— 有效 token 在 _check_auth
+#     最上面就 return,所以正常使用者本來就不會被鎖(那部分設計是對的、註解也
+#     講明了);但一個來源的錯誤嘗試會讓**其他來源**的無效請求一起吃 429 ——
+#     包含新裝置配對、token 過期要重配的正常人。單機自用無感,relay 多租戶會咬人。
+#  ② `_AUTH_FAIL_AGG` 原本永不清理,key=(client, path, status) —— 攻擊者變換
+#     path 就能無限撐大這張 dict → 記憶體耗盡。現在有硬上限 + TTL 清理。
+_AUTH_FAILS_BY_CLIENT: dict = {}   # client → deque[monotonic]
 _AUTH_FAIL_WINDOW = 60.0  # seconds
-_AUTH_FAIL_MAX = 12       # wrong guesses per window before 429
+_AUTH_FAIL_MAX = 12       # wrong guesses per window before 429(每個 client 各自算)
 _AUTH_LOCK = threading.Lock()
 _AUTH_FAIL_AGG: dict = {}
+_AUTH_TABLE_MAX = 2048    # 兩張表的硬上限;超過就清掉沒動靜的條目
+_AUTH_AGG_TTL = 900.0     # 聚合條目 15 分鐘沒再犯就忘掉(monotonic)
+
+
+def _auth_fail_bump_locked(request: Request, now: float) -> bool:
+    """記一次認證失敗,回傳「**這個 client** 是否已超額」。呼叫端須持 _AUTH_LOCK。
+
+    per-client 分桶:一個來源灌爆自己的桶,不影響其他來源。表滿時清掉整窗
+    都沒動靜的桶(掃描者換 IP 也撐不大)。
+    """
+    client = _client_host(request) or "?"
+    dq = _AUTH_FAILS_BY_CLIENT.get(client)
+    if dq is None:
+        dq = collections.deque()
+        _AUTH_FAILS_BY_CLIENT[client] = dq
+    while dq and now - dq[0] > _AUTH_FAIL_WINDOW:
+        dq.popleft()
+    dq.append(now)
+    if len(_AUTH_FAILS_BY_CLIENT) > _AUTH_TABLE_MAX:
+        for k in [k for k, v in _AUTH_FAILS_BY_CLIENT.items()
+                  if k != client and (not v or now - v[-1] > _AUTH_FAIL_WINDOW)]:
+            _AUTH_FAILS_BY_CLIENT.pop(k, None)
+    return len(dq) > _AUTH_FAIL_MAX
 
 
 def _log_event(event: str, **fields) -> None:
@@ -351,10 +381,30 @@ def _attachment_stats(attachments: list) -> dict:
     }
 
 
+def _auth_agg_prune_locked(now: float) -> None:
+    """聚合表清理:先丟過期(TTL),仍超上限就丟最久沒動的。
+
+    原本這張表永不清理,key 含 request path —— 掃描者變換路徑即可無限撐大
+    (記憶體耗盡)。呼叫端須持 _AUTH_LOCK。
+    """
+    if len(_AUTH_FAIL_AGG) <= _AUTH_TABLE_MAX:
+        return
+    for k in [k for k, v in _AUTH_FAIL_AGG.items()
+              if now - v.get("seen", 0.0) > _AUTH_AGG_TTL]:
+        _AUTH_FAIL_AGG.pop(k, None)
+    if len(_AUTH_FAIL_AGG) > _AUTH_TABLE_MAX:
+        for k, _ in sorted(_AUTH_FAIL_AGG.items(),
+                           key=lambda kv: kv[1].get("seen", 0.0)
+                           )[:len(_AUTH_FAIL_AGG) - _AUTH_TABLE_MAX]:
+            _AUTH_FAIL_AGG.pop(k, None)
+
+
 def _auth_fail_summary_locked(request: Request, status: int, now: float) -> dict | None:
     key = (_client_host(request), request.url.path, status)
-    item = _AUTH_FAIL_AGG.setdefault(key, {"count": 0, "last_log": 0.0})
+    item = _AUTH_FAIL_AGG.setdefault(key, {"count": 0, "last_log": 0.0, "seen": now})
     item["count"] += 1
+    item["seen"] = now
+    _auth_agg_prune_locked(now)
     count = item["count"]
     should_log = count in (1, 10, 50, 100) or now - item["last_log"] >= 60.0
     if not should_log:
@@ -387,10 +437,7 @@ def _check_auth(request: Request) -> None:
             return
     now = time.monotonic()
     with _AUTH_LOCK:
-        while _AUTH_FAILS and now - _AUTH_FAILS[0] > _AUTH_FAIL_WINDOW:
-            _AUTH_FAILS.popleft()
-        _AUTH_FAILS.append(now)
-        over = len(_AUTH_FAILS) > _AUTH_FAIL_MAX
+        over = _auth_fail_bump_locked(request, now)
         summary = _auth_fail_summary_locked(request, 429 if over else 401, now)
     if summary:
         _log_event("auth_failure", **summary)
@@ -5822,10 +5869,7 @@ def _pair_code_meta(value):
 def _pair_code_reject(request: Request):
     with _AUTH_LOCK:
         now = time.monotonic()
-        while _AUTH_FAILS and now - _AUTH_FAILS[0] > _AUTH_FAIL_WINDOW:
-            _AUTH_FAILS.popleft()
-        _AUTH_FAILS.append(now)
-        over = len(_AUTH_FAILS) > _AUTH_FAIL_MAX
+        over = _auth_fail_bump_locked(request, now)
         summary = _auth_fail_summary_locked(request, 429 if over else 400, now)
     if summary:
         _log_event("pair_claim_failure", **summary)
