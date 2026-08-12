@@ -4056,6 +4056,15 @@ def _resolve_codex_bin() -> str:
 
 CODEX_BIN = _resolve_codex_bin()   # 僅供顯示/預設;spawn 走 _resolve_codex_bin()
 
+# The managed Codex daemon is the single writer shared by Desktop and Pocket.
+# Its Unix socket speaks WebSocket frames (not JSONL); stdio is retained only
+# as an explicit migration fallback for hosts that have not bootstrapped it.
+CODEX_APP_SERVER_SOCKET = os.path.expanduser(
+    os.environ.get(
+        "CODEX_APP_SERVER_SOCKET",
+        "~/.codex/app-server-control/app-server-control.sock"))
+CODEX_APP_SERVER_MODE = os.environ.get("CODEX_APP_SERVER_MODE", "managed").strip().lower()
+
 
 # ─────────── CC/CX 登入狀態探測(給 app gate CC/CX 頁籤)───────────
 # app 端 CC/CX 頁籤在對應引擎「這台 Mac 從未登入」時要蓋版凍結、提示去 Pocket
@@ -4494,6 +4503,8 @@ class CodexAppServerClient:
 
     def __init__(self):
         self.proc = None
+        self.ws = None
+        self.transport = ""
         self._lock = asyncio.Lock()
         self._next_id = 1
         self._pending = {}
@@ -4553,34 +4564,56 @@ class CodexAppServerClient:
             await self._write_locked(msg)
 
     async def _ensure_started_locked(self):
-        if self.proc and self.proc.returncode is None:
+        if self.ws is not None or (self.proc and self.proc.returncode is None):
             return
         self._pending.clear()
         self.pending_approvals.clear()
         self.pending_approvals_by_thread.clear()
         self._expire_stale_codex_approvals()
         self.app_server_error = ""
-        codex_bin = _resolve_codex_bin()   # 每次 spawn 重新解析:桌面 app 更新後路徑會變
-        self.spawned_bin = codex_bin
-        try:
-            self.proc = await asyncio.create_subprocess_exec(
-                codex_bin, "app-server", "--stdio",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                stdin=asyncio.subprocess.PIPE,
-                cwd=HOME_ROOT,
-                # StreamReader 單行上限。codex app-server 把每個 JSON-RPC 回應當「一行」
-                # 送;thread/turns/list itemsView=full 若含 computer-use 截圖(base64)可能
-                # 單行破 8MB → asyncio 讀取器丟 LimitOverrunError(「Separator is not found,
-                # and chunk exceed the limit」)→ reader task 死 → app-server「stopped」→ 整條
-                # codex 卡死(XCash 就是這樣)。放大到 128MB 吃得下含圖的大回應。
-                limit=128 * 1024 * 1024,
-            )
-        except (FileNotFoundError, PermissionError) as e:
-            _log_event("codex_spawn_failed", bin=codex_bin, error=type(e).__name__)
-            raise CodexAppServerError(f"codex binary unavailable: {codex_bin}") from e
-        self._reader_task = asyncio.create_task(self._read_stdout())
-        self._stderr_task = asyncio.create_task(self._read_stderr())
+        if os.path.exists(CODEX_APP_SERVER_SOCKET):
+            try:
+                import websockets
+                self.ws = await websockets.unix_connect(
+                    CODEX_APP_SERVER_SOCKET,
+                    uri="ws://localhost/",
+                    compression=None,
+                    max_size=128 * 1024 * 1024,
+                    user_agent_header="PocketAgent-Bridge/0.1",
+                )
+            except Exception as e:  # noqa: BLE001
+                self.ws = None
+                _log_event("codex_managed_connect_failed",
+                           socket=CODEX_APP_SERVER_SOCKET,
+                           error=type(e).__name__, error_message=str(e)[:200])
+                raise CodexAppServerError(
+                    "managed Codex app-server unavailable; refusing to spawn a second server"
+                ) from e
+            self.transport = "unix-websocket"
+            self.spawned_bin = "managed-daemon"
+            self._reader_task = asyncio.create_task(self._read_websocket())
+        else:
+            if CODEX_APP_SERVER_MODE != "stdio":
+                raise CodexAppServerError(
+                    f"managed Codex app-server socket not found: {CODEX_APP_SERVER_SOCKET}"
+                )
+            codex_bin = _resolve_codex_bin()
+            self.spawned_bin = codex_bin
+            try:
+                self.proc = await asyncio.create_subprocess_exec(
+                    codex_bin, "app-server", "--stdio",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    stdin=asyncio.subprocess.PIPE,
+                    cwd=HOME_ROOT,
+                    limit=128 * 1024 * 1024,
+                )
+            except (FileNotFoundError, PermissionError) as e:
+                _log_event("codex_spawn_failed", bin=codex_bin, error=type(e).__name__)
+                raise CodexAppServerError(f"codex binary unavailable: {codex_bin}") from e
+            self.transport = "stdio"
+            self._reader_task = asyncio.create_task(self._read_stdout())
+            self._stderr_task = asyncio.create_task(self._read_stderr())
         self.server_started_at = time.time()
         init = await self._call_started_locked(
             "initialize",
@@ -4598,7 +4631,7 @@ class CodexAppServerClient:
         _log_event("codex_app_server_started",
                    user_agent=(init or {}).get("userAgent", ""),
                    codex_home=(init or {}).get("codexHome", ""),
-                   bin=codex_bin)
+                   bin=self.spawned_bin, transport=self.transport)
 
     def _expire_stale_codex_approvals(self):
         import sqlite3
@@ -4635,11 +4668,43 @@ class CodexAppServerClient:
             raise CodexAppServerError(f"{method} timed out") from e
 
     async def _write_locked(self, msg: dict):
+        if self.ws is not None:
+            wire = dict(msg)
+            wire.pop("jsonrpc", None)
+            await self.ws.send(json.dumps(wire, ensure_ascii=False, separators=(",", ":")))
+            return
         if not self.proc or not self.proc.stdin:
             raise CodexAppServerError("codex app-server is not running")
         raw = (json.dumps(msg, ensure_ascii=False, separators=(",", ":")) + "\n").encode()
         self.proc.stdin.write(raw)
         await self.proc.stdin.drain()
+
+    async def _dispatch_wire_message(self, raw):
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8", "replace")
+        try:
+            msg = json.loads(raw)
+        except Exception as e:  # noqa: BLE001
+            _log_event("codex_app_server_bad_json", error=type(e).__name__,
+                       line=str(raw)[:160])
+            return
+        if msg.get("method"):
+            await self._handle_server_message(msg)
+        elif "id" in msg:
+            fut = self._pending.pop(msg.get("id"), None)
+            if not fut or fut.done():
+                _log_event("codex_app_server_unmatched_response",
+                           id_hash=_short_hash(str(msg.get("id"))))
+                return
+            if "error" in msg:
+                err = msg.get("error") or {}
+                fut.set_exception(CodexAppServerError(
+                    err.get("message") or "codex app-server error", err.get("code")))
+            else:
+                fut.set_result(msg.get("result"))
+        else:
+            _log_event("codex_app_server_unknown_message",
+                       keys=",".join(sorted(str(k) for k in msg.keys()))[:120])
 
     async def _read_stdout(self):
         proc = self.proc
@@ -4648,61 +4713,56 @@ class CodexAppServerClient:
                 raw = await proc.stdout.readline()
                 if not raw:
                     break
-                try:
-                    msg = json.loads(raw.decode("utf-8", "replace"))
-                except Exception as e:  # noqa: BLE001
-                    _log_event("codex_app_server_bad_json",
-                               error=type(e).__name__,
-                               line=raw.decode("utf-8", "replace")[:160])
-                    continue
-                if msg.get("method"):
-                    await self._handle_server_message(msg)
-                elif "id" in msg:
-                    fut = self._pending.pop(msg.get("id"), None)
-                    if not fut or fut.done():
-                        _log_event("codex_app_server_unmatched_response",
-                                   id_hash=_short_hash(str(msg.get("id"))))
-                        continue
-                    if "error" in msg:
-                        err = msg.get("error") or {}
-                        fut.set_exception(CodexAppServerError(
-                            err.get("message") or "codex app-server error",
-                            err.get("code")))
-                    else:
-                        fut.set_result(msg.get("result"))
-                else:
-                    _log_event("codex_app_server_unknown_message",
-                               keys=",".join(sorted(str(k) for k in msg.keys()))[:120])
+                await self._dispatch_wire_message(raw)
         except Exception as e:  # noqa: BLE001
             _log_event("codex_app_server_reader_failed", error=type(e).__name__,
                        error_message=str(e)[:160])
         finally:
-            stopped_at = time.time()
-            active = list(self.active_turns)
-            self.app_server_error = "codex app-server stopped"
-            for tid in active:
-                self.thread_errors[tid] = self.app_server_error
-                self.active_turns.pop(tid, None)
-                self.turn_terminal_at[tid] = stopped_at
-                self.last_event_at[tid] = stopped_at
-                self._append(tid, ("text", "\n⚠️ Codex app-server 已掉線，這回合已中止。\n"))
-                task = self.turn_watchdogs.pop(tid, None)
-                if task and task is not asyncio.current_task():
-                    task.cancel()
-                try:
-                    t = asyncio.create_task(_delegation_codex_completed(
-                        tid, True, self.app_server_error))
-                    _BG_TASKS.add(t)
-                    t.add_done_callback(_BG_TASKS.discard)
-                except RuntimeError:
-                    pass
-            self.loaded_threads.clear()
-            if self.proc is proc:
-                self.proc = None
-            for fut in list(self._pending.values()):
-                if not fut.done():
-                    fut.set_exception(CodexAppServerError("codex app-server stopped"))
-            self._pending.clear()
+            await self._reader_cleanup(proc=proc)
+
+    async def _read_websocket(self):
+        ws = self.ws
+        try:
+            while ws is not None and self.ws is ws:
+                raw = await ws.recv()
+                if raw is None:
+                    break
+                await self._dispatch_wire_message(raw)
+        except Exception as e:  # noqa: BLE001
+            _log_event("codex_app_server_websocket_failed", error=type(e).__name__,
+                       error_message=str(e)[:160])
+        finally:
+            await self._reader_cleanup(ws=ws)
+
+    async def _reader_cleanup(self, proc=None, ws=None):
+        stopped_at = time.time()
+        active = list(self.active_turns)
+        self.app_server_error = "codex app-server stopped"
+        for tid in active:
+            self.thread_errors[tid] = self.app_server_error
+            self.active_turns.pop(tid, None)
+            self.turn_terminal_at[tid] = stopped_at
+            self.last_event_at[tid] = stopped_at
+            self._append(tid, ("text", "\n⚠️ Codex app-server 已掉線，這回合已中止。\n"))
+            task = self.turn_watchdogs.pop(tid, None)
+            if task and task is not asyncio.current_task():
+                task.cancel()
+            try:
+                t = asyncio.create_task(_delegation_codex_completed(
+                    tid, True, self.app_server_error))
+                _BG_TASKS.add(t)
+                t.add_done_callback(_BG_TASKS.discard)
+            except RuntimeError:
+                pass
+        self.loaded_threads.clear()
+        if proc is not None and self.proc is proc:
+            self.proc = None
+        if ws is not None and self.ws is ws:
+            self.ws = None
+        for fut in list(self._pending.values()):
+            if not fut.done():
+                fut.set_exception(CodexAppServerError("codex app-server stopped"))
+        self._pending.clear()
 
     async def _read_stderr(self):
         try:
@@ -5032,7 +5092,7 @@ class CodexAppServerClient:
     async def _write_server_error(self, request_id, code: int, message: str):
         try:
             async with self._lock:
-                if not self.proc or self.proc.returncode is not None:
+                if not self._transport_alive():
                     return
                 await self._write_locked({
                     "jsonrpc": "2.0",
@@ -5045,7 +5105,7 @@ class CodexAppServerClient:
 
     async def _write_server_result(self, request_id, result: dict):
         async with self._lock:
-            if not self.proc or self.proc.returncode is not None:
+            if not self._transport_alive():
                 raise CodexAppServerError("codex app-server is not running")
             await self._write_locked({"jsonrpc": "2.0", "id": request_id,
                                       "result": result})
@@ -5675,6 +5735,11 @@ class CodexAppServerClient:
             _cx_sync_queue_depth(thread_id)
 
     def is_server_alive(self) -> bool:
+        return self._transport_alive()
+
+    def _transport_alive(self) -> bool:
+        if self.ws is not None:
+            return True
         return bool(self.proc and self.proc.returncode is None)
 
     # ── thread-store 寫入鎖狀態機 ─────────────────────────────────────────
@@ -6252,13 +6317,16 @@ async def codex_sessions(request: Request, limit: int = 40, cwd: str | None = No
                 "data": [dict(t) for t in data],
                 "hidden_children": hidden_children,
             }
-        # B3: warm the few most-recent threads in the background (fire and
-        # forget — the list response is NOT delayed by this).
-        warm_ids = [t.get("id") for t in data[:4] if t.get("id")]
-        if warm_ids:
-            task = asyncio.create_task(_codex_warm_threads(warm_ids))
-            _BG_TASKS.add(task)
-            task.add_done_callback(_BG_TASKS.discard)
+        # Do not resume threads as a side effect of listing them. In the
+        # shared managed daemon, background thread/resume can contend with the
+        # desktop writer lock and make an otherwise read-only list request
+        # destabilize CX. Keep the old warmup as an explicit opt-in only.
+        if os.environ.get("CODEX_LIST_WARMUP", "").strip() == "1":
+            warm_ids = [t.get("id") for t in data[:4] if t.get("id")]
+            if warm_ids:
+                task = asyncio.create_task(_codex_warm_threads(warm_ids))
+                _BG_TASKS.add(task)
+                task.add_done_callback(_BG_TASKS.discard)
         return {
             "sessions": [_codex_enrich_summary(_codex_session_summary(t))
                          for t in data],
