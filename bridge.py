@@ -42,8 +42,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import agent_call as agent_call_policy
+import agent_context as agent_context_policy
 import agent_registry
 import host_discovery
+from harness import distill as harness_distill
+from harness import model as harness_model
+from harness import store as harness_store
+from harness import trajectory as harness_traj
 import media_artifacts
 import hermes_media
 import openclaw_provider
@@ -901,21 +906,14 @@ async def _polish_transcript(text: str) -> str:
     # 中文 1 字約 1.2~1.5 token;輸入+輸出約 3x。夾在 8192~40960。
     num_ctx = min(40960, max(8192, len(text) * 3 + 2048))
 
-    async def _run() -> str:
-        import httpx
-        async with httpx.AsyncClient(timeout=120) as client:
-            r = await client.post(
-                "http://127.0.0.1:11434/api/chat",
-                json={"model": _MEETING_POLISH_MODEL, "stream": False,
-                      "keep_alive": "15m",
-                      "messages": [{"role": "user",
-                                    "content": _MEETING_POLISH_PROMPT + text}],
-                      "options": {"temperature": 0.2, "num_ctx": num_ctx}})
-            r.raise_for_status()
-            return ((r.json().get("message") or {}).get("content") or "").strip()
-
+    # 2026-08-11:這段本機 Ollama 呼叫被 Continual Harness 的夜批蒸餾共用,
+    # 抽到 harness/model.py 當**唯一實作**(model/num_ctx/timeout/keep_alive/
+    # temperature 逐項保持原值,行為不變)。fail-soft 語意刻意留在這裡 ——
+    # 清稿要「失敗回原稿」,蒸餾要「失敗記一筆跑批錯誤」,不該由共用層代決。
     try:
-        out = await asyncio.wait_for(_run(), timeout=90)
+        out = await harness_model.ollama_text(
+            _MEETING_POLISH_PROMPT + text, model=_MEETING_POLISH_MODEL,
+            num_ctx=num_ctx, timeout=90, temperature=0.2, keep_alive="15m")
         return out or text
     except asyncio.TimeoutError:
         _log_event("meeting_polish_timeout", chars=len(text), num_ctx=num_ctx)
@@ -13745,6 +13743,10 @@ def _sync_persona_reports(session: str, limit: int = 50) -> list[dict]:
     reports = _persona_reports(session, limit)
     if TOOL_ERROR_REPORTS_ENABLED:
         reports.extend(_persona_tool_error_reports(session, min(limit, 20)))
+    # Continual Harness 的待審提案段(HARNESS=1 才有;關著時回空陣列)。
+    # 掛在這裡而不是改寫 cron 晨報本文:改本文會動到內容雜湊,`_report_upsert`
+    # 每次都當成新報告重新鏡射一則聊天訊息 —— 這裡走獨立 report,一天一則。
+    reports.extend(_persona_harness_reports(session))
     if not reports:
         return _report_events(session, limit, newest_first=True)
     upserted = 0
@@ -19047,7 +19049,9 @@ def _agent_call_collect_reply(store, since_seq: int) -> str:
             continue
         body = card.get("body") or {}
         origin = str(body.get("origin") or "")
-        if origin.startswith("agent_call") or origin == "registry.reap_warning":
+        if (origin.startswith("agent_call")
+                or origin.startswith("agent_context")     # 👁 上下文讀取 audit 卡
+                or origin == "registry.reap_warning"):
             continue
         t = str(body.get("text") or body.get("fallback_text") or "").strip()
         if not t:
@@ -19188,11 +19192,11 @@ async def v2_agent_call(request: Request):
     call_id = "call-" + uuid.uuid4().hex[:16]
     # ── 護欄 1:政策 allowlist(default DENY)──────────────────────────
     policy = agent_call_policy.load_policy()
-    if not agent_call_policy.allowed(policy, caller, target):
+    if not agent_call_policy.allowed(policy, caller, target, registry=REGISTRY):
         await _agent_call_deny(
             call_id, caller, target, mode, message, "AGENT_CALL_DENIED",
-            f"政策未放行 {caller} → {target}(default DENY;"
-            f"請在 {agent_call_policy.policy_path()} 加 allowlist 規則)", 403)
+            f"政策未放行 {caller} → {target}(default DENY;家譜直接母子邊自動放行,"
+            f"其餘請在 {agent_call_policy.policy_path()} 加 allowlist 規則)", 403)
     # ── 護欄 2:chain 深度/循環/預算 ──────────────────────────────────
     parent = None
     pid = str(body.get("parent_call_id") or "").strip()
@@ -19322,7 +19326,7 @@ async def v2_agent_targets(request: Request, caller: str = ""):
     for sid, r in sorted(by_id.items()):
         if sid == caller:
             continue
-        if not agent_call_policy.allowed(policy, caller, sid):
+        if not agent_call_policy.allowed(policy, caller, sid, registry=REGISTRY):
             continue
         out.append({"id": sid, "provider": r.get("provider"),
                     "purpose": r.get("purpose"),
@@ -19330,6 +19334,940 @@ async def v2_agent_targets(request: Request, caller: str = ""):
                     "busy": await _registry_is_busy(sid)})
     return {"caller": caller, "targets": out,
             "policy_path": agent_call_policy.policy_path()}
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Continual Harness(藍圖 AGENT_INTEROP §2 / 子程序設計 §0)—— 累積層接線
+# ══════════════════════════════════════════════════════════════════════════
+# Prime Agent 的洞見:贏在累積,不在執行。每回合軌跡回寫 Prompt/Memory/
+# Skill/Subagent 四庫,節點下次開工站在上次的肩膀上。
+#
+# 善彰的鐵律:**夜批蒸餾 + 晨報人審,不搞自動自改**。所以:
+#   - 蒸餾器只產 state=proposed,沒有任何自動生效路徑
+#   - approve 只在人打 HTTP 時發生(`_harness_store().approve` 的唯一呼叫點)
+#   - prompt 提案核准 → 寫進該節點的 ccsess spawn pin,**下次** spawn 才吃到
+#     (不重啟、不干擾進行中的工作)
+#
+# 資料面在 harness/ 套件(獨立 sqlite,env HARNESS_DB,預設 ~/.pocket/
+# harness.db)。**canonical.db / state.db 一律 mode=ro 唯讀**;harness 整個
+# 炸掉最多是少一晚提案,聊天資料零風險。
+#
+# 旗標:HARNESS=1 才開,預設 OFF(merge = 零風險)——關閉時端點 404、
+# 背景蒸餾/收集任務完全不啟動、晨報不加 harness 段。
+
+_HARNESS_STORE = None
+_HARNESS_INGEST_SECS = float(os.environ.get("HARNESS_INGEST_SECS", "300"))
+_HARNESS_DISTILL_HOUR = int(os.environ.get("HARNESS_DISTILL_HOUR", "4"))
+_HARNESS_DISTILL_HOURS = float(os.environ.get("HARNESS_DISTILL_HOURS", "24"))
+_HARNESS_REPORT_LABEL = "蒸餾提案"
+_HARNESS_REPORT_NAME = "harness-proposals"
+
+
+def _harness_enabled() -> bool:
+    """旗標每次呼叫讀 env(同 AGENT_CALL 慣例):預設 OFF,merge 零風險。"""
+    return str(os.environ.get("HARNESS", "")).strip().lower() in (
+        "1", "true", "yes", "on")
+
+
+def _harness_require_enabled() -> None:
+    if not _harness_enabled():
+        raise http_err(404, "HARNESS_DISABLED",
+                       "Continual Harness 未啟用(需 HARNESS=1)")
+
+
+def _harness_store():
+    """惰性建庫 —— 旗標關著時連 DB 檔都不會被建出來。"""
+    global _HARNESS_STORE
+    if _HARNESS_STORE is None:
+        _HARNESS_STORE = harness_store.HarnessStore(
+            os.environ.get("HARNESS_DB")
+            or os.path.join(_POCKET_DIR, "harness.db"))
+    return _HARNESS_STORE
+
+
+# ── 軌跡收集(唯讀:卡片流 ring + registry meta)───────────────────────────
+
+def _harness_node_meta(sid: str) -> dict:
+    """registry 的節點中繼:purpose / provider / node_config(已去密)。
+
+    node_config 走現成的 `_spawn_config_public()`(api_key 連遮罩版都不給,
+    只留 has_api_key 布林),再由 `trajectory.redact_config()` 擋第二道。
+    """
+    row = REGISTRY.get(sid) or {}
+    provider = str(row.get("provider") or "")
+    cfg: dict = {}
+    src = None
+    try:
+        src = _v2_card_source(sid)
+    except Exception:  # noqa: BLE001 — 認不得的 id 就沒有 spawn config
+        src = None
+    if src and src[0] == "cc":
+        try:
+            cfg = _spawn_config_public(_cc_read_spawn_config(src[1]))
+        except Exception as _exc:  # noqa: BLE001
+            _log_exc("_harness_node_meta.cfg", _exc, expected=True)
+    meta = {"purpose": str(row.get("purpose") or ""),
+            "provider": provider or (src[0] if src else ""),
+            "node_config": cfg,
+            "parent": row.get("parent") or "",
+            "class": row.get("class") or ""}
+    return meta
+
+
+async def _harness_ingest_session(sid: str) -> int:
+    """把某個 session 卡片流 ring 裡的完成回合正規化後落 harness DB。
+
+    冪等:trajectory id = sha1(session|turn),重放同一段 ring 只會更新同一
+    列。所以「每 N 分鐘掃一次」這種粗暴做法不會產生重複軌跡,也不需要在
+    turn.end 熱路徑上掛鉤子(掛鉤子 = 動到 production 最敏感的那條線)。
+    """
+    if not _harness_enabled():
+        return 0
+    try:
+        store = await _v2_card_store(sid)
+    except Exception as _exc:  # noqa: BLE001 — 認不得/取不到就跳過
+        _log_exc("_harness_ingest_session.store", _exc, expected=True)
+        return 0
+    meta = _harness_node_meta(sid)
+    try:
+        trajs = harness_traj.from_card_events(
+            list(getattr(store, "events", []) or []), session_id=sid,
+            provider=meta["provider"], purpose=meta["purpose"],
+            node_config=meta["node_config"])
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("_harness_ingest_session.normalize", _exc, expected=True)
+        return 0
+    live_turn = str(getattr(store, "turn_id", "") or "")
+    hs = _harness_store()
+    n = 0
+    for t in trajs:
+        if t["turn_id"] and t["turn_id"] == live_turn:
+            continue          # 進行中的回合不落庫(軌跡還沒寫完)
+        try:
+            hs.put_trajectory(t)
+            n += 1
+        except Exception as _exc:  # noqa: BLE001
+            _log_exc("_harness_ingest_session.put", _exc, expected=True)
+    return n
+
+
+async def _harness_ingest_sweep() -> int:
+    """巡一輪所有活著的登記節點,收軌跡。只讀,不動任何 provider 狀態。"""
+    total = 0
+    for row in REGISTRY.list_rows():
+        if row.get("state") == "archived":
+            continue
+        total += await _harness_ingest_session(row["id"])
+    return total
+
+
+async def _harness_ingest_loop() -> None:
+    while True:
+        try:
+            await asyncio.sleep(_HARNESS_INGEST_SECS)
+            if not _harness_enabled():
+                continue
+            n = await _harness_ingest_sweep()
+            if n:
+                _log_event("harness_ingest", trajectories=n)
+        except asyncio.CancelledError:
+            raise
+        except Exception as _exc:  # noqa: BLE001
+            _log_exc("_harness_ingest_loop", _exc, expected=True)
+
+
+# ── 夜批(排程)────────────────────────────────────────────────────────────
+
+async def _harness_run_distill(hours: float | None = None,
+                               dry_run: bool = False) -> dict:
+    """跑一輪蒸餾(收軌跡 → 蒸餾 → 落提案)。模型走 harness/model.py 的
+    本機 Ollama —— 與會議清稿同一條線,不新增任何雲端依賴/金鑰。"""
+    await _harness_ingest_sweep()
+    out = await harness_distill.run(
+        _harness_store(), hours=hours or _HARNESS_DISTILL_HOURS,
+        current_prompt=_harness_current_prompt, dry_run=dry_run)
+    _log_event("harness_distilled", trajectories=out["trajectories"],
+               groups=out["groups"], proposals=len(out["proposals"]),
+               errors=len(out["errors"]), dry_run=dry_run)
+    return out
+
+
+async def _harness_distill_loop() -> None:
+    """夜批排程:每小時醒一次,到 HARNESS_DISTILL_HOUR(預設凌晨 4 點)就跑。
+
+    刻意不用 cron:bridge 是常駐行程,自己數鐘點最簡單、也最容易在晨報上
+    回報「昨晚跑了沒」。同一天只跑一次(用 last_run 的日期擋)。
+    """
+    while True:
+        try:
+            await asyncio.sleep(3600)
+            if not _harness_enabled():
+                continue
+            now = time.localtime()
+            if now.tm_hour != _HARNESS_DISTILL_HOUR:
+                continue
+            last = _harness_store().last_run()
+            if last and time.localtime(last["started_ts"]).tm_yday == now.tm_yday:
+                continue
+            await _harness_run_distill()
+        except asyncio.CancelledError:
+            raise
+        except Exception as _exc:  # noqa: BLE001
+            _log_exc("_harness_distill_loop", _exc, expected=True)
+
+
+# ── prompt 提案 → spawn-config pin(核准後才走,閉環)──────────────────────
+
+def _harness_current_prompt(node: str) -> str:
+    """該節點現行的 append_system_prompt(做 diff 預覽用)。"""
+    try:
+        return str(_cc_read_spawn_config(node).get("append_system_prompt") or "")
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("_harness_current_prompt", _exc, expected=True)
+        return ""
+
+
+def _harness_apply_prompt(node: str, fragment: str) -> str:
+    """把核准的片段寫進該節點的 ccsess spawn pin,**下次** spawn 生效。
+
+    ⚠️ 刻意不呼叫 `_cc_write_spawn_pins()`:那支在 cfg 沒有 api_key 時會
+    **刪掉** BYO key 的 0600 secret 檔。這裡是局部更新(只動
+    append_system_prompt),絕不能連帶砍掉使用者自帶的金鑰。所以只讀寫
+    flags 檔本身,secret 檔一根汗毛都不碰。
+
+    回傳給人看的一句話(寫進提案的 apply_note)。
+    """
+    fragment = str(fragment or "").strip()
+    if not fragment:
+        return "片段是空的,未寫入"
+    path = os.path.join(CCSESS_SPAWN_DIR, node + ".json")
+    cfg: dict = {}
+    try:
+        if os.path.exists(path):
+            with open(path, encoding="utf-8") as f:
+                cfg = json.load(f) or {}
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("_harness_apply_prompt.read", _exc, expected=True)
+        cfg = {}
+    cfg.pop("api_key", None)          # 防禦:flags 檔本來就不該有金鑰
+    cfg.pop("has_api_key", None)
+    cfg["append_system_prompt"] = fragment
+    # 走現成的驗證(enum/長度/型別),壞值不落地
+    cfg = _spawn_config_validate(cfg, "cc")
+    os.makedirs(CCSESS_SPAWN_DIR, exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, ensure_ascii=False)
+    os.replace(tmp, path)
+    _log_event("harness_prompt_pinned", node=node, chars=len(fragment))
+    return f"已寫入 {node} 的 spawn pin,下次開此節點的子程序時生效"
+
+
+def _harness_apply(row: dict) -> str:
+    """核准後的落地動作。目前只有 prompt 庫有現成的機械可以閉環;
+    memory/skill/route 先進庫等消費端(v0 誠實邊界,見 docs)。"""
+    if row.get("store") != "prompt":
+        return ""
+    node = str(row.get("node") or "")
+    provider = str(row.get("provider") or "")
+    if not node:
+        return ""
+    if provider and provider not in ("cc", "claude_code"):
+        return (f"{provider} 沒有持久的 spawn pin,片段已核准但需在派工時"
+                "手動帶入(v0 限制)")
+    return _harness_apply_prompt(node, str(row.get("fragment") or ""))
+
+
+# ── 端點(晨報審核面)──────────────────────────────────────────────────────
+
+def _harness_public(row: dict) -> dict:
+    """回給 app/晨報的提案形狀。內容早在正規化階段就過遮罩,這裡不再改寫。"""
+    out = {k: row.get(k) for k in
+           ("id", "store", "scope", "key", "version", "state", "rationale",
+            "evidence", "preview", "created_ts", "updated_ts", "decided_ts",
+            "decided_by", "applied", "apply_note", "meta")}
+    _pfx, extra = harness_store.STORES[row["store"]]
+    out["payload"] = {name: row.get(name) for name, _d in extra}
+    return out
+
+
+@app.get("/app/v2/harness/proposals")
+async def v2_harness_proposals(request: Request, state: str = "proposed",
+                               store: str | None = None,
+                               scope: str | None = None, limit: int = 100):
+    """待審提案清單(晨報與 Pocket 審核頁的資料源)。
+
+    state 給空字串 = 全部狀態。每筆帶 rationale(為什麼)、evidence
+    (哪幾條軌跡)、preview(會變成什麼)—— 人審要的三件事。
+    """
+    _check_auth(request)
+    _harness_require_enabled()
+    if store and store not in harness_store.STORES:
+        raise HTTPException(status_code=400,
+                            detail=f"store 需為 {'/'.join(harness_store.STORES)} 其一")
+    if state and state not in harness_store.STATES:
+        raise HTTPException(status_code=400,
+                            detail=f"state 需為 {'/'.join(harness_store.STATES)} 其一")
+    rows = _harness_store().list(store=store, state=state or None, scope=scope,
+                                 limit=max(1, min(limit, 500)))
+    return {"proposals": [_harness_public(r) for r in rows],
+            "stores": list(harness_store.STORES),
+            "last_run": _harness_store().last_run()}
+
+
+@app.post("/app/v2/harness/proposals/{pid}/approve")
+async def v2_harness_approve(pid: str, request: Request):
+    """人審通過:proposed → approved → active,並執行落地動作。
+
+    **這是整個 harness 唯一會讓東西生效的入口,而且只有人打得到。**
+    prompt 提案核准 = 片段寫進該節點 spawn pin,下次 spawn 就吃到 ——
+    與既有的 spawn-config 機械閉環。
+    """
+    _check_auth(request)
+    _harness_require_enabled()
+    body = await _json_body(request)
+    by = str(body.get("by") or "human")[:60]
+    hs = _harness_store()
+    row = hs.get(pid)
+    if row is None:
+        raise http_err(404, "HARNESS_PROPOSAL_NOT_FOUND", "找不到這筆提案")
+    try:
+        row = hs.approve(pid, by=by)
+    except harness_store.StateError as exc:
+        raise http_err(409, "HARNESS_STATE", exc.detail)
+    note = ""
+    try:
+        note = _harness_apply(row)
+    except Exception as exc:  # noqa: BLE001 — 落地失敗不回滾核准,但要說清楚
+        note = f"核准了,但落地失敗:{type(exc).__name__}: {exc}"[:300]
+        _log_exc("_harness_apply", exc, expected=True)
+    if note:
+        hs.mark_applied(pid, note)
+        row = hs.get(pid)
+    _log_event("harness_approved", proposal=pid, store=row["store"],
+               key=row["key"], by=by, applied=bool(note))
+    return {"ok": True, "proposal": _harness_public(row), "applied_note": note}
+
+
+@app.post("/app/v2/harness/proposals/{pid}/reject")
+async def v2_harness_reject(pid: str, request: Request):
+    """人審否決。理由留在 apply_note,下次蒸餾出同樣的東西時看得到前科。"""
+    _check_auth(request)
+    _harness_require_enabled()
+    body = await _json_body(request)
+    hs = _harness_store()
+    if hs.get(pid) is None:
+        raise http_err(404, "HARNESS_PROPOSAL_NOT_FOUND", "找不到這筆提案")
+    try:
+        row = hs.reject(pid, by=str(body.get("by") or "human")[:60],
+                        reason=str(body.get("reason") or "")[:500])
+    except harness_store.StateError as exc:
+        raise http_err(409, "HARNESS_STATE", exc.detail)
+    _log_event("harness_rejected", proposal=pid, store=row["store"], key=row["key"])
+    return {"ok": True, "proposal": _harness_public(row)}
+
+
+@app.post("/app/v2/harness/distill")
+async def v2_harness_distill(request: Request):
+    """手動催一輪夜批(驗收/補跑用)。body {hours?, dry_run?}。"""
+    _check_auth(request)
+    _harness_require_enabled()
+    body = await _json_body(request)
+    try:
+        hours = float(body.get("hours") or _HARNESS_DISTILL_HOURS)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="hours 必須是數字(小時)")
+    out = await _harness_run_distill(hours=hours, dry_run=bool(body.get("dry_run")))
+    return {"ok": True, "trajectories": out["trajectories"],
+            "groups": out["groups"], "proposals": len(out["proposals"]),
+            "written": out["written"], "errors": out["errors"],
+            "dry_run": out["dry_run"]}
+
+
+@app.get("/app/v2/harness/status")
+async def v2_harness_status(request: Request):
+    """旗標/庫況一覽(善彰開燈後第一個該看的)。"""
+    _check_auth(request)
+    _harness_require_enabled()
+    hs = _harness_store()
+    counts = {s: len(hs.list(store=s, state="proposed", limit=500))
+              for s in harness_store.STORES}
+    active = {s: len(hs.active(s)) for s in harness_store.STORES}
+    return {"enabled": True, "db": hs.db_path,
+            "model": harness_model.distill_model(),
+            "distill_hour": _HARNESS_DISTILL_HOUR,
+            "pending": counts, "active": active,
+            "last_run": hs.last_run()}
+
+
+# ── 晨報段(善彰已經在看的地方)────────────────────────────────────────────
+
+def _harness_report_content(pending: list, last_run: dict | None) -> str:
+    """待審提案 → 晨報 markdown。照 `_tool_error_report_content` 的樣式。"""
+    lines = ["## 蒸餾提案待審", ""]
+    if last_run:
+        lines.append(
+            f"- 昨夜蒸餾:{_fmt_ts(last_run.get('started_ts') or 0)}"
+            f",看了 {last_run.get('trajectories') or 0} 條軌跡"
+            f",提了 {last_run.get('proposals') or 0} 案")
+        if last_run.get("error"):
+            lines.append(f"- ⚠️ 跑批有錯:{_clip_text(last_run['error'], 200)}")
+    if not pending:
+        lines += ["", "目前沒有待審提案。"]
+        return "\n".join(lines).strip()
+    lines += [f"- 待審 **{len(pending)}** 筆(核准前不會有任何東西生效)", ""]
+    label = {"memory": "記憶", "skill": "技能", "prompt": "系統提示",
+             "subagent_route": "路由"}
+    for p in pending[:12]:
+        lines += [
+            f"### [{label.get(p['store'], p['store'])}] {p['key']}",
+            f"- 範圍:`{p['scope']}` · 版本 v{p['version']}",
+            f"- 理由:{p.get('rationale') or '(無)'}",
+            f"- 證據:{len(p.get('evidence') or [])} 條軌跡",
+            "",
+            "```diff",
+            _fenced_text(p.get("preview") or "", 800),
+            "```",
+            "",
+        ]
+    if len(pending) > 12:
+        lines.append(f"…另有 {len(pending) - 12} 筆,請到 Pocket 的蒸餾提案頁查看。")
+    lines += ["", f"核准/否決:`POST /app/v2/harness/proposals/<id>/approve|reject`"]
+    return "\n".join(lines).strip()
+
+
+def _persona_harness_reports(persona: str, limit: int = 1) -> list[dict]:
+    """晨報的 harness 段(report_events 產出者,接在 `_sync_persona_reports`)。
+
+    旗標關著、或沒有任何待審提案且昨夜沒跑批 → 回空(不打擾)。
+    external_id 以日期為鍵:一天最多一則,夜批跑完更新內容,不會洗版。
+    """
+    if not _harness_enabled():
+        return []
+    try:
+        hs = _harness_store()
+        pending = hs.list(state="proposed", limit=200)
+        last = hs.last_run()
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("_persona_harness_reports", _exc, expected=True)
+        return []
+    if not pending and not last:
+        return []
+    day = time.strftime("%Y-%m-%d")
+    external_id = f"harness:{persona}:{day}"
+    ts = time.time()
+    return [{"id": _report_id(persona, _HARNESS_REPORT_NAME, day, ts),
+             "external_id": external_id,
+             "external_source": "harness",
+             "session_id": f"harness-{day}",
+             "label": _HARNESS_REPORT_LABEL,
+             "name": _HARNESS_REPORT_NAME,
+             "content": _harness_report_content(pending, last),
+             "ts": ts}]
+
+
+@app.on_event("startup")
+async def _start_harness():
+    """旗標關著就完全不啟動任何背景工作(zero risk),也不建 DB 檔。"""
+    if not _harness_enabled():
+        _log_event("harness_disabled")
+        return
+    for coro in (_harness_ingest_loop(), _harness_distill_loop()):
+        task = asyncio.create_task(coro)
+        _BG_TASKS.add(task)
+        task.add_done_callback(_BG_TASKS.discard)
+    _log_event("harness_started", db=_harness_store().db_path,
+               model=harness_model.distill_model(),
+               ingest_secs=_HARNESS_INGEST_SECS,
+               distill_hour=_HARNESS_DISTILL_HOUR)
+# ═════════ 跨 session 上下文互讀 agent_context(接手/協作的資訊落差)═════════
+# agent_call 解決「A 叫得動 B」;這裡解決「A 看得懂 B 在幹嘛」——cc/cx 接手
+# 或並行時,不用再靠人肉貼上下文。三種模式,由便宜到貴:
+#   summary  蒸餾過的交接簡報(本機 Ollama;依 (session, last_seq) 快取)
+#   recent   最近 N 張卡的 fallback_text(原文,封頂)
+#   search   在「這個 caller 讀得到的範圍內」找關鍵字(原文片段,封頂)
+# 護欄(agent_context.py):AGENT_CONTEXT=1 旗標(預設 OFF → 404)、default DENY
+# 的三來源放行(母子邊/context_targets 規則/agent_call 放行隱含 summary)、
+# **強制遮罩**(連餵給模型的素材都先遮)、每 caller 速率上限、回應字元硬上限。
+# 每次讀取往**被讀的 session** 落一張「👁 上下文讀取」卡 —— 誰讀了誰看得見。
+# 資料源全部是現成的(卡片流 ring:CC jsonl / codex thread / persona 都已由
+# _v2_card_store 統一 seed),這裡不新增任何紀錄機制、不寫 canonical.db。
+
+_AGENT_CONTEXT_SUMMARY_CACHE: dict = {}   # target -> {seq, text, ts}
+_AGENT_CONTEXT_HITS: dict = {}            # caller -> [ts,…](速率窗)
+
+
+def _agent_context_enabled() -> bool:
+    """旗標每次呼叫讀 env:預設 OFF,merge 零風險(同 AGENT_CALL 慣例)。"""
+    return str(os.environ.get("AGENT_CONTEXT", "")).strip().lower() in (
+        "1", "true", "yes", "on")
+
+
+def _agent_context_require_enabled() -> None:
+    if not _agent_context_enabled():
+        raise http_err(404, "AGENT_CONTEXT_DISABLED",
+                       "agent_context 未啟用(需 AGENT_CONTEXT=1 + 政策檔)")
+
+
+def _agent_context_rate_check(caller: str) -> None:
+    """每 caller 每分鐘 N 次(預設 30)。被拒的讀取也記次數 —— 不然探測政策
+    邊界是免費的。"""
+    limit = agent_context_policy.rate_per_min()
+    if limit <= 0:
+        return
+    now = time.time()
+    hits = [t for t in _AGENT_CONTEXT_HITS.get(caller, []) if now - t < 60.0]
+    if len(hits) >= limit:
+        _AGENT_CONTEXT_HITS[caller] = hits
+        _log_event("agent_context_rate_limited", caller=caller, limit=limit)
+        raise http_err(429, "AGENT_CONTEXT_RATE_LIMITED",
+                       f"上下文讀取太頻繁({caller} 每分鐘上限 {limit} 次);"
+                       f"請改用 summary(有快取)或稍後再試")
+    hits.append(now)
+    _AGENT_CONTEXT_HITS[caller] = hits
+    if len(_AGENT_CONTEXT_HITS) > 500:      # 冷 caller 的空窗回收
+        for k in [k for k, v in _AGENT_CONTEXT_HITS.items() if not v]:
+            _AGENT_CONTEXT_HITS.pop(k, None)
+
+
+def _agent_context_warm_store(sid: str):
+    """**已在記憶體裡**的卡片流。search 掃全範圍時只看熱 store:為了搜尋去冷
+    載入整台機器的 session(seed jsonl / 拉 codex 歷史)會把一個回合拖垮,
+    而且會把沒人在看的 session 全部叫醒。明示單一 target 時才走 _v2_card_store。"""
+    store = _registry_card_store(sid)
+    if store is not None:
+        return store
+    try:
+        kind, ref = _registry_provider_ref(sid)
+        if kind == "hp":
+            d = _HP_CARD_DIGESTS.get(ref)
+            return d.store if d else None
+        if sid.startswith("openclaw:"):
+            d = _OC_CARD_DIGESTS.get(_oc_safe_session_key(sid.split(":", 1)[1]))
+            return d.store if d else None
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("_agent_context_warm_store", _exc, expected=True, session=sid)
+    return None
+
+
+def _agent_context_card_text(card: dict) -> str:
+    """一張卡的可讀文字。**自己的 audit 卡不算內容** —— 不然讀取行為會污染
+    下一次讀到的內容,還會讓摘要快取每讀必失效。"""
+    body = card.get("body") or {}
+    if str(body.get("origin") or "").startswith("agent_context"):
+        return ""
+    return str(body.get("fallback_text") or body.get("text") or "").strip()
+
+
+def _agent_context_source_seq(store) -> int:
+    """快取鍵用的「內容 seq」= 排除 audit 卡之後的最大 seq。
+
+    直接用 `store.seq` 會壞事:每次讀取都會落一張 audit 卡把 seq 推高,快取
+    永遠 miss,summary 就變成每次都燒一次模型。這裡只認真正的內容事件。
+    """
+    seq = 0
+    for ev in getattr(store, "events", None) or []:
+        if ev.get("type") == "card.upsert":
+            card = (ev.get("data") or {}).get("card") or {}
+            if str(((card.get("body") or {}).get("origin") or "")).startswith(
+                    "agent_context"):
+                continue
+        seq = max(seq, int(ev.get("seq") or 0))
+    return seq
+
+
+def _agent_context_lines(store, limit: int) -> list:
+    """最近 limit 張有文字的卡 → 已遮罩的行(時間順)。"""
+    order = list(getattr(store, "order", None) or [])
+    cards = getattr(store, "cards", None) or {}
+    out: list = []
+    for cid in reversed(order):
+        card = cards.get(cid) or {}
+        text = _agent_context_card_text(card)
+        if not text:
+            continue
+        out.append(agent_context_policy.card_line(
+            card.get("role") or "", text, card.get("ts")))
+        if len(out) >= max(1, limit):
+            break
+    out.reverse()
+    return out
+
+
+def _agent_context_search_store(store, sid: str, query: str,
+                                max_hits: int) -> list:
+    """單一 store 的子字串搜尋(新→舊掃,回時間順;片段已遮罩)。"""
+    order = list(getattr(store, "order", None) or [])
+    cards = getattr(store, "cards", None) or {}
+    hits: list = []
+    for cid in reversed(order):
+        card = cards.get(cid) or {}
+        text = _agent_context_card_text(card)
+        if not text:
+            continue
+        frag = agent_context_policy.match_snippet(text, query)
+        if frag is None:
+            continue
+        hits.append({"session": sid, "ts": card.get("ts"),
+                     "role": card.get("role") or "", "snippet": frag})
+        if len(hits) >= max(1, max_hits):
+            break
+    hits.reverse()
+    return hits
+
+
+async def _agent_context_meta(sid: str) -> dict:
+    """回應的固定欄位:戶口(purpose/provider/parent/model)+ 現況(busy)。"""
+    row = REGISTRY.get(sid) or {}
+    meta = row.get("meta") or {}
+    spawn = meta.get("spawn_config") if isinstance(
+        meta.get("spawn_config"), dict) else {}
+    model = str(meta.get("model") or spawn.get("model") or "").strip()
+    return {"id": sid,
+            "provider": row.get("provider") or (sid.split(":", 1)[0]
+                                                if ":" in sid else ""),
+            "purpose": agent_context_policy.redact_text(row.get("purpose") or ""),
+            "parent": row.get("parent") or None,
+            "class": row.get("class") or None,
+            "model": model or None,
+            "worktree": row.get("worktree") or None,
+            "busy": await _registry_is_busy(sid),
+            "last_active_ts": row.get("last_active_ts")}
+
+
+def _agent_context_family(caller: str, target: str) -> bool:
+    return agent_context_policy.is_family_edge(
+        REGISTRY.get(caller), REGISTRY.get(target), caller, target)
+
+
+# ── 蒸餾:本機 Ollama(理由與 harness/model.py 同,見下)────────────────
+# bridge 現有「送文字給模型、拿文字回來」的路只有四條,能用的只有第一條:
+#   1. 本機 Ollama(`_polish_transcript` 那條)—— 真無狀態、無金鑰、本機免費 ✅
+#   2. `acp_full()` ACP persona pool —— **綁善彰真正的 Telegram canonical
+#      session**:摘要提示詞會噴到他手機上,還會搶 `self._lock` 卡住真人回合 ❌
+#   3. `run_hermes()` —— 同上,刻意打同一個 canonical session ❌
+#   4. headless `claude -p` dispatch —— 會建 SUBSESSIONS/worktree/registry
+#      配額,為了一段摘要生一個子 agent,層級完全不對 ❌
+# (2/3 已逐條核對過 bridge 現碼:ACPSession 持有 persona 的 canonical
+#  session,POOL 依 persona 復用同一條連線。)所以走第一條。
+# feat/continual-harness 的 `harness.model.ollama_text()` 是同一段的抽象版;
+# 那棵樹合併後,這裡應改成 import 它,不要留兩份 Ollama 呼叫。
+
+def _agent_context_model_name() -> str:
+    return (os.environ.get("AGENT_CONTEXT_MODEL", "").strip()
+            or os.environ.get("HARNESS_MODEL", "").strip()
+            or os.environ.get("MEETING_POLISH_MODEL", "").strip()
+            or "mistral-small3.2:latest")
+
+
+def _agent_context_model_timeout() -> float:
+    try:
+        return float(os.environ.get("AGENT_CONTEXT_MODEL_TIMEOUT", "") or 60.0)
+    except ValueError:
+        return 60.0
+
+
+async def _agent_context_summarize(material: str) -> str:
+    """一發式本機蒸餾。**失敗一律回空字串**,由呼叫端 fail-soft 退成抽取式
+    摘要 —— 模型掛了不該讓「讀不到隊友在幹嘛」變成硬錯誤。"""
+    prompt = agent_context_policy.SUMMARY_PROMPT + material
+    num_ctx = min(40960, max(8192, len(prompt) * 2 + 2048))
+
+    async def _run() -> str:
+        import httpx
+        base = (os.environ.get("OLLAMA_URL", "").strip()
+                or "http://127.0.0.1:11434").rstrip("/")
+        async with httpx.AsyncClient(timeout=120) as client:
+            r = await client.post(
+                base + "/api/chat",
+                json={"model": _agent_context_model_name(), "stream": False,
+                      "keep_alive": "15m",
+                      "messages": [{"role": "user", "content": prompt}],
+                      "options": {"temperature": 0.2, "num_ctx": num_ctx}})
+            r.raise_for_status()
+            return ((r.json().get("message") or {}).get("content") or "").strip()
+
+    try:
+        return await asyncio.wait_for(_run(),
+                                      timeout=_agent_context_model_timeout())
+    except asyncio.TimeoutError:
+        _log_event("agent_context_summary_timeout", chars=len(prompt))
+        return ""
+    except Exception as e:  # noqa: BLE001
+        _log_event("agent_context_summary_failed", error=type(e).__name__,
+                   error_message=str(e)[:200])
+        return ""
+
+
+async def _agent_context_summary(target: str, meta: dict,
+                                 store) -> tuple[str, int, bool]:
+    """摘要 + 快取。回 (text, source_seq, cached)。
+
+    快取鍵 = (session, 內容 seq):目標沒有新動靜就重複用同一份,重讀免費;
+    一有新卡片(seq 前進)即失效。fail-soft 的抽取式退路**不進快取**,
+    否則模型復活後還會拿到那份沒蒸餾過的。
+    """
+    src_seq = _agent_context_source_seq(store)
+    ent = _AGENT_CONTEXT_SUMMARY_CACHE.get(target)
+    if ent and ent.get("seq") == src_seq and ent.get("text"):
+        return (ent["text"], src_seq, True)
+    lines = _agent_context_lines(
+        store, agent_context_policy.summary_material_cards())
+    material = agent_context_policy.build_summary_material(meta, lines)
+    raw = await _agent_context_summarize(material)
+    # 模型輸出再遮一次:素材已遮過,但模型可能從別處(系統提示、幻覺)吐出
+    # key 形狀的字串。遮罩是結構性的,不靠「上游應該已經乾淨了」。
+    text = agent_context_policy.redact_text(raw or "").strip()
+    if not text:
+        return (agent_context_policy.fallback_summary(meta, lines),
+                src_seq, False)
+    _AGENT_CONTEXT_SUMMARY_CACHE[target] = {"seq": src_seq, "text": text,
+                                            "ts": time.time()}
+    cap = agent_context_policy.cache_max_entries()
+    if len(_AGENT_CONTEXT_SUMMARY_CACHE) > cap:
+        for k, _v in sorted(_AGENT_CONTEXT_SUMMARY_CACHE.items(),
+                            key=lambda kv: kv[1].get("ts") or 0)[:len(
+                                _AGENT_CONTEXT_SUMMARY_CACHE) - cap]:
+            _AGENT_CONTEXT_SUMMARY_CACHE.pop(k, None)
+    return (text, src_seq, False)
+
+
+async def _agent_context_audit(caller: str, target: str, mode: str,
+                               read_id: str, note: str = "",
+                               create_store: bool = True) -> None:
+    """audit 卡落**被讀的 session**:使用者在 Pocket 上看得到誰讀了自己。
+    kind "text" + fallback_text(舊 app 照純文字渲染),origin=agent_context
+    (回覆收割與內容擷取都會跳過它)。單邊失敗只留痕不擋事。"""
+    txt = f"👁 {caller} 讀取了本 session 的上下文({mode})"
+    if note:
+        txt += f"|{note}"
+    try:
+        store = (await _v2_card_store(target)) if create_store \
+            else _agent_context_warm_store(target)
+        if store is None:
+            return
+        store.upsert_card(carddigest.make_card(
+            f"card-agentctx-{read_id}", "", "assistant", "text",
+            {"text": txt, "fallback_text": txt, "origin": "agent_context",
+             "caller": caller, "target": target, "mode": mode,
+             "read_id": read_id}))
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("_agent_context_audit", _exc, expected=True, session=target)
+
+
+async def _agent_context_deny(caller: str, target: str, mode: str,
+                              reason: str) -> None:
+    """拒絕:落 log(誰想讀誰、被什麼擋下)、對已有 store 的目標落一張留痕卡
+    (不為一張拒絕卡冷載入目標),丟 403。"""
+    _log_event("agent_context_denied", caller=caller, target=target,
+               mode=mode, reason=reason[:200])
+    await _agent_context_audit(caller, target, mode,
+                               "deny-" + uuid.uuid4().hex[:8],
+                               note="(已被政策拒絕,未取得任何內容)",
+                               create_store=False)
+    raise http_err(403, "AGENT_CONTEXT_DENIED", reason)
+
+
+def _agent_context_candidates() -> list:
+    """search 全範圍的候選 session:registry 未歸檔戶口 + 常駐人格。
+    只回 id;能不能讀、有沒有熱 store 由呼叫端再過濾。"""
+    _registry_ensure_personas()
+    return sorted({r["id"] for r in REGISTRY.list_rows()
+                   if r.get("state") != "archived"})
+
+
+@app.post("/app/v2/agent_context")
+async def v2_agent_context(request: Request):
+    """跨 session 上下文互讀。body:
+    {caller: session_id, target: session_id(search 可省略 = 全可讀範圍),
+     mode: summary|recent|search, query?(search 必填), limit?}。
+
+    caller 自報身分(信任邊界 = bridge token,與 agent_call 同);audit 卡與
+    log 都以此記名。回應固定含 target/purpose/provider/model/busy/
+    last_active_ts/content/truncated/source_seq。
+    """
+    _check_auth(request)
+    _agent_context_require_enabled()
+    body = await _json_body(request)
+    caller = _agent_call_normalize_sid(str(body.get("caller") or ""))
+    target = _agent_call_normalize_sid(str(body.get("target") or ""))
+    mode = str(body.get("mode") or "summary").strip() or "summary"
+    query = str(body.get("query") or "").strip()
+    if mode not in agent_context_policy.MODES:
+        raise http_err(400, "AGENT_CONTEXT_BAD_MODE",
+                       f"mode 必須是 {'|'.join(agent_context_policy.MODES)}")
+    if not caller:
+        raise http_err(400, "AGENT_CONTEXT_BAD_REQUEST", "caller 必填")
+    if mode != "search" and not target:
+        raise http_err(400, "AGENT_CONTEXT_BAD_REQUEST",
+                       f"{mode} 模式的 target 必填")
+    if mode == "search" and not query:
+        raise http_err(400, "AGENT_CONTEXT_BAD_REQUEST", "search 模式 query 必填")
+    if target and caller == target:
+        raise http_err(400, "AGENT_CONTEXT_SELF",
+                       "不能讀自己的上下文(自己的卡片流走 /app/v2/sessions)")
+    try:
+        _v2_card_source(caller)
+    except HTTPException:
+        raise http_err(400, "AGENT_CONTEXT_BAD_CALLER",
+                       f"caller 不是已知 session:{caller}")
+    _agent_context_rate_check(caller)
+    policy = agent_context_policy.load_policy()
+    read_id = "ctx-" + uuid.uuid4().hex[:12]
+    try:
+        limit = int(body.get("limit") or 0)
+    except (TypeError, ValueError):
+        limit = 0
+
+    # ── search 全範圍:掃「這個 caller 讀得到」的熱 store ────────────────
+    if mode == "search" and not target:
+        return await _agent_context_search_all(caller, query, policy, limit,
+                                               read_id)
+
+    # ── 單一 target ────────────────────────────────────────────────────
+    try:
+        _v2_card_source(target)
+    except HTTPException:
+        raise http_err(404, "AGENT_CONTEXT_TARGET_NOT_FOUND",
+                       f"target 不是既有 session:{target}")
+    ok, basis = agent_context_policy.decide(
+        policy, caller, target, mode,
+        family=_agent_context_family(caller, target))
+    if not ok:
+        await _agent_context_deny(caller, target, mode, basis)
+    store = await _v2_card_store(target)
+    meta = await _agent_context_meta(target)
+    hits: list = []
+    cached = False
+    if mode == "summary":
+        content, src_seq, cached = await _agent_context_summary(
+            target, meta, store)
+    elif mode == "recent":
+        n = limit or agent_context_policy.recent_limit_default()
+        n = max(1, min(n, agent_context_policy.recent_limit_max()))
+        src_seq = _agent_context_source_seq(store)
+        lines = _agent_context_lines(store, n)
+        content = "\n".join(lines) if lines else "(這個 session 的卡片流是空的)"
+    else:                                    # search(單一 target 範圍)
+        n = limit or agent_context_policy.search_max_hits()
+        n = max(1, min(n, agent_context_policy.search_max_hits()))
+        src_seq = _agent_context_source_seq(store)
+        hits = _agent_context_search_store(store, target, query, n)
+        content = _agent_context_hits_text(hits, query)
+    content, truncated = agent_context_policy.clip(
+        content, agent_context_policy.max_chars())
+    _log_event("agent_context_read", read=read_id, caller=caller,
+               target=target, mode=mode, basis=basis, cached=cached,
+               chars=len(content), truncated=truncated, source_seq=src_seq)
+    _registry_call_safe("touch", caller)
+    await _agent_context_audit(caller, target, mode, read_id)
+    return {"ok": True, "read_id": read_id, "mode": mode, "target": target,
+            "purpose": meta["purpose"], "provider": meta["provider"],
+            "model": meta["model"], "busy": meta["busy"],
+            "last_active_ts": meta["last_active_ts"],
+            "content": content, "truncated": truncated,
+            "source_seq": src_seq, "cached": cached, "basis": basis,
+            "hits": hits}
+
+
+def _agent_context_hits_text(hits: list, query: str) -> str:
+    if not hits:
+        return f"(在可讀範圍內找不到「{query}」)"
+    return "\n".join(
+        agent_context_policy.card_line(
+            f"{h['session']} {h.get('role') or ''}".strip(),
+            h["snippet"], h.get("ts"))
+        for h in hits)
+
+
+async def _agent_context_search_all(caller: str, query: str, policy: dict,
+                                    limit: int, read_id: str) -> dict:
+    """跨 session 搜尋 —— **範圍即權限**:讀不到的 session 連命中都看不到。
+
+    只掃熱 store(見 `_agent_context_warm_store`),命中的 session 各落一張
+    audit 卡(沒命中的沒外流內容,不打擾)。
+    """
+    max_hits = agent_context_policy.search_max_hits()
+    n = max(1, min(limit or max_hits, max_hits))
+    scanned = 0
+    hits: list = []
+    scope: list = []
+    for sid in _agent_context_candidates():
+        if scanned >= agent_context_policy.search_max_sessions():
+            break
+        if sid == caller:
+            continue
+        ok, _reason = agent_context_policy.decide(
+            policy, caller, sid, "search",
+            family=_agent_context_family(caller, sid))
+        if not ok:
+            continue
+        store = _agent_context_warm_store(sid)
+        if store is None:
+            continue
+        scope.append(sid)
+        scanned += 1
+        hits.extend(_agent_context_search_store(store, sid, query,
+                                                max(1, n - len(hits))))
+        if len(hits) >= n:
+            break
+    hits.sort(key=lambda h: float(h.get("ts") or 0))
+    hits = hits[:n]
+    content, truncated = agent_context_policy.clip(
+        _agent_context_hits_text(hits, query),
+        agent_context_policy.max_chars())
+    _log_event("agent_context_read", read=read_id, caller=caller, target="*",
+               mode="search", scanned=scanned, hits=len(hits),
+               chars=len(content), truncated=truncated)
+    _registry_call_safe("touch", caller)
+    for sid in dict.fromkeys(h["session"] for h in hits):
+        await _agent_context_audit(caller, sid, "search", read_id,
+                                   note=f"關鍵字「{query[:40]}」",
+                                   create_store=False)
+    return {"ok": True, "read_id": read_id, "mode": "search", "target": "*",
+            "purpose": "", "provider": "", "model": None, "busy": False,
+            "last_active_ts": None, "content": content,
+            "truncated": truncated, "source_seq": 0, "cached": False,
+            "basis": "scope", "hits": hits, "scope": scope}
+
+
+@app.get("/app/v2/agent_context_targets")
+async def v2_agent_context_targets(request: Request, caller: str = "",
+                                   mode: str = ""):
+    """這個 caller 讀得到誰、各自能讀到什麼程度(空 mode = 逐模式列出)。
+    給 agent 自己盤點用,也給善彰驗證政策有沒有設對。"""
+    _check_auth(request)
+    _agent_context_require_enabled()
+    caller = _agent_call_normalize_sid(caller)
+    if not caller:
+        raise http_err(400, "AGENT_CONTEXT_BAD_REQUEST", "caller 必填")
+    if mode and mode not in agent_context_policy.MODES:
+        raise http_err(400, "AGENT_CONTEXT_BAD_MODE",
+                       f"mode 必須是 {'|'.join(agent_context_policy.MODES)}")
+    policy = agent_context_policy.load_policy()
+    modes = (mode,) if mode else agent_context_policy.MODES
+    out = []
+    for sid in _agent_context_candidates():
+        if sid == caller:
+            continue
+        fam = _agent_context_family(caller, sid)
+        allowed = [m for m in modes
+                   if agent_context_policy.decide(policy, caller, sid, m,
+                                                  family=fam)[0]]
+        if not allowed:
+            continue
+        row = REGISTRY.get(sid) or {}
+        out.append({"id": sid, "provider": row.get("provider"),
+                    "purpose": agent_context_policy.redact_text(
+                        row.get("purpose") or ""),
+                    "modes": allowed, "family": fam})
+    return {"caller": caller, "targets": out,
+            "policy_path": agent_context_policy.policy_path(),
+            "tiering": {"family": list(agent_context_policy.family_modes()),
+                        "context_rule_default": list(
+                            agent_context_policy.rule_default_modes()),
+                        "agent_call_implies": list(
+                            agent_context_policy.call_implies_modes())}}
 
 
 @app.on_event("startup")
