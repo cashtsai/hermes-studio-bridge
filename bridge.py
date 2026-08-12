@@ -4057,13 +4057,48 @@ def _resolve_codex_bin() -> str:
 CODEX_BIN = _resolve_codex_bin()   # 僅供顯示/預設;spawn 走 _resolve_codex_bin()
 
 # The managed Codex daemon is the single writer shared by Desktop and Pocket.
-# Its Unix socket speaks WebSocket frames (not JSONL); stdio is retained only
-# as an explicit migration fallback for hosts that have not bootstrapped it.
+# Its Unix socket speaks WebSocket frames (not JSONL); spawning our own
+# `codex app-server --stdio` is the fallback for hosts that don't have it.
 CODEX_APP_SERVER_SOCKET = os.path.expanduser(
     os.environ.get(
         "CODEX_APP_SERVER_SOCKET",
         "~/.codex/app-server-control/app-server-control.sock"))
-CODEX_APP_SERVER_MODE = os.environ.get("CODEX_APP_SERVER_MODE", "managed").strip().lower()
+
+# 傳輸選擇是**三態**,而且「有沒有 daemon」一律用「連得上嗎」判定,不是用
+# `os.path.exists(socket)` 判定。兩個都是踩過的雷:
+#   1. unix socket 的 inode 在 daemon 崩潰/被強制結束後**會留在磁碟上**。
+#      exists() 仍為 True → 舊碼走 managed → connect 丟 ConnectionRefusedError
+#      (Errno 61) → 直接 raise,永遠碰不到 stdio。桌面 app 自動更新留下殭屍
+#      正是這個情境(2026-08-12)。
+#   2. 開機後使用者還沒開 ChatGPT.app、或龍蝦那台無頭 Ubuntu 根本沒有桌面
+#      app → socket 檔不存在 → 舊碼(預設 managed)一樣 raise → CX 全滅。
+# 所以 fallback 必須寫在 except 路徑裡,不能寫在「用設定字串決定」的 else 裡。
+#   auto    = 先試 managed daemon,任何連線失敗都退回自己 spawn stdio(預設)
+#   managed = 只用共用 daemon,連不上就大聲壞掉(刻意要 daemon-only 的人用)
+#   stdio   = 只 spawn 自己的 app-server,完全不碰 socket
+CODEX_APP_SERVER_MODES = ("auto", "managed", "stdio")
+CODEX_APP_SERVER_MODE = os.environ.get("CODEX_APP_SERVER_MODE", "auto").strip().lower()
+if CODEX_APP_SERVER_MODE not in CODEX_APP_SERVER_MODES:
+    CODEX_APP_SERVER_MODE = "auto"
+
+
+def _is_clean_ws_closure(exc: BaseException) -> bool:
+    """這個 WebSocket 例外是不是「對方好好地把連線關掉」?
+
+    使用者關掉 ChatGPT.app = daemon 正常收攤 = close code 1000/1001。
+    那不是故障,不該記成 failure(不然每關一次桌面 app 就一則假警報)。
+    """
+    try:
+        from websockets.exceptions import ConnectionClosed, ConnectionClosedOK
+    except Exception:  # noqa: BLE001 - websockets 不在也不該讓 log 分類炸掉
+        return type(exc).__name__ == "ConnectionClosedOK"
+    if isinstance(exc, ConnectionClosedOK):
+        return True
+    if isinstance(exc, ConnectionClosed):
+        for frame in (getattr(exc, "rcvd", None), getattr(exc, "sent", None)):
+            if getattr(frame, "code", None) in (1000, 1001):
+                return True
+    return False
 
 
 # ─────────── CC/CX 登入狀態探測(給 app gate CC/CX 頁籤)───────────
@@ -4505,6 +4540,9 @@ class CodexAppServerClient:
         self.proc = None
         self.ws = None
         self.transport = ""
+        self.spawned_bin = ""
+        # 上一次「印出來」的傳輸種類,用來做 once-per-transition 的日誌節流。
+        self._last_transport_logged = ""
         self._lock = asyncio.Lock()
         self._next_id = 1
         self._pending = {}
@@ -4563,57 +4601,104 @@ class CodexAppServerClient:
                 msg["params"] = params
             await self._write_locked(msg)
 
+    async def _connect_managed_locked(self):
+        """接上桌面版共用的 managed daemon(unix socket 上跑 WebSocket frames)。
+
+        連得上才算數:socket 檔存在與否完全不參與判斷,因為 daemon 崩潰後
+        inode 會留著(stale socket),`exists()` 會騙人。
+        """
+        import websockets
+        self.ws = await websockets.unix_connect(
+            CODEX_APP_SERVER_SOCKET,
+            uri="ws://localhost/",
+            compression=None,
+            # 單一訊息上限。thread/turns/list itemsView=full 若含 computer-use
+            # 截圖(base64)可能單則破 8MB → 預設 1MB 上限會直接把連線關掉。
+            # 對齊 stdio 那條路徑的 128MB,吃得下含圖的大回應。
+            max_size=128 * 1024 * 1024,
+            user_agent_header="PocketAgent-Bridge/0.1",
+        )
+        self.transport = "unix-websocket"
+        self.spawned_bin = "managed-daemon"
+        self._reader_task = asyncio.create_task(self._read_websocket())
+
+    async def _spawn_stdio_locked(self):
+        """自己 spawn 一顆 `codex app-server --stdio`(沒有共用 daemon 時的退路)。"""
+        codex_bin = _resolve_codex_bin()   # 每次 spawn 重新解析:桌面 app 更新後路徑會變
+        self.spawned_bin = codex_bin
+        try:
+            self.proc = await asyncio.create_subprocess_exec(
+                codex_bin, "app-server", "--stdio",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                stdin=asyncio.subprocess.PIPE,
+                cwd=HOME_ROOT,
+                # StreamReader 單行上限。codex app-server 把每個 JSON-RPC 回應當「一行」
+                # 送;thread/turns/list itemsView=full 若含 computer-use 截圖(base64)可能
+                # 單行破 8MB → asyncio 讀取器丟 LimitOverrunError(「Separator is not found,
+                # and chunk exceed the limit」)→ reader task 死 → app-server「stopped」→ 整條
+                # codex 卡死(XCash 就是這樣)。放大到 128MB 吃得下含圖的大回應。
+                limit=128 * 1024 * 1024,
+            )
+        except (FileNotFoundError, PermissionError) as e:
+            _log_event("codex_spawn_failed", bin=codex_bin, error=type(e).__name__)
+            raise CodexAppServerError(f"codex binary unavailable: {codex_bin}") from e
+        self.transport = "stdio"
+        self._reader_task = asyncio.create_task(self._read_stdout())
+        self._stderr_task = asyncio.create_task(self._read_stderr())
+
+    def _note_transport(self, transport: str, **fields):
+        """只在「傳輸換人做」的時候印一行,不要每次重試都洗版。"""
+        if self._last_transport_logged == transport:
+            return
+        self._last_transport_logged = transport
+        _log_event("codex_transport_selected", transport=transport,
+                   mode=CODEX_APP_SERVER_MODE, **fields)
+
     async def _ensure_started_locked(self):
         if self.ws is not None or (self.proc and self.proc.returncode is None):
             return
+        self.app_server_error = ""
+        mode = CODEX_APP_SERVER_MODE
+        if mode not in CODEX_APP_SERVER_MODES:
+            mode = "auto"
+        managed_error = None
+        if mode in ("auto", "managed"):
+            try:
+                await self._connect_managed_locked()
+            except Exception as e:  # noqa: BLE001
+                # FileNotFoundError(socket 不存在)/ ConnectionRefusedError
+                # (stale socket,Errno 61)/ PermissionError / handshake 失敗 /
+                # timeout——全部一視同仁:managed 這條路不通。
+                self.ws = None
+                self.transport = ""
+                managed_error = e
+                _log_event("codex_managed_connect_failed",
+                           socket=CODEX_APP_SERVER_SOCKET, mode=mode,
+                           error=type(e).__name__, error_message=str(e)[:200])
+                if mode == "managed":
+                    # 刻意選 daemon-only 的人:大聲壞掉,不要偷偷開第二顆
+                    # app-server 去搶 thread-store 的 writer lock。
+                    raise CodexAppServerError(
+                        "managed Codex app-server unavailable; refusing to spawn a second server"
+                    ) from e
+        if self.ws is not None:
+            self._note_transport("unix-websocket", socket=CODEX_APP_SERVER_SOCKET)
+        else:
+            await self._spawn_stdio_locked()
+            self._note_transport(
+                "stdio", bin=self.spawned_bin,
+                fallback_from=("managed" if managed_error is not None else ""),
+                fallback_reason=(type(managed_error).__name__
+                                 if managed_error is not None else ""))
+        # P1-3:這批清理(含一發 sqlite UPDATE 把 pending approvals 標 expired)
+        # 只有在**真的接上傳輸**之後才做。放在連線之前的話,daemon 短暫不在
+        # (桌面 app 更新/重開)就會把使用者手上待批准的 Codex 請求全部作廢,
+        # 而且每次重試都再打一次 DB。
         self._pending.clear()
         self.pending_approvals.clear()
         self.pending_approvals_by_thread.clear()
         self._expire_stale_codex_approvals()
-        self.app_server_error = ""
-        if os.path.exists(CODEX_APP_SERVER_SOCKET):
-            try:
-                import websockets
-                self.ws = await websockets.unix_connect(
-                    CODEX_APP_SERVER_SOCKET,
-                    uri="ws://localhost/",
-                    compression=None,
-                    max_size=128 * 1024 * 1024,
-                    user_agent_header="PocketAgent-Bridge/0.1",
-                )
-            except Exception as e:  # noqa: BLE001
-                self.ws = None
-                _log_event("codex_managed_connect_failed",
-                           socket=CODEX_APP_SERVER_SOCKET,
-                           error=type(e).__name__, error_message=str(e)[:200])
-                raise CodexAppServerError(
-                    "managed Codex app-server unavailable; refusing to spawn a second server"
-                ) from e
-            self.transport = "unix-websocket"
-            self.spawned_bin = "managed-daemon"
-            self._reader_task = asyncio.create_task(self._read_websocket())
-        else:
-            if CODEX_APP_SERVER_MODE != "stdio":
-                raise CodexAppServerError(
-                    f"managed Codex app-server socket not found: {CODEX_APP_SERVER_SOCKET}"
-                )
-            codex_bin = _resolve_codex_bin()
-            self.spawned_bin = codex_bin
-            try:
-                self.proc = await asyncio.create_subprocess_exec(
-                    codex_bin, "app-server", "--stdio",
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                    stdin=asyncio.subprocess.PIPE,
-                    cwd=HOME_ROOT,
-                    limit=128 * 1024 * 1024,
-                )
-            except (FileNotFoundError, PermissionError) as e:
-                _log_event("codex_spawn_failed", bin=codex_bin, error=type(e).__name__)
-                raise CodexAppServerError(f"codex binary unavailable: {codex_bin}") from e
-            self.transport = "stdio"
-            self._reader_task = asyncio.create_task(self._read_stdout())
-            self._stderr_task = asyncio.create_task(self._read_stderr())
         self.server_started_at = time.time()
         init = await self._call_started_locked(
             "initialize",
@@ -4671,7 +4756,15 @@ class CodexAppServerClient:
         if self.ws is not None:
             wire = dict(msg)
             wire.pop("jsonrpc", None)
-            await self.ws.send(json.dumps(wire, ensure_ascii=False, separators=(",", ":")))
+            try:
+                await self.ws.send(
+                    json.dumps(wire, ensure_ascii=False, separators=(",", ":")))
+            except Exception as e:  # noqa: BLE001
+                # P1-4:daemon 在寫入當下掉線會丟 websockets 的 ConnectionClosed。
+                # 呼叫端只認 CodexAppServerError,原始例外會一路逃到 handler 外面
+                # 變成 500。統一翻譯成 CodexAppServerError。
+                raise CodexAppServerError(
+                    f"codex app-server send failed: {type(e).__name__}") from e
             return
         if not self.proc or not self.proc.stdin:
             raise CodexAppServerError("codex app-server is not running")
@@ -4721,16 +4814,23 @@ class CodexAppServerClient:
             await self._reader_cleanup(proc=proc)
 
     async def _read_websocket(self):
+        # 注意:`recv()` 不會回 None——連線關掉是用丟例外表示的
+        # (ConnectionClosedOK / ConnectionClosedError),所以這裡沒有
+        # `if raw is None: break` 那種死碼。
         ws = self.ws
         try:
             while ws is not None and self.ws is ws:
                 raw = await ws.recv()
-                if raw is None:
-                    break
                 await self._dispatch_wire_message(raw)
         except Exception as e:  # noqa: BLE001
-            _log_event("codex_app_server_websocket_failed", error=type(e).__name__,
-                       error_message=str(e)[:160])
+            if _is_clean_ws_closure(e):
+                # P2-6:使用者正常關掉 ChatGPT.app 就是這條。以前一律記成
+                # `codex_app_server_websocket_failed`,每關一次桌面 app 就假警報。
+                _log_event("codex_app_server_websocket_closed",
+                           reason=type(e).__name__, detail=str(e)[:160])
+            else:
+                _log_event("codex_app_server_websocket_failed", error=type(e).__name__,
+                           error_message=str(e)[:160])
         finally:
             await self._reader_cleanup(ws=ws)
 
