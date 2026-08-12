@@ -841,6 +841,16 @@ class CodexThreadDigest(ApprovalCardMixin):
         # 避免「最新 live 在前、較舊 seed 歷史被 append 到尾端」污染對話順序。
         self._seed_pending: list[tuple[str, object, object]] = []
         self.last_seed_at = 0.0
+        # thread-store 寫入鎖（這條 thread 正被桌面版 Codex/ChatGPT 佔用）。
+        # 由 bridge 的 `_cx_sync_thread_lock` 灌進來；app 讀
+        # session.status.locked 掛 banner + 停用輸入框，而不是讓使用者對著一個
+        # 送不出去的輸入框打字。
+        self.locked = False
+        self.lock_reason = ""
+        self.lock_message = ""
+        # 已為「哪一次鎖定事件」推過卡（值＝該次鎖的 since 時戳）。以事件為身分
+        # 去重，重複偵測與「開 session 時補推」都只會留下一張卡。
+        self.lock_card_since = None
 
     def _status(self):
         # phase 的契約(app `TerminalCardStore.statusPhase`):
@@ -867,10 +877,23 @@ class CodexThreadDigest(ApprovalCardMixin):
             label = "已排入佇列,等待接手…"
         elif depth:
             label = f"{label} · 另有 {depth} 則排隊"
-        self.store.set_status({
+        locked = bool(getattr(self, "locked", False))
+        if locked and not self.busy:
+            # 被鎖住時的 label 必須講出原因:原本 idle 的「閒置」會讓使用者以為
+            # 一切正常,然後對著送不出去的輸入框打字。
+            label = "已被桌面版 Codex 佔用,送不出去"
+        status = {
             "busy": self.busy, "mode": None, "prompt": self.prompt,
             "phase": phase, "queue_depth": depth, "label": label,
-        })
+            # `locked` 恆存在（bool）：app 可以無條件讀它決定 banner/輸入框，
+            # 鎖放開時它翻回 False，banner 自己消失（不需要重啟 bridge）。
+            "locked": locked,
+        }
+        if locked:
+            status["lock_reason"] = (getattr(self, "lock_reason", "")
+                                     or "thread_store_conflict")
+            status["lock_message"] = getattr(self, "lock_message", "") or ""
+        self.store.set_status(status)
 
     @staticmethod
     def _same_card(prev: dict | None, card: dict) -> bool:
