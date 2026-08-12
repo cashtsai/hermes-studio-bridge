@@ -983,3 +983,173 @@ cx/openclaw = registry 有登記戶口(bridge 開的)→ `managed`,否則
 `sessions[]` 裡、`registered:false`(1a 既有契約)——app 的 FleetView 可以
 直接把它們渲染成「**未登記**」區塊,點一下打 `…/adopt` 收編。
 收編成功後該 id 就從未登記區移到正式戶口列。
+
+## 14. Worker 可見層(`/app/v2/workers`,SUBPROCESS_HARNESS_DESIGN §2.4)
+
+> 善彰 2026-08-12:「我看不出來你有在運作,你有子程序在執行嗎?我也看不到你有」
+> —— AI 在幫你做事,你卻看不到它派了幾個工、做到哪。這是總控台的最後一塊。
+
+**先分清楚兩個東西(§2.3 vs §2.4,它們並存、不是替代關係)**:
+
+| | 子程序面板(§2.3) | 工人摺疊區(§2.4,本節) |
+|---|---|---|
+| 是什麼 | **獨立 session**(自己的 provider/model/審核設定) | session **內部**派出去的活 |
+| 壽命 | 小時/天 | **秒/分** |
+| 資料源 | `/app/v2/registry`(SQLite,家譜、TTL、配額、reaper) | `/app/v2/workers`(**純記憶體**) |
+| 可操作 | 可點進去控制、派工、收編 | **唯讀**,只看狀態燈 |
+
+工人**刻意不進 registry 的 session 表**:它們生滅以秒計、churn 極高,硬套
+TTL/reaper/配額會把治理層淹掉,也會讓家譜樹爆炸(善彰一個 session 同時跑
+3–7 隻手)。
+
+**旗標**:`WORKERS=1`(**預設關**)。關著時這兩個端點回 **404**(不是 403),
+且這一層完全沒有背景成本 —— 沒有計時器、沒有背景任務,過期是讀寫時惰性算的。
+
+### 14.1 `GET /app/v2/workers?session=<v2 session id>`
+
+`session` 就是 `/app/v2/sessions` 的 `id`(`claude_code:<name>` /
+`codex:<thread_id>` / `hermes:<mid>`)。
+
+```jsonc
+{
+  "session": "claude_code:Main",
+  "workers": [{
+    "worker_id": "toolu_01Krkzopp1BTuWnUMZJKRRfL",  // 穩定鍵,Pre/Post 同一顆
+    "label": "查 worker 可見層（Explore）",            // 人話,可直接顯示
+    "state": "running|done|failed",
+    "parent_worker": null,        // 有值時**保證指得到本清單裡的另一筆 worker**;
+                                  // 接不起來的線索一律放 meta,不放這裡
+    "started_ts": 1786528221.77,
+    "updated_ts": 1786528221.78,
+    "meta": {"provider": "claude_code", "kind": "subagent",
+             "subagent_type": "Explore",    // 純量鍵值,可能缺席
+             "agent_id": "agent_abc",       // CC:這筆是在哪隻 subagent 裡派的
+             "link": "cwd|provider"}        // CX:親子連線是怎麼推出來的
+  }],
+  "counts": {"running": 3, "done": 4, "failed": 0},
+  "ttl_secs": 300.0              // 靜默期,app 可據此決定 poll 間隔
+}
+```
+
+- 依 `started_ts` 由舊到新。`counts` 直接餵「⚙️ 3 個工人執行中」摺疊標題。
+- **這是「現在在跑什麼」的即時視圖,不是稽核紀錄**:不落 DB、不寫磁碟,
+  **bridge 重啟即空 —— 這是正確行為**,不是 bug,app 不要當錯誤處理。
+- **靜默期自動過期**(`WORKER_TTL_SECS`,預設 300s):超過 TTL 沒有新回報的
+  工人就從清單消失。這條規則專治「回報 done 的 hook 沒跑到」(CC 被 Ctrl-C、
+  行程被殺)—— 沒有它,面板會永遠掛著一隻假的「執行中」。
+- 每 session ring 上限 50,滿了汰換最舊的。
+- 未知 session → `200` + 空清單(不是 404)。`session` 空字串 → `400`。
+
+### 14.2 `POST /app/v2/workers/report`
+
+```jsonc
+{ "session": "claude_code:Main",   // 或 "cc_session_id": "<CC 的 session_id>"
+  "worker_id": "toolu_01…",        // 必填,upsert 鍵
+  "label": "審 PR #92 的 blocker",
+  "state": "running|done|failed",
+  "parent_worker": "agent_abc",    // 選填
+  "meta": {"…": "純量"} }          // 選填
+```
+→ `{"ok": true, "session": "claude_code:Main", "worker": {…}}`
+
+- **Upsert**:同 `worker_id` 再回報只更新 state/label/`updated_ts`,
+  **`started_ts` 不變**(開工時間是它的身分)。已被靜默期收走的 id 再回報 =
+  當新工人復活,拿到新的 `started_ts`。
+- **不挑嘴**:認不得的 `state` 收斂成 `running` 而不是 `400`
+  (`interrupted`/`stalled`/`timeout` → `failed`,`succeeded`/`complete` → `done`)。
+  呼叫端是掛在工具呼叫上的 hook,不能因為打錯字就讓工人整個消失。
+- `cc_session_id`:CC hook 只知道自己的 `session_id`(uuid),不知道 ccsess
+  session 名。bridge 用**既有**的 name↔sid 對應表(`/ccsessions/_hook` 一直在
+  維護)反查成 `claude_code:<name>`。反查不到時落到 `cc-sid:<uuid>`,
+  **不丟掉這筆回報**(至少診斷時看得出「有工人但認不出是誰的」)。
+- `meta` 只收純量、序列化上限 2KB(外部來源,不無條件信任)。
+- **`parent_worker` 只在真的接得起來時才給**。CC 的巢狀 subagent 目前**接不
+  起來**:`worker_id` 是 `tool_use_id`(`toolu_…`),而 hook payload 只給得出
+  `agent_id`(另一個號碼空間),派出這隻 subagent 的那次呼叫的 `tool_use_id`
+  不在 payload 裡。所以 `agent_id` 放 `meta.agent_id` 當診斷用,**不**冒充
+  `parent_worker` —— 給個指不到的父節點,app 只會畫出一棵斷掉的樹。
+
+### 14.3 三家 provider 的工人實際長什麼樣
+
+| provider | 工人是什麼 | 怎麼來的 | `worker_id` |
+|---|---|---|---|
+| `claude_code` | `Agent` 工具派的 subagent | **CC hook 主動回報**(唯一可行的路:subagent 不在 tmux、無 pane、不進 ccsess 名單) | `toolu_…`(= `tool_use_id`) |
+| `codex` | guardian / subagent child thread | bridge **唯讀投影** `thread/list?includeChildren=true` | `codex:<thread_id>` |
+| `hermes` | dispatch `SUBSESSIONS` | bridge **唯讀投影**既有 SUBSESSIONS | `sub:<sid>` |
+
+- **主清單不受影響**:`_codex_is_child_thread` 的過濾**原樣保留** —— child
+  thread 依然不進 `/app/v2/sessions`(那個過濾當初是對的:390 筆 guardian
+  thread 會把操作者的 lane 整個擠出畫面)。工人視圖是另開的一條唯讀投影。
+- **CX 親子連線是啟發式,誠實標在 `meta.link`**:codex 有一張
+  `thread_spawn_edges(parent_thread_id, child_thread_id)`,但實測(2026-08-12,
+  `~/.codex/state_5.sqlite`)**是空的**,這個版本沒在寫。現況唯一可用訊號是
+  **cwd 相等**(實測 subagent thread 與 parent 共用 cwd),故 `meta.link="cwd"`。
+  哪天 provider 開始在 thread 記錄上給 `parentThreadId`,程式會自動改用它、
+  `meta.link="provider"`。同 cwd 有多個 parent 時,子會同時出現在各自名下。
+- **投影一律唯讀**:不改 SUBSESSIONS 的生命週期、不碰 codex thread。
+- 投影也套靜默期:非 running 且超過 TTL 沒動靜的不列(否則 SUBSESSIONS 的
+  永久記錄會把面板灌爆)。
+- provider 掛掉 → 該來源為空清單,**不 500**。
+- **CX 的 `thread/list` 有 3 秒程序級快取**(`WORKER_CODEX_CACHE_TTL`),而且
+  **會分頁**去找 parent —— 只撈第一頁的話,操作者的 thread 會被前面那批
+  guardian 擠掉,面板無聲回空。
+- CX 時間戳讀不出來時**只信 `is_active`**:真的在跑才列,不會拿「現在」墊
+  一個假的 `updated_ts` 讓它永遠留在面板上。
+- Hermes 只有 status **明寫 `running`** 的才豁免靜默期(SUBSESSIONS 是永久
+  記錄,壞掉的列不能永遠假裝在跑)。
+- `session` 也吃 `delegation:<id>`(底下是一條 codex thread)。
+- **OpenClaw 未接**(§2.4 表格列為「待查」):gateway 側 subagent 的形狀還沒
+  確認,先不猜。`session` 是 openclaw id 時只會拿到 hook 回報的工人(目前為空)。
+
+### 14.4 安裝 CC hook(**善彰手動貼**,腳本不會自己改你的設定)
+
+CC 這一家是善彰真正要看的東西(「看見 Claude 自己派了幾隻手」),需要在
+`~/.claude/settings.json` 的 `hooks` 加兩段。**這是加法** —— 你現有的
+`Stop` / `UserPromptSubmit` 兩段原樣保留,只是多兩個 key:
+
+```jsonc
+{
+  "hooks": {
+    "PreToolUse": [{
+      "matcher": "Agent|Task",
+      "hooks": [{"type": "command", "timeout": 5,
+                 "command": "/Users/xcash/apps/hermes-openwebui-bridge/scripts/worker-report-hook.py"}]
+    }],
+    "PostToolUse": [{
+      "matcher": "Agent|Task",
+      "hooks": [{"type": "command", "timeout": 5,
+                 "command": "/Users/xcash/apps/hermes-openwebui-bridge/scripts/worker-report-hook.py"}]
+    }],
+    "PostToolUseFailure": [{
+      "matcher": "Agent|Task",
+      "hooks": [{"type": "command", "timeout": 5,
+                 "command": "/Users/xcash/apps/hermes-openwebui-bridge/scripts/worker-report-hook.py"}]
+    }]
+  }
+}
+```
+
+**token(擇一,建議走檔案)**:
+```sh
+# 建議:不依賴 env 繼承、也不必把 token 寫進 settings.json
+install -m 600 /dev/null ~/.pocket/worker-hook.token
+printf '%s' "$BRIDGE_TOKEN" > ~/.pocket/worker-hook.token
+```
+腳本讀 token 的順序:`POCKET_WORKER_TOKEN` → `BRIDGE_TOKEN` →
+`~/.pocket/worker-hook.token`。(**不收 `~/.config/studio/token`** —— repo
+CLAUDE.md 明寫那條已過時。)
+其他 env:`POCKET_BRIDGE_URL`(預設 `http://127.0.0.1:8081`)、
+`WORKER_HOOK_TIMEOUT`(預設 1.5 秒)、`POCKET_WORKER_SESSION`
+(硬指定 session id,平常不用)。
+
+**開旗標**:bridge 的 LaunchAgent plist `EnvironmentVariables` 加 `WORKERS=1`
+(不開的話端點 404,hook 會安靜地什麼都不做 —— 這是預期狀態,不會噴錯)。
+
+**為什麼 matcher 是 `Agent|Task`**:claude 2.1.207 的工具實測叫 **`Agent`**
+(近三天真實 transcript 82 筆 `"name":"Agent"`、`Task` 0 筆);舊版叫 `Task`。
+兩個都收,升降版都不會靜默失效。
+
+**這支腳本絕不會擋住你的工具呼叫**:1.5 秒逾時、任何例外一律吞掉、
+**永遠 exit 0**(exit 2 會讓 Claude Code 擋掉工具呼叫)、stdout 一個字都不印
+(PreToolUse 的 stdout 會被當成控制 JSON 解析)。bridge 沒開、沒裝、連不上 —— 
+最壞情況就是 Pocket 上看不到工人,你的 agent 照跑。

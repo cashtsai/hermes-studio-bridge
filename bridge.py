@@ -54,6 +54,7 @@ import media_artifacts
 import hermes_media
 import openclaw_provider
 import tg_outbound
+import workers as workers_store
 from fastapi import (FastAPI, Request, HTTPException, WebSocket, WebSocketDisconnect,
                      File, Form, UploadFile)
 from fastapi.responses import (JSONResponse, StreamingResponse, FileResponse,
@@ -21409,6 +21410,326 @@ def _discovery_registry_view(row: dict) -> dict:
     children = REGISTRY.children_ids(
         [r for r in all_rows if r.get("state") != "archived"])
     return _registry_public_row(row, children, by_id, now)
+
+
+# ───────────────────── Worker 可見層(設計書 §2.4)────────────────────────
+# 「我看不出來你有在運作,你有子程序在執行嗎?」——善彰 2026-08-12。
+# registry(§2.3 子程序面板)看的是**獨立 session**;這一層看的是 session
+# **內部**派出的短命工人。兩者並存、不互相污染:
+#   子程序 = 獨立 session(有 TTL、進家譜、可收編)
+#   工人   = session 內部的活(秒/分級、記憶體、靜默期自動過期)
+# 旗標預設關 —— 關著時端點 404、且這一層**完全沒有背景成本**(沒有計時器、
+# 沒有背景任務,過期是讀寫時惰性算的)。
+WORKERS_ENABLED = os.environ.get("WORKERS", "0").strip().lower() in (
+    "1", "true", "yes", "on")
+
+
+def _worker_ttl_from_env() -> float:
+    """TTL 解析**絕不能讓 bridge 開不起來**。
+
+    這是 import 期執行的:一個手殘打成 `WORKER_TTL_SECS=5m` 的 env,如果直接
+    `float()` 就會在 production 啟動時炸掉整個 bridge —— 而且是在旗標根本沒開
+    的情況下炸,完全違背「沒開旗標 = 零風險」。所以壞值一律退回預設。
+    `nan` 要特別擋:`now - nan` 恆為 nan,所有比較都是 False,結果是**永遠不過期**
+    (面板掛滿假的執行中工人),比炸掉還難查。
+    """
+    raw = os.environ.get("WORKER_TTL_SECS", "").strip()
+    if not raw:
+        return 300.0
+    try:
+        val = float(raw)
+    except (TypeError, ValueError):
+        return 300.0
+    if val != val or val <= 0 or val == float("inf"):   # nan / 非正 / inf
+        return 300.0
+    return min(val, 86400.0)
+
+
+WORKER_TTL_SECS = _worker_ttl_from_env()
+WORKERS = workers_store.WorkerStore(ttl_secs=WORKER_TTL_SECS)
+
+
+def _workers_require_enabled() -> None:
+    """旗標關 = 端點根本不存在(404),不是 403。合併進 main 的風險為零:
+    沒開旗標的 bridge 行為與合併前逐位元相同。"""
+    if not WORKERS_ENABLED:
+        raise HTTPException(status_code=404, detail="Not Found")
+
+
+def _worker_resolve_session(body: dict) -> str:
+    """把回報方給的身分解析成 v2 session id(`claude_code:<name>` 等)。
+
+    CC hook 的難處:hook 腳本只拿得到 Claude Code 自己的 `session_id`(uuid),
+    它**不知道**自己屬於哪個 ccsess session 名。但 bridge 早就知道 —— 現有的
+    `/ccsessions/_hook`(UserPromptSubmit/Stop)一直在把 name↔sid 對應釘進
+    `_CC_SID_PINS`/`_CC_SID_CACHE`/`_CC_SID_HISTORY`。這裡直接沿用同一套
+    `_cc_name_for_sid` 反查,不必叫 hook 腳本去猜 tmux 名字(猜錯就掛錯 session)。
+
+    優先序:明給的 `session` > `cc_session_id` 反查。都沒有 → 400。
+    """
+    explicit = str(body.get("session") or "").strip()
+    if explicit:
+        return explicit
+    cc_sid = str(body.get("cc_session_id") or "").strip()
+    if cc_sid:
+        name = _cc_name_for_sid(cc_sid)
+        if name:
+            return f"claude_code:{name}"
+        # 反查不到(pin 還沒建、或這個 CC 不在 ccsess 名單裡)。不要丟掉這筆
+        # 回報 —— 用 sid 自己開一格,至少 /app/v2/workers?session=cc-sid:<uuid>
+        # 拿得到,診斷時看得出「有工人但認不出是誰的」。
+        return f"cc-sid:{cc_sid}"
+    raise HTTPException(status_code=400, detail="session or cc_session_id required")
+
+
+def _codex_child_worker_rows(threads: list[dict], parent: dict,
+                             now: float) -> list[dict]:
+    """把 codex 的 child thread 投影成 parent 的工人。
+
+    **不進主清單** —— `_codex_v2_visible_threads` 的過濾維持原樣(那個過濾當初
+    是對的:390 筆 guardian thread 會把操作者的 session 整個擠掉)。這裡是另開
+    一條唯讀投影,只在被問到某個 parent 的工人時才算。
+
+    親子連線的實測結論(2026-08-12 查 `~/.codex/state_5.sqlite`):
+    - codex 有一張 `thread_spawn_edges(parent_thread_id, child_thread_id)`,
+      **但這台機器上是空的**(0 列)—— 這個版本沒在寫。有朝一日它開始寫,
+      thread 記錄上出現 `parentThreadId` 之類的欄位,下面的 explicit 分支會
+      自動優先採用。
+    - 現況唯一可用的訊號是 **cwd**:實測 subagent thread 與其 parent 共用 cwd
+      (guardian 228 筆在 /Users/xcash、38 筆在 hermes-agent/home,都與該目錄
+      下的操作者 thread 對得上)。所以用 cwd 相等當連線,並在 meta 標
+      `link:"cwd"` 誠實告訴 app 這是啟發式、不是 provider 給的事實。
+    """
+    parent_id = str(parent.get("id") or "")
+    parent_cwd = os.path.realpath(str(parent.get("cwd") or "")) if parent.get("cwd") else ""
+    out = []
+    for t in threads:
+        tid = str(t.get("id") or "")
+        if not tid or tid == parent_id or not _codex_is_child_thread(t):
+            continue
+        explicit = str(t.get("parentThreadId") or t.get("parent_thread_id") or "")
+        if explicit:
+            if explicit != parent_id:
+                continue
+            link = "provider"
+        else:
+            if not parent_cwd:
+                continue
+            child_cwd = os.path.realpath(str(t.get("cwd") or "")) if t.get("cwd") else ""
+            if child_cwd != parent_cwd:
+                continue
+            link = "cwd"
+        # provider 沒有 done/failed 的分別,只有「還在跑 / 不在跑了」。
+        running = bool(CODEX_APP.is_active(tid))
+        updated = _codex_ts(t.get("updatedAt"))
+        started = _codex_ts(t.get("createdAt")) or updated
+        if not updated:
+            # 時間戳讀不出來(provider 換格式、給了 dict…)。**絕不能墊 now** ——
+            # 那等於宣告「它剛剛才動過」,靜默期就永遠濾不掉它,同 cwd 的幾百筆
+            # guardian thread 會整批變成假的工人灌進面板。認不出時間就只信
+            # is_active:真的在跑才留,否則當它不存在。
+            if not running:
+                continue
+            updated = started = now
+        name = (t.get("name") or t.get("preview") or "").strip()
+        out.append({
+            "worker_id": f"codex:{tid}",
+            "label": (name or tid[:12])[:200],
+            "state": "running" if running else "done",
+            "parent_worker": None,
+            "started_ts": started,
+            "updated_ts": updated,
+            "meta": {"provider": "codex", "kind": "child_thread",
+                     "thread_id": tid, "link": link,
+                     "source": _codex_source_label(t.get("source"))},
+        })
+    return out
+
+
+def _codex_ts(raw) -> float:
+    """codex 的時間戳可能是秒、毫秒、或 ISO 字串。**認不出來回 0**,由呼叫端
+    決定怎麼辦(絕不自作主張墊 now —— 見 `_codex_child_worker_rows`)。
+
+    數字部分沿用 `host_discovery._epoch_secs` 的同一條規則(>1e11 視為毫秒),
+    不另立第二套判準。
+    """
+    secs = host_discovery._epoch_secs(raw)
+    if secs is not None:
+        return secs
+    text = str(raw or "").strip()
+    if not text:
+        return 0.0
+    try:
+        from datetime import datetime, timezone
+        dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            # 沒有時區的 ISO 一律當 UTC。用本地時區解讀會讓 UTC+8 的機器把
+            # 「一秒前」讀成「八小時前」,正在跑的工人直接被靜默期濾掉。
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.timestamp()
+    except Exception:      # noqa: BLE001
+        return 0.0
+
+
+# thread/list(includeChildren)每次都撈 100 列,而工人面板是**被 app 持續 poll**
+# 的端點。同一份清單服務所有 parent,所以快取整份、不分 parent —— 比照隔壁
+# `_REGISTRY_BUSY_CACHE`(3s,理由是「避免 poll 造成 pane capture 風暴」)與
+# `_CODEX_V2_VISIBLE_CACHE`。工人視圖本來就容忍幾秒陳舊(cwd 連線是啟發式)。
+_CODEX_WORKER_THREADS_CACHE: tuple[float, list[dict]] | None = None
+_CODEX_WORKER_CACHE_TTL = float(os.environ.get("WORKER_CODEX_CACHE_TTL", "3.0"))
+
+
+async def _codex_worker_threads() -> list[dict]:
+    """撈含 child 的 thread 清單(帶短快取)。
+
+    **必須分頁**:`_codex_v2_visible_threads` 的註解已經寫過這個坑 —— codex 會把
+    一大批 guardian/subagent thread 排在 `thread/list` 的最前面(這台機器實測 390
+    筆)。只撈第一頁的話,操作者自己那條 parent thread 會被擠到第二頁,
+    `parent is None` → 面板回空清單,而且無聲無息。
+    """
+    global _CODEX_WORKER_THREADS_CACHE
+    cached = _CODEX_WORKER_THREADS_CACHE
+    mono = time.monotonic()
+    if cached is not None and mono - cached[0] < _CODEX_WORKER_CACHE_TTL:
+        return cached[1]
+    params = {
+        "limit": 100, "archived": False,
+        "sourceKinds": ["cli", "vscode", "exec", "appServer"],
+        "sortKey": "updated_at", "sortDirection": "desc",
+        "useStateDbOnly": False, "includeChildren": True,
+    }
+    rows: list[dict] = []
+    cursor = None
+    for _ in range(_CODEX_LIST_MAX_PAGES):
+        if cursor:
+            params["cursor"] = cursor
+        else:
+            params.pop("cursor", None)
+        # 不外掛 asyncio.wait_for:CODEX_APP.call 自己有 timeout,而外層取消會在
+        # 它持著 stdio 鎖、寫到一半時把 coroutine 砍掉,留半截 JSON-RPC frame 在
+        # 共用管線上,毒到的是**每一條** codex session,不只這一個請求。
+        res = await CODEX_APP.call("thread/list", params, timeout=8.0)
+        batch = list((res or {}).get("data", []))
+        rows.extend(batch)
+        cursor = (res or {}).get("nextCursor")
+        if not cursor or not batch:
+            break
+    _CODEX_WORKER_THREADS_CACHE = (mono, rows)
+    return rows
+
+
+async def _codex_workers_for(thread_id: str, now: float) -> list[dict]:
+    if not thread_id:
+        return []
+    try:
+        threads = await _codex_worker_threads()
+    except Exception as e:      # noqa: BLE001 —— codex 掛掉不該讓工人面板整個 500
+        _log_event("workers_codex_list_failed", error=type(e).__name__,
+                   error_message=str(e)[:200])
+        return []
+    parent = next((t for t in threads if str(t.get("id") or "") == thread_id), None)
+    if parent is None:
+        return []
+    rows = _codex_child_worker_rows(threads, parent, now)
+    # 只留靜默期內的 —— 這是「現在在跑什麼」的視圖,不是 thread 歷史。
+    return [r for r in rows
+            if r["state"] == "running" or r["updated_ts"] >= now - WORKER_TTL_SECS]
+
+
+def _hermes_workers_for(mid: str, now: float) -> list[dict]:
+    """把既有 SUBSESSIONS 投影成人格的工人 —— **純唯讀**,不碰 SUBSESSIONS 自己
+    的生命週期(它照舊 persist 到 canonical.db、照舊由既有邏輯收)。
+
+    SUBSESSIONS 是永久記錄(重啟會從 canonical.db 讀回來),整份投影會把面板
+    灌爆,所以同樣套靜默期:只留還在跑的、或最近有動靜的。"""
+    out = []
+    for sid, sub in list(SUBSESSIONS.items()):
+        if str(sub.get("parent") or "") != mid:
+            continue
+        raw_status = str(sub.get("status") or "")
+        state = workers_store.normalize_state(raw_status)
+        try:
+            updated = float(sub.get("lastAt") or 0)
+        except (TypeError, ValueError):
+            updated = 0.0
+        # 只有**明寫 running** 的才豁免靜默期。`normalize_state` 對認不得的狀態
+        # 一律回 running(對 hook 回報是對的,ring 會過期收掉),但 SUBSESSIONS
+        # 是**永久記錄**、重啟還會從 canonical.db 讀回來 —— 一筆 status 是 NULL
+        # 的陳年 sub 若因此被當成 running,就會永遠掛在面板上,沒有東西收得掉它。
+        # 同理 lastAt 缺席時是 0(遠古),不墊 now,否則它每次 poll 都像剛動過。
+        if raw_status != "running" and updated < now - WORKER_TTL_SECS:
+            continue
+        out.append({
+            "worker_id": f"sub:{sid}",
+            "label": str(sub.get("name") or sid)[:200],
+            "state": state,
+            "parent_worker": None,
+            "started_ts": updated,
+            "updated_ts": updated,
+            "meta": {"provider": "hermes", "kind": "subsession",
+                     "sid": sid, "tool": str(sub.get("tool") or "")},
+        })
+    return out
+
+
+async def _workers_projected(session: str, now: float) -> list[dict]:
+    """provider 側現成記錄的唯讀投影(CC 沒有 —— CC 走 hook 主動回報)。"""
+    if session.startswith("codex:") or session.startswith("delegation:"):
+        # `delegation:<id>` 也是 app 拿得到的正牌 v2 session id,底下同樣是一條
+        # codex thread。沿用既有解析器,不自己切前綴 —— 不然 delegation 這一路
+        # 會安靜地永遠回空清單。
+        try:
+            thread_id = _codex_thread_from_v2_session_id(session)
+        except HTTPException:
+            return []       # 不是 codex 的 delegation / 還沒有 thread → 沒有工人
+        return await _codex_workers_for(thread_id, now)
+    if session.startswith("hermes:"):
+        return _hermes_workers_for(session.split(":", 1)[1], now)
+    return []
+
+
+@app.post("/app/v2/workers/report")
+async def v2_workers_report(request: Request):
+    """工人回報(upsert)。body:{session | cc_session_id, worker_id, label,
+    state: running|done|failed, parent_worker?, meta?}。
+
+    這條路要**又快又不挑嘴** —— 呼叫端是 CC 的 PreToolUse/PostToolUse hook,
+    卡住它就是卡住善彰的工具呼叫。所以:不寫 DB、不做 I/O、認不得的 state 收斂
+    成 running 而不是 400。"""
+    _workers_require_enabled()
+    _check_auth(request)
+    body = await _json_body(request)
+    worker_id = str(body.get("worker_id") or "").strip()
+    if not worker_id:
+        raise HTTPException(status_code=400, detail="worker_id required")
+    session = _worker_resolve_session(body)
+    worker = WORKERS.report(session, worker_id,
+                            label=body.get("label") or "",
+                            state=body.get("state"),
+                            parent_worker=body.get("parent_worker"),
+                            meta=body.get("meta"))
+    return {"ok": True, "session": session, "worker": worker}
+
+
+@app.get("/app/v2/workers")
+async def v2_workers_list(request: Request, session: str = ""):
+    """某 session 現在有哪些工人在跑。
+
+    形狀:{session, workers:[{worker_id, label, state, parent_worker,
+    started_ts, updated_ts, meta}], counts:{running, done, failed}}
+    工人依開工時間由舊到新。清單是「回報的」+「provider 投影的」合併結果。"""
+    _workers_require_enabled()
+    _check_auth(request)
+    session = str(session or "").strip()
+    if not session:
+        raise HTTPException(status_code=400, detail="session required")
+    now = time.time()
+    reported = WORKERS.list(session, now)
+    projected = await _workers_projected(session, now)
+    merged = workers_store.merge(reported, projected)
+    return {"session": session, "workers": merged,
+            "counts": workers_store.counts_of(merged),
+            "ttl_secs": WORKER_TTL_SECS}
 
 
 @app.get("/app/v2/discovery")
