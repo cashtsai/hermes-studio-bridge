@@ -29,16 +29,40 @@ import openclaw_provider as ocp  # noqa: E402
 import bridge  # noqa: E402
 from fastapi import HTTPException  # noqa: E402
 
+# 上面那些 os.environ 只在「本檔是第一個 import 這些模組的人」時算數:
+# `_CONFIG_FILE` / `BRIDGE_TOKEN` 都是模組層常數,import 當下就定死了。全套
+# `unittest discover` 一起跑時 bridge / openclaw_provider 早被別的測試檔
+# import 過,於是本檔設的 env 變成 no-op —— 測試讀到的是真實機器上的
+# `~/.pocket/openclaw.json`(這台有配置 → source 是 "file" 不是 "none"),
+# 而且 `save_config()` 會把真的設定檔覆蓋掉。
+#
+# 正式行為不動,只在測試側把模組常數綁回本檔的 tmp:順序無關,也不再碰
+# 使用者家目錄。
+ocp._CONFIG_FILE = os.environ["OPENCLAW_CONFIG_FILE"]
+
 
 class _FakeReq:
     def __init__(self, token=None):
-        # 註:discover 跑全套時 bridge 可能已被別的測試模組先匯入,
-        # `bridge.BRIDGE_TOKEN` 未必等於這裡的 env → 本模組多支測試會誤紅
-        # (baseline 就是紅的)。改讀 bridge.BRIDGE_TOKEN 可以修掉,但那會連帶
-        # 改變全域 `_AUTH_FAILS` 累積量,讓 test_robustness_pack 的
-        # test_4xx_flood_is_throttled 由 429×20 變成 401→429 兩種碼而翻紅。
-        # 兩者都是既有的測試間污染,不在本 PR 範圍,維持原狀。
-        tok = token if token is not None else os.environ["BRIDGE_TOKEN"]
+        # 讀 `bridge.BRIDGE_TOKEN` 而不是 `os.environ["BRIDGE_TOKEN"]`:
+        # 兩者只有在「本檔是第一個 import bridge 的人」時才相等 —— bridge 的
+        # `BRIDGE_TOKEN` 是模組層常數(import 當下由 env 定死),而本檔開頭是
+        # `setdefault`,別人先 import 過就變 no-op,於是 env 與 bridge 實際在
+        # 比對的值發散,本模組多支測試會誤紅。
+        #
+        # 這裡曾有一段註解說「不能改讀 bridge.BRIDGE_TOKEN,否則會改變全域
+        # `_AUTH_FAILS` 的累積量,讓 test_robustness_pack 的
+        # test_4xx_flood_is_throttled 翻紅」。那個顧慮在 per-client 分桶
+        # (`fix/auth-throttle-per-client`:全域 `_AUTH_FAILS` deque →
+        # `_AUTH_FAILS_BY_CLIENT` + `_auth_fail_bump_locked`)之後已經不成立:
+        # 節流桶以 client host 為 key,本檔的 `_FakeReq` 是 "127.0.0.1"、
+        # test_robustness_pack 用的 TestClient 是 "testclient",兩者落在不同
+        # 桶裡,本檔的認證失敗次數再也影響不到那支測試。已實測確認
+        # (兩檔同行程跑,test_4xx_flood_is_throttled 綠)。
+        #
+        # 這也是 main 現行的統一寫法:test_codex_server_requests.py、
+        # test_cx_thread_lock.py、test_dashboard_v1.py 等都已改讀
+        # bridge.BRIDGE_TOKEN,理由與此處相同。
+        tok = token if token is not None else bridge.BRIDGE_TOKEN
         self.headers = {"authorization": f"Bearer {tok}"}
         self.client = type("C", (), {"host": "127.0.0.1"})()
         self._body = b"{}"
@@ -303,11 +327,23 @@ class DigestTests(unittest.TestCase):
 # ───────────────────────── 2. openclaw_provider 純函式 ──────────────────────
 
 class ProviderHelperTests(unittest.TestCase):
+    def setUp(self):
+        # 進來先把「未配置」這個前提自己建立好,不靠別人的 tearDown:
+        # 同檔的 `BridgeWiringTests.test_config_endpoints_roundtrip` 會透過
+        # PUT /openclaw/config 落一份設定檔,而 unittest 是照類別名排序跑的
+        # (BridgeWiring… 在 ProviderHelper… 前面),於是 `test_unconfigured`
+        # 會讀到別人留下的檔案 → source "file" 而不是 "none"。
+        self._reset_openclaw_config()
+
     def tearDown(self):
+        self._reset_openclaw_config()
+
+    @staticmethod
+    def _reset_openclaw_config():
         os.environ.pop("OPENCLAW_BASE_URL", None)
         os.environ.pop("OPENCLAW_TOKEN", None)
         try:
-            os.unlink(os.environ["OPENCLAW_CONFIG_FILE"])
+            os.unlink(ocp._CONFIG_FILE)
         except FileNotFoundError:
             pass
 
@@ -319,7 +355,8 @@ class ProviderHelperTests(unittest.TestCase):
 
     def test_config_priority_env_over_file(self):
         # 注意:openclaw_provider 讀模組常數 _CONFIG_FILE(import 時已定),
-        # 測試檔開頭已把 OPENCLAW_CONFIG_FILE 指到 tmp。
+        # 本檔在 import 後已把它綁回 tmp(見檔頭),所以這裡寫檔不會碰到
+        # 真的 ~/.pocket/openclaw.json。
         ocp.save_config("ws://file-host:1", "file-token")
         self.assertEqual(ocp.load_config()["source"], "file")
         os.environ["OPENCLAW_BASE_URL"] = "ws://env-host:2"

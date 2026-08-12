@@ -33,6 +33,21 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey 
 from cryptography.hazmat.primitives.serialization import (  # noqa: E402
     Encoding, PublicFormat)
 
+# 上面那幾行 os.environ 只在「本檔是第一個 import bridge 的人」時算數:
+# `_POCKET_ID_STATE_PATH` 是模組層常數,bridge import 當下就定死了。全套
+# `unittest discover` 一起跑時 bridge 早被別的測試檔 import 過 → 本檔設的
+# env 變成 no-op,於是 enrollment 被寫進**真的**
+# `~/.pocket/pocket-id-enrollment.json`,而 test_state_file_is_0600 去 stat
+# env 指的 tmp 路徑就 FileNotFoundError(單檔跑卻是綠的)。
+#
+# 正式行為不動,只在測試側把模組常數綁回本檔的 tmp:順序無關,也不再碰
+# 使用者家目錄。(PAIR_BOOT_CODE_FILE 由 test_pair_qr_boot_code.py 自己綁,
+# 本檔用不到,不搶。)
+bridge._POCKET_ID_STATE_PATH = os.environ["POCKET_ID_STATE_FILE"]
+with bridge._POCKET_ID_LOCK:
+    bridge._POCKET_ID_CACHE["loaded"] = False
+    bridge._POCKET_ID_CACHE["state"] = {}
+
 
 def _make_keypair():
     priv = Ed25519PrivateKey.generate()
@@ -167,7 +182,8 @@ class TestVoucherClaim(_Base):
         self.assertEqual(ctx.exception.status_code, 404)
 
     def test_state_file_is_0600(self):
-        mode = stat.S_IMODE(os.stat(os.environ["POCKET_ID_STATE_FILE"]).st_mode)
+        # 讀 bridge 真正在用的那條路徑(env 在全套跑時可能已經不算數)。
+        mode = stat.S_IMODE(os.stat(bridge._POCKET_ID_STATE_PATH).st_mode)
         self.assertEqual(mode, 0o600)
 
 
