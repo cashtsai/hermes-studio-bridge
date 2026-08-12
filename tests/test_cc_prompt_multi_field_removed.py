@@ -5,9 +5,11 @@
 陷阱(2026-08-11 實際有 lane 反映混淆)。移除後用這個測試釘住,免得有人「順手
 補回來」。
 
-`q_total` 是唯一的多題來源,而且它在**真正會執行**的 pane 路徑上也有;
-`multi` 只出現在 jsonl 路徑,而該路徑實測從不命中(CC 是答完才 flush
-tool_use,掃全部 transcript:288 次 AskUserQuestion、0 筆懸空)。
+`q_total` 是唯一的多題來源。注意:**pane 路徑的 q_total 是「從 PR #89 起」
+才有的** —— #89 之前只有這條 jsonl 路徑會產出 q_total,所以本 PR 必須排在
+#89 **之後**合併。`multi` 只出現在 jsonl 路徑,而該路徑實測從不命中
+(CC 是答完才 flush tool_use,掃全部 transcript:288 次 AskUserQuestion、
+0 筆懸空)。
 """
 import unittest
 

@@ -9169,9 +9169,12 @@ def _cc_pending_ask(jsonl, current=None):
                     continue
                 # 不再送 `multi`(= 原 ask 有多題)。它與 `multiselect`(= 這一題
                 # 可複選)只差兩個字、語意完全不同,是現成的誤讀陷阱;而它承載的
-                # 資訊 `q_total > 1` 已經表達得更清楚,且 q_total 在**真正會執行**
-                # 的 pane 路徑上也有(本 jsonl 路徑實測從不命中:掃全部 transcript,
-                # 288 次 AskUserQuestion、0 筆懸空 tool_use,CC 是答完才 flush)。
+                # 資訊 `q_total > 1` 已經表達得更清楚。
+                # **q_total 在 pane 路徑上是「從 PR #89 起」才有的** —— #89 之前
+                # 整個 repo 只有這條 jsonl 路徑會產出 q_total,所以本 PR 必須排在
+                # #89 **之後**合併,否則 pane 路徑會變成沒有任何多題訊號。
+                # 這條 jsonl 路徑本身實測從不命中(掃全部 transcript:288 次
+                # AskUserQuestion、0 筆懸空 tool_use,CC 是答完才 flush),
                 # app 端宣告了 `multi` 但沒有任何渲染端消費 → 兩端皆死,直接拿掉。
                 return {"kind": "menu", "semantic": "question",
                         "title": str(q0.get("question") or "").strip(),
