@@ -33,13 +33,37 @@ def _epoch(ts) -> float:
     return time.time()
 
 
+TS_DEFAULT_KEY = "ts_default"
+"""內部旗標:標記這張卡的 ts 是「呼叫端明確給的權威時間」還是「make_card 補的
+now」。`upsert_card` 只信任明確給的時間,補的 now 一律不覆寫既有卡的時間 ——
+原本兩者混在一起無法分辨,才需要用 min() 一律夾住,而 min() 又跟
+`_same_card` 的「ts 差 > 1s 就算變更」互相打架成 livelock(見 upsert_card)。
+旗標會在 `upsert_card` 落地前被 `_take_ts_default()` 摘掉,不會外流給 app。"""
+
+
+def _mark_ts(card: dict, explicit: bool) -> dict:
+    """標記/清除 TS_DEFAULT_KEY。呼叫端覆寫過 ts 之後要記得標成 explicit。"""
+    if explicit:
+        card.pop(TS_DEFAULT_KEY, None)
+    else:
+        card[TS_DEFAULT_KEY] = True
+    return card
+
+
+def _take_ts_default(card: dict) -> bool:
+    """摘掉旗標並回傳:True = 這張卡的 ts 只是 make_card 補的 now,不具權威性。"""
+    return bool(card.pop(TS_DEFAULT_KEY, False))
+
+
 def make_card(cid: str, turn_id: str, role: str, kind: str, body: dict,
               ts: float | None = None, rev: int = 1, final: bool = True) -> dict:
     body = dict(body or {})
     body.setdefault("fallback_text", body.get("text") or "")
-    return {"id": cid, "turn_id": turn_id, "role": role, "kind": kind,
-            "rev": rev, "final": final, "ts": ts if ts is not None else time.time(),
+    explicit_ts = ts is not None
+    card = {"id": cid, "turn_id": turn_id, "role": role, "kind": kind,
+            "rev": rev, "final": final, "ts": ts if explicit_ts else time.time(),
             "body": body}
+    return _mark_ts(card, explicit_ts)
 
 
 def _norm_visible_text(text: str) -> str:
@@ -80,8 +104,11 @@ def make_input_accepted_card(source: str, client_id: str | None, text: str,
         body["typed_text"] = typed
     if attachments:
         body["attachments"] = [dict(a) for a in attachments if isinstance(a, dict)]
-    return make_card(f"card-{source_key}-input-{digest}", turn_id, "user", "text",
+    card = make_card(f"card-{source_key}-input-{digest}", turn_id, "user", "text",
                      body, ts=stamp, final=True)
+    # stamp 在 ts=None 時其實就是 now(只為了算 digest key 才提前取),
+    # 不能因此謊報成權威時間 → 照原本的 ts 有無決定旗標。
+    return _mark_ts(card, ts is not None)
 
 
 def absorb_echo_into_accepted(store, card: dict) -> dict:
@@ -525,19 +552,65 @@ def _cx_coerce_ts(v):
     return None
 
 
-def _cx_item_ts(turn: dict, item: dict):
+def _cx_uuid7_ts(uid):
+    """UUIDv7 前 48 bit = 毫秒 epoch。codex 的 turn id 明文規定是 UUIDv7,而且
+    `id` 是 **required**(startedAt 反而是 optional+nullable)—— 所以這是比
+    startedAt 更可靠的時間來源。實測 turn id 解出的時間與 rollout 的
+    task_started.started_at 吻合到 14ms。"""
+    if not isinstance(uid, str) or len(uid) < 18 or uid[14:15] != "7":
+        return None                       # 版本位不是 7 → 不是 UUIDv7,別亂解
+    try:
+        ms = int(uid[:8] + uid[9:13], 16)
+    except ValueError:
+        return None
+    # 合理區間守門(2020..2100),避免把隨機字串解成荒謬時間
+    return ms / 1000.0 if 1.5e12 < ms < 4.1e12 else None
+
+
+def _cx_item_ts(turn: dict, item: dict, index: int = 0, total: int = 0):
     """回放歷史時撈原始時間戳,避免每張卡被 make_card 蓋成 now(歷史訊息時間全變
-    「現在」的根因)。app-server 欄位名不一,逐一試常見鍵;都沒有回 None
-    (→ 沿用 now,不比現狀差)。"""
+    「現在」的根因)。都沒有回 None(→ 沿用 now,不比現狀差)。
+
+    2026-08-11 補完(原版只涵蓋回放、且鍵名全漏):
+    - codex 的數字時間欄位一律 **`*Ms` 後綴**(startedAtMs/completedAtMs),原清單
+      剛好一個都沒有 → 即時通知裡明明有權威毫秒值卻永遠撈不到。
+    - **ThreadItem schema 完全沒有任何時間欄位**(實證),所以 per-item 時間拿不到,
+      能做到的上限是 turn 級 → 用 index/total 在 turn 的 [started, completed]
+      區間線性內插,避免整串訊息時間一模一樣(那也是使用者說「時間都錯」的觀感來源)。
+    - turn.startedAt 是 optional+nullable,常常缺席(舊 thread、桌面 Codex 建的
+      thread、compact 過的 turn)→ 缺席時用 UUIDv7 的 turn id 解時間保底。
+    """
     for src in (item, turn):
         if not isinstance(src, dict):
             continue
-        for k in ("timestamp", "ts", "createdAt", "created_at", "startedAt",
-                  "started_at", "completedAt", "completed_at", "time", "at"):
+        for k in ("timestamp", "ts", "startedAtMs", "completedAtMs",
+                  "createdAt", "created_at", "startedAt", "started_at",
+                  "completedAt", "completed_at", "time", "at"):
             got = _cx_coerce_ts(src.get(k))
             if got:
+                if src is turn:
+                    break              # turn 級 → 交給下面做內插,不直接回
                 return got
-    return None
+    if not isinstance(turn, dict):
+        return None
+    start = None
+    for k in ("startedAtMs", "startedAt", "started_at", "timestamp", "createdAt"):
+        start = _cx_coerce_ts(turn.get(k))
+        if start:
+            break
+    if not start:
+        start = _cx_uuid7_ts(turn.get("id"))
+    if not start:
+        return None
+    end = None
+    for k in ("completedAtMs", "completedAt", "completed_at"):
+        end = _cx_coerce_ts(turn.get(k))
+        if end:
+            break
+    # 同一 turn 的多則訊息在 [start, end] 內依序攤開;沒有 end 或只有一則就用 start。
+    if end and end > start and total > 1:
+        return start + (end - start) * (min(index, total - 1) / (total - 1))
+    return start
 
 
 def codex_item_to_cards(item: dict, turn_id: str = "",
@@ -549,6 +622,7 @@ def codex_item_to_cards(item: dict, turn_id: str = "",
     if ts:
         for c in cards:
             c["ts"] = ts
+            _mark_ts(c, True)          # 呼叫端給的權威時間,不是 make_card 補的 now
     return cards
 
 
@@ -578,6 +652,13 @@ def _codex_item_to_cards_raw(item: dict, turn_id: str = "",
             body = {"text": text, "fallback_text": text or "附件"}
             if attachments:
                 body["attachments"] = attachments
+            # bridge 送 turn/start 時有帶 clientUserMessageId,回放的 item 也帶得回來
+            # —— 但這裡一直沒取,於是 codex 的 echo 卡從來沒有 client_id,任何拿
+            # client_id 對位 echo 的客戶端都會永遠對不到(只能退回脆弱的文字比對)。
+            cid_echo = (item.get("clientUserMessageId")
+                        or item.get("clientMessageId") or "")
+            if cid_echo:
+                body["client_id"] = str(cid_echo)
             cards.append(make_card(cid, turn_id, "user", "text",
                                    body))
         return cards
@@ -762,11 +843,33 @@ class CodexThreadDigest(ApprovalCardMixin):
         self.last_seed_at = 0.0
 
     def _status(self):
+        # phase 的契約(app `TerminalCardStore.statusPhase`):
+        #   queued = 「訊息已收下、session **還沒**接手」
+        # **不可以**拿來表示「正在跑、而且後面還有排隊」——app 的 WorkingBar
+        # (回合進行中唯一的停止鍵)在 phase=="queued" 時是隱藏的
+        # (CodexCardSessionView / AgentCardSessionView 皆然),而且
+        # `noteServerBusy(busy && phase != "queued")` 也會把 busy 當成善意謊言
+        # 不予採信。真的在跑卻標成 queued → 使用者只要排一則後續,當前回合的
+        # 停止鍵就消失,再也停不下來。
+        #
+        # 所以:在跑就是 run,積壓量走**獨立欄位** queue_depth,人話寫進 label。
+        # 「收下了但還沒開跑」(depth>0 且 not busy)才是 queued 的原義,保留。
+        depth = int(getattr(self, "queue_depth", 0) or 0)
+        if self.busy:
+            phase = "run"
+        elif depth:
+            phase = "queued"
+        else:
+            phase = "idle"
+        label = cc_status_label(self.busy, self.prompt,
+                                self.store.last_tool, self.store.saw_output)
+        if depth and not self.busy:
+            label = "已排入佇列,等待接手…"
+        elif depth:
+            label = f"{label} · 另有 {depth} 則排隊"
         self.store.set_status({
             "busy": self.busy, "mode": None, "prompt": self.prompt,
-            "phase": "run" if self.busy else "idle",
-            "label": cc_status_label(self.busy, self.prompt,
-                                     self.store.last_tool, self.store.saw_output),
+            "phase": phase, "queue_depth": depth, "label": label,
         })
 
     @staticmethod
@@ -777,17 +880,39 @@ class CodexThreadDigest(ApprovalCardMixin):
             d = dict(c or {})
             d.pop("rev", None)
             d.pop("ts", None)
+            d.pop(TS_DEFAULT_KEY, None)
             return d
+        # ts 也要納入比較:原本無條件 pop 掉 → 內容相同但時間錯的卡在
+        # emit_unchanged=False 的 reseed 會被判定 unchanged 而跳過,
+        # **帶著正確歷史時間的卡永遠寫不進去**,時間一旦錯就再也修不回來。
+        #
+        # 但判準必須與 upsert_card 的 ts 政策**完全一致**:只有在「upsert 真的
+        # 會改動 ts」時才算變更。否則 reseed 判 changed → upsert 又把 ts 夾回
+        # 原值 → 下一輪 reseed 再判 changed…… 每 8 秒無限重播、rev 無限成長
+        # (livelock;實測 rev 1→2→3→4→5 而 ts 紋風不動)。
+        # upsert 政策 = 只接受「更早的權威時間」,故:
+        #   - 補的 now(TS_DEFAULT_KEY):upsert 不會動 ts → 不算變更
+        #   - 權威時間但比既有的晚:min() 會夾回既有值 → 不算變更
+        #   - 權威時間且比既有的早 > 1s:upsert 會採用 → 算變更
+        prev_ts, new_ts = prev.get("ts"), card.get("ts")
+        if (not card.get(TS_DEFAULT_KEY)
+                and isinstance(prev_ts, (int, float))
+                and isinstance(new_ts, (int, float))
+                and new_ts < prev_ts - 1.0):
+            return False
         return comparable(prev) == comparable(card)
 
     def seed_turns(self, turns: list, emit_unchanged: bool = True):
         """thread/turns/list 的 data（呼叫端先 reverse 成舊→新）→ 卡片庫。"""
         for turn in turns or []:
             tid = str(turn.get("id") or "")
-            for item in (turn.get("items") or []):
+            items = turn.get("items") or []
+            for idx, item in enumerate(items):
                 # 回放歷史:帶入該 turn/item 的原始時間戳,別讓 make_card 蓋成 now
                 # (「歷史訊息時間全變現在」根因)。撈不到就 None → 維持原行為。
-                ts = _cx_item_ts(turn, item)
+                # index/total 讓同 turn 的多則訊息在 [started, completed] 內攤開,
+                # 而不是整串同一個時間(codex 的 item 本身沒有時間欄位)。
+                ts = _cx_item_ts(turn, item, index=idx, total=len(items))
                 for card in codex_item_to_cards(item, turn_id=tid, ts=ts):
                     card = merge_input_accepted_echo(self.store, card)
                     card = dedupe_transcript_message(self.store, card)
@@ -867,6 +992,12 @@ class CodexThreadDigest(ApprovalCardMixin):
         elif method in ("item/started", "item/completed"):
             item = params.get("item") or {}
             phase = "started" if method == "item/started" else "completed"
+            # 即時路徑也要帶時間:通知本身就有權威毫秒值(startedAtMs/completedAtMs),
+            # 原本整個丟掉 → 全部 fallback 成 now。平時偏差小,但 finish_seed()
+            # 會把 seed 期間 queue 起來的 live 事件**延後重播**,那批卡就會蓋成
+            # 「重播當下」而不是事件發生時間。
+            live_ts = _cx_coerce_ts(params.get("startedAtMs")
+                                    or params.get("completedAtMs"))
             if item.get("type") == "agentMessage":
                 self.agent_text.pop(item.get("id"), None)
                 self.store.saw_output = True
@@ -874,7 +1005,8 @@ class CodexThreadDigest(ApprovalCardMixin):
                 label = _cx_tool_label(item)
                 if label:
                     self.store.last_tool = label if phase == "started" else ""
-            for card in codex_item_to_cards(item, self.store.turn_id, phase=phase):
+            for card in codex_item_to_cards(item, self.store.turn_id, phase=phase,
+                                            ts=live_ts):
                 card = merge_input_accepted_echo(self.store, card)
                 card = dedupe_transcript_message(self.store, card)
                 self.store.upsert_card(card)
@@ -946,11 +1078,29 @@ class SessionCardStore(ApprovalCardMixin):
         self._wakers.discard(w)
 
     def upsert_card(self, card: dict) -> dict:
+        # 旗標是 carddigest 內部用的,落地/發事件前一律摘掉,不外流給 app。
+        ts_defaulted = _take_ts_default(card)
         prev = self.cards.get(card["id"])
         if prev:
             # 重放同一事件 → rev 遞增，app 以最高 rev 原位替換。
             card = dict(card)
             card["rev"] = max(card.get("rev", 1), prev.get("rev", 1) + 1)
+            # ts 政策:同一則訊息的 started→delta→completed 會反覆 upsert,而新卡
+            # 多半沒帶 ts(=make_card 蓋成 now)。原本直接採新卡的 ts,於是每次重發
+            # 都把歷史時間拉到「現在」;卡片又是照 ts 排序的,順序也跟著錯。
+            #   1. 補的 now(TS_DEFAULT_KEY)完全沒有權威性 → 一律沿用既有時間。
+            #   2. 呼叫端明確給的權威時間才納入比較,且只能往前不能往後(min):
+            #      reseed 撈到的正確歷史時間可以把先前寫錯的 now 修回去,但
+            #      turn 級內插算出來的「較晚」時間不該把既有的正確時間往後推。
+            # 註:區分 1/2 正是加 TS_DEFAULT_KEY 的原因 —— 舊版分不出來只好一律
+            # min(),而「一律 min()」跟 _same_card 的 abs() 判準會互相打架成
+            # livelock(reseed 判 changed → min 夾回 → 再判 changed …)。
+            prev_ts, new_ts = prev.get("ts"), card.get("ts")
+            if isinstance(prev_ts, (int, float)):
+                if ts_defaulted:
+                    card["ts"] = prev_ts
+                elif isinstance(new_ts, (int, float)):
+                    card["ts"] = min(prev_ts, new_ts)
         else:
             self.order.append(card["id"])
             if len(self.order) > self.cards_max:

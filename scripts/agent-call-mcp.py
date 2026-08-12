@@ -9,6 +9,20 @@
   agent_call(target, message, mode?, timeout_secs?)  # 調用另一個 agent
   agent_list()                                       # 政策放行的可調用對象
   agent_result(call_id)                              # background 模式收割
+  agent_context(target, mode?, limit?)               # 讀另一個 session 的上下文
+  agent_context_search(query, target?, limit?)       # 在可讀範圍內找關鍵字
+  agent_context_list()                               # 讀得到誰、能讀到什麼程度
+
+── 上下文互讀怎麼用(接手/協作的正確順序)────────────────────────────────
+  1. `agent_context_list()` 看自己讀得到哪些 session、各自允許哪些 mode。
+  2. 先 `agent_context(target)`(預設 mode=summary):蒸餾過的交接簡報,
+     有快取,對方沒新動靜時重讀不花錢也不吵到對方。
+  3. 摘要不夠再 `agent_context(target, mode="recent", limit=40)` 拿原文卡片,
+     或 `agent_context_search(query="檔名或關鍵字")` 定位。
+  **每次讀取都會在對方的卡片流留下一張「👁 已被讀取」的卡**,使用者看得到;
+  原文模式(recent/search)預設權限比 summary 嚴,拿到 403 是正常的,
+  請退回 summary,不要反覆重試(有速率上限)。
+  前提 = bridge 端 `AGENT_CONTEXT=1`(與 AGENT_CALL 各自獨立的旗標)。
 
 環境變數:
   BRIDGE_URL        bridge 位址(預設 http://127.0.0.1:8081)
@@ -86,6 +100,34 @@ TOOLS = [
      "description": "以 call_id 收割 background / 逾時轉背景的調用結果。",
      "inputSchema": {"type": "object", "properties": {
          "call_id": {"type": "string"}}, "required": ["call_id"]}},
+    {"name": "agent_context",
+     "description": ("讀另一個 agent session 的上下文,用來接手或協作前先補齊"
+                     "資訊落差(不會打擾對方、不佔對方回合)。"
+                     "mode=summary(預設)= 蒸餾過的交接簡報(在做什麼/目前狀態/"
+                     "關鍵決策與檔案/未解問題),有快取;mode=recent = 最近 N 張"
+                     "卡的原文。原文權限比摘要嚴,403 就退回 summary。"
+                     "秘密會被 bridge 遮罩;每次讀取都會在對方卡片流留痕。"),
+     "inputSchema": {"type": "object", "properties": {
+         "target": {"type": "string",
+                    "description": "要讀的 session id(如 claude_code:tirith)"},
+         "mode": {"type": "string", "enum": ["summary", "recent"],
+                  "description": "預設 summary"},
+         "limit": {"type": "number",
+                   "description": "recent 模式回幾張卡(預設 20,上限 100)"}},
+         "required": ["target"]}},
+    {"name": "agent_context_search",
+     "description": ("在自己讀得到的 session 範圍內做關鍵字/子字串搜尋,回命中"
+                     "片段 + 是哪個 session + 時間。省略 target 就掃全部可讀"
+                     "範圍(只掃記憶體裡熱的 session)。"),
+     "inputSchema": {"type": "object", "properties": {
+         "query": {"type": "string", "description": "關鍵字/子字串"},
+         "target": {"type": "string",
+                    "description": "選填:只搜某一個 session"},
+         "limit": {"type": "number", "description": "命中數上限(預設 30)"}},
+         "required": ["query"]}},
+    {"name": "agent_context_list",
+     "description": "列出本 agent 讀得到的 session,以及各自允許的讀取模式。",
+     "inputSchema": {"type": "object", "properties": {}}},
 ]
 
 
@@ -129,6 +171,21 @@ def _tool_call(name: str, args: dict) -> dict:
     elif name == "agent_result":
         cid = str(args.get("call_id") or "")
         res = _http("GET", f"/app/v2/agent_call/{cid}")
+    elif name == "agent_context":
+        body = {"caller": SELF_ID, "target": str(args.get("target") or ""),
+                "mode": str(args.get("mode") or "summary")}
+        if args.get("limit") is not None:
+            body["limit"] = args["limit"]
+        res = _http("POST", "/app/v2/agent_context", body, timeout=180.0)
+    elif name == "agent_context_search":
+        body = {"caller": SELF_ID, "mode": "search",
+                "query": str(args.get("query") or ""),
+                "target": str(args.get("target") or "")}
+        if args.get("limit") is not None:
+            body["limit"] = args["limit"]
+        res = _http("POST", "/app/v2/agent_context", body, timeout=120.0)
+    elif name == "agent_context_list":
+        res = _http("GET", f"/app/v2/agent_context_targets?caller={SELF_ID}")
     else:
         return {"isError": True, "text": f"unknown tool: {name}"}
     is_err = bool(res.get("_http_error"))
