@@ -12,6 +12,17 @@
   agent_context(target, mode?, limit?)               # 讀另一個 session 的上下文
   agent_context_search(query, target?, limit?)       # 在可讀範圍內找關鍵字
   agent_context_list()                               # 讀得到誰、能讀到什麼程度
+  propose_calendar_event(title, start, tz, …)        # 提議行事曆事件(要使用者確認)
+  propose_reminder(title, tz, due?, …)               # 提議提醒事項(要使用者確認)
+
+── 行事曆/提醒:你只能「提議」,不能寫 ─────────────────────────────────────
+  `propose_*` **不會**動到使用者的行事曆,只會在他手機上出現一張確認卡;
+  他按下去才由 Pocket 用 EventKit 寫入,結果會回填成同一張卡的狀態
+  (✅ 已加入 / ✖️ 已略過)。所以:
+  - **時間你自己算好**:傳 epoch 秒 + IANA 時區名(`tz` 必填,bridge 不猜)。
+    今天幾號、使用者說「下週三下午三點」是幾號 —— 那是你的工作,不是 bridge 的。
+  - 送出後**不要**假設已經加成功;要確認就過一陣子讀自己的卡片流看狀態。
+  - 前提 = bridge 端 `CALENDAR_PROPOSALS=1`(獨立旗標),沒開就是 404。
 
 ── 上下文互讀怎麼用(接手/協作的正確順序)────────────────────────────────
   1. `agent_context_list()` 看自己讀得到哪些 session、各自允許哪些 mode。
@@ -67,6 +78,7 @@ import json
 import os
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 
 BRIDGE_URL = (os.environ.get("BRIDGE_URL") or "http://127.0.0.1:8081").rstrip("/")
@@ -128,7 +140,69 @@ TOOLS = [
     {"name": "agent_context_list",
      "description": "列出本 agent 讀得到的 session,以及各自允許的讀取模式。",
      "inputSchema": {"type": "object", "properties": {}}},
+    {"name": "propose_calendar_event",
+     "description": ("提議一個行事曆事件 —— **不會寫入**,只會在使用者手機上"
+                     "出現一張確認卡,他按下去才由 app 寫進行事曆。"
+                     "時間一律由你算好:`start`/`end` 是 epoch 秒,`tz` 是 "
+                     "IANA 時區名(如 Asia/Taipei,必填,bridge 絕不猜)。"
+                     "沒給 end 預設 +1 小時。"),
+     "inputSchema": {"type": "object", "properties": {
+         "title": {"type": "string", "description": "事件標題(≤200 字)"},
+         "start": {"type": "number", "description": "開始時間(epoch 秒)"},
+         "tz": {"type": "string",
+                "description": "IANA 時區名,如 Asia/Taipei(必填)"},
+         "end": {"type": "number", "description": "結束時間(epoch 秒);"
+                                                  "省略 = start + 1 小時"},
+         "notes": {"type": "string", "description": "備註(≤2000 字)"},
+         "location": {"type": "string", "description": "地點(≤200 字)"},
+         "all_day": {"type": "boolean", "description": "整天事件"},
+         "alarm_minutes_before": {
+             "type": "array", "items": {"type": "number"},
+             "description": "提前幾分鐘提醒(最多 5 項,如 [10])"},
+         "recurrence": {"type": "string",
+                        "enum": ["none", "daily", "weekly", "monthly"],
+                        "description": "重複規則,預設 none"},
+         "session": {"type": "string",
+                     "description": "選填:提案卡要落在哪條 session"
+                                    "(預設 = 自己)"}},
+         "required": ["title", "start", "tz"]}},
+    {"name": "propose_reminder",
+     "description": ("提議一則提醒事項(Reminders)—— 同樣**不會寫入**,"
+                     "使用者在手機上確認才生效。`due` 是 epoch 秒(可省略,"
+                     "省略即無期限提醒),`tz` 必填。"),
+     "inputSchema": {"type": "object", "properties": {
+         "title": {"type": "string", "description": "提醒標題(≤200 字)"},
+         "tz": {"type": "string",
+                "description": "IANA 時區名,如 Asia/Taipei(必填)"},
+         "due": {"type": "number", "description": "到期時間(epoch 秒)"},
+         "notes": {"type": "string", "description": "備註(≤2000 字)"},
+         "all_day": {"type": "boolean", "description": "只到日期、不含時刻"},
+         "alarm_minutes_before": {
+             "type": "array", "items": {"type": "number"},
+             "description": "提前幾分鐘提醒(最多 5 項)"},
+         "recurrence": {"type": "string",
+                        "enum": ["none", "daily", "weekly", "monthly"],
+                        "description": "重複規則,預設 none"},
+         "session": {"type": "string",
+                     "description": "選填:提案卡要落在哪條 session"
+                                    "(預設 = 自己)"}},
+         "required": ["title", "tz"]}},
 ]
+
+_PROPOSAL_FIELDS = ("title", "start", "end", "due", "notes", "location",
+                    "all_day", "alarm_minutes_before", "recurrence", "tz")
+
+
+def _proposal_body(target: str, args: dict) -> dict:
+    """只挑契約認得的欄位往上送(agent 亂加的 key 不外流),空值不送 ——
+    讓 bridge 的預設值(end=+1h、recurrence=none)生效。"""
+    body = {"target": target}
+    for key in _PROPOSAL_FIELDS:
+        val = args.get(key)
+        if val is None or val == "" or val == []:
+            continue
+        body[key] = val
+    return body
 
 
 def _http(method: str, path: str, body: dict | None = None,
@@ -186,9 +260,18 @@ def _tool_call(name: str, args: dict) -> dict:
         res = _http("POST", "/app/v2/agent_context", body, timeout=120.0)
     elif name == "agent_context_list":
         res = _http("GET", f"/app/v2/agent_context_targets?caller={SELF_ID}")
+    elif name in ("propose_calendar_event", "propose_reminder"):
+        target = "reminder" if name == "propose_reminder" else "calendar"
+        sid = str(args.get("session") or "").strip() or SELF_ID
+        res = _http("POST",
+                    "/app/v2/sessions/"
+                    f"{urllib.parse.quote(sid, safe=':')}/proposals/calendar",
+                    _proposal_body(target, args), timeout=60.0)
     else:
         return {"isError": True, "text": f"unknown tool: {name}"}
-    is_err = bool(res.get("_http_error"))
+    # `_http_error` 只要出現就是失敗 —— 連不上 bridge 時它是 0(falsy),
+    # 舊寫法 bool() 會把「連不上」報成成功,agent 就會以為事情辦好了。
+    is_err = "_http_error" in res
     return {"isError": is_err,
             "text": json.dumps(res, ensure_ascii=False, indent=1)}
 
