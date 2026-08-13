@@ -800,7 +800,7 @@ class TestFlagOff(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await bridge._harness_ingest_session("claude_code:x"), 0)
 
     def test_晨報段回空(self):
-        self.assertEqual(bridge._persona_harness_reports("yuanfang"), [])
+        self.assertEqual(bridge._persona_harness_reports(bridge._HARNESS_REPORT_PERSONA), [])
 
     async def test_旗標打開才啟動背景工作(self):
         before = set(bridge._BG_TASKS)
@@ -830,7 +830,7 @@ class TestMorningReportSection(unittest.TestCase):
     def test_有待審提案就出一則報告(self):
         self.st.propose("memory", key="pytest-路徑", payload={"fact": "要設 PYTHONPATH"},
                         rationale="踩兩次", evidence=["traj-a"], preview="+ 要設")
-        out = bridge._persona_harness_reports("yuanfang")
+        out = bridge._persona_harness_reports(bridge._HARNESS_REPORT_PERSONA)
         self.assertEqual(len(out), 1)
         r = out[0]
         self.assertEqual(r["label"], "蒸餾提案")
@@ -842,17 +842,17 @@ class TestMorningReportSection(unittest.TestCase):
 
     def test_同一天_external_id_穩定(self):
         self.st.propose("memory", key="k", payload={"fact": "x"})
-        a = bridge._persona_harness_reports("yuanfang")[0]
-        b = bridge._persona_harness_reports("yuanfang")[0]
+        a = bridge._persona_harness_reports(bridge._HARNESS_REPORT_PERSONA)[0]
+        b = bridge._persona_harness_reports(bridge._HARNESS_REPORT_PERSONA)[0]
         self.assertEqual(a["external_id"], b["external_id"])
 
     def test_沒提案也沒跑批就不打擾(self):
-        self.assertEqual(bridge._persona_harness_reports("yuanfang"), [])
+        self.assertEqual(bridge._persona_harness_reports(bridge._HARNESS_REPORT_PERSONA), [])
 
     def test_跑過批但沒提案_報告說沒有待審(self):
         rid = self.st.run_start(hours=24, model="m")
         self.st.run_finish(rid, trajectories=3, proposals=0)
-        out = bridge._persona_harness_reports("yuanfang")
+        out = bridge._persona_harness_reports(bridge._HARNESS_REPORT_PERSONA)
         self.assertIn("沒有待審提案", out[0]["content"])
         self.assertIn("看了 3 條軌跡", out[0]["content"])
 
