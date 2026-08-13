@@ -743,7 +743,7 @@ GET /app/v2/sessions/{session_id}/events?since_seq=N&profile=phone     (SSE)
   "id": "card-…",          // 穩定 id;串流中不變
   "turn_id": "…",
   "role": "user"|"assistant"|"system",
-  "kind": "text"|"markdown"|"tool_call"|"tool_result"|"diff"|"approval"|"status"|"table"|"kv"|"attachment",
+  "kind": "text"|"markdown"|"tool_call"|"tool_result"|"diff"|"approval"|"status"|"table"|"kv"|"attachment"|"calendar_event",
   "rev": 3,                 // 同 id 遞增;app 以最高 rev 為準
   "final": false,
   "ts": epoch,
@@ -751,7 +751,8 @@ GET /app/v2/sessions/{session_id}/events?since_seq=N&profile=phone     (SSE)
 }
 ```
 
-- per-kind body 重點：`tool_call {tool, summary, detail?, patch?}`、
+- per-kind body 重點：`calendar_event`(行事曆/提醒提案,見 §14)、
+  `tool_call {tool, summary, detail?, patch?}`、
   `approval {approval_id, title, options[{key,label,style}], source}`、
   `diff {path, adds, dels, hunks_text}`、`status {label, spinner:bool}`。
 - text/markdown 可帶
@@ -983,3 +984,129 @@ cx/openclaw = registry 有登記戶口(bridge 開的)→ `managed`,否則
 `sessions[]` 裡、`registered:false`(1a 既有契約)——app 的 FleetView 可以
 直接把它們渲染成「**未登記**」區塊,點一下打 `…/adopt` 收編。
 收編成功後該 id 就從未登記區移到正式戶口列。
+
+## 14. 行事曆 / 提醒「提案」(`CALENDAR_PROPOSALS`,2026-08-13)
+
+> **鐵律:agent 永遠不寫使用者的行事曆。** agent 只能發一張**提案**,
+> Pocket 把它渲染成確認卡,**使用者按下去**才由 app 自己用 EventKit 寫入,
+> 寫完回打 `/resolve` 告訴 bridge 結果。這條線的三個好處:沒有背景執行、
+> 每一次寫入都有明示的逐次同意(App Review 友善)、使用者永遠看得到
+> 「發生了什麼」。bridge 端**不含任何 EventKit/CalDAV 程式碼**,也不存
+> 使用者的行事曆內容。
+
+**旗標**:`CALENDAR_PROPOSALS=1`(預設 **OFF**)。關著時兩個端點都回
+`404 CALENDAR_PROPOSALS_DISABLED`,`GET /capabilities` 的 `features` 也不會
+出現 `calendar_proposals` —— **app 用這個 feature 探針決定要不要顯示相關 UI**,
+不要靠打端點去試。
+
+### 14.1 卡片 kind `calendar_event`(卡片 schema v1,§6)
+
+```jsonc
+{ "kind": "calendar_event",
+  "body": {
+    "proposal_id": "cal-<uuid8>",       // bridge 指派;app 確認時原樣回送
+    "target": "calendar" | "reminder",
+    "title": "與王總開會",               // ≤200 字
+    "notes": "…",                        // 選配,≤2000 字
+    "start": 1786690800.0,               // epoch 秒;reminder 可省略
+    "end": 1786694400.0,                 // 選配;calendar 未給且非整天 → start+1h
+    "all_day": false,
+    "due": 1786690800.0,                 // reminder 專用(未給則沿用 start)
+    "alarm_minutes_before": [10],        // 選配,≤5 項,每項 0–40320 分鐘
+    "recurrence": "none|daily|weekly|monthly",   // v1 只做這四種
+    "location": "…",                     // 選配,≤200 字
+    "tz": "Asia/Taipei",                 // IANA,**必填**,bridge 絕不假設裝置時區
+    "state": "proposed" | "accepted" | "declined",
+    "calendar_event_id": "<EKEvent id>", // resolve accepted 後才出現
+    "error": "…",                        // resolve 帶了 error 才出現
+    "fallback_text": "📅 建議行程:與王總開會 8/14 15:00–16:00"   // **必存在**
+  } }
+```
+
+- 卡片 `id` = `card-<proposal_id>`(即 `card-cal-<uuid8>`)、`role` =
+  `assistant`、`turn_id` = `""`。
+- **fallback 原則照舊(§0/§6)**:不認得 `calendar_event` 的舊 client 一律渲染
+  `fallback_text`,所以那一行**三態都要看得懂**,由 bridge 依 `state` 改寫:
+  - `proposed`:`📅 建議行程:…` / `⏰ 建議提醒:…`
+  - `accepted`:`✅ 已加入行事曆:…` / `✅ 已加入提醒事項:…`
+  - `declined`:`✖️ 已略過:…`
+  時間一律用提案自己的 `tz` 格式化,**不吃伺服器 local time**。
+- app 若想自己排版,請用結構化欄位;`fallback_text` 是降級路徑,不是資料源。
+
+### 14.2 `POST /app/v2/sessions/{session_id}/proposals/calendar`
+
+agent(經 MCP 工具)呼叫。body = 上面的 `body` **去掉 `proposal_id` 與
+`state`**;bridge 指派 id、狀態一律從 `proposed` 起算,並把卡片 upsert 進那條
+session 的卡片流(即 §5 的 `card.upsert` 事件 + §7 的 snapshot)。
+
+回應:`{ok, proposal_id, card_id, session_id, state:"proposed", body}`。
+
+**驗證(全部 `400 CALENDAR_PROPOSAL_INVALID` + zh-TW 訊息)** —— 自然語言時間
+不是 bridge 的工作,agent 自己算好 epoch,但 bridge 會擋下這些:
+
+| 情況 | 訊息重點 |
+|---|---|
+| `tz` 缺 / 不是有效 IANA 名 | `tz 必填` / `不是有效的 IANA 時區名` |
+| `title` 空 / >200 字 | `title 必填` / `title 過長` |
+| `notes` >2000、`location` >200 | `… 過長` |
+| epoch 非數字 / NaN / ±Inf | `必須是 epoch 秒(數字)` |
+| epoch < 2000-01-01 或 > 2100-01-01(含把毫秒當秒) | `超出合理範圍(2000–2100 年);確認你送的是**秒**不是毫秒` |
+| `end <= start` | `end 必須晚於 start` |
+| 給了 `end` 卻沒 `start` | `給了 end 就必須給 start` |
+| `target=calendar` 缺 `start` | `start 必填` |
+| `target=reminder` 且 `due`/`start` 都缺 | `提醒事項至少要有 due 或 start 其中之一` |
+| `target` 不是 `calendar|reminder` | `target 必須是 calendar 或 reminder` |
+| `recurrence` 不在四種之內 | `recurrence 必須是 none/daily/weekly/monthly` |
+| `alarm_minutes_before` 非陣列 / 非數字 / 界外 / >5 項 | 各自對應訊息 |
+
+未知 `session_id` → `404 SESSION_NOT_FOUND`(與其他 v2 session 端點同語意)。
+被擋下的提案**不會留下任何卡片**。body 是**白名單**:agent 亂加的欄位(含自封的
+`proposal_id`/`state`)一律丟棄,不會外流給 app。
+
+### 14.3 `POST /app/v2/proposals/{proposal_id}/resolve`
+
+app 寫入完成(或使用者拒絕)之後回報:
+`{state: "accepted"|"declined", calendar_event_id?: "<EKEvent id>", error?}`。
+
+bridge 只更新那張卡:`state` 改寫、`rev++`、`fallback_text` 換成人話,
+於是 agent 的卡片流(以及 `agent_context` 讀到的內容)看得到結果。
+回應 `{ok, proposal_id, session_id, state, calendar_event_id, error,
+already_resolved}`。
+
+- **冪等**:同一個 id 再 resolve 一次回**第一次**的結果、`already_resolved:
+  true`,卡片不再變動(rev 不動)。app 重試網路失敗是安全的。
+- `state` 不是 `accepted`/`declined` → `400`。
+- 未知 id → **`404 CALENDAR_PROPOSAL_NOT_FOUND`**,見下。
+
+### 14.4 儲存與 **app 必須處理的 404**(重要)
+
+提案就存在卡片裡(session store),外加一顆**有界的記憶體索引**
+(`proposal_id → session`,預設 500 筆,`CALENDAR_PROPOSAL_MAX` 可調)讓
+`/resolve` 找得到卡。**不保證跨 bridge 重啟,也不保證無限期保留**:
+
+- bridge 重啟後、或索引被更新的提案擠出去之後,舊卡片**還在畫面上**
+  (卡片本身可能也隨 session store 一起消失),但 `/resolve` 會回
+  `404 CALENDAR_PROPOSAL_NOT_FOUND`。
+- **app 的正確處理**:不要靜默失敗、不要重試、更不要因此不寫行事曆 ——
+  若使用者已按下確認且 EventKit 已寫入,**行事曆是寫成功的**,只是 bridge
+  記不住了;請把卡片標成「無法回報結果」並提示使用者
+  「這筆提案已過期,請再請 agent 提一次」(bridge 的 404 訊息就是這句,
+  可原樣顯示)。
+- 同理 `404 CALENDAR_PROPOSAL_CARD_GONE` = 卡片已被 session store 的環形上限
+  擠掉,處理方式相同。
+- 因為索引是行程內記憶體,**多 bridge 行程 / 重啟中的請求**都可能 404;這是
+  設計取捨(換來零 DB schema 變更、merge 零風險),不是 bug。
+
+### 14.5 agent 端(MCP 工具)
+
+`scripts/agent-call-mcp.py` 增加兩個工具,與 `agent_call`/`agent_context`
+同一顆 stdio server(同樣是極薄包裝,權限與驗證都在 bridge 側):
+
+- `propose_calendar_event(title, start, tz, end?, notes?, location?, all_day?,
+  alarm_minutes_before?, recurrence?, session?)`
+- `propose_reminder(title, tz, due?, notes?, all_day?, alarm_minutes_before?,
+  recurrence?, session?)`
+
+兩者都 POST 到 §14.2;`session` 省略時 = `AGENT_CALL_SELF`(提案卡落在 agent
+自己的卡片流,也就是使用者看得到的那條)。bridge 連不上/旗標沒開時工具回
+錯誤文字而**不中斷 agent 的回合**。

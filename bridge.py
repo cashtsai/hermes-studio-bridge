@@ -17038,7 +17038,9 @@ async def capabilities(request: Request):
                          "hermes_media_settings",
                          "push_register", "dashboard", "openclaw_config"] +
                         (["terminal"] if POCKET_TERMINAL_ENABLED else []) +
-                        (["openclaw_provider"] if OPENCLAW.configured() else []),
+                        (["openclaw_provider"] if OPENCLAW.configured() else []) +
+                        (["calendar_proposals"]
+                         if _calendar_proposals_enabled() else []),
             "terminal": _terminal_capabilities(),
             "endpoints": ["/app/v1/sessions", "/app/v1/messages", "/reports",
                           "/app/v1/uploads",
@@ -17063,7 +17065,10 @@ async def capabilities(request: Request):
                           "/app/v2/hermes/media-settings",
                           "/app/v2/sessions/{id}/approve", "/app/v1/terminal",
                           "/app/v1/usage", "/app/v1/dashboard",
-                          "/app/v1/openclaw/config"]}
+                          "/app/v1/openclaw/config"] +
+                         (["/app/v2/sessions/{id}/proposals/calendar",
+                           "/app/v2/proposals/{proposal_id}/resolve"]
+                          if _calendar_proposals_enabled() else [])}
 
 
 @app.post("/app/v1/auth/apple")
@@ -22977,6 +22982,345 @@ async def v2_agent_context_targets(request: Request, caller: str = "",
                             agent_context_policy.rule_default_modes()),
                         "agent_call_implies": list(
                             agent_context_policy.call_implies_modes())}}
+
+
+# ═════════ 行事曆 / 提醒「提案」(agent 提議 → 裝置上使用者確認才寫入)═════════
+#
+# 設計鐵律(2026-08-13 拍板,app 端同步實作):
+#   **agent 永遠不寫使用者的行事曆**。agent 只能發一張「提案卡」
+#   (kind=calendar_event, state=proposed);iOS 把它渲染成確認卡,
+#   **使用者按下去**才由 app 自己用 EventKit 寫入,寫完回打 /resolve 告訴
+#   bridge 結果。所以:沒有背景執行、每一次寫入都有明示同意(App Review 友善)、
+#   使用者永遠看得到發生了什麼。
+#
+#   自然語言時間**不是 bridge 的工作** —— agent 自己算好 epoch + IANA tz 再送。
+#   bridge 只做防呆(荒謬時間、end<=start、缺 tz、標題過長 → 400 zh-TW)。
+#
+#   儲存 = 卡片本身(session store)+ 一顆有界的記憶體索引
+#   (proposal_id → session),/resolve 靠它找得到卡。**不保證跨重啟**:
+#   bridge 重啟後舊提案卡還在畫面上但 resolve 會 404,app 必須優雅處理
+#   (見 APP_BRIDGE_CONTRACT §14)。
+_CALENDAR_TARGETS = ("calendar", "reminder")
+_CALENDAR_RECURRENCES = ("none", "daily", "weekly", "monthly")
+_CALENDAR_STATES = ("accepted", "declined")
+# 「荒謬時間」邊界:2000-01-01Z ~ 2100-01-01Z。模型算錯 epoch 單位(毫秒當秒)
+# 或抓到 0 的時候會直接落在界外,擋在這裡比讓使用者看到 1970 年的提案好。
+_CALENDAR_EPOCH_MIN = 946684800.0        # 2000-01-01T00:00:00Z
+_CALENDAR_EPOCH_MAX = 4102444800.0       # 2100-01-01T00:00:00Z
+_CALENDAR_DEFAULT_DURATION = 3600.0      # calendar 沒給 end → +1h
+_CALENDAR_TITLE_MAX = 200
+_CALENDAR_NOTES_MAX = 2000
+_CALENDAR_LOCATION_MAX = 200
+_CALENDAR_ALARMS_MAX = 5
+_CALENDAR_ALARM_MINUTES_MAX = 40320      # 4 週,EventKit 實務上限之內
+_CALENDAR_FALLBACK_MAX = 300
+# proposal_id → {session, card_id, target, summary, state, ts, resolved_at,
+#                calendar_event_id, error}。有界:超過就丟最舊的(FIFO)。
+_CALENDAR_PROPOSALS: "collections.OrderedDict[str, dict]" = collections.OrderedDict()
+_CALENDAR_PROPOSALS_LOCK = threading.Lock()
+
+
+def _calendar_proposals_enabled() -> bool:
+    """旗標每次呼叫讀 env:預設 OFF(端點 404),merge 零風險。
+    同 AGENT_CALL / AGENT_CONTEXT 慣例。"""
+    return str(os.environ.get("CALENDAR_PROPOSALS", "")).strip().lower() in (
+        "1", "true", "yes", "on")
+
+
+def _calendar_require_enabled() -> None:
+    if not _calendar_proposals_enabled():
+        raise http_err(404, "CALENDAR_PROPOSALS_DISABLED",
+                       "行事曆提案未啟用(需 CALENDAR_PROPOSALS=1)")
+
+
+def _calendar_index_max() -> int:
+    try:
+        return max(16, int(os.environ.get("CALENDAR_PROPOSAL_MAX", "") or 500))
+    except (TypeError, ValueError):
+        return 500
+
+
+def _calendar_bad(message: str):
+    return http_err(400, "CALENDAR_PROPOSAL_INVALID", message)
+
+
+def _calendar_epoch(value, field: str, required: bool):
+    """epoch 秒防呆:非數字/NaN/Inf/界外一律 400。None 且非必填 → None。"""
+    if value is None or value == "":
+        if required:
+            raise _calendar_bad(f"{field} 必填(epoch 秒,agent 自己換算好)")
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise _calendar_bad(f"{field} 必須是 epoch 秒(數字)")
+    val = float(value)
+    if val != val or val in (float("inf"), float("-inf")):
+        raise _calendar_bad(f"{field} 不是有效的時間值")
+    if not (_CALENDAR_EPOCH_MIN <= val <= _CALENDAR_EPOCH_MAX):
+        raise _calendar_bad(
+            f"{field} 超出合理範圍(2000–2100 年);"
+            "確認你送的是**秒**不是毫秒")
+    return val
+
+
+def _calendar_tz(raw: str):
+    """IANA tz 必填 —— **絕不假設裝置時區**(agent 跟手機可能不同地方)。"""
+    name = str(raw or "").strip()
+    if not name:
+        raise _calendar_bad("tz 必填(IANA 時區名,如 Asia/Taipei);"
+                            "bridge 不替你猜裝置時區")
+    try:
+        from zoneinfo import ZoneInfo
+        return name, ZoneInfo(name)
+    except Exception:  # noqa: BLE001
+        raise _calendar_bad(f"tz 不是有效的 IANA 時區名:{name}")
+
+
+def _calendar_text(raw, field: str, cap: int, required: bool = False) -> str:
+    txt = str(raw or "").strip()
+    if not txt:
+        if required:
+            raise _calendar_bad(f"{field} 必填")
+        return ""
+    if len(txt) > cap:
+        raise _calendar_bad(f"{field} 過長({len(txt)} 字,上限 {cap})")
+    return txt
+
+
+def _calendar_alarms(raw) -> list:
+    if raw in (None, ""):
+        return []
+    if not isinstance(raw, (list, tuple)):
+        raise _calendar_bad("alarm_minutes_before 必須是數字陣列(提前幾分鐘)")
+    out = []
+    for item in raw:
+        if isinstance(item, bool) or not isinstance(item, (int, float)):
+            raise _calendar_bad("alarm_minutes_before 只收數字(分鐘)")
+        mins = int(item)
+        if not (0 <= mins <= _CALENDAR_ALARM_MINUTES_MAX):
+            raise _calendar_bad(
+                f"alarm_minutes_before 每項需在 0–{_CALENDAR_ALARM_MINUTES_MAX} "
+                "分鐘之間")
+        out.append(mins)
+    if len(out) > _CALENDAR_ALARMS_MAX:
+        raise _calendar_bad(
+            f"alarm_minutes_before 最多 {_CALENDAR_ALARMS_MAX} 項")
+    return out
+
+
+def _calendar_local(ts: float, tzinfo) -> "datetime":
+    return datetime.fromtimestamp(float(ts), tz=timezone.utc).astimezone(tzinfo)
+
+
+def _calendar_summary(body: dict, tzinfo=None) -> str:
+    """人話摘要(fallback_text 的內容部分)。全部在提案自己的 tz 算,
+    不吃伺服器 local time。"""
+    if tzinfo is None:
+        try:
+            from zoneinfo import ZoneInfo
+            tzinfo = ZoneInfo(str(body.get("tz") or "UTC"))
+        except Exception as _exc:  # noqa: BLE001
+            # 進不來才對(建立時已驗過 tz);真的發生就退 UTC 但要留痕。
+            _log_exc("_calendar_summary", _exc, expected=False)
+            tzinfo = timezone.utc
+    title = str(body.get("title") or "")
+    all_day = bool(body.get("all_day"))
+    start = body.get("start")
+    end = body.get("end")
+    due = body.get("due")
+    when = ""
+    if body.get("target") == "reminder":
+        stamp = due if due is not None else start
+        if stamp is not None:
+            d = _calendar_local(stamp, tzinfo)
+            when = d.strftime("%-m/%-d") if all_day else d.strftime("%-m/%-d %H:%M")
+    elif start is not None:
+        s = _calendar_local(start, tzinfo)
+        if all_day:
+            when = s.strftime("%-m/%-d")
+        elif end is not None:
+            e = _calendar_local(end, tzinfo)
+            when = (f"{s.strftime('%-m/%-d %H:%M')}–"
+                    f"{e.strftime('%H:%M') if e.date() == s.date() else e.strftime('%-m/%-d %H:%M')}")
+        else:
+            when = s.strftime("%-m/%-d %H:%M")
+    recur = {"daily": "(每天)", "weekly": "(每週)",
+             "monthly": "(每月)"}.get(str(body.get("recurrence") or "none"), "")
+    return " ".join(x for x in (title, when, recur) if x)
+
+
+def _calendar_fallback(body: dict, summary: str) -> str:
+    """舊 client 只看得到這一行 —— 提案/已加入/已略過三態都要看得懂。"""
+    state = str(body.get("state") or "proposed")
+    is_reminder = body.get("target") == "reminder"
+    if state == "accepted":
+        head = "✅ 已加入提醒事項" if is_reminder else "✅ 已加入行事曆"
+    elif state == "declined":
+        head = "✖️ 已略過"
+    else:
+        head = "⏰ 建議提醒" if is_reminder else "📅 建議行程"
+    return f"{head}:{summary}"[:_CALENDAR_FALLBACK_MAX]
+
+
+def _calendar_normalize(raw: dict) -> tuple:
+    """agent 送的 body → 契約形狀的卡片 body(不含 proposal_id/state)。
+    任何不合格一律 400 zh-TW —— **這裡是唯一的防線**,app 端只負責渲染。"""
+    target = str(raw.get("target") or "calendar").strip().lower()
+    if target not in _CALENDAR_TARGETS:
+        raise _calendar_bad(
+            f"target 必須是 {' 或 '.join(_CALENDAR_TARGETS)}")
+    tz_name, tzinfo = _calendar_tz(raw.get("tz"))
+    title = _calendar_text(raw.get("title"), "title", _CALENDAR_TITLE_MAX,
+                           required=True)
+    all_day = bool(raw.get("all_day"))
+    recurrence = str(raw.get("recurrence") or "none").strip().lower()
+    if recurrence not in _CALENDAR_RECURRENCES:
+        raise _calendar_bad(
+            f"recurrence 必須是 {'/'.join(_CALENDAR_RECURRENCES)}")
+    is_reminder = target == "reminder"
+    # calendar 一定要 start;reminder 可以只有 due(也允許只給 start 當 due)。
+    start = _calendar_epoch(raw.get("start"), "start",
+                            required=not is_reminder)
+    due = _calendar_epoch(raw.get("due"), "due", required=False)
+    if is_reminder and due is None and start is None:
+        raise _calendar_bad("提醒事項至少要有 due 或 start 其中之一")
+    end = _calendar_epoch(raw.get("end"), "end", required=False)
+    if end is not None:
+        if start is None:
+            raise _calendar_bad("給了 end 就必須給 start")
+        if end <= start:
+            raise _calendar_bad("end 必須晚於 start")
+    elif not is_reminder and start is not None and not all_day:
+        end = start + _CALENDAR_DEFAULT_DURATION
+    if is_reminder and due is None:
+        due = start
+    body = {"target": target, "title": title, "tz": tz_name,
+            "all_day": all_day, "recurrence": recurrence,
+            "alarm_minutes_before": _calendar_alarms(
+                raw.get("alarm_minutes_before"))}
+    notes = _calendar_text(raw.get("notes"), "notes", _CALENDAR_NOTES_MAX)
+    if notes:
+        body["notes"] = notes
+    location = _calendar_text(raw.get("location"), "location",
+                              _CALENDAR_LOCATION_MAX)
+    if location:
+        body["location"] = location
+    if start is not None:
+        body["start"] = start
+    if end is not None:
+        body["end"] = end
+    if due is not None:
+        body["due"] = due
+    return body, tzinfo
+
+
+def _calendar_card(proposal_id: str, body: dict) -> dict:
+    # id = card-cal-<uuid8>(proposal_id 本身就帶 cal- 前綴,不再疊一層)
+    return carddigest.make_card(f"card-{proposal_id}", "", "assistant",
+                                "calendar_event", body)
+
+
+def _calendar_index_put(proposal_id: str, row: dict) -> None:
+    with _CALENDAR_PROPOSALS_LOCK:
+        _CALENDAR_PROPOSALS[proposal_id] = row
+        cap = _calendar_index_max()
+        while len(_CALENDAR_PROPOSALS) > cap:
+            _CALENDAR_PROPOSALS.popitem(last=False)
+
+
+def _calendar_index_get(proposal_id: str) -> dict | None:
+    with _CALENDAR_PROPOSALS_LOCK:
+        row = _CALENDAR_PROPOSALS.get(proposal_id)
+        return dict(row) if row else None
+
+
+@app.post("/app/v2/sessions/{session_id}/proposals/calendar")
+async def v2_propose_calendar(session_id: str, request: Request):
+    """agent 發一張行事曆/提醒**提案卡**進這條 session 的卡片流。
+
+    body = 契約 §14 的卡片 body 去掉 `proposal_id`/`state`
+    (bridge 指派 id、狀態一律從 `proposed` 起算)。回 `{proposal_id, …}`。
+    **不寫任何行事曆** —— 寫入權在裝置上的使用者手裡。
+    """
+    _check_auth(request)
+    _calendar_require_enabled()
+    raw = await _json_body(request)
+    store = await _v2_card_store(session_id)      # 未知 session → 404/400
+    body, tzinfo = _calendar_normalize(raw)
+    proposal_id = "cal-" + uuid.uuid4().hex[:8]
+    body["proposal_id"] = proposal_id
+    body["state"] = "proposed"
+    summary = _calendar_summary(body, tzinfo)
+    # agent 可以自己給 fallback_text(通常不必);沒給就用 bridge 合成的。
+    supplied = _calendar_text(raw.get("fallback_text"), "fallback_text",
+                              _CALENDAR_FALLBACK_MAX)
+    body["fallback_text"] = supplied or _calendar_fallback(body, summary)
+    card = _calendar_card(proposal_id, body)
+    store.upsert_card(card)
+    _calendar_index_put(proposal_id, {
+        "session": session_id, "card_id": card["id"], "target": body["target"],
+        "summary": summary, "state": "proposed", "ts": time.time(),
+        "resolved_at": None, "calendar_event_id": "", "error": ""})
+    _log_event("calendar_proposal_created", proposal=proposal_id,
+               session=session_id, target=body["target"], tz=body["tz"],
+               all_day=body["all_day"], recurrence=body["recurrence"])
+    return {"ok": True, "proposal_id": proposal_id, "card_id": card["id"],
+            "session_id": session_id, "state": "proposed", "body": body}
+
+
+@app.post("/app/v2/proposals/{proposal_id}/resolve")
+async def v2_resolve_proposal(proposal_id: str, request: Request):
+    """app 寫完(或使用者拒絕)之後回報結果:
+    body `{state: accepted|declined, calendar_event_id?, error?}`。
+
+    bridge 只更新那張卡(rev++ 由 store 負責),讓 agent 的卡片流看得到
+    「✅ 已加入行事曆」/「✖️ 已略過」。**冪等**:同一個 id 再 resolve 一次
+    回第一次的結果(`already_resolved: true`),不會再改卡。
+    """
+    _check_auth(request)
+    _calendar_require_enabled()
+    raw = await _json_body(request)
+    row = _calendar_index_get(proposal_id)
+    if row is None:
+        # 索引不跨重啟:卡片還在畫面上、提案卻已經不可 resolve。
+        raise http_err(404, "CALENDAR_PROPOSAL_NOT_FOUND",
+                       "找不到這筆提案(可能已過期或 bridge 重啟過),"
+                       "請再請 agent 提一次")
+    state = str(raw.get("state") or "").strip().lower()
+    if state not in _CALENDAR_STATES:
+        raise _calendar_bad(
+            f"state 必須是 {' 或 '.join(_CALENDAR_STATES)}")
+    event_id = _calendar_text(raw.get("calendar_event_id"),
+                              "calendar_event_id", 200)
+    error = _calendar_text(raw.get("error"), "error", 500)
+    if row.get("resolved_at"):
+        return {"ok": True, "proposal_id": proposal_id,
+                "session_id": row["session"], "state": row["state"],
+                "calendar_event_id": row.get("calendar_event_id") or "",
+                "error": row.get("error") or "", "already_resolved": True}
+    store = await _v2_card_store(row["session"])
+    card = store.cards.get(row["card_id"])
+    if card is None:
+        raise http_err(404, "CALENDAR_PROPOSAL_CARD_GONE",
+                       "提案卡已不在這條 session 的卡片流裡,請再提一次")
+    body = dict(card.get("body") or {})
+    body["state"] = state
+    if event_id:
+        body["calendar_event_id"] = event_id
+    if error:
+        body["error"] = error
+    body["fallback_text"] = _calendar_fallback(body, row.get("summary") or
+                                               _calendar_summary(body))
+    store.upsert_card(_calendar_card(proposal_id, body))
+    row.update({"state": state, "resolved_at": time.time(),
+                "calendar_event_id": event_id, "error": error})
+    _calendar_index_put(proposal_id, row)
+    _log_event("calendar_proposal_resolved", proposal=proposal_id,
+               session=row["session"], state=state,
+               has_event_id=bool(event_id), has_error=bool(error))
+    return {"ok": True, "proposal_id": proposal_id,
+            "session_id": row["session"], "state": state,
+            "calendar_event_id": event_id, "error": error,
+            "already_resolved": False}
 
 
 @app.on_event("startup")
