@@ -29,9 +29,15 @@ class FailingCodexApp:
         self.token_usage = {}
         self.thread_errors = {}
         self.last_event_at = {}
+        self.provider_status = {}
 
     async def call(self, method, params, timeout):
         raise RuntimeError("codex app-server unavailable")
+
+    def note_provider_status(self, thread_id, status):
+        # 真的那顆會把 provider 回報的 ThreadStatus 收進 provider_status;
+        # 這個 stub 模擬「app-server 整顆掛掉」,有這支、不炸就夠。
+        return None
 
     def is_active(self, thread_id):
         return False
