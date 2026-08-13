@@ -588,12 +588,36 @@ Pins Pocket's provider lane to a native agent session. `{provider}` accepts
   "provider": "claude_code|codex|hermes",
   "title": "pocket-agent",
   "subtitle": "/Users/xcash/apps/pocketagent",  // workdir / 來源說明
-  "status": "idle|running|waiting_approval|failed|done",
+  "status": "idle|running|waiting_approval|failed|stalled|done",
   "last_event_at": "2026-07-04T10:33:42Z",
   "capabilities": ["input","interrupt","approve","attachments","keys","replay","follow"],
   "meta": { /* provider 專屬,app 不硬依賴 */ }
 }
 ```
+
+#### 4.1a `status` 的六個值（2026-08-13 更新）
+
+`stalled` 是本次新增到契約的字串。它**不是新行為** —— bridge 內部的
+`runtime_status()` 一直算得出來，但 `/app/v2/sessions` 的 codex 列以前會把結果
+壓成 `waiting_approval / running / idle` 三選一，把 `failed`／`stalled`／`done`
+全部丟掉。修掉之後這三個值會真的送到 app，所以在此補齊文件。
+
+| status | 意思 | app 端建議 |
+| --- | --- | --- |
+| `idle` | 沒有進行中的回合 | 一般樣式 |
+| `running` | 回合進行中 | 轉圈／可中斷 |
+| `waiting_approval` | 在等使用者（審批，或 codex 的 `waitingOnUserInput`） | 醒目、可點進去回應 |
+| `failed` | 上一回合失敗，或 provider 回報 `systemError` | 紅字＋`meta` / `error` |
+| `stalled` | 回合開著但超過 `CODEX_TURN_STALL_SECS`（預設 300s）沒有任何事件 | 建議比照 `running`，可加「疑似卡住」提示 |
+| `done` | 回合已終結（本地記錄到終局） | 一般樣式 |
+
+**app 端未處理的值一律當 `idle`／一般樣式即可**，不會壞；但 `stalled` 與 `done`
+目前在 app 沒有對應 case，補上才看得出差別。
+
+codex 這一列的 `status` 現在來自 `runtime_status()` 的單一真相，其中
+provider（app-server）自己回報的 `ThreadStatus` 是權威來源：
+`active` → `running`（帶 `waitingOnApproval`／`waitingOnUserInput` 旗標時 →
+`waiting_approval`）、`systemError` → `failed`、`notLoaded` → 視為「無資訊」。
 
 - **session id wire format 全寫**：`claude_code:{name}`、`codex:{thread_id}`、
   `hermes:{persona}`；delegation 列為 `delegation:{id}`（provider 欄仍是

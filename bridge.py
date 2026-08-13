@@ -4351,6 +4351,34 @@ CX_THREAD_UNLOCKED_CARD_TEXT = (
     "✅ 桌面版 Codex/ChatGPT 已釋放這個對話的寫入鎖,現在可以正常送出了。")
 CX_THREAD_LOCKED_REASON = "thread_store_conflict"
 
+# provider_status 的上限:thread 來來去去,這個 map 不能無限長。超過就丟最舊的
+# (以 `at` 排序)。1024 遠大於任何實際「同時活著」的 thread 數,正常永遠不觸發。
+CODEX_PROVIDER_STATUS_MAX = int(
+    os.environ.get("CODEX_PROVIDER_STATUS_MAX", "1024"))
+# align 時最多補幾發 thread/read(只補 thread/list 沒涵蓋到的 loaded thread)。
+# 「同時載入中」實務上是個位數,32 已經很寬;設上限是避免異常狀況打爆連線。
+CODEX_STATUS_ALIGN_READ_MAX = int(
+    os.environ.get("CODEX_STATUS_ALIGN_READ_MAX", "32"))
+
+
+def _v2_iso_utc(ts):
+    """v2 session 列的 `last_event_at` 統一形狀:ISO8601 UTC 字串。
+
+    契約(docs/APP_BRIDGE_CONTRACT.md §4.1)寫的是 "2026-07-04T10:33:42Z",
+    app 端也是用 ISO formatter 解(AgentSessionModel.swift)。但 codex 這列
+    一直是直接送 `time.time()` 的 float epoch → app 解析恆為 nil,「最後活動
+    時間」永遠空白。這裡把 epoch 轉成契約要的字串;已經是字串的原樣放行。
+    """
+    if ts is None or ts == "":
+        return None
+    if isinstance(ts, str):
+        return ts
+    try:
+        return datetime.fromtimestamp(float(ts), tz=timezone.utc) \
+            .strftime("%Y-%m-%dT%H:%M:%SZ")
+    except (TypeError, ValueError, OSError, OverflowError):
+        return None
+
 
 def _codex_thread_lock_text(text: str) -> bool:
     low = str(text or "").lower()
@@ -4646,6 +4674,14 @@ class CodexAppServerClient:
         # wave 2: live token usage per thread (thread/tokenUsage/updated) —
         # thread/list reports tokenUsage: null, so this is the only source.
         self.token_usage = {}
+        # provider(app-server)自己講的 thread 狀態 —— **權威來源**。
+        # thread_id -> {"type": notLoaded|idle|systemError|active,
+        #               "flags": [waitingOnApproval|waitingOnUserInput],
+        #               "at": wall clock}
+        # 2026-08-13 實測(見 runtime_status 的長註解):`thread/status/changed`
+        # 是**全連線廣播**,不是只給 start/resume 過的那條連線 —— 所以桌面版
+        # /VS Code/CLI driven 的 thread 我們也收得到,這是本 map 存在的理由。
+        self.provider_status = {}
 
     async def call(self, method: str, params: dict | None = None, timeout: float = 30.0):
         async with self._lock:
@@ -4795,6 +4831,15 @@ class CodexAppServerClient:
                    codex_home=(init or {}).get("codexHome", ""),
                    isolated=_codex_isolated(),
                    bin=self.spawned_bin, transport=self.transport)
+        # 每次(重)連線都對齊一次 provider 狀態。**不能在這裡 await** ——
+        # 這支是持著 self._lock 跑的,而 align 用的 self.call() 會再搶同一把鎖
+        # (直接 await = 自我死鎖)。丟到背景,等鎖放掉之後自己跑。
+        try:
+            t = asyncio.create_task(self.align_provider_status())
+            _BG_TASKS.add(t)
+            t.add_done_callback(_BG_TASKS.discard)
+        except RuntimeError:
+            pass
 
     def _expire_stale_codex_approvals(self):
         import sqlite3
@@ -4933,6 +4978,10 @@ class CodexAppServerClient:
             except RuntimeError:
                 pass
         self.loaded_threads.clear()
+        # provider 狀態是「那顆 app-server 當下的說法」,連線斷了就不再有效。
+        # 留著會害死人:thread 在 active 時 daemon 掛掉,重連後那條其實是
+        # notLoaded,舊記錄卻讓它永遠顯示 running。清掉,交給 align 重建。
+        self.provider_status.clear()
         if proc is not None and self.proc is proc:
             self.proc = None
         if ws is not None and self.ws is ws:
@@ -5652,6 +5701,11 @@ class CodexAppServerClient:
                 self.loaded_threads.add(tid)
             return
         tid = params.get("threadId")
+        if method == "thread/status/changed" and tid:
+            # **權威狀態**。以前這條完全沒被處理,於是 bridge 只認得自己發起的
+            # 回合(active_turns),桌面版/VS Code/CLI 跑的 thread 一律顯示 idle。
+            self.note_provider_status(tid, params.get("status"))
+            return
         if method == "thread/tokenUsage/updated" and tid:
             self.token_usage[tid] = params.get("tokenUsage") or params
             return
@@ -5871,6 +5925,96 @@ class CodexAppServerClient:
     def is_active(self, thread_id: str) -> bool:
         return thread_id in self.active_turns
 
+    # ── provider 權威狀態 ────────────────────────────────────────────────
+    def note_provider_status(self, thread_id: str, status) -> dict | None:
+        """記下 app-server 對這條 thread 的說法(thread/status/changed 或
+        thread/list 的 `status` 欄)。
+
+        `status` 形狀(codex 0.147 實測,ThreadStatus):
+            {"type": "notLoaded"} / {"type": "idle"} / {"type": "systemError"}
+            {"type": "active", "activeFlags": ["waitingOnApproval"|
+                                               "waitingOnUserInput"]}
+        `notLoaded` = 「這顆 app-server 沒把它載進記憶體」= **沒有資訊**,不是
+        idle。存起來但 runtime_status 會忽略它,以免把別的來源蓋掉。
+        """
+        if not thread_id or not isinstance(status, dict):
+            return None
+        stype = status.get("type")
+        if not isinstance(stype, str) or not stype:
+            return None
+        flags = status.get("activeFlags")
+        flags = [f for f in flags if isinstance(f, str)] \
+            if isinstance(flags, list) else []
+        rec = {"type": stype, "flags": flags, "at": time.time()}
+        self.provider_status[thread_id] = rec
+        if len(self.provider_status) > CODEX_PROVIDER_STATUS_MAX:
+            # 丟最舊的一批(留 max 的 90%),而不是每加一筆就淘汰一筆 ——
+            # 後者會讓每一次寫入都付一次排序成本。
+            keep = max(1, int(CODEX_PROVIDER_STATUS_MAX * 0.9))
+            oldest = sorted(self.provider_status.items(),
+                            key=lambda kv: kv[1].get("at", 0.0))
+            for tid, _ in oldest[:len(self.provider_status) - keep]:
+                self.provider_status.pop(tid, None)
+        return rec
+
+    def provider_status_for(self, thread_id: str) -> dict | None:
+        return self.provider_status.get(thread_id)
+
+    async def align_provider_status(self) -> int:
+        """開機/每次 (重) 連線後對齊一次:問 app-server 現在到底有哪些 thread
+        活著,以及它們的狀態。
+
+        **這是「重啟後狀態還在」的關鍵**:`active_turns` 是 bridge 的記憶,
+        重啟就沒了;但只要接的是桌面版共用的 managed daemon(它活得比 bridge
+        久),`thread/loaded/list` + `thread/list` 就能把真實狀態撈回來。
+
+        兩支都是唯讀查詢,失敗只記 log,絕不讓連線流程掛掉。
+        """
+        loaded = set()
+        try:
+            res = await self.call("thread/loaded/list", {}, timeout=10.0)
+            for tid in ((res or {}).get("data") or []):
+                if isinstance(tid, str) and tid:
+                    loaded.add(tid)
+                    self.loaded_threads.add(tid)
+        except Exception as e:  # noqa: BLE001
+            _log_event("codex_loaded_list_failed", error=type(e).__name__,
+                       error_message=str(e)[:200])
+            return 0
+        aligned = 0
+        if loaded:
+            # loaded/list 只給 id,狀態要靠 thread/list 的 `status` 欄。
+            try:
+                res = await self.call("thread/list",
+                                      {"limit": min(100, max(20, len(loaded)))},
+                                      timeout=15.0)
+                for th in ((res or {}).get("data") or []):
+                    if isinstance(th, dict) and th.get("id") in loaded:
+                        if self.note_provider_status(th["id"], th.get("status")):
+                            aligned += 1
+                            loaded.discard(th["id"])
+            except Exception as e:  # noqa: BLE001
+                _log_event("codex_status_align_failed", error=type(e).__name__,
+                           error_message=str(e)[:200])
+        # 實測(0.147.0):**剛開、還沒落地的 thread 不會出現在 thread/list**,
+        # 但它就在 loaded/list 裡 —— 而那正是「現在有人在跑」最可能的一條。
+        # 補一輪 thread/read(includeTurns=false,只要 metadata)把洞補上。
+        # 不能拿「有 loaded 就當 active」充數:loaded 的 thread 也可能只是 idle。
+        for tid in list(loaded)[:CODEX_STATUS_ALIGN_READ_MAX]:
+            try:
+                res = await self.call("thread/read",
+                                      {"threadId": tid, "includeTurns": False},
+                                      timeout=10.0)
+                th = (res or {}).get("thread") or {}
+                if self.note_provider_status(tid, th.get("status")):
+                    aligned += 1
+            except Exception as e:  # noqa: BLE001
+                _log_event("codex_status_read_failed", thread=tid[:16],
+                           error=type(e).__name__, error_message=str(e)[:200])
+        _log_event("codex_status_aligned", loaded=len(self.loaded_threads),
+                   aligned=aligned)
+        return aligned
+
     # ── CX 排隊層 ────────────────────────────────────────────────────────
     # 契約與 CC 對稱:忙碌時「一定收下」並回 delivery=queued,turn 結束自動送出。
     # 不回 4xx —— app 端沒有辦法分辨「真的失敗」與「只是還在忙」,一律紅字。
@@ -5998,19 +6142,67 @@ class CodexAppServerClient:
         return CodexAppServerError(str(exc), code=_CX_THREAD_LOCKED_CODE)
 
     def runtime_status(self, thread_id: str, raw_status: str = "") -> str:
+        """單一真相:這條 codex thread 現在該顯示什麼狀態。
+
+        ── 為什麼要重寫(2026-08-13)────────────────────────────────────
+        舊版把 provider 的說法整個丟掉:唯一的 raw 判斷是
+        `raw in {"completed","done","success"}`,而 **codex 從來不吐這三個值**。
+        它的 ThreadStatus 只有四種:
+            notLoaded | idle | systemError | active{activeFlags:[…]}
+        所以 `active` 和 `systemError` 全部掉到最後 `return "idle"` ——
+        app-server 明明說「這條在跑」,bridge 卻回報 idle。加上 active_turns
+        只裝「Pocket 自己發起、且 bridge 重啟就清空」的回合,結論就是:
+        桌面版/VS Code/CLI 開的 thread 永遠 idle,bridge 一重啟也全部變 idle。
+
+        ── 實測結論(codex-cli 0.147.0,隔離 CODEX_HOME,兩條連線同一顆
+           app-server)──────────────────────────────────────────────────
+        * `thread/status/changed` 是**全連線廣播**:沒有 start/resume 過那條
+          thread 的連線,一樣完整收到 active → idle / active → systemError。
+          所以不需要為了拿狀態去 resume(那還會搶 thread-store 寫入鎖)。
+        * 只在**狀態真的轉變**時才發;同一狀態不會重送。
+        * `thread/list` 對沒載入的 thread 一律回 `{"type":"notLoaded"}`,
+          對載入中的才回真實狀態 → notLoaded 必須當「沒有資訊」。
+
+        ── 優先序 ─────────────────────────────────────────────────────
+        1. 本地 pending approval          → waiting_approval
+        2. bridge 自己知道的 active turn  → running / stalled
+        3. **provider 權威狀態**          → waiting_approval / running / failed
+        4. 本地錯誤 / 終局                → failed / done
+        5. 舊式 raw 字串                  → done
+        6. 其他                           → idle
+        第 3 步是這次補上的洞:provider 的話再也不會被靜靜丟掉。
+        """
+        # 1. 本地已知的待審請求最優先(它帶得到 approval 物件給 UI)。
         if self.pending_approval_for_thread(thread_id):
             return "waiting_approval"
+        # 2. bridge 自己發起、還沒收到 turn/completed 的回合。
         if self.is_active(thread_id):
             last = self.last_event_at.get(
                 thread_id, self.turn_started_at.get(thread_id, time.time()))
             if time.time() - last >= CODEX_TURN_STALL_SECS:
                 return "stalled"
             return "running"
+        # 3. provider 說了算。notLoaded/idle 不在這裡下結論(往下走),
+        #    因為 notLoaded = 沒資訊,而 idle 不該蓋掉本地的 failed/done。
+        prov = self.provider_status.get(thread_id) or {}
+        ptype = prov.get("type")
+        if ptype == "active":
+            flags = prov.get("flags") or []
+            # waitingOnApproval / waitingOnUserInput 都是「球在使用者身上」,
+            # 對應到 app 已經看得懂的 waiting_approval。
+            if "waitingOnApproval" in flags or "waitingOnUserInput" in flags:
+                return "waiting_approval"
+            return "running"
+        if ptype == "systemError":
+            # 對映到契約既有的 failed(app 已有這個 case),不另造新字串。
+            return "failed"
+        # 4. 本地錯誤/終局。
         error = self.thread_errors.get(thread_id, "")
         if error:
             return "failed"
         if thread_id in self.turn_terminal_at:
             return "done"
+        # 5. 舊式 raw 字串(codex 不吐這些,留著相容其它呼叫端)。
         raw = (raw_status or "").lower()
         if raw in {"completed", "done", "success"}:
             return "done"
@@ -6050,10 +6242,14 @@ def _codex_usage_map(tu) -> dict | None:
 
 def _codex_enrich_summary(summary: dict) -> dict:
     tid = summary.get("thread_id") or summary.get("id") or ""
-    summary["activeTurn"] = CODEX_APP.is_active(tid)
     summary["appServerAlive"] = CODEX_APP.is_server_alive()
     summary["runtimeStatus"] = CODEX_APP.runtime_status(
         tid, summary.get("status") or "")
+    # `activeTurn` 的語意就是「這條現在有沒有回合在跑」。只讀 active_turns 的話
+    # 它只認得 Pocket 自己發起的回合;provider 說 active 也算數,否則 app 的
+    # v1 codexsessions 面(用 activeTurn 推 lifecycle)還是會顯示待機。
+    summary["activeTurn"] = (CODEX_APP.is_active(tid)
+                             or summary["runtimeStatus"] in ("running", "stalled"))
     summary["status"] = summary["runtimeStatus"]
     usage = _codex_usage_map(CODEX_APP.token_usage.get(tid))
     if usage:
@@ -6173,6 +6369,11 @@ def _codex_session_summary(thread: dict) -> dict:
     name = (thread.get("name") or "").strip()
     preview = (thread.get("preview") or "").strip()
     provider_status = _codex_status_type(thread.get("status"))
+    # thread/list 每刷一次就順手餵新 provider 狀態(含 activeFlags)。這是
+    # 廣播之外的第二條保險:錯過通知、或 bridge 比 app-server 晚啟動時,
+    # 清單一拉就補回來。notLoaded 也記,note_provider_status 會照實存,
+    # runtime_status 自己知道要忽略它。
+    CODEX_APP.note_provider_status(tid, thread.get("status"))
     out = {
         "name": name or preview[:180] or (tid[:12] or "codex"),
         "thread_id": tid,
@@ -6440,10 +6641,16 @@ async def _codex_warm_threads(thread_ids: list) -> None:
             if getattr(e, "code", None) == _CX_THREAD_LOCKED_CODE:
                 continue    # 已由 _thread_lock_error 記過一次 log + 推過卡
             _log_event("codex_thread_warm_failed", thread=tid[:16],
-                       error=type(e).__name__, error_message=str(e)[:200])
+                       error=type(e).__name__, error_message=str(e)[:200],
+                       code=getattr(e, "code", None))
         except Exception as e:  # noqa: BLE001
+            # 這條分支以前只記 error type,人話整個丟掉 —— 實機累積了上萬筆
+            # 「error: CodexAppServerError」而**完全沒有訊息**的 log,誰都查不動。
+            # 訊息截 200 字(夠看得出 -32600 / no rollout / timeout 之類的根因,
+            # 又不會把整包 payload 或任何長字串倒進 log)。
             _log_event("codex_thread_warm_failed", thread=tid[:16],
-                       error=type(e).__name__)
+                       error=type(e).__name__, error_message=str(e)[:200],
+                       code=getattr(e, "code", None))
 
 
 @app.get("/codexsessions")
@@ -13546,7 +13753,11 @@ async def v2_sessions(request: Request, provider: str = "", status: str = ""):
                 continue
             thread_id = s.get("thread_id") or s.get("id")
             approval = CODEX_APP.pending_approval_for_thread(thread_id)
-            active = bool(s.get("activeTurn")) or s.get("status") in ("active", "running")
+            # runtimeStatus 已經是 _codex_enrich_summary 算好的單一真相
+            # (優先序見 CodexAppServerClient.runtime_status)。這裡**不再自己
+            # 重算**:舊碼把它壓成 waiting_approval/running/idle 三選一,等於把
+            # failed / stalled / done 這三種結果直接丟掉,app 只看得到 idle。
+            st = s.get("runtimeStatus") or "idle"
             caps = ["input", "interrupt", "attachments", "replay", "follow"]
             if approval:
                 caps.append("approve")
@@ -13569,8 +13780,12 @@ async def v2_sessions(request: Request, provider: str = "", status: str = ""):
                 _codex_lock_recheck(thread_id)
             out.append({"id": f"codex:{thread_id}", "provider": "codex",
                         "title": s.get("name") or "codex", "subtitle": s.get("workdir"),
-                        "status": "waiting_approval" if approval else ("running" if active else "idle"),
-                        "last_event_at": s.get("lastEventAt"),
+                        "status": st,
+                        # lastEventAt 只有「bridge 自己看過事件」的 thread 才有;
+                        # 桌面版/CLI 開的那些一律是 None。退回 provider 的
+                        # updatedAt(thread/list 一定帶),「最後活動」才不會空白。
+                        "last_event_at": _v2_iso_utc(s.get("lastEventAt")
+                                                     or s.get("updatedAt")),
                         "capabilities": caps,
                         "locked": bool(lock),
                         "meta": meta})
