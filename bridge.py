@@ -14644,17 +14644,25 @@ async def _cc_card_follower(name: str, workdir: str):
                         store.tail_partial = ""
                     _cc_digest_lines(store, nl, j, store.tail_lineno)
                     store.tail_lineno += len(nl)
-            if store.subscribers > 0:
+            # **訂閱數要無條件記錄**,不能只在 >0 時記 —— 否則「掉到 0」永遠不會被
+            # 寫進 `_last_subs`。1→0→1 的重連回來時 `_last_subs` 仍是 1,`1 > 1`
+            # 為假 → 下面那條「新訂閱者強制重發狀態」的自癒**完全不會觸發**,
+            # 而它正是 client 游標跳過 status 事件時唯一的補救。
+            # (2026-08-14 修:這個自癒從寫下來就沒在重連路徑上生效過,是 CC 卡在
+            #  「執行中」不動的幫兇之一。另一半在 snapshot 契約,見 carddigest。)
+            subs_now = store.subscribers
+            subs_was = getattr(store, "_last_subs", 0)
+            store._last_subs = subs_now
+            if subs_now > 0:
                 st = await _cc_status_core(name)
                 busy = bool(st.get("busy"))
                 if busy:
                     store.queued_until = 0.0   # 真忙了 → 排隊寬限交還正常路徑
                 # 新訂閱者(開啟/重連時可能在「忙碌中途」接入)→ 強制重發一次當前
                 # 狀態,否則 set_status「有變才發」會讓中途接入者停在舊的「待命」,
-                # 整段回覆期看起來像沒反應(snapshot 冷載不帶 status)。
-                if store.subscribers > getattr(store, "_last_subs", 0):
+                # 整段回覆期看起來像沒反應。
+                if subs_now > subs_was:
                     store.status = None
-                store._last_subs = store.subscribers
                 if prev_busy is not None and busy != prev_busy:
                     if busy:
                         store.turn_id = "turn-" + uuid.uuid4().hex[:12]
@@ -16268,7 +16276,13 @@ async def _v2_card_store(session_id: str):
 @app.get("/app/v2/sessions/{session_id}/cards")
 async def v2_session_cards(session_id: str, request: Request, limit: int = 100,
                            before_seq: int | None = None):
-    """契約 §3 冷載 snapshot:{cards, latest_seq} → app 渲染後從 since_seq 接流。"""
+    """契約 §3 冷載 snapshot:{cards, latest_seq, status} → app 渲染後從 since_seq 接流。
+
+    `status` 2026-08-14 補入契約:形狀與 `session.status` 事件的 data 完全相同
+    (同一顆 `store.status`),app 可以走同一條套用路徑。**可能是 `{}`**(這條
+    session 還沒巡邏過狀態)—— 空的代表「我沒資訊」,client 要**維持原狀**,
+    不可當成「閒置」清掉忙碌旗標。理由見 `SessionCardStore.snapshot`。
+    """
     _check_auth(request)
     store = await _v2_card_store(session_id)
     return store.snapshot(limit=max(1, min(limit, 500)), before_seq=before_seq)
