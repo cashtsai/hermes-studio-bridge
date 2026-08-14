@@ -4674,6 +4674,25 @@ class CodexAppServerClient:
         # wave 2: live token usage per thread (thread/tokenUsage/updated) —
         # thread/list reports tokenUsage: null, so this is the only source.
         self.token_usage = {}
+        # per-thread 設定快取 —— **唯一可信來源**(2026-08-14 對 0.147 實測)。
+        # app-server **沒有** settings 的 getter:合法方法表裡只有
+        # `thread/settings/update`,沒有 `thread/settings`;而 `thread/read` 的
+        # 回覆只有 `{"thread": {...}}`,那顆 thread 物件裡**不帶** model /
+        # approvalPolicy(舊版讀 thread["model"] 永遠是 None,設定面板因此一直
+        # 空白 —— 這才是「切了模型沒生效」的真相:寫入其實成功了,是讀不回來)。
+        # 唯二來源:thread/start|resume 的**結果頂層**,以及
+        # `thread/settings/updated` 廣播(欄名與 start 不同,見 note_thread_settings)。
+        # thread_id -> {"model", "approvalPolicy", "effort", "sandbox", "at"}
+        #
+        # ⚠️ 0.147 實測的持久化**不對稱**(同一次 update 設兩個欄位):
+        #     model          → 存進 rollout,app-server 重啟後 resume 讀得回來
+        #     approvalPolicy → **不持久**,resume 一律回預設 `on-request`
+        # 所以 bridge 重啟 / thread 重新載入之後,使用者設的審核策略會**無聲
+        # 還原**。本快取因為冷的時候是拿 resume 當種子,顯示的是「還原後」的
+        # 真值(不會騙人),但「要不要在 resume 後自動補打一次 update 把使用者
+        # 的意圖貼回去」是**產品/安全決策**(等於重啟後自動恢復免審核),
+        # 未經善彰拍板不自作主張 —— 見接力包。
+        self.thread_settings = {}
         # provider(app-server)自己講的 thread 狀態 —— **權威來源**。
         # thread_id -> {"type": notLoaded|idle|systemError|active,
         #               "flags": [waitingOnApproval|waitingOnUserInput],
@@ -5709,6 +5728,11 @@ class CodexAppServerClient:
         if method == "thread/tokenUsage/updated" and tid:
             self.token_usage[tid] = params.get("tokenUsage") or params
             return
+        if method == "thread/settings/updated" and tid:
+            # 全連線廣播(同 thread/status/changed)→ 桌面版/VS Code 改的設定
+            # 我們也收得到,不只是自己打的那次 update。
+            self.note_thread_settings(tid, params.get("threadSettings") or {})
+            return
         if method == "turn/started" and tid:
             turn = params.get("turn") or {}
             self.active_turns[tid] = turn.get("id") or True
@@ -5798,6 +5822,36 @@ class CodexAppServerClient:
             if c:
                 self._append(tid, ("text", c))
 
+    def note_thread_settings(self, thread_id: str, payload: dict) -> None:
+        """把一份設定併進快取。**兩個來源欄名不一樣**,所以這裡要吃兩套:
+
+        - `thread/start` / `thread/resume` 的結果頂層:
+          `model` / `approvalPolicy` / `reasoningEffort` / `sandbox`
+        - `thread/settings/updated` 的 `threadSettings`:
+          `model` / `approvalPolicy` / `effort` / `sandboxPolicy`
+
+        (舊版的讀取端寫死 `reasoningEffort`+`sandboxMode` 去 thread/read 撈,
+        兩個名字在任何一個來源裡都不存在。)
+
+        併進去而不是整包蓋掉:update 只改一個欄位時,廣播雖然帶全量,但
+        start/resume 的種子是部分的,蓋掉會把已知欄位打成 None。
+        """
+        if not thread_id or not isinstance(payload, dict):
+            return
+        cur = dict(self.thread_settings.get(thread_id) or {})
+        for keys, dst in ((("model",), "model"),
+                          (("approvalPolicy",), "approvalPolicy"),
+                          (("effort", "reasoningEffort"), "effort"),
+                          (("sandbox", "sandboxPolicy"), "sandbox")):
+            for k in keys:
+                if payload.get(k) is not None:
+                    cur[dst] = payload[k]
+                    break
+        if not cur:
+            return
+        cur["at"] = time.time()
+        self.thread_settings[thread_id] = cur
+
     async def ensure_thread_loaded(self, thread_id: str, cwd: str | None = None):
         if thread_id in self.loaded_threads:
             return
@@ -5805,7 +5859,10 @@ class CodexAppServerClient:
         if cwd:
             params["cwd"] = cwd
         try:
-            await self.call("thread/resume", params, timeout=30.0)
+            resumed = await self.call("thread/resume", params, timeout=30.0)
+            # resume 的結果頂層帶著這條 thread 的當前設定 —— 這是設定面板在
+            # 沒收到任何 settings/updated 廣播前唯一的種子。
+            self.note_thread_settings(thread_id, resumed or {})
         except BaseException as e:
             if not isinstance(e, CodexAppServerError) or \
                     _codex_thread_lock_conflict(e) is None:
@@ -6538,6 +6595,15 @@ async def _codex_input_items(text: str, attachments: list) -> list:
     return items
 
 
+# app-server 對「參數不合法」與「thread 忙碌」共用 -32600,只能靠訊息文字分辨。
+# 實測 0.147 的參數錯訊息長這樣:
+#   Invalid request: unknown variant `on-failure`, expected one of `untrusted`…
+#   Invalid request: missing field `threadId`
+_CX_INVALID_PARAM_RE = re.compile(
+    r"unknown variant|unknown field|missing field|invalid type|expected one of",
+    re.I)
+
+
 def _codex_http_error(e: Exception):
     _log_event("codex_provider_error", error=type(e).__name__,
                error_message=str(e)[:200],
@@ -6569,8 +6635,15 @@ def _codex_http_error(e: Exception):
             raise http_err(409, "CX_WRONG_DECISION_SHAPE",
                            "codex server request 需要作答而不是核准", str(e))
         if e.code == -32600:
-            # 舊版一律 409 + 裸訊息,app 端把它顯示成「會話目前沒有在執行」——
-            # 真相通常相反(上一輪正在跑)。給結構化 code 讓 app 講對話。
+            # -32600 是 codex 的**泛用** Invalid request 碼:既是「上一輪正在跑」
+            # 也是「你的參數不合法」。参數類必須先攔下來 —— 否則 schema 一漂移
+            # (例:0.147 拿掉 approvalPolicy 的 `on-failure`),使用者按下去會收到
+            # 「會話忙碌中」,然後去等一個根本不存在的回合。這正是 thread-lock
+            # 那次查了一整天的同一種錯:把參數錯翻譯成狀態錯。
+            if _CX_INVALID_PARAM_RE.search(str(e)):
+                raise http_err(400, "CX_INVALID_PARAM",
+                               "codex 不接受這個參數值(可能是 codex 版本已變更"
+                               "該欄位的合法值)", str(e))
             raise http_err(409, "CX_TURN_IN_FLIGHT",
                            "codex thread is busy with another turn", str(e))
         raise HTTPException(status_code=502, detail=str(e))
@@ -6867,6 +6940,7 @@ async def codex_session_create(request: Request):
         if not thread_id:
             raise CodexAppServerError("thread/start returned no thread id")
         CODEX_APP.loaded_threads.add(thread_id)
+        CODEX_APP.note_thread_settings(thread_id, res or {})
         _registry_register(f"codex:{thread_id}", provider="codex",
                            name=text[:40] or thread_id, purpose=reg_purpose,
                            cls=reg_cls, parent=reg_parent)
@@ -8240,34 +8314,45 @@ async def codex_session_input(thread_id: str, request: Request):
 
 # S3 (wave 2): Codex-side model / approval-policy switching. The app-server
 # exposes `thread/settings/update` (needs the experimentalApi capability the
-# bridge already requests at initialize). Live-probed against codex-cli
-# 0.142.2: accepted fields include `model` and `approvalPolicy`; the policy
-# enum is validated server-side as below. No global setter exists — settings
-# are per-thread.
-_CODEX_APPROVAL_POLICIES = ("untrusted", "on-failure", "on-request",
-                            "granular", "never")
+# bridge already requests at initialize). Accepted fields include `model` and
+# `approvalPolicy`; the policy enum is validated server-side. No global setter
+# exists — settings are per-thread.
+#
+# 2026-08-14 對 codex-cli **0.147.0** 實測(隔離 CODEX_HOME,不碰 production):
+#   • `thread/settings/update` **存在且會生效**,回 `{}` 並廣播
+#     `thread/settings/updated`。接力包說它「0.147 根本不存在」是錯的,
+#     不需要改走 turn/start per-turn 覆寫。
+#   • **`on-failure` 在 0.147 已被移除**(0.142 還在)。合法枚舉只剩下面四個。
+#     舊清單留著它 = 使用者一選就撞 -32600,而 -32600 會被翻成
+#     CX_TURN_IN_FLIGHT「上一輪正在跑」—— 又是一次語意相反的誤導。
+#   • 沒有 getter:合法方法表裡沒有 `thread/settings`,`thread/read` 也不帶
+#     設定。讀取一律走 CODEX_APP.thread_settings 快取。
+_CODEX_APPROVAL_POLICIES = ("untrusted", "on-request", "granular", "never")
 
 
 @app.get("/codexsessions/{thread_id}/settings")
 async def codex_session_settings_read(thread_id: str, request: Request):
     """讀回 per-thread 當前設定(model/approvalPolicy/effort/sandbox)給設定面板。
-    來源 = thread/read;缺欄 = 不帶(舊 app 容忍)。runtime 可改的欄:model、
-    approvalPolicy(見同路徑 POST);effort/sandbox 目前 spawn-only。"""
+
+    來源 = `CODEX_APP.thread_settings` 快取(由 thread/start|resume 的結果頂層
+    種下、`thread/settings/updated` 廣播更新)。**不能走 thread/read** —— 它的
+    回覆不帶任何設定欄,舊版讀 `thread["model"]` 永遠是 None,面板因此一直空白,
+    看起來就像「切模型從來沒生效」(其實寫入是成功的)。詳見 thread_settings。
+
+    快取沒命中 → 就地 resume 一次把種子撈回來(resume 是冪等的,而且面板本來
+    就只在使用者打開那條 session 時才會問)。撞到 thread 鎖 → 照常 409,不要
+    假裝有設定。runtime 可改的欄:model、approvalPolicy;effort/sandbox 目前
+    spawn-only。
+    """
     _check_auth(request)
-    try:
-        res = await CODEX_APP.call("thread/read", {
-            "threadId": thread_id,
-            "includeTurns": False,
-        }, timeout=20.0)
-        thread = (res or {}).get("thread") or {}
-    except Exception as e:  # noqa: BLE001
-        _codex_http_error(e)
-    settings = {}
-    for src, dst in (("model", "model"), ("approvalPolicy", "approvalPolicy"),
-                     ("reasoningEffort", "effort"), ("sandboxMode", "sandbox")):
-        val = thread.get(src)
-        if val:
-            settings[dst] = val
+    if thread_id not in CODEX_APP.thread_settings:
+        try:
+            await CODEX_APP.ensure_thread_loaded(thread_id)
+        except Exception as e:  # noqa: BLE001
+            _codex_http_error(e)
+    cached = dict(CODEX_APP.thread_settings.get(thread_id) or {})
+    cached.pop("at", None)
+    settings = {k: v for k, v in cached.items() if v}
     return {"thread_id": thread_id, "settings": settings,
             "runtime_settable": ["model", "approvalPolicy"],
             "approval_policies": list(_CODEX_APPROVAL_POLICIES)}
@@ -8299,6 +8384,10 @@ async def codex_session_settings(thread_id: str, request: Request):
     except Exception as e:  # noqa: BLE001
         _codex_http_error(e)
     applied = {k: v for k, v in params.items() if k != "threadId"}
+    # 廣播(thread/settings/updated)會帶全量,但它是非同步到的 —— 面板寫完
+    # 立刻讀回時可能還沒進來。這裡先就地併一份,避免「存檔後面板還顯示舊值」
+    # 被再次誤判成沒生效。
+    CODEX_APP.note_thread_settings(thread_id, applied)
     _log_event("codex_settings_update", thread=thread_id[:16], **applied)
     return {"ok": True, "thread_id": thread_id, "applied": applied}
 
