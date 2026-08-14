@@ -1159,12 +1159,23 @@ class SessionCardStore(ApprovalCardMixin):
         return [e for e in self.events if e["seq"] > since_seq]
 
     def snapshot(self, limit: int = 100, before_seq: int | None = None) -> dict:
+        """快照 = 卡片 + **當前狀態** + 游標。
+
+        `status` 是 2026-08-14 補的契約(見 `set_status` 的長註解)。舊版快照只帶
+        cards/latest_seq,而 client 收到快照後會把 SSE 續傳游標推到 `latest_seq`
+        —— 那顆是**全域**事件計數,必然涵蓋 client 從沒套用過的 `session.status`
+        /`turn` 事件。於是「回合結束」的狀態事件被游標跳過,SSE 補送時又被 client
+        當重複丟掉,而 `set_status` 是邊緣觸發、永遠不會再送第二次 → 會話就永遠
+        卡在「執行中」。快照既然已是卡片的權威來源,狀態也一併給,才能讓
+        client 每次冷載/輪詢都無條件對帳回真值。
+        """
         ids = self.order
         if before_seq is not None:
             ids = [i for i in ids if self.card_seq.get(i, 0) < before_seq]
         ids = ids[-max(1, limit):]
         return {"cards": [self.cards[i] for i in ids if i in self.cards],
-                "latest_seq": self.seq}
+                "latest_seq": self.seq,
+                "status": dict(self.status or {})}
 
     def ping(self) -> dict:
         """keepalive 信封 — 不進 ring、不佔 seq。"""
