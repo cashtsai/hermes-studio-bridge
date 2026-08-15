@@ -22,8 +22,43 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import bridge  # noqa: E402
 
+# 安全閂:這個檔的 fixture 會 DELETE/INSERT canonical、registry 表。如果
+# bridge 被別的測試模組**先** import(setdefault 來不及生效),CANON_DB /
+# REGISTRY 會指向 production 路徑 —— 那時寧可整檔炸掉,也不准碰真 DB。
+# (2026-08-16 實錄:跨模組合跑一次就把 production approvals/agent_calls
+# 清掉了。這不是假想敵。)
+assert bridge.CANON_DB == os.environ["POCKET_CANON_DB"], \
+    "bridge 已被先 import,CANON_DB 指向非測試路徑;請單獨跑本測試檔"
+assert bridge.REGISTRY.db_path == os.environ["POCKET_REGISTRY_DB"], \
+    "bridge 已被先 import,REGISTRY 指向非測試路徑;請單獨跑本測試檔"
+assert bridge.KANBAN_DB == os.environ["POCKET_KANBAN_DB"], \
+    "bridge 已被先 import,KANBAN_DB 指向非測試路徑;請單獨跑本測試檔"
+
 KANBAN_DB = os.environ["POCKET_KANBAN_DB"]
+STATEDB_FIXTURE = os.path.join(_TMP, "hermes-state.db")
 NOW = time.time()
+
+
+def _init_statedb(rows=()):
+    """hermes state.db 的 async_delegations fixture(修 ①:委派持久兜底)。
+    只建看板 SELECT 會摸到的欄位。每次重建;預設空表=持久層活著但沒委派。"""
+    if os.path.exists(STATEDB_FIXTURE):
+        os.remove(STATEDB_FIXTURE)
+    con = sqlite3.connect(STATEDB_FIXTURE)
+    con.execute("""CREATE TABLE async_delegations(
+        delegation_id TEXT PRIMARY KEY, origin_session TEXT, state TEXT,
+        dispatched_at REAL, completed_at REAL, updated_at REAL,
+        result_json TEXT, task_json TEXT)""")
+    for r in rows:
+        cols = ", ".join(r.keys())
+        marks = ", ".join("?" for _ in r)
+        con.execute(f"INSERT INTO async_delegations({cols}) VALUES({marks})",
+                    list(r.values()))
+    con.commit()
+    con.close()
+
+
+_init_statedb()   # 預設 fixture:所有既有測試都在「持久層健康且空」下跑
 
 
 def _init_kanban(rows=()):
@@ -104,6 +139,8 @@ def _base_patches(**over):
     """預設把 live 源(cc/cx)靜音,單測各源不互相干擾。"""
     return [
         patch.object(bridge, "_check_auth", return_value=None),
+        patch.object(bridge, "STATE_DB",
+                     over.get("state_db", STATEDB_FIXTURE)),
         patch.object(bridge, "_cc_conf_rows",
                      return_value=over.get("cc_rows", [])),
         patch.object(bridge, "_cc_status_core",
@@ -239,6 +276,105 @@ class TestDelegationColumns(unittest.IsolatedAsyncioTestCase):
         self.assertIn("delegation:d7", running)
         self.assertIn("cx:tid-888", running)
         self.assertNotIn("cx:tid-777", running)   # 已由 delegation 卡代表
+
+
+class TestHermesDelegationPersistence(unittest.IsolatedAsyncioTestCase):
+    """修 ①:委派源的持久兜底 —— bridge 重啟後 canonical/記憶體是空的,
+    hermes state.db 的 async_delegations 必須把失敗委派留在 stuck 欄。"""
+
+    def tearDown(self):
+        _init_statedb()   # 別把持久層 rows 漏給別班測試
+
+    async def test_statedb_rows_mapped_to_columns(self):
+        """重啟情境:canonical 全空,只剩持久層 —— 四欄映射照譜來。"""
+        _init_kanban()
+        _clear_canon()
+        _clear_registry()
+        _init_statedb([
+            {"delegation_id": "h-pend", "origin_session": "yuanfang",
+             "state": "pending", "dispatched_at": NOW - 50},
+            {"delegation_id": "h-run", "origin_session": "yuanfang",
+             "state": "running", "dispatched_at": NOW - 100,
+             "task_json": '{"goal": "查資料\\n附帶第二行"}'},
+            {"delegation_id": "h-fin", "origin_session": "yuanfang",
+             "state": "finalizing", "dispatched_at": NOW - 90},
+            {"delegation_id": "h-err", "origin_session": "yuanfang",
+             "state": "error", "dispatched_at": NOW - 3600,
+             "completed_at": NOW - 3000,
+             "result_json": '{"status":"error","error":"TimeoutError: 卡死\\n第二行"}'},
+            {"delegation_id": "h-lost", "origin_session": "yuanfang",
+             "state": "unknown", "dispatched_at": NOW - 7200,
+             "completed_at": NOW - 7000},
+            {"delegation_id": "h-done", "origin_session": "yuanfang",
+             "state": "completed", "dispatched_at": NOW - 800,
+             "completed_at": NOW - 600},
+            {"delegation_id": "h-old", "origin_session": "yuanfang",
+             "state": "delivered", "dispatched_at": NOW - 86400 * 3,
+             "completed_at": NOW - 86400 * 2},
+        ])
+        res = await _board()
+        self.assertTrue(res["sources_ok"]["delegations"])
+        self.assertEqual(_col_ids(res, "queued"), ["delegation:h-pend"])
+        self.assertEqual(set(_col_ids(res, "running")),
+                         {"delegation:h-run", "delegation:h-fin"})
+        self.assertEqual(set(_col_ids(res, "stuck")),
+                         {"delegation:h-err", "delegation:h-lost"})
+        self.assertEqual(_col_ids(res, "done"), ["delegation:h-done"])
+        # 24h 窗外的完成不上板。
+        for col in res["columns"].values():
+            self.assertNotIn("delegation:h-old", [c["id"] for c in col])
+        # stuck 卡帶 result_json 錯誤**首行**;標題取 task_json goal 首行。
+        stuck = {c["id"]: c for c in res["columns"]["stuck"]}
+        self.assertIn("TimeoutError: 卡死", stuck["delegation:h-err"]["detail"])
+        self.assertNotIn("第二行", stuck["delegation:h-err"]["detail"])
+        running = {c["id"]: c for c in res["columns"]["running"]}
+        self.assertEqual(running["delegation:h-run"]["title"], "查資料")
+
+    async def test_dedup_by_delegation_id_memory_wins(self):
+        """canonical(記憶體側,較新鮮)與 DB 同 id → 只出 canonical 那張。
+        canonical 說 running、DB 舊資料說 error:板上是 running,不是 stuck。"""
+        _init_kanban()
+        _clear_canon()
+        _clear_registry()
+        _insert_delegation("dd-1", "running", title="還在跑的")
+        _init_statedb([
+            {"delegation_id": "dd-1", "origin_session": "yuanfang",
+             "state": "error", "dispatched_at": NOW - 500,
+             "result_json": '{"error":"舊的失敗紀錄"}'},
+            {"delegation_id": "dd-2", "origin_session": "yuanfang",
+             "state": "error", "dispatched_at": NOW - 400,
+             "completed_at": NOW - 300, "result_json": '{"error":"真的掛了"}'},
+        ])
+        res = await _board()
+        self.assertEqual(_col_ids(res, "running"), ["delegation:dd-1"])
+        self.assertEqual(_col_ids(res, "stuck"), ["delegation:dd-2"])
+        all_ids = sum((_col_ids(res, c) for c in res["columns"]), [])
+        self.assertEqual(all_ids.count("delegation:dd-1"), 1, "同 id 只能一張卡")
+
+    async def test_statedb_broken_degrades_but_keeps_canonical(self):
+        """持久層壞掉:canonical 卡照出(不吞卡),sources_ok.delegations
+        誠實標 false(維持既有降級語意)。"""
+        _init_kanban()
+        _clear_canon()
+        _clear_registry()
+        _insert_delegation("d-mem", "failed", title="記憶體側的失敗",
+                           last_error="exit 9")
+        res = await _board(state_db="/nonexistent/state.db")
+        self.assertFalse(res["sources_ok"]["delegations"])
+        self.assertEqual(_col_ids(res, "stuck"), ["delegation:d-mem"])
+        self.assertIn("exit 9", res["columns"]["stuck"][0]["detail"])
+
+    async def test_statedb_missing_table_degrades(self):
+        """檔案在但表不在(舊版 hermes)→ 同樣只降級,不 500、不吞 canonical。"""
+        _init_kanban()
+        _clear_canon()
+        _clear_registry()
+        _insert_delegation("d-ok", "running", title="活著的")
+        bare = os.path.join(_TMP, "bare-state.db")
+        sqlite3.connect(bare).close()
+        res = await _board(state_db=bare)
+        self.assertFalse(res["sources_ok"]["delegations"])
+        self.assertEqual(_col_ids(res, "running"), ["delegation:d-ok"])
 
 
 class TestRegistryAndLiveColumns(unittest.IsolatedAsyncioTestCase):

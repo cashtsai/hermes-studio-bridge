@@ -6780,6 +6780,99 @@ def _cx_latest_card_text(thread_id: str) -> str:
     return ""
 
 
+# ── CX 列表預覽的持久兜底(修 ②,接 PR #95)────────────────────────────────
+# PR #95 的預覽覆蓋(digest 最新卡)只在 digest 已在記憶體時生效 → bridge
+# 重啟後列表預覽退回開場白,直到有人開那條 session。這裡加一層便宜的持久
+# 兜底:digest 每收到新卡,把「最新卡文字前 120 字 + ts」節流寫進 bridge
+# **自家的**輕量快取檔(不是 production DB,可寫;原子寫 + LRU 上限)。
+# 列表路徑:記憶體 digest 有→用它;沒有→查快取;都沒有→維持開場白現狀。
+CX_PREVIEW_CACHE_PATH = os.path.expanduser(os.environ.get(
+    "POCKET_CX_PREVIEW_CACHE", "~/.pocket/cx-previews.json"))
+CX_PREVIEW_CACHE_MAX = 200          # LRU 上限(條)
+CX_PREVIEW_WRITE_MIN_SECS = 30.0    # 每 thread 寫盤節流(熱串流別狂寫盤)
+CX_PREVIEW_TEXT_CHARS = 120
+
+_CX_PREVIEW_CACHE: dict | None = None   # thread_id -> {"text","ts"};None=未載入
+_CX_PREVIEW_LAST_WRITE: dict = {}       # thread_id -> monotonic(節流基準)
+_CX_PREVIEW_LOCK = threading.Lock()
+
+
+def _cx_preview_cache_load() -> dict:
+    """惰性載入快取檔(dict 插入序=LRU 序)。檔案缺席/毀損 → 空快取,
+    絕不拋 —— 兜底層自己不能成為新的故障點。"""
+    global _CX_PREVIEW_CACHE
+    if _CX_PREVIEW_CACHE is not None:
+        return _CX_PREVIEW_CACHE
+    data: dict = {}
+    try:
+        with open(CX_PREVIEW_CACHE_PATH, encoding="utf-8") as f:
+            raw = json.load(f)
+        if isinstance(raw, dict):
+            for tid, ent in raw.items():
+                if not (isinstance(tid, str) and isinstance(ent, dict)):
+                    continue
+                text = str(ent.get("text") or "").strip()
+                if not text:
+                    continue
+                try:
+                    ts = float(ent.get("ts") or 0.0)
+                except (TypeError, ValueError):
+                    ts = 0.0
+                data[tid] = {"text": text[:CX_PREVIEW_TEXT_CHARS], "ts": ts}
+    except FileNotFoundError:
+        pass
+    except Exception as _exc:  # noqa: BLE001 —— 毀損檔=空快取,下次寫入自癒
+        _log_exc("_cx_preview_cache_load", _exc, expected=True)
+    _CX_PREVIEW_CACHE = data
+    return data
+
+
+def _cx_preview_cache_get(thread_id: str) -> str:
+    ent = _cx_preview_cache_load().get(thread_id)
+    return str((ent or {}).get("text") or "")
+
+
+def _cx_preview_cache_note(thread_id: str) -> None:
+    """digest 收到新卡 → 把最新卡文字寫進持久快取(節流+原子寫+LRU)。
+    失敗只記 log,絕不影響餵卡路徑。"""
+    if not thread_id:
+        return
+    now_mono = time.monotonic()
+    with _CX_PREVIEW_LOCK:
+        last = _CX_PREVIEW_LAST_WRITE.get(thread_id)
+        if last is not None and now_mono - last < CX_PREVIEW_WRITE_MIN_SECS:
+            return
+        text = _cx_latest_card_text(thread_id)[:CX_PREVIEW_TEXT_CHARS].strip()
+        if not text:
+            return
+        cache = _cx_preview_cache_load()
+        prev = cache.get(thread_id)
+        if prev is not None and prev.get("text") == text:
+            return                      # 沒新內容,不耗一次寫盤配額
+        cache.pop(thread_id, None)      # 重插到尾端 = LRU 最新
+        cache[thread_id] = {"text": text, "ts": time.time()}
+        while len(cache) > CX_PREVIEW_CACHE_MAX:
+            cache.pop(next(iter(cache)))
+        _CX_PREVIEW_LAST_WRITE[thread_id] = now_mono
+        try:
+            os.makedirs(os.path.dirname(CX_PREVIEW_CACHE_PATH), exist_ok=True)
+            tmp = CX_PREVIEW_CACHE_PATH + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(cache, f, ensure_ascii=False)
+            os.replace(tmp, CX_PREVIEW_CACHE_PATH)
+        except Exception as _exc:  # noqa: BLE001 —— 寫不進盤只損失兜底,不能炸餵卡
+            _log_exc("_cx_preview_cache_note", _exc, expected=True)
+
+
+def _cx_list_preview_text(thread_id: str) -> str:
+    """列表預覽的優先序:記憶體 digest(最新鮮)→ 持久快取(重啟後兜底)
+    → 空字串(呼叫端維持 provider 開場白現狀)。"""
+    text = _cx_latest_card_text(thread_id)
+    if text:
+        return text[:180]
+    return _cx_preview_cache_get(thread_id)
+
+
 def _codex_enrich_summary(summary: dict) -> dict:
     tid = summary.get("thread_id") or summary.get("id") or ""
     summary["appServerAlive"] = CODEX_APP.is_server_alive()
@@ -6807,10 +6900,11 @@ def _codex_enrich_summary(summary: dict) -> dict:
     # first_user_message 一字不差),不是「最新訊息」。bridge 原封轉給 app 當
     # 對話預覽 → 那條 thread 不管後來聊了什麼,列表永遠顯示第一句話。
     # 有卡片流 digest 的(= 使用者實際開過、也正是會注意到預覽的那些)就拿
-    # 最新一張卡的文字覆蓋;沒有 digest 就維持原樣,不為了預覽多打一次 API。
-    latest = _cx_latest_card_text(tid)
+    # 最新一張卡的文字覆蓋;digest 不在(bridge 剛重啟)就查自家持久快取;
+    # 都沒有才維持原樣,不為了預覽多打一次 API。
+    latest = _cx_list_preview_text(tid)
     if latest:
-        summary["preview"] = latest[:180]
+        summary["preview"] = latest
     if tid in CODEX_APP.last_event_at:
         summary["lastEventAt"] = CODEX_APP.last_event_at[tid]
         # updatedAt 取較新者。thread/list 回的 updatedAt 會落後很多(2026-08-15
@@ -15498,6 +15592,9 @@ def _cx_cards_feed(method: str, params: dict) -> None:
     d = _CX_CARD_DIGESTS.get(tid) if tid else None
     if d:
         d.handle(method, params)
+        # 修 ②:最新卡文字進持久快取(內部有 30s/thread 節流,熱串流的
+        # delta 洪水只會偶爾真的落盤)。
+        _cx_preview_cache_note(tid)
 
 
 def _cx_cards_feed_approval(record: dict, resolved: str = "") -> None:
@@ -15699,6 +15796,7 @@ def _cx_feed_input_accepted(thread_id: str, client_id: str | None, text: str,
     # transcript 回顯 digest 成卡(card-cx-<uuid>),accepted 晚到再開一張=
     # 同句兩顆泡泡。CC 同款 race 用 absorb 反向合併,cx 一直沒接上。
     d.store.upsert_card(carddigest.absorb_echo_into_accepted(d.store, card))
+    _cx_preview_cache_note(thread_id)   # 修 ②:使用者剛送的話也算最新預覽
 
 
 async def _cx_seed_card_digest(thread_id: str, d, required: bool = False) -> None:
@@ -15737,6 +15835,9 @@ async def _cx_seed_card_digest(thread_id: str, d, required: bool = False) -> Non
             d.handle_approval(rec)
         d.seeded = True
         d.last_seed_at = now
+        # 修 ②:seed 完(= 剛把桌面端進度補齊)也刷新持久快取,重啟後只要
+        # 有人開過一次 session,之後的列表預覽就不再依賴記憶體。
+        _cx_preview_cache_note(thread_id)
     except Exception as e:  # noqa: BLE001
         # 即使 canonical seed 失敗，也不能丟掉等待中的 live 事件；讓事件先
         # 正常落地，下一次 request 再重試 seed。
@@ -19469,11 +19570,107 @@ def _tb_kanban_cards(now: float) -> list:
     return out
 
 
+def _tb_hermes_deleg_error(raw) -> str:
+    """async_delegations.result_json → 給人看的錯誤首行。JSON dict 取
+    error(退 summary),非 JSON 當純文字;取首行,取不到回空字串。"""
+    txt = str(raw or "").strip()
+    if not txt:
+        return ""
+    try:
+        obj = json.loads(txt)
+        if isinstance(obj, dict):
+            txt = str(obj.get("error") or obj.get("summary") or "").strip()
+        else:
+            txt = str(obj).strip()
+    except (TypeError, ValueError):
+        pass
+    lines = txt.splitlines()
+    return lines[0].strip() if lines else ""
+
+
+def _tb_hermes_deleg_title(d: dict) -> str:
+    """task_json 的 goal(批次取第一條+數量)→ 標題;缺就退 origin/id。"""
+    try:
+        task = json.loads(d.get("task_json") or "{}")
+    except (TypeError, ValueError):
+        task = {}
+    if isinstance(task, dict):
+        goal = str(task.get("goal") or "").strip()
+        if not goal:
+            goals = task.get("goals")
+            if isinstance(goals, list) and goals:
+                goal = str(goals[0] or "").strip()
+                if goal and len(goals) > 1:
+                    goal += f" 等 {len(goals)} 項"
+        if goal:
+            return goal.splitlines()[0]
+    origin = str(d.get("origin_session") or "").strip()
+    return (f"{origin} 的背景委派" if origin
+            else str(d.get("delegation_id") or ""))
+
+
+def _tb_hermes_delegation_cards(now: float, seen_ids: set) -> list:
+    """hermes gateway 自己的背景委派(state.db `async_delegations`,唯讀)→ 卡。
+
+    這是委派源的**持久兜底**:bridge 重啟後 canonical/記憶體那份可能是空的
+    (2026-08-16 實錄:stuck 欄兩筆失敗委派重啟後消失),而 async_delegations
+    是 hermes 的持久層 —— 失敗的委派必須在重啟後仍然浮在 stuck 欄。已被
+    canonical 列涵蓋的 delegation_id 跳過(canonical/記憶體較新鮮,DB 兜底)。
+
+    state 映射(hermes 端 dispatch 寫 'running',完成寫 completion status,
+    孤兒回收寫 'unknown';相容規劃詞彙 pending/created/failed/done/delivered):
+      pending/created → queued;running/finalizing → running;
+      failed/error/unknown → stuck(帶 result_json 錯誤首行);
+      done/delivered/completed 近 24h → done。其他狀態不上板(寧缺毋濫)。"""
+    rows = _tb_ro_rows(
+        STATE_DB,
+        "SELECT delegation_id,origin_session,state,dispatched_at,"
+        "completed_at,result_json,task_json FROM async_delegations"
+        " ORDER BY dispatched_at DESC LIMIT 200")
+    out = []
+    for r in rows:
+        d = dict(r)
+        did = str(d.get("delegation_id") or "")
+        if not did or did in seen_ids:
+            continue
+        st = str(d.get("state") or "").lower()
+        cid = f"delegation:{did}"
+        title = _tb_hermes_deleg_title(d)
+        origin = str(d.get("origin_session") or "").strip()
+        dispatched = _tb_ts(d.get("dispatched_at"))
+        completed = _tb_ts(d.get("completed_at"))
+        if st in ("pending", "created"):
+            out.append(_tb_card(cid, "delegation", title, "queued",
+                                since_ts=dispatched,
+                                detail="委派已建立"
+                                       + (f" · {origin}" if origin else "")))
+        elif st in ("running", "finalizing"):
+            out.append(_tb_card(cid, "delegation", title, "running",
+                                since_ts=dispatched,
+                                detail=(origin or "hermes") + " 背景委派執行中"))
+        elif st in ("failed", "error", "unknown"):
+            err = _tb_hermes_deleg_error(d.get("result_json"))
+            out.append(_tb_card(cid, "delegation", title, "stuck",
+                                since_ts=completed or dispatched,
+                                detail=("失敗:" + err) if err else "委派失敗"))
+        elif st in ("done", "delivered", "completed"):
+            done_ts = completed or dispatched
+            if done_ts and done_ts >= now - TB_DONE_WINDOW:
+                out.append(_tb_card(cid, "delegation", title, "done",
+                                    since_ts=done_ts, detail="已完成"))
+    return out
+
+
 def _tb_delegation_cards(now: float) -> tuple:
-    """delegations → 卡 + (被委派的 CX thread id 集合, CC session 名集合)。
-    後兩者給 cc/cx live 源去重 —— 同一件工作不能同時以兩張卡出現。
+    """delegations → (卡, 被委派的 CX thread id 集合, CC session 名集合,
+    hermes 持久層是否讀成功)。cx/cc 集合給 live 源去重 —— 同一件工作不能
+    同時以兩張卡出現。
     判定:created→queued;running→running;failed→stuck;idle/done 近 24h
-    →done;archived 不上板。用 DB 存的狀態(單源自足,不倚賴 CX/CC 源活著)。"""
+    →done;archived 不上板。用 DB 存的狀態(單源自足,不倚賴 CX/CC 源活著)。
+    canonical 讀完再併 hermes state.db 的 async_delegations(持久兜底,見
+    _tb_hermes_delegation_cards),以 delegation_id 去重、canonical 優先;
+    持久層壞掉不吞卡 —— canonical 卡照出,回 hermes_ok=False 讓呼叫端把
+    sources_ok.delegations 標降級(維持既有降級語意)。"""
     rows = _tb_ro_rows(
         CANON_DB,
         "SELECT id,work_order,parent_persona,provider,title,status,"
@@ -19481,8 +19678,10 @@ def _tb_delegation_cards(now: float) -> tuple:
         "updated_at,last_error FROM delegations"
         " ORDER BY updated_at DESC LIMIT 200")
     out, cx_tids, cc_names = [], set(), set()
+    seen_ids: set = set()
     for r in rows:
         d = dict(r)
+        seen_ids.add(str(d.get("id") or ""))
         if d.get("provider") == "codex":
             cx_tids.add(d.get("codex_thread_id") or d.get("provider_session_id") or "")
         elif d.get("provider") == "claude_code":
@@ -19517,7 +19716,14 @@ def _tb_delegation_cards(now: float) -> tuple:
         # 其他未知狀態不上板。
     cx_tids.discard("")
     cc_names.discard("")
-    return out, cx_tids, cc_names
+    hermes_ok = True
+    try:
+        out.extend(_tb_hermes_delegation_cards(now, seen_ids))
+    except Exception as e:  # noqa: BLE001 —— 持久層壞了:canonical 卡照出,誠實降級
+        hermes_ok = False
+        _log_event("taskboard_source_failed", source="delegations_hermes",
+                   error=type(e).__name__, error_message=str(e)[:200])
+    return out, cx_tids, cc_names, hermes_ok
 
 
 def _tb_registry_cards(now: float) -> list:
@@ -19650,15 +19856,22 @@ async def v2_taskboard(request: Request):
             _log_event("taskboard_source_failed", source=key,
                        error=type(e).__name__, error_message=str(e)[:200])
 
+    hermes_deleg_ok = True
+
     def _delegations():
-        nonlocal skip_tids, skip_names
-        dcards, skip_tids, skip_names = _tb_delegation_cards(now)
+        nonlocal skip_tids, skip_names, hermes_deleg_ok
+        dcards, skip_tids, skip_names, hermes_deleg_ok = \
+            _tb_delegation_cards(now)
         return dcards
 
     # sqlite 源(全 mode=ro + 2s timeout)。delegations 先跑:它同時產出
     # cc/cx live 源的去重集合(委派的工作只以 delegation 卡出現一次)。
     _collect("kanban", lambda: _tb_kanban_cards(now))
     _collect("delegations", _delegations)
+    if sources_ok.get("delegations") and not hermes_deleg_ok:
+        # 修 ①:hermes 持久層(async_delegations)讀不到 —— canonical 卡
+        # 照出,但這源不完整,誠實標降級(與既有單源降級語意一致)。
+        sources_ok["delegations"] = False
     _collect("registry", lambda: _tb_registry_cards(now))
     _collect("approvals", lambda: _tb_approval_stuck_cards(now))
 
