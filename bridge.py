@@ -6839,6 +6839,21 @@ def _codex_http_error(e: Exception):
             raise http_err(409, "CX_WRONG_DECISION_SHAPE",
                            "codex server request 需要作答而不是核准", str(e))
         if e.code == -32600:
+            # 第三種 -32600(2026-08-15,Cashcamp 事故):**thread not found**。
+            # 桌面版(0.148-alpha)動過 thread-store 後,條目會從 local_thread_catalog
+            # 消失,daemon(0.147)按目錄找不到 → 舊路徑翻成「這一輪還在執行」,
+            # 使用者對著一條「待命」的 session 收到「還在跑」——第三次語意相反。
+            # 真相是「對話在 codex 端找不到了」,而且**通常 daemon restart 就能修**
+            # (rollout 檔都在,重啟會重掃目錄;8/15 實測 0→1 筆復活)。
+            if "thread not found" in str(e).lower():
+                # 快取的 loaded 標記已不可信,踢掉讓下次重走 resume。
+                tid_nf = _CX_THREAD_ID_RE.search(str(e))
+                if tid_nf:
+                    CODEX_APP.loaded_threads.discard(tid_nf.group(0))
+                raise http_err(404, "CX_THREAD_NOT_FOUND",
+                               "這條對話在 codex 端找不到(可能桌面版更新後目錄"
+                               "遺失)。多半重啟 codex daemon 即可復原:"
+                               "codex app-server daemon restart", str(e))
             # -32600 是 codex 的**泛用** Invalid request 碼:既是「上一輪正在跑」
             # 也是「你的參數不合法」。参數類必須先攔下來 —— 否則 schema 一漂移
             # (例:0.147 拿掉 approvalPolicy 的 `on-failure`),使用者按下去會收到
