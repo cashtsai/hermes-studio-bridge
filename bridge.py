@@ -17789,6 +17789,7 @@ async def capabilities(request: Request):
                           "/app/v2/hermes/media-capabilities",
                           "/app/v2/hermes/media-settings",
                           "/app/v2/sessions/{id}/approve", "/app/v1/terminal",
+                          "/app/v2/taskboard",
                           "/app/v1/usage", "/app/v1/dashboard",
                           "/app/v1/openclaw/config"] +
                          (["/app/v2/sessions/{id}/proposals/calendar",
@@ -19044,6 +19045,352 @@ async def app_get_message_events(session: str, request: Request,
                 pass
 
     return StreamingResponse(gen(), media_type="text/event-stream")
+
+
+# ─────────────────── 任務看板聚合器(spec §6-1,Pocket 儀表板)──────────────
+# 把散在五處的「任務狀態」一次聚成四欄 queued/running/stuck/done 回給 app:
+#   1. hermes kanban.db(tasks 表)      4. CC live sessions(busy)
+#   2. bridge delegations(canonical)   5. CX live threads(runtimeStatus)
+#   3. agent_calls 互調帳本(registry)  (+ approvals 表的待核准超時)
+# 產品鐵律:使用者永遠知道進度與狀態;「stuck」欄是靈魂 —— 認領逾期、連續
+# 失敗、blocked、委派 failed、CX 鎖死/停滯、待核准超過 10 分鐘都要浮上來。
+# 全部資料源**唯讀**(sqlite 一律 mode=ro + 2s timeout);單一源壞掉降級為
+# 缺席(sources_ok 標明哪些源活著),絕不拖垮整個端點。無背景輪詢/常駐:
+# 一次請求全算。
+
+KANBAN_DB = os.environ.get("POCKET_KANBAN_DB") \
+    or os.path.expanduser("~/apps/hermes-agent/home/kanban.db")
+TB_SQLITE_TIMEOUT = 2.0          # 唯讀查詢逾時(秒)
+TB_DONE_WINDOW = 86400.0         # done 欄只收近 24h 完成的
+TB_APPROVAL_STUCK_SECS = 600.0   # CC/CX 待核准超過 10 分鐘 → stuck
+TB_ASYNC_SOURCE_TIMEOUT = 6.0    # cc/cx live 源的單源時間上限(秒)
+
+# kanban 狀態詞彙(hermes_cli/kanban_db.py VALID_STATUSES)→ 四欄映射的
+# 「排隊中」集合。歷史庫可能還有 'queued' 舊值,一併收。
+_TB_KANBAN_QUEUED = {"triage", "todo", "scheduled", "ready", "queued"}
+
+
+def _tb_ts(val):
+    """epoch 欄位寬容轉 float;NULL/垃圾 → None(絕不為一格爛資料拋錯)。"""
+    try:
+        f = float(val)
+        return f if f > 0 else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _tb_card(cid: str, source: str, title: str, state: str, *,
+             since_ts=None, session_ref: str | None = None,
+             detail: str = "") -> dict:
+    return {"id": cid, "source": source, "title": (title or "")[:120] or cid,
+            "state": state, "since_ts": since_ts,
+            "session_ref": session_ref, "detail": (detail or "")[:200]}
+
+
+def _tb_ro_rows(db_path: str, sql: str, args=()) -> list:
+    """唯讀 sqlite 查詢:mode=ro(連寫的可能都沒有)+ 2s timeout。
+    檔案不存在/表不存在/鎖死超時 → 直接拋,由呼叫端把該源標成 degraded。"""
+    import sqlite3
+    con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True,
+                          timeout=TB_SQLITE_TIMEOUT)
+    try:
+        con.row_factory = sqlite3.Row
+        return con.execute(sql, args).fetchall()
+    finally:
+        con.close()
+
+
+def _tb_kanban_cards(now: float) -> list:
+    """kanban tasks → 卡。判定規則(順序即優先序):
+    done 近 24h → done;review → done(待驗收,不設時窗 —— 等人收貨的東西
+    不該自己消失);consecutive_failures>0 → stuck;blocked/failed → stuck;
+    running 且 claim_expires 已過 → stuck(認領逾期=心跳斷);running → running;
+    其餘(triage/todo/scheduled/ready)→ queued。archived/cancelled 不上板。"""
+    rows = _tb_ro_rows(
+        KANBAN_DB,
+        "SELECT id,title,assignee,status,priority,claim_expires,"
+        "consecutive_failures,worker_pid,created_at,started_at,completed_at,"
+        "last_heartbeat_at,last_failure_error,result FROM tasks"
+        " WHERE status NOT IN ('archived','cancelled')"
+        " ORDER BY id DESC LIMIT 200")
+    out = []
+    for r in rows:
+        d = dict(r)
+        st = str(d.get("status") or "").lower()
+        cid = f"kanban:{d.get('id')}"
+        title = d.get("title") or cid
+        created = _tb_ts(d.get("created_at"))
+        started = _tb_ts(d.get("started_at"))
+        fails = int(d.get("consecutive_failures") or 0)
+        if st == "done":
+            completed = _tb_ts(d.get("completed_at")) or started or created
+            if completed and completed >= now - TB_DONE_WINDOW:
+                out.append(_tb_card(cid, "kanban", title, "done",
+                                    since_ts=completed, detail="已完成"))
+            continue
+        if st == "review":
+            out.append(_tb_card(cid, "kanban", title, "done",
+                                since_ts=_tb_ts(d.get("completed_at")) or started or created,
+                                detail="review 待驗收"))
+            continue
+        if fails > 0:
+            err = (d.get("last_failure_error") or "").strip().splitlines()
+            out.append(_tb_card(cid, "kanban", title, "stuck",
+                                since_ts=_tb_ts(d.get("last_heartbeat_at")) or started or created,
+                                detail=f"連續失敗 {fails} 次" + (f":{err[0]}" if err else "")))
+            continue
+        if st in ("blocked", "failed"):
+            err = (d.get("last_failure_error") or "").strip().splitlines()
+            out.append(_tb_card(cid, "kanban", title, "stuck",
+                                since_ts=started or created,
+                                detail=(f"failed:{err[0]}" if st == "failed" and err
+                                        else st)))
+            continue
+        if st == "running":
+            claim_exp = _tb_ts(d.get("claim_expires"))
+            if claim_exp is not None and claim_exp <= now:
+                out.append(_tb_card(cid, "kanban", title, "stuck",
+                                    since_ts=claim_exp,
+                                    detail="認領逾期(心跳斷)"))
+            else:
+                who = d.get("assignee") or "?"
+                out.append(_tb_card(cid, "kanban", title, "running",
+                                    since_ts=started or created,
+                                    detail=f"{who} 執行中"))
+            continue
+        if st in _TB_KANBAN_QUEUED:
+            pr = d.get("priority")
+            out.append(_tb_card(cid, "kanban", title, "queued",
+                                since_ts=created,
+                                detail=st + (f" · P{pr}" if pr is not None else "")))
+        # 其他未知狀態:不猜,不上板(寧缺毋濫)。
+    return out
+
+
+def _tb_delegation_cards(now: float) -> tuple:
+    """delegations → 卡 + (被委派的 CX thread id 集合, CC session 名集合)。
+    後兩者給 cc/cx live 源去重 —— 同一件工作不能同時以兩張卡出現。
+    判定:created→queued;running→running;failed→stuck;idle/done 近 24h
+    →done;archived 不上板。用 DB 存的狀態(單源自足,不倚賴 CX/CC 源活著)。"""
+    rows = _tb_ro_rows(
+        CANON_DB,
+        "SELECT id,work_order,parent_persona,provider,title,status,"
+        "provider_session_id,codex_thread_id,cc_session_name,created_at,"
+        "updated_at,last_error FROM delegations"
+        " ORDER BY updated_at DESC LIMIT 200")
+    out, cx_tids, cc_names = [], set(), set()
+    for r in rows:
+        d = dict(r)
+        if d.get("provider") == "codex":
+            cx_tids.add(d.get("codex_thread_id") or d.get("provider_session_id") or "")
+        elif d.get("provider") == "claude_code":
+            cc_names.add(d.get("cc_session_name") or d.get("provider_session_id") or "")
+        st = str(d.get("status") or "created").lower()
+        if st == "archived":
+            continue
+        cid = f"delegation:{d.get('id')}"
+        ref = f"delegation:{d.get('id')}"
+        title = d.get("title") or d.get("work_order") or cid
+        wo = d.get("work_order") or ""
+        created = _tb_ts(d.get("created_at"))
+        updated = _tb_ts(d.get("updated_at"))
+        if st == "created":
+            out.append(_tb_card(cid, "delegation", title, "queued",
+                                since_ts=created, session_ref=ref,
+                                detail=f"委派已建立 {wo}".strip()))
+        elif st == "running":
+            out.append(_tb_card(cid, "delegation", title, "running",
+                                since_ts=updated or created, session_ref=ref,
+                                detail=f"{d.get('provider')} 執行中"))
+        elif st == "failed":
+            err = (d.get("last_error") or "").strip().splitlines()
+            out.append(_tb_card(cid, "delegation", title, "stuck",
+                                since_ts=updated or created, session_ref=ref,
+                                detail=("失敗:" + err[0]) if err else "委派失敗"))
+        elif st in ("idle", "done"):
+            if updated and updated >= now - TB_DONE_WINDOW:
+                out.append(_tb_card(cid, "delegation", title, "done",
+                                    since_ts=updated, session_ref=ref,
+                                    detail="已完成"))
+        # 其他未知狀態不上板。
+    cx_tids.discard("")
+    cc_names.discard("")
+    return out, cx_tids, cc_names
+
+
+def _tb_registry_cards(now: float) -> list:
+    """agent_calls 互調帳本:status='running' 的 call = 進行中的互調 →
+    running 欄(誰在替誰跑腿,看板要看得到)。sent/done/denied 不上板 ——
+    完成的互調屬於 session 自己的敘事,不是任務。"""
+    rows = _tb_ro_rows(
+        REGISTRY.db_path,
+        "SELECT id,caller,target,mode,message,status,created_ts,updated_ts"
+        " FROM agent_calls WHERE status='running'"
+        " ORDER BY created_ts DESC LIMIT 100")
+    out = []
+    for r in rows:
+        d = dict(r)
+        target = str(d.get("target") or "")
+        ref = target if target.startswith(
+            ("claude_code:", "codex:", "hermes:", "delegation:", "openclaw:")) else None
+        msg = (d.get("message") or "").strip().splitlines()
+        out.append(_tb_card(f"call:{d.get('id')}", "registry",
+                            f"{d.get('caller')} → {target}", "running",
+                            since_ts=_tb_ts(d.get("created_ts")),
+                            session_ref=ref,
+                            detail=msg[0] if msg else "agent 互調中"))
+    return out
+
+
+def _tb_approval_stuck_cards(now: float) -> list:
+    """CC/CX 的 pending approval 掛超過 10 分鐘 → stuck(球在使用者身上太久
+    =任務實質卡住,而且使用者八成不知道)。讀 canonical approvals 表(watcher
+    /codex 線都會落列),不碰 in-memory 狀態 —— 單源自足。"""
+    rows = _tb_ro_rows(
+        CANON_DB,
+        "SELECT id,title,session_id,provider,created_at FROM approvals"
+        " WHERE status='pending' AND created_at<=?"
+        " AND (provider IN ('claude_code','codex')"
+        "      OR session_id LIKE 'claude_code:%' OR session_id LIKE 'codex:%')"
+        " ORDER BY created_at ASC LIMIT 50",
+        (now - TB_APPROVAL_STUCK_SECS,))
+    out = []
+    for r in rows:
+        d = dict(r)
+        prov = d.get("provider") or ""
+        sid = d.get("session_id") or ""
+        src = "cc" if (prov == "claude_code" or sid.startswith("claude_code:")) else "cx"
+        created = _tb_ts(d.get("created_at"))
+        mins = int((now - created) // 60) if created else "?"
+        out.append(_tb_card(f"approval:{d.get('id')}", src,
+                            d.get("title") or "待核准請求", "stuck",
+                            since_ts=created, session_ref=sid or None,
+                            detail=f"待核准已 {mins} 分鐘"))
+    return out
+
+
+async def _tb_cc_cards(now: float, skip_names: set) -> list:
+    """CC live sessions:busy(executing)→ running。idle/掛掉不上板(session
+    本身不是任務);待核准的 stuck 判定走 approvals 表(_tb_approval_stuck_cards),
+    這裡不重複。被委派接管的 session 由 delegation 卡代表,跳過。"""
+    out = []
+    for name, workdir, enabled in _cc_conf_rows():
+        if enabled != "1" or name in skip_names:
+            continue
+        st = await _cc_status_core(name)
+        if st.get("busy"):
+            out.append(_tb_card(f"cc:{name}", "cc", name, "running",
+                                since_ts=None,
+                                session_ref=f"claude_code:{name}",
+                                detail=f"執行中 · {workdir}"))
+    return out
+
+
+async def _tb_cx_cards(now: float, skip_tids: set) -> list:
+    """CX live threads:runtimeStatus running / activeTurn → running;
+    locked(thread-store 寫入鎖)→ stuck;stalled(回合停滯超過門檻)→ stuck;
+    failed → stuck;waiting_approval → running(球剛到使用者手上;超過 10 分
+    鐘由 approvals 源升級成 stuck,組裝端會去重)。委派中的 thread 跳過。"""
+    out = []
+    for t in await _codex_v2_visible_threads(20):
+        s = _codex_enrich_summary(_codex_session_summary(t))
+        tid = s.get("thread_id") or s.get("id") or ""
+        if not tid or tid in skip_tids:
+            continue
+        ref = f"codex:{tid}"
+        title = s.get("name") or "codex"
+        rst = s.get("runtimeStatus") or "idle"
+        if s.get("locked"):
+            out.append(_tb_card(f"cx:{tid}", "cx", title, "stuck",
+                                since_ts=_tb_ts(s.get("lockedSince")),
+                                session_ref=ref,
+                                detail=s.get("lockMessage") or "thread 被寫入鎖鎖住"))
+        elif rst == "stalled":
+            out.append(_tb_card(f"cx:{tid}", "cx", title, "stuck",
+                                since_ts=_tb_ts(s.get("lastEventAt")),
+                                session_ref=ref, detail="回合停滯(事件斷流)"))
+        elif rst == "failed":
+            err = (s.get("error") or "").strip().splitlines()
+            out.append(_tb_card(f"cx:{tid}", "cx", title, "stuck",
+                                since_ts=_tb_ts(s.get("lastEventAt")),
+                                session_ref=ref,
+                                detail=("失敗:" + err[0]) if err else "回合失敗"))
+        elif rst == "running" or s.get("activeTurn"):
+            out.append(_tb_card(f"cx:{tid}", "cx", title, "running",
+                                since_ts=_tb_ts(s.get("lastEventAt")),
+                                session_ref=ref, detail="回合進行中"))
+        elif rst == "waiting_approval":
+            out.append(_tb_card(f"cx:{tid}", "cx", title, "running",
+                                since_ts=_tb_ts(s.get("lastEventAt")),
+                                session_ref=ref, detail="等待核准"))
+        # idle/done 不上板(session 不是任務;完成敘事歸 kanban/delegation)。
+    return out
+
+
+@app.get("/app/v2/taskboard")
+async def v2_taskboard(request: Request):
+    """任務看板聚合器:五源唯讀、一次請求全算、單源失敗降級為缺席。
+    回應:{generated_at, sources_ok, columns:{queued,running,stuck,done}, counts}。
+    卡片:{id, source, title, state, since_ts, session_ref, detail}。"""
+    _check_auth(request)
+    now = time.time()
+    cards: list = []
+    sources_ok: dict = {}
+    skip_tids: set = set()
+    skip_names: set = set()
+
+    def _collect(key: str, fn):
+        try:
+            cards.extend(fn())
+            sources_ok[key] = True
+        except Exception as e:  # noqa: BLE001 —— 單源壞掉只降級,絕不 500
+            sources_ok[key] = False
+            _log_event("taskboard_source_failed", source=key,
+                       error=type(e).__name__, error_message=str(e)[:200])
+
+    def _delegations():
+        nonlocal skip_tids, skip_names
+        dcards, skip_tids, skip_names = _tb_delegation_cards(now)
+        return dcards
+
+    # sqlite 源(全 mode=ro + 2s timeout)。delegations 先跑:它同時產出
+    # cc/cx live 源的去重集合(委派的工作只以 delegation 卡出現一次)。
+    _collect("kanban", lambda: _tb_kanban_cards(now))
+    _collect("delegations", _delegations)
+    _collect("registry", lambda: _tb_registry_cards(now))
+    _collect("approvals", lambda: _tb_approval_stuck_cards(now))
+
+    # live 源(async;單源掛掉/超時同樣只降級)。
+    for key, coro in (("cc", _tb_cc_cards(now, skip_names)),
+                      ("cx", _tb_cx_cards(now, skip_tids))):
+        try:
+            cards.extend(await asyncio.wait_for(coro, TB_ASYNC_SOURCE_TIMEOUT))
+            sources_ok[key] = True
+        except Exception as e:  # noqa: BLE001
+            sources_ok[key] = False
+            _log_event("taskboard_source_failed", source=key,
+                       error=type(e).__name__, error_message=str(e)[:200])
+
+    # 去重:同一 session_ref 已有 stuck 卡(例如 approvals 源的超時待核准)
+    # → 丟掉它的 running 卡。stuck 是靈魂欄,不能被並存的 running 卡稀釋。
+    stuck_refs = {c["session_ref"] for c in cards
+                  if c["state"] == "stuck" and c["session_ref"]}
+    cards = [c for c in cards
+             if not (c["state"] == "running" and c["session_ref"] in stuck_refs)]
+
+    columns = {"queued": [], "running": [], "stuck": [], "done": []}
+    for c in cards:
+        columns[c["state"]].append(c)
+    # 排序:stuck 由舊到新(卡最久=最該先看);其餘由新到舊。since 缺值沉底。
+    columns["stuck"].sort(key=lambda c: (c["since_ts"] is None,
+                                         c["since_ts"] or 0.0))
+    for col in ("queued", "running", "done"):
+        columns[col].sort(key=lambda c: (c["since_ts"] is None,
+                                         -(c["since_ts"] or 0.0)))
+    return {"generated_at": now,
+            "sources_ok": sources_ok,
+            "columns": columns,
+            "counts": {k: len(v) for k, v in columns.items()}}
 
 
 # ─────────────── Sync engine P2:/app/v2 統一事件流 + 已讀游標 ───────────
