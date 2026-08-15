@@ -4188,21 +4188,29 @@ async def chat_completions(request: Request):
 
 CLAUDE_BIN = os.path.expanduser(os.environ.get("CLAUDE_BIN", "")) or (
     shutil.which("claude") or os.path.expanduser("~/.local/bin/claude"))
-# 用能讀「新版 thread」的 codex 當 app-server。VS Code 用 codex 0.142 建 thread,
-# 舊的 standalone 0.137(~/.local/bin/codex)一讀其 full turns(thread/turns/list
-# itemsView=full)就 crash → UPSTREAM_FAILED「codex app-server stopped」,整條 stdio
-# 卡死,app 端該 session 空白且送不出。優先挑 Codex.app 內建的 0.142(VS Code 同款、
-# 共用 ~/.codex 登入),對不上再退回 standalone。CODEX_BIN 環境變數可覆蓋。
+# stdio 退路要抓哪顆 codex binary?答案隨事故演進過兩次,方向相反,都要記得:
+#   2026-07-10:standalone 還停在 0.137,讀 VS Code(0.142)建的新 thread 會
+#     crash → 當時的修法是「桌面內建 binary 優先」。
+#   2026-08-15:standalone 已會自我更新(~/.codex/packages/standalone),與
+#     managed daemon **同一顆**(0.147);桌面內建版反而永遠**超前**
+#     (0.148-alpha vs 0.147)。stdio 退路抓到桌面版 = 和 daemon 版本分裂:
+#     一天 581 次 codex_app_server_unmatched_response,還會把 thread-store
+#     目錄升級成 0.147 daemon 讀不回來的格式。
+# 所以現在候選序是 standalone 優先、桌面 binary 墊底。CODEX_BIN 環境變數可覆蓋。
 def _resolve_codex_bin() -> str:
-    # 2026-07-10 事故:ChatGPT.app 更新把 Codex Desktop 併入、/Applications/Codex.app
-    # 整個消失 → 舊首選路徑失效,fallback 到 0.137 又是「讀新 thread 會 crash」地雷,
-    # 手機 CX 全空數小時且無錯誤日誌。候選序補上 ChatGPT.app 的新家,且 spawn 時
-    # 每次重新解析(見 _ensure_started_locked),桌面 app 更新不再需要重啟 bridge。
+    # spawn 時每次重新解析(見 _spawn_stdio_locked),binary 更新/搬家不需要
+    # 重啟 bridge(2026-07-10 事故的教訓:桌面 app 更新會讓路徑整個消失)。
     for c in (os.environ.get("CODEX_BIN"),
-              "/Applications/Codex.app/Contents/Resources/codex",
-              "/Applications/ChatGPT.app/Contents/Resources/codex",
+              # standalone 三兄弟其實常是同一顆(~/.local/bin/codex 是 symlink
+              # 進 packages),分開列是為了任何一環斷掉時其他仍可用。
+              os.path.expanduser("~/.codex/packages/standalone/current/codex"),
               os.path.expanduser("~/.local/bin/codex"),
-              shutil.which("codex")):
+              shutil.which("codex"),
+              # 桌面 app 內建 binary **刻意墊底**:桌面自動更新的版本永遠比
+              # standalone 超前(=格式風險,見上方 2026-08-15 事故註解),
+              # 只有整台機器只裝了桌面 app 時才輪得到它們。
+              "/Applications/Codex.app/Contents/Resources/codex",
+              "/Applications/ChatGPT.app/Contents/Resources/codex"):
         if c and os.path.exists(c):
             return c
     return os.path.expanduser("~/.local/bin/codex")
@@ -4234,6 +4242,34 @@ CODEX_APP_SERVER_MODES = ("auto", "managed", "stdio")
 CODEX_APP_SERVER_MODE = os.environ.get("CODEX_APP_SERVER_MODE", "auto").strip().lower()
 if CODEX_APP_SERVER_MODE not in CODEX_APP_SERVER_MODES:
     CODEX_APP_SERVER_MODE = "auto"
+
+# ── stdio → daemon 自動升級(2026-08-15 事故收尾)────────────────────────
+# auto 模式掉到 stdio 之後,舊碼**永遠不會自己回去** daemon:2026-08-15 實錄
+# 12:43 掉下去,15:4x 人工重啟才歸位,中間三小時 bridge 和桌面版各拿一顆
+# app-server 搶 thread-store。所以 stdio 期間低頻探 daemon socket,活了就在
+# 「沒有 in-flight 請求」的空檔優雅切回 managed(見 _maybe_upgrade_transport)。
+CODEX_TRANSPORT_UPGRADE_PROBE_SECS = 60.0    # stdio 模式下探測 daemon 的間隔
+CODEX_TRANSPORT_UPGRADE_BACKOFF_SECS = 600.0  # 升級失敗後的冷卻(防震盪迴圈)
+
+
+def _codex_daemon_socket_alive(path: str | None = None) -> bool:
+    """daemon socket「存在**且連得上**」才算活 —— exists() 不參與判斷
+    (stale inode 會騙人,同 _connect_managed_locked 的長註解)。這裡只做
+    raw unix connect,不做 WS handshake:探測要便宜到能每 60s 跑一次,
+    handshake 留給真正的升級路徑去做(失敗有 backoff 兜底)。"""
+    sock_path = path if path is not None else CODEX_APP_SERVER_SOCKET
+    if not sock_path:
+        return False
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        s.settimeout(2.0)
+        s.connect(sock_path)
+        return True
+    except OSError:
+        return False
+    finally:
+        with contextlib.suppress(OSError):
+            s.close()
 
 # ─────────── codex 家目錄隔離(POCKET_CODEX_ISOLATED)───────────
 # 隔離 = bridge 用**自己的** CODEX_HOME(見 codex_home.py 的長註解)。
@@ -4796,8 +4832,15 @@ class CodexAppServerClient:
         self._lock = asyncio.Lock()
         self._next_id = 1
         self._pending = {}
+        # rid -> method(最近 512 筆,跨重連保留)。唯一用途:回應對不上
+        # future 時,log 能講出「這是哪個 method 的遲到回覆」而不是只有
+        # id_hash 猜謎(2026-08-15 版本分裂事故,一天 581 筆全靠猜)。
+        self._sent_methods = collections.OrderedDict()
         self._reader_task = None
         self._stderr_task = None
+        # stdio → daemon 自動升級:探測協程 + 失敗冷卻(monotonic 截止時刻)。
+        self._upgrade_task = None
+        self._upgrade_backoff_until = 0.0
         self.thread_events = collections.defaultdict(list)
         self.thread_event_generations = collections.defaultdict(int)
         # 忙碌時的待送佇列(CX 排隊層)。CC 早就有「一定收下、回 queued」的語意,
@@ -4862,6 +4905,7 @@ class CodexAppServerClient:
             self._next_id += 1
             fut = asyncio.get_running_loop().create_future()
             self._pending[rid] = fut
+            self._note_sent_method(rid, method)
             await self._write_locked({"jsonrpc": "2.0", "id": rid,
                                       "method": method, "params": params or {}})
         try:
@@ -4976,6 +5020,12 @@ class CodexAppServerClient:
                 fallback_from=("managed" if managed_error is not None else ""),
                 fallback_reason=(type(managed_error).__name__
                                  if managed_error is not None else ""))
+            if mode == "auto":
+                # auto 模式掉到 stdio 是**降級**,不是終點:開低頻探測,daemon
+                # 活回來就自動升級回 managed(2026-08-15 之前這裡是單行道,
+                # 掉下去要人工重啟才回得去)。managed/stdio 模式不開:前者
+                # 根本走不到這裡,後者是使用者明講要 stdio。
+                self._ensure_upgrade_probe()
         # P1-3:這批清理(含一發 sqlite UPDATE 把 pending approvals 標 expired)
         # 只有在**真的接上傳輸**之後才做。放在連線之前的話,daemon 短暫不在
         # (桌面 app 更新/重開)就會把使用者手上待批准的 Codex 請求全部作廢,
@@ -5013,6 +5063,130 @@ class CodexAppServerClient:
         except RuntimeError:
             pass
 
+    # ── stdio → daemon 自動升級 ──────────────────────────────────────────
+    # 狀態機(只在 CODEX_APP_SERVER_MODE 實效 auto 時存在):
+    #
+    #   stdio ──60s 探測──▶ socket 連得上?──否──▶ 繼續 stdio
+    #                        │是
+    #                        ▼
+    #                  空檔?(_pending 空且無 active turn)──否──▶ 下輪再試
+    #                        │是
+    #                        ▼
+    #             關 stdio 子程序 → _ensure_started_locked 重連
+    #                        │
+    #            ┌───────────┴───────────┐
+    #            ▼ 成功(unix-websocket) ▼ 失敗(daemon 又死/handshake 炸)
+    #   codex_transport_upgraded    codex_transport_upgrade_failed
+    #   探測協程收工                 退回 stdio + 10 分鐘內不再試(防震盪)
+    def _ensure_upgrade_probe(self) -> None:
+        """開(或確認已開)探測協程。冪等:活著就不重開。"""
+        if self._upgrade_task is not None and not self._upgrade_task.done():
+            return
+        try:
+            self._upgrade_task = asyncio.create_task(self._transport_upgrade_loop())
+        except RuntimeError:      # 沒有 running loop(單元測試同步呼叫時)
+            self._upgrade_task = None
+            return
+        _BG_TASKS.add(self._upgrade_task)
+        self._upgrade_task.add_done_callback(_BG_TASKS.discard)
+
+    async def _transport_upgrade_loop(self) -> None:
+        try:
+            while True:
+                await asyncio.sleep(CODEX_TRANSPORT_UPGRADE_PROBE_SECS)
+                outcome = await self._maybe_upgrade_transport()
+                if outcome in ("upgraded", "not-stdio", "mode"):
+                    # 已經不在 stdio(升級成功/別人重連走了 managed),或模式
+                    # 不再是 auto(隔離被打開)→ 收工。之後若再掉回 stdio,
+                    # _ensure_started_locked 會重開一條新的探測協程。
+                    return
+        except asyncio.CancelledError:
+            raise
+        except Exception as _exc:  # noqa: BLE001 — 探測協程死掉不能無聲
+            _log_exc("CodexAppServerClient._transport_upgrade_loop", _exc)
+
+    async def _maybe_upgrade_transport(self) -> str:
+        """升級判定 + 執行。回傳結果字串(測試直接斷言用):
+        upgraded / not-stdio / mode / backoff / daemon-dead / busy / failed"""
+        if self.transport != "stdio":
+            return "not-stdio"
+        if _effective_app_server_mode() != "auto":
+            return "mode"
+        if time.monotonic() < self._upgrade_backoff_until:
+            return "backoff"
+        # socket 探測放在鎖外:探測便宜、失敗常態,不要為它卡住正常流量。
+        if not await asyncio.to_thread(_codex_daemon_socket_alive):
+            return "daemon-dead"
+        async with self._lock:
+            # 鎖內全部重查:等鎖期間世界可能已經變了。
+            if self.transport != "stdio" or self.ws is not None:
+                return "not-stdio"
+            if self._pending or self.active_turns:
+                # 有 in-flight 請求或跑到一半的 turn:現在切會腰斬使用者的
+                # 回合。不算失敗、不進 backoff,下一輪探測再看。
+                return "busy"
+            old_bin = self.spawned_bin
+            await self._stop_stdio_child_locked()
+            try:
+                # 重用既有重連機制:auto 模式會先試 managed,失敗自動退回
+                # spawn stdio —— 所以「升級失敗」的殘局它自己會收(還是有
+                # 一顆能用的 app-server),我們只負責記帳 + backoff。
+                await self._ensure_started_locked()
+            except Exception as e:  # noqa: BLE001
+                self._upgrade_backoff_until = (
+                    time.monotonic() + CODEX_TRANSPORT_UPGRADE_BACKOFF_SECS)
+                _log_event("codex_transport_upgrade_failed",
+                           error=type(e).__name__, error_message=str(e)[:160],
+                           backoff_secs=CODEX_TRANSPORT_UPGRADE_BACKOFF_SECS)
+                return "failed"
+            if self.transport == "unix-websocket":
+                self._upgrade_backoff_until = 0.0
+                _log_event("codex_transport_upgraded",
+                           previous="stdio", transport="unix-websocket",
+                           socket=CODEX_APP_SERVER_SOCKET, stdio_bin=old_bin)
+                return "upgraded"
+            # 探測說活、真連卻退回 stdio(daemon 在這幾毫秒內又死了,或
+            # handshake 對不上)→ 進 backoff,10 分鐘內不再試,防止
+            # 「殭屍 socket 每 60 秒騙我們重啟一次 stdio 子程序」的震盪。
+            self._upgrade_backoff_until = (
+                time.monotonic() + CODEX_TRANSPORT_UPGRADE_BACKOFF_SECS)
+            _log_event("codex_transport_upgrade_failed",
+                       reason="daemon_lost_after_probe", transport=self.transport,
+                       backoff_secs=CODEX_TRANSPORT_UPGRADE_BACKOFF_SECS)
+            return "failed"
+
+    async def _stop_stdio_child_locked(self) -> None:
+        """優雅收掉自己 spawn 的 stdio 子程序(呼叫前必須確認沒有 in-flight)。
+
+        kill 之後**等 reader 自然走完**:readline 讀到 EOF → _reader_cleanup
+        把 proc/_pending/loaded_threads/provider_status 清乾淨(active_turns
+        已確認為空,cleanup 那段「腰斬回合」的迴圈是空轉)。cleanup 會把
+        app_server_error 設成 stopped,緊接著的 _ensure_started_locked 開頭
+        就會清掉,對外可見的窗口只有毫秒級。"""
+        proc, reader, stderr_task = self.proc, self._reader_task, self._stderr_task
+        if proc is not None and proc.returncode is None:
+            with contextlib.suppress(ProcessLookupError):
+                proc.kill()
+        if reader is not None:
+            with contextlib.suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(asyncio.shield(reader), timeout=5)
+            if not reader.done():
+                reader.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await reader
+        if stderr_task is not None and not stderr_task.done():
+            stderr_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await stderr_task
+        if proc is not None:
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(proc.wait(), timeout=5)
+        if self.proc is proc:
+            self.proc = None
+        self._reader_task = None
+        self._stderr_task = None
+        self.transport = ""
+
     def _expire_stale_codex_approvals(self):
         import sqlite3
         try:
@@ -5034,11 +5208,19 @@ class CodexAppServerClient:
             _log_event("codex_approval_stale_expire_failed",
                        error=type(e).__name__, error_message=str(e)[:160])
 
+    def _note_sent_method(self, rid, method: str) -> None:
+        """記住 rid → method(封頂 512,FIFO 淘汰),給 unmatched-response 的
+        log 用。跨重連刻意**不清**:遲到回覆常常正是跨了一次重連才回來。"""
+        self._sent_methods[rid] = method
+        while len(self._sent_methods) > 512:
+            self._sent_methods.popitem(last=False)
+
     async def _call_started_locked(self, method: str, params: dict, timeout: float):
         rid = self._next_id
         self._next_id += 1
         fut = asyncio.get_running_loop().create_future()
         self._pending[rid] = fut
+        self._note_sent_method(rid, method)
         await self._write_locked({"jsonrpc": "2.0", "id": rid,
                                   "method": method, "params": params})
         try:
@@ -5081,8 +5263,25 @@ class CodexAppServerClient:
         elif "id" in msg:
             fut = self._pending.pop(msg.get("id"), None)
             if not fut or fut.done():
+                # 對不上 future 的回應。兩種病因,log 要能分辨:
+                #   method 有值 = 我們真的問過,是**遲到回覆**(timeout 後才回,
+                #     或跨了一次重連);
+                #   method 空白 = 這個 id 我們根本沒發過 —— 通常是版本分裂
+                #     (stdio 退路抓到超前的桌面 binary,wire 格式對不上,
+                #     2026-08-15 一天 581 筆就是這款)。
+                if "error" in msg:
+                    err = msg.get("error") or {}
+                    summary = f"error {err.get('code')}: {str(err.get('message'))[:120]}"
+                else:
+                    res = msg.get("result")
+                    summary = ("result keys=" + ",".join(
+                        sorted(str(k) for k in res.keys()))[:120]
+                        if isinstance(res, dict)
+                        else f"result type={type(res).__name__}")
                 _log_event("codex_app_server_unmatched_response",
-                           id_hash=_short_hash(str(msg.get("id"))))
+                           id_hash=_short_hash(str(msg.get("id"))),
+                           method=self._sent_methods.get(msg.get("id"), ""),
+                           late=bool(fut), summary=summary)
                 return
             if "error" in msg:
                 err = msg.get("error") or {}
