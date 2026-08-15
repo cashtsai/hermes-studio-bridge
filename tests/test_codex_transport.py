@@ -128,7 +128,10 @@ async def cancel_task(task) -> None:
 
 
 async def shutdown_client(client) -> None:
-    for task in (client._reader_task, client._stderr_task):
+    # _upgrade_task:auto 模式退到 stdio 時會開的探測協程(60s 睡眠),
+    # 不收掉會在 loop close 時留下 pending-task 警告。
+    for task in (client._reader_task, client._stderr_task,
+                 getattr(client, "_upgrade_task", None)):
         await cancel_task(task)
     if client.ws is not None:
         with contextlib.suppress(Exception):
