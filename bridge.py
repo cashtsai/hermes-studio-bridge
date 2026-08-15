@@ -23449,6 +23449,10 @@ _HARNESS_DISTILL_HOUR = int(os.environ.get("HARNESS_DISTILL_HOUR", "4"))
 _HARNESS_DISTILL_HOURS = float(os.environ.get("HARNESS_DISTILL_HOURS", "24"))
 _HARNESS_REPORT_LABEL = "蒸餾提案"
 _HARNESS_REPORT_NAME = "harness-proposals"
+# 蒸餾提案只送**主人格**一份。提案是全域的(scope 寫在提案自己身上),送給每個
+# 人格只是同一份東西複製四份 —— 2026-08-13 實際炸開:四個人格在同一秒各收到
+# 一份 3533 bytes 的相同報告,而審核動作只有一個人要做。空字串 = 關掉這段。
+_HARNESS_REPORT_PERSONA = os.environ.get("HARNESS_REPORT_PERSONA", "xcash").strip()
 
 
 def _harness_enabled() -> bool:
@@ -23831,6 +23835,10 @@ def _persona_harness_reports(persona: str, limit: int = 1) -> list[dict]:
     external_id 以日期為鍵:一天最多一則,夜批跑完更新內容,不會洗版。
     """
     if not _harness_enabled():
+        return []
+    # 只有主人格拿得到。提案本身是全域的,四個人格各收一份相同內容毫無意義,
+    # 而且審核只有一個人要做 —— 其餘人格收到只是被打擾(未讀徽章、對話列被佔)。
+    if not _HARNESS_REPORT_PERSONA or persona != _HARNESS_REPORT_PERSONA:
         return []
     try:
         hs = _harness_store()
