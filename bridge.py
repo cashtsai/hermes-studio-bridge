@@ -3748,6 +3748,159 @@ def _push_persona_reply(session: str, content: str) -> None:
     t.add_done_callback(_BG_TASKS.discard)
 
 
+# ─── GAP-R2:直開 CC/CX session 的回合完成推播(feat/turnend-push)──────────
+# 產品鐵律:使用者永遠知道進度與狀態,不用回頭開 app 確認。sub-agent/
+# delegation/persona 完成本來就有推播,但**使用者直接開的 CC/CX session**
+# 只發 SSE —— app 進背景 SSE 就斷,回合在背景跑完等於無聲。這裡補上
+# 「turn end 推播」,完全沿用 push_notify 既有發送路徑與 /app/v1/push/register
+# 的偏好(preview=False 的裝置只看到「回合已完成」占位,內容不進鎖屏)。
+#
+# 何時**不**推(防洗版,依序判定):
+#   1. TURNEND_PUSH=0 → 功能整體停用(APNs 金鑰未配置時 push_notify 本來就短路)。
+#   2. 有活躍訂閱者(store.subscribers > 0)= 有人正在看畫面(SSE 連著/
+#      agent_call 收割中)→ 看得到就不吵。
+#   3. 該 session 是委派(delegation)目標 → 完成另有 _delegation_notify 推播,
+#      不雙響(見 _turnend_delegation_covers 的競態時間窗)。
+#   4. CX thread 被桌面版 Codex 鎖住(digest.locked)→ 使用者人就在 Mac 前。
+#   5. 同 session TURNEND_PUSH_MIN_SECS(預設 60s)內已推過 → 節流。
+
+_TURNEND_PUSH_LAST: dict = {}    # v2 session id → 上次推播 time.time()
+_TURNEND_PUSH_MIN_SECS = float(os.environ.get("TURNEND_PUSH_MIN_SECS", "60"))
+# 沒人在看時,CC follower 以低頻(每 N 圈,圈≈1s)巡 busy 抓「背景收尾」;
+# 預設每 5 圈巡一次(≈5s 一次 tmux capture,只在回合疑似進行中才巡)。
+_TURNEND_BG_POLL_EVERY = max(1, int(float(
+    os.environ.get("TURNEND_BG_POLL_SECS", "5"))))
+
+
+def _turnend_push_enabled() -> bool:
+    return os.environ.get("TURNEND_PUSH", "1").strip().lower() not in (
+        "0", "false", "off")
+
+
+def _turnend_delegation_covers(provider: str, key: str) -> bool:
+    """這條 session 的完成是否已由委派回流負責推播(別雙響)。
+
+    created/running = 完成那一刻會走 _delegation_notify 的 done/failed 推播;
+    其餘狀態但 updated_at 在 30s 內 = 委派完成推播剛發過 —— turn/completed
+    的委派回流與本推播是並發 task,讀到哪個狀態看運氣,靠時間窗補平競態。
+    委派完成「之後」使用者接手直聊的回合(updated_at 已老)照常推。"""
+    try:
+        now = time.time()
+        for row in _delegation_rows(limit=200):
+            d = dict(row)
+            if d.get("provider") != provider:
+                continue
+            if provider == "codex":
+                ref = d.get("codex_thread_id") or d.get("provider_session_id") or ""
+            else:
+                ref = d.get("cc_session_name") or d.get("provider_session_id") or ""
+            if str(ref) != key:
+                continue
+            if str(d.get("status") or "") in ("created", "running"):
+                return True
+            if now - float(d.get("updated_at") or 0.0) < 30.0:
+                return True
+        return False
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("_turnend_delegation_covers", _exc, expected=True)
+        return False
+
+
+def _turnend_last_reply(store) -> str:
+    """推播摘要素材:最後一張 assistant 文字卡的純文字(清 studio-card 圍欄
+    與 <details>、壓空白)。找不到回空字串,呼叫端用占位文案。"""
+    try:
+        for cid in reversed(store.order):
+            card = store.cards.get(cid) or {}
+            if card.get("role") != "assistant" or card.get("kind") not in (
+                    "markdown", "text"):
+                continue
+            body = card.get("body") or {}
+            text = str(body.get("text") or body.get("fallback_text") or "")
+            try:
+                text, _bodies = carddigest.extract_studio_cards(text)
+            except Exception as _exc:  # noqa: BLE001
+                _log_exc("_turnend_last_reply", _exc, expected=True)
+            text = re.sub(r"<details>.*?</details>", "", text, flags=re.S)
+            text = re.sub(r"\s+", " ", text).strip()
+            if text:
+                return text
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("_turnend_last_reply", _exc, expected=True)
+    return ""
+
+
+def _turn_end_push(sid: str, display: str, summary: str, ok: bool = True) -> None:
+    """直開 session 的回合完成推播(fire-and-forget)。
+
+    sid = v2 wire session id(claude_code:{name} / codex:{tid});payload 沿用
+    pocket.kind=message + sessionId 巢形 —— 與 _push_persona_reply 同一契約,
+    已部署的 app 不用改就能 deep-link 進該 session。摘要只取前 80 字,且
+    preview=False 的裝置由 no_preview_body 換成占位,全文不進鎖屏。"""
+    if not _turnend_push_enabled():
+        return
+    now = time.time()
+    if now - _TURNEND_PUSH_LAST.get(sid, 0.0) < _TURNEND_PUSH_MIN_SECS:
+        _log_event("turnend_push_throttled", session=sid)
+        return
+    body = (summary or "").strip()[:80] or "回合已完成,回來看看結果"
+    title = ("✅ " if ok else "⚠️ ") + (display or sid)[:40]
+    data = {"kind": "message",
+            "pocket": {"kind": "message", "sessionId": sid}}
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    _TURNEND_PUSH_LAST[sid] = now
+    t = loop.create_task(push_notify(title, body, data,
+                                     thread_id=sid, content_available=True,
+                                     no_preview_body="回合已完成"))
+    _BG_TASKS.add(t)
+    t.add_done_callback(_BG_TASKS.discard)
+    _log_event("turnend_push", session=sid, ok=ok, chars=len(body))
+
+
+def _cc_turn_end_push(name: str, store) -> None:
+    """CC busy→idle 收尾且沒人在看 → 推播。由 _cc_card_follower 呼叫
+    (呼叫端已保證 subscribers==0;CC 的 busy 轉場不帶錯誤資訊,一律 ✅)。"""
+    if _turnend_delegation_covers("claude_code", name):
+        return
+    _turn_end_push(f"claude_code:{name}", name, _turnend_last_reply(store))
+
+
+def _cx_thread_display(tid: str) -> str:
+    """推播標題用的 thread 顯示名:v2 清單快取的 name/preview,冷快取退 id 前綴。"""
+    for t in _CODEX_V2_VISIBLE_CACHE:
+        if str(t.get("id") or "") == tid:
+            name = str(t.get("name") or "").strip()
+            preview = str(t.get("preview") or "").strip()
+            if name or preview:
+                return (name or preview)[:40]
+            break
+    return f"Codex {tid[:8]}" if tid else "Codex"
+
+
+def _cx_turn_end_push(tid: str, err_msg: str = "") -> None:
+    """CX turn/completed 且沒人在看 → 推播。由 _handle_notification 呼叫。
+
+    digest 不存在 = app 從沒開過這條 thread(桌面/內部 thread)→ 不推:
+    既叫不出使用者認得的名字,也代表這不是「使用者直開的 session」。"""
+    if not _turnend_push_enabled():
+        return
+    d = _CX_CARD_DIGESTS.get(tid) if tid else None
+    if d is None:
+        return
+    if getattr(d.store, "subscribers", 0) > 0:
+        return
+    if getattr(d, "locked", False):
+        return   # 桌面版 Codex 佔用中 → 使用者人在 Mac 前,推手機是噪音
+    if _turnend_delegation_covers("codex", tid):
+        return
+    summary = err_msg or _turnend_last_reply(d.store)
+    _turn_end_push(f"codex:{tid}", _cx_thread_display(tid), summary,
+                   ok=not err_msg)
+
+
 _canon_init()
 _accounts_init()
 _subsessions_load()   # issue #5: rebuild /dispatch subs after restart
@@ -5776,6 +5929,14 @@ class CodexAppServerClient:
                 t.add_done_callback(_BG_TASKS.discard)
             except RuntimeError:
                 pass
+            # GAP-R2(feat/turnend-push):直開 thread 在背景收尾 → 推播。
+            # 「誰在看/委派雙響/桌面版鎖定/節流」的不推判定都在函式內;
+            # 絕不讓它把例外拋進通知處理路徑。
+            try:
+                _cx_turn_end_push(
+                    tid, str(err.get("message", err))[:160] if err else "")
+            except Exception as e:  # noqa: BLE001
+                _log_exc("_cx_turn_end_push", e, expected=True)
             return
         if method == "error":
             _log_event("codex_app_server_error",
@@ -14653,7 +14814,21 @@ async def _cc_card_follower(name: str, workdir: str):
             subs_now = store.subscribers
             subs_was = getattr(store, "_last_subs", 0)
             store._last_subs = subs_now
-            if subs_now > 0:
+            # GAP-R2(feat/turnend-push):沒人在看(subs==0)但回合可能在跑
+            # (看過 busy,或 input 剛送達、還在排隊寬限內)→ 以低頻(每
+            # _TURNEND_BG_POLL_EVERY 圈)照巡 busy,才抓得到「背景收尾」那個
+            # busy→idle 轉場並推播;回合確定結束就停巡,維持「無訂閱時近乎
+            # 零 tmux capture 成本」的原性質。
+            bg_watch = False
+            if subs_now <= 0 and _turnend_push_enabled() and (
+                    prev_busy or time.time() < getattr(store, "queued_until", 0.0)):
+                store._turnend_tick = getattr(store, "_turnend_tick", 0) + 1
+                if store._turnend_tick >= _TURNEND_BG_POLL_EVERY:
+                    store._turnend_tick = 0
+                    bg_watch = True
+            elif subs_now <= 0:
+                store._turnend_tick = 0
+            if subs_now > 0 or bg_watch:
                 st = await _cc_status_core(name)
                 busy = bool(st.get("busy"))
                 if busy:
@@ -14676,6 +14851,10 @@ async def _cc_card_follower(name: str, workdir: str):
                         store.turn_id = ""
                         if _cc_token_stream_enabled():
                             _cc_stream_on_turn_end(store)
+                        if subs_now <= 0:
+                            # 背景收尾:沒人在看畫面 → 推播叫人回來
+                            # (委派/節流的「不推」判定在函式內)。
+                            _cc_turn_end_push(name, store)
                 prev_busy = busy
                 if not busy and time.time() < getattr(store, "queued_until", 0.0):
                     # input 已送達但 session 還沒接手(忙上一輪/思考中):
@@ -14701,7 +14880,9 @@ async def _cc_card_follower(name: str, workdir: str):
                 # pane-diff 子迴圈(約 1s,取代外圈 sleep);idle/無人看零成本。
                 if _cc_token_stream_enabled():
                     _cc_stream_finalize_expired(store)
-                    if busy:
+                    # subs_now > 0:bg_watch(GAP-R2 背景收尾巡邏)只為抓
+                    # busy→idle,沒人看畫面就不要燒 pane-diff 快節奏子迴圈。
+                    if busy and subs_now > 0:
                         streamed = True
                         await _cc_stream_subticks(name, store)
         except Exception as e:  # noqa: BLE001
