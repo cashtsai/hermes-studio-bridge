@@ -154,7 +154,9 @@ def test_cc_cum_empty_or_missing():
 def test_codex_usage_map_backcompat():
     tu = {"tokenUsage": {"totalTokens": 1234, "modelContextWindow": 272000}}
     out = bridge._codex_usage_map(tu)
-    assert out["used"] == 1234
+    # PR #95 契約:沒有 prev 快照 → `used` 算不出就**不送**(寧可沒指標
+    # 不要 200% 的假指標);used 的推導/夾限由 test_cx_usage_and_preview 12 測負責。
+    assert "used" not in out
     assert out["size"] == 272000
     # 沒有 input/output 欄 → 不帶新欄
     assert "input_tokens" not in out
@@ -166,7 +168,7 @@ def test_codex_usage_map_cost():
                          "outputTokens": 10_000,
                          "modelContextWindow": 272000}}
     out = bridge._codex_usage_map(tu, model="gpt-5-codex")
-    assert out["used"] == 170_000            # 向後相容:總和當 meter
+    assert "used" not in out                 # PR #95:無 prev 不給 used(見上)
     assert out["input_tokens"] == 100_000
     assert out["cache_read_tokens"] == 60_000
     assert out["output_tokens"] == 10_000
@@ -192,7 +194,7 @@ def test_codex_usage_map_total_split():
     tu = {"tokenUsage": {"total": {"inputTokens": 50, "outputTokens": 5},
                          "last": {"inputTokens": 1, "outputTokens": 1}}}
     out = bridge._codex_usage_map(tu, model="gpt-5")
-    assert out["used"] == 55
+    assert "used" not in out                 # PR #95:無 prev 不給 used
     assert out["input_tokens"] == 50
 
 
