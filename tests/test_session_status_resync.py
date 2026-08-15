@@ -137,3 +137,35 @@ class TestSubscriberDropIsRecorded(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestThreadNotFoundTranslation(unittest.TestCase):
+    """第三種 -32600(2026-08-15 Cashcamp 事故):thread not found 必須誠實回
+    404,不得謊報「這一輪還在執行」。使用者對著待命的 session 收到「還在跑」
+    就是這條沒攔。"""
+
+    def _raise(self, message):
+        import bridge as B
+        err = B.CodexAppServerError(message)
+        err.code = -32600
+        with self.assertRaises(B.HTTPException) as cm:
+            B._codex_http_error(err)
+        return cm.exception
+
+    def test_thread_not_found_is_404(self):
+        exc = self._raise("thread not found: 019f39d3-e347-7203-ba4f-fa92948d149c")
+        self.assertEqual(exc.status_code, 404)
+        self.assertEqual(exc.code, "CX_THREAD_NOT_FOUND")
+
+    def test_not_found_evicts_loaded_flag(self):
+        import bridge as B
+        tid = "019f39d3-e347-7203-ba4f-fa92948d149c"
+        B.CODEX_APP.loaded_threads.add(tid)
+        self._raise(f"thread not found: {tid}")
+        self.assertNotIn(tid, B.CODEX_APP.loaded_threads,
+                         "loaded 標記不踢掉的話,重試永遠跳過 resume、永遠 404")
+
+    def test_busy_still_409(self):
+        exc = self._raise("some turn is already running somewhere")
+        self.assertEqual(exc.status_code, 409)
+        self.assertEqual(exc.code, "CX_TURN_IN_FLIGHT")
