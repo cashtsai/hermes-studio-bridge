@@ -4870,6 +4870,9 @@ class CodexAppServerClient:
         # wave 2: live token usage per thread (thread/tokenUsage/updated) —
         # thread/list reports tokenUsage: null, so this is the only source.
         self.token_usage = {}
+        # 上一次的 tokenUsage(累計)快照。與 token_usage 相減 = 這一輪的用量,
+        # 那才是上下文佔用;累計值只適合拿來算花費。見 _handle_notification。
+        self.token_usage_prev = {}
         # per-thread 設定快取 —— **唯一可信來源**(2026-08-14 對 0.147 實測)。
         # app-server **沒有** settings 的 getter:合法方法表裡只有
         # `thread/settings/update`,沒有 `thread/settings`;而 `thread/read` 的
@@ -6078,6 +6081,16 @@ class CodexAppServerClient:
             self.note_provider_status(tid, params.get("status"))
             return
         if method == "thread/tokenUsage/updated" and tid:
+            # codex 的 tokenUsage 是**整個 thread 生命週期的累計**(0.147 的欄位表
+            # 只有 totalTokens/inputTokens/cachedInputTokens/cacheWriteInputTokens/
+            # outputTokens,沒有 last/total 拆分)。拿它當「上下文佔用」會爆表 ——
+            # 2026-08-15 實機:517,323,425 / 258,400 = 200,203%,其中 96% 是同一段
+            # context 被反覆 cache 重讀灌出來的。
+            # 所以在覆蓋前先留一份上一次的快照,增量的 inputTokens 才是「這一輪
+            # 送進模型的 context 有多大」= 使用者真正想看的那個數。
+            prev = self.token_usage.get(tid)
+            if isinstance(prev, dict):
+                self.token_usage_prev[tid] = prev
             self.token_usage[tid] = params.get("tokenUsage") or params
             return
         if method == "thread/settings/updated" and tid:
@@ -6629,7 +6642,46 @@ class CodexAppServerClient:
 CODEX_APP = CodexAppServerClient()
 
 
-def _codex_usage_map(tu, model=None) -> dict | None:
+def _codex_context_used(inner: dict, prev_inner: dict | None):
+    """從累計 tokenUsage 推「當前上下文佔用」。
+
+    codex 給的是**生命週期累計**,直接拿去比 modelContextWindow 必然爆表
+    (2026-08-15 實機 200,203%)。單次請求的 inputTokens 才等於「這一輪送進
+    模型的 context 有多大」,所以取與上一次快照的**增量**。
+
+    沒有上一次快照(bridge 剛起、或這條 thread 這輪還沒動過)→ 回 None,
+    寧可不顯示,也不要顯示一個差兩三個數量級的數字。
+    """
+    if not isinstance(prev_inner, dict):
+        return None
+    try:
+        cur = int(inner.get("inputTokens") or 0)
+        old_ = int(prev_inner.get("inputTokens") or 0)
+    except (TypeError, ValueError):
+        return None
+    delta = cur - old_
+    # 增量必須為正;thread 被 compact 或 app-server 重啟後累計會歸零/倒退,
+    # 那時無法推論,同樣回 None。
+    return delta if delta > 0 else None
+
+
+def _codex_context_clamp(used, window):
+    """把推得的上下文佔用夾進視窗容量。
+
+    一個 **turn** 可能包含好幾次模型請求(每次工具往返都是一輪),而累計欄位
+    是跨請求相加的 —— 兩次通知之間若夾了多輪,增量就會超過視窗容量。
+    上下文本來就不可能超過視窗,所以超過即代表「已經滿了/接近滿」,夾到上限
+    是誠實的表述;硬把 >100% 畫出來才是說謊。
+    """
+    if used is None or not window:
+        return used
+    try:
+        return min(int(used), int(window))
+    except (TypeError, ValueError):
+        return used
+
+
+def _codex_usage_map(tu, model=None, prev=None) -> dict | None:
     """app-server token usage (thread dict or tokenUsage/updated params) →
     the app's {used, size} meter shape. Defensive: field names probed on
     codex-cli 0.142.2 (totalTokens / inputTokens / cachedInputTokens /
@@ -6652,8 +6704,19 @@ def _codex_usage_map(tu, model=None) -> dict | None:
         return None
     if total <= 0:
         return None
-    usage = {"used": total}
+    # `used` = 當前上下文佔用(與 size 同一把尺),不是生命週期累計。
+    prev_inner = None
+    if isinstance(prev, dict):
+        prev_inner = prev.get("tokenUsage") if isinstance(prev.get("tokenUsage"), dict) else prev
+        if isinstance(prev_inner.get("total"), dict):
+            prev_inner = prev_inner["total"]
+    # 算得出才給 `used`。app 的 ContextUsage.used 是 optional,渲染時
+    # `guard let used ... else { return }` → 缺欄位就整條用量條不畫。
+    # 那比畫一個差兩三個數量級的數字好:寧可沒有指標,也不要有假指標。
+    ctx_used = _codex_context_used(inner, prev_inner)
     window = inner.get("modelContextWindow") or tu.get("modelContextWindow")
+    ctx_used = _codex_context_clamp(ctx_used, window)
+    usage = {} if ctx_used is None else {"used": ctx_used}
     try:
         if window:
             usage["size"] = int(window)
@@ -6698,6 +6761,25 @@ def _codex_thread_model(tid: str, fallback: dict | None = None):
     return m or None
 
 
+def _cx_latest_card_text(thread_id: str) -> str:
+    """卡片流 digest 裡最新一張卡的文字(沒有 digest / 取不到就回空字串)。
+    只讀已經在記憶體裡的東西,不打 API —— 這是列表路徑,N 條 thread 各打一次
+    thread/turns/list 是不能接受的成本。"""
+    d = _CX_CARD_DIGESTS.get(thread_id)
+    store = getattr(d, "store", None) if d is not None else None
+    if store is None:
+        return ""
+    try:
+        for cid in reversed(getattr(store, "order", []) or []):
+            body = (store.cards.get(cid) or {}).get("body") or {}
+            text = (body.get("fallback_text") or body.get("text") or "").strip()
+            if text:
+                return " ".join(text.split())
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("_cx_latest_card_text", _exc, expected=True)
+    return ""
+
+
 def _codex_enrich_summary(summary: dict) -> dict:
     tid = summary.get("thread_id") or summary.get("id") or ""
     summary["appServerAlive"] = CODEX_APP.is_server_alive()
@@ -6710,7 +6792,10 @@ def _codex_enrich_summary(summary: dict) -> dict:
                              or summary["runtimeStatus"] in ("running", "stalled"))
     summary["status"] = summary["runtimeStatus"]
     usage = _codex_usage_map(CODEX_APP.token_usage.get(tid),
-                             model=_codex_thread_model(tid, summary))
+                             model=_codex_thread_model(tid, summary),
+                             # getattr:這條路徑在測試裡會被各種 stub 取代,
+                             # 直接取屬性會讓不相干的測試炸掉。
+                             prev=getattr(CODEX_APP, "token_usage_prev", {}).get(tid))
     if usage:
         summary["usage"] = usage
     approval = CODEX_APP.pending_approval_for_thread(tid)
@@ -6718,8 +6803,26 @@ def _codex_enrich_summary(summary: dict) -> dict:
         summary["awaitingApproval"] = True
         summary["status"] = "waiting_approval"
         summary["approval"] = CODEX_APP._approval_public(approval)
+    # codex 的 `preview` 語意是**開場白**(實測:state DB 裡 preview 與
+    # first_user_message 一字不差),不是「最新訊息」。bridge 原封轉給 app 當
+    # 對話預覽 → 那條 thread 不管後來聊了什麼,列表永遠顯示第一句話。
+    # 有卡片流 digest 的(= 使用者實際開過、也正是會注意到預覽的那些)就拿
+    # 最新一張卡的文字覆蓋;沒有 digest 就維持原樣,不為了預覽多打一次 API。
+    latest = _cx_latest_card_text(tid)
+    if latest:
+        summary["preview"] = latest[:180]
     if tid in CODEX_APP.last_event_at:
         summary["lastEventAt"] = CODEX_APP.last_event_at[tid]
+        # updatedAt 取較新者。thread/list 回的 updatedAt 會落後很多(2026-08-15
+        # 實機:bridge 報 07-07,codex 自己的 state DB 卻是 08-15,差 39 天)——
+        # managed daemon 啟動時把 thread 索引載進記憶體,之後 DB 被別的行程
+        # (桌面 app / bridge 自己的 turn)更新,daemon 的視圖沒跟上。我們手上
+        # 的 last_event_at 是即時的,拿它補齊,對話列表才不會排在錯的位置。
+        try:
+            if float(summary.get("updatedAt") or 0) < CODEX_APP.last_event_at[tid]:
+                summary["updatedAt"] = CODEX_APP.last_event_at[tid]
+        except (TypeError, ValueError):
+            summary["updatedAt"] = CODEX_APP.last_event_at[tid]
     if tid in CODEX_APP.thread_errors:
         summary["error"] = CODEX_APP.thread_errors[tid]
     # thread-store 寫入鎖:`locked` **恆存在**(bool),app 才能無條件拿它決定
