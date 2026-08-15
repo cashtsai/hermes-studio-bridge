@@ -6430,14 +6430,19 @@ class CodexAppServerClient:
 CODEX_APP = CodexAppServerClient()
 
 
-def _codex_usage_map(tu) -> dict | None:
+def _codex_usage_map(tu, model=None) -> dict | None:
     """app-server token usage (thread dict or tokenUsage/updated params) →
     the app's {used, size} meter shape. Defensive: field names probed on
     codex-cli 0.142.2 (totalTokens / inputTokens / cachedInputTokens /
-    outputTokens, window in modelContextWindow); unknown shapes → None."""
+    outputTokens, window in modelContextWindow); unknown shapes → None.
+
+    P2-F5:另帶累計 token 欄與估算花費(加欄不改形,probe 到才帶)。
+    `model` 供計價;認不出(或 None)→ 只給 token 不給 $。"""
     if not isinstance(tu, dict):
         return None
     inner = tu.get("tokenUsage") if isinstance(tu.get("tokenUsage"), dict) else tu
+    if isinstance(inner.get("total"), dict):
+        inner = inner["total"]         # 新版若拆 total/last,累計取 total
     total = inner.get("totalTokens")
     if total is None:
         total = sum(int(inner.get(k) or 0)
@@ -6455,7 +6460,43 @@ def _codex_usage_map(tu) -> dict | None:
             usage["size"] = int(window)
     except (TypeError, ValueError):
         pass
+
+    def _i(key):
+        try:
+            v = inner.get(key)
+            return None if v is None else int(v)
+        except (TypeError, ValueError):
+            return None
+
+    inp, cached, outp = _i("inputTokens"), _i("cachedInputTokens"), _i("outputTokens")
+    if inp is not None or cached is not None or outp is not None:
+        usage["input_tokens"] = inp or 0
+        usage["output_tokens"] = outp or 0
+        usage["cache_read_tokens"] = cached or 0
+        usage["total_tokens"] = total
+        if model:
+            usage["model"] = model
+        # OpenAI 語意:inputTokens **含** cachedInputTokens(子集),計價要拆開。
+        billable_in = max((inp or 0) - (cached or 0), 0)
+        cost = _estimate_cost_usd(model, input_tokens=billable_in,
+                                  output_tokens=outp or 0,
+                                  cache_read_tokens=cached or 0)
+        if cost is not None:
+            usage["cost_usd"] = round(cost, 4)
+            usage["cost_is_estimate"] = True
     return usage
+
+
+def _codex_thread_model(tid: str, fallback: dict | None = None):
+    """這條 CX thread 目前的 model:thread_settings 快取(唯一可信來源,見
+    CodexAppServerClient 註解)優先,退回 summary/thread dict 的 model 欄。"""
+    try:
+        m = (CODEX_APP.thread_settings.get(tid) or {}).get("model")
+    except Exception:  # noqa: BLE001
+        m = None
+    if not m and isinstance(fallback, dict):
+        m = fallback.get("model")
+    return m or None
 
 
 def _codex_enrich_summary(summary: dict) -> dict:
@@ -6469,7 +6510,8 @@ def _codex_enrich_summary(summary: dict) -> dict:
     summary["activeTurn"] = (CODEX_APP.is_active(tid)
                              or summary["runtimeStatus"] in ("running", "stalled"))
     summary["status"] = summary["runtimeStatus"]
-    usage = _codex_usage_map(CODEX_APP.token_usage.get(tid))
+    usage = _codex_usage_map(CODEX_APP.token_usage.get(tid),
+                             model=_codex_thread_model(tid, summary))
     if usage:
         summary["usage"] = usage
     approval = CODEX_APP.pending_approval_for_thread(tid)
@@ -6615,7 +6657,8 @@ def _codex_session_summary(thread: dict) -> dict:
     # 0.142.2 returns tokenUsage: null from thread/list, but map it when a
     # future version populates it; the live overlay in _codex_enrich_summary
     # (thread/tokenUsage/updated) wins either way.
-    usage = _codex_usage_map(thread.get("tokenUsage"))
+    usage = _codex_usage_map(thread.get("tokenUsage"),
+                             model=_codex_thread_model(tid, thread))
     if usage:
         out["usage"] = usage
     return out
@@ -10359,6 +10402,168 @@ def _cc_context_usage_cached(jsonl):
     return usage
 
 
+# ── 花費/token 可見性(P2-F5)──────────────────────────────────────────────
+# 模型單價表(**估算**用)。價格快照日期:2026-08-15;來源:Anthropic / OpenAI
+# 公開牌價($ / 1M tokens,(input, output))。片段子字串比對、先長後短;
+# 認不出的模型 → None,出口只給 token 不給 $,絕不編價格。
+_MODEL_PRICES_ASOF = "2026-08-15"
+_MODEL_PRICES = (
+    # Anthropic(CC)— cache read/write 用下方倍率近似
+    ("fable", (10.0, 50.0)),
+    ("mythos", (10.0, 50.0)),
+    ("opus", (5.0, 25.0)),
+    ("sonnet", (3.0, 15.0)),
+    ("haiku", (1.0, 5.0)),
+    # OpenAI(CX / codex)— cached input 同樣以 0.1x 近似
+    ("gpt-5-mini", (0.25, 2.0)),
+    ("gpt-5-nano", (0.05, 0.4)),
+    ("gpt-5", (1.25, 10.0)),
+    ("codex-mini", (1.5, 6.0)),
+    ("o4-mini", (1.1, 4.4)),
+    ("o3", (2.0, 8.0)),
+)
+_PRICE_CACHE_READ_MULT = 0.1    # Anthropic cache read / OpenAI cached input
+_PRICE_CACHE_WRITE_MULT = 1.25  # Anthropic 5m-TTL cache write
+
+
+def _model_price(model):
+    """model 字串 → (input $/Mtok, output $/Mtok);認不出 → None。"""
+    m = (model or "").lower()
+    if not m:
+        return None
+    for frag, price in _MODEL_PRICES:
+        if frag in m:
+            return price
+    return None
+
+
+def _estimate_cost_usd(model, input_tokens=0, output_tokens=0,
+                       cache_read_tokens=0, cache_write_tokens=0):
+    """token 用量 → 估算花費(USD)。未知模型 → None。**這是估算**:
+    單價表是人工快照(_MODEL_PRICES_ASOF),cache 以倍率近似(5m TTL),
+    與真實帳單必有出入 —— 出口一律標 cost_is_estimate。"""
+    price = _model_price(model)
+    if not price:
+        return None
+    in_rate, out_rate = price
+    return ((input_tokens or 0) * in_rate
+            + (output_tokens or 0) * out_rate
+            + (cache_read_tokens or 0) * in_rate * _PRICE_CACHE_READ_MULT
+            + (cache_write_tokens or 0) * in_rate * _PRICE_CACHE_WRITE_MULT
+            ) / 1_000_000.0
+
+
+# jsonl path -> 增量累加狀態。jsonl 是 append-only:記 offset 只讀新尾巴,
+# 檔案變短(rotate/truncate)才整檔重算 —— 絕不每次全掃。
+_cc_cum_cache: dict = {}
+
+
+def _cc_cum_state_new() -> dict:
+    return {"offset": 0, "mtime": -1.0, "seen": set(), "carry": "",
+            "input": 0, "output": 0, "cache_read": 0, "cache_write": 0,
+            "cost": 0.0, "priced": 0, "model": None}
+
+
+def _cc_cum_ingest_line(st: dict, line: str):
+    """一行 transcript jsonl → 累加進 st。以 message.id 去重(streamed/
+    retried turn 會把同一則 usage 重複寫進 log,與 _claude_local_fallback_usage
+    同款規則)。"""
+    line = line.strip()
+    if not line or '"assistant"' not in line or '"usage"' not in line:
+        return
+    try:
+        rec = json.loads(line)
+    except Exception:  # noqa: BLE001
+        return
+    if rec.get("type") != "assistant":
+        return
+    msg = rec.get("message") or {}
+    u = msg.get("usage")
+    if not isinstance(u, dict):
+        return
+    mid = msg.get("id") or line[:80]
+    if mid in st["seen"]:
+        return
+    st["seen"].add(mid)
+
+    def _i(key):
+        try:
+            return int(u.get(key) or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    inp = _i("input_tokens")
+    outp = _i("output_tokens")
+    cr = _i("cache_read_input_tokens")
+    cw = _i("cache_creation_input_tokens")
+    st["input"] += inp
+    st["output"] += outp
+    st["cache_read"] += cr
+    st["cache_write"] += cw
+    model = msg.get("model")
+    if model:
+        st["model"] = model
+    cost = _estimate_cost_usd(model, input_tokens=inp, output_tokens=outp,
+                              cache_read_tokens=cr, cache_write_tokens=cw)
+    if cost is not None:
+        st["cost"] += cost
+        st["priced"] += 1
+
+
+def _cc_cum_public(st: dict):
+    """累加狀態 → 出口欄位(併進既有 usage dict 的**新增欄**,加欄不改形)。"""
+    total = st["input"] + st["output"] + st["cache_read"] + st["cache_write"]
+    if total <= 0:
+        return None
+    out = {"input_tokens": st["input"], "output_tokens": st["output"],
+           "cache_read_tokens": st["cache_read"],
+           "cache_creation_tokens": st["cache_write"],
+           "total_tokens": total}
+    if st["model"]:
+        out["model"] = st["model"]
+    if st["priced"]:
+        out["cost_usd"] = round(st["cost"], 4)
+        out["cost_is_estimate"] = True   # 單價快照 + cache 倍率近似,非帳單
+    return out
+
+
+def _cc_cum_usage_cached(jsonl):
+    """這條 CC session 的**累計** token 用量與估算花費 → dict 或 None。
+    增量讀取:mtime+size 沒動就零讀取;動了只讀 offset 之後的新內容。"""
+    if not jsonl:
+        return None
+    try:
+        size = os.path.getsize(jsonl)
+        mtime = os.path.getmtime(jsonl)
+    except OSError:
+        return None
+    st = _cc_cum_cache.get(jsonl)
+    if st is None or size < st["offset"]:
+        st = _cc_cum_state_new()       # 新檔 / 檔案變短(truncate)→ 重算
+    if st["offset"] == size and st["mtime"] == mtime:
+        return _cc_cum_public(st)
+    try:
+        with open(jsonl, "rb") as f:
+            f.seek(st["offset"])
+            chunk = f.read(size - st["offset"])
+    except OSError:
+        return None
+    text = st["carry"] + chunk.decode("utf-8", "replace")
+    lines = text.split("\n")
+    st["carry"] = lines.pop()          # 半行(writer 寫到一半)留給下一輪接續
+    for line in lines:
+        try:
+            _cc_cum_ingest_line(st, line)
+        except Exception as _exc:  # noqa: BLE001
+            _log_exc("_cc_cum_usage_cached.line", _exc, expected=True)
+    st["offset"] = size
+    st["mtime"] = mtime
+    if len(_cc_cum_cache) > 256:
+        _cc_cum_cache.clear()          # 罕見;重掃一次換掉無界成長
+    _cc_cum_cache[jsonl] = st
+    return _cc_cum_public(st)
+
+
 def _cc_tail_preview(jsonl: str) -> str:
     """Transcript 尾巴 64KB 反向掃,抽最後一則 user/assistant 可讀文字。
     tool_result/系統包裹(list 無 text 塊、'<'開頭)自然跳過。"""
@@ -10507,10 +10712,12 @@ async def _cc_sessions():
                "sessionId": sid, "sessionTitle": stitle,
                "claudeTitle": claude_title}
         # context 用量(與 Codex 同款 {used,size});取不到就不放這個 key,
-        # app 端整條隱藏而不是顯示 0%。
+        # app 端整條隱藏而不是顯示 0%。P2-F5:有 usage 時順手併累計 token/
+        # 估算花費(加欄不改形;ctx 的 used/size 永遠壓過 cum 同名欄)。
         ctx = _cc_context_usage_cached(jsonl)
         if ctx:
-            row["usage"] = ctx
+            cum = _cc_cum_usage_cached(jsonl)
+            row["usage"] = {**cum, **ctx} if cum else ctx
         out.append(row)
     return out
 
@@ -12720,7 +12927,11 @@ async def _cc_status_core(name: str) -> dict:
     if jsonl:
         usage, plan = _cc_scan_jsonl(jsonl)
         if usage:
-            st["usage"] = usage
+            # P2-F5:併累計 token/估算花費(新增欄;used/size 以即時掃描為準)。
+            # v2 session.status 直接帶這顆 dict(見 cc card follower),
+            # 舊 app 只讀 used/size,不受影響。
+            cum = _cc_cum_usage_cached(jsonl)
+            st["usage"] = {**cum, **usage} if cum else usage
         if prompt and plan and "plan" in low:
             # The live prompt is a plan approval — hand the app the COMPLETE
             # plan markdown (the pane preview is truncated by the TUI).
