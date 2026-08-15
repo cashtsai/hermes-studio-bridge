@@ -14272,11 +14272,19 @@ _CC_STREAM_MAX_TICK = 4000       # 單 tick 附加上限;超過視同重繪,跳�
 _CC_STREAM_MAX_DRAFT = 12000     # 草稿文字上限;飽和後停止增長,等正典卡
 _CC_STREAM_FINAL_GRACE = 4.0     # turn 結束後等正典卡接管的寬限秒數
 
-# 尾端 UI 雜訊(輸入框上方):spinner/狀態行、快捷鍵列、分隔線。
+# 尾端 UI 雜訊(輸入區上方):spinner/狀態行、快捷鍵列、分隔線、tmux 提示。
+# 2.1.x 實錄補充:spinner 有「· Gitifying…」「✻ Coalescing… (4s · ↓ 79 tokens)」
+# 「✻ Brewed for 21s」等變體,leading glyph 字元組已涵蓋;tmux 捲動提示行
+# (「tmux detected · scroll with PgUp/PgDn…」)是 2.1 新增,必須剝掉。
 _CC_STREAM_CHROME_RE = re.compile(
     r"^\s*(?:[✻✽✶✢✳∗＊·✦✧].*|esc to interrupt.*|\? for shortcuts.*"
-    r"|⏵⏵.*|[─╌╍]{4,}\s*)$", re.IGNORECASE)
+    r"|tmux detected ·.*|⏵⏵.*|⏸.*|[─╌╍]{4,}\s*)$", re.IGNORECASE)
 _CC_STREAM_BOX_TOP_RE = re.compile(r"^\s*╭")
+# v2.1+ 輸入區:不再是 ╭─╮ 框,而是「── 分隔線 / ❯ 提示行 / ── 分隔線 /
+# 狀態行」。錨點改抓最後一條 ❯ 提示行(輸入區永遠在 transcript 之下,
+# 使用者回顯的 ❯ 在上方,取「最後一個」就是輸入區)。
+_CC_STREAM_PROMPT_RE = re.compile(r"^\s*❯")
+_CC_STREAM_RULE_RE = re.compile(r"^\s*[─╌╍]{4,}\s*$")
 # 「⏺ ToolName(args…)」的工具呼叫塊;誤把 prose 當工具只會少流(正典補),
 # 反向誤判才會把垃圾塞進草稿 —— 所以規則從寬。
 _CC_STREAM_TOOL_RE = re.compile(r"^[A-Za-z][\w.:-]{0,60}\(")
@@ -14291,19 +14299,33 @@ def _cc_token_stream_enabled() -> bool:
 
 
 def _cc_stream_content(pane: str):
-    """pane 擷取 → 對話區純文字;認不出版面(找不到輸入框)回 None,
-    呼叫端跳過該 tick(保守優先)。"""
+    """pane 擷取 → 對話區純文字;認不出版面(找不到輸入區)回 None,
+    呼叫端跳過該 tick(保守優先)。
+
+    輸入區錨點支援兩代 TUI(2026-08-15 spike 實測補):
+      · ≤v2.0:╭─╮ 輸入框 → 最後一個 ╭(最下方的框)。
+      · v2.1+:`❯` 提示行(上緣緊貼一條 ── 分隔線)→ 最後一個 ❯。
+    兩種都在就取「較下面」那個 —— 輸入區永遠在 transcript 之下;
+    2.1 的歡迎框仍是 ╭─╮,只認 ╭ 會把錨咬在頂部、歡迎框捲走後更是
+    整個認不出版面(feat/cc-token-stream 當初在 2.0.x 上寫,flag 一直
+    沒開的真因就是這條版面漂移)。"""
     if not pane:
         return None
     pane = _CC_STREAM_ANSI_RE.sub("", pane)
     lines = [ln.rstrip() for ln in pane.splitlines()]
-    box_top = None
+    box_top = prompt = None
     for i, ln in enumerate(lines):
         if _CC_STREAM_BOX_TOP_RE.match(ln):
-            box_top = i                     # 取最後一個 ╭ ── 即最下方的輸入框
-    if box_top is None:
+            box_top = i                     # 最後一個 ╭(≤v2.0 輸入框)
+        if _CC_STREAM_PROMPT_RE.match(ln):
+            prompt = i                      # 最後一條 ❯ 提示行(v2.1+)
+    if box_top is None and prompt is None:
         return None
-    content = lines[:box_top]
+    cut = max(x for x in (box_top, prompt) if x is not None)
+    if prompt is not None and cut == prompt and cut > 0 \
+            and _CC_STREAM_RULE_RE.match(lines[cut - 1]):
+        cut -= 1                            # 提示行上緣的 ── 分隔線一併切掉
+    content = lines[:cut]
     # 尾端往上剝:空行、spinner/狀態行、busy 計時行(輸入框上那圈雜訊,
     # 每張 capture 都在變,不剝乾淨 diff 永遠對不上)。
     while content:
@@ -14424,6 +14446,11 @@ class CCPaneStream:
     def _grow(self, piece: str, newline: bool):
         if len(self.draft) >= _CC_STREAM_MAX_DRAFT:
             return                             # 飽和:停止增長,等正典卡
+        if not self.draft:
+            piece = piece.lstrip()             # 空草稿不吃前導空白(2.1 實測:
+                                               # 「⏺」先落、字後到的同行增長會
+                                               # 帶進 ⏺ 後那個空格;≥4 空白還會
+                                               # 被 markdown 當 code block)
         if newline and self.draft and not self.draft.endswith("\n"):
             piece = "\n" + piece
         self.draft = (self.draft + piece)[:_CC_STREAM_MAX_DRAFT]

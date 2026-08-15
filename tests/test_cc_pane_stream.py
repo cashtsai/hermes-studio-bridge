@@ -5,7 +5,14 @@ fixture 是仿真的 CC TUI pane 擷取(tmux capture-pane -p 形狀):歡迎框�
 使用者回顯、⏺ 工具塊 + ⎿ 結果、spinner/狀態行、輸入框、快捷鍵列。
 鐵律驗證:diff 對不上就跳過(不出垃圾)、工具輸出不進草稿、正典卡
 接管草稿 id(同 id rev++ final:true)。
+
+兩代版面都測:
+  · ≤v2.0:╭─╮ 輸入框(原始 fixture)。
+  · v2.1+:── 分隔線 / ❯ 提示行 / ── / 狀態行(2026-08-15 spike 對
+    v2.1.207 實錄還原,含 tmux 提示行、`· Coalescing…` spinner 變體、
+    使用者回顯改用 ❯、`✻ Brewed for 21s` 完稿行)。
 """
+import asyncio
 import os
 import unittest
 from unittest import mock
@@ -52,6 +59,38 @@ T4 = T3 + (
     "     set -euo pipefail"
 )
 T5 = T4 + "\n\n⏺ 結論:可以直接跑。"
+
+
+# ── v2.1+ 版面 fixture(對 v2.1.207 tmux 實錄還原)──────────────────────
+RULE = "─" * 80
+INPUT_AREA_21 = (
+    f"{RULE}\n"
+    "❯ \n"
+    f"{RULE}\n"
+    "   Claude | 5h 74% | 7d 92%\n"
+    "  ⏸ manual mode on · ← for agents\n"
+)
+TMUX_HINT = ("  tmux detected · scroll with PgUp/PgDn · or add 'set -g mouse on'"
+             " to ~/.tmux.conf for wheel scroll")
+WELCOME_21 = (
+    "╭─── Claude Code v2.1.207 ──────────────────────╮\n"
+    "│   Opus 4.8 · Claude Max · someone@example.com │\n"
+    "╰───────────────────────────────────────────────╯\n"
+)
+SPIN_A21 = "· Coalescing… (4s · ↓ 79 tokens)"
+SPIN_B21 = "✻ Coalescing… (running stop hook · 21s · ↓ 356 tokens)"
+
+
+def pane21(transcript: str, spinner: str = SPIN_A21) -> str:
+    """組一張 v2.1 版面 pane:transcript + spinner + tmux 提示 + 輸入區。"""
+    return f"{transcript}\n\n{spinner}\n\n{TMUX_HINT}\n{INPUT_AREA_21}"
+
+
+U0 = WELCOME_21 + "\n❯ 請直接用中文寫一段短文,介紹貓的習性。"
+U1 = U0 + "\n\n⏺ 貓是一種既獨立又充滿魅力的動物,"
+U2 = U1 + "牠們的習性反映出天生的獵手本能。"
+U3 = U2 + "\n\n  貓最為人熟知的特點就是愛睡覺,一天可睡十二到十六個小時。"
+U4 = U3 + "\n\n✻ Brewed for 21s"
 
 
 class FlagTests(unittest.TestCase):
@@ -316,6 +355,159 @@ class DraftCardTests(unittest.TestCase):
         self.assertTrue(card["final"])
         self.assertEqual(card["body"]["text"], full)
         self.assertEqual(st.draft_id, "")
+
+
+class NewLayout21Tests(unittest.TestCase):
+    """v2.1+ 版面(── / ❯ / ── / 狀態行,無 ╭─╮ 輸入框)。
+
+    這正是 feat/cc-token-stream 首發後 flag 一直開不了的真因:v2.1 把
+    輸入框換成 ❯ 提示行,舊錨(最後一個 ╭)不是咬在頂部歡迎框、就是
+    整個認不出版面 → 永遠流不出半個字。"""
+
+    def test_content_anchor_on_prompt_line(self):
+        c = bridge._cc_stream_content(pane21(U1))
+        self.assertIsNotNone(c)
+        self.assertIn("貓是一種既獨立又充滿魅力的動物", c)
+        # 輸入區以下、以及 spinner / tmux 提示全部剝乾淨
+        self.assertNotIn("Claude | 5h", c)
+        self.assertNotIn("manual mode", c)
+        self.assertNotIn("tmux detected", c)
+        self.assertNotIn("Coalescing", c)
+
+    def test_welcome_box_does_not_steal_anchor(self):
+        """歡迎框仍是 ╭─╮:錨必須取「較下面」的 ❯,不能咬在頂部。"""
+        c = bridge._cc_stream_content(pane21(U0))
+        self.assertIsNotNone(c)
+        self.assertIn("請直接用中文寫一段短文", c)
+
+    def test_welcome_scrolled_off_still_works(self):
+        """歡迎框捲出視窗(pane 裡一個 ╭ 都沒有)→ 舊碼回 None,新碼
+        照樣認得 ❯ 錨。"""
+        no_welcome = "\n".join(U1.splitlines()[3:])
+        c = bridge._cc_stream_content(pane21(no_welcome))
+        self.assertIsNotNone(c)
+        self.assertIn("貓是一種既獨立又充滿魅力的動物", c)
+
+    def test_spinner_variants_invisible(self):
+        """2.1 spinner 變體(`· …`/`✻ … (running stop hook · …)`)剝乾淨後
+        content 必須相等,diff 才對得上。"""
+        self.assertEqual(bridge._cc_stream_content(pane21(U1, SPIN_A21)),
+                         bridge._cc_stream_content(pane21(U1, SPIN_B21)))
+
+    def test_streams_prose_new_layout(self):
+        st = bridge.CCPaneStream()
+        st.feed(pane21(U0))
+        draft, changed = st.feed(pane21(U1, SPIN_B21))
+        self.assertTrue(changed)
+        self.assertEqual(draft, "貓是一種既獨立又充滿魅力的動物,")
+        draft, changed = st.feed(pane21(U2))          # 同行長 token
+        self.assertTrue(changed)
+        self.assertTrue(draft.endswith("天生的獵手本能。"))
+        draft, changed = st.feed(pane21(U3, SPIN_B21))  # 縮排續段
+        self.assertTrue(changed)
+        self.assertTrue(draft.endswith("一天可睡十二到十六個小時。"))
+        self.assertNotIn("請直接用中文", draft)        # ❯ 使用者回顯不進草稿
+
+    def test_brewed_line_no_spurious_diff(self):
+        """完稿後 transcript 尾端長出「✻ Brewed for 21s」→ 屬 chrome,
+        不得攪動草稿。"""
+        st = bridge.CCPaneStream()
+        st.feed(pane21(U0))
+        st.feed(pane21(U3))
+        before = st.draft
+        draft, changed = st.feed(pane21(U4))
+        self.assertFalse(changed)
+        self.assertEqual(draft, before)
+
+    def test_empty_draft_strips_leading_space(self):
+        """v2.1 實測:「⏺」先落、字下一 tick 才到 → 同行增長會帶著 ⏺ 後
+        的空格開頭;空草稿必須 lstrip,免得草稿頂著空白(≥4 格還會被
+        markdown 當 code block)。"""
+        base = WELCOME_21 + "\n❯ 問題"
+        st = bridge.CCPaneStream()
+        st.feed(pane21(base))
+        st.feed(pane21(base + "\n\n⏺"))               # ⏺ 先落(裸標記)
+        draft, changed = st.feed(pane21(base + "\n\n⏺ 回覆從這裡開始"))
+        self.assertTrue(changed)
+        self.assertEqual(draft, "回覆從這裡開始")
+
+
+class SubtickLoopTests(unittest.TestCase):
+    """_cc_stream_subticks 全迴圈(monkeypatch 掉 tmux 擷取)+ OFF 零影響。"""
+
+    def _store(self, subs=1):
+        store = carddigest.SessionCardStore()
+        store.turn_id = "turn-sub1"
+        store.subscribers = subs
+        return store
+
+    def test_subticks_upsert_then_canonical_takeover(self):
+        store = self._store()
+        seq = [pane21(U0), pane21(U1), pane21(U2, SPIN_B21), pane21(U3)]
+
+        async def fake_capture(name):
+            return seq.pop(0) if len(seq) > 1 else seq[0]
+
+        async def run():
+            with mock.patch.object(bridge, "_cc_capture_pane_fresh",
+                                   fake_capture), \
+                 mock.patch.object(bridge, "_CC_STREAM_INTERVAL", 0.01):
+                await bridge._cc_stream_subticks("t", store)
+
+        asyncio.run(run())
+        st = store.cc_stream
+        self.assertTrue(st.draft_id)
+        card = store.cards[st.draft_id]
+        self.assertFalse(card["final"])
+        self.assertGreaterEqual(card["rev"], 2)        # 同卡 rev++ 漸進
+        self.assertIn("愛睡覺", card["body"]["text"])
+        # 正典 jsonl 行到 → 接管草稿 id,final:true 原位換文
+        full = "貓是一種既獨立又充滿魅力的動物(正典全文)。"
+        line = ('{"type":"assistant","uuid":"eeff0011-9999",'
+                '"message":{"content":[{"type":"text","text":"%s"}]}}' % full)
+        store.media_session_id = "claude_code:t"
+        with mock.patch.object(bridge, "_schedule_media_capture"):
+            bridge._cc_digest_lines(store, [line], "/tmp/x.jsonl", 0)
+        card = store.cards[st.draft_id if st.draft_id else ""] \
+            if st.draft_id else store.cards[card["id"]]
+        self.assertTrue(card["final"])
+        self.assertEqual(card["body"]["text"], full)
+
+    def test_subticks_stop_when_no_subscribers(self):
+        """訂閱者走光 → 立刻停,一張 pane 都不抓(無人看零成本)。"""
+        store = self._store(subs=0)
+        calls = []
+
+        async def fake_capture(name):
+            calls.append(1)
+            return pane21(U1)
+
+        async def run():
+            with mock.patch.object(bridge, "_cc_capture_pane_fresh",
+                                   fake_capture), \
+                 mock.patch.object(bridge, "_CC_STREAM_INTERVAL", 0.01):
+                await bridge._cc_stream_subticks("t", store)
+
+        asyncio.run(run())
+        self.assertEqual(calls, [])
+        self.assertEqual(store.cards, {})
+
+    def test_flag_off_digest_path_untouched(self):
+        """OFF 零影響:未啟用(從無草稿狀態)時,正典卡原 id 原樣入庫,
+        店裡不會出現任何 card-cc-stream-* 卡。"""
+        self.assertFalse(bridge._cc_token_stream_enabled())   # 預設 OFF
+        store = self._store()
+        store.media_session_id = "claude_code:t"
+        line = ('{"type":"assistant","uuid":"77770000-1234",'
+                '"message":{"content":[{"type":"text","text":"正常回覆"}]}}')
+        with mock.patch.object(bridge, "_schedule_media_capture"):
+            n = bridge._cc_digest_lines(store, [line], "/tmp/x.jsonl", 0)
+        self.assertEqual(n, 1)
+        ids = list(store.cards)
+        self.assertEqual(len(ids), 1)
+        self.assertTrue(ids[0].startswith("card-cc-"))
+        self.assertNotIn("card-cc-stream", ids[0])
+        self.assertTrue(store.cards[ids[0]]["final"])
 
 
 if __name__ == "__main__":
