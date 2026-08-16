@@ -519,14 +519,19 @@ class TestDistill(unittest.IsolatedAsyncioTestCase):
         self.assertIn(ids[0], skill["evidence"])
 
     async def test_路由提案不經模型_純統計(self):
+        # 2026-08-16 守門收緊後,出提案要同時滿足:樣本 ≥ ROUTE_MIN_SAMPLES
+        # 且同類至少 ROUTE_MIN_CANDIDATES 個夠格候選(沒對手的「最高」不算)。
         st = _store()
-        _seed(st, n_ok=8, n_fail=1)
+        _seed(st, n_ok=D.ROUTE_MIN_SAMPLES + 2, n_fail=1)
+        _seed(st, n_ok=D.ROUTE_MIN_SAMPLES - 4, n_fail=D.ROUTE_MIN_SAMPLES,
+              sid="claude_code:rival")            # 對手:夠格但成功率低
         # 模型整個掛掉,路由照樣要有
         mc = AsyncMock(side_effect=RuntimeError("ollama 掛了"))
         out = await D.run(st, hours=24, model_call=mc)
         routes = [p for p in out["proposals"] if p["store"] == "subagent_route"]
         self.assertEqual(len(routes), 1)
         self.assertEqual(routes[0]["payload"]["task_kind"], "coding")
+        self.assertEqual(routes[0]["payload"]["target"], "claude_code:tirith")
         self.assertEqual(routes[0]["meta"]["source"], "statistics")
         self.assertTrue(out["errors"])            # 模型錯誤有被記錄
         self.assertEqual(st.last_run()["proposals"], 1)
@@ -538,9 +543,22 @@ class TestDistill(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([p for p in out["proposals"]
                           if p["store"] == "subagent_route"], [])
         st2 = _store()
-        _seed(st2, n_ok=2, n_fail=6)              # 成功率 25% < 門檻
+        _seed(st2, n_ok=D.ROUTE_MIN_SAMPLES // 2,
+              n_fail=D.ROUTE_MIN_SAMPLES * 2)     # 成功率遠低於門檻
+        _seed(st2, n_ok=D.ROUTE_MIN_SAMPLES, n_fail=D.ROUTE_MIN_SAMPLES,
+              sid="claude_code:rival")            # 有對手,單純輸在成功率
         out2 = await D.run(st2, hours=24, model_call=AsyncMock(return_value="{}"))
         self.assertEqual([p for p in out2["proposals"]
+                          if p["store"] == "subagent_route"], [])
+
+    async def test_單一候選不出路由_倖存者偏差守門(self):
+        # 2026-08-16 實案:第一晚就提「tooling → 某thread(6/6, 100%)」——
+        # 分母全來自同一條 thread,那 24 小時只有它在做那類任務。守門:
+        # 同類沒有第二個夠格候選就不提,「最高」要有對手才成立。
+        st = _store()
+        _seed(st, n_ok=D.ROUTE_MIN_SAMPLES * 2, n_fail=0)   # 樣本夠、100%
+        out = await D.run(st, hours=24, model_call=AsyncMock(return_value="{}"))
+        self.assertEqual([p for p in out["proposals"]
                           if p["store"] == "subagent_route"], [])
 
     async def test_dry_run_不寫庫(self):
@@ -556,7 +574,9 @@ class TestDistill(unittest.IsolatedAsyncioTestCase):
 
     async def test_壞_json_不炸整輪(self):
         st = _store()
-        _seed(st, n_ok=8, n_fail=1)
+        _seed(st, n_ok=D.ROUTE_MIN_SAMPLES + 2, n_fail=1)
+        _seed(st, n_ok=D.ROUTE_MIN_SAMPLES - 4, n_fail=D.ROUTE_MIN_SAMPLES,
+              sid="claude_code:rival")            # 守門要求同類有對手
         out = await D.run(st, hours=24,
                           model_call=AsyncMock(return_value="我覺得應該多加註解"))
         self.assertEqual([p for p in out["proposals"] if p["store"] == "memory"], [])
