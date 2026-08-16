@@ -6131,6 +6131,10 @@ class CodexAppServerClient:
                 self.thread_errors[tid] = str(msg)
                 self._append(tid, ("text", f"\n⚠️ Codex turn failed: {msg}\n"))
             elif not self.thread_errors.get(tid, "").startswith("Codex turn stalled"):
+                # stalled 在這裡**刻意保留**:watchdog 中止卡住的回合時 codex 會
+                # 補送一個「正常完成」的 turn/completed,不擋就來不及看到卡過。
+                # 它的清除點在 start_turn(下一個回合真的開跑)—— 在那之前只有
+                # 這個守衛、卻沒有任何地方會清,才會變成永久黏著。
                 self.thread_errors.pop(tid, None)
             # M1:是委派 thread → 回流父對話(running→idle/failed 轉換內部去重)。
             try:
@@ -6270,6 +6274,13 @@ class CodexAppServerClient:
             if _codex_thread_lock_conflict(e) is None:
                 raise
             raise self._thread_lock_error(thread_id, e) from e
+        # 新回合真的開跑 = 上一次的錯誤已成歷史,務必在這裡清掉。
+        # 2026-08-16 實機:一條 session 卡過一次(watchdog 判 stalled)之後,即使
+        # 後續回合成功跑完並正確回話,app 上的紅色「錯誤」永遠不消 —— 因為
+        # turn/completed 那邊刻意不清 stalled(見該處註解),而 turn/started
+        # **通知**在自己發起的回合上不保證會走到那個 handler。權威的清除時機
+        # 是「turn/start 成功回來」,不是等一個可能不來的通知。
+        self.thread_errors.pop(thread_id, None)
         self.thread_event_generations[thread_id] += 1
         self.thread_events[thread_id].clear()
         turn = (res or {}).get("turn") or {}
