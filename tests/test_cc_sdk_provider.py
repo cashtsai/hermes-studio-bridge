@@ -789,5 +789,33 @@ class TestAttachmentsNotice(CC2Base):
         self.assertNotIn("attachments_dropped", res)
 
 
+class TestResumeHintCard(CC2Base):
+    """終端接手指令卡(2026-08-16):cc2 沒畫面可 attach,接手靠
+    `claude --resume <sid>`。固定卡 id 不洗版;sid 變了原位更新。"""
+
+    def test_hint_card_on_session_id_capture(self):
+        sess = cc_sdk.registry().ensure("hint1", workdir=_TMP)
+        sess._note_sdk_session("sid-abc-123")
+        cards = [c for c in sess.digest.store.cards.values()
+                 if (c.get("body") or {}).get("origin") == "cc2.resume_hint"]
+        self.assertEqual(len(cards), 1)
+        self.assertIn("claude --resume sid-abc-123",
+                      cards[0]["body"]["text"])
+        # sid 換人(自癒重建)→ 同卡原位更新,不多一張
+        sess._note_sdk_session("sid-def-456")
+        cards2 = [c for c in sess.digest.store.cards.values()
+                  if (c.get("body") or {}).get("origin") == "cc2.resume_hint"]
+        self.assertEqual(len(cards2), 1)
+        self.assertIn("sid-def-456", cards2[0]["body"]["text"])
+
+    def test_v2_rows_carry_resume_command(self):
+        sess = cc_sdk.registry().ensure("hint2", workdir=_TMP)
+        sess._note_sdk_session("sid-xyz")
+        rows = cc_sdk.registry().v2_rows()
+        row = next(r for r in rows if r["id"] == "cc2:hint2")
+        self.assertEqual(row["meta"]["resume_command"],
+                         "claude --resume sid-xyz")
+
+
 if __name__ == "__main__":
     unittest.main()
