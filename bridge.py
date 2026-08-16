@@ -54,6 +54,7 @@ from harness import trajectory as harness_traj
 import media_artifacts
 import hermes_media
 import openclaw_provider
+import cc_detect            # CC TUI 狀態偵測(manifest 引擎;herdr 設計移植)
 import cc_sdk               # CC provider v2(Agent SDK;模組內 lazy-import SDK)
 import tg_outbound
 from fastapi import (FastAPI, Request, HTTPException, WebSocket, WebSocketDisconnect,
@@ -11217,7 +11218,7 @@ async def _cc_sessions():
                 if hook_state:
                     busy = bool(hook_state.get("busy"))
                 else:
-                    busy = bool(_CC_BUSY_RE.search(pane)) or ("esc to interrupt" in pane.lower())
+                    busy = _cc_pane_busy(pane)
                 # Parked on a permission / approval prompt → the home list flags it
                 # ("待放行") so a session waiting on you is never invisible.
                 if not busy and _cc_prompt(pane) is not None:
@@ -12680,8 +12681,22 @@ async def _cc_capture_pane_fresh(name: str) -> str:
     return pane
 
 
-def _cc_pane_busy(pane: str) -> bool:
-    return bool(_CC_BUSY_RE.search(pane)) or ("esc to interrupt" in pane.lower())
+def _cc_pane_busy(pane: str, title: str | None = None) -> bool:
+    """CC pane 忙碌判讀的**唯一入口**(2026-08-16 起走 cc_detect manifest 引擎)。
+    舊版有 5 處 inline 的 `_CC_BUSY_RE.search(pane) or "esc to interrupt"`,
+    規則一漂移要改五個地方;現在規則是資料(cc_detect.DEFAULT_MANIFEST,
+    env `CC_DETECT_MANIFEST` 可覆寫熱更新),且預設 manifest 把舊的兩個訊號
+    (spinner 計時行 / esc to interrupt)都收為 working —— 行為是舊判讀的
+    嚴格超集。title(OSC 終端標題,braille spinner 比 pane 內容穩)有現成的
+    就傳;**不要**為了它在熱路徑多打一次 tmux round-trip。"""
+    return cc_detect.classify(pane, title)["state"] == "working"
+
+
+def _cc_pane_blocked(pane: str, title: str | None = None) -> bool:
+    """CC pane 卡審批判讀(權限/確認選單 → blocked)—— herdr 語意的新能力。
+    給 agent_call「target 卡審批提前回報」等後續功能取用;本檔刻意不在既有
+    路徑接線(選單的**結構化解析**仍走 _cc_prompt,那邊要選項不是 bool)。"""
+    return cc_detect.classify(pane, title)["state"] == "blocked"
 
 
 # CC interrupt + busy status (parity with Codex's stop/active). The app uses
@@ -13412,7 +13427,7 @@ async def _cc_status_core(name: str) -> dict:
     if hook_state:
         busy = bool(hook_state.get("busy"))
     else:
-        busy = bool(_CC_BUSY_RE.search(pane)) or ("esc to interrupt" in pane.lower())
+        busy = _cc_pane_busy(pane)
     low = pane.lower()
     # S3 (wave 2): this box's Claude Code cycles FOUR states on shift+tab —
     # normal → accept edits → plan → auto mode → normal. "accept edits" and
@@ -13572,8 +13587,7 @@ async def _cc_key_core_locked(name: str, raw: str) -> dict:
         # Keep key validation in sync with /status: AskUserQuestion details may
         # only be visible in the transcript jsonl, while the pane has a trimmed
         # or transient rendering. Still avoid resurrecting stale asks mid-turn.
-        low_now = pane_now.lower()
-        busy_now = bool(_CC_BUSY_RE.search(pane_now)) or ("esc to interrupt" in low_now)
+        busy_now = _cc_pane_busy(pane_now)
         row = next((r for r in _cc_conf_rows() if r[0] == name), None)
         if row and (
             (isinstance(prompt_now, dict) and prompt_now.get("semantic") == "question")
@@ -14675,8 +14689,31 @@ async def _v2_cc_state(name: str):
     prompt = _cc_prompt(pane)
     if prompt:
         return ("waiting_approval", prompt)
-    busy = bool(_CC_BUSY_RE.search(pane)) or ("esc to interrupt" in pane.lower())
+    busy = _cc_pane_busy(pane)
     return ("running" if busy else "idle", None)
+
+
+@app.get("/app/v2/cc/{name}/detect_explain")
+async def v2_cc_detect_explain(name: str, request: Request):
+    """herdr `agent explain` 的等價端點:吐出 cc_detect 每條規則的命中結果與
+    證據行。偵測跑歪(busy 卡住/blocked 沒抓到)時打這支,不用上主機重演 regex。
+    注意 title 抓的是 tmux pane_title 的**原始值** —— _cc_pane_title 會剝掉
+    braille spinner 等狀態前綴,那正是 osc_title_working 規則要看的訊號。"""
+    _check_auth(request)
+    if not any(r[0] == name for r in _cc_conf_rows()):
+        raise http_err(404, "SESSION_NOT_FOUND", "unknown session")
+    if not await _tmux_alive(name):
+        raise http_err(409, "SESSION_NOT_RUNNING", "session not running")
+    pane = await _cc_capture_pane_fresh(name)
+    title = None
+    try:
+        rc, out, _ = await _tmux_run("display-message", "-t", name, "-p", "#{pane_title}")
+        if rc == 0:
+            title = (out or "").strip() or None
+    except Exception as _exc:  # noqa: BLE001 — title 只是加分訊號,拿不到照樣解釋
+        _log_exc("v2_cc_detect_explain", _exc, expected=True)
+    return {"session": name, "pane_title": title,
+            **cc_detect.explain(pane, title)}
 
 
 @app.get("/app/v2/agents")
