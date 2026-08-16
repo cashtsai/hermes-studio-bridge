@@ -10,6 +10,7 @@
   3. 舊端點沒被動到(舊版 app 與離線補送都還走它)
   4. 兩條收檔路徑用同一套命名規則
 """
+import _isolation  # noqa: F401  # 測試隔離閂:必須是第一個 import(2026-08-15 事故防線,見 tests/_isolation.py)
 import os
 import sys
 import tempfile

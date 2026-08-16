@@ -12,6 +12,7 @@
 ⚠️ 這裡所有 DB 都指向 tmp,**絕不碰真的 canonical.db / state.db /
 ~/.config/ccsess**(那些是活的 production 資料)。
 """
+import _isolation  # noqa: F401  # 測試隔離閂:必須是第一個 import(2026-08-15 事故防線,見 tests/_isolation.py)
 import asyncio
 import json
 import os

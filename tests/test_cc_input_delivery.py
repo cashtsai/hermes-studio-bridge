@@ -8,6 +8,7 @@ bridge 卻回 200 → app 顯示「已送達」,訊息永遠不會被處理。
   2. 補 Enter 後真的送出 → 回 200,且帶 delivery 語意
   3. 忙碌 / 看不到輸入框 / 從沒 render 出來 → 一律不謊稱 accepted
 """
+import _isolation  # noqa: F401  # 測試隔離閂:必須是第一個 import(2026-08-15 事故防線,見 tests/_isolation.py)
 
 import asyncio
 import os

@@ -4,6 +4,7 @@
 module import 會執行 _canon_init()(event_log/read_cursors 建表就在裡面),
 所以 import 本身就是被測物之一。pytest 與 python3 直跑皆可。
 """
+import _isolation  # noqa: F401  # 測試隔離閂:必須是第一個 import(2026-08-15 事故防線,見 tests/_isolation.py)
 import asyncio
 import json
 import os

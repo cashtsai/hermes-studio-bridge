@@ -7,6 +7,7 @@ CC/CX session 在**沒人看畫面**(subscribers==0)時收尾 → 推播」的�
 TURNEND_PUSH=0 全停用、preview=False 裝置只看占位文案(由 push_notify 的
 no_preview_body 承擔,這裡驗參數有帶)。
 """
+import _isolation  # noqa: F401  # 測試隔離閂:必須是第一個 import(2026-08-15 事故防線,見 tests/_isolation.py)
 import asyncio
 import os
 import sys

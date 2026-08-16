@@ -8,6 +8,7 @@
   • `on-failure` 在 0.147 已從 approvalPolicy 枚舉移除;送出去會拿到 -32600,
     而 -32600 舊路徑一律翻成「上一輪正在跑」——語意相反。
 """
+import _isolation  # noqa: F401  # 測試隔離閂:必須是第一個 import(2026-08-15 事故防線,見 tests/_isolation.py)
 import os
 import sys
 import tempfile

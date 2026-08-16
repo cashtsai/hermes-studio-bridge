@@ -5,6 +5,7 @@
 —— 認領逾期、連續失敗、委派 failed、CX 鎖死、待核准超過 10 分鐘都要浮上來;
 而且**單一源壞掉只能降級為缺席(sources_ok=false),絕不拖垮整個端點**。
 """
+import _isolation  # noqa: F401  # 測試隔離閂:必須是第一個 import(2026-08-15 事故防線,見 tests/_isolation.py)
 import os
 import sqlite3
 import sys
@@ -23,18 +24,21 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import bridge  # noqa: E402
 
 # 安全閂:這個檔的 fixture 會 DELETE/INSERT canonical、registry 表。如果
-# bridge 被別的測試模組**先** import(setdefault 來不及生效),CANON_DB /
-# REGISTRY 會指向 production 路徑 —— 那時寧可整檔炸掉,也不准碰真 DB。
+# bridge 綁到的路徑落在 production 目錄下 —— 寧可整檔炸掉,也不准碰真 DB。
 # (2026-08-16 實錄:跨模組合跑一次就把 production approvals/agent_calls
 # 清掉了。這不是假想敵。)
-assert bridge.CANON_DB == os.environ["POCKET_CANON_DB"], \
-    "bridge 已被先 import,CANON_DB 指向非測試路徑;請單獨跑本測試檔"
-assert bridge.REGISTRY.db_path == os.environ["POCKET_REGISTRY_DB"], \
-    "bridge 已被先 import,REGISTRY 指向非測試路徑;請單獨跑本測試檔"
-assert bridge.KANBAN_DB == os.environ["POCKET_KANBAN_DB"], \
-    "bridge 已被先 import,KANBAN_DB 指向非測試路徑;請單獨跑本測試檔"
+# 不再用「== 本檔 env」的等式:全套 discover 一個行程跑時,後來的模組會
+# 硬蓋 env,等式必炸(假紅);要防的其實只是「指到 production」,直接對
+# 閂凍結的紅線根比對,順序無關。
+for _label, _path in (("CANON_DB", bridge.CANON_DB),
+                      ("REGISTRY", bridge.REGISTRY.db_path),
+                      ("KANBAN_DB", bridge.KANBAN_DB)):
+    assert not any(_path.startswith(_root + os.sep) or _path == _root
+                   for _root in _isolation.PRODUCTION_ROOTS.values()), \
+        f"{_label}={_path} 指向 production 路徑;絕不在這上面跑 fixture"
 
-KANBAN_DB = os.environ["POCKET_KANBAN_DB"]
+# fixture 種子要跟 bridge 實際用的同一顆 DB(env 可能已被別的模組硬蓋)。
+KANBAN_DB = bridge.KANBAN_DB
 STATEDB_FIXTURE = os.path.join(_TMP, "hermes-state.db")
 NOW = time.time()
 

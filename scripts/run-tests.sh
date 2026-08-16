@@ -8,11 +8,15 @@
 #       就執行」,製造 ERROR 雜訊與 env/monkeypatch 污染,卻貢獻 0 個 case。
 #
 # 這些腳本式檔現在加了 `if __name__ != "__main__": raise SkipTest(...)`,
-# discover 底下乾淨地顯示為 skipped。但那也代表**沒有任何東西會再跑到它們** ——
-# 其中 test_a3_approval_card_parity / test_report_reader_api /
-# test_tg_outbound_mirror 單跑其實是紅的,會就這樣無聲無息地爛掉。
+# discover 底下乾淨地顯示為 skipped。但那也代表**沒有任何東西會再跑到它們**,
+# 不逐檔跑就會無聲無息地爛掉。
 #
 # 所以:discover 負責 (a),這支負責 (b)。兩個都要跑才算跑完整套。
+#
+# 隔離:每個測試檔第一個 import 都是 tests/_isolation.py(2026-08-15 事故後
+# 補的閂)—— env 導流 + audit-hook 寫入守衛,production 路徑寫入直接 raise。
+# 下面 runner 層的 env 匯出仍保留,當第二層皮帶(閂是 setdefault,不搶手動
+# 指定的覆寫)。
 #
 # 用法:
 #   scripts/run-tests.sh                  # 跑全部 tests/*.py

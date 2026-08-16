@@ -3,6 +3,7 @@
 跑法:POCKET_CANON_DB 指到 tmp 庫再 import bridge — module import 會執行
 _canon_init()(migration 就在裡面),所以 import 本身就是被測物之一。
 """
+import _isolation  # noqa: F401  # 測試隔離閂:必須是第一個 import(2026-08-15 事故防線,見 tests/_isolation.py)
 import asyncio
 import json
 import os

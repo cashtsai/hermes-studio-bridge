@@ -15,6 +15,7 @@ GET /app/v1/messages 看得到、不重複」,外加防回歸邊界:
    不出雙泡泡;而 canonical 沒有副本的久遠 TG-only 訊息不被誤壓。
 6. 守門:非 telegram platform、未知 session、剝完全空的純注入 → ignored。
 """
+import _isolation  # noqa: F401  # 測試隔離閂:必須是第一個 import(2026-08-15 事故防線,見 tests/_isolation.py)
 
 # 這支是「腳本式驗收」(repo 慣例:python3 tests/test_tg_mirror_route.py):測試邏輯直接寫在
 # 模組層、用 sys.exit() 回報結果。被 `unittest discover` 匯入時,那些程式碼會在

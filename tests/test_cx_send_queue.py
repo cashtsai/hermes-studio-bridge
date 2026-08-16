@@ -8,6 +8,7 @@
 3. codex 的 echo 卡從來沒帶 client_id(bridge 明明有送 clientUserMessageId),
    任何拿 client_id 對位 echo 的客戶端都永遠對不到。
 """
+import _isolation  # noqa: F401  # 測試隔離閂:必須是第一個 import(2026-08-15 事故防線,見 tests/_isolation.py)
 import asyncio
 import unittest
 

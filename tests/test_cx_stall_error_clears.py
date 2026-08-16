@@ -12,6 +12,7 @@
 一個「正常完成」,不擋就來不及看到卡過),但**沒有任何地方**會在新回合開跑時清掉,
 於是永久黏著。清除的權威時機是 start_turn 成功回來。
 """
+import _isolation  # noqa: F401  # 測試隔離閂:必須是第一個 import(2026-08-15 事故防線,見 tests/_isolation.py)
 import asyncio
 import unittest
 

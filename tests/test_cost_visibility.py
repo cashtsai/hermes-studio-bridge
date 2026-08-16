@@ -12,6 +12,7 @@ import bridge,可直接 `PYTHONPATH=. python tests/test_cost_visibility.py` 執�
    未知模型只給 token 不給 $;OpenAI cached 子集語意。
 4. CC usage 合併形狀:cum 併 ctx 時 used/size 以 ctx 為準。
 """
+import _isolation  # noqa: F401  # 測試隔離閂:必須是第一個 import(2026-08-15 事故防線,見 tests/_isolation.py)
 import json
 import os
 import sys

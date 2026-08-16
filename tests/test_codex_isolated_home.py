@@ -14,6 +14,7 @@ app 的無頭 Ubuntu 上活著。
     PYTHONPATH=. python -m unittest tests.test_codex_isolated_home
     PYTHONPATH=. python tests/test_codex_isolated_home.py
 """
+import _isolation  # noqa: F401  # 測試隔離閂:必須是第一個 import(2026-08-15 事故防線,見 tests/_isolation.py)
 import asyncio
 import contextlib
 import hashlib

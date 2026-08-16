@@ -10,6 +10,7 @@ TOP half 的行為驗收:
   6. 收隊不殺 session:worker 列保留 + remaining_sessions 列出遺留
   7. status 端點形狀(live 降級不 500)
 """
+import _isolation  # noqa: F401  # 測試隔離閂:必須是第一個 import(2026-08-15 事故防線,見 tests/_isolation.py)
 import asyncio
 import json
 import os

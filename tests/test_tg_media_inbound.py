@@ -19,6 +19,7 @@
    TG 訊息 → 歷史輸出含 {kind, filename, mime, path} 媒體引用。
 6. 文件/音訊 saved-at 提示(gateway/run.py:2298/11681)不回歸。
 """
+import _isolation  # noqa: F401  # 測試隔離閂:必須是第一個 import(2026-08-15 事故防線,見 tests/_isolation.py)
 
 # 這支是「腳本式驗收」(repo 慣例:python3 tests/test_tg_media_inbound.py):測試邏輯直接寫在
 # 模組層、用 sys.exit() 回報結果。被 `unittest discover` 匯入時,那些程式碼會在

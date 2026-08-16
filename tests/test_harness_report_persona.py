@@ -5,6 +5,7 @@
 一份**內容完全相同**的 3533 bytes 報告。提案本身是全域的(scope 寫在提案自己
 身上),審核也只有一個人要做 —— 其餘三個人格收到只是被打擾。
 """
+import _isolation  # noqa: F401  # 測試隔離閂:必須是第一個 import(2026-08-15 事故防線,見 tests/_isolation.py)
 import unittest
 from unittest import mock
 

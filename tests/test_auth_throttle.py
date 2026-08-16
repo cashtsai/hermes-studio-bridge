@@ -6,6 +6,7 @@
      的正常人會被連坐)。relay 多租戶必修。
   ② `_AUTH_FAIL_AGG` 永不清理,key 含 request path → 變換路徑即可無限撐大。
 """
+import _isolation  # noqa: F401  # 測試隔離閂:必須是第一個 import(2026-08-15 事故防線,見 tests/_isolation.py)
 import os, sys, time, types, unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 os.environ.setdefault("BRIDGE_TOKEN", "test-token-for-auth-throttle")

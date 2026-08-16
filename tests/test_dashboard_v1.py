@@ -4,6 +4,7 @@
 401(壞 token)/ oracle 缺席與過期 → null / 天氣 30 分鐘快取(不重複外呼、
 失敗回舊資料)/ approvals pending 數與前 5 筆 / payload 形狀。
 """
+import _isolation  # noqa: F401  # 測試隔離閂:必須是第一個 import(2026-08-15 事故防線,見 tests/_isolation.py)
 import asyncio
 import json
 import os

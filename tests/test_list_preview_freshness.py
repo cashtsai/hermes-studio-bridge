@@ -1,4 +1,5 @@
 """列表 preview 凍結修復:report_events 取最新 + CC transcript 尾巴抽 preview。"""
+import _isolation  # noqa: F401  # 測試隔離閂:必須是第一個 import(2026-08-15 事故防線,見 tests/_isolation.py)
 
 import json
 import os

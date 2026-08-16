@@ -1,5 +1,6 @@
 """S1 CC jsonl digest 行為驗證 — #15 稽核補洞:cc_event_to_cards / cc_status_label
 一直只有間接覆蓋(S2/S3/B3 走 codex/persona 路徑),本檔直測契約 §1/§2 的 CC 面。"""
+import _isolation  # noqa: F401  # 測試隔離閂:必須是第一個 import(2026-08-15 事故防線,見 tests/_isolation.py)
 
 # 這支是「腳本式驗收」(repo 慣例:python3 tests/test_carddigest_s1.py):測試邏輯直接寫在
 # 模組層、用 sys.exit() 回報結果。被 `unittest discover` 匯入時,那些程式碼會在

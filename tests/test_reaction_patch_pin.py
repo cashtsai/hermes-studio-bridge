@@ -17,6 +17,7 @@
    - 跨 session 隔離:別的 session 置頂不受影響。
    - 未知 session → 404;body 非清單 → 400。
 """
+import _isolation  # noqa: F401  # 測試隔離閂:必須是第一個 import(2026-08-15 事故防線,見 tests/_isolation.py)
 
 # 這支是「腳本式驗收」(repo 慣例:python3 tests/test_reaction_patch_pin.py):測試邏輯直接寫在
 # 模組層、用 sys.exit() 回報結果。被 `unittest discover` 匯入時,那些程式碼會在

@@ -10,6 +10,7 @@ Pocket 原生報告閱讀器的 bridge 資料面:
 4. 唯讀鐵律:兩條端點打完,report_events 列數/內容不變(smoke:除了本測試
    自己 upsert 的種子,不產生任何寫入)。
 """
+import _isolation  # noqa: F401  # 測試隔離閂:必須是第一個 import(2026-08-15 事故防線,見 tests/_isolation.py)
 
 # 這支是「腳本式驗收」(repo 慣例:python3 tests/test_report_reader_api.py):測試邏輯直接寫在
 # 模組層、用 sys.exit() 回報結果。被 `unittest discover` 匯入時,那些程式碼會在

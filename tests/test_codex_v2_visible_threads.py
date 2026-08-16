@@ -1,4 +1,5 @@
 """The v2 Codex list must not let guardian threads hide operator sessions."""
+import _isolation  # noqa: F401  # 測試隔離閂:必須是第一個 import(2026-08-15 事故防線,見 tests/_isolation.py)
 import os
 import sys
 import tempfile

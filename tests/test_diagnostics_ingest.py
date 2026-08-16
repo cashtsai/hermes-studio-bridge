@@ -8,6 +8,7 @@
 4. body 超過 _DIAG_MAX_BYTES → 413;壞 json → 400;kind 不在白名單 → 400。
 5. 輪替:壓低 _DIAG_MAX_FILES 後連打,目錄檔數不超過上限(刪最舊)。
 """
+import _isolation  # noqa: F401  # 測試隔離閂:必須是第一個 import(2026-08-15 事故防線,見 tests/_isolation.py)
 
 # 這支是「腳本式驗收」(repo 慣例:python3 tests/test_diagnostics_ingest.py):測試邏輯直接寫在
 # 模組層、用 sys.exit() 回報結果。被 `unittest discover` 匯入時,那些程式碼會在

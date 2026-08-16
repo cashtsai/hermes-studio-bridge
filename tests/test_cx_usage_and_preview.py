@@ -9,6 +9,7 @@
   first_user_message 一字不差)。
   updatedAt bridge 報 07-07,codex 自己的 DB 是 08-15 —— 差 39 天。
 """
+import _isolation  # noqa: F401  # 測試隔離閂:必須是第一個 import(2026-08-15 事故防線,見 tests/_isolation.py)
 import json
 import os
 import tempfile

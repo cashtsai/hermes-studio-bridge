@@ -12,6 +12,7 @@ codex app-server v2 client 的實作）。
 跑法:
     python -m unittest tests.test_codex_server_requests
 """
+import _isolation  # noqa: F401  # 測試隔離閂:必須是第一個 import(2026-08-15 事故防線,見 tests/_isolation.py)
 import asyncio
 import json
 import os

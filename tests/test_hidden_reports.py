@@ -10,6 +10,7 @@
 ⚠️ `_is_hidden_report_message` 靠「📰 **錯誤報告**」等字串前綴比對——
 `TOOL_ERROR_REPORT_LABEL` 或報告文案改字,這裡的測試就該同步紅掉。
 """
+import _isolation  # noqa: F401  # 測試隔離閂:必須是第一個 import(2026-08-15 事故防線,見 tests/_isolation.py)
 import os
 import sqlite3
 import sys

@@ -11,6 +11,7 @@
 - **旗標**:CALENDAR_PROPOSALS 未開 → 兩個端點都 404、卡片流不會出現這個 kind。
 - **MCP 工具**:payload 挑對欄位、target 正確、bridge 連不上時安靜回錯不炸。
 """
+import _isolation  # noqa: F401  # 測試隔離閂:必須是第一個 import(2026-08-15 事故防線,見 tests/_isolation.py)
 import asyncio
 import importlib.util
 import json

@@ -11,6 +11,7 @@
 反向保護:使用者刻意重送同文(不同 turn)必須仍是兩顆泡泡;
 桌面寫入的 turn(無 live 卡)回補功能不得退化。
 """
+import _isolation  # noqa: F401  # 測試隔離閂:必須是第一個 import(2026-08-15 事故防線,見 tests/_isolation.py)
 import os
 import sys
 import tempfile

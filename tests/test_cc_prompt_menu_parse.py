@@ -4,6 +4,7 @@
 出現兩次」。根因是舊解析器固定往上掃 `lines[-28:]`,掃進了對話正文,把訊息裡
 的編號段落(「4. 草稿存附件 — …」)當成選單選項。
 """
+import _isolation  # noqa: F401  # 測試隔離閂:必須是第一個 import(2026-08-15 事故防線,見 tests/_isolation.py)
 import unittest
 
 import bridge

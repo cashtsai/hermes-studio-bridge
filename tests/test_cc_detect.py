@@ -6,6 +6,7 @@
    "esc to interrupt")判 busy 的 pane,新引擎必為 working(parity suite)。
 3. 覆寫檔:載入、mtime 熱更新、壞檔退回內建且不 crash(輪詢路徑的鐵則)。
 """
+import _isolation  # noqa: F401  # 測試隔離閂:必須是第一個 import(2026-08-15 事故防線,見 tests/_isolation.py)
 import json
 import os
 import re

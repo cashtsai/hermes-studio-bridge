@@ -24,6 +24,7 @@ loop 每幾秒重試一次只寫一行 error type、UI 完全沒有訊號 → �
 跑法:
     PYTHONPATH=. python -m unittest tests.test_cx_thread_lock
 """
+import _isolation  # noqa: F401  # 測試隔離閂:必須是第一個 import(2026-08-15 事故防線,見 tests/_isolation.py)
 import asyncio
 import os
 import sys

@@ -13,6 +13,7 @@
 3. keepalive 節奏不變:沒事件時照 SSE_KEEPALIVE_SECS 吐 ping。
 4. 斷線清理:generator 收尾同時歸還 subscribers 計數與 waker(無洩漏)。
 """
+import _isolation  # noqa: F401  # 測試隔離閂:必須是第一個 import(2026-08-15 事故防線,見 tests/_isolation.py)
 
 # 這支是「腳本式驗收」(repo 慣例:python3 tests/test_v2_events_wakeup.py):測試邏輯直接寫在
 # 模組層、用 sys.exit() 回報結果。被 `unittest discover` 匯入時,那些程式碼會在
