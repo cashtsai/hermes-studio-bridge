@@ -23382,12 +23382,71 @@ def _agent_call_collect_reply(store, since_seq: int) -> str:
     return reply
 
 
+class _InternalAuthRequest:
+    """bridge 內部代發的 Request 替身(重啟對帳/回覆送達用):帶 master
+    token 走既有 _check_auth,body 為 bridge 代組輸入。與 _AgentCallInput
+    Request 的差別:不依賴任何原始 HTTP 請求(那個在重啟後不存在了)。"""
+
+    client = None
+
+    def __init__(self, body: dict):
+        self.headers = {"authorization": f"Bearer {BRIDGE_TOKEN}"}
+        self._body = body
+
+    async def json(self):
+        return self._body
+
+
+async def _agent_call_maybe_deliver(call_id: str) -> None:
+    """auto-bridge(closure 契約):call 結案時把結果**送回 caller 的
+    session 喚醒它**,而不是等 caller 自己想起來輪詢。
+
+    只送 background 模式與「await 逾時轉背景」的 call —— await_reply 的
+    結果由 HTTP 回應同步帶回,再送一次就是雙份(Cindy 的「手動回報結清
+    自動回報」同一條鐵律,我們反向套用)。冪等:meta.reply_delivered 擋
+    重送(重啟對帳與記憶體收割人可能各結一次)。送達失敗只留痕:caller
+    可能已被收編/離線,結果仍在帳本上可查。"""
+    row = REGISTRY.call_get(call_id)
+    if row is None or row.get("status") not in ("done", "timeout", "error"):
+        return
+    meta = row.get("meta") or {}
+    if meta.get("reply_delivered"):
+        return
+    if row.get("mode") != "background" and not meta.get("await_timed_out"):
+        return
+    caller = row.get("caller") or ""
+    target = row.get("target") or ""
+    if row["status"] == "done":
+        text = row.get("reply") or "(無文字回覆)"
+        head = f"[agent_call 回報 {target} #{call_id[-8:]}]"
+    else:
+        text = row.get("error") or row["status"]
+        head = f"[agent_call {row['status']} {target} #{call_id[-8:]}]"
+    # 先標記再投遞:投遞本身會觸發 caller 跑 turn,期間任何路徑重入這裡
+    # 都必須已經看到 delivered,否則競態雙送。投遞失敗再把標記收回。
+    REGISTRY.call_update(call_id, meta_merge={"reply_delivered": True})
+    shim = _InternalAuthRequest({"content": f"{head} {text}",
+                                 "client_id": f"{call_id}-reply"})
+    try:
+        await v2_session_input(caller, shim)
+        _log_event("agent_call_reply_delivered", call=call_id, caller=caller,
+                   target=target, status=row["status"])
+    except Exception as _exc:  # noqa: BLE001
+        REGISTRY.call_update(call_id, meta_merge={"reply_delivered": False,
+                                                  "deliver_error": str(_exc)[:200]})
+        _log_exc("_agent_call_maybe_deliver", _exc, expected=True,
+                 call=call_id, caller=caller)
+
+
 async def _agent_call_waiter(call_id: str, caller: str, target: str,
-                             store, since_seq: int) -> dict | None:
+                             store, since_seq: int,
+                             deadline: float | None = None) -> dict | None:
     """收割人:掛在目標卡片流上等 turn end → 收 assistant 回覆。
     subscribers+1 讓 CC follower 願意巡 status/發 turn 事件(同 SSE 訂閱者
-    語意);絕不碰 approval —— 目標若停在待審,這裡就一路等到收割窗關。"""
-    deadline = time.time() + _agent_call_bg_timeout()
+    語意);絕不碰 approval —— 目標若停在待審,這裡就一路等到收割窗關。
+    deadline 可外給(重啟對帳重掛收割人時沿用原 call 的收割窗,不重新起算)。"""
+    if deadline is None:
+        deadline = time.time() + _agent_call_bg_timeout()
     store.subscribers += 1
     waker = store.attach_waker()
     cursor = since_seq
@@ -23412,6 +23471,7 @@ async def _agent_call_waiter(call_id: str, caller: str, target: str,
                         row, "reply",
                         f"{target} 已回覆 {caller}(call {call_id[-8:]}):"
                         f"{reply[:200]}", [caller, target])
+                    await _agent_call_maybe_deliver(call_id)
                     return row
             remain = deadline - time.time()
             if remain <= 0:
@@ -23425,6 +23485,7 @@ async def _agent_call_waiter(call_id: str, caller: str, target: str,
                     f"{caller} → {target} 的調用(call {call_id[-8:]})逾時未收到"
                     f"回覆;目標可能仍在執行或停在待審(審核照常需人工核准)",
                     [caller, target])
+                await _agent_call_maybe_deliver(call_id)
                 return row
             waker.clear()
             try:
@@ -23436,6 +23497,11 @@ async def _agent_call_waiter(call_id: str, caller: str, target: str,
         _log_exc("_agent_call_waiter", _exc, call=call_id)
         row = REGISTRY.call_update(call_id, status="error",
                                    error=f"收割失敗:{_exc}")
+        try:
+            await _agent_call_maybe_deliver(call_id)
+        except Exception as _exc2:  # noqa: BLE001
+            _log_exc("_agent_call_waiter#deliver", _exc2, expected=True,
+                     call=call_id)
         return row
     finally:
         store.subscribers -= 1
@@ -23534,9 +23600,13 @@ async def v2_agent_call(request: Request):
     except agent_call_policy.CallDenied as e:
         await _agent_call_deny(call_id, caller, target, mode, message,
                                e.code, e.reason, 429)
+    # ── accepted 才有副作用(closure 契約,2026-08-16)────────────────
+    # 帳先落成 dispatching(= 「正在投遞」,不冒充進行中);send 被目標
+    # 接受後才升 running。中途死掉(bridge crash / 例外)留下的 dispatching
+    # 列由重啟對帳(_agent_call_reconcile)結案,不會在看板上裝 running。
     row = REGISTRY.call_create(
         call_id, caller=caller, target=target, mode=mode, message=message,
-        status="running", root_call_id=root_id, parent_call_id=parent_id,
+        status="dispatching", root_call_id=root_id, parent_call_id=parent_id,
         depth=depth)
     _log_event("agent_call_created", call=call_id, caller=caller,
                target=target, mode=mode, depth=depth,
@@ -23549,10 +23619,13 @@ async def v2_agent_call(request: Request):
         f"{caller} → {target}({mode},call {call_id[-8:]}):{message[:300]}",
         [caller, target])
     # await/background 需要先掛上目標卡片流,記住基準 seq 再投遞。
+    # since_seq 同時落進 meta —— 重啟對帳要靠它把收割人**從原基準**重新
+    # 掛回去,不然重啟後只能瞎猜要收哪一段。
     store = since_seq = None
     if mode in ("await_reply", "background"):
         store = await _v2_card_store(target)
         since_seq = store.seq
+        REGISTRY.call_update(call_id, meta_merge={"since_seq": since_seq})
     # ── 投遞:真重用 v2 統一輸入路徑(不複製 provider 分支)────────────
     content = f"[agent_call {caller} #{call_id[-8:]}] {message}"
     shim = _AgentCallInputRequest(request, {"content": content,
@@ -23572,6 +23645,7 @@ async def v2_agent_call(request: Request):
     if mode == "fire_and_forget":
         REGISTRY.call_update(call_id, status="sent")
         return {"ok": True, "call_id": call_id, "status": "sent"}
+    REGISTRY.call_update(call_id, status="running")   # send accepted → 進行中
     task = asyncio.create_task(
         _agent_call_waiter(call_id, caller, target, store, since_seq))
     _AGENT_CALL_WAITERS[call_id] = task
@@ -23608,6 +23682,76 @@ async def v2_agent_call_result(call_id: str, request: Request):
     if row is None:
         raise http_err(404, "AGENT_CALL_NOT_FOUND", "沒有這筆 call")
     return {"ok": True, **_agent_call_public(row)}
+
+
+async def _agent_call_reconcile_once() -> dict:
+    """重啟對帳(closure 契約,2026-08-16):收割人只活在記憶體,bridge
+    重啟後 running 的 call 沒人收割 → 在看板上**永遠**冒充進行中(8/15
+    假卡事故的同族病)。開機把每一筆未結案的 call 接回來:
+
+      dispatching        → 投遞中斷,結案 error(send 從未被接受)
+      running·窗已過     → 結案 timeout + 送達 caller
+      running·窗內       → 用 meta.since_seq 把收割人從原基準重新掛回,
+                           收割窗沿用原 created_ts 起算(不重新續命);
+                           await_reply 的同步等待者已隨舊進程死去,一律
+                           轉背景語意(結案時送達 caller)
+
+    回傳統計(測試/日誌用)。逐筆容錯:單筆爛掉不擋其他筆。"""
+    stats = {"dispatch_interrupted": 0, "timeout": 0, "rearmed": 0, "error": 0}
+    try:
+        rows = REGISTRY.call_list_unfinished()
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("_agent_call_reconcile#list", _exc, expected=True)
+        return stats
+    for row in rows:
+        cid = row["id"]
+        try:
+            if row["status"] == "dispatching":
+                REGISTRY.call_update(
+                    cid, status="error",
+                    error="bridge 重啟時投遞中斷(send 未被目標接受)")
+                stats["dispatch_interrupted"] += 1
+                _log_event("agent_call_reconciled", call=cid,
+                           outcome="dispatch_interrupted")
+                continue
+            deadline = (float(row.get("created_ts") or 0)
+                        + _agent_call_bg_timeout())
+            meta = row.get("meta") or {}
+            since_seq = meta.get("since_seq")
+            if time.time() >= deadline or since_seq is None:
+                REGISTRY.call_update(
+                    cid, status="timeout",
+                    error="bridge 重啟對帳:收割窗已過(或舊格式缺收割基準)",
+                    meta_merge={"await_timed_out": True})
+                stats["timeout"] += 1
+                _log_event("agent_call_reconciled", call=cid, outcome="timeout")
+                await _agent_call_maybe_deliver(cid)
+                continue
+            if row.get("mode") == "await_reply":
+                # 同步等待者(HTTP 連線)已隨舊進程死去 → 轉背景語意,
+                # 結案時由 auto-bridge 把結果送回 caller。
+                REGISTRY.call_update(cid, meta_merge={"await_timed_out": True})
+            store = await _v2_card_store(row["target"])
+            task = asyncio.create_task(_agent_call_waiter(
+                cid, row["caller"], row["target"], store, int(since_seq),
+                deadline=deadline))
+            _AGENT_CALL_WAITERS[cid] = task
+            _BG_TASKS.add(task)
+            task.add_done_callback(_BG_TASKS.discard)
+            stats["rearmed"] += 1
+            _log_event("agent_call_reconciled", call=cid, outcome="rearmed")
+        except Exception as _exc:  # noqa: BLE001
+            stats["error"] += 1
+            _log_exc("_agent_call_reconcile", _exc, expected=True, call=cid)
+    if any(stats.values()):
+        _log_event("agent_call_reconcile_done", **stats)
+    return stats
+
+
+@app.on_event("startup")
+async def _agent_call_reconcile_startup():
+    if _agent_call_enabled():
+        await _agent_call_reconcile_once()
 
 
 @app.get("/app/v2/agent_calls")

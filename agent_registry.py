@@ -545,6 +545,14 @@ class AgentRegistry:
             d["meta"] = {}
         return d
 
+    # 「未結案」的 call 狀態(closure 契約,2026-08-16):
+    #   dispatching = 帳已落、send 還沒被目標接受(accepted 前絕不標 running)
+    #   running     = send 已 accepted,收割人掛著等回覆
+    # 其餘一律視為終態,寫入 finished_ts。bridge 重啟時要對這兩種做對帳
+    # (見 bridge._agent_call_reconcile),否則收割人只活在記憶體,call 會
+    # 永遠卡在看板上冒充進行中。
+    CALL_UNFINISHED = ("running", "dispatching")
+
     def call_create(self, call_id: str, *, caller: str, target: str,
                     mode: str, message: str = "", status: str = "running",
                     root_call_id: str | None = None,
@@ -564,12 +572,25 @@ class AgentRegistry:
                     (call_id, caller, target, mode, (message or "")[:2000],
                      status, error, root_call_id or call_id,
                      parent_call_id or None, int(depth), now, now,
-                     now if status != "running" else None,
+                     now if status not in self.CALL_UNFINISHED else None,
                      json.dumps(meta or {}, ensure_ascii=False)))
                 con.commit()
             finally:
                 con.close()
         return self.call_get(call_id) or {}
+
+    def call_list_unfinished(self) -> list[dict]:
+        """重啟對帳用:所有還沒結案的 call(dispatching/running)。"""
+        with self._lock:
+            con = self._connect()
+            try:
+                rows = con.execute(
+                    "SELECT * FROM agent_calls WHERE status IN (?,?) "
+                    "ORDER BY created_ts",
+                    self.CALL_UNFINISHED).fetchall()
+                return [self._call_row_dict(r) for r in rows]
+            finally:
+                con.close()
 
     def call_update(self, call_id: str, *, status: str | None = None,
                     reply: str | None = None, error: str | None = None,
@@ -583,10 +604,17 @@ class AgentRegistry:
                     return None
                 d = self._call_row_dict(row)
                 sets, args = ["updated_ts=?"], [time.time()]
+                # 終態不被覆蓋:call 一旦結案(done/timeout/error/…),晚到的
+                # 結算(重啟對帳 vs 記憶體收割人的競態)不得改寫 status ——
+                # 先到的終態贏。reply/error/meta 照常可補(晚到的收割可能
+                # 帶著更完整的回覆文字)。
+                if status is not None and d["status"] not in self.CALL_UNFINISHED:
+                    status = None
                 if status is not None:
                     sets.append("status=?")
                     args.append(status)
-                    if status != "running" and d.get("finished_ts") is None:
+                    if (status not in self.CALL_UNFINISHED
+                            and d.get("finished_ts") is None):
                         sets.append("finished_ts=?")
                         args.append(time.time())
                 if reply is not None:
