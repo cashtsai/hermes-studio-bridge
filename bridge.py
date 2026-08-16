@@ -17367,6 +17367,27 @@ def _clean_report(s: str) -> str:
     return text
 
 
+def _final_assistant_row(con, sid):
+    """該 cron session 的「最終回覆」列 —— 跳過 tool_calls 進度列。
+
+    跑到一半的 assistant 列(finish_reason='tool_calls')是工具呼叫前的進度句
+    (「正在查行事曆…」),不是報告本體;把它索引進晨報,Pocket 端就會把半成品
+    當正式報告收走(external_id 同一條 session,先進先贏)。舊列的 finish_reason
+    是 NULL/''(hermes 早期不寫)→ 一律視為最終,只排除明確標成 tool_calls 的;
+    缺這個欄位的老 schema 直接退回不過濾(寧可舊行為,不可整表變空)。
+    """
+    import sqlite3
+    base = ("SELECT content, timestamp FROM messages WHERE session_id=? "
+            "AND role='assistant' AND content IS NOT NULL AND content!='' ")
+    try:
+        return con.execute(
+            base + "AND COALESCE(finish_reason,'')!='tool_calls' "
+            "ORDER BY timestamp DESC LIMIT 1", (sid,)).fetchone()
+    except sqlite3.OperationalError:
+        return con.execute(
+            base + "ORDER BY timestamp DESC LIMIT 1", (sid,)).fetchone()
+
+
 def _reports(limit: int = 20):
     """Latest delivered report per recent cron run (the session's final assistant
     message), newest first — only the user-facing notification jobs."""
@@ -17387,10 +17408,7 @@ def _reports(limit: int = 20):
                 job = jobs.get(mobj.group(1)) if mobj else None
                 if not (job and job.get("notify")):
                     continue                       # skip internal / unknown jobs
-                last = con.execute(
-                    "SELECT content, timestamp FROM messages WHERE session_id=? "
-                    "AND role='assistant' AND content IS NOT NULL AND content!='' "
-                    "ORDER BY timestamp DESC LIMIT 1", (sid,)).fetchone()
+                last = _final_assistant_row(con, sid)
                 if last and last[0]:
                     out.append({"label": job.get("label") or job.get("name"),
                                 "name": job.get("name"), "content": _clean_report(last[0]),
@@ -17445,10 +17463,7 @@ def _persona_reports(persona: str, limit: int = 20):
                 label = labels.get(name)
                 if not label:
                     continue                       # not a user-facing daily job
-                last = con.execute(
-                    "SELECT content, timestamp FROM messages WHERE session_id=? "
-                    "AND role='assistant' AND content IS NOT NULL AND content!='' "
-                    "ORDER BY timestamp DESC LIMIT 1", (sid,)).fetchone()
+                last = _final_assistant_row(con, sid)
                 if last and last[0]:
                     external_id = f"cron:{persona}:{name}:{sid}"
                     out.append({"id": _report_id(persona, name or "", str(sid), last[1]),
