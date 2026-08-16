@@ -25,6 +25,7 @@ import difflib
 import mimetypes
 import os
 import pty
+import random
 import re
 import secrets
 import shlex
@@ -14837,7 +14838,8 @@ async def v2_sessions(request: Request, provider: str = "", status: str = ""):
     # 配置了但 gateway 掛 → 標 degraded,照 codex 同款不無聲吞錯。
     if OPENCLAW.configured():
         try:
-            res = await OPENCLAW.call("sessions.list", {"limit": 20}, timeout=10.0)
+            res = await _oc_call_with_retry("sessions.list", {"limit": 20},
+                                            timeout=10.0)
             # 待審中的 session 要看得出來(同 hermes/codex 線的 §7-5):
             # 沒有這個,exec 審批一來 app 只看到 idle,使用者完全不知道在等他。
             oc_pending = _openclaw_pending_by_session()
@@ -15138,8 +15140,9 @@ async def v2_session_interrupt(session_id: str, request: Request):
         busy = bool(d is not None and d.busy)
         if not busy:
             try:
-                res = await OPENCLAW.call("sessions.list", {"limit": 100},
-                                          timeout=8.0)
+                res = await _oc_call_with_retry("sessions.list",
+                                                {"limit": 100}, timeout=8.0,
+                                                session_key=src[1])
                 busy = any(str(r.get("key") or "") == src[1] and r.get("hasActiveRun")
                            for r in (res or {}).get("sessions", []))
             except Exception as _exc:  # noqa: BLE001
@@ -15151,7 +15154,9 @@ async def v2_session_interrupt(session_id: str, request: Request):
         if not busy:
             raise http_err(409, "NO_ACTIVE_TURN", "no active OpenClaw run")
         try:
-            await OPENCLAW.call("chat.abort", {"sessionKey": src[1]})
+            # B2:chat.abort 冪等(無活躍 run 的 abort 無害)→ 允許重試。
+            await _oc_call_with_retry("chat.abort", {"sessionKey": src[1]},
+                                      session_key=src[1])
         except openclaw_provider.OpenClawError as e:
             _oc_http_error(e)
         return {"ok": True, "session_id": session_id, "interrupted": True}
@@ -16824,6 +16829,12 @@ def _oc_on_connect(was_reconnect: bool) -> None:
     t = loop.create_task(_oc_approvals_reseed())
     _BG_TASKS.add(t)
     t.add_done_callback(_BG_TASKS.discard)
+    if was_reconnect and _oc_resilience_enabled():
+        # B3:斷線窗內收尾的回合,turn-end 推播已經漏了 → 補發
+        # (只在重連做 —— 冷啟沒有「bridge 認定在跑」的前態可比)。
+        t2 = loop.create_task(_oc_reconnect_catchup())
+        _BG_TASKS.add(t2)
+        t2.add_done_callback(_BG_TASKS.discard)
 
 
 async def _oc_approval_decide(aid: str, row: dict, b: dict) -> dict:
@@ -16895,6 +16906,9 @@ def _oc_events_feed(event: str, payload: dict) -> None:
         d = _OC_CARD_DIGESTS.get(key)
         if d is not None:
             d.handle(event, payload)
+        if _oc_resilience_enabled() and event in ("chat", "agent"):
+            # B1/B3:回合狀態記帳 + 看門狗掛/收(旗標關 = 完全缺席)。
+            _oc_turn_note_event(key, event, payload, d)
         if event in ("chat", "agent"):
             _oc_msg_notify(key)   # B:喚醒該 session 的 events SSE(即時推播)
         if event == "chat" and payload.get("state") == "final":
@@ -16939,6 +16953,325 @@ def _oc_reseed_on_reconnect() -> None:
         d.seeded = False
 
 
+# ── B1/B2/B3:OpenClaw 回合韌性(旗標 OPENCLAW_RESILIENCE,預設**關**)────
+# 對照 docs/HERMES_OPENCLAW_CONN_HARDENING_20260816.md 的 B 三刀,形狀照本檔
+# CX 已落地那套(_watch_turn / _note_retryable_error / _escalate_retry_storm):
+#   B1 回合看門狗:bridge 認定在跑的回合(digest.busy),超過
+#      OPENCLAW_TURN_STALL_SECS 無任何 gateway 事件 → chat.abort + 合成誠實
+#      終態(錯誤卡 + busy→idle + turn end 事件),Pocket 不再永轉。這是
+#      上游 O2 幻影回合/O3 生成期 event loop degraded 的 **bridge 側誠實
+#      收尾**,不是治上游。
+#   B2 重試預算:OpenClawError.retryable 終於有人用 —— 冪等安全白名單內的
+#      方法自動重試(預設 2 次,抖動退避);重試風暴(30 次/120s,env 可調)
+#      → 合成終態 + openclaw_retry_storm。
+#   B3 斷線補洞:重連後掃近期活躍 session,斷線窗內收尾的回合(turn-end
+#      推播已經漏掉)補發 —— 沿用 _oc_push_final(heartbeat 過濾同一套)。
+# 旗標 per-call 讀(不是模組常數):production 由 plist env 開,測試不用
+# reload 模組。關 = 三刀全缺席,零行為改變。
+
+_OC_TURN_STATE: dict = {}        # sessionKey -> {busy,last_event,ended_at}(B1/B3)
+_OC_TURN_STATE_MAX = 512
+_OC_TURN_WATCHDOGS: dict = {}    # sessionKey -> asyncio.Task(B1)
+_OC_RETRY_ESCALATIONS: dict = {}  # sessionKey -> {count,since}(B2)
+
+# B2 冪等安全白名單 —— **只有這些**允許自動重試,不確定就不進來:
+#   chat.send    — gateway 原生 idempotencyKey(_oc_input_core 一定帶),
+#                  重送同 key 不重跑(SPEC §4)
+#   chat.abort   — 對無活躍 run 的 abort 無害(interrupt 端點註解實測)
+#   chat.history / sessions.list / *.approval.list — 唯讀
+# **絕不重試**:exec/plugin.approval.resolve —— 決議是一次性副作用,逾時
+# 重送可能在 gateway 邊界重放決議或撞 "already resolved" 假錯。
+_OC_RETRYABLE_METHODS = frozenset({
+    "chat.send", "chat.abort", "chat.history", "sessions.list",
+    "exec.approval.list", "plugin.approval.list"})
+
+
+def _oc_resilience_enabled() -> bool:
+    return os.environ.get("OPENCLAW_RESILIENCE", "").strip().lower() in (
+        "1", "true", "on")
+
+
+def _oc_turn_stall_secs() -> float:
+    return float(os.environ.get("OPENCLAW_TURN_STALL_SECS", "240"))
+
+
+def _oc_retry_escalate_limits() -> tuple:
+    return (int(os.environ.get("OPENCLAW_RETRY_ESCALATE_MAX", "30")),
+            float(os.environ.get("OPENCLAW_RETRY_ESCALATE_SECS", "120")))
+
+
+def _oc_turn_state(key: str) -> dict:
+    st = _OC_TURN_STATE.get(key)
+    if st is None:
+        st = _OC_TURN_STATE[key] = {"busy": False, "last_event": 0.0,
+                                    "ended_at": 0.0}
+        while len(_OC_TURN_STATE) > _OC_TURN_STATE_MAX:
+            oldest = min(_OC_TURN_STATE,
+                         key=lambda k: _OC_TURN_STATE[k]["last_event"])
+            if oldest == key:
+                break
+            _OC_TURN_STATE.pop(oldest)
+    return st
+
+
+def _oc_turn_watch_ensure(key: str) -> None:
+    """B1:這條 session 需要看門狗就掛一支(已有活的就不重複)。"""
+    t = _OC_TURN_WATCHDOGS.get(key)
+    if t is not None and not t.done():
+        return
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    t = loop.create_task(_oc_watch_turn(key))
+    _OC_TURN_WATCHDOGS[key] = t
+    _BG_TASKS.add(t)
+    t.add_done_callback(_BG_TASKS.discard)
+
+
+def _oc_turn_watch_cancel(key: str) -> None:
+    wd = _OC_TURN_WATCHDOGS.pop(key, None)
+    if wd is not None and wd is not asyncio.current_task():
+        wd.cancel()
+
+
+def _oc_turn_note_event(key: str, event: str, payload: dict, d) -> None:
+    """B1/B3 狀態記帳(_oc_events_feed 每筆 chat/agent 事件,旗標開才進來)。
+
+    busy 權威:有 digest 用 digest.busy(run 對位/遲送防禦都在那);沒
+    digest(沒人看過的 session)就從事件形狀粗判 —— B3 斷線補洞靠這份
+    記帳涵蓋**無訂閱** session(它們的 turn-end 推播正是斷線盲區)。
+    看門狗只掛在有 digest 的 session:合成終態要有卡片流可寫,無人看過
+    的 session 沒有「永轉的畫面」需要救,別多此一舉去 abort 人家。"""
+    now = time.time()
+    st = _oc_turn_state(key)
+    st["last_event"] = now
+    if d is not None:
+        busy = bool(d.busy)
+    else:
+        busy = st["busy"]
+        if event == "agent" and payload.get("stream") == "lifecycle":
+            ph = (payload.get("data") or {}).get("phase")
+            if ph == "start":
+                busy = True
+            elif ph in ("end", "error"):
+                busy = False
+        elif event == "chat":
+            state = payload.get("state")
+            if state == "delta":
+                busy = True
+            elif state in ("error", "aborted") or (
+                    state == "final" and payload.get("message")):
+                # 帶 message 的 final 才是定稿(裸 final 只是 ack,SPEC §3)
+                busy = False
+    if st["busy"] and not busy:
+        st["ended_at"] = now
+    st["busy"] = busy
+    if busy and d is not None:
+        _oc_turn_watch_ensure(key)
+    elif not busy:
+        _oc_turn_watch_cancel(key)   # 回合正常收尾 → 看門狗功成身退
+
+
+async def _oc_synthesize_terminal(key: str, message: str,
+                                  send_interrupt: bool = True) -> None:
+    """合成誠實終態(B1 stall / B2 retry storm 共用,CX 同款收屍動作):
+    盡力 chat.abort(caps 有 interrupt)→ 錯誤卡進卡片流 + busy→idle +
+    turn end 事件(走 digest 自己的 lifecycle error 路,run 收尾記帳/
+    遲送 delta 防復活全沿用)→ 看門狗收掉。沒有在跑的回合就整個 no-op。"""
+    d = _OC_CARD_DIGESTS.get(key)
+    st = _OC_TURN_STATE.get(key)
+    if not bool((d is not None and d.busy) or (st and st.get("busy"))):
+        return
+    if send_interrupt:
+        try:
+            await asyncio.wait_for(
+                OPENCLAW.call("chat.abort", {"sessionKey": key}, timeout=10.0),
+                timeout=15.0)
+        except Exception as exc:  # noqa: BLE001 — abort 失敗不擋誠實收尾
+            _log_event("openclaw_terminal_interrupt_failed", session=key[:48],
+                       error=type(exc).__name__)
+    if d is not None and d.busy:
+        d.handle("agent", {"runId": d.active_run, "stream": "lifecycle",
+                           "data": {"phase": "error", "error": message}})
+        _oc_msg_notify(key)
+    if st is not None:
+        st["busy"] = False
+        st["ended_at"] = time.time()
+    _oc_turn_watch_cancel(key)
+
+
+async def _oc_watch_turn(key: str) -> None:
+    """B1:CX _watch_turn 的 openclaw 版 —— 生成期無事件超時 → 誠實終態。
+    gateway 連生成中都會廣播 chat delta/agent 事件(heartbeat 回合也有事件),
+    所以「OPENCLAW_TURN_STALL_SECS 完全無聲」= 回合已經斷頭(O2/O3),
+    不是慢,再等只是永轉。"""
+    try:
+        while _oc_resilience_enabled():
+            stall = _oc_turn_stall_secs()
+            await asyncio.sleep(min(5.0, max(0.05, stall / 10)))
+            d = _OC_CARD_DIGESTS.get(key)
+            if d is None or not d.busy:
+                return
+            st = _OC_TURN_STATE.get(key) or {}
+            last = st.get("last_event") or time.time()
+            if time.time() - last < stall:
+                continue
+            _log_event("openclaw_turn_stalled", session=key[:48],
+                       stall_secs=int(stall), run=str(d.active_run)[:24])
+            await _oc_synthesize_terminal(
+                key,
+                f"OpenClaw 回合卡住(超過 {int(stall)}s 無事件),已逾時中止。")
+            return
+    except asyncio.CancelledError:
+        return
+    finally:
+        if _OC_TURN_WATCHDOGS.get(key) is asyncio.current_task():
+            _OC_TURN_WATCHDOGS.pop(key, None)
+
+
+def _oc_note_retryable_failure(key: str, exc: Exception) -> None:
+    """B2 升級計數(CX _note_retryable_error 同款):同 session 的可重試失敗
+    累積到門檻(30 次或跨 120s 還在失敗)→ 背景合成終態;計數當場歸零,
+    不重複開刀。沒有 session 對位的呼叫(全域 sessions.list)不數。"""
+    if not key:
+        return
+    now = time.time()
+    st = _OC_RETRY_ESCALATIONS.get(key)
+    if st is None:
+        st = _OC_RETRY_ESCALATIONS[key] = {"count": 0, "since": now}
+    st["count"] += 1
+    max_count, max_secs = _oc_retry_escalate_limits()
+    elapsed = now - st["since"]
+    if st["count"] < max_count and elapsed < max_secs:
+        return
+    _OC_RETRY_ESCALATIONS.pop(key, None)
+    _log_event("openclaw_retry_storm", session=key[:48], count=st["count"],
+               elapsed=int(elapsed), last_error=str(exc)[:160])
+    try:
+        t = asyncio.get_running_loop().create_task(_oc_escalate_retry_storm(
+            key, st["count"], elapsed, str(exc)))
+        _BG_TASKS.add(t)
+        t.add_done_callback(_BG_TASKS.discard)
+    except RuntimeError:
+        pass
+
+
+async def _oc_escalate_retry_storm(key: str, count: int, elapsed: float,
+                                   last_msg: str) -> None:
+    await _oc_synthesize_terminal(
+        key, (f"OpenClaw 連線持續失敗(已重試 {count} 次/{int(elapsed)}s),"
+              f"本回合放棄:{last_msg[:160]}"))
+
+
+async def _oc_call_with_retry(method: str, params: dict | None = None,
+                              timeout: float | None = None, attempts: int = 2,
+                              base_delay: float = 1.0, session_key: str = ""):
+    """B2:OPENCLAW.call 的重試殼。旗標關或方法不在冪等白名單 = 直通
+    (零行為差)。只重試 OpenClawError.retryable;每次可重試失敗都計入
+    該 session 的風暴計數器(含最後一次放棄的那發)。"""
+    async def _one():
+        if timeout is None:
+            return await OPENCLAW.call(method, params)
+        return await OPENCLAW.call(method, params, timeout=timeout)
+
+    if not _oc_resilience_enabled() or method not in _OC_RETRYABLE_METHODS:
+        return await _one()
+    attempts = max(1, attempts)
+    for attempt in range(attempts):
+        try:
+            return await _one()
+        except openclaw_provider.OpenClawError as e:
+            if not e.retryable:
+                raise
+            _oc_note_retryable_failure(session_key, e)
+            if attempt >= attempts - 1:
+                raise
+            delay = base_delay * (2 ** attempt) * (0.5 + random.random())
+            _log_event("openclaw_call_retried", method=method,
+                       attempt=attempt + 1, delay=round(delay, 2),
+                       error=e.code or str(e)[:80], session=session_key[:48])
+            await asyncio.sleep(delay)
+
+
+def _oc_catchup_limits() -> tuple:
+    return (float(os.environ.get("OPENCLAW_CATCHUP_WINDOW_SECS", "3600")),
+            int(os.environ.get("OPENCLAW_CATCHUP_MAX_SESSIONS", "10")))
+
+
+async def _oc_reconnect_catchup() -> None:
+    """B3:斷線窗補洞(_oc_on_connect(was_reconnect=True) 掛)。
+
+    reseed 只補「有訂閱者的 digest」與待審;斷線期間**收尾**的回合,其
+    turn-end 推播(_oc_push_final 走 chat final 事件)已經永遠漏掉。這裡
+    拿 sessions.list 的 updatedAt/hasActiveRun 對 bridge 記帳的回合狀態:
+    「bridge 認定在跑、gateway 說已經沒在跑」= 斷線窗內收尾 → 補一發。
+    便宜守則:只看最近一小時活躍、上限 10 條(env 可調);記帳翻 idle
+    後同一缺口不會重發(冪等)。"""
+    window, cap = _oc_catchup_limits()
+    try:
+        res = await OPENCLAW.call("sessions.list", {"limit": 100},
+                                  timeout=10.0)
+    except Exception as e:  # noqa: BLE001 — 補洞失敗不能拖垮重連
+        _log_event("oc_reconnect_catchup_failed", error=type(e).__name__,
+                   error_message=str(e)[:120])
+        return
+    now = time.time()
+    cands = []
+    for row in (res or {}).get("sessions", []) or []:
+        if not isinstance(row, dict):
+            continue
+        key = _oc_safe_session_key(str(row.get("key") or ""))
+        if not key:
+            continue
+        upd = row.get("updatedAt")
+        if not isinstance(upd, (int, float)) or upd <= 0:
+            continue
+        ts = upd / 1000.0 if upd > 1e11 else float(upd)
+        if now - ts > window:
+            continue
+        cands.append((ts, key, bool(row.get("hasActiveRun"))))
+    cands.sort(reverse=True)
+    fired = 0
+    for _ts, key, active in cands[:cap]:
+        st = _OC_TURN_STATE.get(key)
+        if st is None or not st.get("busy") or active:
+            continue   # bridge 沒認定在跑 / gateway 還在跑 → 不是缺口
+        st["busy"] = False
+        st["ended_at"] = now
+        d = _OC_CARD_DIGESTS.get(key)
+        if d is not None and d.busy:
+            # 有人看過的 session:畫面也要停轉(正文由 reseed 重讀補齊)。
+            d.handle("agent", {"runId": d.active_run, "stream": "lifecycle",
+                               "data": {"phase": "end"}})
+            _oc_msg_notify(key)
+        _oc_turn_watch_cancel(key)
+        await _oc_catchup_push(key)
+        fired += 1
+    _log_event("oc_reconnect_catchup", candidates=len(cands), fired=fired)
+
+
+async def _oc_catchup_push(key: str) -> None:
+    """gap 內收尾的回合 → 最後一則 assistant 訊息走既有 turnend 推播路
+    (_oc_push_final:heartbeat run 過濾、空文不推,全沿用)。拉不到歷史
+    就不推 —— 寧漏勿假。"""
+    try:
+        res = await OPENCLAW.call("chat.history",
+                                  {"sessionKey": key, "limit": 10},
+                                  timeout=10.0)
+    except Exception as e:  # noqa: BLE001
+        _log_event("oc_catchup_history_failed", session=key[:48],
+                   error=type(e).__name__)
+        return
+    for m in reversed((res or {}).get("messages") or []):
+        if not isinstance(m, dict) or _openclaw_message_role(m) != "assistant":
+            continue
+        oc = m.get("__openclaw") or {}
+        rid = str(oc.get("runId") or m.get("runId") or "")
+        _oc_push_final(key, {"runId": rid, "message": m})
+        return
+
+
 OPENCLAW.on_event = _oc_events_feed
 OPENCLAW.on_reconnect = _oc_reseed_on_reconnect
 OPENCLAW.on_connect = _oc_on_connect
@@ -16956,7 +17289,8 @@ def _openclaw_default_v2_row() -> dict:
 async def _openclaw_v2_rows(limit: int = 20) -> list:
     if not OPENCLAW.configured():
         return []
-    res = await OPENCLAW.call("sessions.list", {"limit": limit}, timeout=10.0)
+    res = await _oc_call_with_retry("sessions.list", {"limit": limit},
+                                    timeout=10.0)
     rows = [openclaw_provider.session_v2_row(row)
             for row in (res or {}).get("sessions", [])[:limit]]
     if not rows:
@@ -17081,9 +17415,10 @@ async def _openclaw_v1_messages(session_id: str, limit: int = 200) -> dict:
     if not key:
         raise http_err(400, "SESSION_NOT_FOUND", "unknown openclaw session")
     try:
-        res = await OPENCLAW.call("chat.history", {"sessionKey": key,
-                                                   "limit": max(1, min(limit, 500))},
-                                  timeout=10.0)
+        res = await _oc_call_with_retry(
+            "chat.history",
+            {"sessionKey": key, "limit": max(1, min(limit, 500))},
+            timeout=10.0, session_key=key)
     except openclaw_provider.OpenClawError as e:
         _oc_http_error(e)
     messages = [_openclaw_v1_message(key, msg, i)
@@ -17175,13 +17510,21 @@ async def _oc_card_digest(key: str):
     if not d.seeded:
         d.seeded = True
         try:
-            res = await OPENCLAW.call("chat.history",
-                                      {"sessionKey": key,
-                                       "limit": _OC_CARD_SEED_MSGS})
+            res = await _oc_call_with_retry("chat.history",
+                                            {"sessionKey": key,
+                                             "limit": _OC_CARD_SEED_MSGS},
+                                            session_key=key)
             d.seed_messages((res or {}).get("messages") or [])
             si = (res or {}).get("sessionInfo") or {}
             d.busy = bool(si.get("hasActiveRun"))
             d._status()
+            if _oc_resilience_enabled() and d.busy:
+                # B1:seed 當下就在跑(含 O2 幻影回合 —— 之後可能一個事件
+                # 都不來)也要掛看門狗,不然這種回合誰都收不了。
+                st = _oc_turn_state(key)
+                st["busy"] = True
+                st["last_event"] = time.time()
+                _oc_turn_watch_ensure(key)
         except Exception as e:  # noqa: BLE001
             d.seeded = False   # 下次請求重試 seed
             _log_event("oc_card_seed_error", session=key[:48],
@@ -17340,7 +17683,8 @@ async def _oc_input_core(key: str, session_id: str, body: dict) -> dict:
     if oc_atts:
         params["attachments"] = oc_atts
     try:
-        res = await OPENCLAW.call("chat.send", params)
+        # B2:chat.send 冪等安全(idempotencyKey 上面一定帶)→ 允許重試。
+        res = await _oc_call_with_retry("chat.send", params, session_key=key)
     except openclaw_provider.OpenClawError as e:
         _oc_http_error(e)
     d = _OC_CARD_DIGESTS.get(key)
