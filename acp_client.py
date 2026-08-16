@@ -17,7 +17,55 @@ Protocol (newline-delimited JSON-RPC, learned from the Scarf ACPClient):
 import asyncio
 import json
 import os
+import time
 import uuid
+
+# ── bridge 注入面(照 cc_sdk.configure 同款)──────────────────────────────
+# acp_client 不 import bridge(避免循環),觀測掛鉤由 bridge 開機時注入。
+# 預設 no-op:單測可以不接 bridge 直接驅動本模組。
+LOG = None                 # bridge._log_event 同形:LOG(event, **fields)
+
+
+def configure(log=None) -> None:
+    global LOG
+    if log is not None:
+        LOG = log
+
+
+def _log(event: str, **fields) -> None:
+    """觀測掛鉤 fail-safe:log 本身壞掉也不准打斷 persona 流程。"""
+    try:
+        if LOG is not None:
+            LOG(event, **fields)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+# ── A1/A2/A3 韌性旗標與參數(全部每次呼叫讀 env:部署開關在 plist,
+#    測試也能逐測調整,不用 reload 模組)──────────────────────────────────
+def resilience_on() -> bool:
+    """ACP_RESILIENCE=1 才啟用回合看門狗/健康巡檢(預設關 = 零行為差異)。"""
+    return os.environ.get("ACP_RESILIENCE", "") == "1"
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, "") or default)
+    except ValueError:
+        return default
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, "") or default)
+    except ValueError:
+        return default
+
+
+ACP_STALL_DEGRADE_WINDOW_SECS = 1800.0   # 連續 stall 計數窗(30 分鐘)
+ACP_CRASH_LOOP_WINDOW_SECS = 600.0       # 巡檢 reset 計數窗(10 分鐘)
+ACP_CRASH_LOOP_N = 3                     # 窗內 >= N 次巡檢 reset → crash loop
+
 
 def _first_existing(paths, fallback):
     for p in paths:
@@ -134,10 +182,30 @@ class ACPSession:
         self._loaded_session = False      # True if session came from session/load
         self._proved_alive = False        # True once any turn produced output
         self._last_canonical_sid = None   # last mapping sid we attempted to load (flap guard)
+        # ── A1/A2/A3 韌性狀態(旗標關時全部維持初始值,零行為差異)──────
+        self._waiters = 0                 # A2:正在 _lock 上排隊的 turn 數(可見佇列深度)
+        self._last_item_at = 0.0          # A1:本回合最後一次 provider 有動靜(monotonic)
+        self._stall_fired = False         # A1:看門狗已對本回合開刀
+        self._stall_resets: list[float] = []   # A1:30 分鐘窗內的 stall-reset 時刻
+        self._sweep_resets: list[float] = []   # A3:10 分鐘窗內的巡檢 reset 時刻
+        self._sweep_cooldown = False      # A3:crash-loop 冷卻中(下個使用者回合解除)
+        self.degraded = False             # A1/A3:連續 stall / crash-loop → 看板標降級
 
     def is_busy(self) -> bool:
         """True while this persona is already running or queued inside a turn."""
         return self._lock.locked()
+
+    def queue_depth(self) -> int:
+        """A2:排在本 persona 鎖上等待的 turn 數(不含正在跑的那一輪)。
+
+        設計取捨:沒有把 prompt_stream 換成 submit()+drainer 的顯式佇列 ——
+        prompt_stream 是「呼叫端自帶 consumer 的 async generator」,bridge.py
+        六個呼叫點(SSE 串流/v2 input/interrupt 驗證…)都靠這個契約各自
+        消費 items;改成集中 drainer 得同時重寫全部消費端,風險遠大於收益。
+        鎖競爭本來就把並發 turn 排成嚴格序列(訊息不會丟,只是隱形),
+        真正缺的是「看得見」:_waiters 計數 + is_busy() 讓 v2 session 列表
+        與 turn status 說真話,app/看板/編隊工具因此看得見人格忙碌。"""
+        return self._waiters
 
     def _next_id(self) -> int:
         self._id += 1
@@ -272,6 +340,10 @@ class ACPSession:
                 msg = json.loads(line)
             except Exception:
                 continue
+            # A1:任何一行 provider 輸出都算「活著」。用 reader 側(而非
+            # consumer 側)記時,下游 SSE 消費慢不會被看門狗誤判成 provider
+            # 卡住 —— 對照 CX 的 last_event_at 也是事件落地就記。
+            self._last_item_at = time.monotonic()
             mid = msg.get("id")
             if mid is not None and ("result" in msg or "error" in msg):
                 fut = self._pending.pop(mid, None)
@@ -403,6 +475,66 @@ class ACPSession:
             self._proved_alive = False
             self._last_canonical_sid = None
 
+    async def _watch_turn(self):
+        """A1 回合看門狗(形狀對照 bridge.CodexAppServerClient._watch_turn)。
+
+        provider 停止產出但不完成 JSON-RPC 時,prompt_stream 與 per-persona
+        lock 會被佔死 —— reset() 的 docstring 自己承認要「呼叫端先取消」,
+        但過去沒有任何自動偵測(CX 8 月「恆忙碌」同族病)。這裡:無輸出超過
+        ACP_TURN_STALL_SECS → cancel()(advisory)→ reset() 取消 pending
+        future,把卡在 _attempt 裡的 consumer 踢醒,prompt_stream 收到後下發
+        誠實終態並釋放鎖。
+
+        切片睡眠 ≤5s + 喚醒縫隙原諒:蓋著睡的 Mac 醒來時,單一長 sleep 會把
+        整段睡眠計入「無輸出」一醒來就誤開刀(PerfProbes suspendedUntil 同一
+        個坑)。每片實測耗時 >3× 片長就視為 OS 睡眠縫隙,重記起點不開刀。
+        """
+        stall_secs = _env_float("ACP_TURN_STALL_SECS", 180.0)
+        slice_secs = min(5.0, max(0.05, stall_secs / 10))
+        try:
+            while True:
+                before = time.monotonic()
+                await asyncio.sleep(slice_secs)
+                if time.monotonic() - before > slice_secs * 3:
+                    self._last_item_at = time.monotonic()   # 睡眠喚醒縫隙,原諒
+                    continue
+                idle = time.monotonic() - self._last_item_at
+                if idle < stall_secs:
+                    continue
+                self._stall_fired = True
+                _log("acp_turn_stalled", home=self.home,
+                     idle_secs=int(idle), stall_secs=int(stall_secs))
+                try:
+                    await asyncio.wait_for(self.cancel(), timeout=2.0)
+                except Exception:  # noqa: BLE001 — cancel 是 advisory,失敗照樣開刀
+                    pass
+                await self.reset()
+                return
+        except asyncio.CancelledError:
+            return
+
+    def _note_stall_reset(self):
+        """A1:stall-reset 計數。30 分鐘窗內 >= ACP_STALL_DEGRADE_N 次 →
+        標 degraded(v2 sessions / turn status 上看板),成功回合歸零。"""
+        now = time.time()
+        self._stall_resets = [t for t in self._stall_resets
+                              if now - t < ACP_STALL_DEGRADE_WINDOW_SECS] + [now]
+        n = _env_int("ACP_STALL_DEGRADE_N", 3)
+        if len(self._stall_resets) >= n and not self.degraded:
+            self.degraded = True
+            _log("acp_session_degraded", home=self.home,
+                 stalls=len(self._stall_resets), threshold=n)
+
+    def _note_turn_ok(self):
+        """A1/A3:任何一個成功回合把降級狀態整組洗白(stall 與 crash-loop
+        計數都清)——降級的語意是「最近持續出事」,成功即證明已恢復。"""
+        if self._stall_resets or self._sweep_resets or self.degraded:
+            self._stall_resets = []
+            self._sweep_resets = []
+            self.degraded = False
+            self._sweep_cooldown = False
+            _log("acp_session_recovered", home=self.home)
+
     async def _attempt(self, text: str):
         """One session/prompt turn — yields (kind, val) items."""
         rid = self._next_id()
@@ -435,31 +567,83 @@ class ACPSession:
         """Async generator yielding (kind, val) items for one turn. Self-heals:
         if a *loaded* Telegram session produces an inert, empty turn, it drops
         to a fresh session/new and retries once (fixes old sessions that load
-        but no longer respond)."""
-        async with self._lock:
+        but no longer respond).
+
+        A1(旗標 ACP_RESILIENCE=1):每回合掛看門狗,provider 停產出超時 →
+        cancel+reset+誠實終態 item,鎖照常釋放,persona 不再被佔死。
+        A2:鎖競爭排隊改為可見(_waiters / queue_depth()),契約不變。"""
+        # A2:等待計數 —— 手動 acquire 等價於原本的 async with,只是把
+        # 「正在排隊」這件事記下來。acquire 被取消時 finally 一樣會歸還計數。
+        waiting = self._lock.locked()
+        if waiting:
+            self._waiters += 1
+        try:
+            await self._lock.acquire()
+        finally:
+            if waiting:
+                self._waiters -= 1
+        try:
+            if resilience_on():
+                self._sweep_cooldown = False   # A3:使用者回合 = crash-loop 冷卻解除
             await self.ensure_started()
             await self._sync_canonical_session()   # gateway rotated? follow it
             yield ("status", {"state": "running", "label": "Hermes 開始處理"})
+            watchdog = None
+            self._stall_fired = False
+            if resilience_on():
+                self._last_item_at = time.monotonic()
+                watchdog = asyncio.create_task(self._watch_turn())
             produced = 0
-            async for item in self._attempt(text):
-                produced += 1
-                yield item
-            if produced:
-                self._proved_alive = True
-            # Self-heal ONLY for an inert just-loaded session we've never seen
-            # respond. Once a loaded session has produced output, a later empty
-            # turn is treated as legitimate — we must NOT drop the session and
-            # lose the accumulated Telegram context.
-            elif self._loaded_session and not self._proved_alive:
-                await self._force_new_session()
-                async for item in self._attempt(text):
-                    yield item
+            total = 0
+            try:
+                try:
+                    async for item in self._attempt(text):
+                        produced += 1
+                        total += 1
+                        yield item
+                    if produced:
+                        self._proved_alive = True
+                    # Self-heal ONLY for an inert just-loaded session we've
+                    # never seen respond. Once a loaded session has produced
+                    # output, a later empty turn is treated as legitimate — we
+                    # must NOT drop the session and lose the accumulated
+                    # Telegram context.
+                    elif self._loaded_session and not self._proved_alive:
+                        await self._force_new_session()
+                        async for item in self._attempt(text):
+                            total += 1
+                            yield item
+                except (Exception, asyncio.CancelledError):
+                    # 看門狗開的刀:reset() 取消 pending future,_attempt 以
+                    # CancelledError/RuntimeError 收場 —— 這不是呼叫端取消,
+                    # 吞掉改下發誠實終態。看門狗沒開刀的例外照舊往上拋
+                    # (呼叫端取消/真錯誤,行為與旗標關閉時完全一致)。
+                    if not self._stall_fired:
+                        raise
+            finally:
+                if watchdog is not None:
+                    watchdog.cancel()
+            if self._stall_fired:
+                # 誠實終態:不裝沒事,也不讓呼叫端永等。reset() 已把程序
+                # 收掉,下一回合 ensure_started 會重載 canonical session。
+                self._note_stall_reset()
+                yield ("error", "Hermes 回合卡住,已重置")
+            elif total:
+                self._note_turn_ok()
+        finally:
+            self._lock.release()
 
 
 class ACPPool:
     def __init__(self):
         self._sessions: dict[str, ACPSession] = {}
         self._lock = asyncio.Lock()
+        self._sweeper: asyncio.Task | None = None
+
+    def peek(self, key: str) -> ACPSession | None:
+        """只窺不生 —— 狀態面(v2 sessions 列表等)用,絕不為了看忙碌/降級
+        而冷啟一條 ACP 程序(對照 bridge._registry_is_busy 同一條紅線)。"""
+        return self._sessions.get(key)
 
     async def get(self, key: str, home: str) -> ACPSession:
         async with self._lock:
@@ -467,4 +651,53 @@ class ACPPool:
             if s is None:
                 s = ACPSession(home, workspace_cwd_for(key, home))
                 self._sessions[key] = s
+            # A3:健康巡檢惰啟(首次 get 才開,一 pool 一條)。旗標關不開;
+            # 開了之後旗標熱關 → 迴圈裡每輪再讀一次 env,睡著待命。
+            if resilience_on() and (self._sweeper is None or self._sweeper.done()):
+                self._sweeper = asyncio.create_task(self._health_sweep())
             return s
+
+    async def _health_sweep(self):
+        """A3 背景健康巡檢(herdr 偵測循環的精神,我們 30s 夠)。
+
+        程序死了不等下一回合寫入失敗才發現:每 ACP_HEALTH_SWEEP_SECS 掃一次
+        returncode,死了先行 reset(),下一回合直接走 ensure_started 冷啟,
+        使用者感受從「先吃一次錯誤」變「只是慢一點」。"""
+        try:
+            while True:
+                await asyncio.sleep(_env_float("ACP_HEALTH_SWEEP_SECS", 30.0))
+                if not resilience_on():
+                    continue                    # 旗標熱關:睡著待命,不退出
+                for key, s in list(self._sessions.items()):
+                    try:
+                        await self._sweep_one(key, s)
+                    except Exception as e:  # noqa: BLE001 — 巡檢自己不准把 pool 弄死
+                        _log("acp_health_sweep_error", key=key,
+                             error=type(e).__name__, error_message=str(e)[:200])
+        except asyncio.CancelledError:
+            return
+
+    async def _sweep_one(self, key: str, s: ACPSession):
+        proc = s.proc
+        if proc is None or proc.returncode is None:
+            return                              # 沒程序 / 還活著
+        if s.is_busy():
+            # 回合進行中死掉:_read_loop 結束時會 fail 掉全部 pending,
+            # 由該回合自己收尾 —— 巡檢不跟進行中的 turn 搶收屍。
+            return
+        if s._sweep_cooldown:
+            return                              # crash-loop 冷卻:等下個使用者回合
+        now = time.time()
+        s._sweep_resets = [t for t in s._sweep_resets
+                           if now - t < ACP_CRASH_LOOP_WINDOW_SECS] + [now]
+        _log("acp_proc_died_swept", key=key, returncode=proc.returncode,
+             sweep_resets=len(s._sweep_resets))
+        await s.reset()
+        if len(s._sweep_resets) >= ACP_CRASH_LOOP_N:
+            # crash-loop 護欄:10 分鐘內第 3 次巡檢收屍 —— 程序反覆秒死,
+            # 再繼續「收屍→下回合重啟」只是空轉。標降級 + 冷卻,冷卻到
+            # 下個使用者回合(prompt_stream 開頭)才解除。
+            s.degraded = True
+            s._sweep_cooldown = True
+            _log("acp_crash_loop", key=key, resets=len(s._sweep_resets),
+                 window_secs=int(ACP_CRASH_LOOP_WINDOW_SECS))
