@@ -6,8 +6,11 @@
 身上),審核也只有一個人要做 —— 其餘三個人格收到只是被打擾。
 """
 import _isolation  # noqa: F401  # 測試隔離閂:必須是第一個 import(2026-08-15 事故防線,見 tests/_isolation.py)
+import os
+import time
 import unittest
 from unittest import mock
+from unittest.mock import patch
 
 import bridge
 
@@ -84,3 +87,38 @@ class HarnessReportPersonaTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestHarnessReportStability(unittest.TestCase):
+    """2026-08-16 灌訊事故回歸:同一天內容不變 → id/ts 必須逐位元組穩定,
+    _report_upsert 才判得出重複;一個下午 64 則就是 id 每輪都變造成的。"""
+
+    def test_same_day_same_content_is_stable(self):
+        with patch.dict(os.environ, {"HARNESS": "1"}):
+            with patch.object(bridge, "_harness_store") as hs:
+                hs.return_value.list.return_value = [
+                    {"store": "memory", "key": "k", "scope": "s", "version": 1,
+                     "rationale": "r", "evidence": [], "preview": "p"}]
+                hs.return_value.last_run.return_value = {
+                    "started_ts": 1786600000.0, "trajectories": 5,
+                    "proposals": 1}
+                a = bridge._persona_harness_reports("xcash")
+                b = bridge._persona_harness_reports("xcash")
+        self.assertEqual(len(a), 1)
+        self.assertEqual(a[0]["id"], b[0]["id"])
+        self.assertEqual(a[0]["ts"], b[0]["ts"])
+        self.assertEqual(a[0]["content"], b[0]["content"])
+        # ts 錨在跑批時刻,不是「現在」
+        self.assertEqual(a[0]["ts"], 1786600000.0)
+
+    def test_no_last_run_anchors_to_day_start(self):
+        with patch.dict(os.environ, {"HARNESS": "1"}):
+            with patch.object(bridge, "_harness_store") as hs:
+                hs.return_value.list.return_value = [
+                    {"store": "skill", "key": "k", "scope": "s", "version": 1,
+                     "rationale": "", "evidence": [], "preview": ""}]
+                hs.return_value.last_run.return_value = None
+                a = bridge._persona_harness_reports("xcash")
+                b = bridge._persona_harness_reports("xcash")
+        self.assertEqual(a[0]["ts"], b[0]["ts"])
+        self.assertNotAlmostEqual(a[0]["ts"], time.time(), delta=3600)
