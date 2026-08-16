@@ -63,6 +63,7 @@ from fastapi.responses import (JSONResponse, StreamingResponse, FileResponse,
                                HTMLResponse, PlainTextResponse)
 from starlette.websockets import WebSocketState
 
+import acp_client
 from acp_client import ACPPool, canonical_telegram_session
 
 # Persistent warm ACP process per persona — removes the ~5s `hermes -z`
@@ -307,6 +308,12 @@ def _log_exc(site: str, exc: BaseException, *, expected: bool = False,
     if suppressed:
         payload["suppressed"] = suppressed
     _log_event("exc_swallowed", **payload)
+
+
+# 接線:acp_client 不 import bridge(避免循環,照 cc_sdk.configure 同款),
+# A1/A3 的看門狗/巡檢事件(acp_turn_stalled / acp_proc_died_swept /
+# acp_crash_loop…)由這裡注入 _log_event 落到 bridge 事件流。
+acp_client.configure(log=_log_event)
 
 
 def _media_store() -> media_artifacts.MediaArtifactStore:
@@ -2405,7 +2412,8 @@ def _canonical_reply_failure(reply: str) -> tuple[str, str, str] | None:
 
 
 def _app_turn_status(session: str, client_id: str | None = None,
-                     acp_busy: bool = False) -> dict:
+                     acp_busy: bool = False, acp_queue_depth: int = 0,
+                     acp_degraded: bool = False) -> dict:
     """Current app-turn recovery status for the mobile client.
 
     The POST /app/v1/messages stream can legitimately be detached by a mobile
@@ -2450,6 +2458,9 @@ def _app_turn_status(session: str, client_id: str | None = None,
     elapsed = int(now - entry["ts"]) if entry and entry.get("ts") else None
     return {"session": session, "state": turn_state, "label": label,
             "in_flight": in_flight, "acp_busy": acp_busy,
+            # A2/A1 可觀測欄位(加法,舊 app 忽略):queue_depth = 排在人格
+            # 鎖上等待的 turn 數;degraded = 連續 stall / crash-loop 降級。
+            "queue_depth": acp_queue_depth, "degraded": acp_degraded,
             "elapsed_seconds": elapsed, "stale_seconds": elapsed,
             "output_chars": len(acc), "canonical_reply": bool(canonical_reply),
             "canonical_reply_chars": len(canonical_reply or ""),
@@ -14777,12 +14788,29 @@ async def v2_sessions(request: Request, provider: str = "", status: str = ""):
     hp_pending = _hermes_pending_by_session()
     for mid, (disp, _home) in PERSONAS.items():
         pend = hp_pending.get(f"hermes:{mid}")
+        # 注意變數名:這個 endpoint 的查詢參數叫 `status`(結尾過濾用),
+        # 這裡不能撞名。
+        hp_status = "waiting_approval" if pend else "idle"
+        meta = {"approval": pend} if pend else {}
+        # A1/A2(旗標 ACP_RESILIENCE=1):人格忙碌/排隊/降級進列表 ——
+        # 之前恆 idle,app/看板/編隊工具看不見人格正在跑。POOL.peek 只窺
+        # 不生:絕不為了列狀態冷啟 ACP 程序。
+        if acp_client.resilience_on():
+            acp = POOL.peek(mid)
+            if acp is not None:
+                if acp.is_busy() and not pend:
+                    hp_status = "running"
+                depth = acp.queue_depth()
+                if acp.is_busy() or depth:
+                    meta["queue_depth"] = depth
+                if acp.degraded:
+                    meta["degraded"] = True
         out.append({"id": f"hermes:{mid}", "provider": "hermes", "title": disp,
                     "subtitle": None,
-                    "status": "waiting_approval" if pend else "idle",
+                    "status": hp_status,
                     "last_event_at": pend.get("created_at") if pend else None,
                     "capabilities": ["input", "attachments", "replay", "follow", "approve"],
-                    "meta": ({"approval": pend} if pend else {})})
+                    "meta": meta})
     delegated_codex_ids = _delegated_codex_thread_ids()
     try:
         for t in await _codex_v2_visible_threads(20):
@@ -19680,7 +19708,9 @@ async def app_get_message_status(session: str, request: Request,
     if session not in PERSONAS:
         raise http_err(400, "SESSION_NOT_FOUND", "unknown session")
     acp = await POOL.get(session, home_for(session))
-    return _app_turn_status(session, client_id or None, acp_busy=acp.is_busy())
+    return _app_turn_status(session, client_id or None, acp_busy=acp.is_busy(),
+                            acp_queue_depth=acp.queue_depth(),
+                            acp_degraded=acp.degraded)
 
 
 async def _oc_events_gen(session: str, key: str, since: int, follow: bool):
