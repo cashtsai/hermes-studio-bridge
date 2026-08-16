@@ -14966,10 +14966,29 @@ async def v2_session_input(session_id: str, request: Request):
         # CC2 seam:忙碌 → 排隊(turn end 後 drain,同 CX pending_inputs
         # 語意);turn 本體/卡片流全在 cc_sdk.py,這裡只做驗證與轉發。
         content = (body.get("content") or body.get("text") or "").strip()
+        attachments = body.get("attachments") or []
+        sess = cc_sdk.registry().get(src[1])
+        if attachments:
+            # cc2 MVP 不轉發附件 —— 限制必須可見:出明確卡 + 回應帶
+            # attachments_dropped,絕不默默丟掉;純附件(無文字)直接 400。
+            try:
+                sess.digest.error_card(
+                    f"cc2 尚不支援附件轉發,已忽略 {len(attachments)} 件附件"
+                    + ("" if content else "(本則無文字內容,未送出)"))
+            except Exception as e:  # noqa: BLE001
+                _log_event("cc2_attachment_card_failed", error=str(e)[:160])
+            _log_event("cc2_attachments_dropped", session=src[1],
+                       count=len(attachments), has_text=bool(content))
+            if not content:
+                raise http_err(400, "CC2_ATTACHMENTS_UNSUPPORTED",
+                               "cc2 尚不支援附件;請改用文字內容")
         if not content:
             raise HTTPException(status_code=400, detail="empty")
-        res = await cc_sdk.registry().get(src[1]).submit(content)
-        return {"ok": True, "session_id": session_id, "accepted": True, **res}
+        res = await sess.submit(content)
+        out = {"ok": True, "session_id": session_id, "accepted": True, **res}
+        if attachments:
+            out["attachments_dropped"] = len(attachments)
+        return out
     if src[0] == "cx":
         content = (body.get("content") or body.get("text") or "").strip()
         attachments = body.get("attachments") or []
@@ -16539,6 +16558,42 @@ async def v2_cc2_create(name: str, request: Request):
         permission_mode=mode)
     return {"ok": True, "session_id": f"cc2:{name}",
             "workdir": sess.workdir, "permission_mode": sess.permission_mode}
+
+
+def _cc2_reconcile_orphan_approvals() -> int:
+    """cc2 孤兒審批列收尾(_expire_stale_codex_approvals 同款):cc2 的審批
+    等待者(can_use_tool 協程)只活在記憶體,bridge 重啟後 DB 裡殘留的
+    pending 列永遠無人能決(SDK 側早已 fail-closed deny)→ 一律標 expired,
+    審核中心不再掛著答不了的殭屍列。回真的改到幾列。"""
+    import sqlite3
+    try:
+        con = sqlite3.connect(CANON_DB, timeout=30)
+        try:
+            cur = con.execute(
+                "UPDATE approvals SET status='expired', decided_at=?, result=? "
+                "WHERE status='pending' AND (provider='cc2' OR source LIKE 'cc2:%')",
+                (time.time(), json.dumps(
+                    {"reason": "bridge restarted; cc2 waiter gone"},
+                    ensure_ascii=False)))
+            con.commit()
+            n = cur.rowcount
+        finally:
+            con.close()
+        if n:
+            _log_event("cc2_approval_reconcile", expired=n)
+        return n
+    except Exception as e:  # noqa: BLE001
+        _log_event("cc2_approval_reconcile_failed",
+                   error=type(e).__name__, error_message=str(e)[:160])
+        return 0
+
+
+@app.on_event("startup")
+async def _cc2_approval_reconcile_startup():
+    """重啟對帳(照 _agent_call_reconcile_startup 的開機收尾模式)。刻意
+    **不看** CC_SDK_PROVIDER 旗標:旗標事後關掉,殘留的 pending 列一樣
+    答不了,一樣要收。"""
+    _cc2_reconcile_orphan_approvals()
 
 
 # ── H-2:openclaw 事件的 sqlite 一律不准跑在 WS 事件圈上 ────────────────
@@ -21882,6 +21937,12 @@ async def _approval_decide_core(aid: str, b: dict) -> dict:
         # bridge 重啟過)→ 409;SDK 側早已 fail-closed deny,不會懸空。
         if not key:
             key = "approve" if b.get("approve") else "deny"
+            # 相容糖(同 codex 分支):{approve:true, for_session:true} →
+            # 第三態(cc_sdk 記 session_allowed_tools,同工具不再問)。
+            if key == "approve" and (b.get("for_session")
+                                     or b.get("approve_for_session")
+                                     or b.get("remember")):
+                key = "approve_for_session"
         status = cc_sdk.registry().decide_approval(aid, key)
         if status is None:
             raise HTTPException(status_code=409, detail="already decided or expired")
