@@ -15,6 +15,7 @@ S2（codex app-server 事件）/ S3（persona stream）之後各自加一個
 
 import asyncio
 import json
+import os
 import hashlib
 import re
 import time
@@ -1055,7 +1056,21 @@ class SessionCardStore(ApprovalCardMixin):
     _appr_source = "claude_code"
     _appr_default_title = "Claude Code 等待核准"
 
-    def __init__(self, ring_max: int = 2000, cards_max: int = 600):
+    # 容量預設(env 可調,不必改碼就能為不同機器調整):
+    #   ring_max  SSE 事件環。游標落在環外 → 410 SEQ_GONE → 客戶端得整包冷載。
+    #             2026-08-16 實機:一條活躍 session 的 latest_seq 已 4066,舊上限
+    #             2000 表示「離開一陣子回來」幾乎必然 410 —— 冷載 200 張卡的成本
+    #             遠高於補幾百個事件,體感就是每次進場都在等。
+    #   cards_max 卡片庫。往前翻歷史只能翻到這裡,再往前 bridge 就沒有了。
+    # 記憶體:實測平均 0.8 KB/張卡,而環裡放的是卡片**參照**不是複本,所以上限
+    # 由 ring 主導 —— 8000 × 0.8KB ≈ 6.4 MB/session,13 條 ≈ 83 MB。這台 128 GB
+    # 的機器完全不痛,而換來的是 410 幾乎不再發生。
+    _RING_MAX_DEFAULT = int(os.environ.get("POCKET_CARD_RING_MAX", "8000"))
+    _CARDS_MAX_DEFAULT = int(os.environ.get("POCKET_CARD_STORE_MAX", "2000"))
+
+    def __init__(self, ring_max: int | None = None, cards_max: int | None = None):
+        ring_max = self._RING_MAX_DEFAULT if ring_max is None else ring_max
+        cards_max = self._CARDS_MAX_DEFAULT if cards_max is None else cards_max
         self.seq = 0
         self.events: list[dict] = []      # 事件信封 {seq, ts, type, data}
         self.cards: dict[str, dict] = {}  # card id → 最新 rev 的卡
