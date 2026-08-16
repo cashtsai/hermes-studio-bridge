@@ -4858,6 +4858,12 @@ class CodexAppServerClient:
         #               "detail": str, "next_retry_at": monotonic}
         # 只有「resume/turn 成功」才會清掉 → 狀態欄的 locked 旗標會自己翻回來。
         self.thread_locks = {}
+        # 重試風暴升級器(Cindy 對照 #2-2):provider 連不上時 app-server 以
+        # `error` 通知無上限重試(他們實測 ~1/s 無退避封頂),UI 只會一直忙。
+        # thread_id -> {"count": int, "since": wall}。turn 開始/結束時歸零;
+        # 超過 CODEX_RETRY_ESCALATE_MAX 次或 _SECS 秒 → 合成終態錯誤收掉
+        # 這一輪(誠實說「連不上已放棄」,不是 300 秒後謊稱「卡住」)。
+        self.retry_escalations = {}
         self.remote_status = None
         self.app_server_error = ""
         self.server_started_at = 0.0
@@ -6105,12 +6111,14 @@ class CodexAppServerClient:
             self.turn_terminal_at.pop(tid, None)
             self.last_event_at[tid] = time.time()
             self.thread_errors.pop(tid, None)
+            self.retry_escalations.pop(tid, None)   # 新回合 → 重試計數歸零
             self._start_turn_watchdog(tid)
             _codex_history_invalidate(tid)   # cached /history page is now stale
             return
         if method == "turn/completed" and tid:
             self.active_turns.pop(tid, None)
             self.turn_terminal_at[tid] = time.time()
+            self.retry_escalations.pop(tid, None)   # 回合結束 → 重試計數歸零
             if self.pending_inputs.get(tid):     # 這輪結束 → 送出排隊中的下一則
                 try:
                     t = asyncio.create_task(self.drain_pending(tid))
@@ -6153,6 +6161,7 @@ class CodexAppServerClient:
         if method == "error":
             _log_event("codex_app_server_error",
                        message=str(params.get("message") or params)[:240])
+            self._note_retryable_error(params)
             return
         if method == "serverRequest/resolved":
             self._drop_approval_by_request(params.get("requestId"))
@@ -6267,9 +6276,24 @@ class CodexAppServerClient:
             res = await self.call("turn/start", params, timeout=30.0)
         except CodexAppServerError as e:
             # resume 過關之後才被搶走寫入權(桌面 app 中途打開同一條)也走同一條路。
-            if _codex_thread_lock_conflict(e) is None:
+            if _codex_thread_lock_conflict(e) is not None:
+                raise self._thread_lock_error(thread_id, e) from e
+            if "thread not found" in str(e).lower():
+                # 自動復原(Cindy 對照 #2-1,2026-08-16):daemon 被換過人
+                # (重啟/更新)時,我們的 loaded 標記還在、它那邊的載入態卻沒了
+                # → turn/start 撞 thread not found。正解是**重掛再試一次**:
+                # 踢掉 loaded 標記 → thread/resume(= 重訂閱+重載)→ 重試
+                # turn/start。resume 也找不到才是真的丟了(catalog 遺失),
+                # 照舊拋給 _codex_http_error 翻成 404 + 人話。
+                # 絕不在這裡自動 restart daemon —— 那會把桌面 ChatGPT 踢下線,
+                # 桌面立刻開內建 codex 搶鎖,分家重演(8/15 實錄)。
+                _log_event("codex_thread_notfound_autorecover",
+                           thread=thread_id[:16])
+                self.loaded_threads.discard(thread_id)
+                await self.ensure_thread_loaded(thread_id, cwd=cwd)
+                res = await self.call("turn/start", params, timeout=30.0)
+            else:
                 raise
-            raise self._thread_lock_error(thread_id, e) from e
         self.thread_event_generations[thread_id] += 1
         self.thread_events[thread_id].clear()
         turn = (res or {}).get("turn") or {}
@@ -6293,6 +6317,75 @@ class CodexAppServerClient:
             "threadId": thread_id,
             "turnId": turn_id,
         }, timeout=15.0)
+
+    def _note_retryable_error(self, params: dict) -> None:
+        """`error` 通知的升級計數(同步路徑,O(1))。
+
+        只數「還會再試」的錯誤:willRetry 旗標,或訊息長得像重試/重連
+        (codex 版本間欄位名不穩,兩條都認)。沒有 threadId 的全域錯誤不數
+        —— 那類由 transport 死亡路徑(_reader_cleanup)處理。門檻一到就
+        丟一顆背景任務去收掉這一輪;計數當場歸零,不重複開刀。"""
+        tid = str(params.get("threadId") or "")
+        if not tid or not self.is_active(tid):
+            return
+        msg = str(params.get("message") or params.get("error") or "")[:300]
+        retryable = bool(params.get("willRetry")) or bool(
+            _CX_RETRYABLE_ERROR_RE.search(msg))
+        if not retryable:
+            return
+        now = time.time()
+        st = self.retry_escalations.get(tid)
+        if st is None:
+            st = {"count": 0, "since": now}
+            self.retry_escalations[tid] = st
+        st["count"] += 1
+        elapsed = now - st["since"]
+        if (st["count"] < CODEX_RETRY_ESCALATE_MAX
+                and elapsed < CODEX_RETRY_ESCALATE_SECS):
+            return
+        self.retry_escalations.pop(tid, None)
+        try:
+            t = asyncio.create_task(self._escalate_retry_storm(
+                tid, st["count"], elapsed, msg))
+            _BG_TASKS.add(t)
+            t.add_done_callback(_BG_TASKS.discard)
+        except RuntimeError:
+            pass
+
+    async def _escalate_retry_storm(self, thread_id: str, count: int,
+                                    elapsed: float, last_msg: str) -> None:
+        """重試風暴 → 合成終態(Cindy 對照 #2-2)。
+
+        app-server 對 provider 連線失敗會無上限重試,期間 turn 恆 active、
+        使用者只看到永遠的忙碌。這裡誠實收尾:標錯誤、寫進對話、中斷回合、
+        放行輸入佇列 —— 與 stall 看門狗同一套收屍動作,但訊息說真話
+        (「連不上,已重試 N 次放棄」而不是「卡住」)。"""
+        if not self.is_active(thread_id):
+            return
+        message = (f"Codex provider 連線持續失敗(已重試 {count} 次/"
+                   f"{int(elapsed)}s),本回合放棄:{last_msg[:160]}")
+        _log_event("codex_retry_storm_escalated", thread=thread_id[:16],
+                   count=count, elapsed=int(elapsed),
+                   last_error=last_msg[:160])
+        self.thread_errors[thread_id] = message
+        self._append(thread_id, ("text", f"\n⚠️ {message}\n"))
+        try:
+            await asyncio.wait_for(self.interrupt_turn(thread_id), timeout=15.0)
+        except Exception as exc:  # noqa: BLE001
+            _log_event("codex_retry_storm_interrupt_failed",
+                       thread=thread_id[:16], error=type(exc).__name__)
+        self.active_turns.pop(thread_id, None)
+        self.turn_terminal_at[thread_id] = time.time()
+        watchdog = self.turn_watchdogs.pop(thread_id, None)
+        if watchdog and watchdog is not asyncio.current_task():
+            watchdog.cancel()
+        if self.pending_inputs.get(thread_id):   # 放行排隊中的輸入
+            try:
+                t = asyncio.create_task(self.drain_pending(thread_id))
+                _BG_TASKS.add(t)
+                t.add_done_callback(_BG_TASKS.discard)
+            except RuntimeError:
+                pass
 
     def _start_turn_watchdog(self, thread_id: str) -> None:
         previous = self.turn_watchdogs.pop(thread_id, None)
@@ -7285,6 +7378,13 @@ _CODEX_HISTORY_CACHE: dict = {}   # (thread_id, limit, cursor) -> (cached_at_mon
 # events. Treat that as a stalled turn, interrupt it, and expose the state
 # instead of leaving Pocket's spinner up forever.
 CODEX_TURN_STALL_SECS = float(os.environ.get("CODEX_TURN_STALL_SECS", "300"))
+# 重試風暴升級門檻(Cindy 對照 #2-2;他們用 30 次/120s,我們沿用)。
+CODEX_RETRY_ESCALATE_MAX = int(os.environ.get("CODEX_RETRY_ESCALATE_MAX", "30"))
+CODEX_RETRY_ESCALATE_SECS = float(
+    os.environ.get("CODEX_RETRY_ESCALATE_SECS", "120"))
+# 「還會再試」的錯誤長相(欄位名跨版本不穩,訊息樣式兜底)。
+_CX_RETRYABLE_ERROR_RE = re.compile(
+    r"reconnect|retry|retrying|will retry|attempt \d+", re.IGNORECASE)
 _CODEX_LIST_MAX_PAGES = 8
 _CODEX_SESSION_LIST_CACHE: dict = {}
 _CODEX_V2_VISIBLE_CACHE: list[dict] = []
