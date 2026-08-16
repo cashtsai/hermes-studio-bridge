@@ -25023,8 +25023,16 @@ def _persona_harness_reports(persona: str, limit: int = 1) -> list[dict]:
         return []
     day = time.strftime("%Y-%m-%d")
     external_id = f"harness:{persona}:{day}"
-    ts = time.time()
-    return [{"id": _report_id(persona, _HARNESS_REPORT_NAME, day, ts),
+    # ⚠️ id/ts 必須**當日穩定**(2026-08-16 灌訊事故):_report_upsert 靠 id
+    # 去重,原本這裡每次呼叫都拿 time.time() 現生成 → 每一輪同步都是
+    # 「新報告」→ 一輪鏡射一則聊天訊息,一個下午灌了 64 則。cron 報告不會
+    # 這樣是因為它們用訊息自己的 ts(穩定)。
+    # ts 錨在「昨夜跑批時刻」(沒有就當日零點):同一天內容不變 → 同 id
+    # 同 ts → upsert 判重複跳過;內容變(審完/新跑批)→ 同 id 原位更新,
+    # 一天最多一張卡,不洗版 —— 這才是 docstring 承諾的行為。
+    ts = float((last or {}).get("started_ts") or 0) or float(
+        time.mktime(time.strptime(day, "%Y-%m-%d")))
+    return [{"id": _report_id(persona, _HARNESS_REPORT_NAME, day, day),
              "external_id": external_id,
              "external_source": "harness",
              "session_id": f"harness-{day}",
