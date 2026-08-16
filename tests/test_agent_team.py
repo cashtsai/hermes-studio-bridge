@@ -453,5 +453,34 @@ class TestStatusEndpoint(unittest.TestCase):
             self.assertIsNone(res["workers"][0]["live"])
 
 
+class TestDefaultProviderCC2(unittest.TestCase):
+    """cc2 轉正第一步(2026-08-16):省略 provider 的招工預設 cc2。
+    tmux(claude_code)仍可顯式指定 —— 終端接手/委派線的價值不動。"""
+
+    def _start(self):
+        asyncio.run(bridge.v2_team_start(FakeRequest({"lead": LEAD})))
+
+    def test_omitted_provider_defaults_to_cc2(self):
+        with _Env() as env:
+            self._start()
+            res = asyncio.run(bridge.v2_team_worker(FakeRequest(
+                {"lead": LEAD, "label": "dev"})))
+            self.assertTrue(res["session_id"].startswith("cc2:"))
+
+    def test_env_can_change_default(self):
+        with _Env(extra_env={"CC_DEFAULT_PROVIDER": "claude_code"}) as env:
+            self._start()
+            res = asyncio.run(bridge.v2_team_worker(FakeRequest(
+                {"lead": LEAD, "label": "dev"})))
+            self.assertTrue(res["session_id"].startswith("claude_code:"))
+
+    def test_explicit_provider_still_wins(self):
+        with _Env() as env:
+            self._start()
+            res = asyncio.run(bridge.v2_team_worker(FakeRequest(
+                {"lead": LEAD, "label": "dev", "provider": "claude_code"})))
+            self.assertTrue(res["session_id"].startswith("claude_code:"))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

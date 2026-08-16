@@ -24824,7 +24824,12 @@ async def v2_team_worker(request: Request):
     lead = _agent_call_normalize_sid(str(body.get("lead") or ""))
     label = str(body.get("label") or "").strip()
     role = str(body.get("role") or "").strip()
-    provider = str(body.get("provider") or "").strip()
+    # cc2 轉正第一步(2026-08-16 老闆拍板「造它就是因為比較好」):省略
+    # provider 的招工預設走 cc2(SDK 引擎:真串流/結構化審批/resume 自癒)。
+    # tmux 路線(claude_code)保留給「要從終端接手」與委派線 —— 那是 ccsess
+    # 的獨有價值,不硬遷;要指定照舊顯式傳。env 可改預設(回退開關)。
+    provider = str(body.get("provider") or "").strip() \
+        or os.environ.get("CC_DEFAULT_PROVIDER", "cc2").strip()
     if not lead or not label:
         raise http_err(400, "TEAM_BAD_REQUEST", "lead、label 皆為必填")
     if provider not in _TEAM_PROVIDERS:
