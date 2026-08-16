@@ -54,6 +54,7 @@ from harness import trajectory as harness_traj
 import media_artifacts
 import hermes_media
 import openclaw_provider
+import cc_sdk               # CC provider v2(Agent SDK;模組內 lazy-import SDK)
 import tg_outbound
 from fastapi import (FastAPI, Request, HTTPException, WebSocket, WebSocketDisconnect,
                      File, Form, UploadFile)
@@ -14678,7 +14679,11 @@ async def v2_agents(request: Request):
     ] + ([
         {"provider": "openclaw", "name": "OpenClaw", "kind": "code_agent",
          "status": "ready", "auth": {"connected": True, "account": None}, "can_create": False},
-    ] if OPENCLAW.configured() else [])}
+    ] if OPENCLAW.configured() else []) + ([
+        # CC2 seam:旗標開才亮相(旗標關 = 對 app 完全不存在)。
+        {"provider": "cc2", "name": "Claude Code (SDK)", "kind": "code_agent",
+         "status": "ready", "auth": {"connected": True, "account": None}, "can_create": True},
+    ] if cc_sdk.enabled() else [])}
 
 
 @app.get("/app/v2/sessions")
@@ -14786,6 +14791,15 @@ async def v2_sessions(request: Request, provider: str = "", status: str = ""):
             _log_event("v2_openclaw_list_failed", error=type(e).__name__,
                        error_message=str(e)[:200])
             degraded.append("openclaw")
+    # CC2 seam:旗標開才列(關 = 整段缺席,零影響現有使用者);列表失敗照
+    # codex/openclaw 同款標 degraded,不無聲吞錯。
+    if cc_sdk.enabled():
+        try:
+            out.extend(cc_sdk.registry().v2_rows())
+        except Exception as e:  # noqa: BLE001
+            _log_event("v2_cc2_list_failed", error=type(e).__name__,
+                       error_message=str(e)[:200])
+            degraded.append("cc2")
     if provider:
         out = [s for s in out if s["provider"] == provider]
     if status:
@@ -14898,6 +14912,14 @@ async def v2_session_input(session_id: str, request: Request):
         return {"session_id": session_id, **res}
     if src[0] == "oc":
         return await _oc_input_core(src[1], session_id, body)
+    if src[0] == "cc2":
+        # CC2 seam:忙碌 → 排隊(turn end 後 drain,同 CX pending_inputs
+        # 語意);turn 本體/卡片流全在 cc_sdk.py,這裡只做驗證與轉發。
+        content = (body.get("content") or body.get("text") or "").strip()
+        if not content:
+            raise HTTPException(status_code=400, detail="empty")
+        res = await cc_sdk.registry().get(src[1]).submit(content)
+        return {"ok": True, "session_id": session_id, "accepted": True, **res}
     if src[0] == "cx":
         content = (body.get("content") or body.get("text") or "").strip()
         attachments = body.get("attachments") or []
@@ -15022,6 +15044,11 @@ async def v2_session_interrupt(session_id: str, request: Request):
     if src[0] == "hp":
         res = await _persona_interrupt_core(src[1])
         return {"session_id": session_id, **res}
+    if src[0] == "cc2":
+        # CC2 seam:SDK interrupt()(結構化中斷,不再是 send-keys Esc)。
+        if not await cc_sdk.registry().get(src[1]).interrupt():
+            raise http_err(409, "NO_ACTIVE_TURN", "no active cc2 turn")
+        return {"ok": True, "session_id": session_id, "interrupted": True}
     if src[0] == "oc":
         # SPEC §4:chat.abort {sessionKey}。v2 契約「無活躍 turn 一律 409」,
         # 忙碌判定雙軌:digest.busy(lifecycle start 之後)OR gateway
@@ -15664,6 +15691,15 @@ def _v2_card_source(session_id: str) -> tuple:
             if not rest:
                 raise http_err(404, "SESSION_NOT_FOUND", "empty openclaw session key")
             return ("oc", _oc_safe_session_key(rest))
+        if prov == "cc2":
+            # CC provider v2(Agent SDK,CC_SDK_PROVIDER 旗標並行):旗標關 =
+            # 整個 cc2 id 空間不存在(404,零行為改變);開了但名字沒建過一樣
+            # 404 —— 不隱式建 session(建立走 POST /app/v2/cc2/{name})。
+            if not cc_sdk.enabled():
+                raise http_err(404, "SESSION_NOT_FOUND", "cc2 provider disabled")
+            if not rest or cc_sdk.registry().get(rest) is None:
+                raise http_err(404, "SESSION_NOT_FOUND", "unknown cc2 session")
+            return ("cc2", rest)
         if prov != "claude_code":
             raise http_err(400, "UNSUPPORTED_PROVIDER",
                            f"不支援的 provider: {prov}")
@@ -16384,6 +16420,75 @@ def _oc_approval_mark(aid: str, status: str, result: str = "") -> bool:
         return bool(n)
     finally:
         con.close()
+
+
+# ─────────── CC provider v2(cc2:Agent SDK,旗標 CC_SDK_PROVIDER)───────────
+# 本體全在 cc_sdk.py(session/卡片流翻譯/審批等待者/state 檔);bridge 只做
+# 薄接線(CC2 seams):id 路由(_v2_card_source)、input/interrupt 分支、
+# sessions/agents 列表、統一決議路由 cc2 分支、以及底下這組 approvals DB
+# 鏡像掛鉤 + 建立端點。旗標關(預設)= 全部缺席,零行為改變;cc_sdk 模組
+# 內部 lazy-import SDK,SDK 缺席/壞掉不影響 bridge 啟動。
+
+
+def _cc2_approval_db_upsert(record: dict) -> None:
+    """cc2 pending 審批 → canonical approvals 表(照 _oc_approval_upsert 同款
+    鏡像:審核中心列表/GET /app/v1/approvals/推播全部沿用既有機制)。真相在
+    cc_sdk 等待者;DB 只是鏡像,失敗由 cc_sdk._db_hook 吃掉不影響審批。"""
+    import sqlite3
+    con = sqlite3.connect(CANON_DB, timeout=30)
+    try:
+        row = con.execute("SELECT status FROM approvals WHERE id=?",
+                          (record["id"],)).fetchone()
+        if not row:
+            con.execute("INSERT INTO approvals"
+                        "(id,title,source,risk,detail,created_at,expires_at,"
+                        "status,decided_at,result,callback,session_id,provider,"
+                        "kind,options) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                        (record["id"], record["title"], record["source"],
+                         record["risk"], record["detail"], record["created_at"],
+                         record["expires_at"], "pending", None, None, None,
+                         record["session_id"], "cc2", "permission",
+                         json.dumps(record["options"], ensure_ascii=False)))
+        con.commit()
+        con.close()
+    finally:
+        con.close()
+
+
+def _cc2_approval_db_mark(aid: str, status: str) -> None:
+    """cc2 審批收尾(決議/逾時 expired)回寫 DB 鏡像。共用 openclaw 的
+    generic UPDATE(WHERE status='pending' 冪等)。"""
+    _oc_approval_mark(aid, status)
+
+
+# 接線:cc_sdk 不 import bridge(避免循環),觀測/DB 掛鉤由這裡注入。
+cc_sdk.configure(log=_log_event,
+                 approval_db_upsert=_cc2_approval_db_upsert,
+                 approval_db_mark=_cc2_approval_db_mark)
+
+
+@app.post("/app/v2/cc2/{name}")
+async def v2_cc2_create(name: str, request: Request):
+    """建立/更新 cc2 session:body {workdir?, permission_mode?}。冪等 ——
+    同名重 POST 只更新設定,不打斷進行中的 turn。旗標關 → 404(對外表現
+    同不存在,與 _v2_card_source 的 cc2 分支一致)。"""
+    _check_auth(request)
+    if not cc_sdk.enabled():
+        raise http_err(404, "CC_SDK_DISABLED",
+                       "cc2 provider 未啟用(需 CC_SDK_PROVIDER=1)")
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", name or ""):
+        raise http_err(400, "BAD_SESSION_NAME",
+                       "cc2 session 名限英數/底線/連字號(≤64)")
+    body = await _json_body(request)
+    mode = str(body.get("permission_mode") or "").strip()
+    if mode and mode not in cc_sdk.PERMISSION_MODES:
+        raise http_err(400, "BAD_PERMISSION_MODE",
+                       f"permission_mode 必須是 {list(cc_sdk.PERMISSION_MODES)} 之一")
+    sess = cc_sdk.registry().ensure(
+        name, workdir=str(body.get("workdir") or "").strip(),
+        permission_mode=mode)
+    return {"ok": True, "session_id": f"cc2:{name}",
+            "workdir": sess.workdir, "permission_mode": sess.permission_mode}
 
 
 # ── H-2:openclaw 事件的 sqlite 一律不准跑在 WS 事件圈上 ────────────────
@@ -17176,6 +17281,10 @@ async def _v2_card_store(session_id: str):
         return (await _hp_card_digest(src[1])).store
     if src[0] == "oc":
         return (await _oc_card_digest(src[1])).store
+    if src[0] == "cc2":
+        # cc2 無歷史 seed(MVP:卡片只來自 live SDK 訊息流;歷史在 ~/.claude
+        # jsonl,終端 `claude --resume` 可接手)。digest 常駐於 session 物件。
+        return cc_sdk.registry().get(src[1]).digest.store
     _, name, workdir = src
     store = _cc_card_store(name)
     await _cc_card_seed(store, name, workdir)
@@ -21716,6 +21825,19 @@ async def _approval_decide_core(aid: str, b: dict) -> dict:
         # 打 `*.approval.resolve`,成功了才改 DB。反過來寫會出現「app 顯示
         # 已核准、agent 還在那裡等」。
         return await _oc_approval_decide(aid, d, b)
+    if d and src.startswith("cc2:"):
+        # CC2 seam:真相在 cc_sdk 的 can_use_tool 等待者手上 —— 這裡只負責
+        # 叫醒;卡片收尾/DB mark 由等待者協程統一做(決議與逾時同一條收尾
+        # 路,不會出現「卡片已決、SDK 還在等」)。等待者不存在(已決/逾時/
+        # bridge 重啟過)→ 409;SDK 側早已 fail-closed deny,不會懸空。
+        if not key:
+            key = "approve" if b.get("approve") else "deny"
+        status = cc_sdk.registry().decide_approval(aid, key)
+        if status is None:
+            raise HTTPException(status_code=409, detail="already decided or expired")
+        _log_event("cc2_approval_decision", approval_id=aid, status=status,
+                   key=key)
+        return {"id": aid, "status": status, "key": key}
     if d and src.startswith("codex"):
         # question 類 server request(item/tool/requestUserInput /
         # mcpServer/elicitation/request)不是二元核准 —— key 就是答案，
