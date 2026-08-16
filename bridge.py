@@ -23524,6 +23524,14 @@ def _agent_call_bg_timeout() -> float:
         return 1800.0
 
 
+def _agent_call_blocked_check_secs() -> float:
+    """H2 的 blocked 偵測節流(CC 偵測要 capture pane,不能每次醒來都打)。"""
+    try:
+        return float(os.environ.get("AGENT_CALL_BLOCKED_CHECK_SECS", "") or 15.0)
+    except ValueError:
+        return 15.0
+
+
 def _agent_call_reply_max() -> int:
     try:
         return int(os.environ.get("AGENT_CALL_REPLY_MAX", "") or 4000)
@@ -23617,6 +23625,35 @@ def _agent_call_collect_reply(store, since_seq: int) -> str:
     return reply
 
 
+async def _agent_call_target_blocked(sid: str) -> str | None:
+    """target 是否停在「等人」(待審核/互動問題)。herdr 對照 H2/H4:
+    對 blocked 的 target 派單,訊息只會在佇列裡等到天荒地老,caller 卻掛著
+    等回覆 —— 正解是先看狀態:派單前拒送(H4),派單後偵測到就提前告知
+    caller(H2)。回 None = 沒擋著;查不出來也回 None(絕不因偵測失敗
+    擋派單)。"""
+    try:
+        if sid.startswith("codex:"):
+            tid = sid.split(":", 1)[1]
+            if CODEX_APP.pending_approval_for_thread(tid):
+                return "codex 停在待審核"
+            prov = CODEX_APP.provider_status.get(tid) or {}
+            if prov.get("type") == "active":
+                flags = prov.get("flags") or []
+                if "waitingOnApproval" in flags or "waitingOnUserInput" in flags:
+                    return "codex 停在待審核/待作答"
+        elif sid.startswith("claude_code:"):
+            state, _prompt = await _v2_cc_state(sid.split(":", 1)[1])
+            if state == "waiting_approval":
+                return "Claude Code 停在權限審核選單"
+        elif sid.startswith("cc2:"):
+            if cc_sdk.enabled() and cc_sdk.registry().pending_for(
+                    sid.split(":", 1)[1]):
+                return "cc2 停在待審核"
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("_agent_call_target_blocked", _exc, expected=True, session=sid)
+    return None
+
+
 class _InternalAuthRequest:
     """bridge 內部代發的 Request 替身(重啟對帳/回覆送達用):帶 master
     token 走既有 _check_auth,body 為 bridge 代組輸入。與 _AgentCallInput
@@ -23686,6 +23723,9 @@ async def _agent_call_waiter(call_id: str, caller: str, target: str,
     waker = store.attach_waker()
     cursor = since_seq
     end_seen = False
+    blocked_notified = False
+    _blk_secs = _agent_call_blocked_check_secs()
+    next_blocked_check = time.time() + _blk_secs   # 派單後給 target 起跑時間
     try:
         while True:
             fresh = [e for e in store.events if e["seq"] > cursor]
@@ -23695,6 +23735,41 @@ async def _agent_call_waiter(call_id: str, caller: str, target: str,
                        (e.get("data") or {}).get("state") == "end"
                        for e in fresh):
                     end_seen = True
+            # H2(herdr 語意):target 中途停在待審 → 提前告知 caller 一次,
+            # 別讓 caller 乾等收割窗關(最長 30 分鐘)才知道球在人身上。
+            # 15s 節流(CC 的偵測要 capture pane);只通知不結案 —— 審核
+            # 通過後 turn 會繼續,收割照常。
+            if (not end_seen and not blocked_notified
+                    and time.time() >= next_blocked_check):
+                next_blocked_check = time.time() + _blk_secs
+                blocked = await _agent_call_target_blocked(target)
+                if blocked:
+                    blocked_notified = True
+                    row_b = REGISTRY.call_update(
+                        call_id, meta_merge={"blocked_notice": blocked})
+                    _log_event("agent_call_target_blocked", call=call_id,
+                               caller=caller, target=target, reason=blocked)
+                    await _agent_call_audit(
+                        row_b or {"id": call_id, "caller": caller,
+                                  "target": target, "mode": ""},
+                        "blocked",
+                        f"{target} 目前{blocked}(call {call_id[-8:]}),"
+                        f"審核完成前不會有回覆 —— 審核照常需人工核准",
+                        [caller, target])
+                    try:
+                        row_m = REGISTRY.call_get(call_id) or {}
+                        meta_m = row_m.get("meta") or {}
+                        if (row_m.get("mode") == "background"
+                                or meta_m.get("await_timed_out")):
+                            shim = _InternalAuthRequest({
+                                "content": (f"[agent_call 提醒 {target} "
+                                            f"#{call_id[-8:]}] 對方{blocked},"
+                                            f"等人核准後才會回覆"),
+                                "client_id": f"{call_id}-blocked"})
+                            await v2_session_input(caller, shim)
+                    except Exception as _exc:  # noqa: BLE001
+                        _log_exc("_agent_call_waiter#blocked_notice", _exc,
+                                 expected=True, call=call_id)
             if end_seen:
                 reply = _agent_call_collect_reply(store, since_seq)
                 if reply:
@@ -23723,9 +23798,14 @@ async def _agent_call_waiter(call_id: str, caller: str, target: str,
                 await _agent_call_maybe_deliver(call_id)
                 return row
             waker.clear()
+            # 醒來時機取三者最早:事件、收割窗、下一次 blocked 偵測窗
+            # (H2 —— 不然沒事件時一睡 5 秒,偵測節流形同虛設)。
+            wait_secs = min(5.0, max(0.1, remain))
+            if not end_seen and not blocked_notified:
+                wait_secs = min(wait_secs,
+                                max(0.05, next_blocked_check - time.time()))
             try:
-                await asyncio.wait_for(waker.wait(),
-                                       timeout=min(5.0, max(0.1, remain)))
+                await asyncio.wait_for(waker.wait(), timeout=wait_secs)
             except asyncio.TimeoutError:
                 pass
     except Exception as _exc:  # noqa: BLE001
@@ -23835,6 +23915,17 @@ async def v2_agent_call(request: Request):
     except agent_call_policy.CallDenied as e:
         await _agent_call_deny(call_id, caller, target, mode, message,
                                e.code, e.reason, 429)
+    # ── 護欄 3(H4,herdr 語意):target 停在待審 → 拒送不排隊 ─────────
+    # 已 blocked 的 target 收訊息只會躺佇列,caller 卻掛著等回覆。拒回 409
+    # 讓 caller 當下知道「先去催審核」。堅持排隊 → force=true 照舊投遞。
+    if not bool(body.get("force")):
+        blocked = await _agent_call_target_blocked(target)
+        if blocked:
+            await _agent_call_deny(
+                call_id, caller, target, mode, message,
+                "AGENT_CALL_TARGET_BLOCKED",
+                f"{blocked} —— 審核完成前不會回覆(不代審;要硬排隊請帶 "
+                f"force=true)", 409)
     # ── accepted 才有副作用(closure 契約,2026-08-16)────────────────
     # 帳先落成 dispatching(= 「正在投遞」,不冒充進行中);send 被目標
     # 接受後才升 running。中途死掉(bridge crash / 例外)留下的 dispatching
