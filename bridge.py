@@ -4348,7 +4348,8 @@ def _is_clean_ws_closure(exc: BaseException) -> bool:
     """
     try:
         from websockets.exceptions import ConnectionClosed, ConnectionClosedOK
-    except Exception:  # noqa: BLE001 - websockets 不在也不該讓 log 分類炸掉
+    except Exception as _exc:  # noqa: BLE001 - websockets 不在也不該讓 log 分類炸掉
+        _log_exc("_ws_closed_ok#import", _exc, expected=True)
         return type(exc).__name__ == "ConnectionClosedOK"
     if isinstance(exc, ConnectionClosedOK):
         return True
@@ -6867,7 +6868,8 @@ def _codex_thread_model(tid: str, fallback: dict | None = None):
     CodexAppServerClient 註解)優先,退回 summary/thread dict 的 model 欄。"""
     try:
         m = (CODEX_APP.thread_settings.get(tid) or {}).get("model")
-    except Exception:  # noqa: BLE001
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("_cx_model_hint", _exc, expected=True)
         m = None
     if not m and isinstance(fallback, dict):
         m = fallback.get("model")
@@ -8190,7 +8192,8 @@ def _pair_lan_ip():
         finally:
             s.close()
         return ip if ip and not ip.startswith("127.") else None
-    except Exception:  # noqa: BLE001
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("_local_ip_probe", _exc, expected=True)
         return None
 
 
@@ -8213,7 +8216,8 @@ def _pair_tailscale_host():
             ips = self_.get("TailscaleIPs") or []
             if ips:
                 return str(ips[0])
-        except Exception:  # noqa: BLE001
+        except Exception as _exc:  # noqa: BLE001
+            _log_exc("_local_ip_dns", _exc, expected=True)
             continue
     return None
 
@@ -9150,7 +9154,8 @@ async def codex_session_answer(thread_id: str, request: Request):
     _check_auth(request)
     try:
         b = await request.json()
-    except Exception:  # noqa: BLE001
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("_json_body_lenient", _exc, expected=True)
         b = {}
     if not isinstance(b, dict):
         b = {}
@@ -11004,7 +11009,8 @@ def _cc_cum_ingest_line(st: dict, line: str):
         return
     try:
         rec = json.loads(line)
-    except Exception:  # noqa: BLE001
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("_cc_jsonl_line", _exc, expected=True)
         return
     if rec.get("type") != "assistant":
         return
@@ -17025,7 +17031,8 @@ def _openclaw_key_from_session_id(session_id: str) -> str | None:
 def _openclaw_message_text(msg: dict) -> str:
     try:
         return carddigest._oc_msg_text(msg.get("content")).strip()
-    except Exception:  # noqa: BLE001
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("_openclaw_message_text", _exc, expected=True)
         content = msg.get("content")
         if isinstance(content, str):
             return content.strip()
@@ -22787,7 +22794,8 @@ def _registry_validate_parent(parent: str | None) -> None:
         try:
             _v2_card_source(parent)
             known = True
-        except Exception:  # noqa: BLE001  (HTTPException/BridgeError 皆=未知)
+        except Exception as _exc:  # noqa: BLE001  (HTTPException/BridgeError 皆=未知)
+            _log_exc("_registry_parent_probe", _exc, expected=True)
             known = False
     if not known:
         raise http_err(400, "REGISTRY_BAD_PARENT",
@@ -24654,7 +24662,8 @@ def _harness_node_meta(sid: str) -> dict:
     src = None
     try:
         src = _v2_card_source(sid)
-    except Exception:  # noqa: BLE001 — 認不得的 id 就沒有 spawn config
+    except Exception as _exc:  # noqa: BLE001 — 認不得的 id 就沒有 spawn config
+        _log_exc("_spawn_config_probe", _exc, expected=True)
         src = None
     if src and src[0] == "cc":
         try:
