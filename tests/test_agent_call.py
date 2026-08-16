@@ -5,6 +5,7 @@ AGENT_CALL 旗標關閉 = 404、await_reply happy path + 逾時轉背景、
 audit 卡雙邊落卡、絕不代審(approval 核心零觸碰)、call 帳本 CRUD、
 addendum:spawn 路徑 parent/purpose 落籍 + parent 驗證 + children 端點。
 """
+import _isolation  # noqa: F401  # 測試隔離閂:必須是第一個 import(2026-08-15 事故防線,見 tests/_isolation.py)
 import asyncio
 import json
 import os

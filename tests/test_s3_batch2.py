@@ -19,6 +19,7 @@
 5. v1 相容:同一段對話 GET /app/v1/messages 照樣看得到(批次 2 不破壞
    老 app 的路)。
 """
+import _isolation  # noqa: F401  # 測試隔離閂:必須是第一個 import(2026-08-15 事故防線,見 tests/_isolation.py)
 
 # 這支是「腳本式驗收」(repo 慣例:python3 tests/test_s3_batch2.py):測試邏輯直接寫在
 # 模組層、用 sys.exit() 回報結果。被 `unittest discover` 匯入時,那些程式碼會在

@@ -9,6 +9,7 @@
 
 真靶機層(需本機 OpenClaw gateway)在 test_openclaw_live.py,預設 skip。
 """
+import _isolation  # noqa: F401  # 測試隔離閂:必須是第一個 import(2026-08-15 事故防線,見 tests/_isolation.py)
 import asyncio
 import json
 import os

@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+# (__future__ 依語法必須排最前;隔離閂緊跟在後,仍在任何 repo 模組之前)
+import _isolation  # noqa: F401  # 測試隔離閂(2026-08-15 事故防線,見 tests/_isolation.py)
+
 import asyncio
 import os
 import sys

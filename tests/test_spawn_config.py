@@ -14,6 +14,7 @@
 7. 舊 shape 容忍:config=None / 未知欄位 → 不炸、沿用今天行為。
 8. _claude_argv 併 config:permission-mode 覆寫且不重複、其餘 flags 帶上、key 不進 argv。
 """
+import _isolation  # noqa: F401  # 測試隔離閂:必須是第一個 import(2026-08-15 事故防線,見 tests/_isolation.py)
 import json
 import os
 import sys

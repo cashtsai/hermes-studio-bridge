@@ -23,6 +23,7 @@
 6. `approval_create`:persona-relay 驗證、options.send 落庫、push:false
    不疊推播。7. ApprovalCardMixin:kind=question/notice 上卡(加值欄位)。
 """
+import _isolation  # noqa: F401  # 測試隔離閂:必須是第一個 import(2026-08-15 事故防線,見 tests/_isolation.py)
 
 # 這支是「腳本式驗收」(repo 慣例:python3 tests/test_a3_approval_card_parity.py):測試邏輯直接寫在
 # 模組層、用 sys.exit() 回報結果。被 `unittest discover` 匯入時,那些程式碼會在
@@ -487,7 +488,11 @@ try:
         bridge._hp_cards_feed_approval = _orig_hp_feed3
         bridge._MAIN_LOOP = None
 
-    # _sync_persona_reports 接線:新 upsert 觸發 notice
+    # _sync_persona_reports 接線:2026-08-10 拍板**拆掉**自動 notice
+    # (c437358:報告本體已走 TG/推播,這顆「知道了」按下去會擾動人格卡片流,
+    # 使用者回報「按知道了就回覆斷線」)。舊期望「新 upsert 觸發 notice」是
+    # 過時規格 —— 現在的契約是:同步照常 upsert,但**不再**順手建 notice;
+    # `_notice_for_report` 本體保留(上面幾條驗的就是它),供未來明確接回。
     _orig_persona_reports = bridge._persona_reports
     _orig_write_mem = bridge._write_report_memory
     bridge._persona_reports = lambda session, limit=20: [
@@ -497,11 +502,11 @@ try:
     bridge._write_report_memory = lambda session, reports: None
     try:
         bridge._sync_persona_reports("xcash", 50)
-        check("notice:_sync_persona_reports 新 upsert 觸發 notice",
-              bridge._approval_get_row(_ntc_aid("rp-ntc-5")) is not None)
-        bridge._sync_persona_reports("xcash", 50)   # 同內容重同步:無新 upsert
-        row5 = bridge._approval_get_row(_ntc_aid("rp-ntc-5"))
-        check("notice:重同步不重建", row5 is not None and row5["status"] == "pending")
+        check("notice:_sync_persona_reports 不再自動建 notice(2026-08-10 拆除)",
+              bridge._approval_get_row(_ntc_aid("rp-ntc-5")) is None)
+        bridge._sync_persona_reports("xcash", 50)   # 同內容重同步:仍不建
+        check("notice:重同步也不建",
+              bridge._approval_get_row(_ntc_aid("rp-ntc-5")) is None)
     finally:
         bridge._persona_reports = _orig_persona_reports
         bridge._write_report_memory = _orig_write_mem

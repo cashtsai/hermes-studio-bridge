@@ -4,6 +4,7 @@ fail-closed/失效 resume 自癒/state 檔往返。
 SDK 全假(cc_sdk._sdk_mod 注入假模組),絕不 spawn 真的 claude CLI;
 所有落地路徑(canonical DB / registry DB / CC_SDK_STATE)都指 temp。
 """
+import _isolation  # noqa: F401  # 測試隔離閂:必須是第一個 import(2026-08-15 事故防線,見 tests/_isolation.py)
 import asyncio
 import json
 import os

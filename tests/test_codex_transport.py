@@ -23,6 +23,7 @@ mock 測試就是因為只 mock 到 happy path,才讓這兩顆雷活著上 produ
 跑法:
     PYTHONPATH=. python -m unittest tests.test_codex_transport
 """
+import _isolation  # noqa: F401  # 測試隔離閂:必須是第一個 import(2026-08-15 事故防線,見 tests/_isolation.py)
 import asyncio
 import contextlib
 import io

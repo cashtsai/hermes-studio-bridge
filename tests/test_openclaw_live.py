@@ -9,6 +9,7 @@
 → OpenClawDigest 出卡、chat.history seed 對得上。地端小模型回覆可能要
 數十秒(冷載更久),整體 timeout 給 240s。
 """
+import _isolation  # noqa: F401  # 測試隔離閂:必須是第一個 import(2026-08-15 事故防線,見 tests/_isolation.py)
 import asyncio
 import os
 import sys

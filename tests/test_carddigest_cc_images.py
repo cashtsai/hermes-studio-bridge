@@ -4,6 +4,7 @@
 2. 非圖片路徑 → 不多卡(行為不變)。
 3. user 文字裡的 harness 圖片座標說明行被濾掉;整則只有說明 → 不出卡。
 """
+import _isolation  # noqa: F401  # 測試隔離閂:必須是第一個 import(2026-08-15 事故防線,見 tests/_isolation.py)
 
 # 這支是「腳本式驗收」(repo 慣例:python3 tests/test_carddigest_cc_images.py):測試邏輯直接寫在
 # 模組層、用 sys.exit() 回報結果。被 `unittest discover` 匯入時,那些程式碼會在

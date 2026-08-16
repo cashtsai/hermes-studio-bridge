@@ -1061,7 +1061,12 @@ async def _resolve_persona_prompt(messages: list, home: str) -> str:
 # Hermes state.db schema or cron JSON directly.
 CANON_DB = os.environ.get("POCKET_CANON_DB") \
     or os.path.expanduser("~/.local/share/pocket-agent/canonical.db")
-ACCOUNTS_DB = os.path.expanduser("~/.local/share/pocket-agent/accounts.db")
+# 測試隔離把手(chore/test-isolation-latch):accounts 跟 canonical 一樣要能
+# 導到 tmp —— import bridge 尾端就會 `_accounts_init()` 建表,沒有這顆 env
+# 的話**每一個**測試 import 都直接寫真的 accounts.db。production 不設此 env,
+# 預設路徑不變。
+ACCOUNTS_DB = os.environ.get("POCKET_ACCOUNTS_DB") \
+    or os.path.expanduser("~/.local/share/pocket-agent/accounts.db")
 REPORT_MEMORY_FILE = "REPORTS.md"
 REPORT_MEMORY_ITEMS = 20
 REPORT_MEMORY_CHARS = 2400

@@ -14,6 +14,7 @@
    SUBSESSIONS 已空)也會被掃掉 —— 「連續 isolate 派工後 worktrees 不無限成長」。
 5. 例外日誌化:被吞掉的例外留得下痕跡,而且熱迴圈不會把 log 塞爆。
 """
+import _isolation  # noqa: F401  # 測試隔離閂:必須是第一個 import(2026-08-15 事故防線,見 tests/_isolation.py)
 import asyncio
 import os
 import sqlite3

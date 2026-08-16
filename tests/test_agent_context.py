@@ -13,6 +13,7 @@
 - **速率**:每 caller 每分鐘上限 → 429。
 - **搜尋範圍即權限**:讀不到的 session 連命中都看不到。
 """
+import _isolation  # noqa: F401  # 測試隔離閂:必須是第一個 import(2026-08-15 事故防線,見 tests/_isolation.py)
 import asyncio
 import json
 import os

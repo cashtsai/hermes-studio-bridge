@@ -8,6 +8,7 @@ Cindy/Orca 對照後補上的四條鐵律:
   4. 重啟對帳 —— 收割人只活在記憶體;開機把未結案 call 接回(投遞中斷結案/
      窗過結 timeout/窗內重掛收割人,收割窗沿用原 created_ts)
 """
+import _isolation  # noqa: F401  # 測試隔離閂:必須是第一個 import(2026-08-15 事故防線,見 tests/_isolation.py)
 import asyncio
 import json
 import os

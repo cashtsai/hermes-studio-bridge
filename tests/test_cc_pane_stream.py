@@ -6,6 +6,7 @@ fixture 是仿真的 CC TUI pane 擷取(tmux capture-pane -p 形狀):歡迎框�
 鐵律驗證:diff 對不上就跳過(不出垃圾)、工具輸出不進草稿、正典卡
 接管草稿 id(同 id rev++ final:true)。
 """
+import _isolation  # noqa: F401  # 測試隔離閂:必須是第一個 import(2026-08-15 事故防線,見 tests/_isolation.py)
 import os
 import unittest
 from unittest import mock

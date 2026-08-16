@@ -5,6 +5,7 @@ H4:派單前 target 已停在待審 → 拒送不排隊(409 AGENT_CALL_TARGET_BL
 H2:派單後 target 中途轉入待審 → 提前告知 caller 一次(audit 卡 + background
     模式注入提醒),不結案不代審;審核通過後收割照常。
 """
+import _isolation  # noqa: F401  # 測試隔離閂:必須是第一個 import(2026-08-15 事故防線,見 tests/_isolation.py)
 import asyncio
 import json
 import os

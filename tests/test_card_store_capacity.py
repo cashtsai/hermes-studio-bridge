@@ -7,6 +7,7 @@
 記憶體:實測平均 0.8 KB/張卡;環裡放的是卡片**參照**不是複本,所以上限由 ring
 主導(8000 × 0.8KB ≈ 6.4 MB/session)。
 """
+import _isolation  # noqa: F401  # 測試隔離閂:必須是第一個 import(2026-08-15 事故防線,見 tests/_isolation.py)
 import importlib
 import os
 import unittest

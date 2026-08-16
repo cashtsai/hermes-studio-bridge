@@ -9,6 +9,7 @@
      通知),UI 恆忙。超過 30 次/120s 合成終態錯誤收掉這一輪,誠實說
      「連不上已放棄」,不是 300 秒後謊稱「卡住」。
 """
+import _isolation  # noqa: F401  # 測試隔離閂:必須是第一個 import(2026-08-15 事故防線,見 tests/_isolation.py)
 import asyncio
 import os
 import sys

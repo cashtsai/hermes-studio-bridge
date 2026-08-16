@@ -11,6 +11,7 @@ codex 實際使用的 `*Ms` 後綴全漏掉,所以症狀依舊。實際上有四
 4. ts 一旦寫錯就**永遠修不回來**:upsert 採新卡 ts(每次重發蓋成 now)、
    _same_card 把 ts pop 掉(reseed 判定 unchanged 而跳過)。
 """
+import _isolation  # noqa: F401  # 測試隔離閂:必須是第一個 import(2026-08-15 事故防線,見 tests/_isolation.py)
 import unittest
 
 import carddigest as cd

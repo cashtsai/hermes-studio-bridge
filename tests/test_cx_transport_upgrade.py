@@ -18,6 +18,7 @@
 跑法:
     PYTHONPATH=. python -m unittest tests.test_cx_transport_upgrade
 """
+import _isolation  # noqa: F401  # 測試隔離閂:必須是第一個 import(2026-08-15 事故防線,見 tests/_isolation.py)
 import asyncio
 import contextlib
 import io
@@ -89,12 +90,17 @@ async def settle_align_tasks():
 class ResolveCodexBinOrderTest(unittest.TestCase):
     """`_resolve_codex_bin()` 的候選序:standalone 優先,桌面 binary 墊底。"""
 
-    STANDALONE = os.path.expanduser("~/.codex/packages/standalone/current/codex")
-    LOCAL_BIN = os.path.expanduser("~/.local/bin/codex")
     DESKTOP_CODEX = "/Applications/Codex.app/Contents/Resources/codex"
     DESKTOP_CHATGPT = "/Applications/ChatGPT.app/Contents/Resources/codex"
 
     def setUp(self):
+        # ~ 開頭的候選路徑要在 setUp 展開,不能當 class 屬性在 import 時定死:
+        # 全套 discover 一個行程跑時,別的測試檔會把 HOME 改到各自的 tmp,
+        # import 時展開的 ~ 和 _resolve_codex_bin() 呼叫當下展開的 ~ 會是
+        # 兩個不同目錄 → 三條斷言全假紅(單檔跑永遠看不到)。
+        self.STANDALONE = os.path.expanduser(
+            "~/.codex/packages/standalone/current/codex")
+        self.LOCAL_BIN = os.path.expanduser("~/.local/bin/codex")
         self._saved_exists = os.path.exists
         self._saved_which = shutil.which
         self._saved_env = os.environ.get("CODEX_BIN")

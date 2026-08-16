@@ -10,6 +10,7 @@ content 是 base64),送不出去的一律報錯。
 對 openclaw 也硬拒。現在翻成 approval 卡 + 進審核中心,`/approve` 回覆
 gateway。附帶:tool 分支補 tool_result 卡、純圖片訊息不再整則消失。
 """
+import _isolation  # noqa: F401  # 測試隔離閂:必須是第一個 import(2026-08-15 事故防線,見 tests/_isolation.py)
 import asyncio
 import base64
 import builtins
@@ -32,6 +33,13 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import carddigest as cd  # noqa: E402
 import bridge  # noqa: E402
 from fastapi import HTTPException  # noqa: E402
+
+# UPLOAD_DIR 是模組層常數,硬編碼指向 production 的
+# ~/apps/hermes-agent/home/uploads —— 這支測試會真的落檔(_save_attachment /
+# data URI decode),不綁回 tmp 就是每跑一次污染一次正式 uploads 目錄
+# (隔離閂上線後直接 ProductionWriteBlocked,這裡是修根因不是關警報)。
+from pathlib import Path as _Path  # noqa: E402
+bridge.UPLOAD_DIR = _Path(_TMP) / "uploads"
 
 _PNG = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmM"

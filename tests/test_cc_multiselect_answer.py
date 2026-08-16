@@ -14,6 +14,7 @@
 
 所以數字+Enter 的結果是「勾了 A 又順手切掉 B」,而且永遠不會真的送出。
 """
+import _isolation  # noqa: F401  # 測試隔離閂:必須是第一個 import(2026-08-15 事故防線,見 tests/_isolation.py)
 import asyncio
 import contextlib
 import os

@@ -10,6 +10,7 @@ instance — see the PR description for that transcript.
 Run directly (repo convention — no pytest in the runtime venv):
     python3 tests/test_terminal_pty.py
 """
+import _isolation  # noqa: F401  # 測試隔離閂:必須是第一個 import(2026-08-15 事故防線,見 tests/_isolation.py)
 import asyncio
 import os
 import struct

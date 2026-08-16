@@ -3,6 +3,7 @@
 素材 = 2026-08-04 生產實抓:同一則回覆兩份落稿,措辭微漂+開頭空白,
 舊的字面相等壓重必漏 → app 兩顆氣泡(「人格常回覆重複內容」病根)。
 """
+import _isolation  # noqa: F401  # 測試隔離閂:必須是第一個 import(2026-08-15 事故防線,見 tests/_isolation.py)
 
 # 這支是「腳本式驗收」(repo 慣例:python3 tests/test_dual_source_dedup.py):測試邏輯直接寫在
 # 模組層、用 sys.exit() 回報結果。被 `unittest discover` 匯入時,那些程式碼會在

@@ -1,4 +1,5 @@
 """附件限制修復單(bridge 端)測試:件數閥、單檔閥、估算器。"""
+import _isolation  # noqa: F401  # 測試隔離閂:必須是第一個 import(2026-08-15 事故防線,見 tests/_isolation.py)
 import base64
 import os
 import sys

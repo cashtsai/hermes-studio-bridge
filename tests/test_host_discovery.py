@@ -8,6 +8,7 @@ managed vs discovered 判定、cx 來源分類、收編寫 ccsess 名單(冪等/
 ⚠️ 這裡的 ccsess 設定檔一律指向 tmp,**絕不碰真的
 `~/.config/ccsess/sessions.conf`**(那是活的常駐名單)。
 """
+import _isolation  # noqa: F401  # 測試隔離閂:必須是第一個 import(2026-08-15 事故防線,見 tests/_isolation.py)
 import asyncio
 import os
 import sys
@@ -563,7 +564,16 @@ class TestAdoptIsBookkeepingOnly(unittest.IsolatedAsyncioTestCase):
             await slow.wait()
             return []
 
-        with patch.object(bridge, "_discovery_cc_items", never_finishes):
+        # _codex_v2_visible_threads 也要摀住:這條測的是「發現面掃描不擋
+        # registry」,不是 codex 延遲。不摀的話它會真的打本機 codex
+        # app-server(macOS 預設不隔離,~/.codex 的 daemon socket),實測
+        # thread/list 一趟 3–4 秒,1 秒 deadline 紅得跟環境有關 —— 而且
+        # 測試根本不該碰 production daemon。
+        async def no_threads(*a, **kw):
+            return []
+
+        with patch.object(bridge, "_discovery_cc_items", never_finishes), \
+                patch.object(bridge, "_codex_v2_visible_threads", no_threads):
             rows = await asyncio.wait_for(bridge._registry_legacy_rows(set()), 1.0)
         self.assertNotIn("claude_code:sidequest", {r["id"] for r in rows})
         slow.set()

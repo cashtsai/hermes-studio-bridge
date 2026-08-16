@@ -11,6 +11,7 @@
 (CC 是答完才 flush tool_use,掃全部 transcript:288 次 AskUserQuestion、
 0 筆懸空)。
 """
+import _isolation  # noqa: F401  # 測試隔離閂:必須是第一個 import(2026-08-15 事故防線,見 tests/_isolation.py)
 import unittest
 
 import bridge

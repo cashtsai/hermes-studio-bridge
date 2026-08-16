@@ -20,6 +20,7 @@
   * `thread/list` 對沒載入的 thread 一律回 `{"type":"notLoaded"}`,載入中的
     才回真實狀態 → notLoaded 必須當成「沒有資訊」,不能當 idle。
 """
+import _isolation  # noqa: F401  # 測試隔離閂:必須是第一個 import(2026-08-15 事故防線,見 tests/_isolation.py)
 import asyncio
 import os
 import sys

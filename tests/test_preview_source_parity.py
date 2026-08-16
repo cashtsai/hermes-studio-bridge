@@ -3,6 +3,7 @@
 病症:預覽顯示一則訊息,點進對話卻找不到 —— 因為卡片流會把 TG 側的
 雙寫副本壓掉、把活 turn 中的 TG assistant 近訊檢疫,而預覽以前不套這兩層。
 """
+import _isolation  # noqa: F401  # 測試隔離閂:必須是第一個 import(2026-08-15 事故防線,見 tests/_isolation.py)
 
 import os
 import sys

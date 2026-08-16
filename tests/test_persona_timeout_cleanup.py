@@ -1,4 +1,5 @@
 """Persona ACP turn cleanup: normal completion, stall timeout, caller cancel."""
+import _isolation  # noqa: F401  # 測試隔離閂:必須是第一個 import(2026-08-15 事故防線,見 tests/_isolation.py)
 import asyncio
 import os
 import sys

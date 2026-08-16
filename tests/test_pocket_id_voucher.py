@@ -9,6 +9,7 @@
 - enroll(register)與 heartbeat client 的 payload 形狀(mock 到 API 邊界)
 - POCKET_ID_RESET / env 撤除 → 開機清 enrollment
 """
+import _isolation  # noqa: F401  # 測試隔離閂:必須是第一個 import(2026-08-15 事故防線,見 tests/_isolation.py)
 import asyncio
 import base64
 import json

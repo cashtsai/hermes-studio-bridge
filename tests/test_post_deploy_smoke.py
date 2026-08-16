@@ -5,6 +5,7 @@
 
 這裡的壞資料全部取自 2026-08-11~16 的實機數字,不是想像出來的。
 """
+import _isolation  # noqa: F401  # 測試隔離閂:必須是第一個 import(2026-08-15 事故防線,見 tests/_isolation.py)
 import importlib.util
 import os
 import unittest

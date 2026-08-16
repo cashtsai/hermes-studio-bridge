@@ -8,6 +8,7 @@
 驗項:缺碼 403 / 錯碼 403 / 正確碼 200+payload / 鑄碼節流 429 /
 loopback 第二層仍在 / boot code 檔案 0600。
 """
+import _isolation  # noqa: F401  # 測試隔離閂:必須是第一個 import(2026-08-15 事故防線,見 tests/_isolation.py)
 import os
 import stat
 import sys

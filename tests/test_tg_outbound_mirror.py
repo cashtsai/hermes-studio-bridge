@@ -20,6 +20,7 @@ Pocket 對人格發話 / 人格回覆 → 貼進同一條 Telegram 聊天室」�
 8. 角色語意:user 帶 📱 前綴(TG 那頭看得出是從手機說的)、assistant 不帶
    (它就是人格在說話)。
 """
+import _isolation  # noqa: F401  # 測試隔離閂:必須是第一個 import(2026-08-15 事故防線,見 tests/_isolation.py)
 
 # 這支是「腳本式驗收」(repo 慣例:python3 tests/test_tg_outbound_mirror.py):測試邏輯直接寫在
 # 模組層、用 sys.exit() 回報結果。被 `unittest discover` 匯入時,那些程式碼會在
@@ -101,6 +102,22 @@ with open(os.path.join(_home, "sessions", "sessions.json"), "w") as f:
 with open(os.path.join(_home, ".env"), "w") as f:
     f.write("# comment line\nFOO=bar\nTELEGRAM_BOT_TOKEN=\"123456:FAKE-TEST-TOKEN\"\n")
 
+# 2026-08-11 起(2ec6cd9「防復活」)canonical_telegram_session 不只讀 mapping,
+# 還會回 state.db 驗證該 session 真的存在、source=telegram、未封存、非 claude
+# 模型 —— fixture 的 state.db 要跟上這個契約,否則「單一真相」檢查拿到 None
+# (這支 8/15 前的紅就是 fixture 停在舊契約)。schema 帶齊 archived/model 欄。
+_db = os.path.join(_home, "state.db")
+con = sqlite3.connect(_db)
+con.execute("CREATE TABLE sessions (id TEXT PRIMARY KEY, source TEXT, "
+            "archived INT DEFAULT 0, model TEXT, "
+            "message_count INT DEFAULT 0, started_at REAL)")
+con.execute("CREATE TABLE messages (session_id TEXT, role TEXT, content TEXT, "
+            "timestamp REAL)")
+con.execute("INSERT INTO sessions VALUES (?,?,?,?,?,?)",
+            (SID_NOW, "telegram", 0, "gpt-5", 2, time.time()))
+con.commit()
+con.close()
+
 REPLY_BODY = "好的,明天的班表我看過了:早班是你,晚班是阿哲。"
 REPLY_WITH_STEPS = (REPLY_BODY +
                     "\n\n<details><summary>🔧 執行步驟 (2)</summary>\n"
@@ -176,14 +193,9 @@ check("壓重鍵仍相等(canonical 帶附錄 vs TG 乾淨正文)",
       == bridge._steps_stripped(sent["parts"][0]))
 
 # 端到端:即使 state.db 真的長出一份鏡射回來的副本,合併輸出也不該變雙氣泡。
-_db = os.path.join(_home, "state.db")
+# (state.db 本體與 sessions 列已在檔頭 fixture 建好 —— 單一真相檢查要用。)
 con = sqlite3.connect(_db)
-con.execute("CREATE TABLE sessions (id TEXT PRIMARY KEY, source TEXT, "
-            "message_count INT DEFAULT 0, started_at REAL)")
-con.execute("CREATE TABLE messages (session_id TEXT, role TEXT, content TEXT, "
-            "timestamp REAL)")
 NOW = time.time()
-con.execute("INSERT INTO sessions VALUES (?,?,?,?)", (SID_NOW, "telegram", 2, NOW))
 con.execute("INSERT INTO messages VALUES (?,?,?,?)",
             (SID_NOW, "assistant", REPLY_BODY, NOW))
 con.commit()

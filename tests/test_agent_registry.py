@@ -4,6 +4,7 @@
 reaper 絕不碰未登記 session、REGISTRY_REAPER 旗標關閉 = 零 destructive、
 孤兒偵測(parent 歸檔、child 還活著)。
 """
+import _isolation  # noqa: F401  # 測試隔離閂:必須是第一個 import(2026-08-15 事故防線,見 tests/_isolation.py)
 import asyncio
 import os
 import sys
