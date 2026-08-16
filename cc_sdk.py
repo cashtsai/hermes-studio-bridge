@@ -493,6 +493,23 @@ class CCSdkSession:
         if sid and sid != self.sdk_session_id:
             self.sdk_session_id = sid
             self.registry.save()
+            self._upsert_resume_hint_card()
+
+    def _upsert_resume_hint_card(self) -> None:
+        """終端接手指令卡(2026-08-16 老闆點的):cc2 沒有畫面可 attach,
+        接手 = 桌面跑 `claude --resume <sid>` 開同一條對話。固定卡 id →
+        不洗版;sdk session id 換了(自癒重建)原位更新成新指令。"""
+        if not self.sdk_session_id:
+            return
+        try:
+            txt = (f"📎 終端接手:`claude --resume {self.sdk_session_id}`"
+                   f"(等它閒著時;cwd {self.workdir})")
+            self.digest.store.upsert_card(carddigest.make_card(
+                f"card-cc2-resume-{self.name}", "", "assistant", "text",
+                {"text": txt, "fallback_text": txt, "origin": "cc2.resume_hint"}))
+        except Exception as _exc:  # noqa: BLE001
+            _log("cc2_resume_hint_card_failed", session=self.name,
+                 error=type(_exc).__name__, error_message=str(_exc)[:160])
 
     def _handle_message(self, msg) -> bool:
         """一則 SDK 訊息 → 卡片/turn/status 事件。回 True = turn 已收尾。"""
@@ -713,6 +730,10 @@ class CCSdkRegistry:
             meta = {"permission_mode": sess.permission_mode}
             if pend:
                 meta["approval"] = pend
+            if sess.sdk_session_id:
+                # 終端接手指令(app 未來可直接顯示/複製;對話裡另有同款卡)
+                meta["resume_command"] = \
+                    f"claude --resume {sess.sdk_session_id}"
             out.append({"id": f"cc2:{name}", "provider": "cc2", "title": name,
                         "subtitle": sess.workdir, "status": status,
                         "last_event_at": None,
