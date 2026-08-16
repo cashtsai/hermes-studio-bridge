@@ -91,6 +91,22 @@ def approval_timeout() -> float:
         return 110.0
 
 
+def history_seed_limit() -> int:
+    """歷史種子上限(0 = 關閉):session 重建時從 SDK transcript jsonl 撈
+    最後 N 則 user/assistant 文字訊息餵進卡片庫,先於一切 live 事件。"""
+    try:
+        return int(os.environ.get("CC_SDK_HISTORY_SEED", "") or 40)
+    except ValueError:
+        return 40
+
+
+def _claude_projects_root() -> str:
+    """SDK transcript 落地根目錄(claude CLI 慣例 ~/.claude/projects)。
+    測試以 CC_SDK_CLAUDE_PROJECTS 指到 temp fixture,不碰真 ~/.claude。"""
+    return os.path.expanduser(
+        os.environ.get("CC_SDK_CLAUDE_PROJECTS", "") or "~/.claude/projects")
+
+
 # ── SDK lazy import ─────────────────────────────────────────────────────────
 
 _sdk_mod = None            # 測試以假模組覆蓋這顆(cc_sdk._sdk_mod = fake)
@@ -132,12 +148,50 @@ def _tool_summary(tool: str, tool_input: dict) -> str:
     return txt[:117] + "…" if len(txt) > 120 else txt
 
 
+# ── 歷史種子(transcript jsonl → 卡片)────────────────────────────────────────
+# SDK 每條 session 都落 ~/.claude/projects/<munged-workdir>/<sid>.jsonl
+# (munge 慣例同 bridge._cc_project_dir:'/'→'-')。cc2 card store 是 live-only
+# in-memory —— bridge 重啟後 app 打開會是一片空白,所以 session 重建時把最近
+# 的對話種回去。解析自包含(不 import bridge),過濾清單鏡像 _fmt_cc_event。
+
+_SEED_SKIP_TAGS = ("<task-notification>", "<system-reminder>", "[Internal",
+                   "<command-name>", "<local-command", "[Your previous response")
+
+
+def _seed_row(d):
+    """一行 transcript jsonl → (role, text, ts) 或 None(工具水管/系統訊息/
+    非文字內容一律略過 —— 種子只還原「人打的字」與「模型的回覆」)。"""
+    if not isinstance(d, dict):
+        return None
+    t = d.get("type")
+    msg = d.get("message") if isinstance(d.get("message"), dict) else {}
+    ts = carddigest._epoch(d.get("timestamp"))
+    if t == "user":
+        content = msg.get("content")
+        if not isinstance(content, str) or not content.strip():
+            return None            # list = tool_result 水管,不是打字輸入
+        if any(tag in content.lstrip()[:80] for tag in _SEED_SKIP_TAGS):
+            return None
+        return ("user", content, ts)
+    if t == "assistant":
+        content = msg.get("content")
+        if not isinstance(content, list):
+            return None
+        texts = [b.get("text") for b in content
+                 if isinstance(b, dict) and b.get("type") == "text"
+                 and b.get("text")]
+        if not texts:
+            return None
+        return ("assistant", "\n".join(texts), ts)
+    return None
+
+
 # ── 卡片流 digest(契約 §1/§3/§6,與 S2/S3/S4 同款)──────────────────────────
 
 class CC2Digest(carddigest.ApprovalCardMixin):
-    """一條 cc2 session 的卡片 digest。來源只有 live SDK 訊息流(MVP 不做
-    歷史 seed —— SDK session 落的 jsonl 屬於 `~/.claude`,老闆要翻歷史可以
-    `claude --resume` 接手,見遷移策略)。
+    """一條 cc2 session 的卡片 digest。來源 = 歷史種子(session 重建時從
+    SDK transcript jsonl 撈最近對話,見 `CCSdkSession._seed_history`)+
+    live SDK 訊息流;種子一定先於 live 事件落卡,順序不倒置。
 
     出卡規則(app 零改動的關鍵):
     - assistant 文字:stream_event 的 text_delta 累積成**同一張** draft 卡
@@ -186,6 +240,12 @@ class CC2Digest(carddigest.ApprovalCardMixin):
         self.store.upsert_card(carddigest.make_card(
             self._next_id("u"), self.store.turn_id, "user", "text",
             {"text": text, "fallback_text": text}))
+
+    def seed_card(self, role: str, text: str, ts: float):
+        """歷史種子卡:final:true、帶原始 ts(權威時間)、不掛 turn。"""
+        self.store.upsert_card(carddigest.make_card(
+            self._next_id("h"), "", role, "markdown",
+            {"text": text, "fallback_text": text}, ts=ts))
 
     def text_delta(self, delta: str):
         if not delta:
@@ -261,6 +321,54 @@ class CCSdkSession:
         self.queue: list[str] = []       # 忙碌時的輸入佇列(turn end 後 drain)
         self.busy = False
         self._task: asyncio.Task | None = None
+        # approve_for_session 記憶:此 session 已「本次全允許」的工具名。
+        # 純 in-memory —— bridge 重啟/session 重建即清空,之後第一次仍會
+        # 出卡再問(fail-safe:寧可多問,不留跨進程的隱形放行)。
+        self.session_allowed_tools: set[str] = set()
+        self._seed_history()
+
+    def _seed_history(self) -> None:
+        """歷史種子:sdk_session_id 對應的 transcript jsonl 撈最後 N 則
+        (CC_SDK_HISTORY_SEED,預設 40)user/assistant 文字訊息 → final:true
+        卡(原角色/原 ts),先於一切 live 事件。jsonl 缺席 = 全新對話,安靜
+        跳過;整檔讀不動/個別行壞掉容忍,各 log 一次,絕不擋 session 起步。"""
+        if not self.sdk_session_id:
+            return
+        limit = history_seed_limit()
+        if limit <= 0:
+            return
+        path = os.path.join(_claude_projects_root(),
+                            self.workdir.replace("/", "-"),
+                            f"{self.sdk_session_id}.jsonl")
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+        except FileNotFoundError:
+            return
+        except Exception as e:  # noqa: BLE001
+            _log("cc2_history_seed_failed", session=self.name,
+                 error=type(e).__name__, error_message=str(e)[:200])
+            return
+        rows, bad = [], 0
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = _seed_row(json.loads(line))
+            except Exception:  # noqa: BLE001
+                bad += 1
+                continue
+            if row is not None:
+                rows.append(row)
+        for role, text, ts in rows[-limit:]:
+            self.digest.seed_card(role, text, ts)
+        if bad:
+            _log("cc2_history_seed_bad_lines", session=self.name,
+                 skipped=bad)
+        if rows:
+            _log("cc2_history_seeded", session=self.name,
+                 cards=min(len(rows), limit))
 
     # ── 輸入 ──
 
@@ -433,6 +541,11 @@ class CCSdkSession:
         `/app/v1/approvals/{id}/decision` 叫醒 → 逾時/無決議一律 DENY
         (fail-closed,鏡像 Cindy:絕不掛起、絕不默許)。"""
         sdk = _sdk()
+        if tool in self.session_allowed_tools:
+            # 「本次全允許」記憶命中:同 session 同工具直接放行,不出卡
+            # 不落 DB(記憶體記號,bridge 重啟/重建即清空 → 會重新問)。
+            _log("cc2_approval_auto_allow", session=self.name, tool=tool)
+            return sdk.PermissionResultAllow()
         aid = "cc2-" + uuid.uuid4().hex[:12]
         title = str(getattr(_ctx, "title", "") or
                     f"Claude Code 要使用 {tool}")[:200]
@@ -444,7 +557,13 @@ class CCSdkSession:
             "status": "pending", "decided_at": None, "result": None,
             "session_id": f"cc2:{self.name}", "provider": "cc2",
             "kind": "permission",
+            # 三態選項(鏡像 codex _handle_approval_request 的宣告形狀,app
+            # 零改動):第三顆 key=approve_for_session → 舊 App(只認
+            # approve/deny)安全退成一般允許,不會誤送拒絕;style=secondary
+            # (較軟的允許)。
             "options": [{"key": "approve", "label": "允許", "style": "primary"},
+                        {"key": "approve_for_session", "label": "本次全允許",
+                         "style": "secondary"},
                         {"key": "deny", "label": "拒絕", "style": "danger"}],
         }
         waiter = {"event": asyncio.Event(), "decision": None,
@@ -462,7 +581,9 @@ class CCSdkSession:
         finally:
             self.registry.pending_approvals.pop(aid, None)
         decision = waiter["decision"]
-        approved = decision == "approve"
+        approved = decision in ("approve", "approve_for_session")
+        if decision == "approve_for_session":
+            self.session_allowed_tools.add(tool)
         status = "approved" if approved else (
             "denied" if decision else "expired")
         self.digest.resolve_approval(record, status)
@@ -562,10 +683,15 @@ class CCSdkRegistry:
         waiter = self.pending_approvals.get(aid)
         if waiter is None or waiter["decision"] is not None:
             return None
-        decision = "approve" if key != "deny" else "deny"
+        # 三態:approve_for_session 對等待者是獨立決議值(等待者藉此記下
+        # session_allowed_tools);對外(DB/卡片/回應)仍是 approved ——
+        # 狀態字彙不擴,app 零改動。
+        decision = ("deny" if key == "deny" else
+                    "approve_for_session" if key == "approve_for_session" else
+                    "approve")
         waiter["decision"] = decision
         waiter["event"].set()
-        return "approved" if decision == "approve" else "denied"
+        return "denied" if decision == "deny" else "approved"
 
     def pending_for(self, name: str) -> dict | None:
         """該 session 最早一筆 pending 審批(v2 sessions 列 waiting_approval)。"""
