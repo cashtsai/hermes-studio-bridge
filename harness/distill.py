@@ -44,8 +44,15 @@ from harness.store import HarnessStore          # noqa: E402
 PER_GROUP = 12
 MAX_GROUPS = 8                # 一輪最多處理幾組(夜批要在早上七點前跑完)
 MAX_PER_STORE = {"memory": 5, "skill": 3, "prompt": 1}
-ROUTE_MIN_SAMPLES = 4         # 樣本太少不出路由提案(3 次成功不代表什麼)
+# 路由守門(2026-08-16 收緊):第一晚蒸餾就產出兩筆「100% 成功率」的
+# global 路由提案 —— 樣本 4/4 與 6/6,分母全來自同一條 thread。那不是
+# 「同類最高」,是那 24 小時只有它在做那類任務(倖存者偏差)。改 global
+# 路由的證據門檻必須高:樣本要夠、而且要**有對手可比**。
+ROUTE_MIN_SAMPLES = int(os.environ.get("HARNESS_ROUTE_MIN_SAMPLES", "20"))
 ROUTE_MIN_RATE = 0.7          # 成功率門檻
+# 同 task_kind 至少要有幾個「夠格的候選節點」才允許出提案 —— 只有一個
+# 候選時「最高」是空話,沒得比就不提。
+ROUTE_MIN_CANDIDATES = int(os.environ.get("HARNESS_ROUTE_MIN_CANDIDATES", "2"))
 
 
 # ── 任務分類(v0 純啟發式:看用了哪些工具)──────────────────────────────
@@ -229,9 +236,17 @@ def route_candidates(trajs) -> list[dict]:
         cnt = tally.setdefault(k, {"n": 0, "ok": 0, "provider": t.get("provider") or ""})
         cnt["n"] += 1
         cnt["ok"] += 1 if ok else 0
+    # 候選多樣性:每個 task_kind 先數「樣本夠格」的節點數(不看成功率),
+    # 少於 ROUTE_MIN_CANDIDATES 就整類不提 —— 沒有對手的「最高」不成立。
+    eligible: dict = {}
+    for (kind, _sid), c in tally.items():
+        if c["n"] >= ROUTE_MIN_SAMPLES:
+            eligible[kind] = eligible.get(kind, 0) + 1
     best: dict = {}
     for (kind, sid), c in tally.items():
         if c["n"] < ROUTE_MIN_SAMPLES:
+            continue
+        if eligible.get(kind, 0) < ROUTE_MIN_CANDIDATES:
             continue
         rate = c["ok"] / c["n"]
         if rate < ROUTE_MIN_RATE:
