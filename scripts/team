@@ -1,0 +1,296 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""team —— lead 人格的編隊工具(cindy_orca 移植,第四刀 2026-08-16)。
+
+這是 lead 人格(hermes:yuanfang)在 shell 裡指揮 worker 編隊的唯一介面;
+bridge 端點見 /app/v2/team/*(需 AGENT_TEAM=1;派單另需 AGENT_CALL=1)。
+行為契約:`team contract`(或 docs/TEAM_LEAD_CONTRACT.md)。
+
+環境:
+  AGENT_SELF          必填,自己的 session id(如 hermes:yuanfang)
+  BRIDGE_TOKEN        bridge token;或 BRIDGE_TOKEN_FILE 指向含 token 的檔案
+  BRIDGE_URL          預設 http://127.0.0.1:8081
+
+零第三方依賴(python3 stdlib only)—— persona home 沒有 venv 也能跑。
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+import urllib.error
+import urllib.request
+
+BRIDGE_URL = os.environ.get("BRIDGE_URL", "http://127.0.0.1:8081").rstrip("/")
+
+CONTRACT = """\
+══ Lead 編隊行為契約(cindy_orca 移植)══
+
+你是 lead。工具:team start / worker / send / status / end。
+以下不變量沒有例外:
+
+1. 真實派發才靜默等待
+   - 回傳 dispatched:false 或帶 error → **立刻回報使用者**,不等、
+     不輪詢、不假設「應該有送到」。沒派出去的任務不存在。
+
+2. 忙碌/待審的 worker 不硬送
+   - 409 AGENT_CALL_TARGET_BLOCKED = 對方停在審批,訊息只會排隊到
+     天荒地老。正確動作:先回報使用者去催審核。--force 只在使用者
+     明確同意排隊時用,而且要說清楚理由。
+
+3. 驗收按同一通道確認真實終態
+   - worker 完成的回報會由 auto-bridge **自動送回你的 session**,
+     不要輪詢等回覆。
+   - 要確認就 `team status` 看 last_call 終態(done/timeout/error);
+     status=running 就是還沒完,不能當成完成去回報使用者。
+
+4. 只能動自己 team 的 worker
+   - label 每隊唯一;跨隊操作會被 403 拒絕 —— 這是設計,不是 bug。
+   - model 中途不換:要換模型就結束該 worker、開新 worker
+     (effort 可調,model 不可)。
+
+5. 結束 team 不殺 session
+   - `team end` 只收編制;worker session 全數保留並列在
+     remaining_sessions。回報使用者遺留清單,清理由人決定。
+"""
+
+
+def _die(msg: str, rc: int = 2):
+    print(f"team: {msg}", file=sys.stderr)
+    sys.exit(rc)
+
+
+def _token() -> str:
+    tok = (os.environ.get("BRIDGE_TOKEN") or "").strip()
+    if tok:
+        return tok
+    path = (os.environ.get("BRIDGE_TOKEN_FILE") or "").strip()
+    if path:
+        try:
+            with open(os.path.expanduser(path), encoding="utf-8") as f:
+                tok = f.read().strip()
+        except OSError as e:
+            _die(f"讀不到 BRIDGE_TOKEN_FILE({path}):{e}")
+        if tok:
+            return tok
+    _die("缺 token:請設 BRIDGE_TOKEN(或 BRIDGE_TOKEN_FILE 指向 token 檔)")
+
+
+def _self_id() -> str:
+    sid = (os.environ.get("AGENT_SELF") or "").strip()
+    if not sid:
+        _die("缺 AGENT_SELF:請設定自己的 session id(例:AGENT_SELF=hermes:yuanfang)。"
+             "沒有身分不派單 —— 帳本要記名。")
+    return sid
+
+
+def _call(method: str, path: str, body: dict | None = None,
+          timeout: float = 630.0) -> dict:
+    url = BRIDGE_URL + path
+    data = json.dumps(body, ensure_ascii=False).encode("utf-8") \
+        if body is not None else None
+    req = urllib.request.Request(
+        url, data=data, method=method,
+        headers={"Authorization": f"Bearer {_token()}",
+                 "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        try:
+            payload = json.loads(e.read().decode("utf-8"))
+        except Exception:  # noqa: BLE001
+            payload = {}
+        err = (payload.get("error") or {}) if isinstance(payload, dict) else {}
+        code = err.get("code") or str(e.code)
+        message = err.get("message") or payload.get("detail") or str(e)
+        detail = err.get("detail") or ""
+        print(f"❌ {code}:{message}", file=sys.stderr)
+        if code == "TEAM_ALREADY_ACTIVE" and detail:
+            print(f"   既有 team_id:{detail}(直接沿用,或先 team end)",
+                  file=sys.stderr)
+        if code == "AGENT_CALL_TARGET_BLOCKED":
+            print("   → 對方停在待審:先回報使用者去催審核;"
+                  "確定要排隊才帶 --force(附理由)。", file=sys.stderr)
+        sys.exit(1)
+    except urllib.error.URLError as e:
+        _die(f"連不上 bridge({BRIDGE_URL}):{e.reason}", 1)
+
+
+def _ts(v) -> str:
+    if not v:
+        return "-"
+    import datetime
+    return datetime.datetime.fromtimestamp(float(v)).strftime("%m-%d %H:%M")
+
+
+def _emit(res: dict, as_json: bool, human) -> None:
+    if as_json:
+        print(json.dumps(res, ensure_ascii=False, indent=2))
+    else:
+        human(res)
+
+
+# ── 子命令 ────────────────────────────────────────────────────────────────
+
+def cmd_start(args) -> None:
+    res = _call("POST", "/app/v2/team/start", {"lead": _self_id()})
+
+    def human(r):
+        t = r.get("team") or {}
+        print(f"✅ team 已開:{t.get('team_id')}(lead {t.get('lead')})")
+    _emit(res, args.json, human)
+
+
+def cmd_worker(args) -> None:
+    body = {"lead": _self_id(), "label": args.label,
+            "provider": args.provider}
+    if args.role:
+        body["role"] = args.role
+    if args.workdir:
+        body["workdir"] = args.workdir
+    if args.model:
+        body["model"] = args.model
+    if args.task:
+        body["initial_task"] = args.task
+        body["mode"] = args.mode
+    if args.force:
+        body["force"] = True
+    res = _call("POST", "/app/v2/team/worker", body)
+
+    def human(r):
+        print(f"✅ worker 已建:{r.get('label')} → {r.get('session_id')}"
+              f"(id {r.get('worker_id')})")
+        if not args.task:
+            return
+        if r.get("dispatched"):
+            print(f"📤 首任務已真實派發(call {r.get('call_id')},"
+                  f"{r.get('call_status')});回報會自動送回,不用輪詢。")
+        else:
+            # 契約第 1 條:沒派出去就要立刻說,不准靜默等待。
+            print(f"⚠️ 首任務**沒有派發出去**:{r.get('error') or '原因不明'}")
+            print("   worker 已留著(idle)。請立刻回報使用者,"
+                  "處理完再用 team send 派。")
+    _emit(res, args.json, human)
+
+
+def cmd_send(args) -> None:
+    body = {"lead": _self_id(), "worker": args.worker,
+            "message": " ".join(args.message), "mode": args.mode}
+    if args.force:
+        body["force"] = True
+    if args.timeout is not None:
+        body["timeout_secs"] = args.timeout
+    res = _call("POST", "/app/v2/team/send", body)
+
+    def human(r):
+        print(f"📤 已真實派發給 {args.worker}(call {r.get('call_id')},"
+              f"{r.get('call_status')})")
+        if r.get("reply"):
+            print(f"—— 回覆 ——\n{r['reply']}")
+        elif r.get("call_status") == "running":
+            print("回報會由 auto-bridge 自動送回你的 session,不用輪詢。")
+    _emit(res, args.json, human)
+
+
+def cmd_status(args) -> None:
+    res = _call("GET", f"/app/v2/team/status?lead={_self_id()}")
+
+    def human(r):
+        t = r.get("team") or {}
+        ws = r.get("workers") or []
+        print(f"team {t.get('team_id')}(lead {t.get('lead')},"
+              f"{t.get('status')},開隊 {_ts(t.get('created_ts'))})"
+              f" —— {len(ws)} 個 worker")
+        for w in ws:
+            live = w.get("live") or {}
+            marks = []
+            if live.get("blocked"):
+                marks.append(f"🔔 {live['blocked']}")
+            elif live.get("busy"):
+                marks.append("跑動中")
+            lc = w.get("last_call") or {}
+            lc_txt = (f"last_call {lc.get('status')}({lc.get('call_id')})"
+                      if lc else "尚未派過單")
+            print(f"  · {w.get('label')} [{w.get('status')}] "
+                  f"{w.get('session_id')}"
+                  f"{'(' + w.get('role') + ')' if w.get('role') else ''}"
+                  f" — {lc_txt}"
+                  f"{' — ' + ';'.join(marks) if marks else ''}")
+    _emit(res, args.json, human)
+
+
+def cmd_end(args) -> None:
+    res = _call("POST", "/app/v2/team/end", {"lead": _self_id()})
+
+    def human(r):
+        t = r.get("team") or {}
+        rem = r.get("remaining_sessions") or []
+        print(f"✅ team {t.get('team_id')} 已收隊。")
+        if rem:
+            print(f"⚠️ 遺留 {len(rem)} 個 worker session(**未銷毀**,"
+                  f"請回報使用者、由人決定清理):")
+            for w in rem:
+                print(f"  · {w.get('label')} → {w.get('session_id')}"
+                      f" [{w.get('status')}]")
+    _emit(res, args.json, human)
+
+
+def cmd_contract(args) -> None:
+    print(CONTRACT)
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(
+        prog="team", description="lead 人格的 worker 編隊工具(先讀 team contract)")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser("start", help="開隊(一個 lead 同時只有一隊)")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(fn=cmd_start)
+
+    p = sub.add_parser("worker", help="招工:spawn worker + 可選首任務")
+    p.add_argument("--label", required=True, help="worker 代號(每隊唯一)")
+    p.add_argument("--provider", required=True,
+                   choices=["claude_code", "codex", "cc2"])
+    p.add_argument("--role", default="", help="職責描述(自由文字)")
+    p.add_argument("--workdir", default="")
+    p.add_argument("--model", default="",
+                   help="模型(開工後不可換;要換就開新 worker)")
+    p.add_argument("--task", default="", help="首任務(走 agent_call 閉環)")
+    p.add_argument("--mode", default="background",
+                   choices=["background", "await_reply"])
+    p.add_argument("--force", action="store_true",
+                   help="對 blocked 目標硬排隊(要有明確理由)")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(fn=cmd_worker)
+
+    p = sub.add_parser("send", help="對自己隊上的 worker 派單(id 或 label)")
+    p.add_argument("worker", help="worker id 或 label")
+    p.add_argument("message", nargs="+", help="任務內容")
+    p.add_argument("--mode", default="background",
+                   choices=["background", "await_reply"])
+    p.add_argument("--timeout", type=float, default=None,
+                   help="await_reply 同步等待秒數")
+    p.add_argument("--force", action="store_true")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(fn=cmd_send)
+
+    p = sub.add_parser("status", help="隊況(worker 狀態 + 最後一筆 call)")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(fn=cmd_status)
+
+    p = sub.add_parser("end", help="收隊(不殺 session,列出遺留)")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(fn=cmd_end)
+
+    p = sub.add_parser("contract", help="印出行為契約(開工前先讀)")
+    p.set_defaults(fn=cmd_contract)
+
+    args = ap.parse_args()
+    args.fn(args)
+
+
+if __name__ == "__main__":
+    main()
