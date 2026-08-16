@@ -23819,6 +23819,7 @@ async def _agent_call_waiter(call_id: str, caller: str, target: str,
                         f"{target} 已回覆 {caller}(call {call_id[-8:]}):"
                         f"{reply[:200]}", [caller, target])
                     await _agent_call_maybe_deliver(call_id)
+                    _team_note_call_settled(call_id)
                     return row
             remain = deadline - time.time()
             if remain <= 0:
@@ -23833,6 +23834,7 @@ async def _agent_call_waiter(call_id: str, caller: str, target: str,
                     f"回覆;目標可能仍在執行或停在待審(審核照常需人工核准)",
                     [caller, target])
                 await _agent_call_maybe_deliver(call_id)
+                _team_note_call_settled(call_id)
                 return row
             waker.clear()
             # 醒來時機取三者最早:事件、收割窗、下一次 blocked 偵測窗
@@ -23854,6 +23856,7 @@ async def _agent_call_waiter(call_id: str, caller: str, target: str,
         except Exception as _exc2:  # noqa: BLE001
             _log_exc("_agent_call_waiter#deliver", _exc2, expected=True,
                      call=call_id)
+        _team_note_call_settled(call_id)
         return row
     finally:
         store.subscribers -= 1
@@ -23967,10 +23970,18 @@ async def v2_agent_call(request: Request):
     # 帳先落成 dispatching(= 「正在投遞」,不冒充進行中);send 被目標
     # 接受後才升 running。中途死掉(bridge crash / 例外)留下的 dispatching
     # 列由重啟對帳(_agent_call_reconcile)結案,不會在看板上裝 running。
+    # ── lead 編隊(agent_team 第四刀):call 綁 worker ─────────────────
+    # team 派單走同一條 v2_agent_call(閉環/blocked/auto-bridge 全繼承),
+    # 只多一個 meta 戳記:worker 狀態由 call 生命週期驅動 —— 落帳即綁
+    # running、結案 done/error(_team_note_call_settled)、投遞失敗回滾 idle。
+    team_wid = str(body.get("team_worker_id") or "").strip() \
+        if _agent_team_enabled() else ""
     row = REGISTRY.call_create(
         call_id, caller=caller, target=target, mode=mode, message=message,
         status="dispatching", root_call_id=root_id, parent_call_id=parent_id,
-        depth=depth)
+        depth=depth, meta={"team_worker_id": team_wid} if team_wid else None)
+    if team_wid:
+        _registry_call_safe("worker_mark_running", team_wid, call_id)
     _log_event("agent_call_created", call=call_id, caller=caller,
                target=target, mode=mode, depth=depth,
                root=row.get("root_call_id"))
@@ -23998,6 +24009,10 @@ async def v2_agent_call(request: Request):
     except HTTPException as e:
         REGISTRY.call_update(call_id, status="error",
                              error=f"投遞失敗:{e.detail}")
+        if team_wid:
+            # Cindy 不變量:沒派出去就不是 running —— worker 回滾到派發前
+            # (CAS 保證回滾不覆蓋終態/新 call 的狀態)。
+            _registry_call_safe("worker_rollback_idle", team_wid, call_id)
         _log_event("agent_call_dispatch_failed", call=call_id, target=target,
                    status=e.status_code, detail=str(e.detail)[:200])
         await _agent_call_audit(row, "error",
@@ -24074,6 +24089,7 @@ async def _agent_call_reconcile_once() -> dict:
                     cid, status="error",
                     error="bridge 重啟時投遞中斷(send 未被目標接受)")
                 stats["dispatch_interrupted"] += 1
+                _team_note_call_settled(cid)
                 _log_event("agent_call_reconciled", call=cid,
                            outcome="dispatch_interrupted")
                 continue
@@ -24089,6 +24105,7 @@ async def _agent_call_reconcile_once() -> dict:
                 stats["timeout"] += 1
                 _log_event("agent_call_reconciled", call=cid, outcome="timeout")
                 await _agent_call_maybe_deliver(cid)
+                _team_note_call_settled(cid)
                 continue
             if row.get("mode") == "await_reply":
                 # 同步等待者(HTTP 連線)已隨舊進程死去 → 轉背景語意,
@@ -24157,6 +24174,351 @@ async def v2_agent_targets(request: Request, caller: str = ""):
                     "busy": await _registry_is_busy(sid)})
     return {"caller": caller, "targets": out,
             "policy_path": agent_call_policy.policy_path()}
+
+
+# ═════════ Lead 編隊 agent_team(Cindy cindy_orca 對照第四刀,2026-08-16)═════════
+# lead 人格(hermes:yuanfang)的 team/worker 控制面 —— Orca 工具組
+# (create_worker / send_to_worker / worker_status)的 bridge 同構版,
+# 行為契約見 docs/TEAM_LEAD_CONTRACT.md 與 `scripts/team contract`。設計鐵律:
+#   - worker spawn 走各 provider **既有**派工路徑(配額 precheck / 戶政照舊),
+#     這裡不長第二套 spawn。
+#   - 派單一律走 v2_agent_call(帳本/閉環/blocked 409/auto-bridge 全繼承);
+#     工具回傳帶明確 dispatched 信號 —— **只有真實派發才算派發**。
+#   - 身分 fail-closed:lead 只能動自己 active team 的 worker(403)。
+#   - 結束 team 絕不殺 session:列出遺留交人清理(絕不自主銷毀)。
+
+_TEAM_PROVIDERS = ("claude_code", "codex", "cc2")
+
+
+def _agent_team_enabled() -> bool:
+    """旗標每次呼叫讀 env(同 AGENT_CALL 慣例):預設 OFF,merge 零風險。
+    派單另需 AGENT_CALL=1 —— team 派單就是 agent_call,不繞閉環。"""
+    return str(os.environ.get("AGENT_TEAM", "")).strip().lower() in (
+        "1", "true", "yes", "on")
+
+
+def _agent_team_require_enabled() -> None:
+    if not _agent_team_enabled():
+        raise http_err(404, "AGENT_TEAM_DISABLED",
+                       "agent team 未啟用(需 AGENT_TEAM=1;派單另需 AGENT_CALL=1)")
+
+
+def _team_public(row: dict) -> dict:
+    return {"team_id": row["id"], "lead": row["lead"],
+            "status": row["status"], "created_ts": row.get("created_ts"),
+            "ended_ts": row.get("ended_ts")}
+
+
+def _team_worker_public(row: dict) -> dict:
+    return {"worker_id": row["id"], "team_id": row["team_id"],
+            "session_id": row["session_id"], "role": row.get("role") or "",
+            "label": row["label"], "status": row["status"],
+            "last_call_id": row.get("last_call_id"),
+            "created_ts": row.get("created_ts"),
+            "updated_ts": row.get("updated_ts")}
+
+
+def _team_active_or_404(lead: str) -> dict:
+    team = REGISTRY.team_active(lead)
+    if team is None:
+        raise http_err(404, "TEAM_NOT_FOUND",
+                       f"{lead} 沒有 active team(先 POST /app/v2/team/start)")
+    return team
+
+
+def _team_resolve_worker(team: dict, ref: str) -> dict:
+    """herdr/Cindy resolveWorkerRef:id 精確比對優先、label 其次,且**只在
+    lead 自己的 active team 裡找**。id 存在但屬於別隊 → 403(fail-closed:
+    跨隊操作結構上禁止);完全比對不到 → 404。"""
+    workers = REGISTRY.worker_list(team["id"])
+    for w in workers:
+        if w["id"] == ref:
+            return w
+    for w in workers:
+        if w["label"] == ref:
+            return w
+    other = REGISTRY.worker_get(ref)
+    if other is not None and other.get("team_id") != team["id"]:
+        raise http_err(403, "NOT_YOUR_WORKER",
+                       f"worker {ref} 不屬於你的 team —— 只能動自己 team 的 worker")
+    raise http_err(404, "TEAM_WORKER_NOT_FOUND",
+                   f"team 裡沒有這個 worker:{ref}(id 與 label 都比對不到)")
+
+
+def _team_note_call_settled(call_id: str) -> None:
+    """call 結案 → worker 狀態跟著走(掛在收割人/對帳的結案點旁)。
+    查 call meta 的 team_worker_id 戳記,非 team call 一步就退;
+    絕不拋 —— worker 記帳壞了不能拖垮收割/對帳本業。"""
+    if not _agent_team_enabled():
+        return
+    try:
+        row = REGISTRY.call_get(call_id) or {}
+        wid = str((row.get("meta") or {}).get("team_worker_id") or "")
+        if not wid:
+            return
+        status = str(row.get("status") or "")
+        if status in agent_registry.AgentRegistry.CALL_UNFINISHED:
+            return
+        # sent(fire_and_forget)視同 done:訊息已被接受、沒有收割窗可等;
+        # 其餘非 done 終態(timeout/error/denied)一律記 error —— worker
+        # 沒交出真實終態,lead 驗收時要看得到紅。
+        worker_status = "done" if status in ("done", "sent") else "error"
+        REGISTRY.worker_note_settled(wid, call_id, worker_status)
+        _log_event("team_worker_settled", worker=wid, call=call_id,
+                   call_status=status, worker_status=worker_status)
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("_team_note_call_settled", _exc, expected=True, call=call_id)
+
+
+async def _team_spawn_worker(provider: str, *, label: str, workdir: str,
+                             model: str, lead: str, purpose: str) -> str:
+    """worker session 出生:走各 provider **既有**派工路徑(reuse,不複製
+    provider 分支)。回 session_id(registry 座標)。任何失敗直接拋 ——
+    呼叫端轉成明確的 spawn 失敗,絕不留「有戶口沒 session」的半個 worker。"""
+    if provider == "claude_code":
+        # /ccsessions 全套:workdir 護欄、spawn pin、配額 precheck、出生登記。
+        body = {"name": label, "workdir": workdir, "parent": lead,
+                "class": "task", "purpose": purpose}
+        if model:
+            body["model"] = model
+        res = await cc_session_create(_InternalAuthRequest(body))
+        return f"claude_code:{(res.get('session') or {}).get('name') or label}"
+    if provider == "cc2":
+        # cc2 create 是冪等 ensure,不落戶 —— 這裡補配額前檢 + 出生登記,
+        # 家譜(parent=lead)與編隊視圖才看得到這個 worker。
+        _registry_validate_parent(lead)
+        _registry_precheck_or_429(lead, "task")
+        body = {"workdir": workdir} if workdir else {}
+        await v2_cc2_create(label, _InternalAuthRequest(body))
+        _registry_register(f"cc2:{label}", provider="cc2", name=label,
+                           purpose=purpose, cls="task", parent=lead)
+        return f"cc2:{label}"
+    # codex:thread/start(照 /codexsessions 的 spawn 半段;**不**帶首 turn
+    # —— 首任務走 agent_call 派單,帳本/閉環才算數)。
+    _registry_validate_parent(lead)
+    _registry_precheck_or_429(lead, "task")
+    params = {"cwd": workdir or HOME_ROOT, "ephemeral": False,
+              "threadSource": "user"}
+    if model:
+        params.update(_spawn_cx_thread_params({"model": model}))
+    res = await CODEX_APP.call("thread/start", params, timeout=30.0)
+    thread = (res or {}).get("thread") or {}
+    tid = thread.get("id")
+    if not tid:
+        raise CodexAppServerError("thread/start returned no thread id")
+    CODEX_APP.loaded_threads.add(tid)
+    CODEX_APP.note_thread_settings(tid, res or {})
+    _registry_register(f"codex:{tid}", provider="codex", name=label,
+                       purpose=purpose, cls="task", parent=lead)
+    return f"codex:{tid}"
+
+
+async def _team_dispatch(request: Request, lead: str, worker: dict,
+                         message: str, mode: str, *, force: bool = False,
+                         timeout_secs=None) -> dict:
+    """team 派單 = v2_agent_call 真重用(閉環/blocked 409/auto-bridge/帳本
+    全繼承),多帶 team_worker_id 戳記讓 worker 狀態跟著 call 走。
+    fire_and_forget 不收:沒有閉環的派發,驗收無從按同一通道確認終態。"""
+    if mode not in ("background", "await_reply"):
+        raise http_err(400, "TEAM_BAD_MODE",
+                       "team 派單只收 background|await_reply"
+                       "(fire_and_forget 無閉環,不算真實派發)")
+    body = {"caller": lead, "target": worker["session_id"],
+            "message": message, "mode": mode, "team_worker_id": worker["id"]}
+    if force:
+        body["force"] = True
+    if timeout_secs is not None:
+        body["timeout_secs"] = timeout_secs
+    return await v2_agent_call(_AgentCallInputRequest(request, body))
+
+
+@app.post("/app/v2/team/start")
+async def v2_team_start(request: Request):
+    """開隊。body {lead}。一個 lead 同時只有一個 active team(Cindy
+    uniq_active_team_per_lead)—— 已有 → 409,detail 帶既有 team_id,
+    lead 直接沿用即可,不必猜自己上一隊是哪個。"""
+    _check_auth(request)
+    _agent_team_require_enabled()
+    body = await _json_body(request)
+    lead = _agent_call_normalize_sid(str(body.get("lead") or ""))
+    if not lead:
+        raise http_err(400, "TEAM_BAD_REQUEST", "lead 必填")
+    try:
+        _v2_card_source(lead)
+    except HTTPException:
+        raise http_err(400, "TEAM_BAD_LEAD", f"lead 不是已知 session:{lead}")
+    team_id = "team-" + uuid.uuid4().hex[:12]
+    try:
+        row = REGISTRY.team_start(team_id, lead)
+    except agent_registry.TeamActiveExists as e:
+        raise http_err(409, "TEAM_ALREADY_ACTIVE",
+                       f"{lead} 已有 active team:{e.team_id}"
+                       f"(直接沿用它,或先 team/end 收隊)",
+                       detail=e.team_id)
+    _log_event("team_started", team=team_id, lead=lead)
+    return {"ok": True, "team": _team_public(row)}
+
+
+@app.post("/app/v2/team/worker")
+async def v2_team_worker(request: Request):
+    """招工。body {lead, role?, label, provider: claude_code|codex|cc2,
+    workdir?, model?, initial_task?, mode?, force?, timeout_secs?}。
+
+    流程:active team 校驗 → label 唯一 → spawn(既有派工路徑,配額照舊)
+    → worker 落籍 → initial_task 走 v2_agent_call 派單(帳本/閉環/
+    auto-bridge 全套)。回傳帶**明確派發信號**(Cindy:只有真實派發才算
+    派發):{worker_id, session_id, dispatched, call_id?, error?} ——
+    spawn 成功但首任務沒送出去 → dispatched=false + error(HTTP 仍 200,
+    worker 留著);lead 必須立刻回報使用者,不准等一個不會來的回報。"""
+    _check_auth(request)
+    _agent_team_require_enabled()
+    body = await _json_body(request)
+    lead = _agent_call_normalize_sid(str(body.get("lead") or ""))
+    label = str(body.get("label") or "").strip()
+    role = str(body.get("role") or "").strip()
+    provider = str(body.get("provider") or "").strip()
+    if not lead or not label:
+        raise http_err(400, "TEAM_BAD_REQUEST", "lead、label 皆為必填")
+    if provider not in _TEAM_PROVIDERS:
+        raise http_err(400, "TEAM_BAD_PROVIDER",
+                       f"provider 必須是 {'|'.join(_TEAM_PROVIDERS)}")
+    team = _team_active_or_404(lead)
+    if REGISTRY.worker_by_label(team["id"], label) is not None:
+        raise http_err(409, "TEAM_LABEL_TAKEN",
+                       f"label「{label}」在這個 team 已被占用(label 每隊唯一)")
+    purpose = f"team worker:{role or label}(lead {lead})"
+    try:
+        session_id = await _team_spawn_worker(
+            provider, label=label,
+            workdir=str(body.get("workdir") or "").strip(),
+            model=str(body.get("model") or "").strip(),
+            lead=lead, purpose=purpose)
+    except HTTPException:
+        raise          # 配額 429 / provider 4xx 原樣透出(誠實,不包裝)
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("v2_team_worker#spawn", _exc, provider=provider, label=label)
+        raise http_err(502, "TEAM_SPAWN_FAILED",
+                       f"spawn worker 失敗({provider}):{_exc}")
+    worker_id = "wk-" + uuid.uuid4().hex[:12]
+    try:
+        wrow = REGISTRY.worker_add(worker_id, team_id=team["id"],
+                                   session_id=session_id, role=role,
+                                   label=label)
+    except agent_registry.WorkerLabelTaken:
+        raise http_err(409, "TEAM_LABEL_TAKEN",
+                       f"label「{label}」在這個 team 已被占用(label 每隊唯一)")
+    _log_event("team_worker_created", team=team["id"], worker=worker_id,
+               session=session_id, provider=provider, label=label)
+    out = {"ok": True, "worker_id": worker_id, "session_id": session_id,
+           "team_id": team["id"], "label": label, "dispatched": False}
+    task = str(body.get("initial_task") or "").strip()
+    if not task:
+        return out
+    try:
+        res = await _team_dispatch(request, lead, wrow, task,
+                                   str(body.get("mode") or "background"),
+                                   force=bool(body.get("force")),
+                                   timeout_secs=body.get("timeout_secs"))
+        out.update({"dispatched": True, "call_id": res.get("call_id"),
+                    "call_status": res.get("status")})
+    except HTTPException as e:
+        # Cindy 不變量:只有真實派發才算派發。spawn 成功、首任務沒送出去 →
+        # 明確回報(worker 留著、狀態仍 idle),絕不靜默。
+        out["error"] = (f"{getattr(e, 'code', '') or e.status_code}:"
+                        f"{getattr(e, 'message', '') or e.detail}")
+        _log_event("team_worker_initial_dispatch_failed", worker=worker_id,
+                   status=e.status_code, detail=str(e.detail)[:200])
+    except Exception as _exc:  # noqa: BLE001 —— worker 已生,派單路徑絕不
+        # 讓整筆招工 500(留 dispatched:false + error,lead 拿得到 worker_id)
+        out["error"] = f"TEAM_DISPATCH_ERROR:{_exc}"
+        _log_exc("v2_team_worker#dispatch", _exc, worker=worker_id)
+    return out
+
+
+@app.post("/app/v2/team/send")
+async def v2_team_send(request: Request):
+    """對自己 team 的 worker 派單/傳話。body {lead, worker: id|label,
+    message, mode?, force?, timeout_secs?}。blocked 的 worker → 409
+    (v2_agent_call 的 H4 語意原樣透出:先催審核;堅持排隊帶 force=true,
+    且要有明確理由)。跨隊 → 403 NOT_YOUR_WORKER。"""
+    _check_auth(request)
+    _agent_team_require_enabled()
+    body = await _json_body(request)
+    lead = _agent_call_normalize_sid(str(body.get("lead") or ""))
+    ref = str(body.get("worker") or "").strip()
+    message = str(body.get("message") or "").strip()
+    if not lead or not ref or not message:
+        raise http_err(400, "TEAM_BAD_REQUEST",
+                       "lead、worker、message 皆為必填")
+    team = _team_active_or_404(lead)
+    worker = _team_resolve_worker(team, ref)
+    res = await _team_dispatch(request, lead, worker, message,
+                               str(body.get("mode") or "background"),
+                               force=bool(body.get("force")),
+                               timeout_secs=body.get("timeout_secs"))
+    return {"ok": True, "worker_id": worker["id"],
+            "session_id": worker["session_id"], "dispatched": True,
+            "call_id": res.get("call_id"), "call_status": res.get("status"),
+            "reply": res.get("reply")}
+
+
+@app.get("/app/v2/team/status")
+async def v2_team_status(request: Request, lead: str = ""):
+    """lead 的隊況:team + workers(戶口狀態 + provider 即時信號 + 最後一筆
+    call)。live 探測單 worker 失敗只降級(live=null),絕不 500 —— 隊況
+    看板任何時候都要能開。"""
+    _check_auth(request)
+    _agent_team_require_enabled()
+    lead = _agent_call_normalize_sid(lead)
+    if not lead:
+        raise http_err(400, "TEAM_BAD_REQUEST", "lead 必填")
+    team = _team_active_or_404(lead)
+    workers = []
+    for w in REGISTRY.worker_list(team["id"]):
+        item = _team_worker_public(w)
+        sid = w["session_id"]
+        try:
+            # 與 taskboard/reaper 同一套 provider 信號(busy 3s 快取)+
+            # blocked 偵測(H2/H4 同款)—— 不另起爐灶。
+            item["live"] = {"busy": await _registry_busy_cached(sid),
+                            "blocked": await _agent_call_target_blocked(sid)}
+        except Exception as _exc:  # noqa: BLE001
+            _log_exc("v2_team_status#live", _exc, expected=True, session=sid)
+            item["live"] = None
+        try:
+            calls = REGISTRY.call_list(session=sid, limit=1)
+            item["last_call"] = _agent_call_public(calls[0]) if calls else None
+        except Exception as _exc:  # noqa: BLE001
+            _log_exc("v2_team_status#calls", _exc, expected=True, session=sid)
+            item["last_call"] = None
+        workers.append(item)
+    return {"ok": True, "team": _team_public(team), "workers": workers}
+
+
+@app.post("/app/v2/team/end")
+async def v2_team_end(request: Request):
+    """收隊。**絕不殺 session**(Cindy 鐵律:不自主銷毀)—— 只把 team 標
+    ended,worker session 全數保留並列在 remaining_sessions,交人驗收後用
+    既有路徑清理(🧹 registry sweep / ccsess archive / codex archive)。"""
+    _check_auth(request)
+    _agent_team_require_enabled()
+    body = await _json_body(request)
+    lead = _agent_call_normalize_sid(str(body.get("lead") or ""))
+    if not lead:
+        raise http_err(400, "TEAM_BAD_REQUEST", "lead 必填")
+    team = _team_active_or_404(lead)
+    workers = REGISTRY.worker_list(team["id"])
+    row = REGISTRY.team_end(team["id"]) or {**team, "status": "ended"}
+    _log_event("team_ended", team=team["id"], lead=lead,
+               workers=len(workers))
+    return {"ok": True, "team": _team_public(row),
+            "remaining_sessions": [
+                {"worker_id": w["id"], "label": w["label"],
+                 "session_id": w["session_id"], "status": w["status"]}
+                for w in workers],
+            "note": "worker session 一律保留(絕不自動銷毀);請驗收後用"
+                    "既有路徑收工(registry sweep / ccsess archive / "
+                    "codex archive)"}
 
 
 # ══════════════════════════════════════════════════════════════════════════

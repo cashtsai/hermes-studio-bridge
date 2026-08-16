@@ -53,6 +53,21 @@ class QuotaExceeded(Exception):
         self.reason = reason
 
 
+class TeamActiveExists(Exception):
+    """該 lead 已有 active team(Cindy uniq_active_team_per_lead)。
+    `.team_id` 帶既有那隊的 id —— bridge 回 409 時附給 caller,lead 直接
+    沿用即可,不必瞎猜自己上一隊叫什麼。"""
+
+    def __init__(self, team_id: str):
+        super().__init__(f"active team exists: {team_id}")
+        self.team_id = team_id
+
+
+class WorkerLabelTaken(Exception):
+    """label 在該 team 已被占用(label 每隊唯一 —— lead 用 label 指人,
+    重名 = 指令歧義,結構上禁止)。"""
+
+
 class AgentRegistry:
     """sqlite-backed session 戶口名簿。執行緒安全(單一 Lock 串行化;
     量小到不值得更細的鎖)。所有時間都是 epoch 秒。"""
@@ -134,6 +149,36 @@ class AgentRegistry:
             con.execute("CREATE INDEX IF NOT EXISTS idx_ac_target ON agent_calls(target)")
             con.execute("CREATE INDEX IF NOT EXISTS idx_ac_caller ON agent_calls(caller)")
             con.execute("CREATE INDEX IF NOT EXISTS idx_ac_root ON agent_calls(root_call_id)")
+            # lead 編隊(第四刀,Cindy/Orca 對照 2026-08-16):team/worker 的
+            # TOP half 資料面。worker 的 session 本體仍在 sessions 表(spawn
+            # 走既有派工路徑、配額照 precheck),這兩張表只管「誰的隊、
+            # 誰是誰、現在誰在跑」。與 agent_calls 同庫 —— worker 狀態由
+            # call 生命週期驅動(meta.team_worker_id 戳記),一庫查得齊。
+            con.execute("""CREATE TABLE IF NOT EXISTS agent_teams(
+                id TEXT PRIMARY KEY,
+                lead TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'active',
+                created_ts REAL NOT NULL,
+                ended_ts REAL)""")
+            # Cindy uniq_active_team_per_lead:一個 lead 同時只能有一個
+            # active team。partial unique index 是「先查再插」之外的最後一道
+            # 防線 —— 併發 start 也生不出第二隊。
+            con.execute("""CREATE UNIQUE INDEX IF NOT EXISTS
+                uniq_active_team_per_lead ON agent_teams(lead)
+                WHERE status='active'""")
+            con.execute("""CREATE TABLE IF NOT EXISTS agent_workers(
+                id TEXT PRIMARY KEY,
+                team_id TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                role TEXT NOT NULL DEFAULT '',
+                label TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'idle',
+                last_call_id TEXT,
+                created_ts REAL NOT NULL,
+                updated_ts REAL NOT NULL,
+                UNIQUE(team_id, label))""")
+            con.execute(
+                "CREATE INDEX IF NOT EXISTS idx_aw_team ON agent_workers(team_id)")
             con.commit()
         finally:
             con.close()
@@ -708,3 +753,189 @@ class AgentRegistry:
                 " AND status != 'denied'", (root_call_id,)).fetchone()[0])
         finally:
             con.close()
+
+    # ── lead 編隊(agent_team,第四刀)──────────────────────────────────────
+    # worker 狀態機(Cindy updateWorkerStatus 語意):
+    #   idle → running:派單被 v2_agent_call 落帳時綁上 last_call_id
+    #   running → done|error:**只有**綁著的那顆 call 結案才能寫(CAS);
+    #       晚到/過期 call 的結算絕不覆蓋新任務的狀態(call_update
+    #       終態贏的同款鐵律)
+    #   running → idle:dispatch 失敗回滾 —— 同樣只有綁著的 call 能回滾,
+    #       且終態不被回滾覆蓋
+    WORKER_STATUSES = ("idle", "running", "done", "error")
+    WORKER_TERMINAL = ("done", "error")
+
+    def team_active(self, lead: str) -> dict | None:
+        con = self._connect()
+        try:
+            row = con.execute(
+                "SELECT * FROM agent_teams WHERE lead=? AND status='active'",
+                (lead,)).fetchone()
+            return dict(row) if row is not None else None
+        finally:
+            con.close()
+
+    def team_get(self, team_id: str) -> dict | None:
+        con = self._connect()
+        try:
+            row = con.execute("SELECT * FROM agent_teams WHERE id=?",
+                              (team_id,)).fetchone()
+            return dict(row) if row is not None else None
+        finally:
+            con.close()
+
+    def team_start(self, team_id: str, lead: str) -> dict:
+        """開隊。已有 active team → TeamActiveExists(帶既有 id)。
+        先查再插 + partial unique index 雙保險(競態下 IntegrityError 也
+        轉成同一個例外,呼叫端只需要懂一種拒絕)。"""
+        now = time.time()
+        with self._lock:
+            con = self._connect()
+            try:
+                row = con.execute(
+                    "SELECT id FROM agent_teams WHERE lead=? AND status='active'",
+                    (lead,)).fetchone()
+                if row is not None:
+                    raise TeamActiveExists(row["id"])
+                try:
+                    con.execute(
+                        "INSERT INTO agent_teams(id, lead, status, created_ts)"
+                        " VALUES(?,?,'active',?)", (team_id, lead, now))
+                    con.commit()
+                except sqlite3.IntegrityError:
+                    row = con.execute(
+                        "SELECT id FROM agent_teams WHERE lead=? AND"
+                        " status='active'", (lead,)).fetchone()
+                    raise TeamActiveExists(row["id"] if row is not None
+                                           else "(unknown)")
+                fresh = con.execute("SELECT * FROM agent_teams WHERE id=?",
+                                    (team_id,)).fetchone()
+                return dict(fresh)
+            finally:
+                con.close()
+
+    def team_end(self, team_id: str) -> dict | None:
+        """收隊(記帳面)。worker 的 session 一律不動 —— 銷毀是人的決定,
+        走既有 sweep/archive 路徑。冪等:已 ended 的再 end 不改 ended_ts。"""
+        with self._lock:
+            con = self._connect()
+            try:
+                con.execute(
+                    "UPDATE agent_teams SET status='ended', ended_ts=?"
+                    " WHERE id=? AND status='active'", (time.time(), team_id))
+                con.commit()
+                fresh = con.execute("SELECT * FROM agent_teams WHERE id=?",
+                                    (team_id,)).fetchone()
+                return dict(fresh) if fresh is not None else None
+            finally:
+                con.close()
+
+    def worker_add(self, worker_id: str, *, team_id: str, session_id: str,
+                   role: str = "", label: str = "") -> dict:
+        """worker 落籍(session 已由既有派工路徑 spawn 完)。label 每隊唯一
+        —— 先查再插 + UNIQUE(team_id,label) 雙保險。"""
+        now = time.time()
+        with self._lock:
+            con = self._connect()
+            try:
+                row = con.execute(
+                    "SELECT id FROM agent_workers WHERE team_id=? AND label=?",
+                    (team_id, label)).fetchone()
+                if row is not None:
+                    raise WorkerLabelTaken(label)
+                try:
+                    con.execute(
+                        """INSERT INTO agent_workers(id, team_id, session_id,
+                           role, label, status, created_ts, updated_ts)
+                           VALUES(?,?,?,?,?,'idle',?,?)""",
+                        (worker_id, team_id, session_id, role, label, now, now))
+                    con.commit()
+                except sqlite3.IntegrityError:
+                    raise WorkerLabelTaken(label)
+                fresh = con.execute("SELECT * FROM agent_workers WHERE id=?",
+                                    (worker_id,)).fetchone()
+                return dict(fresh)
+            finally:
+                con.close()
+
+    def worker_get(self, worker_id: str) -> dict | None:
+        con = self._connect()
+        try:
+            row = con.execute("SELECT * FROM agent_workers WHERE id=?",
+                              (worker_id,)).fetchone()
+            return dict(row) if row is not None else None
+        finally:
+            con.close()
+
+    def worker_by_label(self, team_id: str, label: str) -> dict | None:
+        con = self._connect()
+        try:
+            row = con.execute(
+                "SELECT * FROM agent_workers WHERE team_id=? AND label=?",
+                (team_id, label)).fetchone()
+            return dict(row) if row is not None else None
+        finally:
+            con.close()
+
+    def worker_list(self, team_id: str) -> list[dict]:
+        con = self._connect()
+        try:
+            rows = con.execute(
+                "SELECT * FROM agent_workers WHERE team_id=?"
+                " ORDER BY created_ts", (team_id,)).fetchall()
+            return [dict(r) for r in rows]
+        finally:
+            con.close()
+
+    def worker_mark_running(self, worker_id: str, call_id: str) -> dict | None:
+        """派單落帳 → worker 綁上這顆 call 並轉 running。新 call 允許把
+        done/error 的 worker 重新拉上工(新任務就是新一輪);唯一不放行:
+        **同一顆** call 已把 worker 結成終態(收割人比 HTTP 路徑先跑完的
+        競態)—— 終態贏,不得倒退。"""
+        with self._lock:
+            con = self._connect()
+            try:
+                con.execute(
+                    "UPDATE agent_workers SET status='running',"
+                    " last_call_id=?, updated_ts=? WHERE id=?"
+                    " AND NOT (last_call_id=? AND status IN ('done','error'))",
+                    (call_id, time.time(), worker_id, call_id))
+                con.commit()
+            finally:
+                con.close()
+        return self.worker_get(worker_id)
+
+    def worker_note_settled(self, worker_id: str, call_id: str,
+                            status: str) -> dict | None:
+        """call 結案 → worker 狀態跟著走(done/error)。CAS:只有「這顆
+        call 仍是 worker 目前綁著的 call、且 worker 還在 running」才寫 ——
+        晚到的重複結算與過期 call 都寫不進來(終態不被覆蓋)。"""
+        if status not in ("done", "error"):
+            return self.worker_get(worker_id)
+        with self._lock:
+            con = self._connect()
+            try:
+                con.execute(
+                    "UPDATE agent_workers SET status=?, updated_ts=?"
+                    " WHERE id=? AND last_call_id=? AND status='running'",
+                    (status, time.time(), worker_id, call_id))
+                con.commit()
+            finally:
+                con.close()
+        return self.worker_get(worker_id)
+
+    def worker_rollback_idle(self, worker_id: str, call_id: str) -> dict | None:
+        """dispatch 失敗回滾:回到派發前(idle)。同樣 CAS —— 只有這顆 call
+        標上的 running 才退;終態/新 call 的狀態絕不被回滾覆蓋
+        (closure 契約「回滾不得覆蓋已有終態」的 worker 版)。"""
+        with self._lock:
+            con = self._connect()
+            try:
+                con.execute(
+                    "UPDATE agent_workers SET status='idle', updated_ts=?"
+                    " WHERE id=? AND last_call_id=? AND status='running'",
+                    (time.time(), worker_id, call_id))
+                con.commit()
+            finally:
+                con.close()
+        return self.worker_get(worker_id)
