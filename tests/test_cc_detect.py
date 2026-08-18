@@ -62,6 +62,29 @@ Which option?
 Enter to select · ↑/↓ to navigate · Esc to cancel
 """
 
+# /model 的確認頁(2026-08-18 實地從 Pocket-Main 的 pane 抄回來的原樣)。
+# 注意它「沒有」do you want to proceed? / esc to cancel / select model ——
+# 正是這三個缺席讓舊規則全部比對不到。
+MODEL_SWITCH_CONFIRM = f"""⏺ Background command "Foreground build verify" completed (exit code 0)
+{RULE}
+   Switch model?
+   Your next response will be slower and use more tokens
+
+   This conversation is cached for the current model. Switching to Opus 4.8
+   means the full history gets re-read on your next message.
+
+   ❯ 1. Yes, switch to Opus 4.8
+     2. No, go back
+"""
+
+# 對照組:人正在「挑」模型的那一頁,該維持 unknown + skip_state_update。
+MODEL_PICKER_MENU = """  Select Model
+  ❯ 1. Opus 4.8
+    2. Sonnet 5
+
+  Enter to set as default · Esc to cancel
+"""
+
 BUSY_SPINNER_PANE = """· Fermenting… (1m 51s · ↓ 6.5k tokens)
 """
 
@@ -125,6 +148,24 @@ Enter to select · ↑/↓ to navigate · Esc to cancel
         r = cc_detect.classify(LIVE_BLOCKED_FORM)
         self.assertEqual(r["state"], "blocked")
         self.assertEqual(r["rule"], "live_blocked_form")
+
+    def test_blocked_model_switch_confirm(self):
+        """/model 的確認頁 —— 2026-08-18 主線卡死 2.5 小時的那一頁。
+
+        修之前這份 pane 會一路掉到 default_known_agent_idle_fallback,
+        bridge 回報 status=idle / meta={},App 顯示「待命」,使用者看不到
+        這個框、也無從回答;更糟的是 modal 擋住 pane,他之後送的每個
+        /model 都進不去,只覺得「session 叫不起來」。
+        """
+        r = cc_detect.classify(MODEL_SWITCH_CONFIRM)
+        self.assertEqual(r["state"], "blocked")
+        self.assertEqual(r["rule"], "model_switch_confirm")
+
+    def test_model_picker_menu_still_skips(self):
+        """新規則不能把「人正在挑模型」那一頁也判成 blocked(它該是 unknown+skip)。"""
+        r = cc_detect.classify(MODEL_PICKER_MENU)
+        self.assertEqual(r["rule"], "model_picker_menu")
+        self.assertEqual(r["state"], "unknown")
 
     def test_osc_title_spinner_working_even_when_pane_idle(self):
         # braille spinner 在標題、pane 看起來待命 → 仍是 working(1100 最高)。

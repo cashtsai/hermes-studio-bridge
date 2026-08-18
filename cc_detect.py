@@ -163,6 +163,37 @@ DEFAULT_MANIFEST = {
             "not": [
                 {"contains": ["do you want to proceed?"]},
                 {"contains": ["enter to select"]},
+                {"contains": ["switch model?"]},
+            ],
+        },
+        {
+            # /model 的「確認頁」——挑完模型後 CC 還會再問一次:
+            #     Switch model?
+            #     This conversation is cached for the current model. Switching to
+            #     Opus 4.8 means the full history gets re-read on your next message.
+            #     ❯ 1. Yes, switch to Opus 4.8
+            #       2. No, go back
+            #
+            # 2026-08-18 實害:主線 session(Pocket-Main)額度用完後改模型,就卡死在
+            # 這一頁 2.5 小時。這頁**沒有** "do you want to proceed?"、**沒有**
+            # "esc to cancel"、也沒有 model_picker_menu 要的 "select model" /
+            # "enter to set as default",所以上面三條規則一條都比不到 → 狀態掉回
+            # idle → bridge 回報 status=idle / meta={} → App 顯示「待命」。
+            #
+            # 後果比「看不到」更糟:modal 擋住 pane,使用者之後在 App 送的每一個
+            # /model 指令都進不去,他以為自己一直在改模型,其實一次都沒生效,只覺得
+            # 「session 叫不起來」。CC 近版 pending ask 不寫 jsonl,pane 是唯一真相,
+            # 所以 pane 規則漏一種框 = 全鏈路瞎掉。
+            "id": "model_switch_confirm",
+            "state": "blocked",
+            "priority": 860,
+            "region": "whole_recent",
+            "contains": ["switch model?"],
+            "all": [
+                {"any": [
+                    {"line_regex": [r"(?i)^\s*❯?\s*1\.\s*yes,\s*switch\b"]},
+                    {"line_regex": [r"(?i)^\s*2\.\s*no,\s*go\s*back\b"]},
+                ]},
             ],
         },
         {
