@@ -7112,14 +7112,25 @@ async def _codex_v2_visible_threads(wanted: int = 20) -> list[dict]:
     """
     wanted = max(1, min(int(wanted or 20), 100))
     params = {
-        "limit": min(100, max(wanted, 40)),
+        "limit": min(100, max(wanted, 20)),
         "archived": False,
         "sourceKinds": ["cli", "vscode", "exec", "appServer"],
         "sortKey": "updated_at",
         "sortDirection": "desc",
-        "useStateDbOnly": False,
+        # 2026-08-18 病理定案:False 會讓 daemon 逐一開 rollout jsonl(1GB/404
+        # 檔)去補 metadata —— 而可見 thread 只有 13 條,limit 填不滿就是全庫
+        # 掃描,一次 10-17s;輪詢排隊放大到 45s+TimeoutError。實測 True 之後
+        # 回傳 13 條逐欄位完全相同(bridge 本來就不信 list 的 updatedAt 與
+        # preview,全都自己蓋),1.7-3.3s。rollout 掃描買到的東西我們全不用。
+        "useStateDbOnly": True,
     }
-    global _CODEX_V2_VISIBLE_CACHE
+    global _CODEX_V2_VISIBLE_CACHE, _CODEX_V2_VISIBLE_FRESH_AT, _CODEX_V2_STALE
+    # TTL 正向快取(2026-08-18):/app/v2/sessions 實測 ~6s 一輪、3.1 小時
+    # 1,876 次 —— 每一次都真打 thread/list 就是把 daemon 灌飽的放大器本體。
+    # 5s 內直接回上次的新鮮結果,daemon 每 TTL 至多掃一次。
+    if (_CODEX_V2_VISIBLE_CACHE and not _CODEX_V2_STALE
+            and time.time() - _CODEX_V2_VISIBLE_FRESH_AT < _CODEX_V2_LIST_TTL):
+        return _CODEX_V2_VISIBLE_CACHE[:wanted]
     visible: list[dict] = []
     cursor = None
     try:
@@ -7141,9 +7152,15 @@ async def _codex_v2_visible_threads(wanted: int = 20) -> list[dict]:
             _log_event("codex_thread_list_stale", surface="v2",
                        count=len(_CODEX_V2_VISIBLE_CACHE),
                        error=type(e).__name__)
+            # 誠實旗標(2026-08-18 深診 §4):吃 stale cache 不 raise = timeout
+            # 被吞、degraded_providers 永遠回空 —— CX 半死一整天看板卻說健康。
+            # 這裡標起來,v2_sessions 據此把 codex 列進 degraded。
+            _CODEX_V2_STALE = True
             return _CODEX_V2_VISIBLE_CACHE[:wanted]
         raise
     _CODEX_V2_VISIBLE_CACHE = [dict(t) for t in visible]
+    _CODEX_V2_VISIBLE_FRESH_AT = time.time()
+    _CODEX_V2_STALE = False
     return visible[:wanted]
 
 
@@ -7422,6 +7439,9 @@ _CX_RETRYABLE_ERROR_RE = re.compile(
 _CODEX_LIST_MAX_PAGES = 8
 _CODEX_SESSION_LIST_CACHE: dict = {}
 _CODEX_V2_VISIBLE_CACHE: list[dict] = []
+_CODEX_V2_VISIBLE_FRESH_AT = 0.0     # 上次真打 thread/list 成功的時刻(TTL 快取)
+_CODEX_V2_STALE = False              # 目前回的是 stale cache(degraded 誠實旗標)
+_CODEX_V2_LIST_TTL = float(os.environ.get("CODEX_V2_LIST_TTL", "5.0"))
 
 
 def _codex_history_invalidate(thread_id: str) -> None:
@@ -7484,12 +7504,17 @@ async def codex_sessions(request: Request, limit: int = 40, cwd: str | None = No
     params = {
         # The provider may return a burst of hidden /private/tmp exec threads
         # first, so fetch enough rows to fill the visible page after filtering.
-        "limit": min(100, max(wanted, 40)),
+        "limit": min(100, max(wanted, 20)),
         "archived": archived,
         "sourceKinds": ["cli", "vscode", "exec", "appServer"],
         "sortKey": "updated_at",
         "sortDirection": "desc",
-        "useStateDbOnly": False,
+        # 2026-08-18 病理定案:False 會讓 daemon 逐一開 rollout jsonl(1GB/404
+        # 檔)去補 metadata —— 而可見 thread 只有 13 條,limit 填不滿就是全庫
+        # 掃描,一次 10-17s;輪詢排隊放大到 45s+TimeoutError。實測 True 之後
+        # 回傳 13 條逐欄位完全相同(bridge 本來就不信 list 的 updatedAt 與
+        # preview,全都自己蓋),1.7-3.3s。rollout 掃描買到的東西我們全不用。
+        "useStateDbOnly": True,
     }
     if cwd:
         params["cwd"] = cwd
@@ -14897,6 +14922,9 @@ async def v2_sessions(request: Request, provider: str = "", status: str = ""):
         out = [s for s in out if s["status"] == status]
     # degraded_providers:清單為空 ≠ 沒有 session,可能是 provider 暫時掛了。
     # 舊 app 忽略新欄位,向後相容;新 app 可據此顯示「清單暫時無法取得」。
+    if _CODEX_V2_STALE and "codex" not in degraded:
+        # stale cache 撐著畫面 ≠ 健康(深診 §4:v2 幾乎每次都走 stale 路)
+        degraded.append("codex")
     return {"sessions": out, "degraded_providers": degraded}
 
 
@@ -22923,7 +22951,12 @@ async def _dashboard_sessions():
         res = await CODEX_APP.call(
             "thread/list", {"limit": 20, "archived": False,
                             "sortKey": "updated_at", "sortDirection": "desc",
-                            "useStateDbOnly": False}, timeout=5.0)
+                            # 2026-08-18 病理定案:False 會讓 daemon 逐一開 rollout jsonl(1GB/404
+        # 檔)去補 metadata —— 而可見 thread 只有 13 條,limit 填不滿就是全庫
+        # 掃描,一次 10-17s;輪詢排隊放大到 45s+TimeoutError。實測 True 之後
+        # 回傳 13 條逐欄位完全相同(bridge 本來就不信 list 的 updatedAt 與
+        # preview,全都自己蓋),1.7-3.3s。rollout 掃描買到的東西我們全不用。
+        "useStateDbOnly": True}, timeout=5.0)
         for t in (res or {}).get("data", [])[:20]:
             s = _codex_session_summary(t)
             tid = s.get("thread_id") or s.get("id")
