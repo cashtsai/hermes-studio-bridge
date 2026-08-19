@@ -13681,8 +13681,17 @@ async def _cc_key_core_locked(name: str, raw: str) -> dict:
         #   ‧ 單題:沿用數字+Enter(某些版面數字停在選取欄需 Enter;無下一題可污染)。
         _tab = _cc_pane_tab_bar(pane_now) if submit_after_key else None
         _multi_q = bool(_tab) and (_tab.get("q_total") or 0) >= 2
-        _on_review = bool(_tab) and bool(_tab.get("q_answered")) and all(_tab["q_answered"])
-        need_enter = submit_after_key and (not _multi_q or _on_review)
+        if _multi_q:
+            # 還有幾題沒答(含當前這題)。>=2 題未答 → 數字鍵自己前進到下一題,
+            # **不補 Enter**(補了會多吃一題)。只剩最後一題(或已在全 ☒ 的 review
+            # 頁)→ 補 Enter:數字答掉最後一題後 TUI 會進 review 頁,Enter 直接送出。
+            # 好處:手機端答完最後一題就完成,不必再顯示/點一次「送出」頁(那頁
+            # /status 根本回 prompt=None、app 看不到 → 是「答完卻卡在最後」的真兇)。
+            _answered = sum(1 for a in (_tab.get("q_answered") or []) if a)
+            _unanswered = (_tab.get("q_total") or 0) - _answered
+            need_enter = _unanswered <= 1
+        else:
+            need_enter = submit_after_key   # 單題:沿用數字+Enter
         args += ["-l", raw]                  # literal single char (y / n / 1-3)
     else:
         raise HTTPException(status_code=400, detail="unsupported key")
