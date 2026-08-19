@@ -13607,17 +13607,19 @@ async def _cc_seq_guard(name: str, what: str = "keys"):
         lock.release()
 
 
-def _cc_tabbar_answered_count(pane: str):
-    """多題 AskUserQuestion 頁籤列(`←  ☒ Fruit  ☐ Drink  … ✔ Submit  →`)裡已作答
-    (☒)的數量;找不到頁籤列(非多題 ask)回 None。
+def _cc_pane_q_total(pane: str) -> int:
+    """掃 pane 找 AskUserQuestion 頁籤列(`←  ☐ Fruit  ☐ Drink  … ✔ Submit  →`)
+    → 題數(q_total);非多題/找不到回 1。
 
-    答一題會把該題的 ☐ 變 ☒,所以這個數字是判斷「數字鍵是否已自己前進到下一題」
-    最可靠、與題目內容/版面文字無關的訊號 —— 比比對選項 label 穩(多題選項鍵恆為
-    1/2/3、label 也可能重複)。"""
-    for line in pane.splitlines():
-        if ("☒" in line or "☐" in line) and ("→" in line or "←" in line or "Submit" in line):
-            return line.count("☒")
-    return None
+    用**送鍵前**就已在手的 pane 判斷「這是不是多題 ask」,不依賴送鍵後的即時重繪
+    —— 那在 production 負載下會延遲、快取還可能回舊畫面,正是條件式-Enter 第一版
+    修復在真機失敗的原因(送鍵後抓到的是尚未前進的舊畫面 → 誤判沒前進 → 補了那個
+    會多吃一題的 Enter)。沿用已驗證的 _cc_tab_bar 解析(q_total 純文字就可靠)。"""
+    for raw in pane.splitlines()[:80]:
+        bar = _cc_tab_bar(raw)
+        if bar:
+            return bar.get("q_total") or 1
+    return 1
 
 
 async def _cc_key_core(name: str, raw: str) -> dict:
@@ -13669,9 +13671,11 @@ async def _cc_key_core_locked(name: str, raw: str) -> dict:
         # only "1"/"2"/"3" leaves the digit in the TUI selection field on some
         # Claude Code layouts; permission prompts keep the old single-key path.
         submit_after_key = (prompt_now or {}).get("semantic") == "question"
-        # 2026-08-19 多題 ask 修復:記下按鍵「前」的頁籤已作答(☒)數,送出後用來
-        # 判斷數字鍵是否已自己前進到下一題(現行 CC 版面數字=選定+前進)。
-        q_answered_before = _cc_tabbar_answered_count(pane_now) if submit_after_key else None
+        # 2026-08-19 多題 ask 修復:送鍵**前**就先判斷是不是多題(頁籤 q_total>=2)。
+        # 現行 CC 版面數字鍵本身就「選定+前進到下一題」(最後一題進 review、submit
+        # 頁再按數字送出),多補一個 Enter 會多前進一題、把下一題用預設值默默答掉
+        # —— 這是「多題只點第一題卻連下一題被吃掉→app 題號失步→卡住」的真兇。
+        multi_q = submit_after_key and _cc_pane_q_total(pane_now) >= 2
         args += ["-l", raw]                  # literal single char (y / n / 1-3)
     else:
         raise HTTPException(status_code=400, detail="unsupported key")
@@ -13679,33 +13683,15 @@ async def _cc_key_core_locked(name: str, raw: str) -> dict:
     if rc:
         raise http_err(502, "TMUX_FAILED", "tmux send-keys failed",
                        err[:200] or "send-keys failed")
-    if submit_after_key:
-        # 現行 Claude Code 的 AskUserQuestion:數字鍵本身就「選定並前進到下一題」
-        # (單題/最後一題則直接送出到 review)。舊版某些版面數字會停在選取欄、要再
-        # 按 Enter 才成交。**盲送 Enter 在新版面會多前進一題、把下一題用預設值答掉**
-        # —— 這正是「多題 ask 只點第一題卻連下一題一起被吃掉、之後卡住」的真兇
-        # (2026-08-19 實機 tmux 重現:送 `1`+Enter 後 Fruit 與 Drink 同時被打勾、
-        # 直接跳到 Dessert)。改成:送數字後確認畫面「有沒有自己前進」,只有**完全
-        # 沒動**(舊版面數字卡在欄位)才補一個 Enter。刻意偏向不補:補錯會污染下一題
-        # (不可逆),不補最多讓使用者再點一次(可恢復),代價不對稱。
-        advanced = False
-        for _ in range(3):                       # 最多 ~0.6s 等 TUI 重繪
-            await asyncio.sleep(0.2)
-            _PANE_CACHE.pop(name, None)
-            pane_chk = await _tmux_capture_cached(name)
-            after_cnt = _cc_tabbar_answered_count(pane_chk)
-            if (q_answered_before is not None and after_cnt is not None
-                    and after_cnt > q_answered_before):
-                advanced = True                  # 頁籤多打了一個勾 = 已前進
-                break
-            if _cc_prompt(pane_chk) is None:
-                advanced = True                  # 選單消失 = 單題已送出/整組已完成
-                break
-        if not advanced:
-            rc_enter, _, err_enter = await _tmux_run("send-keys", "-t", name, "Enter")
-            if rc_enter:
-                raise http_err(502, "TMUX_FAILED", "tmux send-keys enter failed",
-                               err_enter[:200] or "send-keys Enter failed")
+    # 多題 ask:數字鍵已經自己前進,**絕不補 Enter**(補了會多吃一題)。
+    # 單題:沿用舊的「數字 + Enter」——某些 CC 版面數字會停在選取欄需要 Enter 成交,
+    # 且單題沒有「下一題」可被污染,那個 Enter 最壞只是往聊天框送個空行,無害。
+    if submit_after_key and not multi_q:
+        await asyncio.sleep(0.08)
+        rc_enter, _, err_enter = await _tmux_run("send-keys", "-t", name, "Enter")
+        if rc_enter:
+            raise http_err(502, "TMUX_FAILED", "tmux send-keys enter failed",
+                           err_enter[:200] or "send-keys Enter failed")
     # The key just changed the TUI (mode toggle, menu pick) — a cached pane
     # would feed the app a pre-keystroke mode/prompt for up to TTL seconds.
     _PANE_CACHE.pop(name, None)
