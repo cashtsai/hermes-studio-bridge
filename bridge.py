@@ -13607,19 +13607,19 @@ async def _cc_seq_guard(name: str, what: str = "keys"):
         lock.release()
 
 
-def _cc_pane_q_total(pane: str) -> int:
-    """掃 pane 找 AskUserQuestion 頁籤列(`←  ☐ Fruit  ☐ Drink  … ✔ Submit  →`)
-    → 題數(q_total);非多題/找不到回 1。
+def _cc_pane_tab_bar(pane: str) -> dict | None:
+    """掃 pane 找 AskUserQuestion 頁籤列(`←  ☒ Fruit  ☐ Drink  … ✔ Submit  →`)
+    → _cc_tab_bar 結果(q_total / q_answered / …);非多題/找不到回 None。
 
-    用**送鍵前**就已在手的 pane 判斷「這是不是多題 ask」,不依賴送鍵後的即時重繪
-    —— 那在 production 負載下會延遲、快取還可能回舊畫面,正是條件式-Enter 第一版
-    修復在真機失敗的原因(送鍵後抓到的是尚未前進的舊畫面 → 誤判沒前進 → 補了那個
-    會多吃一題的 Enter)。沿用已驗證的 _cc_tab_bar 解析(q_total 純文字就可靠)。"""
+    用**送鍵前**就已在手的 pane 判斷版面,不依賴送鍵後的即時重繪 —— 那在 production
+    負載下會延遲、快取還可能回舊畫面,正是條件式-Enter 第一版在真機失敗的根因
+    (送鍵後抓到尚未前進的舊畫面 → 誤判沒前進 → 補了那個會多吃一題的 Enter)。
+    沿用已驗證的 _cc_tab_bar 解析(q_total / q_answered 純文字就可靠)。"""
     for raw in pane.splitlines()[:80]:
         bar = _cc_tab_bar(raw)
         if bar:
-            return bar.get("q_total") or 1
-    return 1
+            return bar
+    return None
 
 
 async def _cc_key_core(name: str, raw: str) -> dict:
@@ -13634,6 +13634,7 @@ async def _cc_key_core_locked(name: str, raw: str) -> dict:
     args = ["send-keys", "-t", name]
     mapped = _CC_KEYS.get(raw.lower())
     submit_after_key = False
+    need_enter = False                       # 只有問答路徑會設 True(見下)
     if mapped:
         args.append(mapped)                  # named control key
     elif len(raw) == 1 and raw.isprintable():
@@ -13671,11 +13672,17 @@ async def _cc_key_core_locked(name: str, raw: str) -> dict:
         # only "1"/"2"/"3" leaves the digit in the TUI selection field on some
         # Claude Code layouts; permission prompts keep the old single-key path.
         submit_after_key = (prompt_now or {}).get("semantic") == "question"
-        # 2026-08-19 多題 ask 修復:送鍵**前**就先判斷是不是多題(頁籤 q_total>=2)。
-        # 現行 CC 版面數字鍵本身就「選定+前進到下一題」(最後一題進 review、submit
-        # 頁再按數字送出),多補一個 Enter 會多前進一題、把下一題用預設值默默答掉
-        # —— 這是「多題只點第一題卻連下一題被吃掉→app 題號失步→卡住」的真兇。
-        multi_q = submit_after_key and _cc_pane_q_total(pane_now) >= 2
+        # 2026-08-19 多題 ask 修復:送鍵**前**就用已在手的 pane 判斷版面。
+        #   ‧ 多題「題目」版面(頁籤還有 ☐ 未答題):現行 CC 數字鍵本身就「選定+前進
+        #     到下一題」,**絕不能補 Enter** —— 補了會多前進一題、把下一題用預設值默默
+        #     答掉(「只點第一題卻連下一題被吃掉→app 題號失步→卡住」的真兇)。
+        #   ‧ 多題「review/送出」版面(頁籤全 ☒、Ready to submit):是一般確認選單,
+        #     數字只選不成交,**要補 Enter** 才送得出去。
+        #   ‧ 單題:沿用數字+Enter(某些版面數字停在選取欄需 Enter;無下一題可污染)。
+        _tab = _cc_pane_tab_bar(pane_now) if submit_after_key else None
+        _multi_q = bool(_tab) and (_tab.get("q_total") or 0) >= 2
+        _on_review = bool(_tab) and bool(_tab.get("q_answered")) and all(_tab["q_answered"])
+        need_enter = submit_after_key and (not _multi_q or _on_review)
         args += ["-l", raw]                  # literal single char (y / n / 1-3)
     else:
         raise HTTPException(status_code=400, detail="unsupported key")
@@ -13683,10 +13690,9 @@ async def _cc_key_core_locked(name: str, raw: str) -> dict:
     if rc:
         raise http_err(502, "TMUX_FAILED", "tmux send-keys failed",
                        err[:200] or "send-keys failed")
-    # 多題 ask:數字鍵已經自己前進,**絕不補 Enter**(補了會多吃一題)。
-    # 單題:沿用舊的「數字 + Enter」——某些 CC 版面數字會停在選取欄需要 Enter 成交,
-    # 且單題沒有「下一題」可被污染,那個 Enter 最壞只是往聊天框送個空行,無害。
-    if submit_after_key and not multi_q:
+    # 只有「單題」或「多題的 review/送出頁」才補 Enter;多題的題目版面數字自己前進,
+    # 補 Enter 會多吃一題(見上方 need_enter 計算)。
+    if need_enter:
         await asyncio.sleep(0.08)
         rc_enter, _, err_enter = await _tmux_run("send-keys", "-t", name, "Enter")
         if rc_enter:
