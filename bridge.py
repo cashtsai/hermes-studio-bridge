@@ -7343,8 +7343,25 @@ async def _codex_input_items(text: str, attachments: list) -> list:
 # 實測 0.147 的參數錯訊息長這樣:
 #   Invalid request: unknown variant `on-failure`, expected one of `untrusted`…
 #   Invalid request: missing field `threadId`
+#
+# 2026-08-21 擴充(**第四次**語意相反):id 格式錯整族原本沒被涵蓋 ——
+#   GET /codexsessions/not-a-real-thread/status
+#   → 409 CX_TURN_IN_FLIGHT「codex thread is busy with another turn」
+#     detail: invalid thread id: invalid character: expected an optional prefix
+#             of `urn:uuid:` followed by [0-9a-fA-F-], found `n` at 1
+# 純粹的參數格式錯被翻成狀態錯。任何 id 被截斷、`codex:` 前綴外洩、app 傳錯
+# 欄位,使用者都會看到「上一輪還在跑」,然後去等一個不存在的回合。
 _CX_INVALID_PARAM_RE = re.compile(
-    r"unknown variant|unknown field|missing field|invalid type|expected one of",
+    r"unknown variant|unknown field|missing field|invalid type|expected one of"
+    r"|invalid thread id|invalid session id|invalid character|invalid length"
+    r"|invalid value|expected an optional prefix",
+    re.I)
+
+# 「這是真的在忙」的正面特徵。用來支援下面的結構規則:訊息說 invalid、又完全
+# 沒有任何忙碌字眼 → 一律當參數錯,而不是預設丟給 CX_TURN_IN_FLIGHT。
+# 刻意**不含** "thread" —— 上面那個 `invalid thread id` 就是反例。
+_CX_BUSY_HINT_RE = re.compile(
+    r"\bturn\b|busy|in flight|in-flight|in progress|already (running|active)",
     re.I)
 
 
@@ -7399,12 +7416,17 @@ def _codex_http_error(e: Exception):
             # (例:0.147 拿掉 approvalPolicy 的 `on-failure`),使用者按下去會收到
             # 「會話忙碌中」,然後去等一個根本不存在的回合。這正是 thread-lock
             # 那次查了一整天的同一種錯:把參數錯翻譯成狀態錯。
-            if _CX_INVALID_PARAM_RE.search(str(e)):
+            # 結構規則(2026-08-21):除了列舉的參數特徵,再補一條「訊息自稱
+            # invalid、卻沒有任何忙碌字眼 → 就是參數錯」。列舉永遠追不上 codex
+            # 每次改版的新措辭(這已經是第四次同族復發),這條規則才擋得住下一次。
+            _msg = str(e)
+            if (_CX_INVALID_PARAM_RE.search(_msg)
+                    or ("invalid" in _msg.lower() and not _CX_BUSY_HINT_RE.search(_msg))):
                 raise http_err(400, "CX_INVALID_PARAM",
                                "codex 不接受這個參數值(可能是 codex 版本已變更"
-                               "該欄位的合法值)", str(e))
+                               "該欄位的合法值,或 id 格式不對)", _msg)
             raise http_err(409, "CX_TURN_IN_FLIGHT",
-                           "codex thread is busy with another turn", str(e))
+                           "codex thread is busy with another turn", _msg)
         raise HTTPException(status_code=502, detail=str(e))
     raise HTTPException(status_code=502, detail=str(e))
 
@@ -7689,9 +7711,10 @@ async def codex_session_create(request: Request):
         "ephemeral": False,
         "threadSource": "user",
     }
-    # spawn config(設計 §2.1):cx thread 走共用 app-server,能逐 thread 設的是
-    # model/approvalPolicy(runtime 亦可,見 /settings);effort/sandbox 以
-    # camelCase 透傳(app-server 不認會忽略)。api_key/profile 無法逐 thread 注入
+    # spawn config(設計 §2.1):cx thread 走共用 app-server,thread/start 能設的是
+    # model/approvalPolicy/**sandbox**(欄名以 ThreadStartParams schema 為準);
+    # effort 不在 thread 層,起好之後補送 thread/settings/update(見下)。
+    # api_key/profile 無法逐 thread 注入
     # (共用 app-server 一份 auth)→ 要 BYO key 請走 /dispatch 的 codex exec 子程序。
     try:
         spawn_cfg = _spawn_config_validate(body.get("config"), "cx")
@@ -7715,6 +7738,18 @@ async def codex_session_create(request: Request):
             raise CodexAppServerError("thread/start returned no thread id")
         CODEX_APP.loaded_threads.add(thread_id)
         CODEX_APP.note_thread_settings(thread_id, res or {})
+        # effort 在 thread 層沒有欄位(schema:`effort` 只在 TurnStartParams)——
+        # thread/start 帶 reasoningEffort 會被靜默丟掉。thread 起好之後補送一次
+        # settings/update 才會生效;失敗不擋開場,但要記進 unsupported 讓 app 知道
+        # 「沒套上」,不可以照抄回去謊稱已套用(2026-08-21 安全性修正的一部分)。
+        if spawn_cfg.get("effort"):
+            try:
+                await CODEX_APP.call("thread/settings/update",
+                                     {"threadId": thread_id,
+                                      "effort": spawn_cfg["effort"]}, timeout=15.0)
+            except Exception as _eff_exc:   # noqa: BLE001
+                _log_exc("cx_spawn_effort_apply", _eff_exc, expected=True)
+                cx_unsupported.append("effort")
         _registry_register(f"codex:{thread_id}", provider="codex",
                            name=text[:40] or thread_id, purpose=reg_purpose,
                            cls=reg_cls, parent=reg_parent)
@@ -9504,17 +9539,35 @@ def _spawn_cx_exec_flags(cfg: dict) -> list:
 
 def _spawn_cx_thread_params(cfg: dict) -> dict:
     """config → codex app-server `thread/start` 額外參數(共用 app-server 的
-    thread 路徑)。app-server 已實測吃 model / approvalPolicy;effort / sandbox
-    以 camelCase 透傳,app-server 不認得的欄位會被忽略(前向相容)。"""
+    thread 路徑)。
+
+    2026-08-21 修正(**安全性**):欄位名對不上就是**靜默失效**。以 codex 0.149
+    `codex app-server generate-json-schema` 的官方 schema 為準:
+
+        ThreadStartParams = approvalPolicy | approvalsReviewer | baseInstructions
+                          | config | cwd | developerInstructions | ephemeral | model
+                          | modelProvider | personality | **sandbox** | serviceName
+                          | serviceTier | sessionStartSource | threadSource
+
+      ‧ 沙箱欄位叫 **`sandbox`**,不是 `sandboxMode` —— 舊寫法送出去被當未知欄位
+        丟掉:使用者在新會話選「唯讀」,thread 實際照 config.toml 跑
+        workspace-write(**有寫入權**),bridge 卻回報已套用。使用者以為把不信任的
+        任務關進唯讀沙箱,其實沒有 —— 這是安全性問題,不是外觀問題。
+      ‧ thread 層**沒有** effort 欄位(`effort` 只在 `TurnStartParams`,per-turn),
+        `reasoningEffort` 同樣被丟掉 → 不在這裡送,改由呼叫端於 thread 起好後
+        補送 `thread/settings/update`。
+
+    值本身不用動:`_SPAWN_CX_SANDBOXES` 存的就是 schema 要的 kebab-case
+    (read-only / workspace-write / danger-full-access)。
+    """
     params: dict = {}
     if cfg.get("model"):
         params["model"] = cfg["model"]
     if cfg.get("approval_policy"):
         params["approvalPolicy"] = cfg["approval_policy"]
-    if cfg.get("effort"):
-        params["reasoningEffort"] = cfg["effort"]
     if cfg.get("sandbox"):
-        params["sandboxMode"] = cfg["sandbox"]
+        params["sandbox"] = cfg["sandbox"]
+    # effort 不在這裡送(thread 層無此欄位);由呼叫端在 thread/start 之後補套。
     return params
 
 
