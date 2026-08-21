@@ -7080,6 +7080,12 @@ def _cx_list_preview_text(thread_id: str) -> str:
     return _cx_preview_cache_get(thread_id)
 
 
+# thread_id → 我們見過的最新 updatedAt(高水位)。thread/list(走 state.db,新鮮)
+# 與 thread/read(daemon 記憶體索引,可能落後數十天)共用,避免同一條 thread 在
+# 列表與 status 兩個畫面顯示差很多的時間。純記憶體、重啟歸零即可(列表一刷就回填)。
+_CX_UPDATED_AT_SEEN: dict = {}
+
+
 def _codex_enrich_summary(summary: dict) -> dict:
     tid = summary.get("thread_id") or summary.get("id") or ""
     summary["appServerAlive"] = CODEX_APP.is_server_alive()
@@ -7124,6 +7130,22 @@ def _codex_enrich_summary(summary: dict) -> dict:
                 summary["updatedAt"] = CODEX_APP.last_event_at[tid]
         except (TypeError, ValueError):
             summary["updatedAt"] = CODEX_APP.last_event_at[tid]
+    # 2026-08-21:上面那段只在 last_event_at 有記錄時才補,而它是純記憶體、重啟後
+    # 是空的 —— 於是 `/status`(走 thread/read,拿 daemon 陳舊索引)會report 出比
+    # 列表舊幾十天的時間。實測同一條 thread:list=08-19、status=07-07,差 43 天,
+    # 使用者打開 session 看到「最後更新」跳回好幾週前。
+    # 列表那條路走 state.db(useStateDbOnly)拿得到新鮮值,所以這裡記住「這條
+    # thread 我們見過的最新時間」,兩條路徑共用同一個高水位,誰先看到都算數。
+    try:
+        cur = float(summary.get("updatedAt") or 0)
+    except (TypeError, ValueError):
+        cur = 0.0
+    if tid:
+        seen = _CX_UPDATED_AT_SEEN.get(tid, 0.0)
+        if cur > seen:
+            _CX_UPDATED_AT_SEEN[tid] = cur
+        elif seen > cur:
+            summary["updatedAt"] = seen
     if tid in CODEX_APP.thread_errors:
         summary["error"] = CODEX_APP.thread_errors[tid]
     # thread-store 寫入鎖:`locked` **恆存在**(bool),app 才能無條件拿它決定
