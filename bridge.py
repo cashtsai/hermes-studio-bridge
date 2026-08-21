@@ -7420,7 +7420,7 @@ def _cx_turns_user_count(turns: list) -> int:
     return n
 
 
-def _cx_history_from_cards(thread_id: str):
+async def _cx_history_from_cards(thread_id: str):
     """用 bridge 自己的卡片流組逐字稿(含工具步驟)。覆蓋不足就回 None。
 
     為什麼需要這條:codex 0.149 的**持久化視圖不含工具項**。2026-08-22 隔離實測,
@@ -7436,8 +7436,15 @@ def _cx_history_from_cards(thread_id: str):
     取代 turns 會把更早的歷史整段弄丟(比缺工具步驟更糟)。所以只有在卡片裡的使用者
     訊息數 **不少於** turns 裡的數量時才採用;否則回 None 走原路。
     """
-    d = _CX_CARD_DIGESTS.get(thread_id)
-    store = getattr(d, "store", None) if d is not None else None
+    # 必須走 _cx_card_digest(會建立 + 從持久層 seed),不能只讀 _CX_CARD_DIGESTS
+    # —— 那是純記憶體字典,bridge 一重啟就是空的,於是這條路「有時有效有時無效」
+    # (2026-08-22 實測踩到:重啟後逐字稿又退回沒有工具步驟的版本)。
+    try:
+        d = await _cx_card_digest(thread_id)
+        store = getattr(d, "store", None)
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("_cx_history_from_cards.digest", _exc, expected=True)
+        return None
     if store is None:
         return None
     try:
@@ -9538,7 +9545,7 @@ async def codex_session_history(thread_id: str, request: Request, limit: int = 4
         # 覆蓋不足就維持原樣:寧可少了工具步驟,也不能把更早的歷史弄丟。
         # 只在第一頁(沒有 cursor)換 —— 翻頁是 turns 的游標語意,不能混用。
         if not cursor:
-            rich = _cx_history_from_cards(thread_id)
+            rich = await _cx_history_from_cards(thread_id)
             if rich and rich[1] >= _cx_turns_user_count(turns):
                 text = rich[0]
         payload = {"text": text,
