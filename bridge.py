@@ -9362,6 +9362,8 @@ async def codex_session_interrupt(thread_id: str, request: Request):
     _check_auth(request)
     try:
         await CODEX_APP.interrupt_turn(thread_id)
+        # 中斷成功才留痕 —— 失敗路徑不能推卡,否則卡片會宣稱「已中斷」而其實沒有。
+        _cx_feed_interrupted(thread_id)
         return {"ok": True, "thread_id": thread_id}
     except Exception as e:  # noqa: BLE001
         _codex_http_error(e)
@@ -15473,6 +15475,8 @@ async def v2_session_interrupt(session_id: str, request: Request):
         if "no active" in str(e).lower():
             raise http_err(409, "NO_ACTIVE_TURN", "no active Codex turn")
         _codex_http_error(e)
+    # 中斷成功才留痕(app 走的是這條 v2 路由,兩條都要補,否則手機按停止一樣沒痕跡)
+    _cx_feed_interrupted(src[1])
     return {"ok": True, "session_id": session_id, "interrupted": True}
 
 
@@ -16298,6 +16302,28 @@ def _cx_feed_queue_drop(thread_id: str, item: dict, exc: BaseException) -> None:
             {"text": msg, "fallback_text": msg}))
     except Exception as _exc:  # noqa: BLE001
         _log_exc("_cx_feed_queue_drop", _exc, expected=True)
+
+
+def _cx_feed_interrupted(thread_id: str) -> None:
+    """使用者中斷了這一輪 → 推一張系統卡留痕。
+
+    2026-08-21:在此之前中斷**完全不留痕跡** —— 卡片流只剩孤零零的 user 卡,
+    /history 也是「你送出訊息」後直接接下一則。換一台裝置、或重開 app 之後,
+    那一輪看起來就像「訊息送出去沒人理」,使用者會以為是壞掉而重送一次。
+    CC 那邊本來就有中斷痕跡,這裡補齊對齊。
+    """
+    if not thread_id:
+        return
+    d = _CX_CARD_DIGESTS.get(thread_id)
+    if d is None:
+        return
+    try:
+        msg = "⏹ 已中斷這一輪(你按了停止)"
+        d.store.upsert_card(carddigest.make_card(
+            f"card-cx-interrupted-{d.store.seq}", d.store.turn_id, "system", "text",
+            {"text": msg, "fallback_text": msg}))
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("_cx_feed_interrupted", _exc, expected=True)
 
 
 def _cx_feed_input_accepted(thread_id: str, client_id: str | None, text: str,
