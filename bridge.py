@@ -5752,7 +5752,10 @@ class CodexAppServerClient:
                 _log_event("codex_question_advance",
                            approval_id=approval_id,
                            q_index=fields["q_index"], q_total=fields["q_total"])
+                # `result` 一定要在:呼叫端(/answer、/approve)是 result["result"],
+                # 少這個 key 會 KeyError → 500,使用者明明答對卻看到錯誤。
                 return {"id": approval_id, "status": "next_question",
+                        "result": {},
                         "q_index": fields["q_index"], "q_total": fields["q_total"],
                         "thread_id": record.get("thread_id") or "",
                         "method": record.get("method")}
@@ -9358,8 +9361,14 @@ async def codex_session_answer(thread_id: str, request: Request):
             raise http_err(409, "QUESTION_NOT_PENDING",
                            "Codex question is no longer live")
         _codex_http_error(e)
-    return {"ok": True, "thread_id": thread_id, "id": record["id"],
-            "status": result["status"], "key": key, "result": result["result"]}
+    out = {"ok": True, "thread_id": thread_id, "id": record["id"],
+           "status": result.get("status"), "key": key,
+           "result": result.get("result") or {}}
+    # 多題:還沒問完時帶回進度,app 可直接顯示「第 N/M 題」而不必再撈卡片。
+    for k in ("q_index", "q_total"):
+        if result.get(k) is not None:
+            out[k] = result[k]
+    return out
 
 
 @app.get("/codexsessions/{thread_id}/history")
@@ -22567,8 +22576,12 @@ async def _approval_decide_core(aid: str, b: dict) -> dict:
             try:
                 result = await CODEX_APP.answer_question(
                     aid, key=key, text=str(b.get("text") or b.get("answer") or ""))
-                return {"id": aid, "status": result["status"],
-                        "key": key, "result": result["result"]}
+                out = {"id": aid, "status": result.get("status"),
+                       "key": key, "result": result.get("result") or {}}
+                for k in ("q_index", "q_total"):
+                    if result.get(k) is not None:
+                        out[k] = result[k]
+                return out
             except CodexAppServerError as e:
                 if e.code == 404:
                     raise http_err(409, "APPROVAL_NOT_PENDING",
