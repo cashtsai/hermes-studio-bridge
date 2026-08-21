@@ -9139,6 +9139,9 @@ async def codex_session_input(thread_id: str, request: Request):
 #   • 沒有 getter:合法方法表裡沒有 `thread/settings`,`thread/read` 也不帶
 #     設定。讀取一律走 CODEX_APP.thread_settings 快取。
 _CODEX_APPROVAL_POLICIES = ("untrusted", "on-request", "granular", "never")
+# codex 0.149 `ModeKind` enum(schema 實證)。plan = 會用 request_user_input 跟
+# 使用者確認方向;default = 悶頭做完(工具不上線,問不了)。
+_CODEX_COLLAB_MODES = ("plan", "default")
 
 
 @app.get("/codexsessions/{thread_id}/settings")
@@ -9165,20 +9168,31 @@ async def codex_session_settings_read(thread_id: str, request: Request):
     cached.pop("at", None)
     settings = {k: v for k, v in cached.items() if v}
     return {"thread_id": thread_id, "settings": settings,
-            "runtime_settable": ["model", "approvalPolicy"],
-            "approval_policies": list(_CODEX_APPROVAL_POLICIES)}
+            "runtime_settable": ["model", "approvalPolicy", "collaborationMode"],
+            "approval_policies": list(_CODEX_APPROVAL_POLICIES),
+            "collaboration_modes": list(_CODEX_COLLAB_MODES)}
 
 
 @app.post("/codexsessions/{thread_id}/settings")
 async def codex_session_settings(thread_id: str, request: Request):
     """Update per-thread Codex settings. body {"model": str?,
-    "approvalPolicy": "untrusted"|"on-failure"|"on-request"|"granular"|"never"}
-    — at least one field required."""
+    "approvalPolicy": "untrusted"|"on-failure"|"on-request"|"granular"|"never",
+    "collaborationMode": "plan"|"default"} — at least one field required.
+
+    `collaborationMode`(2026-08-21 新增)是 CX 能不能向使用者提問的**總開關**。
+    隔離實測(獨立 CODEX_HOME + 自架 app-server,codex 0.149):
+      ‧ default → 模型回 `TOOL_UNAVAILABLE`,`request_user_input` 工具不存在
+      ‧ plan    → 收到 `item/tool/requestUserInput`(帶 questions 陣列)
+    在此之前 bridge 從不設這個欄位 → 所有 CX thread 恆在 default → **CX 在 Pocket
+    裡永遠不會開口問問題**,而 bridge 那整套 requestUserInput 處理程式碼是死碼。
+    這是 CC 有、CX 沒有的最大功能落差。
+    """
     _check_auth(request)
     body = await request.json()
     params = {"threadId": thread_id}
     model = str(body.get("model") or "").strip()
     policy = str(body.get("approvalPolicy") or "").strip()
+    mode = str(body.get("collaborationMode") or "").strip()
     if model:
         params["model"] = model
     if policy:
@@ -9187,8 +9201,22 @@ async def codex_session_settings(thread_id: str, request: Request):
                                 detail="approvalPolicy must be one of "
                                        + "|".join(_CODEX_APPROVAL_POLICIES))
         params["approvalPolicy"] = policy
+    if mode:
+        if mode not in _CODEX_COLLAB_MODES:
+            raise HTTPException(status_code=400,
+                                detail="collaborationMode must be one of "
+                                       + "|".join(_CODEX_COLLAB_MODES))
+        # schema:CollaborationMode = {mode, settings};`settings` 少了會被拒
+        # (實測 `missing field settings`),模型沿用該 thread 現有的那顆。
+        cur_model = model or str((CODEX_APP.thread_settings.get(thread_id)
+                                  or {}).get("model") or "").strip()
+        params["collaborationMode"] = {"mode": mode,
+                                       "settings": ({"model": cur_model}
+                                                    if cur_model else {})}
     if len(params) == 1:
-        raise HTTPException(status_code=400, detail="model or approvalPolicy required")
+        raise HTTPException(
+            status_code=400,
+            detail="model, approvalPolicy or collaborationMode required")
     try:
         await CODEX_APP.ensure_thread_loaded(thread_id)
         await CODEX_APP.call("thread/settings/update", params, timeout=15.0)
