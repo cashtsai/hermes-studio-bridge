@@ -9244,8 +9244,10 @@ async def _codex_known_models() -> set:
     except Exception as e:  # noqa: BLE001
         _log_exc("cx_model_list", e, expected=True)
         return set()
+    # `ModelListResponse` = {data:[Model], nextCursor}(schema 實證);Model.id 是
+    # 真正要比對的欄位。相容其他鍵名,免得下一版換欄位又靜默失效。
     ids = set()
-    for m in ((res or {}).get("models") or []):
+    for m in ((res or {}).get("data") or (res or {}).get("models") or []):
         if isinstance(m, dict):
             mid = m.get("id") or m.get("model") or m.get("name")
             if isinstance(mid, str) and mid:
