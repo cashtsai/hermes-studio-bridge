@@ -4741,23 +4741,15 @@ def _codex_user_input_detail(questions: list[dict]) -> str:
     return "\n".join(lines).strip()
 
 
-def _codex_build_user_input_answers(record: dict, key: str, text: str) -> dict:
-    """ToolRequestUserInputResponse = {answers: {qid: {answers: [str, ...]}}}
-
-    （形狀對齊 OpenClaw `buildAgentHarnessUserInputAnswers`。）只有第一題
-    能用選項鈕回答（卡片一次只有一組選項）；其餘題目回空陣列 = 未作答。
-    """
-    questions = record.get("questions") or []
-    if not questions:
-        return {"answers": {}}
-    first = questions[0]
+def _codex_answer_for_question(question: dict, key: str, text: str) -> str:
+    """單一題目 + 使用者按的鍵/打的字 → 該題答案字串(空 = 未作答/略過)。"""
     answer = ""
     if key and key.startswith("opt"):
         try:
             idx = int(key[3:])
         except ValueError:
             idx = -1
-        opts = first.get("options") or []
+        opts = question.get("options") or []
         if 0 <= idx < len(opts):
             answer = opts[idx]["label"]
     elif key == "deny":
@@ -4765,16 +4757,71 @@ def _codex_build_user_input_answers(record: dict, key: str, text: str) -> dict:
     if not answer and text:
         # 自由輸入:對得上選項就用選項 label（codex 期待原字串），否則原文。
         trimmed = text.strip()
-        match = next((o["label"] for o in (first.get("options") or [])
+        match = next((o["label"] for o in (question.get("options") or [])
                       if o["label"].lower() == trimmed.lower()), "")
         if match:
             answer = match
-        elif first.get("isOther") or not first.get("options"):
+        elif question.get("isOther") or not question.get("options"):
             answer = trimmed
-    answers = {q["id"]: {"answers": []} for q in questions}
-    if answer:
-        answers[first["id"]] = {"answers": [answer]}
-    return {"answers": answers}
+    return answer
+
+
+def _codex_build_user_input_answers(record: dict, key: str, text: str) -> dict:
+    """ToolRequestUserInputResponse = {answers: {qid: {answers: [str, ...]}}}
+
+    （形狀對齊 OpenClaw `buildAgentHarnessUserInputAnswers`。）
+
+    2026-08-21 多題修正:舊版只認 `questions[0]` —— 卡片把三題全印在 detail 給
+    使用者看,卻只給第一題的選項鈕;使用者照著卡片打第二題的答案,送回 codex 的是
+    **三題全空**(沒有錯誤、沒有提示,答案人間蒸發)。協定本身支援 N 題對 N 答。
+    現在改成逐題推進(對齊 CC 的做法):`record["_answers"]` 累積已答的題目,
+    這裡把它連同「當前這題」的答案一起組成完整 frame。
+    """
+    questions = record.get("questions") or []
+    if not questions:
+        return {"answers": {}}
+    acc = dict(record.get("_answers") or {})            # 之前幾題已收的答案
+    cur = _codex_current_question(record)
+    if cur is not None:
+        a = _codex_answer_for_question(cur, key, text)
+        if a:
+            acc[cur["id"]] = a
+    # 沒答到的題目一律回空陣列(協定要求每題都要有 key)。
+    return {"answers": {q["id"]: {"answers": ([acc[q["id"]]]
+                                              if acc.get(q["id"]) else [])}
+                        for q in questions}}
+
+
+def _codex_current_question(record: dict) -> dict | None:
+    """目前該問的那一題 = 第一個還沒有答案的題目;全答完回 None。"""
+    questions = record.get("questions") or []
+    acc = record.get("_answers") or {}
+    for q in questions:
+        if q.get("id") not in acc:
+            return q
+    return None
+
+
+def _codex_question_card_fields(record: dict) -> dict:
+    """依 `當前題` 重算卡片要顯示的 title/detail/options(多題逐題推進用)。"""
+    questions = record.get("questions") or []
+    cur = _codex_current_question(record) or (questions[0] if questions else {})
+    total = len(questions)
+    idx = next((i for i, q in enumerate(questions)
+                if q.get("id") == cur.get("id")), 0)
+    options = [{"key": f"opt{i}", "label": opt["label"],
+                "style": "primary" if i == 0 else "secondary",
+                "send": opt["label"]}
+               for i, opt in enumerate(cur.get("options") or [])]
+    options.append({"key": "deny", "label": "略過", "style": "deny"})
+    title = cur.get("header") or "Codex 需要你的回答"
+    if total > 1:
+        title = f"{title}（第 {idx + 1}/{total} 題）"
+    # 多題時 detail 只印當前這題 —— 舊版把全部題目印出來,使用者會照著回答
+    # 第二題,而那個答案會被丟掉。
+    detail = _codex_user_input_detail([cur]) if cur else ""
+    return {"title": title, "detail": detail, "options": options,
+            "q_index": idx, "q_total": total}
 
 
 CODEX_SECRET_ANSWER_PLACEHOLDER = "[redacted:secret]"
@@ -5578,15 +5625,15 @@ class CodexAppServerClient:
             questions = _codex_read_user_input_questions(params)
             if not questions:
                 return None
-            first = questions[0]
-            options = [{"key": f"opt{i}", "label": opt["label"],
-                        "style": "primary" if i == 0 else "secondary",
-                        "send": opt["label"]}
-                       for i, opt in enumerate(first.get("options") or [])]
-            options.append({"key": "deny", "label": "略過", "style": "deny"})
-            title = first.get("header") or "Codex 需要你的回答"
-            detail = _codex_user_input_detail(questions)
+            # 多題:第一張卡只問第一題,答完再換下一題(見 answer_question)。
+            fields = _codex_question_card_fields({"questions": questions,
+                                                  "_answers": {}})
+            options = fields["options"]
+            title = fields["title"]
+            detail = fields["detail"]
             extra = {"questions": questions,
+                     "_answers": {},
+                     "q_index": fields["q_index"], "q_total": fields["q_total"],
                      "auto_resolution_ms": params.get("autoResolutionMs")}
         elif method == "mcpServer/elicitation/request":
             server_name = str(params.get("serverName") or "MCP server")
@@ -5679,6 +5726,36 @@ class CodexAppServerClient:
             raise CodexAppServerError(
                 "這是 Codex 的審批請求（不是問答），請用 approve/deny 決議，"
                 "不要用作答介面。", code=409)
+        # 多題逐題推進(2026-08-21):這一題收下之後如果還有題沒問,**先不要**回
+        # response frame —— 協定是「一個 tool_use 對一個 result」,提早回等於把
+        # 其餘題目用空答案定案(舊版就是這樣把使用者的第二題答案丟掉的)。
+        # 改成:記下這題的答案 → 把 record 放回 pending → 重發一張「下一題」的卡。
+        if (record.get("method") == "item/tool/requestUserInput"
+                and not auto):
+            cur = _codex_current_question(record)
+            if cur is not None:
+                acc = dict(record.get("_answers") or {})
+                acc[cur["id"]] = _codex_answer_for_question(cur, key, text)
+                record["_answers"] = acc
+            if _codex_current_question(record) is not None:
+                fields = _codex_question_card_fields(record)
+                record.update({"title": fields["title"],
+                               "detail": fields["detail"],
+                               "options": fields["options"],
+                               "q_index": fields["q_index"],
+                               "q_total": fields["q_total"]})
+                self._unclaim_pending(record)          # 還沒定案,放回去等下一答
+                try:
+                    _cx_cards_feed_approval(record)    # 換成下一題的卡
+                except Exception as e:  # noqa: BLE001
+                    _log_event("cx_cards_feed_error", error=str(e)[:160])
+                _log_event("codex_question_advance",
+                           approval_id=approval_id,
+                           q_index=fields["q_index"], q_total=fields["q_total"])
+                return {"id": approval_id, "status": "next_question",
+                        "q_index": fields["q_index"], "q_total": fields["q_total"],
+                        "thread_id": record.get("thread_id") or "",
+                        "method": record.get("method")}
         result = self._question_response_result(record, key, text)
         try:
             await self._write_server_result(record.get("request_id"), result)
