@@ -9218,10 +9218,43 @@ async def codex_session_input(thread_id: str, request: Request):
 #     CX_TURN_IN_FLIGHT「上一輪正在跑」—— 又是一次語意相反的誤導。
 #   • 沒有 getter:合法方法表裡沒有 `thread/settings`,`thread/read` 也不帶
 #     設定。讀取一律走 CODEX_APP.thread_settings 快取。
-_CODEX_APPROVAL_POLICIES = ("untrusted", "on-request", "granular", "never")
+# 2026-08-21:拿掉 `granular`。GET /settings 把它列進 approval_policies 對外宣傳,
+# 照著送 POST 卻被 codex 0.149 打回(實測:`invalid type: unit variant, expected
+# struct variant`)。它在 schema 裡是**結構變體** `{granular:{mcp_elicitations,
+# rules, …}}` 而非字串,bridge 沒有那組表單、給不出合法值。宣傳一個送出去必定失敗
+# 的選項只會讓人踩坑(目前是 app 自己把它濾掉才沒炸)。要支援得先收物件形式。
+_CODEX_APPROVAL_POLICIES = ("untrusted", "on-request", "never")
 # codex 0.149 `ModeKind` enum(schema 實證)。plan = 會用 request_user_input 跟
 # 使用者確認方向;default = 悶頭做完(工具不上線,問不了)。
 _CODEX_COLLAB_MODES = ("plan", "default")
+
+_CX_MODELS_CACHE: dict = {"at": 0.0, "ids": set()}
+
+
+async def _codex_known_models() -> set:
+    """codex 認得的 model id 集合(`model/list`,快取 10 分鐘)。
+
+    拿不到就回空集合 = 呼叫端放行不擋:這是護欄,不該因為 codex 暫時不回應就把
+    使用者的正常設定擋掉。清單很少變,10 分鐘快取足夠。"""
+    now = time.time()
+    if _CX_MODELS_CACHE["ids"] and now - _CX_MODELS_CACHE["at"] < 600:
+        return _CX_MODELS_CACHE["ids"]
+    try:
+        res = await CODEX_APP.call("model/list", {}, timeout=10.0)
+    except Exception as e:  # noqa: BLE001
+        _log_exc("cx_model_list", e, expected=True)
+        return set()
+    ids = set()
+    for m in ((res or {}).get("models") or []):
+        if isinstance(m, dict):
+            mid = m.get("id") or m.get("model") or m.get("name")
+            if isinstance(mid, str) and mid:
+                ids.add(mid)
+        elif isinstance(m, str) and m:
+            ids.add(m)
+    if ids:
+        _CX_MODELS_CACHE.update({"at": now, "ids": ids})
+    return ids
 
 
 @app.get("/codexsessions/{thread_id}/settings")
@@ -9256,8 +9289,10 @@ async def codex_session_settings_read(thread_id: str, request: Request):
 @app.post("/codexsessions/{thread_id}/settings")
 async def codex_session_settings(thread_id: str, request: Request):
     """Update per-thread Codex settings. body {"model": str?,
-    "approvalPolicy": "untrusted"|"on-failure"|"on-request"|"granular"|"never",
+    "approvalPolicy": "untrusted"|"on-request"|"never",
     "collaborationMode": "plan"|"default"} — at least one field required.
+    (`granular` 是結構變體、bridge 給不出合法值,已從對外清單移除;`model` 寫入前
+    會對 codex 的 `model/list` 驗一次,不再靜默吃下不存在的模型。)
 
     `collaborationMode`(2026-08-21 新增)是 CX 能不能向使用者提問的**總開關**。
     隔離實測(獨立 CODEX_HOME + 自架 app-server,codex 0.149):
@@ -9274,6 +9309,15 @@ async def codex_session_settings(thread_id: str, request: Request):
     policy = str(body.get("approvalPolicy") or "").strip()
     mode = str(body.get("collaborationMode") or "").strip()
     if model:
+        # 2026-08-21:寫入前查一次 codex 的 model 清單。舊行為是**靜默接受**任何
+        # 字串(實測 `totally-bogus-model-xyz` 回 200、讀回來也是它),要等下一輪
+        # 真的跑起來才炸,而且錯誤跟「你設過一個不存在的模型」看不出關聯。
+        # model/list 拿不到(舊版/暫時失敗)就放行 —— 驗證是護欄,不該變成新的故障點。
+        known = await _codex_known_models()
+        if known and model not in known:
+            raise http_err(400, "CX_UNKNOWN_MODEL",
+                           f"codex 不認得這個模型:{model}",
+                           "可用:" + ", ".join(sorted(known)[:12]))
         params["model"] = model
     if policy:
         if policy not in _CODEX_APPROVAL_POLICIES:
