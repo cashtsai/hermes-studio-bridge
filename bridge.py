@@ -7411,6 +7411,74 @@ def _codex_format_turns(turns: list) -> str:
     return "".join(parts)
 
 
+def _cx_turns_user_count(turns: list) -> int:
+    n = 0
+    for turn in turns or []:
+        for item in (turn.get("items") or []):
+            if isinstance(item, dict) and item.get("type") == "userMessage":
+                n += 1
+    return n
+
+
+def _cx_history_from_cards(thread_id: str):
+    """用 bridge 自己的卡片流組逐字稿(含工具步驟)。覆蓋不足就回 None。
+
+    為什麼需要這條:codex 0.149 的**持久化視圖不含工具項**。2026-08-22 隔離實測,
+    同一個真的跑了 shell 的回合:
+        即時通知              → agentMessage, commandExecution, userMessage
+        thread/turns/list full → agentMessage, userMessage   ← 工具項被丟掉
+        thread/read includeTurns → 同上,也被丟掉
+    schema 裡沒有第三種讀法,所以「換一支 API 就能撈回工具步驟」是死路 —— 那些步驟
+    只存在於即時事件流,而 bridge 早就把它們收進卡片 digest 了(tool_call /
+    tool_result 卡)。使用者看到的病症是:助手說「我來跑這個指令」,然後憑空報出結果。
+
+    **覆蓋度檢查**是這裡的重點:卡片只涵蓋「bridge 看得到那段對話」的期間,直接拿它
+    取代 turns 會把更早的歷史整段弄丟(比缺工具步驟更糟)。所以只有在卡片裡的使用者
+    訊息數 **不少於** turns 裡的數量時才採用;否則回 None 走原路。
+    """
+    d = _CX_CARD_DIGESTS.get(thread_id)
+    store = getattr(d, "store", None) if d is not None else None
+    if store is None:
+        return None
+    try:
+        order = list(getattr(store, "order", []) or [])
+        cards = [store.cards.get(cid) or {} for cid in order]
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("_cx_history_from_cards", _exc, expected=True)
+        return None
+    if not cards:
+        return None
+    parts, users = [], 0
+    for c in cards:
+        kind = c.get("kind")
+        role = c.get("role")
+        body = c.get("body") or {}
+        text = (body.get("text") or "").strip()
+        if kind == "tool_call":
+            cmd = (body.get("summary") or "").strip()[:TOOL_CMD_MAX]
+            if cmd:
+                parts.append(f"\n› 🔧 **{body.get('tool') or 'tool'}** `{cmd}`\n")
+        elif kind == "tool_result":
+            if text:
+                parts.append(_codex_format_tool_result(text))
+        elif kind == "approval":
+            title = (body.get("title") or "").strip()
+            if title:
+                state = body.get("resolved") or "pending"
+                parts.append(f"\n› 🔐 **{title}** [{state}]\n")
+        elif role == "user":
+            if text:
+                users += 1
+                parts.append(f"\n\n**🧑 你:** {text}\n\n")
+        elif role == "assistant":
+            if text:
+                parts.append(f"\n\n**🤖 助手:** {text}\n\n")
+        elif role == "system":
+            if text:
+                parts.append(f"\n_{text}_\n")
+    return ("".join(parts), users) if parts else None
+
+
 async def _codex_input_items(text: str, attachments: list) -> list:
     text = (text or "").strip()
     _att_guard(attachments)   # 修復單「附件限制」:直送口件數閥
@@ -9464,7 +9532,16 @@ async def codex_session_history(thread_id: str, request: Request, limit: int = 4
         res = await CODEX_APP.call("thread/turns/list", params, timeout=45.0)
         turns = list((res or {}).get("data", []))
         turns.reverse()
-        payload = {"text": _codex_format_turns(turns),
+        text = _codex_format_turns(turns)
+        # 工具步驟只存在於卡片流(codex 的持久化視圖不含 —— 見
+        # _cx_history_from_cards 的實測紀錄)。卡片覆蓋得夠完整才換過去,
+        # 覆蓋不足就維持原樣:寧可少了工具步驟,也不能把更早的歷史弄丟。
+        # 只在第一頁(沒有 cursor)換 —— 翻頁是 turns 的游標語意,不能混用。
+        if not cursor:
+            rich = _cx_history_from_cards(thread_id)
+            if rich and rich[1] >= _cx_turns_user_count(turns):
+                text = rich[0]
+        payload = {"text": text,
                    "more": bool((res or {}).get("nextCursor")),
                    "nextCursor": (res or {}).get("nextCursor")}
         _CODEX_HISTORY_CACHE[key] = (time.monotonic(), payload)
