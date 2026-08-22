@@ -7071,6 +7071,119 @@ def _cx_preview_cache_note(thread_id: str) -> None:
             _log_exc("_cx_preview_cache_note", _exc, expected=True)
 
 
+# ── CX 工具步驟的持久層(2026-08-22)──────────────────────────────────────
+# 為什麼需要:codex 0.149 **不持久化工具項**。隔離實測同一個真的跑了 shell 的回合:
+#   即時通知               → agentMessage, commandExecution, userMessage
+#   thread/turns/list full → agentMessage, userMessage   ← 工具項被丟掉
+#   thread/read includeTurns → 同上
+# 而 digest 重啟後正是從 turns/list re-seed → 卡片流裡的 tool_call/tool_result
+# 一併蒸發。結果:使用者重開 app 看舊對話,只看到助手說「我來跑這個指令」然後憑空
+# 報出結果,中間的指令與輸出全部消失,而且**再也救不回來**(沒有任何地方存過)。
+# 這裡把 live 收到的工具步驟落進 bridge 自家的輕量檔(同 cx-previews 那套:
+# 原子寫 + LRU + 節流),/history 組稿時按 ts 併回去。
+CX_TOOLSTEPS_CACHE_PATH = os.path.expanduser(os.environ.get(
+    "POCKET_CX_TOOLSTEPS_CACHE", "~/.pocket/cx-toolsteps.json"))
+CX_TOOLSTEPS_THREADS_MAX = 60       # LRU:最多保留幾條 thread
+CX_TOOLSTEPS_PER_THREAD = 200       # 每條 thread 最多幾個步驟(超過丟最舊)
+CX_TOOLSTEPS_TEXT_CHARS = 2000      # 單一步驟輸出上限(工具輸出可能很大)
+CX_TOOLSTEPS_WRITE_MIN_SECS = 5.0   # 每 thread 寫盤節流
+
+_CX_TOOLSTEPS_LOCK = threading.RLock()
+_CX_TOOLSTEPS_CACHE: dict | None = None
+_CX_TOOLSTEPS_DIRTY: set = set()
+_CX_TOOLSTEPS_LAST_WRITE: dict = {}
+
+
+def _cx_toolsteps_load() -> dict:
+    """惰性載入。檔案缺席/毀損 → 空快取(這是兜底層,壞掉不該讓主路徑失敗)。"""
+    global _CX_TOOLSTEPS_CACHE
+    if _CX_TOOLSTEPS_CACHE is None:
+        try:
+            with open(CX_TOOLSTEPS_CACHE_PATH, encoding="utf-8") as f:
+                data = json.load(f)
+            _CX_TOOLSTEPS_CACHE = data if isinstance(data, dict) else {}
+        except Exception:      # noqa: BLE001 — 檔案不在/壞掉都當空的
+            _CX_TOOLSTEPS_CACHE = {}
+    return _CX_TOOLSTEPS_CACHE
+
+
+def _cx_toolsteps_flush(thread_id: str, force: bool = False) -> None:
+    """節流 + 原子寫。寫不進盤只損失兜底,絕不能炸餵卡路徑。"""
+    now_mono = time.monotonic()
+    last = _CX_TOOLSTEPS_LAST_WRITE.get(thread_id)
+    if not force and last is not None and now_mono - last < CX_TOOLSTEPS_WRITE_MIN_SECS:
+        return
+    _CX_TOOLSTEPS_LAST_WRITE[thread_id] = now_mono
+    cache = _cx_toolsteps_load()
+    try:
+        os.makedirs(os.path.dirname(CX_TOOLSTEPS_CACHE_PATH), exist_ok=True)
+        tmp = CX_TOOLSTEPS_CACHE_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(cache, f, ensure_ascii=False)
+        os.replace(tmp, CX_TOOLSTEPS_CACHE_PATH)
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("_cx_toolsteps_flush", _exc, expected=True)
+
+
+def _cx_toolsteps_note(thread_id: str) -> None:
+    """digest 收到 live 事件 → 把 store 裡的工具卡落進持久層(冪等)。
+
+    以 card id 去重,所以同一張卡 rev 遞增(started → completed)只會更新不會重複。
+    只讀已在記憶體的 store,不打任何 API。
+    """
+    if not thread_id:
+        return
+    d = _CX_CARD_DIGESTS.get(thread_id)
+    store = getattr(d, "store", None) if d is not None else None
+    if store is None:
+        return
+    try:
+        with _CX_TOOLSTEPS_LOCK:
+            cache = _cx_toolsteps_load()
+            rows = {r.get("id"): r for r in (cache.get(thread_id) or [])
+                    if isinstance(r, dict)}
+            changed = False
+            for cid in (getattr(store, "order", []) or []):
+                card = store.cards.get(cid) or {}
+                kind = card.get("kind")
+                if kind not in ("tool_call", "tool_result"):
+                    continue
+                body = card.get("body") or {}
+                row = {"id": cid, "ts": card.get("ts"), "kind": kind,
+                       "tool": body.get("tool") or "",
+                       "summary": (body.get("summary") or "")[:CX_TOOLSTEPS_TEXT_CHARS],
+                       "text": (body.get("text") or "")[:CX_TOOLSTEPS_TEXT_CHARS]}
+                if rows.get(cid) != row:
+                    rows[cid] = row
+                    changed = True
+            if not changed:
+                return
+            ordered = sorted(rows.values(), key=lambda r: (r.get("ts") or 0))
+            if len(ordered) > CX_TOOLSTEPS_PER_THREAD:
+                ordered = ordered[-CX_TOOLSTEPS_PER_THREAD:]
+            cache.pop(thread_id, None)          # 重插到尾端 = LRU 最新
+            cache[thread_id] = ordered
+            while len(cache) > CX_TOOLSTEPS_THREADS_MAX:
+                cache.pop(next(iter(cache)))
+            _cx_toolsteps_flush(thread_id)
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("_cx_toolsteps_note", _exc, expected=True)
+
+
+def _cx_toolsteps_get(thread_id: str) -> list:
+    """該 thread 存下來的工具步驟(按 ts 排序);沒有就空 list。"""
+    if not thread_id:
+        return []
+    try:
+        with _CX_TOOLSTEPS_LOCK:
+            rows = list((_cx_toolsteps_load().get(thread_id) or []))
+        return sorted((r for r in rows if isinstance(r, dict)),
+                      key=lambda r: (r.get("ts") or 0))
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("_cx_toolsteps_get", _exc, expected=True)
+        return []
+
+
 def _cx_list_preview_text(thread_id: str) -> str:
     """列表預覽的優先序:記憶體 digest(最新鮮)→ 持久快取(重啟後兜底)
     → 空字串(呼叫端維持 provider 開場白現狀)。"""
@@ -7455,6 +7568,19 @@ async def _cx_history_from_cards(thread_id: str):
         return None
     if not cards:
         return None
+    # 持久層補件:digest 重啟後從 turns/list re-seed,工具卡會整批消失(codex 不
+    # 存工具項)。把當初 live 落盤的步驟按 ts 併回來,重開 app 也看得到指令與輸出。
+    # 以 card id 去重 —— store 裡還在的(熱 session)就不重複插。
+    have = {c.get("id") for c in cards}
+    revived = [{"id": r.get("id"), "ts": r.get("ts"), "kind": r.get("kind"),
+                "role": "assistant",
+                "body": {"tool": r.get("tool"), "summary": r.get("summary"),
+                         "text": r.get("text")}}
+               for r in _cx_toolsteps_get(thread_id)
+               if r.get("id") not in have]
+    if revived:
+        cards = sorted(list(cards) + revived,
+                       key=lambda c: (c.get("ts") or 0))
     parts, users = [], 0
     for c in cards:
         kind = c.get("kind")
@@ -16233,6 +16359,10 @@ def _cx_cards_feed(method: str, params: dict) -> None:
         # 修 ②:最新卡文字進持久快取(內部有 30s/thread 節流,熱串流的
         # delta 洪水只會偶爾真的落盤)。
         _cx_preview_cache_note(tid)
+        # 工具步驟落持久層 —— codex 不存這些,digest 重啟後 re-seed 也救不回來,
+        # 只有 live 這一刻抓得到(內部有 5s/thread 節流 + card id 去重)。
+        if method in {"item/started", "item/completed"}:
+            _cx_toolsteps_note(tid)
 
 
 def _cx_cards_feed_approval(record: dict, resolved: str = "") -> None:
