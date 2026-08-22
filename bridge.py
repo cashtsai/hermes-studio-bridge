@@ -7125,7 +7125,7 @@ def _cx_toolsteps_flush(thread_id: str, force: bool = False) -> None:
         _log_exc("_cx_toolsteps_flush", _exc, expected=True)
 
 
-def _cx_toolsteps_note(thread_id: str) -> None:
+def _cx_toolsteps_note(thread_id: str, force: bool = False) -> None:
     """digest 收到 live 事件 → 把 store 裡的工具卡落進持久層(冪等)。
 
     以 card id 去重,所以同一張卡 rev 遞增(started → completed)只會更新不會重複。
@@ -7165,7 +7165,7 @@ def _cx_toolsteps_note(thread_id: str) -> None:
             cache[thread_id] = ordered
             while len(cache) > CX_TOOLSTEPS_THREADS_MAX:
                 cache.pop(next(iter(cache)))
-            _cx_toolsteps_flush(thread_id)
+            _cx_toolsteps_flush(thread_id, force=force)
     except Exception as _exc:  # noqa: BLE001
         _log_exc("_cx_toolsteps_note", _exc, expected=True)
 
@@ -16363,6 +16363,12 @@ def _cx_cards_feed(method: str, params: dict) -> None:
         # 只有 live 這一刻抓得到(內部有 5s/thread 節流 + card id 去重)。
         if method in {"item/started", "item/completed"}:
             _cx_toolsteps_note(tid)
+        elif method == "turn/completed":
+            # 回合收尾強制落盤:節流(5s)只擋「寫盤頻率」,但最後一批更新(往往正是
+            # tool_result —— 指令的**輸出**,最有價值的那半)如果剛好落在節流窗內,
+            # 之後又沒有新事件來觸發,就永遠不會寫進檔案。實測踩到:重啟後逐字稿
+            # 只剩 🔧 指令、沒有 ↳ 結果。
+            _cx_toolsteps_note(tid, force=True)
 
 
 def _cx_cards_feed_approval(record: dict, resolved: str = "") -> None:
