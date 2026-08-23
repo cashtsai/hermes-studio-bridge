@@ -507,18 +507,124 @@ HERMES_BIN = os.path.expanduser(os.environ.get("HERMES_BIN", "")) or _first_exis
 POCKET_TERMINAL_ENABLED = os.environ.get("POCKET_TERMINAL_ENABLED", "1") != "0"
 
 # model id -> (display name, HERMES_HOME). id stays ascii for client URLs.
-# G6 (wave 2): these four are the code-level BUILTINS; the personas table in
-# canonical.db overlays them (rename / disable / soft-delete) and adds custom
-# personas. PERSONAS itself stays a plain {id: (display, home)} dict mutated
-# in place by _personas_reload(), so every existing consumer keeps working and
-# CRUD takes effect without a restart.
-_PERSONAS_BUILTIN = {
-    "yuanfang":    ("袁方 (幕僚長/main)", HOME_ROOT),
-    "pantianqing": ("潘天晴 (FLiPER)",    f"{HOME_ROOT}/profiles/fliper"),
-    "xcash":       ("XCash (PocketAgent 協調)", f"{HOME_ROOT}/profiles/xcash"),
-    "shuijing":    ("水鏡 (shuijing)",    f"{HOME_ROOT}/profiles/shuijing"),
-}
-PERSONAS = dict(_PERSONAS_BUILTIN)
+# personas 表(canonical.db)可再覆蓋(rename / disable / soft-delete)並加自訂;
+# PERSONAS 本身是 {id: (display, home)} 的普通 dict,由 _personas_reload() 原地
+# 改寫,所以既有消費端不用動、CRUD 也不必重啟。
+#
+# 2026-08-23:**移除寫死的四個人格**。原本這裡直接放
+#   yuanfang「袁方 (幕僚長/main)」、pantianqing「潘天晴 (FLiPER)」、
+#   xcash「XCash (PocketAgent 協調)」、shuijing「水鏡 (shuijing)」
+# —— 那是開發者本人的人格名、事業名(FLiPER)與組織稱謂(幕僚長),卻是**每一台安裝
+# 桌面端的機器**開機就有的預設。既是隱私外洩(審查機一連上第一眼就是這四個真名),
+# 也是產品錯誤:新使用者不認識這些人,而且 profiles/fliper 這些目錄在他機器上根本
+# 不存在。善彰定調:**人格應該由使用者自己接上的 Hermes/OpenClaw 決定,不該有預設。**
+#
+# 解析順序(第一個成功的就用):
+#   1. `$HOME_ROOT/personas.json` —— 明確設定,形狀 {id: {"name":…, "home":…}}。
+#      `home` 可省略/相對,相對於 HOME_ROOT/profiles 解析。
+#   2. 掃描檔案系統 —— HOME_ROOT 本身當 main,加上 HOME_ROOT/profiles/* 每個目錄
+#      一個人格;顯示名優先取 avatars/manifest.json 的 name,沒有就用目錄名。
+#   3. 都沒有 → 空 dict(沒接 Hermes 就沒有人格,由 app 端顯示未配置,不假造)。
+#
+# ⚠️ 為什麼要有 (1) 而不是只做 (2):現役機器上目錄名與 id **對不起來**
+# (FLiPER 的 id 是 `pantianqing`,目錄卻叫 `fliper`)。只做掃描會把 id 換掉,而歷史
+# 是按 id 存的 —— 會直接打斷既有對話。升級路徑:第一次啟動若偵測到舊的四人格佈局
+# 且沒有 personas.json,就照舊 id 產一份(見 _personas_seed_legacy_config)。
+def _personas_from_config() -> dict:
+    """`$HOME_ROOT/personas.json` → {id: (display, home)};檔案不在/壞掉回 {}。"""
+    path = os.path.join(HOME_ROOT, "personas.json")
+    try:
+        with open(path, encoding="utf-8") as f:
+            raw = json.load(f)
+    except Exception:      # noqa: BLE001 — 缺檔/壞檔一律安靜退回掃描
+        return {}
+    out = {}
+    for pid, spec in (raw.get("personas") or raw or {}).items():
+        if not isinstance(pid, str) or not pid.strip():
+            continue
+        if isinstance(spec, str):
+            spec = {"name": spec}
+        if not isinstance(spec, dict):
+            continue
+        name = str(spec.get("name") or pid)
+        home = str(spec.get("home") or "")
+        if not home:
+            home = HOME_ROOT if spec.get("main") else os.path.join(HOME_ROOT, "profiles", pid)
+        elif not os.path.isabs(home):
+            home = os.path.join(HOME_ROOT, "profiles", home)
+        out[pid] = (name, os.path.expanduser(home))
+    return out
+
+
+def _personas_from_disk() -> dict:
+    """掃 HOME_ROOT(main)+ HOME_ROOT/profiles/* → {id: (display, home)}。
+
+    顯示名優先用 avatars/manifest.json 的 name(那是使用者自己的正典),沒有就用
+    目錄名。沒有 Hermes home 就回 {} —— 不假造任何人格。
+    """
+    if not os.path.isdir(HOME_ROOT):
+        return {}
+    names = {}
+    try:
+        with open(os.path.join(HOME_ROOT, "avatars", "manifest.json"), encoding="utf-8") as f:
+            for pid, spec in ((json.load(f).get("personas") or {})).items():
+                if isinstance(spec, dict) and spec.get("name"):
+                    names[pid] = str(spec["name"])
+    except Exception:      # noqa: BLE001
+        pass
+    out = {"main": (names.get("main") or "Main", HOME_ROOT)}
+    prof = os.path.join(HOME_ROOT, "profiles")
+    try:
+        for d in sorted(os.listdir(prof)):
+            p = os.path.join(prof, d)
+            if d.startswith(".") or not os.path.isdir(p):
+                continue
+            out[d] = (names.get(d) or d, p)
+    except Exception:      # noqa: BLE001 — 沒有 profiles/ 就只有 main
+        pass
+    return out
+
+
+def _personas_seed_legacy_config() -> None:
+    """升級路徑:偵測到「舊四人格佈局」且還沒有 personas.json → 照**舊 id** 產一份。
+
+    現役機器的目錄名與 id 對不起來(FLiPER 的 id 是 `pantianqing`、目錄叫 `fliper`),
+    純掃描會換掉 id 而歷史是按 id 存的。這裡在第一次啟動時把既有對應固化成設定檔,
+    之後就走設定檔那條,升級無感、歷史不斷。**只在確定是那個佈局時才寫**,別人的
+    機器不會被塞進不屬於他的人格。
+    """
+    path = os.path.join(HOME_ROOT, "personas.json")
+    if os.path.exists(path) or not os.path.isdir(HOME_ROOT):
+        return
+    prof = os.path.join(HOME_ROOT, "profiles")
+    legacy = {"fliper": "pantianqing", "xcash": "xcash", "shuijing": "shuijing"}
+    if not all(os.path.isdir(os.path.join(prof, d)) for d in legacy):
+        return                      # 不是那個佈局 → 不碰
+    names = {}
+    try:
+        with open(os.path.join(HOME_ROOT, "avatars", "manifest.json"), encoding="utf-8") as f:
+            for pid, spec in ((json.load(f).get("personas") or {})).items():
+                if isinstance(spec, dict) and spec.get("name"):
+                    names[pid] = str(spec["name"])
+    except Exception:      # noqa: BLE001
+        pass
+    cfg = {"_note": "由 bridge 於首次啟動時從既有 profiles 佈局產生;可自行改名/增刪。",
+           "personas": {"yuanfang": {"name": names.get("yuanfang", "yuanfang"), "main": True}}}
+    for d, pid in legacy.items():
+        cfg["personas"][pid] = {"name": names.get(pid, pid), "home": d}
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
+        _log_event("personas_legacy_config_seeded", path=path, count=len(cfg["personas"]))
+    except Exception as e:  # noqa: BLE001 — 寫不進去就退回掃描,不影響啟動
+        _log_exc("_personas_seed_legacy_config", e, expected=True)
+
+
+_personas_seed_legacy_config()
+PERSONAS = _personas_from_config() or _personas_from_disk()
+# 舊名相容:程式其他地方用 _PERSONAS_BUILTIN 判斷「是不是內建人格」(相對於 db 自訂),
+# 現在「內建」= 由設定檔/掃描解析出來的那一組。
+_PERSONAS_BUILTIN = dict(PERSONAS)
 
 # ── Persona 正典身分(TG 同源)─────────────────────────────────────────
 # HOME_ROOT/avatars/ 是四人格(+自訂)的視覺與命名正典:manifest.json 提供
