@@ -186,6 +186,7 @@ class ACPSession:
         self._waiters = 0                 # A2:正在 _lock 上排隊的 turn 數(可見佇列深度)
         self._last_item_at = 0.0          # A1:本回合最後一次 provider 有動靜(monotonic)
         self._stall_fired = False         # A1:看門狗已對本回合開刀
+        self._active_tool = ""            # 文件/影像工具執行中時放寬閒置上限
         self._stall_resets: list[float] = []   # A1:30 分鐘窗內的 stall-reset 時刻
         self._sweep_resets: list[float] = []   # A3:10 分鐘窗內的巡檢 reset 時刻
         self._sweep_cooldown = False      # A3:crash-loop 冷卻中(下個使用者回合解除)
@@ -383,8 +384,13 @@ class ACPSession:
                 elif kind == "tool_call":
                     title = (upd.get("title") or "").strip()
                     name = (title.split(":", 1)[0].strip() or "tool")
+                    self._active_tool = name
                     q.put_nowait(("tool_start", {"name": name, "cmd": _content_text(upd)}))
                 elif kind == "tool_call_update":
+                    status = str(upd.get("status") or "").lower()
+                    if status in {"completed", "complete", "done", "failed",
+                                  "error", "cancelled", "canceled"}:
+                        self._active_tool = ""
                     q.put_nowait(("tool_result", {"text": _content_text(upd),
                                                   "status": upd.get("status", "")}))
                 elif kind == "usage_update":
@@ -490,6 +496,9 @@ class ACPSession:
         個坑)。每片實測耗時 >3× 片長就視為 OS 睡眠縫隙,重記起點不開刀。
         """
         stall_secs = _env_float("ACP_TURN_STALL_SECS", 180.0)
+        tool_stall_secs = max(
+            stall_secs, _env_float("ACP_TOOL_STALL_SECS", 900.0)
+        )
         slice_secs = min(5.0, max(0.05, stall_secs / 10))
         try:
             while True:
@@ -499,11 +508,14 @@ class ACPSession:
                     self._last_item_at = time.monotonic()   # 睡眠喚醒縫隙,原諒
                     continue
                 idle = time.monotonic() - self._last_item_at
-                if idle < stall_secs:
+                limit = tool_stall_secs if self._active_tool else stall_secs
+                if idle < limit:
                     continue
                 self._stall_fired = True
                 _log("acp_turn_stalled", home=self.home,
-                     idle_secs=int(idle), stall_secs=int(stall_secs))
+                     idle_secs=int(idle), stall_secs=int(limit),
+                     scope="tool" if self._active_tool else "turn",
+                     tool=self._active_tool or None)
                 try:
                     await asyncio.wait_for(self.cancel(), timeout=2.0)
                 except Exception:  # noqa: BLE001 — cancel 是 advisory,失敗照樣開刀
@@ -590,6 +602,7 @@ class ACPSession:
             yield ("status", {"state": "running", "label": "Hermes 開始處理"})
             watchdog = None
             self._stall_fired = False
+            self._active_tool = ""
             if resilience_on():
                 self._last_item_at = time.monotonic()
                 watchdog = asyncio.create_task(self._watch_turn())
@@ -627,7 +640,10 @@ class ACPSession:
                 # 誠實終態:不裝沒事,也不讓呼叫端永等。reset() 已把程序
                 # 收掉,下一回合 ensure_started 會重載 canonical session。
                 self._note_stall_reset()
-                yield ("error", "Hermes 回合卡住,已重置")
+                # This is a terminal stall, not a transient ACP error. The
+                # bridge must not launch a second cold `hermes -z` turn for
+                # the same document after the watchdog already reset it.
+                yield ("stall", "Hermes 回合卡住,已重置")
             elif total:
                 self._note_turn_ok()
         finally:

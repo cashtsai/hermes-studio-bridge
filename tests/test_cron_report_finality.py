@@ -19,6 +19,37 @@ import bridge  # noqa: E402
 
 
 class TestCronReportFinality(unittest.TestCase):
+    def test_clean_report_does_not_cut_on_later_morning_oracle_reference(self):
+        # The evening report itself mentions 晨卦 in a later bold bullet. The
+        # cleaner must keep the title and every section, not treat that bullet
+        # as a new report start.
+        report = (
+            "**水鏡晚卦｜2026-09-14**\n"
+            "主卦：46.升 / 變卦：40.解 / 動爻：三、四爻\n\n"
+            "**卦象先說**\n"
+            "升由累進轉向解困。\n\n"
+            "**今日給善彰**\n"
+            "1. 先處理一個卡點。\n"
+            "2. **扣回晨卦家人變屯**：先定位置。\n"
+            "3. **扣回晨卦家人變屯與變卦解**：不要把推測當成果。\n\n"
+            "**宜**\n"
+            "- 只挑一個節點。\n\n"
+            "**明日第一步**\n"
+            "留下可核對的結果。"
+        )
+        cleaned = bridge._clean_report(report)
+        self.assertEqual(cleaned, report)
+        self.assertTrue(cleaned.startswith("**水鏡晚卦｜2026-09-14**"))
+        self.assertIn("**卦象先說**", cleaned)
+        self.assertIn("**明日第一步**", cleaned)
+
+    def test_clean_report_still_removes_leading_english_preamble(self):
+        raw = "I have gathered the inputs. Now composing.\n\n**晨報｜2026-09-14**\n\n正式正文"
+        self.assertEqual(
+            bridge._clean_report(raw),
+            "**晨報｜2026-09-14**\n\n正式正文",
+        )
+
     def test_tool_call_progress_is_not_indexed_before_final_reply(self):
         home = os.path.join(_TMP, "home")
         os.makedirs(os.path.join(home, "cron"), exist_ok=True)

@@ -831,7 +831,10 @@ class CodexThreadDigest(ApprovalCardMixin):
     _appr_default_title = "Codex approval"
 
     def __init__(self):
-        self.store = SessionCardStore()
+        # CX can receive canonical catch-up cards after live app-server cards.
+        # Keep its snapshot/order chronological; CC and persona stores retain
+        # their existing arrival-order semantics.
+        self.store = SessionCardStore(chronological=True)
         self.agent_text: dict[str, str] = {}   # itemId → delta 累積文字
         self.busy = False
         self.prompt = None                     # pending approval title（label 素材）
@@ -1068,7 +1071,8 @@ class SessionCardStore(ApprovalCardMixin):
     _RING_MAX_DEFAULT = int(os.environ.get("POCKET_CARD_RING_MAX", "8000"))
     _CARDS_MAX_DEFAULT = int(os.environ.get("POCKET_CARD_STORE_MAX", "2000"))
 
-    def __init__(self, ring_max: int | None = None, cards_max: int | None = None):
+    def __init__(self, ring_max: int | None = None, cards_max: int | None = None,
+                 chronological: bool = False):
         ring_max = self._RING_MAX_DEFAULT if ring_max is None else ring_max
         cards_max = self._CARDS_MAX_DEFAULT if cards_max is None else cards_max
         self.seq = 0
@@ -1078,9 +1082,16 @@ class SessionCardStore(ApprovalCardMixin):
         self.card_seq: dict[str, int] = {}  # card id → 最後 upsert 的 seq（before_seq 分頁）
         self.ring_max = ring_max
         self.cards_max = cards_max
+        self.chronological = chronological
         self.status: dict = {}            # 最後一筆 session.status data
         self.turn_id = ""                 # 進行中 turn 的 id（"" = 無）
         self.subscribers = 0              # 活躍 SSE 連線數（follower 決定要不要巡 status）
+        # CC input accepted 之後，Claude Code 可能把 shell 丟到背景並立刻回到
+        # prompt。這時 tmux 的 busy=false 不代表這次工作已經有結果；bridge
+        # 用卡片序號追蹤下一個真正的進度事件，避免 UI 落回「待命」死寂。
+        self.dispatch_pending = False
+        self.dispatch_started_at = 0.0
+        self.dispatch_card_seq = 0
         # 人話 label 的素材（digest 時順手更新）
         self.last_tool = ""               # 本 turn 最後一個 tool_call 的工具名
         self.saw_output = False           # 本 turn 是否已出現助手文字
@@ -1141,13 +1152,29 @@ class SessionCardStore(ApprovalCardMixin):
                     card["ts"] = min(prev_ts, new_ts)
         else:
             self.order.append(card["id"])
-            if len(self.order) > self.cards_max:
+            if not self.chronological and len(self.order) > self.cards_max:
                 drop = self.order[:len(self.order) - self.cards_max]
                 del self.order[:len(self.order) - self.cards_max]
                 for cid in drop:
                     self.cards.pop(cid, None)
                     self.card_seq.pop(cid, None)
         self.cards[card["id"]] = card
+        if self.chronological:
+            # A request-time reseed may discover an older turn after live cards
+            # are already present. Arrival order would put that history at the
+            # tail, making the app jump backwards; stable sorting preserves the
+            # arrival order for cards with the same timestamp.
+            self.order.sort(key=lambda cid: (
+                self.cards.get(cid, {}).get("ts")
+                if isinstance(self.cards.get(cid, {}).get("ts"), (int, float))
+                else float("inf"),
+            ))
+            if len(self.order) > self.cards_max:
+                drop = self.order[:len(self.order) - self.cards_max]
+                del self.order[:len(self.order) - self.cards_max]
+                for cid in drop:
+                    self.cards.pop(cid, None)
+                    self.card_seq.pop(cid, None)
         ev = self._push("card.upsert", {"card": card})
         self.card_seq[card["id"]] = ev["seq"]
         return ev

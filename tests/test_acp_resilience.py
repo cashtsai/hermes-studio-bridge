@@ -66,7 +66,7 @@ class TestA1TurnWatchdog(_EnvBase):
         async for item in s.prompt_stream("hi"):
             items.append(item)
 
-        self.assertEqual(items[-1], ("error", "Hermes 回合卡住,已重置"))
+        self.assertEqual(items[-1], ("stall", "Hermes 回合卡住,已重置"))
         self.assertFalse(s._lock.locked(), "看門狗開刀後 per-persona 鎖必須釋放")
         self.assertIsNone(s.proc, "reset() 必須把卡住的程序收掉")
         self.assertEqual(len(s._stall_resets), 1)
