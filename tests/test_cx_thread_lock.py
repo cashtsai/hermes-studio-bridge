@@ -15,7 +15,7 @@ loop 每幾秒重試一次只寫一行 error type、UI 完全沒有訊號 → �
 
 這裡驗六件事:
   1. 分類:conflict → CX_THREAD_LOCKED;**一般 app-server 錯誤不得誤判**。
-  2. POST 兩條 input 路由(v1 / v2)回 409 + zh-TW 人話。
+  2. POST 兩條 input 路由(v1 / v2):鎖住 → 入佇列(queued=True),不回 409(2026-09-19 改版)。
   3. 錯誤卡進到**那條 session** 的卡片流。
   4. 狀態 payload(v1 summary / v2 清單 / 卡片流 session.status)帶 locked。
   5. warm loop 抑制窗:窗內不重試,窗過了才重試。
@@ -407,7 +407,11 @@ class RecoveryProbeTests(unittest.IsolatedAsyncioTestCase):
 
 
 class HttpTests(unittest.TestCase):
-    """2. 兩條 input 路由都要 409 + zh-TW 人話(不能再是 CX_TURN_IN_FLIGHT)。"""
+    """2. input 路由的鎖行為。
+
+    2026-09-19 契約改版:鎖住**不再回 409** —— 訊息入佇列(queued=True),
+    解鎖偵測後自動送出;使用者看到的是「已排隊」而不是紅字「送不出去」。
+    409 + CX_THREAD_LOCKED 只保留給狀態端點語意;非鎖錯誤(busy 等)不變。"""
 
     def setUp(self):
         from fastapi.testclient import TestClient
@@ -426,25 +430,36 @@ class HttpTests(unittest.TestCase):
         bridge._CX_CARD_DIGESTS.update(self.saved_digests)
         reset_auth_throttle()
 
-    def _assert_locked_response(self, r):
-        self.assertEqual(r.status_code, 409, r.text)
-        err = r.json().get("error") or {}
-        self.assertEqual(err.get("code"), "CX_THREAD_LOCKED", r.text)
-        self.assertEqual(err.get("message"), bridge.CX_THREAD_LOCKED_MESSAGE)
-        self.assertIn("thread 寫入鎖", err.get("message"))
-        self.assertEqual(r.headers.get("X-Error-Code"), "CX_THREAD_LOCKED")
+    def _assert_queued_response(self, r):
+        self.assertEqual(r.status_code, 200, r.text)
+        body = r.json()
+        self.assertTrue(body.get("queued"), r.text)
+        self.assertEqual(body.get("delivery"), "queued", r.text)
 
-    def test_v1_input_returns_409(self):
+    def test_v1_input_queues_instead_of_409(self):
         r = self.http.post(f"/codexsessions/{LOCKED_TID}/input",
                            json={"text": "在嗎", "client_id": "cid-v1"},
                            headers=self.auth)
-        self._assert_locked_response(r)
+        self._assert_queued_response(r)
+        self.assertEqual(self.client.pending_count(LOCKED_TID), 1,
+                         "鎖住時的訊息必須留在佇列等解鎖,不能消失")
 
-    def test_v2_input_returns_409(self):
+    def test_v2_input_queues_instead_of_409(self):
         r = self.http.post(f"/app/v2/sessions/codex:{LOCKED_TID}/input",
                            json={"content": "在嗎", "client_id": "cid-v2"},
                            headers=self.auth)
-        self._assert_locked_response(r)
+        self._assert_queued_response(r)
+        self.assertEqual(self.client.pending_count(LOCKED_TID), 1)
+
+    def test_known_locked_thread_queues_without_touching_app_server(self):
+        """狀態機已登記鎖 → 直接入佇列,連 thread/resume 都不必打。"""
+        self.client.note_thread_locked(LOCKED_TID, REAL_RPC_MESSAGE)
+        before = self.client.call.count("thread/resume")
+        r = self.http.post(f"/codexsessions/{LOCKED_TID}/input",
+                           json={"text": "還在嗎", "client_id": "cid-pre"},
+                           headers=self.auth)
+        self._assert_queued_response(r)
+        self.assertEqual(self.client.call.count("thread/resume"), before)
 
     def test_v1_input_also_pushes_the_card(self):
         self.http.post(f"/codexsessions/{LOCKED_TID}/input",
@@ -479,6 +494,92 @@ class HttpTests(unittest.TestCase):
         r = self.http.get("/codexsessions/t-free/status", headers=self.auth)
         self.assertEqual(r.status_code, 200, r.text)
         self.assertIs(r.json()["session"]["locked"], False)
+
+
+class QueueOnLockTests(unittest.TestCase):
+    """2026-09-19:鎖住入佇列之後的三個新零件。
+
+    a. 有訊息排隊時,探測窗從 300s 縮成 QUEUED 短窗(送達延遲的決定因素)。
+    b. 解鎖(resume 成功)當下自動 drain —— 沒有 turn 在跑,「等 turn 結束再
+       drain」的舊時機永遠不會來。
+    c. drain 撞到桌面 re-grab 的鎖 → 塞回隊首,不得當失敗丟掉使用者的話。
+    """
+
+    def setUp(self):
+        self.saved_app = bridge.CODEX_APP
+        self.saved_digests = dict(bridge._CX_CARD_DIGESTS)
+        bridge._CX_CARD_DIGESTS.clear()
+
+    def tearDown(self):
+        bridge.CODEX_APP = self.saved_app
+        bridge._CX_CARD_DIGESTS.clear()
+        bridge._CX_CARD_DIGESTS.update(self.saved_digests)
+
+    def test_retry_window_shrinks_when_inputs_are_queued(self):
+        c = fresh_client()
+        c.note_thread_locked(LOCKED_TID, REAL_RPC_MESSAGE)
+        self.assertFalse(c.thread_lock_retry_due(LOCKED_TID),
+                         "沒人排隊 → 維持長窗,窗內不重試")
+        c.enqueue_input(LOCKED_TID, [{"type": "text", "text": "hi"}])
+        saved = bridge.CODEX_THREAD_LOCK_RETRY_QUEUED_SECS
+        bridge.CODEX_THREAD_LOCK_RETRY_QUEUED_SECS = 0.0
+        try:
+            self.assertTrue(c.thread_lock_retry_due(LOCKED_TID),
+                            "有人排隊 → 短窗過了就該放行探測")
+        finally:
+            bridge.CODEX_THREAD_LOCK_RETRY_QUEUED_SECS = saved
+
+    def test_unlock_drains_pending_queue(self):
+        async def main():
+            c = fresh_client(resume_error=locked_error())
+            bridge.CODEX_APP = c
+            with self.assertRaises(bridge.CodexAppServerError):
+                await c.ensure_thread_loaded(LOCKED_TID)     # 進入鎖定
+            c.enqueue_input(LOCKED_TID, [{"type": "text", "text": "排隊中"}],
+                            text="排隊中")
+            c.call.resume_error = None                        # 桌面放開了
+            c.thread_locks[LOCKED_TID]["next_retry_at"] = 0.0  # 窗到期
+            await c.ensure_thread_loaded(LOCKED_TID)          # 解鎖探針
+            for _ in range(50):                               # 等 drain task
+                if c.pending_count(LOCKED_TID) == 0:
+                    break
+                await asyncio.sleep(0.02)
+            self.assertEqual(c.pending_count(LOCKED_TID), 0,
+                             "解鎖後佇列必須自動送出,不能等一個不存在的 turn 結束")
+            self.assertGreaterEqual(c.call.count("turn/start"), 1)
+        run(main())
+
+    def test_drain_requeues_on_relock_instead_of_dropping(self):
+        async def main():
+            c = fresh_client()
+            bridge.CODEX_APP = c
+            await c.ensure_thread_loaded(LOCKED_TID)          # 先正常載入
+            c.enqueue_input(LOCKED_TID, [{"type": "text", "text": "別丟我"}],
+                            text="別丟我")
+
+            class Relock(FakeCall):
+                """turn/start 撞鎖 = 桌面在 drain 的空隙把鎖搶回去。"""
+                async def __call__(self, method, params=None, timeout=None):
+                    self.calls.append(method)
+                    if method == "turn/start":
+                        raise locked_error()
+                    return {}
+
+            c.call = Relock()
+            await c.drain_pending(LOCKED_TID)
+            self.assertEqual(c.pending_count(LOCKED_TID), 1,
+                             "鎖住不是失敗:訊息必須塞回隊首,不能被丟掉")
+        run(main())
+
+    def test_drain_is_single_flight_per_thread(self):
+        async def main():
+            c = fresh_client()
+            c.enqueue_input(LOCKED_TID, [{"type": "text", "text": "x"}])
+            c._draining_threads = {LOCKED_TID}                # 另一條 drain 進行中
+            await c.drain_pending(LOCKED_TID)
+            self.assertEqual(c.pending_count(LOCKED_TID), 1,
+                             "重入的 drain 必須直接讓路,不能搶著 pop")
+        run(main())
 
 
 if __name__ == "__main__":

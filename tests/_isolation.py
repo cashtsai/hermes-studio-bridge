@@ -60,6 +60,10 @@ _ENV_TMP_DEFAULTS = {
     "HERMES_HOME_ROOT":       os.path.join(_TMP, "hermes-home"),
     # bridge.py:ccsess 常駐名單(活的 production 檔,收編會改寫+備份)
     "CCSESS_CONF":            os.path.join(_TMP, "ccsess", "sessions.conf"),
+    # bridge.py:codex daemon 自療(2026-09-19)。0 = 停用 —— 測試走到
+    # managed-connect 失敗的路徑時,絕不能真的去 spawn
+    # `codex app-server daemon start`(機器上有真 codex,會啟動真 daemon)。
+    "CODEX_DAEMON_AUTOSTART_COOLDOWN_SECS": "0",
 }
 for _k, _v in _ENV_TMP_DEFAULTS.items():
     os.environ.setdefault(_k, _v)

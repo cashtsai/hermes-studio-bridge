@@ -4680,9 +4680,22 @@ _CX_THREAD_ID_RE = re.compile(_CX_UUID_PATTERN)
 # 「桌面端有沒有放開」的探針,所以 banner 不需要重啟 bridge 就會自己消失。
 CODEX_THREAD_LOCK_RETRY_SECS = float(
     os.environ.get("CODEX_THREAD_LOCK_RETRY_SECS", "300"))
+# 鎖住期間**有訊息在排隊**時的探測窗:300s 對「桌面剛關掉對話、使用者在手機
+# 等回覆」太殘忍(最壞白等五分鐘)。有人排隊 → 用短窗頻繁探,沒人排隊 → 維持
+# 長窗省 log。(2026-09-19 鎖住不再回 409 改為入佇列,這個窗決定送達延遲。)
+CODEX_THREAD_LOCK_RETRY_QUEUED_SECS = float(
+    os.environ.get("CODEX_THREAD_LOCK_RETRY_QUEUED_SECS", "20"))
+# daemon 自療:managed socket 連不上時,試著用官方 CLI 把 daemon 拉起來
+# (`codex app-server daemon start`,冪等)再重連一次。冷卻窗防止 daemon 真的
+# 壞掉時每次連線都重複 spawn。0 = 停用。
+# (2026-09-19 事故:daemon backend=pid 非 launchd 管,8/24 死掉躺了快一個月,
+# bridge 靜默退 stdio、桌面開內建 app-server 搶鎖 —— 自療讓這事不再依賴
+# 某一台機器上有沒有裝 keepalive。)
+CODEX_DAEMON_AUTOSTART_COOLDOWN_SECS = float(
+    os.environ.get("CODEX_DAEMON_AUTOSTART_COOLDOWN_SECS", "600"))
 CX_THREAD_LOCKED_MESSAGE = (
     "此對話正被桌面版 Codex/ChatGPT 佔用(thread 寫入鎖)。"
-    "請在桌面 app 關閉這個對話後再試,或改用另一條 session。")
+    "送出的訊息會自動排隊,桌面釋放後就會送出;急用可改另一條 session。")
 CX_THREAD_LOCKED_CARD_TEXT = "⚠️ " + CX_THREAD_LOCKED_MESSAGE
 CX_THREAD_UNLOCKED_CARD_TEXT = (
     "✅ 桌面版 Codex/ChatGPT 已釋放這個對話的寫入鎖,現在可以正常送出了。")
@@ -5190,6 +5203,43 @@ class CodexAppServerClient:
                    effective_mode=_effective_app_server_mode(),
                    isolated=_codex_isolated(), **fields)
 
+    # daemon 自療的冷卻時戳(monotonic)。類別屬性當預設,首次嘗試後成為實例屬性。
+    _daemon_autostart_last = 0.0
+
+    async def _maybe_autostart_daemon_locked(self) -> bool:
+        """managed socket 連不上時,試著把官方 daemon 拉起來。
+
+        `codex app-server daemon start` 是冪等的(活著回 running、死了才拉),
+        用官方 CLI 而不是自己 spawn app-server —— 後者就是「第二顆 writer」
+        災難的起點。回 True = 有嘗試且 CLI 回 0(值得再重連一次)。
+        冷卻窗 CODEX_DAEMON_AUTOSTART_COOLDOWN_SECS(0 = 停用整個自療)。
+        """
+        if CODEX_DAEMON_AUTOSTART_COOLDOWN_SECS <= 0:
+            return False
+        now = time.monotonic()
+        if now - self._daemon_autostart_last < CODEX_DAEMON_AUTOSTART_COOLDOWN_SECS:
+            return False
+        self._daemon_autostart_last = now
+        bin_ = _resolve_codex_bin()
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                bin_, "app-server", "daemon", "start",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT)
+            try:
+                out, _ = await asyncio.wait_for(proc.communicate(), timeout=20)
+            except asyncio.TimeoutError:
+                proc.kill()
+                _log_event("codex_daemon_autostart_timeout", bin=bin_)
+                return False
+            _log_event("codex_daemon_autostart", bin=bin_, rc=proc.returncode,
+                       output=(out or b"").decode("utf-8", "replace")[:200])
+            return proc.returncode == 0
+        except Exception as exc:  # noqa: BLE001
+            _log_exc("CodexAppServerClient._maybe_autostart_daemon_locked",
+                     exc, expected=True)
+            return False
+
     async def _ensure_started_locked(self):
         if self.ws is not None or (self.proc and self.proc.returncode is None):
             return
@@ -5209,12 +5259,32 @@ class CodexAppServerClient:
                 _log_event("codex_managed_connect_failed",
                            socket=CODEX_APP_SERVER_SOCKET, mode=mode,
                            error=type(e).__name__, error_message=str(e)[:200])
-                if mode == "managed":
+                # daemon 自療(2026-09-19):daemon 是 backend=pid、非 launchd 管,
+                # 重開機/崩潰後沒人拉起 —— 8/24 死掉躺了快一個月,bridge 靜默退
+                # stdio、桌面開內建 app-server 搶 thread 鎖。與其依賴每台機器都
+                # 記得裝 keepalive,bridge 在需要的當下自己 `daemon start`(官方
+                # CLI、冪等)再重連一次。冷卻窗擋住 daemon 真壞掉時的重複 spawn。
+                if await self._maybe_autostart_daemon_locked():
+                    try:
+                        await self._connect_managed_locked()
+                        managed_error = None
+                        _log_event("codex_daemon_autostart_reconnected",
+                                   socket=CODEX_APP_SERVER_SOCKET)
+                    except Exception as e2:  # noqa: BLE001
+                        self.ws = None
+                        self.transport = ""
+                        managed_error = e2
+                        _log_event("codex_managed_connect_failed",
+                                   socket=CODEX_APP_SERVER_SOCKET, mode=mode,
+                                   error=type(e2).__name__,
+                                   error_message=str(e2)[:200],
+                                   after="daemon-autostart")
+                if mode == "managed" and managed_error is not None:
                     # 刻意選 daemon-only 的人:大聲壞掉,不要偷偷開第二顆
                     # app-server 去搶 thread-store 的 writer lock。
                     raise CodexAppServerError(
                         "managed Codex app-server unavailable; refusing to spawn a second server"
-                    ) from e
+                    ) from managed_error
         if self.ws is not None:
             self._note_transport("unix-websocket", socket=CODEX_APP_SERVER_SOCKET)
         else:
@@ -6490,6 +6560,15 @@ class CodexAppServerClient:
         if self.clear_thread_lock(thread_id):
             _log_event("codex_thread_unlocked", thread=thread_id[:16])
             _cx_feed_thread_unlocked(thread_id)
+            # 鎖住期間送的訊息都在佇列裡(2026-09-19 起鎖住不回 409)——
+            # 解鎖的當下就是送出時機,不能等下一次 turn 結束(沒有 turn 在跑,
+            # 那個時機永遠不來)。用 create_task 避免重入:這裡可能正處在
+            # start_turn → ensure_thread_loaded 的呼叫鏈上,drain 內部的
+            # is_active 檢查會讓它與呼叫者的 turn 自然錯開。
+            if self.pending_count(thread_id) > 0:
+                task = asyncio.create_task(self.drain_pending(thread_id))
+                _BG_TASKS.add(task)
+                task.add_done_callback(_BG_TASKS.discard)
 
     async def start_turn(self, thread_id: str, input_items: list, client_id: str | None = None,
                          cwd: str | None = None):
@@ -6795,7 +6874,16 @@ class CodexAppServerClient:
 
     async def drain_pending(self, thread_id: str) -> None:
         """turn 結束後送出佇列裡的下一則(一次一則:codex 是單 writer)。
-        失敗不吞:把該則丟掉並記錄,否則會永遠卡在隊首反覆撞同一面牆。"""
+        失敗不吞:把該則丟掉並記錄,否則會永遠卡在隊首反覆撞同一面牆。
+
+        防重入(2026-09-19):入口從一個(turn 結束)變兩個(+ 解鎖時),並發
+        drain 會各自 pop 一則同時 start_turn —— 後到的撞 turn-in-flight,
+        那則使用者訊息就被當失敗丟掉。同 thread 同時只准一條 drain 在跑。"""
+        if not hasattr(self, "_draining_threads"):
+            self._draining_threads = set()
+        if thread_id in self._draining_threads:
+            return
+        self._draining_threads.add(thread_id)
         try:
             while self.pending_inputs.get(thread_id):
                 if self.is_active(thread_id):
@@ -6809,6 +6897,15 @@ class CodexAppServerClient:
                                remaining=len(self.pending_inputs.get(thread_id) or []))
                     return                  # 開跑了 → 下一則等這輪結束
                 except Exception as exc:    # noqa: BLE001
+                    if _codex_thread_lock_conflict(exc) is not None:
+                        # 鎖又被搶回去(桌面 app 的 re-grab race,memory 有
+                        # 記載)。這不是失敗是暫時狀態 —— 塞回**隊首**保序,
+                        # 等下一個探測窗再送;丟掉等於把使用者的話吃掉。
+                        self.pending_inputs[thread_id].insert(0, item)
+                        _log_event("codex_pending_input_relocked",
+                                   thread=thread_id[:16],
+                                   remaining=len(self.pending_inputs.get(thread_id) or []))
+                        return
                     _log_event("codex_pending_input_failed", thread=thread_id[:16],
                                error=type(exc).__name__,
                                error_message=str(exc)[:200])
@@ -6816,6 +6913,7 @@ class CodexAppServerClient:
                     # 不推張錯誤卡的話,他到死都不知道這則根本沒送出去。
                     _cx_feed_queue_drop(thread_id, item, exc)
         finally:
+            self._draining_threads.discard(thread_id)
             # 只在成功路徑同步 → 整個佇列全部失敗清空時 depth 永遠卡著不歸零,
             # 狀態列就一直掛著「另有 N 則排隊」。無論怎麼離開都要同步一次。
             _cx_sync_queue_depth(thread_id)
@@ -6873,9 +6971,23 @@ class CodexAppServerClient:
         return thread_id in self.thread_locks
 
     def thread_lock_retry_due(self, thread_id: str) -> bool:
-        """鎖定中且抑制窗已過 → 允許再試一次(同時是「桌面端放開了沒」的探針)。"""
+        """鎖定中且抑制窗已過 → 允許再試一次(同時是「桌面端放開了沒」的探針)。
+
+        有訊息排隊時改用短窗(CODEX_THREAD_LOCK_RETRY_QUEUED_SECS):鎖住已不
+        回 409 而是入佇列,這個窗直接決定「桌面放開後多久送達」——300s 的
+        止血窗是為 log 風暴設的,對排隊中的使用者是白等。上次偵測時刻由
+        next_retry_at 反推(它固定 = 偵測時刻 + 長窗),不另存欄位。"""
         rec = self.thread_locks.get(thread_id)
-        return bool(rec) and time.monotonic() >= float(rec.get("next_retry_at") or 0.0)
+        if not rec:
+            return False
+        now = time.monotonic()
+        due = float(rec.get("next_retry_at") or 0.0)
+        if now >= due:
+            return True
+        if self.pending_count(thread_id) <= 0:
+            return False
+        last_detect = due - CODEX_THREAD_LOCK_RETRY_SECS
+        return now >= last_detect + CODEX_THREAD_LOCK_RETRY_QUEUED_SECS
 
     def thread_lock_info(self, thread_id: str) -> dict | None:
         """狀態端點/卡片流共用的 lock 描述;沒鎖 → None。"""
@@ -9518,10 +9630,12 @@ async def codex_session_input(thread_id: str, request: Request):
         return {"ok": True, "thread_id": thread_id, "duplicate": True,
                 **await _cx_input_replay(prior)}
     try:
-        # 上一輪還在跑 → 收下入佇列(delivery=queued),**絕不回 4xx**。
-        # 舊行為是直送 app-server 撞牆 → 409/502 → app 紅字「送出失敗」,而且 409
-        # 的人話還是「會話目前沒有在執行」,跟真相完全相反。CC 早有 queued 語意。
-        if CODEX_APP.is_active(thread_id):
+        # 上一輪還在跑 / thread 被桌面鎖住 → 收下入佇列(delivery=queued),
+        # **絕不回 4xx**。舊行為兩種都直接紅字:忙碌回 409「會話沒有在執行」
+        # (語意相反),鎖住回 409「被桌面版佔用,送不出去」(2026-09-19 老闆
+        # 實測,使用者只能乾等)。CC 早有 queued 語意;鎖住入佇列後,解鎖偵測
+        # (ensure_thread_loaded 成功)會自動 drain,使用者什麼都不用做。
+        def _accept_queued() -> dict:
             depth = CODEX_APP.enqueue_input(thread_id, input_items,
                                             client_id=client_id,
                                             cwd=body.get("cwd"), text=text)
@@ -9534,7 +9648,15 @@ async def codex_session_input(thread_id: str, request: Request):
             res = {"turn": None, "delivery": "queued",
                    "queued": True, "queue_depth": depth}
             _cx_input_settle(entry, res)
+            # 鎖住而入佇列的話,要把「為什麼在排隊」的鎖卡也推進卡片流 ——
+            # 舊 409 路徑由 _codex_http_error 推(create_if_missing=True),
+            # 新路徑不走它,不補的話使用者只看到泡泡排著、不知道在等什麼。
+            if CODEX_APP.is_thread_locked(thread_id):
+                _cx_feed_thread_locked(thread_id, create_if_missing=True)
             return {"ok": True, "thread_id": thread_id, **res}
+
+        if CODEX_APP.is_active(thread_id) or CODEX_APP.is_thread_locked(thread_id):
+            return _accept_queued()
         try:
             started = await CODEX_APP.start_turn(thread_id, input_items,
                                                  client_id=client_id,
@@ -9548,6 +9670,10 @@ async def codex_session_input(thread_id: str, request: Request):
             _cx_input_settle(entry, res)
             return {"ok": True, "thread_id": thread_id, **res}
         except Exception as e:  # noqa: BLE001
+            # 直送當下才第一次撞鎖(桌面剛搶走、狀態機還沒登記)→ 一樣入佇列。
+            # start_turn 內部已把鎖記進狀態機 + 推了 locked 卡,這裡只補收訊息。
+            if _codex_thread_lock_conflict(e) is not None:
+                return _accept_queued()
             _codex_http_error(e)
     except BaseException:
         _cx_input_release(entry)     # 失敗要放掉 claim,不然重試被自己擋整個 TTL
@@ -15688,7 +15814,7 @@ async def v2_session_input(session_id: str, request: Request):
             return {"ok": True, "session_id": session_id, "accepted": True,
                     "duplicate": True, **await _cx_input_replay(prior)}
         try:
-            if CODEX_APP.is_active(src[1]):    # 忙碌 → 入佇列(同 v1,不回 4xx)
+            def _accept_queued_v2() -> dict:
                 depth = CODEX_APP.enqueue_input(src[1], items, client_id=client_id,
                                                 text=text)
                 _cx_feed_input_accepted(src[1], client_id, text, attachments,
@@ -15698,10 +15824,22 @@ async def v2_session_input(session_id: str, request: Request):
                 # persona 的 v2 input 早就有回;CX 少了它 → app 永遠當成沒排隊。
                 res = {"delivery": "queued", "queued": True, "queue_depth": depth}
                 _cx_input_settle(entry, res)
+                # 同 v1:鎖住入佇列要補推鎖卡(舊 409 路徑由 _codex_http_error 推)。
+                if CODEX_APP.is_thread_locked(src[1]):
+                    _cx_feed_thread_locked(src[1], create_if_missing=True)
                 return {"ok": True, "session_id": session_id, "accepted": True, **res}
+
+            # 忙碌/鎖住 → 入佇列(同 v1,不回 4xx)。鎖住入佇列 = 2026-09-19
+            # 契約改版:解鎖偵測會自動 drain,使用者不再看到「被桌面佔用」紅字。
+            if CODEX_APP.is_active(src[1]) or CODEX_APP.is_thread_locked(src[1]):
+                return _accept_queued_v2()
             try:
                 await CODEX_APP.start_turn(src[1], items, client_id=client_id)
             except CodexAppServerError as e:
+                # 直送當下才第一次撞鎖 → 一樣入佇列(鎖已由 start_turn 記進
+                # 狀態機 + 推卡,這裡只補收訊息)。
+                if _codex_thread_lock_conflict(e) is not None:
+                    return _accept_queued_v2()
                 _codex_http_error(e)
             _cx_feed_input_accepted(src[1], client_id, text, attachments,
                                     typed_text=text, create_if_missing=True)
