@@ -5,7 +5,7 @@ import os
 import sys
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 _TMP = tempfile.mkdtemp(prefix="persona-timeout-canon-")
 os.environ.setdefault("POCKET_CANON_DB", os.path.join(_TMP, "canonical.db"))
@@ -81,6 +81,34 @@ class TestPersonaTimeoutCleanup(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(session.cancel_calls, 1)
         self.assertEqual(session.reset_calls, 1)
         self.assertFalse(session.is_busy())
+
+    async def test_acp_stall_does_not_start_second_cold_fallback(self):
+        """ACP 看門狗已重置後,文件回合不可再疊跑一次 hermes -z。"""
+        class StallSession:
+            def __init__(self):
+                self.cancel_calls = 0
+                self.reset_calls = 0
+
+            def is_busy(self):
+                return False
+
+            async def cancel(self):
+                self.cancel_calls += 1
+
+            async def reset(self):
+                self.reset_calls += 1
+
+            async def prompt_stream(self, _prompt):
+                yield ("stall", "Hermes 回合卡住,已重置")
+
+        session = StallSession()
+        bridge.POOL = FakePool(session)
+        with patch.object(bridge, "run_hermes", new=AsyncMock(
+                return_value="不應該被呼叫")) as fallback:
+            chunks = [item async for item in bridge._persona_content_stream("xcash", "file")]
+        self.assertTrue(any("文件處理" in (value or "") for kind, value in chunks
+                            if kind == "content"))
+        fallback.assert_not_awaited()
 
     async def test_caller_cancel_releases_lock_without_forced_reset(self):
         session = FakeSession(stall=True)

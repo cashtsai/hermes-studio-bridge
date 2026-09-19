@@ -99,6 +99,12 @@ SSE_KEEPALIVE_SECS = 2.0
 # deliberately configurable so the cleanup path can be exercised quickly in
 # regression tests while production keeps the five-minute ceiling.
 PERSONA_STALL_LIMIT_SECS = float(os.environ.get("PERSONA_STALL_LIMIT_SECS", "300"))
+# A document/vision tool can legitimately spend several minutes without an
+# ACP event. Keep this separate from ordinary model-turn silence so a slow
+# file inspection gets time to finish without making a stuck chat invisible.
+PERSONA_TOOL_STALL_LIMIT_SECS = float(
+    os.environ.get("PERSONA_TOOL_STALL_LIMIT_SECS", "900")
+)
 
 # A follow stream that has sent ZERO data (keepalives don't count) for this long
 # gets disconnected — a client that hangs without reading otherwise pins the
@@ -4059,6 +4065,7 @@ async def _persona_content_stream(model: str, prompt: str):
     completed = False
     thought_buf: list[str] = []
     steps: list[dict] = []          # 工具步驟 — 不進正文,收尾摺疊附錄
+    tool_active = False
 
     def flush_thought():
         if thought_buf:
@@ -4124,9 +4131,15 @@ async def _persona_content_stream(model: str, prompt: str):
                 kind, val = await asyncio.wait_for(q.get(), timeout=SSE_KEEPALIVE_SECS)
                 last_event = _t.monotonic()
             except asyncio.TimeoutError:
-                if _t.monotonic() - last_event > PERSONA_STALL_LIMIT_SECS:
+                stall_limit = (PERSONA_TOOL_STALL_LIMIT_SECS if tool_active
+                               else PERSONA_STALL_LIMIT_SECS)
+                if _t.monotonic() - last_event > stall_limit:
                     await stop_pump(reset=True)
-                    yield ("content", "\n\n⚠️ 回合逾時(伺服器端 5 分鐘無回應),已中止。")
+                    if tool_active:
+                        msg = "\n\n⚠️ 回合逾時：文件工具長時間沒有回應，已中止並重置執行器。"
+                    else:
+                        msg = "\n\n⚠️ 回合逾時：伺服器長時間沒有回應，已中止並重置執行器。"
+                    yield ("content", msg)
                     completed = True
                     break
                 yield ("keepalive", None)
@@ -4148,6 +4161,7 @@ async def _persona_content_stream(model: str, prompt: str):
                 cmd = (val.get("cmd") or "").strip().splitlines()
                 cmd1 = (cmd[0] if cmd else "")[:TOOL_CMD_MAX]
                 steps.append({"name": name, "cmd": cmd1, "result": "", "note": ""})
+                tool_active = True
                 yield ("status", {"state": "running",
                                   "label": f"執行步驟 {len(steps)}:{name}"})
             elif kind == "tool_result":
@@ -4157,6 +4171,7 @@ async def _persona_content_stream(model: str, prompt: str):
                     if len(res) > 400:
                         short += "\n…(截斷)"
                     steps[-1]["result"] = short
+                tool_active = False
             elif kind == "perm":
                 if steps:
                     steps[-1]["note"] = f"🔐 自動允許 {val}"
@@ -4167,6 +4182,13 @@ async def _persona_content_stream(model: str, prompt: str):
                 yield ("status", val)
             elif kind == "usage":
                 yield ("usage", val)
+            elif kind == "stall":
+                # A watchdog reset already retired the bad ACP process. A
+                # cold fallback here would repeat the same document/vision
+                # work and add another 180s timeout on top of the first one.
+                _log_event("persona_stall_terminal", model=model,
+                           had_text=got_text, had_tool=tool_active)
+                yield ("content", "\n\n⚠️ 回合逾時：文件處理長時間沒有新進度，已重置執行器。請重新送出文件。")
             elif kind == "error":
                 if not got_text:
                     try:
@@ -12955,6 +12977,9 @@ async def _cc_input_core(name: str, body: dict) -> dict:
     # 「待命」直到真正接手(可能好幾分鐘)——使用者看起來就是沒反應。
     # follower 在 queued 寬限內不以 idle 蓋掉;真 busy 一出現即交還正常路徑。
     store = _cc_card_store(name)
+    store.dispatch_pending = True
+    store.dispatch_started_at = time.time()
+    store.dispatch_card_seq = max(store.card_seq.values(), default=store.seq)
     store.queued_until = time.time() + _CC_QUEUED_GRACE_SECS
     store.set_status({"busy": True, "mode": None, "prompt": None,
                       "phase": "queued", "label": "已排入佇列,等待接手…"})
@@ -15842,6 +15867,7 @@ _CC_CARD_STORES: dict = {}      # name -> carddigest.SessionCardStore
 _CC_CARD_FOLLOWERS: dict = {}   # name -> asyncio.Task
 _CC_CARD_SEED_LINES = 200       # 冷載種子:最新 jsonl 的尾端行數
 _CC_QUEUED_GRACE_SECS = 120     # input 送達後,「已排入佇列」狀態最長維持秒數
+_CC_DISPATCH_LONG_WAIT_SECS = 120
 
 
 def _cc_card_store(name: str):
@@ -15850,6 +15876,52 @@ def _cc_card_store(name: str):
         store = _CC_CARD_STORES[name] = carddigest.SessionCardStore()
         store.media_session_id = f"claude_code:{name}"
     return store
+
+
+def _cc_dispatch_progressed(store) -> bool:
+    """Return true once a post-accept card has arrived for this dispatch.
+
+    The input.accepted card itself is the baseline. A later transcript echo,
+    tool card, stdout card, or assistant reply advances ``card_seq`` and is
+    evidence that the accepted input is no longer waiting in the gap between
+    the TUI and the transcript.
+    """
+    if not getattr(store, "dispatch_pending", False):
+        return False
+    latest = max(getattr(store, "card_seq", {}).values(), default=0)
+    baseline = int(getattr(store, "dispatch_card_seq", 0) or 0)
+    if latest <= baseline:
+        return False
+    store.dispatch_pending = False
+    store.dispatch_started_at = 0.0
+    store.dispatch_card_seq = latest
+    return True
+
+
+def _cc_dispatch_status(store, st: dict, now: float | None = None) -> dict | None:
+    """Build a visible status for an accepted input with no progress card yet.
+
+    ``busy=false`` is intentional: a background shell can be running while
+    Claude Code is back at its prompt, so this state must not expose a
+    misleading stop button or block the next input. The UI still gets a
+    spinner through the ``dispatching`` phase.
+    """
+    if _cc_dispatch_progressed(store):
+        return None
+    if not getattr(store, "dispatch_pending", False):
+        return None
+    if st.get("prompt"):
+        return {"busy": False, "mode": st.get("mode"),
+                "prompt": st.get("prompt"), "phase": "blocked",
+                "label": "等待核准"}
+    started = float(getattr(store, "dispatch_started_at", 0.0) or 0.0)
+    elapsed = max(0.0, (now if now is not None else time.time()) - started)
+    label = ("已送達，等待 Claude Code 開始…"
+             if elapsed < _CC_DISPATCH_LONG_WAIT_SECS
+             else "等待背景工作結果…")
+    return {"busy": False, "mode": st.get("mode"),
+            "prompt": st.get("prompt"), "phase": "dispatching",
+            "label": label}
 
 
 def _cc_cards_feed_approval(name: str, record: dict, resolved: str = "") -> None:
@@ -16339,7 +16411,14 @@ async def _cc_card_follower(name: str, workdir: str):
                             # (委派/節流的「不推」判定在函式內)。
                             _cc_turn_end_push(name, store)
                 prev_busy = busy
-                if not busy and time.time() < getattr(store, "queued_until", 0.0):
+                dispatch_status = None if busy else _cc_dispatch_status(store, st)
+                if dispatch_status is not None:
+                    # The TUI is idle because it handed work to a background
+                    # process, but the accepted input has not produced a
+                    # follow-up card yet. Keep this visible until a real card
+                    # proves progress; do not fall back to idle.
+                    status = dispatch_status
+                elif not busy and time.time() < getattr(store, "queued_until", 0.0):
                     # input 已送達但 session 還沒接手(忙上一輪/思考中):
                     # 不用 idle 蓋掉「已排入佇列」,避免 UI 誤示「待命」死寂。
                     status = {"busy": True, "mode": st.get("mode"),
@@ -18594,6 +18673,7 @@ PERSONA_REPORTS = {
     },
     "shuijing": {
         "shuijing-sunrise-oracle": "水鏡晨卦",
+        "shuijing-sunset-closing-oracle": "水鏡晚卦",
     },
 }
 
@@ -18691,8 +18771,8 @@ async def _hermes_cron(action: str, job_id: str):
 
 _REPORT_START = re.compile(r"(🌅|🌙|☀️|🌇|🌃|📊|🗓️|善彰[，,、]?\s*(早安|午安|晚安)|早安|午安|晚安)")
 _REPORT_INLINE_START = re.compile(
-    r"(\*\*[^*\n]*(晨報|午報|晚間|速覽|掃描|晨卦)[^*\n]*\*\*|"
-    r"#{1,3}\s*[^\n]*(晨報|午報|晚間|速覽|掃描|晨卦)|"
+    r"(\*\*[^*\n]*(晨報|午報|晚間|晚卦|速覽|掃描|晨卦)[^*\n]*\*\*|"
+    r"#{1,3}\s*[^\n]*(晨報|午報|晚間|晚卦|速覽|掃描|晨卦)|"
     r"(🌅|🌙|☀️|🌇|🌃|📊|🗓️)[^\n]*|"
     r"善彰[，,、]?\s*(早安|午安|晚安))"
 )
@@ -18704,10 +18784,24 @@ def _clean_report(s: str) -> str:
     real title. Keep from the first line that carries real content: any CJK, a
     markdown header, or one of the known report openers (🌅/善彰早安…)."""
     text = s.strip()
-    inline = _REPORT_INLINE_START.search(text)
-    if inline and inline.start() > 0:
-        return text[inline.start():].lstrip(" -—\n").strip()
     lines = text.split("\n")
+
+    # An occasional cron preamble and the report title share one physical line.
+    # Only inspect the first non-empty line here. Searching the whole report is
+    # unsafe: a later valid sentence such as "**扣回晨卦...**" looks exactly
+    # like a report heading to the old regex and silently drops the report head.
+    first = next((i for i, line in enumerate(lines) if line.strip()), None)
+    if first is not None:
+        first_line = lines[first].strip()
+        inline = _REPORT_INLINE_START.search(first_line)
+        prefix = first_line[:inline.start()].strip() if inline else ""
+        # Inline trimming is only for an ASCII/English-looking preamble. A
+        # Chinese prefix is already report content and must remain untouched.
+        prefix_has_cjk = any("一" <= c <= "鿿" for c in prefix)
+        if inline and inline.start() > 0 and prefix and not prefix_has_cjk:
+            kept = first_line[inline.start():].lstrip(" -—")
+            return "\n".join([kept, *lines[first + 1:]]).strip()
+
     for i, line in enumerate(lines):
         t = line.strip()
         if not t:

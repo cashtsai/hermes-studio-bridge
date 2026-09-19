@@ -152,6 +152,27 @@ class CxDupScenarioTests(unittest.TestCase):
         self.assertIn("card-cx-appr-approval-live", d.store.cards)
         self.assertFalse(d.seeding)
 
+    def test_late_canonical_backfill_is_sorted_before_live(self):
+        """reseed 晚到的舊 turn 不得被追加到目前 live 對話之後。"""
+        d = self._digest()
+        d.handle("turn/started", {"turn": {"id": "turn-live"}})
+        d.handle("item/completed", {
+            "startedAtMs": 1788839000000,
+            "item": _agent_item("msg-live", "今天的新回覆"),
+        })
+        d.seed_turns([{
+            "id": "turn-old",
+            "startedAtMs": 1788650000000,
+            "completedAtMs": 1788650100000,
+            "items": [
+                _user_item("item-old", "兩天前的舊訊息"),
+                _agent_item("item-old-a", "兩天前的舊回覆"),
+            ],
+        }], emit_unchanged=False)
+        ids = d.store.order
+        self.assertLess(ids.index("card-cx-item-old"), ids.index("card-cx-msg-live"))
+        self.assertLess(ids.index("card-cx-item-old-a"), ids.index("card-cx-msg-live"))
+
 
 class BridgeWiringTest(unittest.TestCase):
     """接線層:cc 修過同款 race 但 cx 沒接上,就是這次的病因之一 —
