@@ -213,21 +213,35 @@ async def mirror(home: str, session: str, role: str, body: str, mid: str,
     """
     result = {"session": session, "role": role, "mode": mode(),
               "sent": 0, "skipped": ""}
+
+    # 2026-09-21:log 移進單一出口。舊版早退路徑(empty/duplicate/no_target)
+    # 在 log 之前就 return —— sessions.json 退場後每一次鏡射都 no_target
+    # 靜默跳過,log 一片空白,老闆回報「沒同步」後多花一整輪才定位到。
+    # 跳過**也是結果**,一樣要記;mode=off 仍不記(常態零噪音)。
+    def _done():
+        if log is not None and result["mode"] != "off":
+            try:
+                log("tg_mirror_outbound", **{k: v for k, v in result.items()
+                                            if k != "error"})
+            except Exception:  # noqa: BLE001
+                pass
+        return result
+
     try:
         if result["mode"] == "off":
             result["skipped"] = "disabled"
-            return result
+            return _done()
         text = format_text(role, body)
         if not text:
             result["skipped"] = "empty"
-            return result
+            return _done()
         if _seen(mid):
             result["skipped"] = "duplicate"
-            return result
+            return _done()
         target = resolve_target(home)
         if not target:
             result["skipped"] = "no_target"
-            return result
+            return _done()
         token, chat_id, thread_id = target
         parts = split_text(text)
         if result["mode"] == "dry":
@@ -235,20 +249,18 @@ async def mirror(home: str, session: str, role: str, body: str, mid: str,
                             "thread_id": thread_id, "mid": mid, "parts": parts})
             result["sent"] = len(parts)
             result["skipped"] = "dry_run"
-            return result
+            return _done()
         for p in parts:
             if await _post(token, chat_id, thread_id, p):
                 result["sent"] += 1
+        if result["sent"] < len(parts):
+            # 送出去幾段、掉了幾段要講清楚 —— 9/3 潘天晴那批「sent:0
+            # skipped:空白」就是 _post 靜默失敗,誰都看不出原因。
+            result["skipped"] = f"post_failed:{len(parts) - result['sent']}/{len(parts)}"
     except Exception as e:  # noqa: BLE001
         result["skipped"] = f"error:{type(e).__name__}"
         result["error"] = str(e)[:180]
-    if log is not None:
-        try:
-            log("tg_mirror_outbound", **{k: v for k, v in result.items()
-                                        if k != "error"})
-        except Exception:  # noqa: BLE001
-            pass
-    return result
+    return _done()
 
 
 def mirror_soon(home: str, session: str, role: str, body: str, mid: str,
