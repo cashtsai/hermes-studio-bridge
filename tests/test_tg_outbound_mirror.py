@@ -282,6 +282,53 @@ check("assistant 不帶前綴", tg_outbound.format_text("assistant", "在") == "
 check("空正文格式化成空", tg_outbound.format_text("user", "  ") == "")
 
 
+# ── 9. sessions.json 退場後的 state.db 退路(2026-09-21)────────────────
+# hermes 新版把 sessions.json 降級成 LEGACY MIRROR(只剩 _README),
+# gateway_routing 表也是空的 —— 現行 TG session 的真相在 sessions 表自己。
+# 老闆實測鏡射全滅(resolve_target 永遠 no_target)就是這裡斷的。
+import sqlite3 as _sq
+_fb_home = tempfile.mkdtemp(prefix="tgout-fb-")
+os.makedirs(os.path.join(_fb_home, "sessions"), exist_ok=True)
+with open(os.path.join(_fb_home, "sessions", "sessions.json"), "w") as f:
+    f.write('{"_README": "LEGACY MIRROR"}')          # 真實形狀:只剩 README
+_con = _sq.connect(os.path.join(_fb_home, "state.db"))
+_con.execute("CREATE TABLE sessions (id TEXT, session_key TEXT, "
+             "last_activity_at REAL, started_at REAL)")
+_con.execute("INSERT INTO sessions VALUES ('sid-old', "
+             "'agent:main:telegram:dm:111', NULL, 100)")
+_con.execute("INSERT INTO sessions VALUES ('sid-new', "
+             "'agent:main:telegram:dm:222', 900, 50)")
+_con.execute("INSERT INTO sessions VALUES ('sid-cli', NULL, 999, 999)")
+_con.commit(); _con.close()
+from acp_client import canonical_telegram_entry as _cte
+_fb = _cte(_fb_home)
+check("sessions.json 只剩 README → 退 state.db", _fb is not None)
+check("退路挑最近活動那筆(last_activity_at 優先)",
+      _fb and _fb[1]["session_id"] == "sid-new")
+check("session_key 原樣供 chat 解析",
+      _fb and tg_outbound.chat_from_session_key(_fb[0]) == ("222", ""))
+check("NULL session_key 的列不得中選", _fb and _fb[1]["session_id"] != "sid-cli")
+_empty_home = tempfile.mkdtemp(prefix="tgout-nofb-")
+check("兩邊都沒有 → None(與從前相同)", _cte(_empty_home) is None)
+
+# ── 10. 跳過也要留痕(2026-09-21):no_target 不得靜默 ──────────────────
+# 舊版早退在 log 之前 return —— sessions.json 死後每次都 no_target 且零
+# log,老闆回報後多花一整輪才定位。跳過也是結果,必須記;off 除外。
+_logged = []
+def _cap(event, **kw): _logged.append((event, kw))
+r = run(tg_outbound.mirror(_empty_home, SESSION, "user", "hi",
+                           "mid-log-1", log=_cap))
+check("no_target 有記 log", len(_logged) == 1
+      and _logged[0][1].get("skipped") == "no_target")
+_logged.clear()
+os.environ["POCKET_TG_MIRROR_OUTBOUND"] = "off"
+r = run(tg_outbound.mirror(_empty_home, SESSION, "user", "hi",
+                           "mid-log-2", log=_cap))
+check("mode=off 仍然零噪音", _logged == [])
+os.environ["POCKET_TG_MIRROR_OUTBOUND"] = "dry"
+
+
+
 print()
 if fails:
     print("FAILED (%d): %s" % (len(fails), ", ".join(fails)))

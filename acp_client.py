@@ -131,9 +131,44 @@ def canonical_telegram_entry(home: str):
             upd = ent.get("updated_at") or ""          # ISO strings sort lexically
             if best is None or upd > best[0]:
                 best = (upd, key, ent)
-        return (best[1], best[2]) if best else None
+        if best:
+            return (best[1], best[2])
+    except Exception:
+        pass
+    # 2026-09-21 退路:hermes 新版把 sessions.json 降級成 LEGACY MIRROR
+    # (檔案只剩 _README;README 指的 gateway_routing 表在各 profile 的
+    # state.db 裡也是 0 列)。現行 TG session 的唯一活真相 = sessions 表
+    # 自己:gateway 每輪把 session_key(agent:<profile>:telegram:<type>:
+    # <chat_id>[:<thread>])與 last_activity_at 寫在該列。老闆實測鏡射
+    # 全滅(resolve_target 永遠 no_target)就是這裡斷的。唯讀,不碰內核。
+    return _telegram_entry_from_statedb(home)
+
+
+def _telegram_entry_from_statedb(home: str):
+    """state.db sessions 表 → 最近活動的 TG session,形狀對齊 sessions.json
+    的 (session_key, entry):[0] 給 tg_outbound 解 chat,[1]['session_id']
+    給 session-pinning 的 thin accessor。挑不到(從沒用過 TG / 舊 schema
+    沒這些欄位)回 None,行為與 sessions.json 缺席時相同。"""
+    import sqlite3
+    db = os.path.join(home, "state.db")
+    if not os.path.exists(db):
+        return None
+    try:
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=5)
+        try:
+            row = con.execute(
+                "SELECT session_key, id, COALESCE(last_activity_at, started_at) "
+                "FROM sessions WHERE session_key LIKE '%:telegram:%' "
+                "ORDER BY COALESCE(last_activity_at, started_at) DESC LIMIT 1"
+            ).fetchone()
+        finally:
+            con.close()
     except Exception:
         return None
+    if not row or not row[0] or not row[1]:
+        return None
+    return (row[0], {"session_id": row[1], "platform": "telegram",
+                     "updated_at": row[2] or 0, "origin": "statedb"})
 
 
 def canonical_telegram_session(home: str):
