@@ -238,10 +238,36 @@ install_requested_provider() {
   esac
 }
 
+# bridge.py 需要 Python ≥3.10(127 處 PEP 604 型別語法)。macOS CLT 的
+# /usr/bin/python3 是 3.9 —— 用它建 venv,import 當下就 SyntaxError,使用者
+# 只看到「bridge 起不來」(2026-10-05 上線前盤查,乾淨 Mac 百分之百踩中)。
+# 候選序與桌面 app 的 BridgeEnvironment 一致;POCKET_BRIDGE_PYTHON 可覆寫。
+resolve_python() {
+  for c in "${POCKET_BRIDGE_PYTHON:-}"            /opt/homebrew/bin/python3 /usr/local/bin/python3            "$HOME/.local/bin/python3" /usr/bin/python3; do
+    [ -n "$c" ] && [ -x "$c" ] || continue
+    if "$c" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3,10) else 1)' 2>/dev/null; then
+      printf '%s' "$c"; return 0
+    fi
+  done
+  return 1
+}
+
 install_bridge_runtime() {
   log_step "Preparing Pocket bridge runtime"
+  BRIDGE_PY="$(resolve_python)" || {
+    echo "✗ 找不到 Python 3.10 以上版本(系統內建的 3.9 跑不動 bridge)。" >&2
+    echo "  安裝其一後重跑:  brew install python   或  https://www.python.org/downloads/macos/" >&2
+    exit 1
+  }
   if [ ! -x "$BRIDGE_VENV/bin/python" ]; then
-    python3 -m venv "$BRIDGE_VENV"
+    "$BRIDGE_PY" -m venv "$BRIDGE_VENV"
+  else
+    # 既有 venv 可能是舊 3.9 建的(踩雷後重跑的使用者)—— 驗一次,不合格就重建。
+    if ! "$BRIDGE_VENV/bin/python" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3,10) else 1)' 2>/dev/null; then
+      echo "▸ 既有 venv 版本過舊,重建($BRIDGE_PY)"
+      rm -rf "$BRIDGE_VENV"
+      "$BRIDGE_PY" -m venv "$BRIDGE_VENV"
+    fi
   fi
   "$BRIDGE_VENV/bin/python" -m pip install --upgrade pip >/dev/null
   "$BRIDGE_VENV/bin/python" -m pip install \
