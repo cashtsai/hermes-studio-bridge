@@ -9145,9 +9145,35 @@ async def v2_memory_search(request: Request, q: str = "", k: int = 8, provider: 
     try:
         async with httpx.AsyncClient(timeout=10) as client:
             r = await client.get(MEMORYD_URL + "/memory/search", params=params)
-        return JSONResponse(r.json(), status_code=r.status_code)
+        data = r.json()
     except Exception as e:  # noqa: BLE001
         raise HTTPException(status_code=503, detail=f"memoryd unavailable: {type(e).__name__}")
+    # 留痕(期二):hit 涉及誰的 session 就往誰的卡片流落「👁 記憶調閱」卡 ——
+    # 誰調閱了誰看得見,照 _agent_context_audit 原樣。保守版:只對**已有 warm store**
+    # 的目標落(create_store=False,不為留痕冷載任意歷史 session);skey→bridge session
+    # 能乾淨對應的才落(codex:<id> 同鍵、hermes:<persona>:<sid>→hermes:<persona>);
+    # CC 的 skey 是 jsonl uuid、對不回 bridge 的 ccsess name,先跳過。
+    try:
+        seen = set()
+        for h in (data.get("hits") or []):
+            skey = h.get("skey") or ""
+            if skey.startswith("codex:"):
+                target = skey
+            elif skey.startswith("hermes:"):
+                parts = skey.split(":")
+                target = f"hermes:{parts[1]}" if len(parts) >= 2 else None
+            else:
+                target = None                      # CC uuid 對不回 name,跳過
+            if not target or target in seen:
+                continue
+            seen.add(target)
+            await _agent_context_audit(
+                "記憶檢索", target, "memory_search",
+                "mem-" + uuid.uuid4().hex[:8],
+                note=f"查詢「{q.strip()[:40]}」", create_store=False)
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("v2_memory_search_audit", _exc, expected=True)
+    return JSONResponse(data, status_code=r.status_code)
 
 
 # ═════════════ Pocket ID(Pairing V3):enroll + heartbeat + voucher claim ═════════════
