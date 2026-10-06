@@ -511,6 +511,10 @@ HERMES_BIN = os.path.expanduser(os.environ.get("HERMES_BIN", "")) or _first_exis
 # get full shell access over /app/v1/terminal, so a self-hosted owner needs an
 # escape hatch; "0" makes the endpoint refuse every handshake.
 POCKET_TERMINAL_ENABLED = os.environ.get("POCKET_TERMINAL_ENABLED", "1") != "0"
+# 桌面 Web 主控台 /console(1-1)。預設 **OFF** —— 它是**持續的控制面**(含
+# input/approve),比一次性的 /pair/qr 危險得多,而 _pair_local_only 在 tunnel
+# 下形同虛設,所以要開才開。見 docs/SPEC_DESKTOP_CONSOLE_20261006.md §6。
+POCKET_CONSOLE_ENABLED = os.environ.get("POCKET_CONSOLE_ENABLED", "0") != "0"
 
 # model id -> (display name, HERMES_HOME). id stays ascii for client URLs.
 # personas 表(canonical.db)可再覆蓋(rename / disable / soft-delete)並加自訂;
@@ -8957,6 +8961,57 @@ async def pair_qr_page(request: Request):
     _pair_check_boot(request)       # 真閘:一次性 boot code(tunnel 下 loopback 不可信)
     _pair_local_only(request)       # defense-in-depth 第二層
     return HTMLResponse(_PAIR_QR_HTML)
+
+
+# ═════════════ 桌面 Web 主控台 /console(1-1,SPEC_DESKTOP_CONSOLE_20261006)═══════
+# 前端是 static 檔(static/console/),bootstrap 流程與 /pair/qr 同款:
+#   /console?boot=<code> → 頁面 JS fetch /pair/qr.json?boot= 取一次性碼 →
+#   POST /pair/claim 換可撤銷 pdev- token → 之後 /app/v2/* 帶 Bearer。
+# 控制路徑(input/interrupt/approve/events/cards)全部複用現有 v2 端點,不新增。
+_CONSOLE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "static", "console")
+
+_CONSOLE_SECURITY_HEADERS = {
+    "Cache-Control": "no-store",
+    # 自家 static 的 inline JS/CSS 要能跑,且只准連回自己(connect-src 'self');
+    # 其餘一律封死。比 Apple 回呼頁放寬 script-src,因為主控台有互動邏輯。
+    "Content-Security-Policy": (
+        "default-src 'none'; "
+        "script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; "
+        "img-src 'self' data: blob:; media-src 'self' blob:; "
+        "connect-src 'self'; base-uri 'none'; frame-ancestors 'none'"),
+    "Referrer-Policy": "no-referrer",
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+}
+
+
+def _console_guard(request: Request) -> None:
+    """/console 的門:旗標關 → 404(對外表現同不存在);boot code 仍是真閘。"""
+    if not POCKET_CONSOLE_ENABLED:
+        raise HTTPException(status_code=404, detail="not found")
+    _pair_check_boot(request)       # 真閘:一次性 boot code(同 /pair/qr)
+    _pair_local_only(request)       # defense-in-depth 第二層
+
+
+@app.get("/console")
+async def console_page(request: Request):
+    _console_guard(request)
+    index = os.path.join(_CONSOLE_DIR, "index.html")
+    try:
+        html = open(index, encoding="utf-8").read()
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="console not installed")
+    return HTMLResponse(html, headers=_CONSOLE_SECURITY_HEADERS)
+
+
+# 靜態資產(app.js / sse.js / style.css)。旗標關時整個 mount 不掛 → 404。
+# 注意:StaticFiles 不經 _console_guard 的 boot 檢查(靜態資產本身不含機密,
+# 真正的機密是 token,由頁面 JS 走 /pair/claim 取得;資產洩漏無害)。
+if POCKET_CONSOLE_ENABLED and os.path.isdir(_CONSOLE_DIR):
+    from fastapi.staticfiles import StaticFiles
+    app.mount("/console/static",
+              StaticFiles(directory=_CONSOLE_DIR), name="console-static")
 
 
 # ═════════════ Pocket ID(Pairing V3):enroll + heartbeat + voucher claim ═════════════
