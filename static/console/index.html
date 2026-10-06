@@ -10,6 +10,10 @@
 <div id="app">
   <header id="topbar">
     <div class="brand">Pocket <span class="brand-dim">Console</span></div>
+    <nav id="mode-nav">
+      <button class="mode-btn active" data-mode="agents">Agents</button>
+      <button class="mode-btn" data-mode="files">檔案</button>
+    </nav>
     <div id="conn" class="conn" title="連線狀態"><span class="dot"></span><span id="conn-text">連線中…</span></div>
   </header>
 
@@ -40,9 +44,22 @@
     </section>
   </main>
 
+  <!-- 檔案瀏覽模式 -->
+  <section id="files-view" class="hidden">
+    <div id="fb-bar" class="fb-bar">
+      <button id="fb-up" class="btn-ghost" title="上一層">↑</button>
+      <div id="fb-crumb" class="fb-crumb"></div>
+    </div>
+    <div id="fb-body" class="fb-body">
+      <div id="fb-list" class="fb-list"></div>
+      <div id="fb-preview" class="fb-preview"><div class="placeholder">← 選一個檔案預覽</div></div>
+    </div>
+  </section>
+
   <div id="toast" class="toast hidden"></div>
 </div>
 <script src="/console/static/sse.js"></script>
 <script src="/console/static/app.js"></script>
+<script src="/console/static/filebrowser.js"></script>
 </body>
 </html>

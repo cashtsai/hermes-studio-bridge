@@ -436,6 +436,26 @@ def _auth_fail_summary_locked(request: Request, status: int, now: float) -> dict
     }
 
 
+def _token_is_valid(token: str) -> bool:
+    """Raw token 成員檢查(master 或 device token)。無節流、無 401 副作用 ——
+    需要節流的呼叫端用 _check_auth。給 /file 的 ?token= fallback 用:瀏覽器的
+    <img>/<video>/<iframe> 無法帶 Authorization header(同 terminal WS 的限制)。"""
+    token = (token or "").strip()
+    if not token:
+        return False
+    if hmac.compare_digest(token, BRIDGE_TOKEN):
+        return True
+    with _PAIR_LOCK:
+        dev = _DEVICE_TOKENS.get(token)
+        if dev is not None:
+            if not dev.get("apple_user_id") or _account_device_for_token(token) is not None:
+                dev["last_seen"] = time.time()
+                return True
+    if _account_device_for_token(token) is not None:
+        return True
+    return False
+
+
 def _check_auth(request: Request) -> None:
     auth = request.headers.get("authorization", "")
     token = auth[7:].strip() if auth.lower().startswith("bearer ") else ""
@@ -515,6 +535,9 @@ POCKET_TERMINAL_ENABLED = os.environ.get("POCKET_TERMINAL_ENABLED", "1") != "0"
 # input/approve),比一次性的 /pair/qr 危險得多,而 _pair_local_only 在 tunnel
 # 下形同虛設,所以要開才開。見 docs/SPEC_DESKTOP_CONSOLE_20261006.md §6。
 POCKET_CONSOLE_ENABLED = os.environ.get("POCKET_CONSOLE_ENABLED", "0") != "0"
+# 檔案瀏覽面 /app/v2/fs/list(1-2)。預設 **OFF** —— 把家中檔案系統開給遠端,
+# root 白名單是唯一的牆。見 docs/SPEC_FILE_BROWSER_20261006.md §6。
+POCKET_FILEBROWSER_ENABLED = os.environ.get("POCKET_FILEBROWSER_ENABLED", "0") != "0"
 
 # model id -> (display name, HERMES_HOME). id stays ascii for client URLs.
 # personas 表(canonical.db)可再覆蓋(rename / disable / soft-delete)並加自訂;
@@ -8317,13 +8340,100 @@ async def codex_session_create(request: Request):
         _codex_http_error(e)
 
 
+# ═════════════ 檔案瀏覽面 /app/v2/fs/list(1-2,SPEC_FILE_BROWSER)═══════════════
+# 只加「列目錄」—— 檔案內容仍走 /file?path=(複用其服務 + Range,見規格 §7)。
+def _fs_browse_roots() -> list:
+    """檔案瀏覽的允許 root。預設只 home —— temp dirs 是 agent scratch、不是使用者
+    檔案,不列(規格 §6)。未來做『允許 root 設定頁』時從這裡擴。"""
+    return [os.path.realpath(os.path.expanduser("~"))]
+
+
+def _fs_path_allowed(p: str, roots: list) -> bool:
+    """realpath 後的 p 是否落在允許 root 內(防 ../ 穿越、symlink 逃逸)。
+    這是檔案瀏覽唯一的牆,與 /file 同精神 —— 單一真相,不要各寫一份。"""
+    return any(p == r or p.startswith(r + os.sep) for r in roots)
+
+
+_FS_LIST_MAX = 2000
+
+
+def _fs_entry_kind(name: str, is_dir: bool) -> str:
+    if is_dir:
+        return "dir"
+    ext = os.path.splitext(name)[1].lower().lstrip(".")
+    for kind, exts in (
+        ("pdf", ("pdf",)),
+        ("video", ("mp4", "mov", "webm", "m4v", "avi", "mkv")),
+        ("markdown", ("md", "markdown")),
+        ("html", ("html", "htm")),
+        ("image", ("png", "jpg", "jpeg", "gif", "webp", "heic", "svg", "bmp")),
+        ("audio", ("mp3", "wav", "m4a", "aac", "flac")),
+        ("text", ("txt", "log", "json", "yaml", "yml", "csv", "xml", "py",
+                  "js", "ts", "swift", "go", "rs", "sh", "c", "cpp", "h", "toml")),
+    ):
+        if ext in exts:
+            return kind
+    return "file"
+
+
+@app.get("/app/v2/fs/list")
+async def fs_list(request: Request, path: str = ""):
+    """列目錄。旗標關 → 404。root 白名單比 /file 更嚴(預設只 home)。"""
+    if not POCKET_FILEBROWSER_ENABLED:
+        raise HTTPException(status_code=404, detail="not found")
+    _check_auth(request)
+    roots = _fs_browse_roots()
+    target = (path or "").strip() or roots[0]
+    p = os.path.realpath(os.path.expanduser(target))
+    if not _fs_path_allowed(p, roots):
+        raise HTTPException(status_code=404, detail="not found")
+    if not os.path.isdir(p):
+        raise HTTPException(status_code=400, detail="not a directory")
+    entries = []
+    try:
+        with os.scandir(p) as it:
+            for de in it:
+                if de.name.startswith("."):      # 隱藏檔預設不列
+                    continue
+                try:
+                    st = de.stat(follow_symlinks=False)
+                    is_dir = de.is_dir(follow_symlinks=False)
+                except OSError:
+                    continue
+                entries.append({
+                    "name": de.name, "is_dir": is_dir,
+                    "size": 0 if is_dir else st.st_size,
+                    "mtime": st.st_mtime,
+                    "kind": _fs_entry_kind(de.name, is_dir),
+                    "path": de.path,
+                })
+                if len(entries) >= _FS_LIST_MAX:
+                    break
+    except OSError:
+        raise HTTPException(status_code=403, detail="cannot read directory")
+    entries.sort(key=lambda e: (not e["is_dir"], e["name"].lower()))
+    parent = os.path.dirname(p)
+    if p in roots or not _fs_path_allowed(parent, roots):
+        parent = None            # 已在 root,沒有上一層
+    return {"path": p, "parent": parent, "entries": entries,
+            "truncated": len(entries) >= _FS_LIST_MAX, "roots": roots}
+
+
 @app.get("/file")
 async def serve_file(request: Request, path: str):
     """Serve a local file (image/pdf) by path so the app can render image paths
     that appear in transcripts (your attachments + files the agent references).
     Restricted to a small set of safe roots (home + the temp dirs agents write
     scratch files to), must be a regular file."""
-    _check_auth(request)
+    # ?token= fallback(檔案瀏覽 1-2):<img>/<video>/<iframe> 無法帶 Authorization
+    # header。有 bearer → 正常 _check_auth(含節流);沒 header 但有 ?token= → 驗 query
+    # token。token 會進 access log/Referer,所以僅此端點、且只在無 header 時才看 query。
+    _qtok = (request.query_params.get("token") or "").strip()
+    if _qtok and not request.headers.get("authorization", "").lower().startswith("bearer "):
+        if not _token_is_valid(_qtok):
+            raise http_err(401, "AUTH_INVALID_TOKEN", "invalid bridge token")
+    else:
+        _check_auth(request)
     p = os.path.realpath(os.path.expanduser(path))
     roots = [os.path.realpath(os.path.expanduser("~"))]
     # Agents (incl. Claude Code's scratchpad) often emit files under the system
