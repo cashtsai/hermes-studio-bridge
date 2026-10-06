@@ -13,6 +13,7 @@
     <nav id="mode-nav">
       <button class="mode-btn active" data-mode="agents">Agents</button>
       <button class="mode-btn" data-mode="files">檔案</button>
+      <button class="mode-btn" data-mode="memory">記憶</button>
     </nav>
     <div id="conn" class="conn" title="連線狀態"><span class="dot"></span><span id="conn-text">連線中…</span></div>
   </header>
@@ -56,10 +57,24 @@
     </div>
   </section>
 
+  <!-- 記憶檢索模式 -->
+  <section id="memory-view" class="hidden">
+    <div class="mem-bar">
+      <input id="mem-q" class="mem-input" placeholder="搜尋所有 session 的長久記憶（CC / CX / 人格）…">
+      <select id="mem-prov" class="mem-sel">
+        <option value="">全部</option><option value="cc">CC</option>
+        <option value="cx">CX</option><option value="hermes">人格</option>
+      </select>
+      <button id="mem-go" class="btn btn-primary">搜尋</button>
+    </div>
+    <div id="mem-results" class="mem-results"><div class="placeholder">輸入關鍵字，跨所有 session 找「當時做了什麼、改了哪、結論是什麼」</div></div>
+  </section>
+
   <div id="toast" class="toast hidden"></div>
 </div>
 <script src="/console/static/sse.js"></script>
 <script src="/console/static/app.js"></script>
 <script src="/console/static/filebrowser.js"></script>
+<script src="/console/static/memory.js"></script>
 </body>
 </html>

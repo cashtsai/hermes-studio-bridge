@@ -538,6 +538,12 @@ POCKET_CONSOLE_ENABLED = os.environ.get("POCKET_CONSOLE_ENABLED", "0") != "0"
 # 檔案瀏覽面 /app/v2/fs/list(1-2)。預設 **OFF** —— 把家中檔案系統開給遠端,
 # root 白名單是唯一的牆。見 docs/SPEC_FILE_BROWSER_20261006.md §6。
 POCKET_FILEBROWSER_ENABLED = os.environ.get("POCKET_FILEBROWSER_ENABLED", "0") != "0"
+# 記憶檢索薄代理 /app/v2/memory/search(2-1)。預設 OFF。轉發到 pocket-memoryd
+# (:8082)。期二應在這層加政策(default DENY/caller 記名/速率限)+ 留痕
+# (hit 涉及誰的 session 往誰的卡片流落「👁 記憶調閱」卡);目前先純轉發雛形,
+# 讓 console 記憶面板能同源呼叫(memoryd 不開 CORS)。
+POCKET_MEMORY_ENABLED = os.environ.get("POCKET_MEMORY_ENABLED", "0") != "0"
+MEMORYD_URL = os.environ.get("MEMORYD_URL", "http://127.0.0.1:8082")
 
 # model id -> (display name, HERMES_HOME). id stays ascii for client URLs.
 # personas 表(canonical.db)可再覆蓋(rename / disable / soft-delete)並加自訂;
@@ -9122,6 +9128,26 @@ if POCKET_CONSOLE_ENABLED and os.path.isdir(_CONSOLE_DIR):
     from fastapi.staticfiles import StaticFiles
     app.mount("/console/static",
               StaticFiles(directory=_CONSOLE_DIR), name="console-static")
+
+
+# ═════════ 記憶檢索薄代理 /app/v2/memory/search(2-1,期二薄代理雛形)═════════
+@app.get("/app/v2/memory/search")
+async def v2_memory_search(request: Request, q: str = "", k: int = 8, provider: str = ""):
+    if not POCKET_MEMORY_ENABLED:
+        raise HTTPException(status_code=404, detail="not found")
+    _check_auth(request)
+    if not q.strip():
+        raise HTTPException(status_code=400, detail="missing q")
+    import httpx
+    params = {"q": q, "k": max(1, min(k, 50))}
+    if provider:
+        params["provider"] = provider
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.get(MEMORYD_URL + "/memory/search", params=params)
+        return JSONResponse(r.json(), status_code=r.status_code)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=503, detail=f"memoryd unavailable: {type(e).__name__}")
 
 
 # ═════════════ Pocket ID(Pairing V3):enroll + heartbeat + voucher claim ═════════════
