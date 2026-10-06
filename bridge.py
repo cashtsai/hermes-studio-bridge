@@ -9130,12 +9130,35 @@ if POCKET_CONSOLE_ENABLED and os.path.isdir(_CONSOLE_DIR):
               StaticFiles(directory=_CONSOLE_DIR), name="console-static")
 
 
-# ═════════ 記憶檢索薄代理 /app/v2/memory/search(2-1,期二薄代理雛形)═════════
+# ═════════ 記憶檢索薄代理 /app/v2/memory/search(2-1,期二:政策 + 留痕)═════════
+# 政策:per-caller 速率限(預設 30 次/分;避免有效 token 把 memoryd + ollama 打爆,
+# 承 bridge「有效 token 不節流」的例外 —— 記憶檢索會連帶觸發 embedding,要限)。
+_MEMORY_RATE: dict = {}          # token_hash → [timestamps]
+_MEMORY_RATE_MAX = int(os.environ.get("POCKET_MEMORY_RATE_MAX", "30"))
+_MEMORY_RATE_WINDOW = 60.0
+
+
+def _memory_rate_ok(request: Request) -> bool:
+    auth = request.headers.get("authorization", "")
+    tok = auth[7:].strip() if auth.lower().startswith("bearer ") else "?"
+    key = _short_hash(tok)
+    now = time.monotonic()
+    hits = [t for t in _MEMORY_RATE.get(key, []) if now - t < _MEMORY_RATE_WINDOW]
+    if len(hits) >= _MEMORY_RATE_MAX:
+        _MEMORY_RATE[key] = hits
+        return False
+    hits.append(now)
+    _MEMORY_RATE[key] = hits
+    return True
+
+
 @app.get("/app/v2/memory/search")
 async def v2_memory_search(request: Request, q: str = "", k: int = 8, provider: str = ""):
     if not POCKET_MEMORY_ENABLED:
         raise HTTPException(status_code=404, detail="not found")
     _check_auth(request)
+    if not _memory_rate_ok(request):
+        raise HTTPException(status_code=429, detail="memory search rate limit; slow down")
     if not q.strip():
         raise HTTPException(status_code=400, detail="missing q")
     import httpx
@@ -9162,8 +9185,13 @@ async def v2_memory_search(request: Request, q: str = "", k: int = 8, provider: 
             elif skey.startswith("hermes:"):
                 parts = skey.split(":")
                 target = f"hermes:{parts[1]}" if len(parts) >= 2 else None
+            elif skey.startswith("claude_code:"):
+                # CC 的 skey 是 jsonl session uuid → _cc_name_for_sid 反查 ccsess name
+                # (D,2026-10-07)。對不上(歷史 session 早不在 pin/cache)→ 仍跳過。
+                nm = _cc_name_for_sid(skey.split(":", 1)[1])
+                target = f"claude_code:{nm}" if nm else None
             else:
-                target = None                      # CC uuid 對不回 name,跳過
+                target = None
             if not target or target in seen:
                 continue
             seen.add(target)
