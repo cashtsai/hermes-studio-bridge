@@ -1342,6 +1342,7 @@ class PersonaDigest(ApprovalCardMixin):
     _appr_prefix = "card-hp-appr-"
     _appr_source = "hermes"
     _appr_default_title = "需要核准"
+    _card_prefix = "card-hp-"          # 卡 id 前綴;子類(GeminiDigest)覆寫
 
     def __init__(self):
         self.store = SessionCardStore()
@@ -1398,9 +1399,9 @@ class PersonaDigest(ApprovalCardMixin):
                 for a in atts
             ]
         ts = _epoch(m.get("ts"))
-        self.store.upsert_card(make_card(f"card-hp-{mid}", "", role, kind,
+        self.store.upsert_card(make_card(f"{self._card_prefix}{mid}", "", role, kind,
                                          body, ts=ts))
-        self._emit_studio_cards(f"card-hp-{mid}", sc_bodies, ts=ts)
+        self._emit_studio_cards(f"{self._card_prefix}{mid}", sc_bodies, ts=ts)
 
     def seed_messages(self, msgs: list):
         for m in msgs or []:
@@ -1421,7 +1422,7 @@ class PersonaDigest(ApprovalCardMixin):
         text = self.turn_text.get(cid, "") + delta
         self.turn_text[cid] = text
         self.store.upsert_card(make_card(
-            f"card-hp-turn-{cid}", self.store.turn_id, "assistant", "markdown",
+            f"{self._card_prefix}turn-{cid}", self.store.turn_id, "assistant", "markdown",
             {"text": text, "fallback_text": text}, final=False))
         self._status("回覆中")
 
@@ -1440,16 +1441,31 @@ class PersonaDigest(ApprovalCardMixin):
         if full_text:
             clean, sc_bodies = extract_studio_cards(full_text)
             self.store.upsert_card(make_card(
-                f"card-hp-turn-{cid}", self.store.turn_id, "assistant",
+                f"{self._card_prefix}turn-{cid}", self.store.turn_id, "assistant",
                 "markdown", {"text": clean, "fallback_text": clean}))
-            self._emit_studio_cards(f"card-hp-turn-{cid}", sc_bodies)
+            self._emit_studio_cards(f"{self._card_prefix}turn-{cid}", sc_bodies)
         if error:
             self.store.upsert_card(make_card(
-                f"card-hp-turn-{cid}-err", self.store.turn_id, "system", "text",
+                f"{self._card_prefix}turn-{cid}-err", self.store.turn_id, "system", "text",
                 {"text": f"⚠️ {error}", "fallback_text": f"⚠️ {error}"}))
         self.store.push_turn("end", self.store.turn_id)
         self.store.turn_id = ""
         self._status()
+
+
+class GeminiDigest(PersonaDigest):
+    """S5:Gemini(ACP)session 的卡片 digest。
+
+    卡形與 PersonaDigest 完全同款(chat + 逐字 turn 卡 + approval mixin),
+    只有 id 前綴與 approval 來源不同:
+    - seed:gemini_provider.transcript_read 的訊息(mid 穩定 → 卡 id)。
+    - live:bridge 把 ACP session/update 的 agent_message_chunk 餵進
+      turn_delta,turn 結束(session/prompt 回來)呼叫 turn_end。
+    - approval:session/request_permission → feed_approval(來源 "gemini")。
+    """
+    _appr_prefix = "card-gm-appr-"
+    _appr_source = "gemini"
+    _card_prefix = "card-gm-"
 
 
 # ───────────────────────── S4:openclaw gateway 事件 → 卡片 ───────────────────

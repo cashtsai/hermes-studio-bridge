@@ -55,6 +55,7 @@ from harness import trajectory as harness_traj
 import media_artifacts
 import hermes_media
 import openclaw_provider
+import gemini_provider
 import cc_detect            # CC TUI 狀態偵測(manifest 引擎;herdr 設計移植)
 import cc_sdk               # CC provider v2(Agent SDK;模組內 lazy-import SDK)
 import tg_outbound
@@ -16171,6 +16172,9 @@ async def v2_agents(request: Request):
         {"provider": "openclaw", "name": "OpenClaw", "kind": "code_agent",
          "status": "ready", "auth": {"connected": True, "account": None}, "can_create": False},
     ] if OPENCLAW.configured() else []) + ([
+        {"provider": "gemini", "name": "Gemini", "kind": "code_agent",
+         "status": "ready", "auth": {"connected": True, "account": None}, "can_create": True},
+    ] if GEMINI.configured() else []) + ([
         # CC2 seam:旗標開才亮相(旗標關 = 對 app 完全不存在)。
         {"provider": "cc2", "name": "Claude Code (SDK)", "kind": "code_agent",
          "status": "ready", "auth": {"connected": True, "account": None}, "can_create": True},
@@ -16280,6 +16284,14 @@ async def v2_sessions(request: Request, provider: str = "", status: str = ""):
         _log_event("v2_codex_list_failed", error=type(e).__name__,
                    error_message=str(e)[:200])
         degraded.append("codex")
+    # S5:gemini sessions(名錄制,無遠端列表可壞,失敗就空)。
+    if GEMINI.configured():
+        try:
+            out.extend(await _gemini_v2_rows())
+        except Exception as e:  # noqa: BLE001
+            _log_event("v2_gemini_list_failed", error=type(e).__name__,
+                       error_message=str(e)[:160])
+            degraded.append("gemini")
     # S4:openclaw sessions(SPEC §5)。未配置 → 整段缺席(零影響現有使用者);
     # 配置了但 gateway 掛 → 標 degraded,照 codex 同款不無聲吞錯。
     if OPENCLAW.configured():
@@ -17312,6 +17324,12 @@ def _v2_card_source(session_id: str) -> tuple:
             if rest not in PERSONAS:
                 raise http_err(404, "SESSION_NOT_FOUND", "unknown persona")
             return ("hp", rest)
+        if prov == "gemini":
+            if not GEMINI.configured():
+                raise http_err(404, "SESSION_NOT_FOUND", "gemini not configured")
+            if not rest:
+                raise http_err(404, "SESSION_NOT_FOUND", "empty gemini session key")
+            return ("gm", rest)
         if prov == "openclaw":
             # S4:rest = 完整 sessionKey(本身含冒號,如 agent:main:main),
             # partition 之後整段原樣保留。未配置 → 404(對外表現同不存在)。
@@ -19053,6 +19071,217 @@ async def _openclaw_v1_post_message(body: dict, request: Request):
                  "X-Accel-Buffering": "no"},
     )
 
+# ─────────── Phase 0 S5:Gemini(ACP)provider ──────────────────────────────
+# 傳輸層 gemini_provider.py;卡片 carddigest.GeminiDigest(PersonaDigest 同款
+# 卡形)。session 模型:bridge key(名錄持久化)↔ gemini 的 ACP sessionId,
+# 解耦讓 CLI 端 session 蒸發時可換 acp_sid 續命(bridge 端歷史不動)。
+# 未配置(無 GEMINI_API_KEY)→ 全部靜默缺席,照 APNs 金鑰缺席模式。
+
+GEMINI = gemini_provider.GeminiClient(log=_log_event)
+_GM_CARD_DIGESTS: dict = {}
+_GM_TURNS: dict = {}     # acp_sid -> {"cid","text","key"}(進行中 turn 的路由表)
+
+
+def _gemini_key_from_session_id(session_id: str) -> str | None:
+    sid = str(session_id or "")
+    if not sid.startswith("gemini:"):
+        return None
+    rest = sid.split(":", 1)[1].strip()
+    return rest or None
+
+
+def _gm_busy(key: str) -> bool:
+    return any(t.get("key") == key for t in _GM_TURNS.values())
+
+
+async def _gm_card_digest(key: str):
+    """取得(必要時建立+seed)該 key 的 digest。seed 來源 = 自家逐字稿
+    (ACP 沒有歷史 API;session/load 的 replay 刻意不用 —— 卡 id 要穩定)。"""
+    d = _GM_CARD_DIGESTS.get(key)
+    if d is None:
+        d = _GM_CARD_DIGESTS[key] = carddigest.GeminiDigest()
+        d.store.media_session_id = f"gemini:{key}"
+    if not d.seeded:
+        d.seeded = True
+        try:
+            msgs = await asyncio.to_thread(gemini_provider.transcript_read, key)
+            d.seed_messages(msgs)
+            d._status()
+        except Exception as e:  # noqa: BLE001
+            d.seeded = False
+            _log_event("gm_card_seed_error", session=key[:48], error=str(e)[:200])
+            raise HTTPException(status_code=500, detail="gemini card seed failed")
+    return d
+
+
+def _gm_on_update(acp_sid: str, update: dict) -> None:
+    """ACP session/update → 進行中 turn 的卡片流。沒有登記中的 turn(例:
+    session/load 的歷史 replay)一律忽略 —— seed 由逐字稿負責,不雙出。"""
+    t = _GM_TURNS.get(acp_sid)
+    if not t:
+        return
+    d = _GM_CARD_DIGESTS.get(t["key"])
+    if d is None:
+        return
+    kind = str(update.get("sessionUpdate") or "")
+    if kind == "agent_message_chunk":
+        text = ((update.get("content") or {}).get("text") or "")
+        if text:
+            t["text"] += text
+            d.turn_delta(t["cid"], text)
+    elif kind == "agent_thought_chunk":
+        d.turn_status("思考中")
+    elif kind in ("tool_call", "tool_call_update"):
+        title = str((update.get("title") or update.get("kind") or "工具"))[:40]
+        d.turn_status(f"使用工具:{title}")
+
+
+async def _gm_on_request(req: dict):
+    """server→client 請求。v1 刀:權限請求一律保守拒絕 + 卡片明示 ——
+    「自動拒絕」要看得見,不能無聲(互動審批接 Approval Hub 是下一刀)。"""
+    method = str(req.get("method") or "")
+    params = req.get("params") or {}
+    if method == "session/request_permission":
+        acp_sid = str(params.get("sessionId") or "")
+        t = _GM_TURNS.get(acp_sid)
+        tool = ((params.get("toolCall") or {}).get("title")
+                or (params.get("toolCall") or {}).get("kind") or "工具")
+        _log_event("gemini_permission_autodenied", tool=str(tool)[:60])
+        if t:
+            d = _GM_CARD_DIGESTS.get(t["key"])
+            if d is not None:
+                note = (f"⚠️ Gemini 請求使用「{tool}」權限 —— v1 尚未接審批中心,"
+                        "已自動拒絕。")
+                d.store.upsert_card(carddigest.make_card(
+                    f"card-gm-perm-{uuid.uuid4().hex[:10]}", d.store.turn_id,
+                    "system", "text", {"text": note, "fallback_text": note}))
+        return {"outcome": {"outcome": "cancelled"}}
+    return None
+
+
+GEMINI.on_update = _gm_on_update
+GEMINI.on_request = _gm_on_request
+
+
+async def _gm_run_turn(key: str, content: str) -> None:
+    d = await _gm_card_digest(key)
+    cid = uuid.uuid4().hex[:10]
+    acp_sid = ""
+    try:
+        acp_sid = await GEMINI.ensure_session(key)
+        _GM_TURNS[acp_sid] = {"cid": cid, "text": "", "key": key}
+        d.turn_begin(cid, "已送達 Gemini，回覆中。")
+        gemini_provider.touch_session(key, title_hint=content)
+        res = await GEMINI.call(
+            "session/prompt",
+            {"sessionId": acp_sid,
+             "prompt": [{"type": "text", "text": content}]},
+            timeout=float(os.environ.get("GEMINI_TURN_TIMEOUT", "600")))
+        full = _GM_TURNS.get(acp_sid, {}).get("text", "")
+        mid = ""
+        if full:
+            mid = await asyncio.to_thread(
+                gemini_provider.transcript_append, key, "assistant", full)
+        d.turn_end(cid, full, reply_mid=mid)
+        _log_event("gemini_turn_end", session=key[:32],
+                   stop=str((res or {}).get("stopReason") or ""),
+                   chars=len(full))
+    except Exception as e:  # noqa: BLE001
+        partial = _GM_TURNS.get(acp_sid, {}).get("text", "") if acp_sid else ""
+        try:
+            d.turn_end(cid, partial, error=f"Gemini 回合失敗：{str(e)[:160]}")
+        except Exception as e2:  # noqa: BLE001
+            _log_exc("gm_turn_end_error", e2, expected=True)
+        _log_event("gemini_turn_failed", session=key[:32],
+                   error=type(e).__name__, error_message=str(e)[:160])
+    finally:
+        if acp_sid:
+            _GM_TURNS.pop(acp_sid, None)
+
+
+async def _gemini_v2_rows() -> list:
+    if not GEMINI.configured():
+        return []
+    rows = await asyncio.to_thread(gemini_provider.list_sessions)
+    out = [gemini_provider.session_v2_row(r, busy=_gm_busy(str(r.get("id"))))
+           for r in rows[:20]]
+    if not out:
+        # 新裝也要有一個入口(_openclaw_default_v2_row 同精神):第一則訊息
+        # 送到 gemini:default 時才真正開 ACP session。
+        out = [gemini_provider.session_v2_row({"id": "default",
+                                               "title": "Gemini"})]
+    return out
+
+
+async def _gemini_v1_post_message(body: dict, request: Request):
+    session_id = str(body.get("session") or "gemini:default")
+    key = _gemini_key_from_session_id(session_id)
+    if not key:
+        raise http_err(400, "SESSION_NOT_FOUND", "unknown gemini session")
+    if not GEMINI.configured():
+        raise http_err(404, "SESSION_NOT_FOUND", "gemini not configured")
+    content = (body.get("content") or body.get("text") or "").strip()
+    if not content:
+        raise http_err(400, "EMPTY_CONTENT", "content required")
+    dry_run = bool(body.get("dry_run"))
+    if not dry_run and _gm_busy(key):
+        raise http_err(409, "TURN_IN_PROGRESS", "上一輪還在回覆中，稍候或先中斷。")
+    cid = "gmmsg-" + uuid.uuid4().hex[:20]
+    created = int(time.time())
+
+    d = await _gm_card_digest(key)
+    if not dry_run:
+        mid = await asyncio.to_thread(
+            gemini_provider.transcript_append, key, "user", content)
+        d.message_card({"id": mid, "role": "user", "content": content,
+                        "ts": time.time()})
+        task = asyncio.create_task(_gm_run_turn(key, content))
+        _BG_TASKS.add(task)
+        task.add_done_callback(_BG_TASKS.discard)
+
+    def chunk(delta, finish=None, **extra):
+        payload = {"id": cid, "object": "chat.completion.chunk",
+                   "created": created, "model": session_id,
+                   "choices": [{"index": 0, "delta": delta,
+                                "finish_reason": finish}]}
+        payload.update(extra)
+        return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+    async def agen():
+        yield chunk({"role": "assistant", "content": ""})
+        yield chunk({}, None, status={"state": "accepted",
+                                      "label": "Gemini 已收到，正在回覆。"},
+                    accepted=True, dry_run=dry_run)
+        yield chunk({}, "stop", accepted=True, dry_run=dry_run)
+        yield "data: [DONE]\n\n"
+
+    return StreamingResponse(
+        agen(), media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache, no-transform",
+                 "X-Accel-Buffering": "no"})
+
+
+@app.get("/app/v1/gemini/config")
+async def gemini_config_get(request: Request):
+    _check_auth(request)
+    cfg = gemini_provider.load_config()
+    return {"configured": GEMINI.configured(), "source": cfg["source"],
+            "key_set": bool(cfg["api_key"])}
+
+
+@app.put("/app/v1/gemini/config")
+async def gemini_config_put(request: Request):
+    """App「進階」頁寫入 API key(0600 落檔;env 有值時 env 仍優先)。"""
+    _check_auth(request)
+    body = await request.json()
+    cfg = gemini_provider.save_config(str(body.get("api_key") or ""))
+    await GEMINI._drop_proc()   # 讓下一次呼叫以新 key 重新握手
+    _log_event("gemini_config_updated", configured=GEMINI.configured(),
+               source=cfg["source"])
+    return {"ok": True, "configured": GEMINI.configured(),
+            "source": cfg["source"]}
+
+
 def _dashboard_active_provider() -> str:
     """Provider chosen by PocketConnect's first-run installer.
 
@@ -19318,6 +19547,8 @@ async def _v2_card_store(session_id: str):
         return (await _hp_card_digest(src[1])).store
     if src[0] == "oc":
         return (await _oc_card_digest(src[1])).store
+    if src[0] == "gm":
+        return (await _gm_card_digest(src[1])).store
     if src[0] == "cc2":
         # cc2 無歷史 seed(MVP:卡片只來自 live SDK 訊息流;歷史在 ~/.claude
         # jsonl,終端 `claude --resume` 可接手)。digest 常駐於 session 物件。
@@ -20444,6 +20675,7 @@ async def capabilities(request: Request):
                          "subscription_entitlement"] +
                         (["terminal"] if POCKET_TERMINAL_ENABLED else []) +
                         (["openclaw_provider"] if OPENCLAW.configured() else []) +
+                        (["gemini_provider"] if GEMINI.configured() else []) +
                         (["calendar_proposals"]
                          if _calendar_proposals_enabled() else []),
             "terminal": _terminal_capabilities(),
@@ -23306,6 +23538,8 @@ async def app_post_message(request: Request):
     session = body.get("session") or "xcash"
     if _openclaw_key_from_session_id(session):
         return await _openclaw_v1_post_message(body, request)
+    if _gemini_key_from_session_id(session):
+        return await _gemini_v1_post_message(body, request)
     if session not in PERSONAS:
         raise http_err(400, "SESSION_NOT_FOUND", "unknown session")
     content = (body.get("content") or "").strip()
@@ -23557,6 +23791,12 @@ async def app_message_interrupt(request: Request):
     _check_auth(request)
     body = await request.json()
     session = body.get("session") or "xcash"
+    gm_key = _gemini_key_from_session_id(session)
+    if gm_key:
+        await GEMINI.cancel(gm_key)
+        _log_event("gemini_interrupt", session=gm_key[:32])
+        return {"ok": True, "session": session, "interrupted": True,
+                "attempts": 1}
     if session not in PERSONAS:
         raise http_err(400, "SESSION_NOT_FOUND", "unknown session")
     return await _persona_interrupt_core(session)
