@@ -67,6 +67,7 @@ Required features:
 - `media_artifacts`
 - `hermes_media_capabilities`
 - `hermes_media_settings`
+- `subscription_entitlement`
 
 ### `POST /app/v1/auth/apple`
 
@@ -188,6 +189,123 @@ Rules:
 - A missing APNs key must never prevent the bridge from starting: the push
   module silently disables itself (`push_notify` short-circuits with
   `disabled: true`) and logs a single `apns_disabled` event.
+
+### Subscription entitlement (StoreKit 2)
+
+Subscription state is **server-authoritative** so it survives reinstall and stays
+consistent across a user's devices. The app may never assert its own tier: the
+only accepted evidence is a JWS signed by Apple. Any `tier` / `active` /
+`expires_at` field the app puts in a request body is ignored.
+
+Verification is **offline**. StoreKit 2's `signedTransaction` and Server
+Notifications V2's `signedPayload` are ES256 JWS whose header carries the full
+`x5c` chain (`leaf → Apple WWDR intermediate → Apple Root CA - G3`), so the
+bridge validates the chain against a pinned local copy of Apple's root and never
+calls Apple to check a receipt. Rationale: no dependency on Apple reachability
+from a home Mac Studio behind a tunnel, no App Store Server API `.p8` key to
+guard, no rate limits. Live reconciliation (renewals, refunds) arrives instead
+through Server Notifications V2. Details in `apple_storekit.py`.
+
+Required bridge environment (absent → module silently disabled):
+
+- `APPLE_STOREKIT_BUNDLE_ID`: the only bundle id whose transactions are accepted,
+  e.g. `com.pocketagent.kernel`.
+- `APPLE_STOREKIT_ROOT_CA_PATH`: local Apple Root CA - G3 (PEM or DER). Export it
+  with no network access at all using
+  `security find-certificate -c "Apple Root CA - G3" -p /System/Library/Keychains/SystemRootCertificates.keychain > AppleRootCA-G3.pem`,
+  or download `AppleRootCA-G3.cer` from Apple's certificate authority page.
+- `APPLE_STOREKIT_ENVIRONMENTS` (optional): default `Production,Sandbox`. `Xcode`
+  (local StoreKit testing) is rejected unless explicitly listed.
+- `APPLE_STOREKIT_APP_APPLE_ID` (optional): when set, notifications whose
+  `appAppleId` differs are dropped.
+- `APPLE_STOREKIT_CHECK_CERT_OIDS` (optional, default on): pins Apple's leaf
+  (`1.2.840.113635.100.6.11.1`) and intermediate (`1.2.840.113635.100.6.2.1`)
+  certificate OIDs as defence in depth. Escape hatch if Apple ever rotates them —
+  the rejection reason appears in the event log as `leaf_oid_missing`.
+- `POCKET_SUBSCRIPTION_PRODUCT_TIERS` (optional): `product_id:tier,...`. Default
+  is that any verified subscription product maps to tier `pro`.
+
+**Missing configuration is silent**, exactly like the APNs key: all three
+endpoints stay reachable and return `200`, but always report the free tier with
+`configured: false`, write nothing, and verify nothing. A single
+`subscription_disabled` event is logged. The app must treat `configured: false`
+as "this bridge has no paid tier", not as a verification failure.
+
+The `entitlement` object (identical everywhere it appears):
+
+```json
+{"tier": "pro", "active": true, "status": "active",
+ "product_id": "com.pocketagent.kernel.pro.monthly",
+ "expires_at": 1787753718.6, "grace_expires_at": null, "auto_renew": true,
+ "environment": "Production", "original_transaction_id": "5000000000000001",
+ "updated_at": 1785161795.59, "configured": true}
+```
+
+- `status` is one of `active`, `grace`, `expired`, `revoked`, `none`. It is
+  recomputed from timestamps on every read, so expiry needs no cron sweep.
+- `active` is true for `active` and `grace` (Apple's billing-retry grace period
+  still counts as paid). `tier` falls back to `free` whenever `active` is false.
+- Times are epoch **seconds** (Apple's milliseconds are converted at the edge).
+
+`entitlement` is included in the responses of `POST /app/v1/auth/apple` and
+`GET /app/v1/account`, so a fresh sign-in already knows the paid tier without a
+second round trip. `GET /capabilities` reports `subscription_configured`.
+
+#### `POST /app/v1/subscription/verify`
+
+Exchanges a StoreKit 2 transaction for server-side entitlement. Requires an
+account session — the signature proves the subscription exists, the session is
+what binds it to an Apple account so the user's other devices inherit it.
+
+Request: `signedTransaction` (required), `signedRenewalInfo` (optional; supplies
+`auto_renew` and the grace period).
+
+Response: `{ok, configured, entitlement}`.
+
+Errors: `SUBSCRIPTION_MISSING_RECEIPT` (400), `SUBSCRIPTION_INVALID_RECEIPT`
+(401, any signature/chain failure), `SUBSCRIPTION_BUNDLE_MISMATCH` (400, a valid
+receipt from a different app), `SUBSCRIPTION_ENVIRONMENT_REJECTED` (400),
+`SUBSCRIPTION_RENEWAL_MISMATCH` (400, renewal info spliced from another
+subscription). Idempotent: re-posting the same receipt changes nothing.
+
+#### `GET /app/v1/subscription/status`
+
+Requires an account session. Returns `{ok, configured, entitlement, entitlements}`
+where `entitlements` lists every subscription record on the account (plan changes,
+sandbox alongside production) for debugging. A device that never sent a receipt
+sees the same `entitlement` as the device that did.
+
+#### `POST /app/v1/subscription/notify`
+
+App Store Server Notifications V2 receiver (renewals, refunds, cancellations,
+plan changes). **Unauthenticated by design** — Apple cannot carry a bridge bearer
+token, so the JWS certificate chain *is* the authentication. This is the only
+subscription endpoint that must be publicly reachable; it is served through the
+fixed-domain cloudflare tunnel, so the URL to register in App Store Connect is
+`https://pocket.tsai.cash/app/v1/subscription/notify`.
+
+Request: `{"signedPayload": "<JWS>"}`.
+
+Response codes matter, because non-2xx makes Apple retry for days:
+
+- Valid and applied → `200 {ok, notification_type, subtype, applied: true, status}`.
+- `TEST` notification, unconfigured bridge, another app's bundle id, or a
+  notification with no `signedTransactionInfo` → `200` with `applied: false`.
+  Nothing is written; retrying would be pointless.
+- Signature or chain failure → `401`. Nothing is written.
+
+Storage rules:
+
+- Keyed by `original_transaction_id` (Apple's durable per-subscription id), in the
+  `entitlements` table of the accounts DB.
+- Writes are monotonic: a notification signed earlier than the stored state is
+  ignored, because Apple's delivery order is not guaranteed. The one exception is
+  revocation — a refund is terminal and always applies, so a late renewal can
+  never resurrect a refunded subscription.
+- Notifications carry no account identity. If one arrives before the app's
+  `/verify`, the row is stored with a null `apple_user_id` (invisible to every
+  account) and is claimed later when the app verifies the same transaction with a
+  session. Subsequent notifications never clear an existing binding.
 
 ### `POST /app/v1/diagnostics`
 
