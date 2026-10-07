@@ -43,6 +43,8 @@ from harness.store import HarnessStore          # noqa: E402
 # 每組餵給模型的軌跡數;超過取「最近的 + 失敗的」(失敗最有蒸餾價值)
 PER_GROUP = 12
 MAX_GROUPS = 8                # 一輪最多處理幾組(夜批要在早上七點前跑完)
+MAX_PROPOSALS = 3             # 人審負擔上限；寧缺毋濫
+MIN_GROUP_TRAJECTORIES = 3    # 少於三條無法證明是重複模式
 MAX_PER_STORE = {"memory": 5, "skill": 3, "prompt": 1}
 # 路由守門(2026-08-16 收緊):第一晚蒸餾就產出兩筆「100% 成功率」的
 # global 路由提案 —— 樣本 4/4 與 6/6,分母全來自同一條 thread。那不是
@@ -97,6 +99,18 @@ def _pick(trajs: list, n: int = PER_GROUP) -> list:
     return (fails + oks)[:n]
 
 
+def _best_group_proposal(proposals: list[dict]) -> dict | None:
+    """同一組只留一案,避免同一模式同時進三個庫。"""
+    if not proposals:
+        return None
+    priority = {"memory": 3, "skill": 2, "prompt": 1}
+    return max(proposals, key=lambda p: (
+        len(p.get("evidence") or []),
+        bool(p.get("rationale")),
+        priority.get(str(p.get("store") or ""), 0),
+    ))
+
+
 # ── 提示詞 ──────────────────────────────────────────────────────────────
 
 _PROMPT_HEAD = """你是一個 agent 系統的「軌跡蒸餾器」。下面是同一個節點在同一類任務上的近期執行軌跡。
@@ -106,6 +120,7 @@ _PROMPT_HEAD = """你是一個 agent 系統的「軌跡蒸餾器」。下面是�
 - 只提「重複出現」或「造成明顯失敗」的模式。單次偶發不要提。
 - 具體、可執行。不要寫「應該更仔細」這種廢話。
 - 沒有值得提的就回空陣列。寧可不提,也不要湊數。
+- 同一個模式只能放進一個庫(memory / skill / prompt),不要為同一件事複製三份。
 - 全部用繁體中文。
 - evidence 必須是下面軌跡的 id(traj-…),不可捏造。
 
@@ -308,7 +323,8 @@ async def run(store: HarnessStore, *, hours: float = 24.0,
         ordered = sorted(groups.items(), key=lambda kv: len(kv[1]), reverse=True)
         for (scope, kind), items in ordered[:max_groups]:
             picked = _pick(items)
-            if len(picked) < 2:          # 一條軌跡蒸不出「重複模式」
+            if len(picked) < MIN_GROUP_TRAJECTORIES:
+                # 少於三條軌跡蒸不出可驗證的「重複模式」
                 continue
             valid_ids = {t["id"] for t in picked}
             try:
@@ -320,12 +336,19 @@ async def run(store: HarnessStore, *, hours: float = 24.0,
             node = scope[5:] if scope.startswith("node:") else scope
             provider = next((str(t.get("provider") or "") for t in picked
                              if t.get("provider")), "")
+            group_proposals = []
             for st, items2 in parsed.items():
                 for it in items2:
                     rec = _shape(st, it, scope, node, kind, valid_ids,
                                  current_prompt, provider)
                     if rec:
-                        proposals.append(rec)
+                        group_proposals.append(rec)
+            best = _best_group_proposal(group_proposals)
+            if best:
+                proposals.append(best)
+
+        # 路由與 LLM 合計也受同一個人審上限約束。
+        proposals = proposals[:MAX_PROPOSALS]
 
         # 3) 落庫(state=proposed;dry_run 不寫)
         written = []

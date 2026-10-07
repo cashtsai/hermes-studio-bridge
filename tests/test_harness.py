@@ -494,6 +494,29 @@ def _seed(st, n_ok=6, n_fail=2, sid="claude_code:tirith"):
 
 
 class TestDistill(unittest.IsolatedAsyncioTestCase):
+    async def test_同一組只保留一筆蒸餾提案(self):
+        """同一模式不可同時落 memory/skill/prompt 三種重複提案。"""
+        st = _store()
+        ids = _seed(st, n_ok=3, n_fail=0)
+        reply = MODEL_REPLY.replace("__EV0__", ids[0]).replace("__EV1__", ids[1])
+        out = await D.run(st, hours=24, model_call=AsyncMock(return_value=reply))
+        self.assertEqual(len(out["proposals"]), 1)
+
+    async def test_軌跡少於三條不蒸餾(self):
+        st = _store()
+        _seed(st, n_ok=2, n_fail=0)
+        out = await D.run(st, hours=24,
+                          model_call=AsyncMock(return_value=MODEL_REPLY))
+        self.assertEqual(out["proposals"], [])
+
+    async def test_整輪提案不超過三筆(self):
+        st = _store()
+        for i in range(4):
+            _seed(st, n_ok=3, n_fail=0, sid=f"claude_code:node-{i}")
+        out = await D.run(st, hours=24, max_groups=4,
+                          model_call=AsyncMock(return_value=MODEL_REPLY))
+        self.assertLessEqual(len(out["proposals"]), 3)
+
     async def test_提案生成含理由_證據_預覽(self):
         st = _store()
         ids = _seed(st)
@@ -501,8 +524,8 @@ class TestDistill(unittest.IsolatedAsyncioTestCase):
         mc = AsyncMock(return_value=reply)
         out = await D.run(st, hours=24, model_call=mc)
         self.assertTrue(mc.await_count >= 1)
-        stores = {p["store"] for p in out["proposals"]}
-        self.assertTrue({"memory", "skill", "prompt"} <= stores)
+        self.assertEqual(len([p for p in out["proposals"]
+                              if p["store"] != "subagent_route"]), 1)
         for p in out["proposals"]:
             self.assertTrue(p["rationale"], f"{p['store']} 缺理由")
             self.assertTrue(p["preview"], f"{p['store']} 缺預覽")
@@ -515,9 +538,10 @@ class TestDistill(unittest.IsolatedAsyncioTestCase):
         ids = _seed(st)
         reply = MODEL_REPLY.replace("__EV0__", ids[0]).replace("__EV1__", ids[1])
         out = await D.run(st, hours=24, model_call=AsyncMock(return_value=reply))
-        skill = next(p for p in out["proposals"] if p["store"] == "skill")
-        self.assertNotIn("捏造的id", skill["evidence"])
-        self.assertIn(ids[0], skill["evidence"])
+        llm = next(p for p in out["proposals"]
+                   if p["store"] != "subagent_route")
+        self.assertNotIn("捏造的id", llm["evidence"])
+        self.assertIn(ids[0], llm["evidence"])
 
     async def test_路由提案不經模型_純統計(self):
         # 2026-08-16 守門收緊後,出提案要同時滿足:樣本 ≥ ROUTE_MIN_SAMPLES
