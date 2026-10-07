@@ -270,6 +270,47 @@ class BridgeGlueTests(unittest.TestCase):
         self.assertEqual(gemini_provider.load_config()["source"], "file")
         os.remove(os.environ["GEMINI_CONFIG_FILE"])
 
+    def test_v2_input_core_and_route(self):
+        ran = {}
+
+        async def fake_ensure(key):
+            ran["key"] = key
+            return "acp-88"
+
+        async def fake_call(method, params=None, timeout=0):
+            bridge._gm_on_update("acp-88", {"sessionUpdate": "agent_message_chunk",
+                                            "content": {"text": "OK"}})
+            return {"stopReason": "end_turn"}
+
+        with patch.object(bridge.GEMINI, "ensure_session", side_effect=fake_ensure), \
+                patch.object(bridge.GEMINI, "call", side_effect=fake_call):
+            r = client.post("/app/v2/sessions/gemini:kv2/input", headers=AUTH,
+                            json={"content": "ping"})
+            self.assertEqual(r.status_code, 200)
+            j = r.json()
+            self.assertTrue(j["accepted"])
+            self.assertTrue(j["message_id"].startswith("gm-"))
+            deadline = time.time() + 5
+            while time.time() < deadline and bridge._GM_TURNS:
+                time.sleep(0.05)
+        msgs = gemini_provider.transcript_read("kv2")
+        self.assertEqual([m["role"] for m in msgs], ["user", "assistant"])
+
+    def test_v2_input_attachments_visible_not_silent(self):
+        r = client.post("/app/v2/sessions/gemini:ka/input", headers=AUTH,
+                        json={"content": "", "attachments": [{"kind": "image"}]})
+        self.assertEqual(r.status_code, 400)   # 純附件 → 明確拒絕,不默吞
+
+    def test_v2_interrupt_409_when_idle_and_cancel_when_busy(self):
+        r = client.post("/app/v2/sessions/gemini:ki/interrupt", headers=AUTH, json={})
+        self.assertEqual(r.status_code, 409)
+        bridge._GM_TURNS["acp-i"] = {"cid": "c", "text": "", "key": "ki"}
+        with patch.object(bridge.GEMINI, "cancel", new=AsyncMock()) as cancel:
+            r = client.post("/app/v2/sessions/gemini:ki/interrupt", headers=AUTH, json={})
+            self.assertEqual(r.status_code, 200)
+            cancel.assert_awaited_once_with("ki")
+        bridge._GM_TURNS.clear()
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
