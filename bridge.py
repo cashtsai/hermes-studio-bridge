@@ -16436,6 +16436,8 @@ async def v2_session_input(session_id: str, request: Request):
         return {"session_id": session_id, **res}
     if src[0] == "oc":
         return await _oc_input_core(src[1], session_id, body)
+    if src[0] == "gm":
+        return await _gm_input_core(src[1], session_id, body)
     if src[0] == "cc2":
         # CC2 seam:忙碌 → 排隊(turn end 後 drain,同 CX pending_inputs
         # 語意);turn 本體/卡片流全在 cc_sdk.py,這裡只做驗證與轉發。
@@ -16603,6 +16605,12 @@ async def v2_session_interrupt(session_id: str, request: Request):
         # CC2 seam:SDK interrupt()(結構化中斷,不再是 send-keys Esc)。
         if not await cc_sdk.registry().get(src[1]).interrupt():
             raise http_err(409, "NO_ACTIVE_TURN", "no active cc2 turn")
+        return {"ok": True, "session_id": session_id, "interrupted": True}
+    if src[0] == "gm":
+        if not _gm_busy(src[1]):
+            raise http_err(409, "NO_ACTIVE_TURN", "no active gemini turn")
+        await GEMINI.cancel(src[1])
+        _log_event("gemini_interrupt", session=src[1][:32])
         return {"ok": True, "session_id": session_id, "interrupted": True}
     if src[0] == "oc":
         # SPEC §4:chat.abort {sessionKey}。v2 契約「無活躍 turn 一律 409」,
@@ -19213,6 +19221,38 @@ async def _gemini_v2_rows() -> list:
     return out
 
 
+async def _gm_input_core(key: str, session_id: str, body: dict) -> dict:
+    """v2 統一 input(契約 §4.4)的 gemini 分支:收下即回 ack,回覆走卡片
+    事件流(同 hermes fire-and-forget 語意)。附件 v1 不支援 —— 明說,不默吞。"""
+    if not GEMINI.configured():
+        raise http_err(404, "SESSION_NOT_FOUND", "gemini not configured")
+    content = (body.get("content") or body.get("text") or "").strip()
+    attachments = body.get("attachments") or []
+    if attachments:
+        _log_event("gemini_attachments_dropped", session=key[:32],
+                   count=len(attachments), has_text=bool(content))
+        if not content:
+            raise http_err(400, "GEMINI_ATTACHMENTS_UNSUPPORTED",
+                           "Gemini 尚不支援附件;請改用文字內容")
+    if not content:
+        raise http_err(400, "EMPTY_CONTENT", "content required")
+    if _gm_busy(key):
+        raise http_err(409, "TURN_IN_PROGRESS", "上一輪還在回覆中，稍候或先中斷。")
+    d = await _gm_card_digest(key)
+    mid = await asyncio.to_thread(
+        gemini_provider.transcript_append, key, "user", content)
+    d.message_card({"id": mid, "role": "user", "content": content,
+                    "ts": time.time()})
+    task = asyncio.create_task(_gm_run_turn(key, content))
+    _BG_TASKS.add(task)
+    task.add_done_callback(_BG_TASKS.discard)
+    out = {"ok": True, "session_id": session_id, "accepted": True,
+           "message_id": mid}
+    if attachments:
+        out["attachments_dropped"] = len(attachments)
+    return out
+
+
 async def _gemini_v1_post_message(body: dict, request: Request):
     session_id = str(body.get("session") or "gemini:default")
     key = _gemini_key_from_session_id(session_id)
@@ -19220,24 +19260,11 @@ async def _gemini_v1_post_message(body: dict, request: Request):
         raise http_err(400, "SESSION_NOT_FOUND", "unknown gemini session")
     if not GEMINI.configured():
         raise http_err(404, "SESSION_NOT_FOUND", "gemini not configured")
-    content = (body.get("content") or body.get("text") or "").strip()
-    if not content:
-        raise http_err(400, "EMPTY_CONTENT", "content required")
     dry_run = bool(body.get("dry_run"))
-    if not dry_run and _gm_busy(key):
-        raise http_err(409, "TURN_IN_PROGRESS", "上一輪還在回覆中，稍候或先中斷。")
     cid = "gmmsg-" + uuid.uuid4().hex[:20]
     created = int(time.time())
-
-    d = await _gm_card_digest(key)
     if not dry_run:
-        mid = await asyncio.to_thread(
-            gemini_provider.transcript_append, key, "user", content)
-        d.message_card({"id": mid, "role": "user", "content": content,
-                        "ts": time.time()})
-        task = asyncio.create_task(_gm_run_turn(key, content))
-        _BG_TASKS.add(task)
-        task.add_done_callback(_BG_TASKS.discard)
+        await _gm_input_core(key, session_id, body)   # 驗證+user 卡+背景 turn 共用一條
 
     def chunk(delta, finish=None, **extra):
         payload = {"id": cid, "object": "chat.completion.chunk",
