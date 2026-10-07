@@ -58,7 +58,6 @@ import openclaw_provider
 import cc_detect            # CC TUI 狀態偵測(manifest 引擎;herdr 設計移植)
 import cc_sdk               # CC provider v2(Agent SDK;模組內 lazy-import SDK)
 import tg_outbound
-import workers as workers_store
 from fastapi import (FastAPI, Request, HTTPException, WebSocket, WebSocketDisconnect,
                      File, Form, UploadFile)
 from fastapi.responses import (JSONResponse, StreamingResponse, FileResponse,
@@ -100,12 +99,6 @@ SSE_KEEPALIVE_SECS = 2.0
 # deliberately configurable so the cleanup path can be exercised quickly in
 # regression tests while production keeps the five-minute ceiling.
 PERSONA_STALL_LIMIT_SECS = float(os.environ.get("PERSONA_STALL_LIMIT_SECS", "300"))
-# A document/vision tool can legitimately spend several minutes without an
-# ACP event. Keep this separate from ordinary model-turn silence so a slow
-# file inspection gets time to finish without making a stuck chat invisible.
-PERSONA_TOOL_STALL_LIMIT_SECS = float(
-    os.environ.get("PERSONA_TOOL_STALL_LIMIT_SECS", "900")
-)
 
 # A follow stream that has sent ZERO data (keepalives don't count) for this long
 # gets disconnected — a client that hangs without reading otherwise pins the
@@ -193,38 +186,6 @@ _APPLE_JWK_CLIENT = None
 _APPLE_WEB_FLOWS: dict = {}
 _APPLE_WEB_STARTS: dict[str, collections.deque] = {}
 _APPLE_WEB_FLOW_LOCK = threading.Lock()
-
-# ───────── Apple 訂閱 entitlement(StoreKit 2,feat/subscription-entitlement)─────
-# 訂閱狀態的**權威在伺服器**:app 只能送 Apple 簽的 signedTransaction 當證據,
-# 永遠不能自稱「我是訂閱者」。收據用離線 JWS 驗簽(憑證鏈驗到我們釘死的
-# Apple Root CA - G3),理由與做法見 apple_storekit.py 模組 docstring。
-#
-# 缺配置 → 靜默停用(照 APNs 金鑰缺席的規矩):subscription_configured() 回
-# False 時,三個端點照樣活著、照樣回 200,但一律回「免費層」,不寫 DB、不驗
-# 簽、不炸例外。bridge 絕不因為沒設訂閱參數而起不來或壞掉既有功能。
-#
-#   APPLE_STOREKIT_BUNDLE_ID   我們接受哪個 app 的交易(空 = 未配置)
-#   APPLE_STOREKIT_ROOT_CA_PATH  Apple Root CA - G3 憑證(PEM 或 DER;空 = 未配置)
-#   APPLE_STOREKIT_ENVIRONMENTS  接受的環境,預設 Production,Sandbox
-#   APPLE_STOREKIT_APP_APPLE_ID  選填;有設就比對通知裡的 appAppleId
-#   POCKET_SUBSCRIPTION_PRODUCT_TIERS  "product_id:tier,..." 選填,預設全 pro
-APPLE_STOREKIT_BUNDLE_ID = os.environ.get("APPLE_STOREKIT_BUNDLE_ID", "").strip()
-APPLE_STOREKIT_ROOT_CA_PATH = os.path.expanduser(
-    os.environ.get("APPLE_STOREKIT_ROOT_CA_PATH", "").strip()
-)
-APPLE_STOREKIT_ENVIRONMENTS = tuple(
-    e.strip() for e in os.environ.get(
-        "APPLE_STOREKIT_ENVIRONMENTS", "Production,Sandbox").split(",") if e.strip()
-)
-APPLE_STOREKIT_APP_APPLE_ID = os.environ.get("APPLE_STOREKIT_APP_APPLE_ID", "").strip()
-# 憑證 OID 釘選(縱深防禦)。萬一 Apple 換 OID 導致正式交易全被拒,event log
-# 會留下 leaf_oid_missing / intermediate_oid_missing,屆時設 0 可先解鎖。
-APPLE_STOREKIT_CHECK_CERT_OIDS = os.environ.get(
-    "APPLE_STOREKIT_CHECK_CERT_OIDS", "1").strip().lower() not in ("0", "false", "no")
-SUBSCRIPTION_FREE_TIER = "free"
-SUBSCRIPTION_DEFAULT_TIER = "pro"
-_SUBSCRIPTION_ROOT_CACHE: list = [None, 0.0, ""]   # [certs, mtime, path]
-_SUBSCRIPTION_DISABLED_LOGGED: list = [False]
 
 
 def _load_device_tokens() -> dict:
@@ -469,26 +430,6 @@ def _auth_fail_summary_locked(request: Request, status: int, now: float) -> dict
     }
 
 
-def _token_is_valid(token: str) -> bool:
-    """Raw token 成員檢查(master 或 device token)。無節流、無 401 副作用 ——
-    需要節流的呼叫端用 _check_auth。給 /file 的 ?token= fallback 用:瀏覽器的
-    <img>/<video>/<iframe> 無法帶 Authorization header(同 terminal WS 的限制)。"""
-    token = (token or "").strip()
-    if not token:
-        return False
-    if hmac.compare_digest(token, BRIDGE_TOKEN):
-        return True
-    with _PAIR_LOCK:
-        dev = _DEVICE_TOKENS.get(token)
-        if dev is not None:
-            if not dev.get("apple_user_id") or _account_device_for_token(token) is not None:
-                dev["last_seen"] = time.time()
-                return True
-    if _account_device_for_token(token) is not None:
-        return True
-    return False
-
-
 def _check_auth(request: Request) -> None:
     auth = request.headers.get("authorization", "")
     token = auth[7:].strip() if auth.lower().startswith("bearer ") else ""
@@ -564,19 +505,6 @@ HERMES_BIN = os.path.expanduser(os.environ.get("HERMES_BIN", "")) or _first_exis
 # get full shell access over /app/v1/terminal, so a self-hosted owner needs an
 # escape hatch; "0" makes the endpoint refuse every handshake.
 POCKET_TERMINAL_ENABLED = os.environ.get("POCKET_TERMINAL_ENABLED", "1") != "0"
-# 桌面 Web 主控台 /console(1-1)。預設 **OFF** —— 它是**持續的控制面**(含
-# input/approve),比一次性的 /pair/qr 危險得多,而 _pair_local_only 在 tunnel
-# 下形同虛設,所以要開才開。見 docs/SPEC_DESKTOP_CONSOLE_20261006.md §6。
-POCKET_CONSOLE_ENABLED = os.environ.get("POCKET_CONSOLE_ENABLED", "0") != "0"
-# 檔案瀏覽面 /app/v2/fs/list(1-2)。預設 **OFF** —— 把家中檔案系統開給遠端,
-# root 白名單是唯一的牆。見 docs/SPEC_FILE_BROWSER_20261006.md §6。
-POCKET_FILEBROWSER_ENABLED = os.environ.get("POCKET_FILEBROWSER_ENABLED", "0") != "0"
-# 記憶檢索薄代理 /app/v2/memory/search(2-1)。預設 OFF。轉發到 pocket-memoryd
-# (:8082)。期二應在這層加政策(default DENY/caller 記名/速率限)+ 留痕
-# (hit 涉及誰的 session 往誰的卡片流落「👁 記憶調閱」卡);目前先純轉發雛形,
-# 讓 console 記憶面板能同源呼叫(memoryd 不開 CORS)。
-POCKET_MEMORY_ENABLED = os.environ.get("POCKET_MEMORY_ENABLED", "0") != "0"
-MEMORYD_URL = os.environ.get("MEMORYD_URL", "http://127.0.0.1:8082")
 
 # model id -> (display name, HERMES_HOME). id stays ascii for client URLs.
 # personas 表(canonical.db)可再覆蓋(rename / disable / soft-delete)並加自訂;
@@ -608,8 +536,7 @@ def _personas_from_config() -> dict:
     try:
         with open(path, encoding="utf-8") as f:
             raw = json.load(f)
-    except Exception as _exc:      # noqa: BLE001 — 缺檔/壞檔退回掃描
-        _log_exc("personas_json_load", _exc, expected=True)
+    except Exception:      # noqa: BLE001 — 缺檔/壞檔一律安靜退回掃描
         return {}
     out = {}
     for pid, spec in (raw.get("personas") or raw or {}).items():
@@ -643,8 +570,8 @@ def _personas_from_disk() -> dict:
             for pid, spec in ((json.load(f).get("personas") or {})).items():
                 if isinstance(spec, dict) and spec.get("name"):
                     names[pid] = str(spec["name"])
-    except Exception as _exc:      # noqa: BLE001 — manifest 缺席/壞檔不致命
-        _log_exc("avatars_manifest_names", _exc, expected=True)
+    except Exception:      # noqa: BLE001
+        pass
     out = {"main": (names.get("main") or "Main", HOME_ROOT)}
     prof = os.path.join(HOME_ROOT, "profiles")
     try:
@@ -653,8 +580,8 @@ def _personas_from_disk() -> dict:
             if d.startswith(".") or not os.path.isdir(p):
                 continue
             out[d] = (names.get(d) or d, p)
-    except Exception as _exc:      # noqa: BLE001 — 沒有 profiles/ 就只有 main
-        _log_exc("profiles_scan", _exc, expected=True)
+    except Exception:      # noqa: BLE001 — 沒有 profiles/ 就只有 main
+        pass
     return out
 
 
@@ -679,8 +606,8 @@ def _personas_seed_legacy_config() -> None:
             for pid, spec in ((json.load(f).get("personas") or {})).items():
                 if isinstance(spec, dict) and spec.get("name"):
                     names[pid] = str(spec["name"])
-    except Exception as _exc:      # noqa: BLE001 — manifest 缺席/壞檔不致命
-        _log_exc("avatars_manifest_bootstrap", _exc, expected=True)
+    except Exception:      # noqa: BLE001
+        pass
     cfg = {"_note": "由 bridge 於首次啟動時從既有 profiles 佈局產生;可自行改名/增刪。",
            "personas": {"yuanfang": {"name": names.get("yuanfang", "yuanfang"), "main": True}}}
     for d, pid in legacy.items():
@@ -1251,7 +1178,7 @@ CANON_DB = os.environ.get("POCKET_CANON_DB") \
 # 測試隔離把手(chore/test-isolation-latch):accounts 跟 canonical 一樣要能
 # 導到 tmp —— import bridge 尾端就會 `_accounts_init()` 建表,沒有這顆 env
 # 的話**每一個**測試 import 都直接寫真的 accounts.db。production 不設此 env,
-# 預設路徑不變。帳號與訂閱 entitlement 都在這顆 db。
+# 預設路徑不變。
 ACCOUNTS_DB = os.environ.get("POCKET_ACCOUNTS_DB") \
     or os.path.expanduser("~/.local/share/pocket-agent/accounts.db")
 REPORT_MEMORY_FILE = "REPORTS.md"
@@ -1502,34 +1429,6 @@ def _accounts_init():
                 ON UPDATE CASCADE ON DELETE CASCADE)""")
         con.execute("CREATE INDEX IF NOT EXISTS idx_account_devices_user ON devices(apple_user_id, revoked)")
         con.execute("CREATE INDEX IF NOT EXISTS idx_account_devices_token ON devices(device_token)")
-        # entitlements:訂閱狀態的伺服器端真相,讓「換手機/重裝」不會掉訂閱。
-        # 主鍵是 original_transaction_id —— Apple 對「一條訂閱」的永久識別,
-        # 續訂會換 transaction_id 但 original 不變。apple_user_id 可為 NULL:
-        # App Store Server Notification 可能比 app 的 /verify 先到,那時我們
-        # 還不知道這筆屬於誰,先落帳,等 app 帶著 account session 來認領。
-        # 這裡刻意**不加 users 的 FOREIGN KEY**:通知先到時 apple_user_id 是
-        # NULL 沒問題,但若之後填了一個尚未 upsert 的 user,外鍵會讓 Apple 的
-        # 通知寫入失敗 → 退款/撤銷事件被丟掉,是最不能壞的方向。
-        con.execute("""CREATE TABLE IF NOT EXISTS entitlements(
-            original_transaction_id TEXT PRIMARY KEY,
-            apple_user_id TEXT,
-            product_id TEXT,
-            tier TEXT,
-            status TEXT,
-            environment TEXT,
-            purchase_at REAL,
-            expires_at REAL,
-            grace_expires_at REAL,
-            revoked_at REAL,
-            auto_renew INTEGER,
-            transaction_id TEXT,
-            last_signed_at REAL,
-            source TEXT,
-            raw_json TEXT,
-            created_at REAL NOT NULL,
-            updated_at REAL NOT NULL)""")
-        con.execute("CREATE INDEX IF NOT EXISTS idx_entitlements_user "
-                    "ON entitlements(apple_user_id)")
         con.commit()
         con.close()
     finally:
@@ -1719,349 +1618,6 @@ def _account_device_revoke(apple_user_id: str, device_id: str):
         return revoked
     finally:
         con.close()
-
-
-# ───────────── 訂閱 entitlement:配置、驗簽、資料存取 ─────────────────────
-ENTITLEMENT_COLUMNS = (
-    "original_transaction_id", "apple_user_id", "product_id", "tier", "status",
-    "environment", "purchase_at", "expires_at", "grace_expires_at", "revoked_at",
-    "auto_renew", "transaction_id", "last_signed_at", "source", "raw_json",
-    "created_at", "updated_at",
-)
-# 效力排序:同一個帳號可能有多筆 original_transaction_id(換方案、sandbox 與
-# production 並存、退款後再訂)。挑「最有利且最新」的那筆當有效 entitlement。
-_ENTITLEMENT_RANK = {"active": 3, "grace": 2, "expired": 1, "revoked": 0}
-
-
-def subscription_configured() -> bool:
-    """bundle id + Apple Root CA 都到位才算配置完成。
-
-    未配置 → 訂閱模組整體靜默停用:三個端點照樣回 200,但一律回免費層,
-    不驗簽、不寫 DB、不炸例外(照 apns_configured() 的同一套規矩)。第一次
-    偵測到未配置時 _log_event 一筆,讓「訂閱沒動靜」查得到原因。"""
-    ok = bool(APPLE_STOREKIT_BUNDLE_ID) and bool(APPLE_STOREKIT_ROOT_CA_PATH) \
-        and os.path.isfile(APPLE_STOREKIT_ROOT_CA_PATH)
-    if not ok and not _SUBSCRIPTION_DISABLED_LOGGED[0]:
-        _SUBSCRIPTION_DISABLED_LOGGED[0] = True
-        _log_event("subscription_disabled",
-                   bundle_id_set=bool(APPLE_STOREKIT_BUNDLE_ID),
-                   root_ca_path=APPLE_STOREKIT_ROOT_CA_PATH,
-                   root_ca_exists=bool(APPLE_STOREKIT_ROOT_CA_PATH)
-                   and os.path.isfile(APPLE_STOREKIT_ROOT_CA_PATH))
-    return ok
-
-
-def _subscription_root_certs():
-    """讀取並快取信任錨憑證(檔案 mtime 變了才重讀)。讀不到 → None。"""
-    import apple_storekit
-    path = APPLE_STOREKIT_ROOT_CA_PATH
-    try:
-        mtime = os.path.getmtime(path)
-    except OSError:
-        return None
-    if _SUBSCRIPTION_ROOT_CACHE[0] is not None \
-            and _SUBSCRIPTION_ROOT_CACHE[1] == mtime \
-            and _SUBSCRIPTION_ROOT_CACHE[2] == path:
-        return _SUBSCRIPTION_ROOT_CACHE[0]
-    try:
-        with open(path, "rb") as fh:
-            certs = apple_storekit.load_root_certificates(fh.read())
-    except Exception as exc:  # noqa: BLE001
-        _log_event("subscription_root_ca_unreadable", path=path,
-                   error=type(exc).__name__)
-        return None
-    _SUBSCRIPTION_ROOT_CACHE[0] = certs
-    _SUBSCRIPTION_ROOT_CACHE[1] = mtime
-    _SUBSCRIPTION_ROOT_CACHE[2] = path
-    return certs
-
-
-def _subscription_verify_jws(token: str, what: str) -> dict:
-    """驗一段 Apple JWS,回 payload。失敗 → 401(**永不**回未驗證內容)。"""
-    import apple_storekit
-    roots = _subscription_root_certs()
-    if not roots:
-        raise http_err(503, "SUBSCRIPTION_NOT_CONFIGURED",
-                       "subscription verification is not configured")
-    try:
-        return apple_storekit.verify_jws(
-            token, roots, check_cert_oids=APPLE_STOREKIT_CHECK_CERT_OIDS)
-    except apple_storekit.StoreKitVerifyError as exc:
-        # reason 是我們自己的代碼,不含收據內容,可安全進 log。
-        _log_event("subscription_verify_rejected", what=what, reason=exc.reason,
-                   detail=str(exc.detail)[:80])
-        raise http_err(401, "SUBSCRIPTION_INVALID_RECEIPT",
-                       "receipt signature verification failed")
-
-
-def _subscription_tier_for_product(product_id: str | None) -> str:
-    """product_id → tier。預設「驗過簽的訂閱就是 pro」;env 可細分方案。"""
-    if not product_id:
-        return SUBSCRIPTION_FREE_TIER
-    raw = os.environ.get("POCKET_SUBSCRIPTION_PRODUCT_TIERS", "").strip()
-    if raw:
-        for pair in raw.split(","):
-            name, _, tier = pair.partition(":")
-            if name.strip() == product_id and tier.strip():
-                return tier.strip()
-    return SUBSCRIPTION_DEFAULT_TIER
-
-
-def _entitlement_status(row: dict, now: float | None = None) -> str:
-    """狀態一律**由時間戳當場算**,不信 status 欄位的快取值 —— 否則「到期」
-    就得靠 cron 掃表,而漏跑 cron 會讓過期訂閱一直看起來有效。"""
-    now = time.time() if now is None else now
-    if row.get("revoked_at"):
-        return "revoked"
-    expires_at = row.get("expires_at")
-    grace = row.get("grace_expires_at")
-    if expires_at and now < float(expires_at):
-        return "active"
-    if grace and now < float(grace):
-        return "grace"          # 帳單重試寬限期:Apple 說還算付費使用者
-    if expires_at is None and row.get("purchase_at"):
-        return "active"         # 沒有到期日(非續訂型購買)→ 永久有效
-    return "expired"
-
-
-def _entitlement_row(row):
-    return dict(zip(ENTITLEMENT_COLUMNS, row)) if row else None
-
-
-def _entitlement_free(configured: bool | None = None) -> dict:
-    """免費層 —— 未配置、查無資料、或訂閱已失效時的統一形狀。"""
-    return {
-        "tier": SUBSCRIPTION_FREE_TIER,
-        "active": False,
-        "status": "none",
-        "product_id": None,
-        "expires_at": None,
-        "grace_expires_at": None,
-        "auto_renew": None,
-        "environment": None,
-        "original_transaction_id": None,
-        "updated_at": None,
-        "configured": subscription_configured() if configured is None else configured,
-    }
-
-
-def _entitlement_public(row: dict | None, now: float | None = None) -> dict:
-    if not row:
-        return _entitlement_free()
-    status = _entitlement_status(row, now)
-    active = status in ("active", "grace")
-    auto_renew = row.get("auto_renew")
-    return {
-        "tier": (row.get("tier") or SUBSCRIPTION_DEFAULT_TIER) if active
-                else SUBSCRIPTION_FREE_TIER,
-        "active": active,
-        "status": status,
-        "product_id": row.get("product_id"),
-        "expires_at": row.get("expires_at"),
-        "grace_expires_at": row.get("grace_expires_at"),
-        "auto_renew": None if auto_renew is None else bool(auto_renew),
-        "environment": row.get("environment"),
-        "original_transaction_id": row.get("original_transaction_id"),
-        "updated_at": row.get("updated_at"),
-        "configured": True,
-    }
-
-
-def _entitlement_rows_for_user(apple_user_id: str) -> list:
-    import sqlite3
-    if not apple_user_id:
-        return []
-    try:
-        con = sqlite3.connect(f"file:{ACCOUNTS_DB}?mode=ro", uri=True, timeout=5)
-        try:
-            rows = con.execute(
-                f"SELECT {','.join(ENTITLEMENT_COLUMNS)} FROM entitlements "
-                "WHERE apple_user_id=? ORDER BY updated_at DESC",
-                (apple_user_id,)).fetchall()
-            con.close()
-            return [_entitlement_row(r) for r in rows]
-        finally:
-            con.close()
-    except Exception as exc:  # noqa: BLE001
-        # 讀不到 entitlement = 「該使用者掉回免費層」。絕不能無聲無息。
-        _log_event("entitlement_read_failed", error=type(exc).__name__,
-                   error_message=str(exc)[:160])
-        return []
-
-
-def _entitlement_by_original_transaction(original_transaction_id: str):
-    import sqlite3
-    if not original_transaction_id:
-        return None
-    try:
-        con = sqlite3.connect(f"file:{ACCOUNTS_DB}?mode=ro", uri=True, timeout=5)
-        try:
-            row = con.execute(
-                f"SELECT {','.join(ENTITLEMENT_COLUMNS)} FROM entitlements "
-                "WHERE original_transaction_id=?",
-                (original_transaction_id,)).fetchone()
-            con.close()
-            return _entitlement_row(row)
-        finally:
-            con.close()
-    except Exception as exc:  # noqa: BLE001
-        _log_event("entitlement_read_failed", error=type(exc).__name__,
-                   error_message=str(exc)[:160])
-        return None
-
-
-def _entitlement_effective(apple_user_id: str, now: float | None = None) -> dict:
-    """帳號目前的有效 entitlement(跨裝置一致的那個答案)。"""
-    if not subscription_configured():
-        return _entitlement_free(configured=False)
-    best = None
-    for row in _entitlement_rows_for_user(apple_user_id):
-        pub = _entitlement_public(row, now)
-        key = (_ENTITLEMENT_RANK.get(pub["status"], 0),
-               float(pub.get("expires_at") or 0.0),
-               float(pub.get("updated_at") or 0.0))
-        if best is None or key > best[0]:
-            best = (key, pub)
-    return best[1] if best else _entitlement_free(configured=True)
-
-
-def _entitlement_upsert(tx: dict, renewal: dict | None, *,
-                        apple_user_id: str | None, source: str) -> dict:
-    """把驗過簽的交易寫進 entitlements 表,回寫入後的 row。
-
-    冪等 + 單調:同一個 original_transaction_id 重複送不會有副作用;**較舊的
-    事件不得覆蓋較新的**(Apple 的通知會重送,順序沒有保證)。唯一例外是
-    「撤銷」——退款是終局狀態,就算 signedDate 較舊也一定要生效,否則一筆遲
-    到的續訂通知能讓已退款的人繼續用付費功能。"""
-    import sqlite3
-    original_transaction_id = tx.get("original_transaction_id")
-    if not original_transaction_id:
-        raise http_err(400, "SUBSCRIPTION_BAD_TRANSACTION",
-                       "transaction has no originalTransactionId")
-    renewal = renewal or {}
-    now = time.time()
-    incoming_signed_at = float(tx.get("signed_at") or renewal.get("signed_at") or now)
-    product_id = tx.get("product_id") or renewal.get("product_id")
-    candidate = {
-        "original_transaction_id": original_transaction_id,
-        "apple_user_id": apple_user_id or None,
-        "product_id": product_id,
-        "tier": _subscription_tier_for_product(product_id),
-        "environment": tx.get("environment") or renewal.get("environment"),
-        "purchase_at": tx.get("purchase_at"),
-        "expires_at": tx.get("expires_at"),
-        "grace_expires_at": renewal.get("grace_expires_at"),
-        "revoked_at": tx.get("revoked_at"),
-        "auto_renew": renewal.get("auto_renew"),
-        "transaction_id": tx.get("transaction_id"),
-        "last_signed_at": incoming_signed_at,
-        "source": source,
-    }
-
-    con = sqlite3.connect(ACCOUNTS_DB, timeout=30)
-    try:
-        con.execute("PRAGMA busy_timeout=30000")
-        # BEGIN IMMEDIATE:讀-改-寫要在同一把寫鎖裡,否則 app 的 /verify 與
-        # Apple 的 /notify 同時到會互相蓋掉(單調性檢查就形同虛設)。
-        con.execute("BEGIN IMMEDIATE")
-        existing = _entitlement_row(con.execute(
-            f"SELECT {','.join(ENTITLEMENT_COLUMNS)} FROM entitlements "
-            "WHERE original_transaction_id=?",
-            (original_transaction_id,)).fetchone())
-        if existing:
-            stored_signed_at = float(existing.get("last_signed_at") or 0.0)
-            newly_revoking = bool(candidate["revoked_at"]) and not existing.get("revoked_at")
-            if incoming_signed_at < stored_signed_at and not newly_revoking:
-                con.rollback()
-                con.close()
-                _log_event("entitlement_stale_event_ignored",
-                           source=source,
-                           otid_hash=_short_hash(original_transaction_id),
-                           incoming_signed_at=incoming_signed_at,
-                           stored_signed_at=stored_signed_at)
-                return existing
-            # 通知不帶帳號資訊 → 保留既有綁定,別把 apple_user_id 洗成 NULL。
-            if not candidate["apple_user_id"]:
-                candidate["apple_user_id"] = existing.get("apple_user_id")
-            # 較舊的撤銷事件:只補 revoked_at,其餘欄位維持較新的那份。
-            if newly_revoking and incoming_signed_at < stored_signed_at:
-                merged = dict(existing)
-                merged["revoked_at"] = candidate["revoked_at"]
-                merged["source"] = source
-                candidate = merged
-            candidate["last_signed_at"] = max(incoming_signed_at, stored_signed_at)
-            # 通知常常只帶交易、不帶續訂資訊 → 別把既有的寬限期/自動續訂/
-            # 方案資訊洗成 NULL(那會讓寬限期內的使用者瞬間掉出付費層)。
-            for key in ("grace_expires_at", "auto_renew", "environment", "product_id"):
-                if candidate.get(key) is None:
-                    candidate[key] = existing.get(key)
-            candidate["tier"] = _subscription_tier_for_product(candidate.get("product_id"))
-            created_at = float(existing.get("created_at") or now)
-        else:
-            created_at = now
-        # status 欄位只是給人查表用的快取(讀取時一律用 _entitlement_status 重
-        # 算)。這裡放在所有欄位合併**之後**才算,免得快取值與真相不一致。
-        candidate["status"] = _entitlement_status(candidate, now)
-        raw = json.dumps({"transaction": tx, "renewal": renewal},
-                         ensure_ascii=False, sort_keys=True)[:8000]
-        con.execute(
-            """INSERT INTO entitlements(
-                   original_transaction_id, apple_user_id, product_id, tier, status,
-                   environment, purchase_at, expires_at, grace_expires_at, revoked_at,
-                   auto_renew, transaction_id, last_signed_at, source, raw_json,
-                   created_at, updated_at)
-               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-               ON CONFLICT(original_transaction_id) DO UPDATE SET
-                 apple_user_id=excluded.apple_user_id,
-                 product_id=excluded.product_id,
-                 tier=excluded.tier,
-                 status=excluded.status,
-                 environment=excluded.environment,
-                 purchase_at=excluded.purchase_at,
-                 expires_at=excluded.expires_at,
-                 grace_expires_at=excluded.grace_expires_at,
-                 revoked_at=excluded.revoked_at,
-                 auto_renew=excluded.auto_renew,
-                 transaction_id=excluded.transaction_id,
-                 last_signed_at=excluded.last_signed_at,
-                 source=excluded.source,
-                 raw_json=excluded.raw_json,
-                 updated_at=excluded.updated_at""",
-            (candidate["original_transaction_id"], candidate["apple_user_id"],
-             candidate["product_id"], candidate["tier"], candidate["status"],
-             candidate["environment"], candidate["purchase_at"],
-             candidate["expires_at"], candidate["grace_expires_at"],
-             candidate["revoked_at"],
-             None if candidate["auto_renew"] is None else int(bool(candidate["auto_renew"])),
-             candidate["transaction_id"], candidate["last_signed_at"],
-             candidate["source"], raw, created_at, now))
-        row = con.execute(
-            f"SELECT {','.join(ENTITLEMENT_COLUMNS)} FROM entitlements "
-            "WHERE original_transaction_id=?",
-            (original_transaction_id,)).fetchone()
-        con.commit()
-        con.close()
-        return _entitlement_row(row)
-    finally:
-        con.close()
-
-
-def _subscription_check_transaction(tx: dict) -> None:
-    """驗過簽之後的內容檢查:必須是**我們這個 app**、允許環境內的交易。
-
-    簽章只證明「Apple 簽過這筆」,不證明「這筆是我們的」—— 少了這關,別的
-    App Store app 的合法收據就能拿來換 Pocket 的付費層。"""
-    bundle_id = tx.get("bundle_id")
-    if bundle_id and APPLE_STOREKIT_BUNDLE_ID and bundle_id != APPLE_STOREKIT_BUNDLE_ID:
-        _log_event("subscription_bundle_mismatch", bundle_id=str(bundle_id)[:64])
-        raise http_err(400, "SUBSCRIPTION_BUNDLE_MISMATCH",
-                       "transaction belongs to a different app")
-    environment = tx.get("environment")
-    if environment and APPLE_STOREKIT_ENVIRONMENTS \
-            and environment not in APPLE_STOREKIT_ENVIRONMENTS:
-        _log_event("subscription_environment_rejected", environment=str(environment)[:32])
-        raise http_err(400, "SUBSCRIPTION_ENVIRONMENT_REJECTED",
-                       f"environment {environment} is not accepted")
 
 
 def _b64u(data: bytes) -> str:
@@ -4503,7 +4059,6 @@ async def _persona_content_stream(model: str, prompt: str):
     completed = False
     thought_buf: list[str] = []
     steps: list[dict] = []          # 工具步驟 — 不進正文,收尾摺疊附錄
-    tool_active = False
 
     def flush_thought():
         if thought_buf:
@@ -4569,15 +4124,9 @@ async def _persona_content_stream(model: str, prompt: str):
                 kind, val = await asyncio.wait_for(q.get(), timeout=SSE_KEEPALIVE_SECS)
                 last_event = _t.monotonic()
             except asyncio.TimeoutError:
-                stall_limit = (PERSONA_TOOL_STALL_LIMIT_SECS if tool_active
-                               else PERSONA_STALL_LIMIT_SECS)
-                if _t.monotonic() - last_event > stall_limit:
+                if _t.monotonic() - last_event > PERSONA_STALL_LIMIT_SECS:
                     await stop_pump(reset=True)
-                    if tool_active:
-                        msg = "\n\n⚠️ 回合逾時：文件工具長時間沒有回應，已中止並重置執行器。"
-                    else:
-                        msg = "\n\n⚠️ 回合逾時：伺服器長時間沒有回應，已中止並重置執行器。"
-                    yield ("content", msg)
+                    yield ("content", "\n\n⚠️ 回合逾時(伺服器端 5 分鐘無回應),已中止。")
                     completed = True
                     break
                 yield ("keepalive", None)
@@ -4599,7 +4148,6 @@ async def _persona_content_stream(model: str, prompt: str):
                 cmd = (val.get("cmd") or "").strip().splitlines()
                 cmd1 = (cmd[0] if cmd else "")[:TOOL_CMD_MAX]
                 steps.append({"name": name, "cmd": cmd1, "result": "", "note": ""})
-                tool_active = True
                 yield ("status", {"state": "running",
                                   "label": f"執行步驟 {len(steps)}:{name}"})
             elif kind == "tool_result":
@@ -4609,7 +4157,6 @@ async def _persona_content_stream(model: str, prompt: str):
                     if len(res) > 400:
                         short += "\n…(截斷)"
                     steps[-1]["result"] = short
-                tool_active = False
             elif kind == "perm":
                 if steps:
                     steps[-1]["note"] = f"🔐 自動允許 {val}"
@@ -4620,13 +4167,6 @@ async def _persona_content_stream(model: str, prompt: str):
                 yield ("status", val)
             elif kind == "usage":
                 yield ("usage", val)
-            elif kind == "stall":
-                # A watchdog reset already retired the bad ACP process. A
-                # cold fallback here would repeat the same document/vision
-                # work and add another 180s timeout on top of the first one.
-                _log_event("persona_stall_terminal", model=model,
-                           had_text=got_text, had_tool=tool_active)
-                yield ("content", "\n\n⚠️ 回合逾時：文件處理長時間沒有新進度，已重置執行器。請重新送出文件。")
             elif kind == "error":
                 if not got_text:
                     try:
@@ -5118,22 +4658,9 @@ _CX_THREAD_ID_RE = re.compile(_CX_UUID_PATTERN)
 # 「桌面端有沒有放開」的探針,所以 banner 不需要重啟 bridge 就會自己消失。
 CODEX_THREAD_LOCK_RETRY_SECS = float(
     os.environ.get("CODEX_THREAD_LOCK_RETRY_SECS", "300"))
-# 鎖住期間**有訊息在排隊**時的探測窗:300s 對「桌面剛關掉對話、使用者在手機
-# 等回覆」太殘忍(最壞白等五分鐘)。有人排隊 → 用短窗頻繁探,沒人排隊 → 維持
-# 長窗省 log。(2026-09-19 鎖住不再回 409 改為入佇列,這個窗決定送達延遲。)
-CODEX_THREAD_LOCK_RETRY_QUEUED_SECS = float(
-    os.environ.get("CODEX_THREAD_LOCK_RETRY_QUEUED_SECS", "20"))
-# daemon 自療:managed socket 連不上時,試著用官方 CLI 把 daemon 拉起來
-# (`codex app-server daemon start`,冪等)再重連一次。冷卻窗防止 daemon 真的
-# 壞掉時每次連線都重複 spawn。0 = 停用。
-# (2026-09-19 事故:daemon backend=pid 非 launchd 管,8/24 死掉躺了快一個月,
-# bridge 靜默退 stdio、桌面開內建 app-server 搶鎖 —— 自療讓這事不再依賴
-# 某一台機器上有沒有裝 keepalive。)
-CODEX_DAEMON_AUTOSTART_COOLDOWN_SECS = float(
-    os.environ.get("CODEX_DAEMON_AUTOSTART_COOLDOWN_SECS", "600"))
 CX_THREAD_LOCKED_MESSAGE = (
     "此對話正被桌面版 Codex/ChatGPT 佔用(thread 寫入鎖)。"
-    "送出的訊息會自動排隊,桌面釋放後就會送出;急用可改另一條 session。")
+    "請在桌面 app 關閉這個對話後再試,或改用另一條 session。")
 CX_THREAD_LOCKED_CARD_TEXT = "⚠️ " + CX_THREAD_LOCKED_MESSAGE
 CX_THREAD_UNLOCKED_CARD_TEXT = (
     "✅ 桌面版 Codex/ChatGPT 已釋放這個對話的寫入鎖,現在可以正常送出了。")
@@ -5641,43 +5168,6 @@ class CodexAppServerClient:
                    effective_mode=_effective_app_server_mode(),
                    isolated=_codex_isolated(), **fields)
 
-    # daemon 自療的冷卻時戳(monotonic)。類別屬性當預設,首次嘗試後成為實例屬性。
-    _daemon_autostart_last = 0.0
-
-    async def _maybe_autostart_daemon_locked(self) -> bool:
-        """managed socket 連不上時,試著把官方 daemon 拉起來。
-
-        `codex app-server daemon start` 是冪等的(活著回 running、死了才拉),
-        用官方 CLI 而不是自己 spawn app-server —— 後者就是「第二顆 writer」
-        災難的起點。回 True = 有嘗試且 CLI 回 0(值得再重連一次)。
-        冷卻窗 CODEX_DAEMON_AUTOSTART_COOLDOWN_SECS(0 = 停用整個自療)。
-        """
-        if CODEX_DAEMON_AUTOSTART_COOLDOWN_SECS <= 0:
-            return False
-        now = time.monotonic()
-        if now - self._daemon_autostart_last < CODEX_DAEMON_AUTOSTART_COOLDOWN_SECS:
-            return False
-        self._daemon_autostart_last = now
-        bin_ = _resolve_codex_bin()
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                bin_, "app-server", "daemon", "start",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT)
-            try:
-                out, _ = await asyncio.wait_for(proc.communicate(), timeout=20)
-            except asyncio.TimeoutError:
-                proc.kill()
-                _log_event("codex_daemon_autostart_timeout", bin=bin_)
-                return False
-            _log_event("codex_daemon_autostart", bin=bin_, rc=proc.returncode,
-                       output=(out or b"").decode("utf-8", "replace")[:200])
-            return proc.returncode == 0
-        except Exception as exc:  # noqa: BLE001
-            _log_exc("CodexAppServerClient._maybe_autostart_daemon_locked",
-                     exc, expected=True)
-            return False
-
     async def _ensure_started_locked(self):
         if self.ws is not None or (self.proc and self.proc.returncode is None):
             return
@@ -5697,32 +5187,12 @@ class CodexAppServerClient:
                 _log_event("codex_managed_connect_failed",
                            socket=CODEX_APP_SERVER_SOCKET, mode=mode,
                            error=type(e).__name__, error_message=str(e)[:200])
-                # daemon 自療(2026-09-19):daemon 是 backend=pid、非 launchd 管,
-                # 重開機/崩潰後沒人拉起 —— 8/24 死掉躺了快一個月,bridge 靜默退
-                # stdio、桌面開內建 app-server 搶 thread 鎖。與其依賴每台機器都
-                # 記得裝 keepalive,bridge 在需要的當下自己 `daemon start`(官方
-                # CLI、冪等)再重連一次。冷卻窗擋住 daemon 真壞掉時的重複 spawn。
-                if await self._maybe_autostart_daemon_locked():
-                    try:
-                        await self._connect_managed_locked()
-                        managed_error = None
-                        _log_event("codex_daemon_autostart_reconnected",
-                                   socket=CODEX_APP_SERVER_SOCKET)
-                    except Exception as e2:  # noqa: BLE001
-                        self.ws = None
-                        self.transport = ""
-                        managed_error = e2
-                        _log_event("codex_managed_connect_failed",
-                                   socket=CODEX_APP_SERVER_SOCKET, mode=mode,
-                                   error=type(e2).__name__,
-                                   error_message=str(e2)[:200],
-                                   after="daemon-autostart")
-                if mode == "managed" and managed_error is not None:
+                if mode == "managed":
                     # 刻意選 daemon-only 的人:大聲壞掉,不要偷偷開第二顆
                     # app-server 去搶 thread-store 的 writer lock。
                     raise CodexAppServerError(
                         "managed Codex app-server unavailable; refusing to spawn a second server"
-                    ) from managed_error
+                    ) from e
         if self.ws is not None:
             self._note_transport("unix-websocket", socket=CODEX_APP_SERVER_SOCKET)
         else:
@@ -6998,15 +6468,6 @@ class CodexAppServerClient:
         if self.clear_thread_lock(thread_id):
             _log_event("codex_thread_unlocked", thread=thread_id[:16])
             _cx_feed_thread_unlocked(thread_id)
-            # 鎖住期間送的訊息都在佇列裡(2026-09-19 起鎖住不回 409)——
-            # 解鎖的當下就是送出時機,不能等下一次 turn 結束(沒有 turn 在跑,
-            # 那個時機永遠不來)。用 create_task 避免重入:這裡可能正處在
-            # start_turn → ensure_thread_loaded 的呼叫鏈上,drain 內部的
-            # is_active 檢查會讓它與呼叫者的 turn 自然錯開。
-            if self.pending_count(thread_id) > 0:
-                task = asyncio.create_task(self.drain_pending(thread_id))
-                _BG_TASKS.add(task)
-                task.add_done_callback(_BG_TASKS.discard)
 
     async def start_turn(self, thread_id: str, input_items: list, client_id: str | None = None,
                          cwd: str | None = None):
@@ -7312,16 +6773,7 @@ class CodexAppServerClient:
 
     async def drain_pending(self, thread_id: str) -> None:
         """turn 結束後送出佇列裡的下一則(一次一則:codex 是單 writer)。
-        失敗不吞:把該則丟掉並記錄,否則會永遠卡在隊首反覆撞同一面牆。
-
-        防重入(2026-09-19):入口從一個(turn 結束)變兩個(+ 解鎖時),並發
-        drain 會各自 pop 一則同時 start_turn —— 後到的撞 turn-in-flight,
-        那則使用者訊息就被當失敗丟掉。同 thread 同時只准一條 drain 在跑。"""
-        if not hasattr(self, "_draining_threads"):
-            self._draining_threads = set()
-        if thread_id in self._draining_threads:
-            return
-        self._draining_threads.add(thread_id)
+        失敗不吞:把該則丟掉並記錄,否則會永遠卡在隊首反覆撞同一面牆。"""
         try:
             while self.pending_inputs.get(thread_id):
                 if self.is_active(thread_id):
@@ -7335,15 +6787,6 @@ class CodexAppServerClient:
                                remaining=len(self.pending_inputs.get(thread_id) or []))
                     return                  # 開跑了 → 下一則等這輪結束
                 except Exception as exc:    # noqa: BLE001
-                    if _codex_thread_lock_conflict(exc) is not None:
-                        # 鎖又被搶回去(桌面 app 的 re-grab race,memory 有
-                        # 記載)。這不是失敗是暫時狀態 —— 塞回**隊首**保序,
-                        # 等下一個探測窗再送;丟掉等於把使用者的話吃掉。
-                        self.pending_inputs[thread_id].insert(0, item)
-                        _log_event("codex_pending_input_relocked",
-                                   thread=thread_id[:16],
-                                   remaining=len(self.pending_inputs.get(thread_id) or []))
-                        return
                     _log_event("codex_pending_input_failed", thread=thread_id[:16],
                                error=type(exc).__name__,
                                error_message=str(exc)[:200])
@@ -7351,7 +6794,6 @@ class CodexAppServerClient:
                     # 不推張錯誤卡的話,他到死都不知道這則根本沒送出去。
                     _cx_feed_queue_drop(thread_id, item, exc)
         finally:
-            self._draining_threads.discard(thread_id)
             # 只在成功路徑同步 → 整個佇列全部失敗清空時 depth 永遠卡著不歸零,
             # 狀態列就一直掛著「另有 N 則排隊」。無論怎麼離開都要同步一次。
             _cx_sync_queue_depth(thread_id)
@@ -7409,23 +6851,9 @@ class CodexAppServerClient:
         return thread_id in self.thread_locks
 
     def thread_lock_retry_due(self, thread_id: str) -> bool:
-        """鎖定中且抑制窗已過 → 允許再試一次(同時是「桌面端放開了沒」的探針)。
-
-        有訊息排隊時改用短窗(CODEX_THREAD_LOCK_RETRY_QUEUED_SECS):鎖住已不
-        回 409 而是入佇列,這個窗直接決定「桌面放開後多久送達」——300s 的
-        止血窗是為 log 風暴設的,對排隊中的使用者是白等。上次偵測時刻由
-        next_retry_at 反推(它固定 = 偵測時刻 + 長窗),不另存欄位。"""
+        """鎖定中且抑制窗已過 → 允許再試一次(同時是「桌面端放開了沒」的探針)。"""
         rec = self.thread_locks.get(thread_id)
-        if not rec:
-            return False
-        now = time.monotonic()
-        due = float(rec.get("next_retry_at") or 0.0)
-        if now >= due:
-            return True
-        if self.pending_count(thread_id) <= 0:
-            return False
-        last_detect = due - CODEX_THREAD_LOCK_RETRY_SECS
-        return now >= last_detect + CODEX_THREAD_LOCK_RETRY_QUEUED_SECS
+        return bool(rec) and time.monotonic() >= float(rec.get("next_retry_at") or 0.0)
 
     def thread_lock_info(self, thread_id: str) -> dict | None:
         """狀態端點/卡片流共用的 lock 描述;沒鎖 → None。"""
@@ -7780,8 +7208,7 @@ def _cx_toolsteps_load() -> dict:
             with open(CX_TOOLSTEPS_CACHE_PATH, encoding="utf-8") as f:
                 data = json.load(f)
             _CX_TOOLSTEPS_CACHE = data if isinstance(data, dict) else {}
-        except Exception as _exc:      # noqa: BLE001 — 檔案不在/壞掉都當空的
-            _log_exc("cx_toolsteps_cache_load", _exc, expected=True)
+        except Exception:      # noqa: BLE001 — 檔案不在/壞掉都當空的
             _CX_TOOLSTEPS_CACHE = {}
     return _CX_TOOLSTEPS_CACHE
 
@@ -8752,100 +8179,13 @@ async def codex_session_create(request: Request):
         _codex_http_error(e)
 
 
-# ═════════════ 檔案瀏覽面 /app/v2/fs/list(1-2,SPEC_FILE_BROWSER)═══════════════
-# 只加「列目錄」—— 檔案內容仍走 /file?path=(複用其服務 + Range,見規格 §7)。
-def _fs_browse_roots() -> list:
-    """檔案瀏覽的允許 root。預設只 home —— temp dirs 是 agent scratch、不是使用者
-    檔案,不列(規格 §6)。未來做『允許 root 設定頁』時從這裡擴。"""
-    return [os.path.realpath(os.path.expanduser("~"))]
-
-
-def _fs_path_allowed(p: str, roots: list) -> bool:
-    """realpath 後的 p 是否落在允許 root 內(防 ../ 穿越、symlink 逃逸)。
-    這是檔案瀏覽唯一的牆,與 /file 同精神 —— 單一真相,不要各寫一份。"""
-    return any(p == r or p.startswith(r + os.sep) for r in roots)
-
-
-_FS_LIST_MAX = 2000
-
-
-def _fs_entry_kind(name: str, is_dir: bool) -> str:
-    if is_dir:
-        return "dir"
-    ext = os.path.splitext(name)[1].lower().lstrip(".")
-    for kind, exts in (
-        ("pdf", ("pdf",)),
-        ("video", ("mp4", "mov", "webm", "m4v", "avi", "mkv")),
-        ("markdown", ("md", "markdown")),
-        ("html", ("html", "htm")),
-        ("image", ("png", "jpg", "jpeg", "gif", "webp", "heic", "svg", "bmp")),
-        ("audio", ("mp3", "wav", "m4a", "aac", "flac")),
-        ("text", ("txt", "log", "json", "yaml", "yml", "csv", "xml", "py",
-                  "js", "ts", "swift", "go", "rs", "sh", "c", "cpp", "h", "toml")),
-    ):
-        if ext in exts:
-            return kind
-    return "file"
-
-
-@app.get("/app/v2/fs/list")
-async def fs_list(request: Request, path: str = ""):
-    """列目錄。旗標關 → 404。root 白名單比 /file 更嚴(預設只 home)。"""
-    if not POCKET_FILEBROWSER_ENABLED:
-        raise HTTPException(status_code=404, detail="not found")
-    _check_auth(request)
-    roots = _fs_browse_roots()
-    target = (path or "").strip() or roots[0]
-    p = os.path.realpath(os.path.expanduser(target))
-    if not _fs_path_allowed(p, roots):
-        raise HTTPException(status_code=404, detail="not found")
-    if not os.path.isdir(p):
-        raise HTTPException(status_code=400, detail="not a directory")
-    entries = []
-    try:
-        with os.scandir(p) as it:
-            for de in it:
-                if de.name.startswith("."):      # 隱藏檔預設不列
-                    continue
-                try:
-                    st = de.stat(follow_symlinks=False)
-                    is_dir = de.is_dir(follow_symlinks=False)
-                except OSError:
-                    continue
-                entries.append({
-                    "name": de.name, "is_dir": is_dir,
-                    "size": 0 if is_dir else st.st_size,
-                    "mtime": st.st_mtime,
-                    "kind": _fs_entry_kind(de.name, is_dir),
-                    "path": de.path,
-                })
-                if len(entries) >= _FS_LIST_MAX:
-                    break
-    except OSError:
-        raise HTTPException(status_code=403, detail="cannot read directory")
-    entries.sort(key=lambda e: (not e["is_dir"], e["name"].lower()))
-    parent = os.path.dirname(p)
-    if p in roots or not _fs_path_allowed(parent, roots):
-        parent = None            # 已在 root,沒有上一層
-    return {"path": p, "parent": parent, "entries": entries,
-            "truncated": len(entries) >= _FS_LIST_MAX, "roots": roots}
-
-
 @app.get("/file")
 async def serve_file(request: Request, path: str):
     """Serve a local file (image/pdf) by path so the app can render image paths
     that appear in transcripts (your attachments + files the agent references).
     Restricted to a small set of safe roots (home + the temp dirs agents write
     scratch files to), must be a regular file."""
-    # ?token= fallback(檔案瀏覽 1-2):<img>/<video>/<iframe> 無法帶 Authorization
-    # header。有 bearer → 正常 _check_auth(含節流);沒 header 但有 ?token= → 驗 query
-    # token。token 會進 access log/Referer,所以僅此端點、且只在無 header 時才看 query。
-    _qtok = (request.query_params.get("token") or "").strip()
-    if _qtok and not request.headers.get("authorization", "").lower().startswith("bearer "):
-        if not _token_is_valid(_qtok):
-            raise http_err(401, "AUTH_INVALID_TOKEN", "invalid bridge token")
-    else:
-        _check_auth(request)
+    _check_auth(request)
     p = os.path.realpath(os.path.expanduser(path))
     roots = [os.path.realpath(os.path.expanduser("~"))]
     # Agents (incl. Claude Code's scratchpad) often emit files under the system
@@ -9483,131 +8823,6 @@ async def pair_qr_page(request: Request):
     _pair_check_boot(request)       # 真閘:一次性 boot code(tunnel 下 loopback 不可信)
     _pair_local_only(request)       # defense-in-depth 第二層
     return HTMLResponse(_PAIR_QR_HTML)
-
-
-# ═════════════ 桌面 Web 主控台 /console(1-1,SPEC_DESKTOP_CONSOLE_20261006)═══════
-# 前端是 static 檔(static/console/),bootstrap 流程與 /pair/qr 同款:
-#   /console?boot=<code> → 頁面 JS fetch /pair/qr.json?boot= 取一次性碼 →
-#   POST /pair/claim 換可撤銷 pdev- token → 之後 /app/v2/* 帶 Bearer。
-# 控制路徑(input/interrupt/approve/events/cards)全部複用現有 v2 端點,不新增。
-_CONSOLE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                            "static", "console")
-
-_CONSOLE_SECURITY_HEADERS = {
-    "Cache-Control": "no-store",
-    # 自家 static 的 inline JS/CSS 要能跑,且只准連回自己(connect-src 'self');
-    # 其餘一律封死。比 Apple 回呼頁放寬 script-src,因為主控台有互動邏輯。
-    "Content-Security-Policy": (
-        "default-src 'none'; "
-        "script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; "
-        "img-src 'self' data: blob:; media-src 'self' blob:; "
-        "connect-src 'self'; base-uri 'none'; frame-ancestors 'none'"),
-    "Referrer-Policy": "no-referrer",
-    "X-Content-Type-Options": "nosniff",
-    "X-Frame-Options": "DENY",
-}
-
-
-def _console_guard(request: Request) -> None:
-    """/console 的門:旗標關 → 404(對外表現同不存在);boot code 仍是真閘。"""
-    if not POCKET_CONSOLE_ENABLED:
-        raise HTTPException(status_code=404, detail="not found")
-    _pair_check_boot(request)       # 真閘:一次性 boot code(同 /pair/qr)
-    _pair_local_only(request)       # defense-in-depth 第二層
-
-
-@app.get("/console")
-async def console_page(request: Request):
-    _console_guard(request)
-    index = os.path.join(_CONSOLE_DIR, "index.html")
-    try:
-        html = open(index, encoding="utf-8").read()
-    except FileNotFoundError:
-        raise HTTPException(status_code=404, detail="console not installed")
-    return HTMLResponse(html, headers=_CONSOLE_SECURITY_HEADERS)
-
-
-# 靜態資產(app.js / sse.js / style.css)。旗標關時整個 mount 不掛 → 404。
-# 注意:StaticFiles 不經 _console_guard 的 boot 檢查(靜態資產本身不含機密,
-# 真正的機密是 token,由頁面 JS 走 /pair/claim 取得;資產洩漏無害)。
-if POCKET_CONSOLE_ENABLED and os.path.isdir(_CONSOLE_DIR):
-    from fastapi.staticfiles import StaticFiles
-    app.mount("/console/static",
-              StaticFiles(directory=_CONSOLE_DIR), name="console-static")
-
-
-# ═════════ 記憶檢索薄代理 /app/v2/memory/search(2-1,期二:政策 + 留痕)═════════
-# 政策:per-caller 速率限(預設 30 次/分;避免有效 token 把 memoryd + ollama 打爆,
-# 承 bridge「有效 token 不節流」的例外 —— 記憶檢索會連帶觸發 embedding,要限)。
-_MEMORY_RATE: dict = {}          # token_hash → [timestamps]
-_MEMORY_RATE_MAX = int(os.environ.get("POCKET_MEMORY_RATE_MAX", "30"))
-_MEMORY_RATE_WINDOW = 60.0
-
-
-def _memory_rate_ok(request: Request) -> bool:
-    auth = request.headers.get("authorization", "")
-    tok = auth[7:].strip() if auth.lower().startswith("bearer ") else "?"
-    key = _short_hash(tok)
-    now = time.monotonic()
-    hits = [t for t in _MEMORY_RATE.get(key, []) if now - t < _MEMORY_RATE_WINDOW]
-    if len(hits) >= _MEMORY_RATE_MAX:
-        _MEMORY_RATE[key] = hits
-        return False
-    hits.append(now)
-    _MEMORY_RATE[key] = hits
-    return True
-
-
-@app.get("/app/v2/memory/search")
-async def v2_memory_search(request: Request, q: str = "", k: int = 8, provider: str = ""):
-    if not POCKET_MEMORY_ENABLED:
-        raise HTTPException(status_code=404, detail="not found")
-    _check_auth(request)
-    if not _memory_rate_ok(request):
-        raise HTTPException(status_code=429, detail="memory search rate limit; slow down")
-    if not q.strip():
-        raise HTTPException(status_code=400, detail="missing q")
-    import httpx
-    params = {"q": q, "k": max(1, min(k, 50))}
-    if provider:
-        params["provider"] = provider
-    try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            r = await client.get(MEMORYD_URL + "/memory/search", params=params)
-        data = r.json()
-    except Exception as e:  # noqa: BLE001
-        raise HTTPException(status_code=503, detail=f"memoryd unavailable: {type(e).__name__}")
-    # 留痕(期二):hit 涉及誰的 session 就往誰的卡片流落「👁 記憶調閱」卡 ——
-    # 誰調閱了誰看得見,照 _agent_context_audit 原樣。保守版:只對**已有 warm store**
-    # 的目標落(create_store=False,不為留痕冷載任意歷史 session);skey→bridge session
-    # 能乾淨對應的才落(codex:<id> 同鍵、hermes:<persona>:<sid>→hermes:<persona>);
-    # CC 的 skey 是 jsonl uuid、對不回 bridge 的 ccsess name,先跳過。
-    try:
-        seen = set()
-        for h in (data.get("hits") or []):
-            skey = h.get("skey") or ""
-            if skey.startswith("codex:"):
-                target = skey
-            elif skey.startswith("hermes:"):
-                parts = skey.split(":")
-                target = f"hermes:{parts[1]}" if len(parts) >= 2 else None
-            elif skey.startswith("claude_code:"):
-                # CC 的 skey 是 jsonl session uuid → _cc_name_for_sid 反查 ccsess name
-                # (D,2026-10-07)。對不上(歷史 session 早不在 pin/cache)→ 仍跳過。
-                nm = _cc_name_for_sid(skey.split(":", 1)[1])
-                target = f"claude_code:{nm}" if nm else None
-            else:
-                target = None
-            if not target or target in seen:
-                continue
-            seen.add(target)
-            await _agent_context_audit(
-                "記憶檢索", target, "memory_search",
-                "mem-" + uuid.uuid4().hex[:8],
-                note=f"查詢「{q.strip()[:40]}」", create_store=False)
-    except Exception as _exc:  # noqa: BLE001
-        _log_exc("v2_memory_search_audit", _exc, expected=True)
-    return JSONResponse(data, status_code=r.status_code)
 
 
 # ═════════════ Pocket ID(Pairing V3):enroll + heartbeat + voucher claim ═════════════
@@ -10281,12 +9496,10 @@ async def codex_session_input(thread_id: str, request: Request):
         return {"ok": True, "thread_id": thread_id, "duplicate": True,
                 **await _cx_input_replay(prior)}
     try:
-        # 上一輪還在跑 / thread 被桌面鎖住 → 收下入佇列(delivery=queued),
-        # **絕不回 4xx**。舊行為兩種都直接紅字:忙碌回 409「會話沒有在執行」
-        # (語意相反),鎖住回 409「被桌面版佔用,送不出去」(2026-09-19 老闆
-        # 實測,使用者只能乾等)。CC 早有 queued 語意;鎖住入佇列後,解鎖偵測
-        # (ensure_thread_loaded 成功)會自動 drain,使用者什麼都不用做。
-        def _accept_queued() -> dict:
+        # 上一輪還在跑 → 收下入佇列(delivery=queued),**絕不回 4xx**。
+        # 舊行為是直送 app-server 撞牆 → 409/502 → app 紅字「送出失敗」,而且 409
+        # 的人話還是「會話目前沒有在執行」,跟真相完全相反。CC 早有 queued 語意。
+        if CODEX_APP.is_active(thread_id):
             depth = CODEX_APP.enqueue_input(thread_id, input_items,
                                             client_id=client_id,
                                             cwd=body.get("cwd"), text=text)
@@ -10299,15 +9512,7 @@ async def codex_session_input(thread_id: str, request: Request):
             res = {"turn": None, "delivery": "queued",
                    "queued": True, "queue_depth": depth}
             _cx_input_settle(entry, res)
-            # 鎖住而入佇列的話,要把「為什麼在排隊」的鎖卡也推進卡片流 ——
-            # 舊 409 路徑由 _codex_http_error 推(create_if_missing=True),
-            # 新路徑不走它,不補的話使用者只看到泡泡排著、不知道在等什麼。
-            if CODEX_APP.is_thread_locked(thread_id):
-                _cx_feed_thread_locked(thread_id, create_if_missing=True)
             return {"ok": True, "thread_id": thread_id, **res}
-
-        if CODEX_APP.is_active(thread_id) or CODEX_APP.is_thread_locked(thread_id):
-            return _accept_queued()
         try:
             started = await CODEX_APP.start_turn(thread_id, input_items,
                                                  client_id=client_id,
@@ -10321,10 +9526,6 @@ async def codex_session_input(thread_id: str, request: Request):
             _cx_input_settle(entry, res)
             return {"ok": True, "thread_id": thread_id, **res}
         except Exception as e:  # noqa: BLE001
-            # 直送當下才第一次撞鎖(桌面剛搶走、狀態機還沒登記)→ 一樣入佇列。
-            # start_turn 內部已把鎖記進狀態機 + 推了 locked 卡,這裡只補收訊息。
-            if _codex_thread_lock_conflict(e) is not None:
-                return _accept_queued()
             _codex_http_error(e)
     except BaseException:
         _cx_input_release(entry)     # 失敗要放掉 claim,不然重試被自己擋整個 TTL
@@ -13754,9 +12955,6 @@ async def _cc_input_core(name: str, body: dict) -> dict:
     # 「待命」直到真正接手(可能好幾分鐘)——使用者看起來就是沒反應。
     # follower 在 queued 寬限內不以 idle 蓋掉;真 busy 一出現即交還正常路徑。
     store = _cc_card_store(name)
-    store.dispatch_pending = True
-    store.dispatch_started_at = time.time()
-    store.dispatch_card_seq = max(store.card_seq.values(), default=store.seq)
     store.queued_until = time.time() + _CC_QUEUED_GRACE_SECS
     store.set_status({"busy": True, "mode": None, "prompt": None,
                       "phase": "queued", "label": "已排入佇列,等待接手…"})
@@ -16465,7 +15663,7 @@ async def v2_session_input(session_id: str, request: Request):
             return {"ok": True, "session_id": session_id, "accepted": True,
                     "duplicate": True, **await _cx_input_replay(prior)}
         try:
-            def _accept_queued_v2() -> dict:
+            if CODEX_APP.is_active(src[1]):    # 忙碌 → 入佇列(同 v1,不回 4xx)
                 depth = CODEX_APP.enqueue_input(src[1], items, client_id=client_id,
                                                 text=text)
                 _cx_feed_input_accepted(src[1], client_id, text, attachments,
@@ -16475,22 +15673,10 @@ async def v2_session_input(session_id: str, request: Request):
                 # persona 的 v2 input 早就有回;CX 少了它 → app 永遠當成沒排隊。
                 res = {"delivery": "queued", "queued": True, "queue_depth": depth}
                 _cx_input_settle(entry, res)
-                # 同 v1:鎖住入佇列要補推鎖卡(舊 409 路徑由 _codex_http_error 推)。
-                if CODEX_APP.is_thread_locked(src[1]):
-                    _cx_feed_thread_locked(src[1], create_if_missing=True)
                 return {"ok": True, "session_id": session_id, "accepted": True, **res}
-
-            # 忙碌/鎖住 → 入佇列(同 v1,不回 4xx)。鎖住入佇列 = 2026-09-19
-            # 契約改版:解鎖偵測會自動 drain,使用者不再看到「被桌面佔用」紅字。
-            if CODEX_APP.is_active(src[1]) or CODEX_APP.is_thread_locked(src[1]):
-                return _accept_queued_v2()
             try:
                 await CODEX_APP.start_turn(src[1], items, client_id=client_id)
             except CodexAppServerError as e:
-                # 直送當下才第一次撞鎖 → 一樣入佇列(鎖已由 start_turn 記進
-                # 狀態機 + 推卡,這裡只補收訊息)。
-                if _codex_thread_lock_conflict(e) is not None:
-                    return _accept_queued_v2()
                 _codex_http_error(e)
             _cx_feed_input_accepted(src[1], client_id, text, attachments,
                                     typed_text=text, create_if_missing=True)
@@ -16656,7 +15842,6 @@ _CC_CARD_STORES: dict = {}      # name -> carddigest.SessionCardStore
 _CC_CARD_FOLLOWERS: dict = {}   # name -> asyncio.Task
 _CC_CARD_SEED_LINES = 200       # 冷載種子:最新 jsonl 的尾端行數
 _CC_QUEUED_GRACE_SECS = 120     # input 送達後,「已排入佇列」狀態最長維持秒數
-_CC_DISPATCH_LONG_WAIT_SECS = 120
 
 
 def _cc_card_store(name: str):
@@ -16665,52 +15850,6 @@ def _cc_card_store(name: str):
         store = _CC_CARD_STORES[name] = carddigest.SessionCardStore()
         store.media_session_id = f"claude_code:{name}"
     return store
-
-
-def _cc_dispatch_progressed(store) -> bool:
-    """Return true once a post-accept card has arrived for this dispatch.
-
-    The input.accepted card itself is the baseline. A later transcript echo,
-    tool card, stdout card, or assistant reply advances ``card_seq`` and is
-    evidence that the accepted input is no longer waiting in the gap between
-    the TUI and the transcript.
-    """
-    if not getattr(store, "dispatch_pending", False):
-        return False
-    latest = max(getattr(store, "card_seq", {}).values(), default=0)
-    baseline = int(getattr(store, "dispatch_card_seq", 0) or 0)
-    if latest <= baseline:
-        return False
-    store.dispatch_pending = False
-    store.dispatch_started_at = 0.0
-    store.dispatch_card_seq = latest
-    return True
-
-
-def _cc_dispatch_status(store, st: dict, now: float | None = None) -> dict | None:
-    """Build a visible status for an accepted input with no progress card yet.
-
-    ``busy=false`` is intentional: a background shell can be running while
-    Claude Code is back at its prompt, so this state must not expose a
-    misleading stop button or block the next input. The UI still gets a
-    spinner through the ``dispatching`` phase.
-    """
-    if _cc_dispatch_progressed(store):
-        return None
-    if not getattr(store, "dispatch_pending", False):
-        return None
-    if st.get("prompt"):
-        return {"busy": False, "mode": st.get("mode"),
-                "prompt": st.get("prompt"), "phase": "blocked",
-                "label": "等待核准"}
-    started = float(getattr(store, "dispatch_started_at", 0.0) or 0.0)
-    elapsed = max(0.0, (now if now is not None else time.time()) - started)
-    label = ("已送達，等待 Claude Code 開始…"
-             if elapsed < _CC_DISPATCH_LONG_WAIT_SECS
-             else "等待背景工作結果…")
-    return {"busy": False, "mode": st.get("mode"),
-            "prompt": st.get("prompt"), "phase": "dispatching",
-            "label": label}
 
 
 def _cc_cards_feed_approval(name: str, record: dict, resolved: str = "") -> None:
@@ -16777,19 +15916,11 @@ _CC_STREAM_MAX_TICK = 4000       # 單 tick 附加上限;超過視同重繪,跳�
 _CC_STREAM_MAX_DRAFT = 12000     # 草稿文字上限;飽和後停止增長,等正典卡
 _CC_STREAM_FINAL_GRACE = 4.0     # turn 結束後等正典卡接管的寬限秒數
 
-# 尾端 UI 雜訊(輸入區上方):spinner/狀態行、快捷鍵列、分隔線、tmux 提示。
-# 2.1.x 實錄補充:spinner 有「· Gitifying…」「✻ Coalescing… (4s · ↓ 79 tokens)」
-# 「✻ Brewed for 21s」等變體,leading glyph 字元組已涵蓋;tmux 捲動提示行
-# (「tmux detected · scroll with PgUp/PgDn…」)是 2.1 新增,必須剝掉。
+# 尾端 UI 雜訊(輸入框上方):spinner/狀態行、快捷鍵列、分隔線。
 _CC_STREAM_CHROME_RE = re.compile(
     r"^\s*(?:[✻✽✶✢✳∗＊·✦✧].*|esc to interrupt.*|\? for shortcuts.*"
-    r"|tmux detected ·.*|⏵⏵.*|⏸.*|[─╌╍]{4,}\s*)$", re.IGNORECASE)
+    r"|⏵⏵.*|[─╌╍]{4,}\s*)$", re.IGNORECASE)
 _CC_STREAM_BOX_TOP_RE = re.compile(r"^\s*╭")
-# v2.1+ 輸入區:不再是 ╭─╮ 框,而是「── 分隔線 / ❯ 提示行 / ── 分隔線 /
-# 狀態行」。錨點改抓最後一條 ❯ 提示行(輸入區永遠在 transcript 之下,
-# 使用者回顯的 ❯ 在上方,取「最後一個」就是輸入區)。
-_CC_STREAM_PROMPT_RE = re.compile(r"^\s*❯")
-_CC_STREAM_RULE_RE = re.compile(r"^\s*[─╌╍]{4,}\s*$")
 # 「⏺ ToolName(args…)」的工具呼叫塊;誤把 prose 當工具只會少流(正典補),
 # 反向誤判才會把垃圾塞進草稿 —— 所以規則從寬。
 _CC_STREAM_TOOL_RE = re.compile(r"^[A-Za-z][\w.:-]{0,60}\(")
@@ -16804,33 +15935,19 @@ def _cc_token_stream_enabled() -> bool:
 
 
 def _cc_stream_content(pane: str):
-    """pane 擷取 → 對話區純文字;認不出版面(找不到輸入區)回 None,
-    呼叫端跳過該 tick(保守優先)。
-
-    輸入區錨點支援兩代 TUI(2026-08-15 spike 實測補):
-      · ≤v2.0:╭─╮ 輸入框 → 最後一個 ╭(最下方的框)。
-      · v2.1+:`❯` 提示行(上緣緊貼一條 ── 分隔線)→ 最後一個 ❯。
-    兩種都在就取「較下面」那個 —— 輸入區永遠在 transcript 之下;
-    2.1 的歡迎框仍是 ╭─╮,只認 ╭ 會把錨咬在頂部、歡迎框捲走後更是
-    整個認不出版面(feat/cc-token-stream 當初在 2.0.x 上寫,flag 一直
-    沒開的真因就是這條版面漂移)。"""
+    """pane 擷取 → 對話區純文字;認不出版面(找不到輸入框)回 None,
+    呼叫端跳過該 tick(保守優先)。"""
     if not pane:
         return None
     pane = _CC_STREAM_ANSI_RE.sub("", pane)
     lines = [ln.rstrip() for ln in pane.splitlines()]
-    box_top = prompt = None
+    box_top = None
     for i, ln in enumerate(lines):
         if _CC_STREAM_BOX_TOP_RE.match(ln):
-            box_top = i                     # 最後一個 ╭(≤v2.0 輸入框)
-        if _CC_STREAM_PROMPT_RE.match(ln):
-            prompt = i                      # 最後一條 ❯ 提示行(v2.1+)
-    if box_top is None and prompt is None:
+            box_top = i                     # 取最後一個 ╭ ── 即最下方的輸入框
+    if box_top is None:
         return None
-    cut = max(x for x in (box_top, prompt) if x is not None)
-    if prompt is not None and cut == prompt and cut > 0 \
-            and _CC_STREAM_RULE_RE.match(lines[cut - 1]):
-        cut -= 1                            # 提示行上緣的 ── 分隔線一併切掉
-    content = lines[:cut]
+    content = lines[:box_top]
     # 尾端往上剝:空行、spinner/狀態行、busy 計時行(輸入框上那圈雜訊,
     # 每張 capture 都在變,不剝乾淨 diff 永遠對不上)。
     while content:
@@ -16951,11 +16068,6 @@ class CCPaneStream:
     def _grow(self, piece: str, newline: bool):
         if len(self.draft) >= _CC_STREAM_MAX_DRAFT:
             return                             # 飽和:停止增長,等正典卡
-        if not self.draft:
-            piece = piece.lstrip()             # 空草稿不吃前導空白(2.1 實測:
-                                               # 「⏺」先落、字後到的同行增長會
-                                               # 帶進 ⏺ 後那個空格;≥4 空白還會
-                                               # 被 markdown 當 code block)
         if newline and self.draft and not self.draft.endswith("\n"):
             piece = "\n" + piece
         self.draft = (self.draft + piece)[:_CC_STREAM_MAX_DRAFT]
@@ -17227,14 +16339,7 @@ async def _cc_card_follower(name: str, workdir: str):
                             # (委派/節流的「不推」判定在函式內)。
                             _cc_turn_end_push(name, store)
                 prev_busy = busy
-                dispatch_status = None if busy else _cc_dispatch_status(store, st)
-                if dispatch_status is not None:
-                    # The TUI is idle because it handed work to a background
-                    # process, but the accepted input has not produced a
-                    # follow-up card yet. Keep this visible until a real card
-                    # proves progress; do not fall back to idle.
-                    status = dispatch_status
-                elif not busy and time.time() < getattr(store, "queued_until", 0.0):
+                if not busy and time.time() < getattr(store, "queued_until", 0.0):
                     # input 已送達但 session 還沒接手(忙上一輪/思考中):
                     # 不用 idle 蓋掉「已排入佇列」,避免 UI 誤示「待命」死寂。
                     status = {"busy": True, "mode": st.get("mode"),
@@ -19489,7 +18594,6 @@ PERSONA_REPORTS = {
     },
     "shuijing": {
         "shuijing-sunrise-oracle": "水鏡晨卦",
-        "shuijing-sunset-closing-oracle": "水鏡晚卦",
     },
 }
 
@@ -19587,8 +18691,8 @@ async def _hermes_cron(action: str, job_id: str):
 
 _REPORT_START = re.compile(r"(🌅|🌙|☀️|🌇|🌃|📊|🗓️|善彰[，,、]?\s*(早安|午安|晚安)|早安|午安|晚安)")
 _REPORT_INLINE_START = re.compile(
-    r"(\*\*[^*\n]*(晨報|午報|晚間|晚卦|速覽|掃描|晨卦)[^*\n]*\*\*|"
-    r"#{1,3}\s*[^\n]*(晨報|午報|晚間|晚卦|速覽|掃描|晨卦)|"
+    r"(\*\*[^*\n]*(晨報|午報|晚間|速覽|掃描|晨卦)[^*\n]*\*\*|"
+    r"#{1,3}\s*[^\n]*(晨報|午報|晚間|速覽|掃描|晨卦)|"
     r"(🌅|🌙|☀️|🌇|🌃|📊|🗓️)[^\n]*|"
     r"善彰[，,、]?\s*(早安|午安|晚安))"
 )
@@ -19600,24 +18704,10 @@ def _clean_report(s: str) -> str:
     real title. Keep from the first line that carries real content: any CJK, a
     markdown header, or one of the known report openers (🌅/善彰早安…)."""
     text = s.strip()
+    inline = _REPORT_INLINE_START.search(text)
+    if inline and inline.start() > 0:
+        return text[inline.start():].lstrip(" -—\n").strip()
     lines = text.split("\n")
-
-    # An occasional cron preamble and the report title share one physical line.
-    # Only inspect the first non-empty line here. Searching the whole report is
-    # unsafe: a later valid sentence such as "**扣回晨卦...**" looks exactly
-    # like a report heading to the old regex and silently drops the report head.
-    first = next((i for i, line in enumerate(lines) if line.strip()), None)
-    if first is not None:
-        first_line = lines[first].strip()
-        inline = _REPORT_INLINE_START.search(first_line)
-        prefix = first_line[:inline.start()].strip() if inline else ""
-        # Inline trimming is only for an ASCII/English-looking preamble. A
-        # Chinese prefix is already report content and must remain untouched.
-        prefix_has_cjk = any("一" <= c <= "鿿" for c in prefix)
-        if inline and inline.start() > 0 and prefix and not prefix_has_cjk:
-            kept = first_line[inline.start():].lstrip(" -—")
-            return "\n".join([kept, *lines[first + 1:]]).strip()
-
     for i, line in enumerate(lines):
         t = line.strip()
         if not t:
@@ -20440,8 +19530,7 @@ async def capabilities(request: Request):
                          "interactive_push", "media_artifacts",
                          "hermes_media_capabilities",
                          "hermes_media_settings",
-                         "push_register", "dashboard", "openclaw_config",
-                         "subscription_entitlement"] +
+                         "push_register", "dashboard", "openclaw_config"] +
                         (["terminal"] if POCKET_TERMINAL_ENABLED else []) +
                         (["openclaw_provider"] if OPENCLAW.configured() else []) +
                         (["calendar_proposals"]
@@ -20471,14 +19560,10 @@ async def capabilities(request: Request):
                           "/app/v2/sessions/{id}/approve", "/app/v1/terminal",
                           "/app/v2/taskboard",
                           "/app/v1/usage", "/app/v1/dashboard",
-                          "/app/v1/openclaw/config",
-                          "/app/v1/subscription/verify",
-                          "/app/v1/subscription/status",
-                          "/app/v1/subscription/notify"] +
+                          "/app/v1/openclaw/config"] +
                          (["/app/v2/sessions/{id}/proposals/calendar",
                            "/app/v2/proposals/{proposal_id}/resolve"]
-                          if _calendar_proposals_enabled() else []),
-            "subscription_configured": subscription_configured()}
+                          if _calendar_proposals_enabled() else [])}
 
 
 @app.post("/app/v1/auth/apple")
@@ -20521,9 +19606,6 @@ async def app_auth_apple(request: Request):
             "token": session_token,
             "expires_at": expires_at,
         },
-        # 登入即知付費層 —— app 不必再多打一趟 /subscription/status 才敢決定
-        # 要不要開付費 UI。未配置訂閱時這裡就是免費層(configured=false)。
-        "entitlement": _entitlement_effective(apple_user_id),
     }
 
 
@@ -20702,191 +19784,6 @@ async def app_auth_apple_web_callback(request: Request):
             error=type(e).__name__,
         )
         return _apple_web_callback_page("failed")
-
-
-# ───────────── 訂閱 entitlement 端點(feat/subscription-entitlement)─────────
-# 信任模型:app **永遠不能**自稱訂閱者。唯一可接受的證據是 Apple 簽的 JWS
-# (StoreKit 2 的 signedTransaction / Server Notification 的 signedPayload),
-# 由 bridge 離線驗簽後自己解出 product / 到期日。app 送來的 product_id、
-# expires_at、"is_pro" 之類的欄位一律不讀 —— 那些都是可竄改的自我宣稱。
-
-@app.post("/app/v1/subscription/verify")
-async def app_subscription_verify(request: Request):
-    """app 買完/啟動時把 StoreKit 2 的 signedTransaction 送來換伺服器端 entitlement。
-
-    需要 account session:驗簽只證明「這筆訂閱存在」,是 account session 把它
-    綁到某個 Apple 帳號,訂閱才能跨裝置生效。"""
-    try:
-        body = await request.json()
-    except Exception:  # noqa: BLE001
-        raise http_err(400, "BAD_REQUEST", "bad json")
-    if not isinstance(body, dict):
-        raise http_err(400, "BAD_REQUEST", "bad json")
-    user = _account_user_from_request(request, body)
-    apple_user_id = user["apple_user_id"]
-
-    if not subscription_configured():
-        # 缺配置靜默:回免費層,不報錯。app 看 configured=false 就知道這台
-        # bridge 沒開訂閱,不該顯示「驗證失敗」給使用者。
-        return {"ok": True, "configured": False,
-                "entitlement": _entitlement_free(configured=False)}
-
-    signed_transaction = str(
-        body.get("signedTransaction") or body.get("signed_transaction")
-        or body.get("signedTransactionInfo") or "").strip()
-    if not signed_transaction:
-        raise http_err(400, "SUBSCRIPTION_MISSING_RECEIPT",
-                       "signedTransaction required")
-    signed_renewal = str(
-        body.get("signedRenewalInfo") or body.get("signed_renewal_info") or "").strip()
-
-    tx_payload = await asyncio.to_thread(
-        _subscription_verify_jws, signed_transaction, "transaction")
-    import apple_storekit
-    tx = apple_storekit.normalize_transaction(tx_payload)
-    _subscription_check_transaction(tx)
-    renewal = None
-    if signed_renewal:
-        renewal_payload = await asyncio.to_thread(
-            _subscription_verify_jws, signed_renewal, "renewal")
-        renewal = apple_storekit.normalize_renewal(renewal_payload)
-        # 續訂資訊必須跟交易是同一條訂閱,否則就是拼接兩筆不同來源的證據。
-        if renewal.get("original_transaction_id") and \
-                renewal["original_transaction_id"] != tx.get("original_transaction_id"):
-            raise http_err(400, "SUBSCRIPTION_RENEWAL_MISMATCH",
-                           "renewal info belongs to a different subscription")
-
-    row = await asyncio.to_thread(
-        _entitlement_upsert, tx, renewal,
-        apple_user_id=apple_user_id, source="verify")
-    entitlement = _entitlement_public(row)
-    _log_event("subscription_verified",
-               apple_user_hash=_short_hash(apple_user_id),
-               otid_hash=_short_hash(tx.get("original_transaction_id")),
-               product_id=str(tx.get("product_id") or "")[:80],
-               status=entitlement["status"],
-               environment=str(tx.get("environment") or "")[:32])
-    return {"ok": True, "configured": True, "entitlement": entitlement}
-
-
-@app.get("/app/v1/subscription/status")
-async def app_subscription_status(request: Request):
-    """目前 entitlement(跨裝置一致的權威答案)。"""
-    user = _account_user_from_request(request)
-    apple_user_id = user["apple_user_id"]
-    if not subscription_configured():
-        return {"ok": True, "configured": False,
-                "entitlement": _entitlement_free(configured=False),
-                "entitlements": []}
-    rows = await asyncio.to_thread(_entitlement_rows_for_user, apple_user_id)
-    return {
-        "ok": True,
-        "configured": True,
-        "entitlement": _entitlement_effective(apple_user_id),
-        # 全部訂閱紀錄(換方案/sandbox 並存時的除錯用)。
-        "entitlements": [_entitlement_public(r) for r in rows],
-    }
-
-
-# 通知類型 → 我們要不要據此改狀態。REFUND/REVOKE 是撤銷(交易 payload 會帶
-# revocationDate,狀態自然變 revoked);其餘續訂/到期/方案變更都靠交易與續訂
-# 資訊裡的時間戳推導,不需要為每個 type 寫一套邏輯。
-_SUBSCRIPTION_NOTIFICATION_IGNORED = ("TEST",)
-
-
-@app.post("/app/v1/subscription/notify")
-async def app_subscription_notify(request: Request):
-    """App Store Server Notifications V2 接收端(Apple 主動推續訂/退款/取消)。
-
-    **這個端點沒有 bridge bearer 驗證**,因為呼叫者是 Apple,不可能帶我們的
-    token。它的認證完全來自 signedPayload 的憑證鏈 —— 驗不過就 401,不寫任何
-    東西。這也是為什麼它必須公網可達(cloudflare tunnel `pocket.tsai.cash`)。
-
-    回應碼對 Apple 有意義:非 2xx 會被重試(最長數天)。因此「我們這邊沒配置
-    訂閱」「這是 TEST 通知」「這筆不是我們的 app」都回 200 —— 那些重試無意義。
-    只有簽章驗不過才回 401(那是攻擊或設定錯誤,值得讓 Apple 重試/留痕)。"""
-    try:
-        body = await request.json()
-    except Exception:  # noqa: BLE001
-        raise http_err(400, "BAD_REQUEST", "bad json")
-    if not isinstance(body, dict):
-        raise http_err(400, "BAD_REQUEST", "bad json")
-
-    if not subscription_configured():
-        _log_event("subscription_notification_dropped", reason="not_configured")
-        return {"ok": True, "configured": False}
-
-    signed_payload = str(body.get("signedPayload") or body.get("signed_payload") or "").strip()
-    if not signed_payload:
-        raise http_err(400, "SUBSCRIPTION_MISSING_PAYLOAD", "signedPayload required")
-
-    payload = await asyncio.to_thread(
-        _subscription_verify_jws, signed_payload, "notification")
-    import apple_storekit
-    notification_type = str(payload.get("notificationType") or "")[:48]
-    subtype = str(payload.get("subtype") or "")[:48]
-    data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
-
-    if notification_type in _SUBSCRIPTION_NOTIFICATION_IGNORED:
-        _log_event("subscription_notification_received",
-                   notification_type=notification_type, applied=False,
-                   reason="test_notification")
-        return {"ok": True, "configured": True,
-                "notification_type": notification_type, "applied": False}
-
-    bundle_id = str(data.get("bundleId") or "")
-    if bundle_id and bundle_id != APPLE_STOREKIT_BUNDLE_ID:
-        _log_event("subscription_notification_dropped", reason="bundle_mismatch",
-                   notification_type=notification_type, bundle_id=bundle_id[:64])
-        return {"ok": True, "configured": True,
-                "notification_type": notification_type, "applied": False}
-    app_apple_id = str(data.get("appAppleId") or "")
-    if APPLE_STOREKIT_APP_APPLE_ID and app_apple_id \
-            and app_apple_id != APPLE_STOREKIT_APP_APPLE_ID:
-        _log_event("subscription_notification_dropped", reason="app_apple_id_mismatch",
-                   notification_type=notification_type)
-        return {"ok": True, "configured": True,
-                "notification_type": notification_type, "applied": False}
-
-    signed_transaction = str(data.get("signedTransactionInfo") or "").strip()
-    if not signed_transaction:
-        # 有些通知(如 RENEWAL_EXTENSION 的彙總、PRICE_INCREASE)沒有交易資訊。
-        # 沒有可驗證的交易就沒有可信的狀態變更 —— 收下、記錄、不改 DB。
-        _log_event("subscription_notification_received",
-                   notification_type=notification_type, subtype=subtype,
-                   applied=False, reason="no_transaction_info")
-        return {"ok": True, "configured": True,
-                "notification_type": notification_type, "applied": False}
-
-    tx_payload = await asyncio.to_thread(
-        _subscription_verify_jws, signed_transaction, "notification_transaction")
-    tx = apple_storekit.normalize_transaction(tx_payload)
-    _subscription_check_transaction(tx)
-    renewal = None
-    signed_renewal = str(data.get("signedRenewalInfo") or "").strip()
-    if signed_renewal:
-        renewal_payload = await asyncio.to_thread(
-            _subscription_verify_jws, signed_renewal, "notification_renewal")
-        renewal = apple_storekit.normalize_renewal(renewal_payload)
-        if renewal.get("original_transaction_id") and \
-                renewal["original_transaction_id"] != tx.get("original_transaction_id"):
-            renewal = None      # 拼接的證據,寧可不用
-
-    # apple_user_id=None:通知不帶帳號資訊。既有列會保留原本的綁定;若這是第
-    # 一次見到這條訂閱(通知比 app 的 /verify 先到),先落無主的一列,等 app
-    # 帶 account session 來 /verify 認領。
-    row = await asyncio.to_thread(
-        _entitlement_upsert, tx, renewal, apple_user_id=None, source="notification")
-    entitlement = _entitlement_public(row)
-    _log_event("subscription_notification_applied",
-               notification_type=notification_type, subtype=subtype,
-               otid_hash=_short_hash(tx.get("original_transaction_id")),
-               status=entitlement["status"],
-               claimed=bool(row and row.get("apple_user_id")),
-               environment=str(tx.get("environment") or "")[:32])
-    return {"ok": True, "configured": True,
-            "notification_type": notification_type, "subtype": subtype or None,
-            "applied": True, "status": entitlement["status"]}
 
 
 # ── /app/v1/usage: Codex + Claude Code 本機用量(不打雲端 API)──────────
@@ -21228,7 +20125,6 @@ async def app_account(request: Request, include_revoked: bool = False):
     return {
         "user": _account_public_user(user),
         "devices": [_account_public_device(d) for d in devices],
-        "entitlement": _entitlement_effective(user["apple_user_id"]),
     }
 
 
@@ -25594,327 +24490,6 @@ def _discovery_registry_view(row: dict) -> dict:
     children = REGISTRY.children_ids(
         [r for r in all_rows if r.get("state") != "archived"])
     return _registry_public_row(row, children, by_id, now)
-
-
-# ───────────────────── Worker 可見層(設計書 §2.4)────────────────────────
-# 「我看不出來你有在運作,你有子程序在執行嗎?」——善彰 2026-08-12。
-# registry(§2.3 子程序面板)看的是**獨立 session**;這一層看的是 session
-# **內部**派出的短命工人。兩者並存、不互相污染:
-#   子程序 = 獨立 session(有 TTL、進家譜、可收編)
-#   工人   = session 內部的活(秒/分級、記憶體、靜默期自動過期)
-# 旗標預設關 —— 關著時端點 404、且這一層**完全沒有背景成本**(沒有計時器、
-# 沒有背景任務,過期是讀寫時惰性算的)。
-WORKERS_ENABLED = os.environ.get("WORKERS", "0").strip().lower() in (
-    "1", "true", "yes", "on")
-
-
-def _worker_ttl_from_env() -> float:
-    """TTL 解析**絕不能讓 bridge 開不起來**。
-
-    這是 import 期執行的:一個手殘打成 `WORKER_TTL_SECS=5m` 的 env,如果直接
-    `float()` 就會在 production 啟動時炸掉整個 bridge —— 而且是在旗標根本沒開
-    的情況下炸,完全違背「沒開旗標 = 零風險」。所以壞值一律退回預設。
-    `nan` 要特別擋:`now - nan` 恆為 nan,所有比較都是 False,結果是**永遠不過期**
-    (面板掛滿假的執行中工人),比炸掉還難查。
-    """
-    raw = os.environ.get("WORKER_TTL_SECS", "").strip()
-    if not raw:
-        return 300.0
-    try:
-        val = float(raw)
-    except (TypeError, ValueError):
-        return 300.0
-    if val != val or val <= 0 or val == float("inf"):   # nan / 非正 / inf
-        return 300.0
-    return min(val, 86400.0)
-
-
-WORKER_TTL_SECS = _worker_ttl_from_env()
-WORKERS = workers_store.WorkerStore(ttl_secs=WORKER_TTL_SECS)
-
-
-def _workers_require_enabled() -> None:
-    """旗標關 = 端點根本不存在(404),不是 403。合併進 main 的風險為零:
-    沒開旗標的 bridge 行為與合併前逐位元相同。"""
-    if not WORKERS_ENABLED:
-        raise HTTPException(status_code=404, detail="Not Found")
-
-
-def _worker_resolve_session(body: dict) -> str:
-    """把回報方給的身分解析成 v2 session id(`claude_code:<name>` 等)。
-
-    CC hook 的難處:hook 腳本只拿得到 Claude Code 自己的 `session_id`(uuid),
-    它**不知道**自己屬於哪個 ccsess session 名。但 bridge 早就知道 —— 現有的
-    `/ccsessions/_hook`(UserPromptSubmit/Stop)一直在把 name↔sid 對應釘進
-    `_CC_SID_PINS`/`_CC_SID_CACHE`/`_CC_SID_HISTORY`。這裡直接沿用同一套
-    `_cc_name_for_sid` 反查,不必叫 hook 腳本去猜 tmux 名字(猜錯就掛錯 session)。
-
-    優先序:明給的 `session` > `cc_session_id` 反查。都沒有 → 400。
-    """
-    explicit = str(body.get("session") or "").strip()
-    if explicit:
-        return explicit
-    cc_sid = str(body.get("cc_session_id") or "").strip()
-    if cc_sid:
-        name = _cc_name_for_sid(cc_sid)
-        if name:
-            return f"claude_code:{name}"
-        # 反查不到(pin 還沒建、或這個 CC 不在 ccsess 名單裡)。不要丟掉這筆
-        # 回報 —— 用 sid 自己開一格,至少 /app/v2/workers?session=cc-sid:<uuid>
-        # 拿得到,診斷時看得出「有工人但認不出是誰的」。
-        return f"cc-sid:{cc_sid}"
-    raise HTTPException(status_code=400, detail="session or cc_session_id required")
-
-
-def _codex_child_worker_rows(threads: list[dict], parent: dict,
-                             now: float) -> list[dict]:
-    """把 codex 的 child thread 投影成 parent 的工人。
-
-    **不進主清單** —— `_codex_v2_visible_threads` 的過濾維持原樣(那個過濾當初
-    是對的:390 筆 guardian thread 會把操作者的 session 整個擠掉)。這裡是另開
-    一條唯讀投影,只在被問到某個 parent 的工人時才算。
-
-    親子連線的實測結論(2026-08-12 查 `~/.codex/state_5.sqlite`):
-    - codex 有一張 `thread_spawn_edges(parent_thread_id, child_thread_id)`,
-      **但這台機器上是空的**(0 列)—— 這個版本沒在寫。有朝一日它開始寫,
-      thread 記錄上出現 `parentThreadId` 之類的欄位,下面的 explicit 分支會
-      自動優先採用。
-    - 現況唯一可用的訊號是 **cwd**:實測 subagent thread 與其 parent 共用 cwd
-      (guardian 228 筆在 /Users/xcash、38 筆在 hermes-agent/home,都與該目錄
-      下的操作者 thread 對得上)。所以用 cwd 相等當連線,並在 meta 標
-      `link:"cwd"` 誠實告訴 app 這是啟發式、不是 provider 給的事實。
-    """
-    parent_id = str(parent.get("id") or "")
-    parent_cwd = os.path.realpath(str(parent.get("cwd") or "")) if parent.get("cwd") else ""
-    out = []
-    for t in threads:
-        tid = str(t.get("id") or "")
-        if not tid or tid == parent_id or not _codex_is_child_thread(t):
-            continue
-        explicit = str(t.get("parentThreadId") or t.get("parent_thread_id") or "")
-        if explicit:
-            if explicit != parent_id:
-                continue
-            link = "provider"
-        else:
-            if not parent_cwd:
-                continue
-            child_cwd = os.path.realpath(str(t.get("cwd") or "")) if t.get("cwd") else ""
-            if child_cwd != parent_cwd:
-                continue
-            link = "cwd"
-        # provider 沒有 done/failed 的分別,只有「還在跑 / 不在跑了」。
-        running = bool(CODEX_APP.is_active(tid))
-        updated = _codex_ts(t.get("updatedAt"))
-        started = _codex_ts(t.get("createdAt")) or updated
-        if not updated:
-            # 時間戳讀不出來(provider 換格式、給了 dict…)。**絕不能墊 now** ——
-            # 那等於宣告「它剛剛才動過」,靜默期就永遠濾不掉它,同 cwd 的幾百筆
-            # guardian thread 會整批變成假的工人灌進面板。認不出時間就只信
-            # is_active:真的在跑才留,否則當它不存在。
-            if not running:
-                continue
-            updated = started = now
-        name = (t.get("name") or t.get("preview") or "").strip()
-        out.append({
-            "worker_id": f"codex:{tid}",
-            "label": (name or tid[:12])[:200],
-            "state": "running" if running else "done",
-            "parent_worker": None,
-            "started_ts": started,
-            "updated_ts": updated,
-            "meta": {"provider": "codex", "kind": "child_thread",
-                     "thread_id": tid, "link": link,
-                     "source": _codex_source_label(t.get("source"))},
-        })
-    return out
-
-
-def _codex_ts(raw) -> float:
-    """codex 的時間戳可能是秒、毫秒、或 ISO 字串。**認不出來回 0**,由呼叫端
-    決定怎麼辦(絕不自作主張墊 now —— 見 `_codex_child_worker_rows`)。
-
-    數字部分沿用 `host_discovery._epoch_secs` 的同一條規則(>1e11 視為毫秒),
-    不另立第二套判準。
-    """
-    secs = host_discovery._epoch_secs(raw)
-    if secs is not None:
-        return secs
-    text = str(raw or "").strip()
-    if not text:
-        return 0.0
-    try:
-        from datetime import datetime, timezone
-        dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
-        if dt.tzinfo is None:
-            # 沒有時區的 ISO 一律當 UTC。用本地時區解讀會讓 UTC+8 的機器把
-            # 「一秒前」讀成「八小時前」,正在跑的工人直接被靜默期濾掉。
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt.timestamp()
-    except Exception as _exc:      # noqa: BLE001 — 壞時間戳當 0,靜默期判定自會放行
-        _log_exc("worker_ts_parse", _exc, expected=True)
-        return 0.0
-
-
-# thread/list(includeChildren)每次都撈 100 列,而工人面板是**被 app 持續 poll**
-# 的端點。同一份清單服務所有 parent,所以快取整份、不分 parent —— 比照隔壁
-# `_REGISTRY_BUSY_CACHE`(3s,理由是「避免 poll 造成 pane capture 風暴」)與
-# `_CODEX_V2_VISIBLE_CACHE`。工人視圖本來就容忍幾秒陳舊(cwd 連線是啟發式)。
-_CODEX_WORKER_THREADS_CACHE: tuple[float, list[dict]] | None = None
-_CODEX_WORKER_CACHE_TTL = float(os.environ.get("WORKER_CODEX_CACHE_TTL", "3.0"))
-
-
-async def _codex_worker_threads() -> list[dict]:
-    """撈含 child 的 thread 清單(帶短快取)。
-
-    **必須分頁**:`_codex_v2_visible_threads` 的註解已經寫過這個坑 —— codex 會把
-    一大批 guardian/subagent thread 排在 `thread/list` 的最前面(這台機器實測 390
-    筆)。只撈第一頁的話,操作者自己那條 parent thread 會被擠到第二頁,
-    `parent is None` → 面板回空清單,而且無聲無息。
-    """
-    global _CODEX_WORKER_THREADS_CACHE
-    cached = _CODEX_WORKER_THREADS_CACHE
-    mono = time.monotonic()
-    if cached is not None and mono - cached[0] < _CODEX_WORKER_CACHE_TTL:
-        return cached[1]
-    params = {
-        "limit": 100, "archived": False,
-        "sourceKinds": ["cli", "vscode", "exec", "appServer"],
-        "sortKey": "updated_at", "sortDirection": "desc",
-        "useStateDbOnly": True, "includeChildren": True,
-    }
-    rows: list[dict] = []
-    cursor = None
-    for _ in range(_CODEX_LIST_MAX_PAGES):
-        if cursor:
-            params["cursor"] = cursor
-        else:
-            params.pop("cursor", None)
-        # 不外掛 asyncio.wait_for:CODEX_APP.call 自己有 timeout,而外層取消會在
-        # 它持著 stdio 鎖、寫到一半時把 coroutine 砍掉,留半截 JSON-RPC frame 在
-        # 共用管線上,毒到的是**每一條** codex session,不只這一個請求。
-        res = await CODEX_APP.call("thread/list", params, timeout=8.0)
-        batch = list((res or {}).get("data", []))
-        rows.extend(batch)
-        cursor = (res or {}).get("nextCursor")
-        if not cursor or not batch:
-            break
-    _CODEX_WORKER_THREADS_CACHE = (mono, rows)
-    return rows
-
-
-async def _codex_workers_for(thread_id: str, now: float) -> list[dict]:
-    if not thread_id:
-        return []
-    try:
-        threads = await _codex_worker_threads()
-    except Exception as e:      # noqa: BLE001 —— codex 掛掉不該讓工人面板整個 500
-        _log_event("workers_codex_list_failed", error=type(e).__name__,
-                   error_message=str(e)[:200])
-        return []
-    parent = next((t for t in threads if str(t.get("id") or "") == thread_id), None)
-    if parent is None:
-        return []
-    rows = _codex_child_worker_rows(threads, parent, now)
-    # 只留靜默期內的 —— 這是「現在在跑什麼」的視圖,不是 thread 歷史。
-    return [r for r in rows
-            if r["state"] == "running" or r["updated_ts"] >= now - WORKER_TTL_SECS]
-
-
-def _hermes_workers_for(mid: str, now: float) -> list[dict]:
-    """把既有 SUBSESSIONS 投影成人格的工人 —— **純唯讀**,不碰 SUBSESSIONS 自己
-    的生命週期(它照舊 persist 到 canonical.db、照舊由既有邏輯收)。
-
-    SUBSESSIONS 是永久記錄(重啟會從 canonical.db 讀回來),整份投影會把面板
-    灌爆,所以同樣套靜默期:只留還在跑的、或最近有動靜的。"""
-    out = []
-    for sid, sub in list(SUBSESSIONS.items()):
-        if str(sub.get("parent") or "") != mid:
-            continue
-        raw_status = str(sub.get("status") or "")
-        state = workers_store.normalize_state(raw_status)
-        try:
-            updated = float(sub.get("lastAt") or 0)
-        except (TypeError, ValueError):
-            updated = 0.0
-        # 只有**明寫 running** 的才豁免靜默期。`normalize_state` 對認不得的狀態
-        # 一律回 running(對 hook 回報是對的,ring 會過期收掉),但 SUBSESSIONS
-        # 是**永久記錄**、重啟還會從 canonical.db 讀回來 —— 一筆 status 是 NULL
-        # 的陳年 sub 若因此被當成 running,就會永遠掛在面板上,沒有東西收得掉它。
-        # 同理 lastAt 缺席時是 0(遠古),不墊 now,否則它每次 poll 都像剛動過。
-        if raw_status != "running" and updated < now - WORKER_TTL_SECS:
-            continue
-        out.append({
-            "worker_id": f"sub:{sid}",
-            "label": str(sub.get("name") or sid)[:200],
-            "state": state,
-            "parent_worker": None,
-            "started_ts": updated,
-            "updated_ts": updated,
-            "meta": {"provider": "hermes", "kind": "subsession",
-                     "sid": sid, "tool": str(sub.get("tool") or "")},
-        })
-    return out
-
-
-async def _workers_projected(session: str, now: float) -> list[dict]:
-    """provider 側現成記錄的唯讀投影(CC 沒有 —— CC 走 hook 主動回報)。"""
-    if session.startswith("codex:") or session.startswith("delegation:"):
-        # `delegation:<id>` 也是 app 拿得到的正牌 v2 session id,底下同樣是一條
-        # codex thread。沿用既有解析器,不自己切前綴 —— 不然 delegation 這一路
-        # 會安靜地永遠回空清單。
-        try:
-            thread_id = _codex_thread_from_v2_session_id(session)
-        except HTTPException:
-            return []       # 不是 codex 的 delegation / 還沒有 thread → 沒有工人
-        return await _codex_workers_for(thread_id, now)
-    if session.startswith("hermes:"):
-        return _hermes_workers_for(session.split(":", 1)[1], now)
-    return []
-
-
-@app.post("/app/v2/workers/report")
-async def v2_workers_report(request: Request):
-    """工人回報(upsert)。body:{session | cc_session_id, worker_id, label,
-    state: running|done|failed, parent_worker?, meta?}。
-
-    這條路要**又快又不挑嘴** —— 呼叫端是 CC 的 PreToolUse/PostToolUse hook,
-    卡住它就是卡住善彰的工具呼叫。所以:不寫 DB、不做 I/O、認不得的 state 收斂
-    成 running 而不是 400。"""
-    _workers_require_enabled()
-    _check_auth(request)
-    body = await _json_body(request)
-    worker_id = str(body.get("worker_id") or "").strip()
-    if not worker_id:
-        raise HTTPException(status_code=400, detail="worker_id required")
-    session = _worker_resolve_session(body)
-    worker = WORKERS.report(session, worker_id,
-                            label=body.get("label") or "",
-                            state=body.get("state"),
-                            parent_worker=body.get("parent_worker"),
-                            meta=body.get("meta"))
-    return {"ok": True, "session": session, "worker": worker}
-
-
-@app.get("/app/v2/workers")
-async def v2_workers_list(request: Request, session: str = ""):
-    """某 session 現在有哪些工人在跑。
-
-    形狀:{session, workers:[{worker_id, label, state, parent_worker,
-    started_ts, updated_ts, meta}], counts:{running, done, failed}}
-    工人依開工時間由舊到新。清單是「回報的」+「provider 投影的」合併結果。"""
-    _workers_require_enabled()
-    _check_auth(request)
-    session = str(session or "").strip()
-    if not session:
-        raise HTTPException(status_code=400, detail="session required")
-    now = time.time()
-    reported = WORKERS.list(session, now)
-    projected = await _workers_projected(session, now)
-    merged = workers_store.merge(reported, projected)
-    return {"session": session, "workers": merged,
-            "counts": workers_store.counts_of(merged),
-            "ttl_secs": WORKER_TTL_SECS}
 
 
 @app.get("/app/v2/discovery")

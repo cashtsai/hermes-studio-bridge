@@ -30,7 +30,8 @@ class TestStateDbOnly(unittest.TestCase):
         # 碼面守衛:再有人把 rollout 掃描加回來,這裡先紅
         import inspect
         src = inspect.getsource(bridge)
-        self.assertEqual(src.count('"useStateDbOnly": True'), 3)
+        # 4 = 原三處 + worker 可見層(feat/worker-visibility)的 thread 列表。
+        self.assertEqual(src.count('"useStateDbOnly": True'), 4)
         self.assertEqual(src.count('"useStateDbOnly": False'), 0)
 
     def test_overfetch_floor_is_20(self):
