@@ -437,6 +437,26 @@ def _auth_fail_summary_locked(request: Request, status: int, now: float) -> dict
     }
 
 
+def _token_is_valid(token: str) -> bool:
+    """Raw token 成員檢查(master 或 device token)。無節流、無 401 副作用 ——
+    需要節流的呼叫端用 _check_auth。給 /file 的 ?token= fallback 用:瀏覽器的
+    <img>/<video>/<iframe> 無法帶 Authorization header(同 terminal WS 的限制)。"""
+    token = (token or "").strip()
+    if not token:
+        return False
+    if hmac.compare_digest(token, BRIDGE_TOKEN):
+        return True
+    with _PAIR_LOCK:
+        dev = _DEVICE_TOKENS.get(token)
+        if dev is not None:
+            if not dev.get("apple_user_id") or _account_device_for_token(token) is not None:
+                dev["last_seen"] = time.time()
+                return True
+    if _account_device_for_token(token) is not None:
+        return True
+    return False
+
+
 def _check_auth(request: Request) -> None:
     auth = request.headers.get("authorization", "")
     token = auth[7:].strip() if auth.lower().startswith("bearer ") else ""
@@ -512,6 +532,19 @@ HERMES_BIN = os.path.expanduser(os.environ.get("HERMES_BIN", "")) or _first_exis
 # get full shell access over /app/v1/terminal, so a self-hosted owner needs an
 # escape hatch; "0" makes the endpoint refuse every handshake.
 POCKET_TERMINAL_ENABLED = os.environ.get("POCKET_TERMINAL_ENABLED", "1") != "0"
+# 桌面 Web 主控台 /console(1-1)。預設 **OFF** —— 它是**持續的控制面**(含
+# input/approve),比一次性的 /pair/qr 危險得多,而 _pair_local_only 在 tunnel
+# 下形同虛設,所以要開才開。見 docs/SPEC_DESKTOP_CONSOLE_20261006.md §6。
+POCKET_CONSOLE_ENABLED = os.environ.get("POCKET_CONSOLE_ENABLED", "0") != "0"
+# 檔案瀏覽面 /app/v2/fs/list(1-2)。預設 **OFF** —— 把家中檔案系統開給遠端,
+# root 白名單是唯一的牆。見 docs/SPEC_FILE_BROWSER_20261006.md §6。
+POCKET_FILEBROWSER_ENABLED = os.environ.get("POCKET_FILEBROWSER_ENABLED", "0") != "0"
+# 記憶檢索薄代理 /app/v2/memory/search(2-1)。預設 OFF。轉發到 pocket-memoryd
+# (:8082)。期二應在這層加政策(default DENY/caller 記名/速率限)+ 留痕
+# (hit 涉及誰的 session 往誰的卡片流落「👁 記憶調閱」卡);目前先純轉發雛形,
+# 讓 console 記憶面板能同源呼叫(memoryd 不開 CORS)。
+POCKET_MEMORY_ENABLED = os.environ.get("POCKET_MEMORY_ENABLED", "0") != "0"
+MEMORYD_URL = os.environ.get("MEMORYD_URL", "http://127.0.0.1:8082")
 
 # model id -> (display name, HERMES_HOME). id stays ascii for client URLs.
 # personas 表(canonical.db)可再覆蓋(rename / disable / soft-delete)並加自訂;
@@ -8314,13 +8347,100 @@ async def codex_session_create(request: Request):
         _codex_http_error(e)
 
 
+# ═════════════ 檔案瀏覽面 /app/v2/fs/list(1-2,SPEC_FILE_BROWSER)═══════════════
+# 只加「列目錄」—— 檔案內容仍走 /file?path=(複用其服務 + Range,見規格 §7)。
+def _fs_browse_roots() -> list:
+    """檔案瀏覽的允許 root。預設只 home —— temp dirs 是 agent scratch、不是使用者
+    檔案,不列(規格 §6)。未來做『允許 root 設定頁』時從這裡擴。"""
+    return [os.path.realpath(os.path.expanduser("~"))]
+
+
+def _fs_path_allowed(p: str, roots: list) -> bool:
+    """realpath 後的 p 是否落在允許 root 內(防 ../ 穿越、symlink 逃逸)。
+    這是檔案瀏覽唯一的牆,與 /file 同精神 —— 單一真相,不要各寫一份。"""
+    return any(p == r or p.startswith(r + os.sep) for r in roots)
+
+
+_FS_LIST_MAX = 2000
+
+
+def _fs_entry_kind(name: str, is_dir: bool) -> str:
+    if is_dir:
+        return "dir"
+    ext = os.path.splitext(name)[1].lower().lstrip(".")
+    for kind, exts in (
+        ("pdf", ("pdf",)),
+        ("video", ("mp4", "mov", "webm", "m4v", "avi", "mkv")),
+        ("markdown", ("md", "markdown")),
+        ("html", ("html", "htm")),
+        ("image", ("png", "jpg", "jpeg", "gif", "webp", "heic", "svg", "bmp")),
+        ("audio", ("mp3", "wav", "m4a", "aac", "flac")),
+        ("text", ("txt", "log", "json", "yaml", "yml", "csv", "xml", "py",
+                  "js", "ts", "swift", "go", "rs", "sh", "c", "cpp", "h", "toml")),
+    ):
+        if ext in exts:
+            return kind
+    return "file"
+
+
+@app.get("/app/v2/fs/list")
+async def fs_list(request: Request, path: str = ""):
+    """列目錄。旗標關 → 404。root 白名單比 /file 更嚴(預設只 home)。"""
+    if not POCKET_FILEBROWSER_ENABLED:
+        raise HTTPException(status_code=404, detail="not found")
+    _check_auth(request)
+    roots = _fs_browse_roots()
+    target = (path or "").strip() or roots[0]
+    p = os.path.realpath(os.path.expanduser(target))
+    if not _fs_path_allowed(p, roots):
+        raise HTTPException(status_code=404, detail="not found")
+    if not os.path.isdir(p):
+        raise HTTPException(status_code=400, detail="not a directory")
+    entries = []
+    try:
+        with os.scandir(p) as it:
+            for de in it:
+                if de.name.startswith("."):      # 隱藏檔預設不列
+                    continue
+                try:
+                    st = de.stat(follow_symlinks=False)
+                    is_dir = de.is_dir(follow_symlinks=False)
+                except OSError:
+                    continue
+                entries.append({
+                    "name": de.name, "is_dir": is_dir,
+                    "size": 0 if is_dir else st.st_size,
+                    "mtime": st.st_mtime,
+                    "kind": _fs_entry_kind(de.name, is_dir),
+                    "path": de.path,
+                })
+                if len(entries) >= _FS_LIST_MAX:
+                    break
+    except OSError:
+        raise HTTPException(status_code=403, detail="cannot read directory")
+    entries.sort(key=lambda e: (not e["is_dir"], e["name"].lower()))
+    parent = os.path.dirname(p)
+    if p in roots or not _fs_path_allowed(parent, roots):
+        parent = None            # 已在 root,沒有上一層
+    return {"path": p, "parent": parent, "entries": entries,
+            "truncated": len(entries) >= _FS_LIST_MAX, "roots": roots}
+
+
 @app.get("/file")
 async def serve_file(request: Request, path: str):
     """Serve a local file (image/pdf) by path so the app can render image paths
     that appear in transcripts (your attachments + files the agent references).
     Restricted to a small set of safe roots (home + the temp dirs agents write
     scratch files to), must be a regular file."""
-    _check_auth(request)
+    # ?token= fallback(檔案瀏覽 1-2):<img>/<video>/<iframe> 無法帶 Authorization
+    # header。有 bearer → 正常 _check_auth(含節流);沒 header 但有 ?token= → 驗 query
+    # token。token 會進 access log/Referer,所以僅此端點、且只在無 header 時才看 query。
+    _qtok = (request.query_params.get("token") or "").strip()
+    if _qtok and not request.headers.get("authorization", "").lower().startswith("bearer "):
+        if not _token_is_valid(_qtok):
+            raise http_err(401, "AUTH_INVALID_TOKEN", "invalid bridge token")
+    else:
+        _check_auth(request)
     p = os.path.realpath(os.path.expanduser(path))
     roots = [os.path.realpath(os.path.expanduser("~"))]
     # Agents (incl. Claude Code's scratchpad) often emit files under the system
@@ -8958,6 +9078,131 @@ async def pair_qr_page(request: Request):
     _pair_check_boot(request)       # 真閘:一次性 boot code(tunnel 下 loopback 不可信)
     _pair_local_only(request)       # defense-in-depth 第二層
     return HTMLResponse(_PAIR_QR_HTML)
+
+
+# ═════════════ 桌面 Web 主控台 /console(1-1,SPEC_DESKTOP_CONSOLE_20261006)═══════
+# 前端是 static 檔(static/console/),bootstrap 流程與 /pair/qr 同款:
+#   /console?boot=<code> → 頁面 JS fetch /pair/qr.json?boot= 取一次性碼 →
+#   POST /pair/claim 換可撤銷 pdev- token → 之後 /app/v2/* 帶 Bearer。
+# 控制路徑(input/interrupt/approve/events/cards)全部複用現有 v2 端點,不新增。
+_CONSOLE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "static", "console")
+
+_CONSOLE_SECURITY_HEADERS = {
+    "Cache-Control": "no-store",
+    # 自家 static 的 inline JS/CSS 要能跑,且只准連回自己(connect-src 'self');
+    # 其餘一律封死。比 Apple 回呼頁放寬 script-src,因為主控台有互動邏輯。
+    "Content-Security-Policy": (
+        "default-src 'none'; "
+        "script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; "
+        "img-src 'self' data: blob:; media-src 'self' blob:; "
+        "connect-src 'self'; base-uri 'none'; frame-ancestors 'none'"),
+    "Referrer-Policy": "no-referrer",
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+}
+
+
+def _console_guard(request: Request) -> None:
+    """/console 的門:旗標關 → 404(對外表現同不存在);boot code 仍是真閘。"""
+    if not POCKET_CONSOLE_ENABLED:
+        raise HTTPException(status_code=404, detail="not found")
+    _pair_check_boot(request)       # 真閘:一次性 boot code(同 /pair/qr)
+    _pair_local_only(request)       # defense-in-depth 第二層
+
+
+@app.get("/console")
+async def console_page(request: Request):
+    _console_guard(request)
+    index = os.path.join(_CONSOLE_DIR, "index.html")
+    try:
+        html = open(index, encoding="utf-8").read()
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="console not installed")
+    return HTMLResponse(html, headers=_CONSOLE_SECURITY_HEADERS)
+
+
+# 靜態資產(app.js / sse.js / style.css)。旗標關時整個 mount 不掛 → 404。
+# 注意:StaticFiles 不經 _console_guard 的 boot 檢查(靜態資產本身不含機密,
+# 真正的機密是 token,由頁面 JS 走 /pair/claim 取得;資產洩漏無害)。
+if POCKET_CONSOLE_ENABLED and os.path.isdir(_CONSOLE_DIR):
+    from fastapi.staticfiles import StaticFiles
+    app.mount("/console/static",
+              StaticFiles(directory=_CONSOLE_DIR), name="console-static")
+
+
+# ═════════ 記憶檢索薄代理 /app/v2/memory/search(2-1,期二:政策 + 留痕)═════════
+# 政策:per-caller 速率限(預設 30 次/分;避免有效 token 把 memoryd + ollama 打爆,
+# 承 bridge「有效 token 不節流」的例外 —— 記憶檢索會連帶觸發 embedding,要限)。
+_MEMORY_RATE: dict = {}          # token_hash → [timestamps]
+_MEMORY_RATE_MAX = int(os.environ.get("POCKET_MEMORY_RATE_MAX", "30"))
+_MEMORY_RATE_WINDOW = 60.0
+
+
+def _memory_rate_ok(request: Request) -> bool:
+    auth = request.headers.get("authorization", "")
+    tok = auth[7:].strip() if auth.lower().startswith("bearer ") else "?"
+    key = _short_hash(tok)
+    now = time.monotonic()
+    hits = [t for t in _MEMORY_RATE.get(key, []) if now - t < _MEMORY_RATE_WINDOW]
+    if len(hits) >= _MEMORY_RATE_MAX:
+        _MEMORY_RATE[key] = hits
+        return False
+    hits.append(now)
+    _MEMORY_RATE[key] = hits
+    return True
+
+
+@app.get("/app/v2/memory/search")
+async def v2_memory_search(request: Request, q: str = "", k: int = 8, provider: str = ""):
+    if not POCKET_MEMORY_ENABLED:
+        raise HTTPException(status_code=404, detail="not found")
+    _check_auth(request)
+    if not _memory_rate_ok(request):
+        raise HTTPException(status_code=429, detail="memory search rate limit; slow down")
+    if not q.strip():
+        raise HTTPException(status_code=400, detail="missing q")
+    import httpx
+    params = {"q": q, "k": max(1, min(k, 50))}
+    if provider:
+        params["provider"] = provider
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.get(MEMORYD_URL + "/memory/search", params=params)
+        data = r.json()
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=503, detail=f"memoryd unavailable: {type(e).__name__}")
+    # 留痕(期二):hit 涉及誰的 session 就往誰的卡片流落「👁 記憶調閱」卡 ——
+    # 誰調閱了誰看得見,照 _agent_context_audit 原樣。保守版:只對**已有 warm store**
+    # 的目標落(create_store=False,不為留痕冷載任意歷史 session);skey→bridge session
+    # 能乾淨對應的才落(codex:<id> 同鍵、hermes:<persona>:<sid>→hermes:<persona>);
+    # CC 的 skey 是 jsonl uuid、對不回 bridge 的 ccsess name,先跳過。
+    try:
+        seen = set()
+        for h in (data.get("hits") or []):
+            skey = h.get("skey") or ""
+            if skey.startswith("codex:"):
+                target = skey
+            elif skey.startswith("hermes:"):
+                parts = skey.split(":")
+                target = f"hermes:{parts[1]}" if len(parts) >= 2 else None
+            elif skey.startswith("claude_code:"):
+                # CC 的 skey 是 jsonl session uuid → _cc_name_for_sid 反查 ccsess name
+                # (D,2026-10-07)。對不上(歷史 session 早不在 pin/cache)→ 仍跳過。
+                nm = _cc_name_for_sid(skey.split(":", 1)[1])
+                target = f"claude_code:{nm}" if nm else None
+            else:
+                target = None
+            if not target or target in seen:
+                continue
+            seen.add(target)
+            await _agent_context_audit(
+                "記憶檢索", target, "memory_search",
+                "mem-" + uuid.uuid4().hex[:8],
+                note=f"查詢「{q.strip()[:40]}」", create_store=False)
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("v2_memory_search_audit", _exc, expected=True)
+    return JSONResponse(data, status_code=r.status_code)
 
 
 # ═════════════ Pocket ID(Pairing V3):enroll + heartbeat + voucher claim ═════════════

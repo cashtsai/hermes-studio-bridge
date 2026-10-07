@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Pocket Console</title>
+<link rel="stylesheet" href="/console/static/style.css">
+</head>
+<body>
+<div id="app">
+  <header id="topbar">
+    <div class="brand">Pocket <span class="brand-dim">Console</span></div>
+    <nav id="mode-nav">
+      <button class="mode-btn active" data-mode="agents">Agents</button>
+      <button class="mode-btn" data-mode="files">檔案</button>
+      <button class="mode-btn" data-mode="memory">記憶</button>
+    </nav>
+    <div id="conn" class="conn" title="連線狀態"><span class="dot"></span><span id="conn-text">連線中…</span></div>
+  </header>
+
+  <main id="main">
+    <!-- 左:session 列表 -->
+    <aside id="sidebar">
+      <div class="side-head">
+        <span>Sessions</span>
+        <button id="refresh" class="icon-btn" title="重新整理">↻</button>
+      </div>
+      <div id="session-list"><div class="empty">載入中…</div></div>
+    </aside>
+
+    <!-- 右:卡片流 -->
+    <section id="stream">
+      <div id="stream-head" class="stream-head hidden">
+        <div class="sh-title"><span id="sh-provider" class="pill"></span><span id="sh-name"></span></div>
+        <div class="sh-actions">
+          <span id="sh-status" class="status-chip"></span>
+          <button id="interrupt" class="btn btn-danger" title="中斷目前回合">■ 中斷</button>
+        </div>
+      </div>
+      <div id="cards"><div class="placeholder">← 從左邊選一條 session</div></div>
+      <form id="composer" class="composer hidden">
+        <textarea id="input" rows="1" placeholder="送到這條 session…（⌘/Ctrl+Enter 送出）"></textarea>
+        <button id="send" class="btn btn-primary" type="submit">送出</button>
+      </form>
+    </section>
+  </main>
+
+  <!-- 檔案瀏覽模式 -->
+  <section id="files-view" class="hidden">
+    <div id="fb-bar" class="fb-bar">
+      <button id="fb-up" class="btn-ghost" title="上一層">↑</button>
+      <div id="fb-crumb" class="fb-crumb"></div>
+    </div>
+    <div id="fb-body" class="fb-body">
+      <div id="fb-list" class="fb-list"></div>
+      <div id="fb-preview" class="fb-preview"><div class="placeholder">← 選一個檔案預覽</div></div>
+    </div>
+  </section>
+
+  <!-- 記憶檢索模式 -->
+  <section id="memory-view" class="hidden">
+    <div class="mem-bar">
+      <input id="mem-q" class="mem-input" placeholder="搜尋所有 session 的長久記憶（CC / CX / 人格）…">
+      <select id="mem-prov" class="mem-sel">
+        <option value="">全部</option><option value="cc">CC</option>
+        <option value="cx">CX</option><option value="hermes">人格</option>
+      </select>
+      <button id="mem-go" class="btn btn-primary">搜尋</button>
+    </div>
+    <div id="mem-results" class="mem-results"><div class="placeholder">輸入關鍵字，跨所有 session 找「當時做了什麼、改了哪、結論是什麼」</div></div>
+  </section>
+
+  <div id="toast" class="toast hidden"></div>
+</div>
+<script src="/console/static/sse.js"></script>
+<script src="/console/static/app.js"></script>
+<script src="/console/static/filebrowser.js"></script>
+<script src="/console/static/memory.js"></script>
+</body>
+</html>
