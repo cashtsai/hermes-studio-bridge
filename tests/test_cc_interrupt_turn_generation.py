@@ -166,7 +166,7 @@ class TestAppContractSmoke(unittest.IsolatedAsyncioTestCase):
 
         request = FakeAppRequest(
             "/app/v1/messages",
-            {"session": "xcash", "content": "dry smoke", "dry_run": True},
+            {"session": "main", "content": "dry smoke", "dry_run": True}  # 隔離環境只有 main 人格,
         )
         with patch.object(bridge, "_log_event", Mock()):
             response = await bridge.app_post_message(request)

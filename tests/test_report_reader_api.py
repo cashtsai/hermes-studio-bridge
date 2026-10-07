@@ -53,21 +53,25 @@ def check(name, cond):
         fails.append(name)
 
 
+# 隔離環境的 PERSONAS 只有 main;report 端點驗 persona 存在,補兩個測試人格。
+bridge.PERSONAS.setdefault("demo-a", ("Demo A", _TMP))
+bridge.PERSONAS.setdefault("demo-b", ("Demo B", _TMP))
+
 client = TestClient(bridge.app)
 AUTH = {"Authorization": "Bearer " + os.environ["BRIDGE_TOKEN"]}
 
-# ── 種子:三筆報告(兩筆 yuanfang cron、一筆 pantianqing fed)──────────────
+# ── 種子:三筆報告(兩筆 demo-a cron、一筆 demo-b fed)──────────────
 NOW = time.time()
 LONG = "# 晨報\n\n" + "第二段內容,夠長才能驗證 preview 截斷。" * 30  # >200 chars
-rid_a = bridge._report_upsert("yuanfang", {
+rid_a = bridge._report_upsert("demo-a", {
     "label": "晨報", "name": "morning", "content": LONG,
     "ts": NOW - 600, "external_source": "hermes-cron",
-    "external_id": "cron:yuanfang:morning:sid-1"})
-rid_b = bridge._report_upsert("yuanfang", {
+    "external_id": "cron:demo-a:morning:sid-1"})
+rid_b = bridge._report_upsert("demo-a", {
     "label": "午報", "name": "noon", "content": "短內容,不足兩百字。",
     "ts": NOW - 60, "external_source": "hermes-cron",
-    "external_id": "cron:yuanfang:noon:sid-2"})
-rid_c = bridge._report_upsert("pantianqing", {
+    "external_id": "cron:demo-a:noon:sid-2"})
+rid_c = bridge._report_upsert("demo-b", {
     "label": "今日精選", "name": "fed-today", "content": "fed 內容",
     "ts": NOW - 30, "external_source": "fed",
     "external_id": "fed:today:2026-07-24"})
@@ -95,7 +99,7 @@ check("normalize 空白修剪", bridge._report_key_normalize(f"  {rid_a} ") == r
 
 # ── 2. 單筆端點:四形取回同一筆 ─────────────────────────────────────────
 forms = [rid_a, f"rep-{rid_a}", f"card-hp-rep-{rid_a}",
-         "cron:yuanfang:morning:sid-1"]
+         "cron:demo-a:morning:sid-1"]
 bodies = []
 for f in forms:
     r = client.get(f"/app/v1/reports/{f}", headers=AUTH)
@@ -108,7 +112,7 @@ check("單筆帶標題/時間/來源",
       rep["label"] == "晨報" and rep["name"] == "morning"
       and abs(rep["ts"] - (NOW - 600)) < 1
       and rep["external_source"] == "hermes-cron"
-      and rep["session"] == "yuanfang")
+      and rep["session"] == "demo-a")
 
 r404 = client.get("/app/v1/reports/rep-no-such-id", headers=AUTH)
 check("不存在 → 404 REPORT_NOT_FOUND",
@@ -117,7 +121,7 @@ check("單筆無 auth → 401",
       client.get(f"/app/v1/reports/{rid_a}").status_code == 401)
 
 # ── 3. 列表端點 ─────────────────────────────────────────────────────────
-rl = client.get("/app/v1/reports", params={"session": "yuanfang"}, headers=AUTH)
+rl = client.get("/app/v1/reports", params={"session": "demo-a"}, headers=AUTH)
 check("列表 200", rl.status_code == 200)
 reports = rl.json().get("reports", [])
 check("列表只含該人格、newest-first",
@@ -127,17 +131,17 @@ check("preview 截斷 + chars 全文長度",
       len(la["preview"]) < len(LONG) and "截斷" in la["preview"]
       and la["chars"] == len(LONG))
 check("列表不揹全文", all("content" not in x for x in reports))
-rl1 = client.get("/app/v1/reports", params={"session": "yuanfang", "limit": 1},
+rl1 = client.get("/app/v1/reports", params={"session": "demo-a", "limit": 1},
                  headers=AUTH)
 check("limit=1 只回最新一筆",
       [x["id"] for x in rl1.json()["reports"]] == [rid_b])
-rl0 = client.get("/app/v1/reports", params={"session": "yuanfang", "limit": 0},
+rl0 = client.get("/app/v1/reports", params={"session": "demo-a", "limit": 0},
                  headers=AUTH)
 check("limit=0 退回預設(回全部兩筆)", len(rl0.json()["reports"]) == 2)
 rbad = client.get("/app/v1/reports", params={"session": "nobody"}, headers=AUTH)
 check("非人格 session → 400", rbad.status_code == 400)
 check("列表無 auth → 401",
-      client.get("/app/v1/reports", params={"session": "yuanfang"}).status_code == 401)
+      client.get("/app/v1/reports", params={"session": "demo-a"}).status_code == 401)
 
 # ── 4. 唯讀鐵律:讀端點不產生任何寫入 ───────────────────────────────────
 check("report_events 不變(唯讀)", _rows_snapshot() == _BEFORE)

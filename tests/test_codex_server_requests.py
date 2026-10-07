@@ -250,7 +250,12 @@ class TestRequestUserInput(unittest.TestCase):
                          "method": "item/tool/requestUserInput",
                          "params": params})
         record = client.pending_question_for_thread("t-2")
-        _run(client.answer_question(record["id"], key="opt0"))
+        # 逐題推進(2026-08-21):第一題答完只換下一題的卡,還不回 app-server
+        # (提早回 = 把其餘題目用空答案定案,舊版就是這樣丟掉第二題答案的)。
+        out = _run(client.answer_question(record["id"], key="opt0"))
+        self.assertEqual(out["status"], "next_question")
+        self.assertEqual(client.replies_for(23), [])
+        _run(client.answer_question(record["id"], key="deny"))   # 第二題跳過
         self.assertEqual(client.replies_for(23)[0]["result"],
                          {"answers": {"q1": {"answers": ["staging"]},
                                       "q2": {"answers": []}}})
@@ -642,7 +647,9 @@ class TestSecretAnswersNeverPersisted(unittest.TestCase):
     def _answered(self, request_id=81):
         client = _question_client(request_id=request_id, params=self.PARAMS)
         record = client.pending_question_for_thread("t-secret")
-        out = _run(client.answer_question(record["id"], key="", text=self.SECRET))
+        # 逐題推進:第一題(secret)收答後換卡,第二題跳過才定案回 frame。
+        _run(client.answer_question(record["id"], key="", text=self.SECRET))
+        out = _run(client.answer_question(record["id"], key="deny"))
         return client, record, out
 
     def test_plaintext_reaches_app_server_but_nothing_else(self):

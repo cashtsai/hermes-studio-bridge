@@ -53,6 +53,10 @@ def check(name, cond):
         fails.append(name)
 
 
+# 隔離環境的 PERSONAS 只有 main;report 端點驗 persona 存在,補兩個測試人格。
+bridge.PERSONAS.setdefault("demo-a", ("Demo A", _TMP))
+bridge.PERSONAS.setdefault("demo-b", ("Demo B", _TMP))
+
 client = TestClient(bridge.app)
 AUTH = {"Authorization": "Bearer " + os.environ["BRIDGE_TOKEN"]}
 NOW = time.time()
@@ -93,7 +97,7 @@ ACTIONS = [
     {"label": "壞顆:沒有 text"},                       # 略過
 ]
 r = client.post("/app/v1/persona-report", headers=AUTH, json={
-    "session": "yuanfang", "label": "晨報(帶行動)", "name": "morning-act",
+    "session": "demo-a", "label": "晨報(帶行動)", "name": "morning-act",
     "content": "# 晨報\n\n今天有三件事。", "ts": NOW - 300,
     "external_source": "test-actions", "external_id": "act:morning:1",
     "actions": ACTIONS})
@@ -123,7 +127,7 @@ for form in (f"rep-{rid}", f"card-hp-rep-{rid}", "act:morning:1"):
 
 # ── 3. 舊列相容:無 actions 報告 → actions == [] ────────────────────────
 r = client.post("/app/v1/persona-report", headers=AUTH, json={
-    "session": "yuanfang", "label": "無行動報告", "name": "plain",
+    "session": "demo-a", "label": "無行動報告", "name": "plain",
     "content": "純內容", "ts": NOW - 200, "external_id": "act:plain:1"})
 rid_plain = r.json()["id"]
 r = client.get(f"/app/v1/reports/{rid_plain}", headers=AUTH)
@@ -134,7 +138,7 @@ con = sqlite3.connect(bridge.CANON_DB)
 con.execute(
     "INSERT INTO report_events(id,session,label,name,content,ts,"
     "external_source,external_id,ingested_at) VALUES(?,?,?,?,?,?,?,?,?)",
-    ("legacyrow0001", "yuanfang", "舊列", "legacy", "遷移前的舊報告",
+    ("legacyrow0001", "demo-a", "舊列", "legacy", "遷移前的舊報告",
      NOW - 100, "hermes-cron", "act:legacy:1", NOW))
 con.commit()
 con.close()
@@ -144,7 +148,7 @@ check("遷移前舊列(NULL 欄)→ []",
 
 # actions 送非 list(舊發送端手滑)→ 當空,不 500
 r = client.post("/app/v1/persona-report", headers=AUTH, json={
-    "session": "yuanfang", "label": "手滑", "name": "oops",
+    "session": "demo-a", "label": "手滑", "name": "oops",
     "content": "actions 給了字串", "ts": NOW - 90,
     "external_id": "act:oops:1", "actions": "not-a-list"})
 check("actions 非 list 不擋件", r.status_code == 200)
@@ -153,7 +157,7 @@ check("actions 非 list → []", r.json()["report"]["actions"] == [])
 
 # ── 4. 更新語意:同 external_id 重發 → actions 整組替換/清空 ────────────
 r = client.post("/app/v1/persona-report", headers=AUTH, json={
-    "session": "yuanfang", "label": "晨報(帶行動)", "name": "morning-act",
+    "session": "demo-a", "label": "晨報(帶行動)", "name": "morning-act",
     "content": "# 晨報 v2\n\n改稿。", "ts": NOW - 60,
     "external_source": "test-actions", "external_id": "act:morning:1",
     "actions": [{"label": "只剩一顆", "text": "回報進度"}]})
@@ -163,14 +167,14 @@ rep2 = r.json()["report"]
 check("重發 → actions 整組替換",
       [a["label"] for a in rep2["actions"]] == ["只剩一顆"])
 r = client.post("/app/v1/persona-report", headers=AUTH, json={
-    "session": "yuanfang", "label": "晨報(帶行動)", "name": "morning-act",
+    "session": "demo-a", "label": "晨報(帶行動)", "name": "morning-act",
     "content": "# 晨報 v3\n\n再改。", "ts": NOW - 30,
     "external_source": "test-actions", "external_id": "act:morning:1"})
 r = client.get("/app/v1/reports/act:morning:1", headers=AUTH)
 check("重發不帶 actions → 清空", r.json()["report"]["actions"] == [])
 
 # ── 5. 冪等短路仍含 actions:同 payload(含 actions)重發 → upsert 短路 ──
-payload = {"session": "yuanfang", "label": "冪等", "name": "idem",
+payload = {"session": "demo-a", "label": "冪等", "name": "idem",
            "content": "同包重發", "ts": NOW - 10, "external_id": "act:idem:1",
            "actions": [{"label": "A", "text": "a"}]}
 client.post("/app/v1/persona-report", headers=AUTH, json=payload)
@@ -182,7 +186,7 @@ check("短路後 actions 仍在",
 
 # ── 6. 列表端點不回歸(不揹 actions,欄位形狀照舊) ─────────────────────
 r = client.get("/app/v1/reports", headers=AUTH,
-               params={"session": "yuanfang", "limit": 10})
+               params={"session": "demo-a", "limit": 10})
 check("列表 200", r.status_code == 200)
 items = r.json()["reports"]
 check("列表照舊無 actions 欄(全文/行動走單筆端點)",

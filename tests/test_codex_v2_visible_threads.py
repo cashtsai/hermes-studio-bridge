@@ -83,7 +83,8 @@ class TestCodexV2VisibleThreads(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(rows, [xcash])
         self.assertEqual(len(app.calls), 2)
-        self.assertEqual(app.calls[0][1]["limit"], 40)
+        # 樓地板 40→20(a2538e7 慢病三修:statedb-only 後大頁換不到東西)。
+        self.assertEqual(app.calls[0][1]["limit"], 20)
         self.assertEqual(app.calls[1][1]["cursor"], "next-page")
 
     async def test_uses_last_v2_list_when_provider_is_temporarily_down(self):

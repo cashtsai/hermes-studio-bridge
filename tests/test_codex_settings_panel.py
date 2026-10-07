@@ -133,8 +133,9 @@ class TestSettingsNotification(unittest.IsolatedAsyncioTestCase):
 class TestApprovalPolicyEnum(unittest.IsolatedAsyncioTestCase):
     def test_on_failure_is_gone_in_0147(self):
         self.assertNotIn("on-failure", bridge._CODEX_APPROVAL_POLICIES)
+        # granular 刻意不在列(43c4dad 誠實化:app-server 送不出去的不宣傳)。
         self.assertEqual(set(bridge._CODEX_APPROVAL_POLICIES),
-                         {"untrusted", "on-request", "granular", "never"})
+                         {"untrusted", "on-request", "never"})
 
     async def test_stale_policy_rejected_locally_as_400(self):
         """本地就擋掉,不要送到 app-server 再被翻成『上一輪正在跑』。"""

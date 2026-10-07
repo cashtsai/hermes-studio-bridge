@@ -78,8 +78,11 @@ def test_cx_flags():
     params = bridge._spawn_cx_thread_params(cfg)
     ok(params.get("model") == "gpt-5.5", "cx thread model")
     ok(params.get("approvalPolicy") == "on-request", "cx thread approvalPolicy")
-    ok(params.get("reasoningEffort") == "xhigh", "cx thread reasoningEffort")
-    ok(params.get("sandboxMode") == "workspace-write", "cx thread sandboxMode")
+    # 2026-08-21 安全修正後:schema 欄位叫 sandbox(不是 sandboxMode);
+    # effort 不在 thread 層(送了會被丟掉=靜默失效),由呼叫端 thread 起好後補套。
+    ok(params.get("sandbox") == "workspace-write", "cx thread sandbox")
+    ok("reasoningEffort" not in params and "sandboxMode" not in params,
+       "cx thread 不送會被 schema 丟掉的欄位")
     ok("api_key" not in json.dumps(params) and OPENAI_KEY not in json.dumps(params),
        "cx thread params no key")
 

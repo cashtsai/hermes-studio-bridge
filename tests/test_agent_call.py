@@ -53,9 +53,9 @@ class FakeRequest:
         return self._body
 
 
-CALLER = "hermes:yuanfang"
+CALLER = "hermes:demo-a"
 TARGET = "claude_code:tirith"
-_KNOWN = {CALLER: ("hp", "yuanfang"), TARGET: ("cc", "tirith", "/tmp"),
+_KNOWN = {CALLER: ("hp", "demo-a"), TARGET: ("cc", "tirith", "/tmp"),
           "codex:c1": ("cx", "c1"), "claude_code:b": ("cc", "b", "/tmp")}
 
 
@@ -129,10 +129,10 @@ class TestPolicyModule(unittest.TestCase):
 
     def test_allowlist_fnmatch(self):
         pol = agent_call.load_policy(_write_policy(
-            [{"caller": "hermes:yuanfang", "targets": ["claude_code:*"]}]))
-        self.assertTrue(agent_call.allowed(pol, "hermes:yuanfang",
+            [{"caller": "hermes:demo-a", "targets": ["claude_code:*"]}]))
+        self.assertTrue(agent_call.allowed(pol, "hermes:demo-a",
                                            "claude_code:tirith"))
-        self.assertFalse(agent_call.allowed(pol, "hermes:yuanfang", "codex:x"))
+        self.assertFalse(agent_call.allowed(pol, "hermes:demo-a", "codex:x"))
         self.assertFalse(agent_call.allowed(pol, "hermes:other",
                                             "claude_code:tirith"))
         # 自呼永遠拒
@@ -140,7 +140,7 @@ class TestPolicyModule(unittest.TestCase):
             [{"caller": "*", "targets": ["*"]}]))
         self.assertFalse(agent_call.allowed(pol2, "a", "a"))
         self.assertEqual(agent_call.allowed_target_patterns(
-            pol, "hermes:yuanfang"), ["claude_code:*"])
+            pol, "hermes:demo-a"), ["claude_code:*"])
 
     def test_check_chain_root_depth_cycle_budget(self):
         self.assertEqual(agent_call.check_chain(None, [], 0, "a", "b"),
@@ -242,7 +242,7 @@ class TestFlagAndPolicy(unittest.TestCase):
             env.assert_no_auto_approve(self)
 
     def test_allowlist_grant_fire_and_forget(self):
-        rules = [{"caller": "hermes:yuanfang", "targets": ["claude_code:*"]}]
+        rules = [{"caller": "hermes:demo-a", "targets": ["claude_code:*"]}]
         with _Env(rules=rules) as env:
             res = _post({"caller": CALLER, "target": TARGET,
                          "message": "幫我跑測試", "mode": "fire_and_forget"})
@@ -252,7 +252,7 @@ class TestFlagAndPolicy(unittest.TestCase):
             self.assertEqual(sid, TARGET)
             body = asyncio.run(shim.json())
             self.assertIn("幫我跑測試", body["content"])
-            self.assertIn("[agent_call hermes:yuanfang", body["content"])
+            self.assertIn("[agent_call hermes:demo-a", body["content"])
             self.assertEqual(body["client_id"], res["call_id"])
             # audit request 卡雙邊都有
             for side in (CALLER, TARGET):
@@ -446,7 +446,7 @@ class TestAwaitReply(unittest.TestCase):
 
 class TestTargetsAndLedgerApi(unittest.TestCase):
     def test_targets_filtered_by_policy(self):
-        rules = [{"caller": "hermes:yuanfang", "targets": ["claude_code:*"]}]
+        rules = [{"caller": "hermes:demo-a", "targets": ["claude_code:*"]}]
         with _Env(rules=rules) as env:
             env.reg.register("claude_code:tirith", provider="claude_code",
                              purpose="常駐 CC", cls="persistent")
@@ -456,9 +456,11 @@ class TestTargetsAndLedgerApi(unittest.TestCase):
                                  AsyncMock(return_value=[])), \
                     patch.object(bridge, "_registry_is_busy",
                                  AsyncMock(return_value=True)):
-                res = asyncio.run(bridge.v2_agent_targets(
-                    FakeRequest(), caller="yuanfang"))   # 裸 persona id 可
-            self.assertEqual(res["caller"], "hermes:yuanfang")
+                # 裸 id 正規化靠 PERSONAS 認得這個人格;隔離環境只有 main,補注入。
+                with patch.dict(bridge.PERSONAS, {"demo-a": ("Demo A", "/tmp")}):
+                    res = asyncio.run(bridge.v2_agent_targets(
+                        FakeRequest(), caller="demo-a"))   # 裸 persona id 可
+            self.assertEqual(res["caller"], "hermes:demo-a")
             self.assertEqual([t["id"] for t in res["targets"]],
                              ["claude_code:tirith"])
             self.assertTrue(res["targets"][0]["busy"])
@@ -482,16 +484,16 @@ class TestRegistryAddendum(unittest.TestCase):
     def test_spawn_fields_records_parent_and_purpose(self):
         reg = _fresh_registry()
         with patch.object(bridge, "REGISTRY", reg):
-            reg.register("hermes:yuanfang", provider="hermes",
+            reg.register("hermes:demo-a", provider="hermes",
                          cls="persistent", purpose="常駐")
             parent, cls, purpose = bridge._registry_spawn_fields(
-                {"parent": "hermes:yuanfang", "purpose": "查資料"})
+                {"parent": "hermes:demo-a", "purpose": "查資料"})
             self.assertEqual((parent, cls, purpose),
-                             ("hermes:yuanfang", "task", "查資料"))
+                             ("hermes:demo-a", "task", "查資料"))
             row = bridge._registry_register(
                 "codex:t9", provider="codex", purpose=purpose, cls=cls,
                 parent=parent)
-            self.assertEqual(row["parent"], "hermes:yuanfang")
+            self.assertEqual(row["parent"], "hermes:demo-a")
             self.assertEqual(row["purpose"], "查資料")
             self.assertEqual(row["depth"], 1)
 
@@ -524,15 +526,15 @@ class TestRegistryAddendum(unittest.TestCase):
         with patch.object(bridge, "REGISTRY", reg), \
                 patch.object(bridge, "_registry_is_busy", busy_mock), \
                 patch.dict(bridge._REGISTRY_BUSY_CACHE, clear=True):
-            reg.register("hermes:yuanfang", provider="hermes",
+            reg.register("hermes:demo-a", provider="hermes",
                          cls="persistent", purpose="常駐")
             reg.register("codex:busy1", provider="codex", purpose="忙工",
-                         parent="hermes:yuanfang")
+                         parent="hermes:demo-a")
             reg.register("codex:idle1", provider="codex", purpose="閒工",
-                         parent="hermes:yuanfang")
+                         parent="hermes:demo-a")
             reg.register("codex:other", provider="codex", purpose="別家的")
             res = asyncio.run(bridge.v2_registry_children(
-                "hermes:yuanfang", FakeRequest()))
+                "hermes:demo-a", FakeRequest()))
             kids = {c["id"]: c for c in res["children"]}
             self.assertEqual(set(kids), {"codex:busy1", "codex:idle1"})
             self.assertTrue(kids["codex:busy1"]["busy"])
@@ -543,13 +545,13 @@ class TestRegistryAddendum(unittest.TestCase):
                     self.assertIn(key, c)
             # TTL 快取:窗內第二次 poll 不再打 provider busy 探測
             n = busy_mock.await_count
-            asyncio.run(bridge.v2_registry_children("hermes:yuanfang",
+            asyncio.run(bridge.v2_registry_children("hermes:demo-a",
                                                     FakeRequest()))
             self.assertEqual(busy_mock.await_count, n)
             # archived 孩子不列
             reg.archive("codex:idle1", "manual")
             res = asyncio.run(bridge.v2_registry_children(
-                "hermes:yuanfang", FakeRequest()))
+                "hermes:demo-a", FakeRequest()))
             self.assertEqual([c["id"] for c in res["children"]],
                              ["codex:busy1"])
 
@@ -587,9 +589,9 @@ class FamilyEdgeTests(unittest.TestCase):
     def test_grandparent_denied(self):
         """深度 2 的孫不能直接叫爺爺 —— 只有**直接**母子邊算數。"""
         reg = self._reg(**{"claude_code:kid": "claude_code:mom",
-                           "claude_code:mom": "hermes:yuanfang"})
+                           "claude_code:mom": "hermes:demo-a"})
         self.assertFalse(agent_call.allowed(
-            {"rules": []}, "claude_code:kid", "hermes:yuanfang", registry=reg))
+            {"rules": []}, "claude_code:kid", "hermes:demo-a", registry=reg))
 
     def test_stranger_denied(self):
         reg = self._reg(**{"claude_code:a": "", "codex:b": ""})
@@ -605,16 +607,16 @@ class FamilyEdgeTests(unittest.TestCase):
         """registry 不可用 → 舊行為(純白名單)完全不變。"""
         pol = {"rules": [{"caller": "hermes:*", "targets": ["claude_code:*"]}]}
         self.assertTrue(agent_call.allowed(
-            pol, "hermes:yuanfang", "claude_code:ops", registry=None))
+            pol, "hermes:demo-a", "claude_code:ops", registry=None))
         self.assertFalse(agent_call.allowed(
-            {"rules": []}, "hermes:yuanfang", "claude_code:ops", registry=None))
+            {"rules": []}, "hermes:demo-a", "claude_code:ops", registry=None))
 
     def test_registry_exception_does_not_break_calls(self):
         class Boom:
             def get(self, sid): raise RuntimeError("registry down")
         pol = {"rules": [{"caller": "hermes:*", "targets": ["claude_code:*"]}]}
         self.assertTrue(agent_call.allowed(
-            pol, "hermes:yuanfang", "claude_code:ops", registry=Boom()))
+            pol, "hermes:demo-a", "claude_code:ops", registry=Boom()))
 
     def test_allowlist_still_works_alongside_family(self):
         """母子邊是新增放行來源,既有白名單一字不變。"""

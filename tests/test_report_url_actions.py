@@ -50,6 +50,10 @@ def check(name, cond):
         fails.append(name)
 
 
+# 隔離環境的 PERSONAS 只有 main;report 端點驗 persona 存在,補兩個測試人格。
+bridge.PERSONAS.setdefault("demo-a", ("Demo A", _TMP))
+bridge.PERSONAS.setdefault("demo-b", ("Demo B", _TMP))
+
 client = TestClient(bridge.app)
 AUTH = {"Authorization": "Bearer " + os.environ["BRIDGE_TOKEN"]}
 NOW = time.time()
@@ -110,7 +114,7 @@ ACTIONS = [
     {"label": "壞顆", "url": "javascript:alert(1)"},   # 略過
 ]
 r = client.post("/app/v1/persona-report", headers=AUTH, json={
-    "session": "pantianqing", "label": "新文章發佈", "name": "fed-story",
+    "session": "demo-b", "label": "新文章發佈", "name": "fed-story",
     "content": "# Today Pick\n\n![封面](https://cdn.flipermag.com/c.jpg)\n\n- 文章:x",
     "ts": NOW - 60, "external_source": "fed", "external_id": "urlact:story:1",
     "actions": ACTIONS})
@@ -134,7 +138,7 @@ for form in (f"rep-{rid}", f"card-hp-rep-{rid}", "urlact:story:1"):
 
 # 重發只帶連結型 → 整組替換(#178 更新語意含新型別)
 r = client.post("/app/v1/persona-report", headers=AUTH, json={
-    "session": "pantianqing", "label": "新文章發佈", "name": "fed-story",
+    "session": "demo-b", "label": "新文章發佈", "name": "fed-story",
     "content": "# Today Pick v2", "ts": NOW - 30,
     "external_source": "fed", "external_id": "urlact:story:1",
     "actions": [{"label": "Console", "url": "https://console.tsai.cash/#story"}]})
