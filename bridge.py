@@ -17571,6 +17571,38 @@ def _cx_feed_thread_locked(thread_id: str, create_if_missing: bool = False) -> N
         _log_exc("_cx_feed_thread_locked", _exc, expected=True)
 
 
+CX_EMPTY_HISTORY_CARD_TEXT = (
+    "📭 這條 session 讀不到歷史訊息 —— Codex 的 thread 索引裡沒有可列的回合"
+    "(常見於委派建立、或歷史已被壓縮的 session)。原始紀錄仍在 Mac 上,"
+    "但手機這邊補不回來;在這裡送出新訊息仍然可以正常對話。")
+
+
+def _cx_feed_empty_history(thread_id: str) -> None:
+    """seed 完全空(turns/list 回 0 筆、卡片庫也空)→ 推一張說明卡。
+
+    沒有這張卡時,使用者看到的是一個「打得開但完全空白」的聊天室,而且所有
+    API 都回 200 —— 無從分辨「這條真的沒講過話」與「壞了」。實錄根因:
+    `codex_delegation` 建立的委派型 session,整段歷史被壓成單筆 `compacted`
+    紀錄,codex 的 `thread/turns/list` 結構上就列不出 turn(rollout 檔本身
+    完好、459KB 真實內容都在)。bridge 修不了資料面,但有責任說明現況。
+
+    一條 session 只推一張(`empty_history_carded` 旗標):每次 TTL 重新 seed
+    都推一張的話,空白聊天室會變成一疊重複的系統卡。"""
+    d = _CX_CARD_DIGESTS.get(thread_id)
+    if d is None or getattr(d, "empty_history_carded", False):
+        return
+    try:
+        d.empty_history_carded = True
+        d.store.upsert_card(carddigest.make_card(
+            f"card-cx-empty-{d.store.seq}", d.store.turn_id, "system", "text",
+            {"text": CX_EMPTY_HISTORY_CARD_TEXT,
+             "fallback_text": CX_EMPTY_HISTORY_CARD_TEXT,
+             "error_code": "CX_EMPTY_HISTORY"}))
+        _log_event("cx_empty_history", thread=thread_id[:16])
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("_cx_feed_empty_history", _exc, expected=True)
+
+
 def _cx_feed_thread_unlocked(thread_id: str) -> None:
     """鎖放開了 → 翻回未鎖 + 推一張恢復卡。只在真的推過鎖定卡的 session 推,
     否則使用者會看到一張「已釋放」卻從沒看過「被佔用」。"""
@@ -17739,6 +17771,14 @@ async def _cx_seed_card_digest(thread_id: str, d, required: bool = False) -> Non
             d.handle_approval(rec)
         d.seeded = True
         d.last_seed_at = now
+        # 靜默空白防線(2026-10-08):turns/list 回 0 筆、卡片庫也空 —— 對使用者
+        # 就是一個「打得開但什麼都沒有」的聊天室,所有 API 都回 200,沒有任何
+        # 線索可循。實錄:codex_delegation 建的委派型 session,歷史被壓成單筆
+        # `compacted` 紀錄(rollout 第 2 行),codex 的 turns/list 結構上就列不出
+        # turn → bridge 永遠 seed 到 0 筆。這不是 bridge 能修的資料面問題,
+        # 但「不給任何說明」是 bridge 的責任。推一張卡講清楚現況與去處。
+        if not turns and not d.store.cards:
+            _cx_feed_empty_history(thread_id)
         # 修 ②:seed 完(= 剛把桌面端進度補齊)也刷新持久快取,重啟後只要
         # 有人開過一次 session,之後的列表預覽就不再依賴記憶體。
         _cx_preview_cache_note(thread_id)

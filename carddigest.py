@@ -855,6 +855,9 @@ class CodexThreadDigest(ApprovalCardMixin):
         # 已為「哪一次鎖定事件」推過卡（值＝該次鎖的 since 時戳）。以事件為身分
         # 去重，重複偵測與「開 session 時補推」都只會留下一張卡。
         self.lock_card_since = None
+        # 已推過「讀不到歷史」說明卡（見 bridge._cx_feed_empty_history）。
+        # 每次 TTL 重 seed 都會再走一次那條判斷，沒有這個旗標就會疊成一堆。
+        self.empty_history_carded = False
 
     def _status(self):
         # phase 的契約(app `TerminalCardStore.statusPhase`):
