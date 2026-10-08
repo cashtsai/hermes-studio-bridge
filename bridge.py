@@ -25110,6 +25110,21 @@ async def _dashboard_sessions():
             _log_event("dashboard_openclaw_failed", error=type(e).__name__,
                        error_message=str(e)[:160])
             degraded.append("openclaw")
+    # S5:gemini 同 openclaw 的語意 —— 未配置就整鍵缺席(app optional decode
+    # 不畫那一列)。名錄制、純讀本機 json,沒有遠端列表可壞;忙碌judge 與
+    # /app/v2/sessions 的 gemini 列同一個 `_gm_busy`,兩處不會各說各話。
+    if GEMINI.configured():
+        try:
+            rows = await asyncio.to_thread(gemini_provider.list_sessions)
+            gm_w = sum(1 for r in rows[:20] if _gm_busy(str(r.get("id"))))
+            # 新裝還沒有名錄時,v2 清單會給一個 gemini:default 入口列 ——
+            # 儀表板跟著算 1 條閒置,免得「分頁裡有一條、儀表板說 0」。
+            gm_total = len(rows[:20]) or 1
+            out["gemini"] = {"working": gm_w, "idle": gm_total - gm_w}
+        except Exception as e:  # noqa: BLE001
+            _log_event("dashboard_gemini_failed", error=type(e).__name__,
+                       error_message=str(e)[:160])
+            degraded.append("gemini")
     return out
 
 
@@ -25177,6 +25192,7 @@ def _host_capabilities() -> dict:
         "cx": os.path.exists(_resolve_codex_bin()),
         "hermes": os.path.exists(HERMES_BIN),
         "openclaw": OPENCLAW.configured(),
+        "gemini": GEMINI.configured(),
         "terminal": POCKET_TERMINAL_ENABLED,
     }
 

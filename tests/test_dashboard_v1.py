@@ -55,7 +55,7 @@ def _stub_light(monkey_self):
     便宜假件,只留 approvals/oracle 真路徑。回傳 restore closure。"""
     orig = (bridge._cc_sessions, bridge._dashboard_weather,
             bridge._dashboard_gateways, bridge.CODEX_APP.call,
-            bridge._agent_auth_status)
+            bridge._agent_auth_status, bridge.GEMINI.configured)
 
     async def no_cc():
         return []
@@ -86,11 +86,15 @@ def _stub_light(monkey_self):
     bridge._dashboard_gateways = no_gw
     bridge.CODEX_APP.call = no_codex
     bridge._agent_auth_status = no_agent_auth
+    # gemini 的「有沒有配置」不是路徑型 env,隔離閂管不到 —— 跑測試的機器
+    # 只要有 GEMINI_API_KEY 或 ~/.pocket/gemini.json,基準形狀就會多一鍵。
+    # 基準一律當未配置,要驗那一列的測試自己開(見 TestGeminiLane)。
+    bridge.GEMINI.configured = lambda: False
 
     def restore():
         (bridge._cc_sessions, bridge._dashboard_weather,
          bridge._dashboard_gateways, bridge.CODEX_APP.call,
-         bridge._agent_auth_status) = orig
+         bridge._agent_auth_status, bridge.GEMINI.configured) = orig
     return restore
 
 
@@ -407,6 +411,60 @@ class TestApprovals(unittest.TestCase):
         d = bridge._dashboard_approvals()
         self.assertEqual(d["pending"], 0)
         self.assertEqual(d["items"], [])
+
+
+class TestGeminiLane(unittest.TestCase):
+    """S5:儀表板的 gemini 列。
+
+    2026-10-09 機主回報「開了 gemini session,儀表板 Sessions 卡沒那一列」——
+    真因是這支聚合端點根本沒算 gemini(`/app/v2/sessions` 有、儀表板沒有),
+    app 再怎麼畫也畫不出來。語意比照 openclaw:**未配置就整鍵缺席**
+    (app optional decode 自動不畫),配置了但壞 → 鍵缺席 + degraded。
+    """
+
+    def _sessions(self, configured, rows, busy=()):
+        restore = _stub_light(self)
+        orig_list = bridge.gemini_provider.list_sessions
+        orig_busy = bridge._gm_busy
+        bridge.GEMINI.configured = lambda: configured
+        bridge.gemini_provider.list_sessions = lambda: list(rows)
+        bridge._gm_busy = lambda key: key in busy
+        try:
+            return asyncio.run(bridge._dashboard_sessions())
+        finally:
+            bridge.gemini_provider.list_sessions = orig_list
+            bridge._gm_busy = orig_busy
+            restore()
+
+    def test_absent_when_not_configured(self):
+        self.assertNotIn("gemini", self._sessions(False, [{"id": "default"}]))
+
+    def test_counts_split_working_idle(self):
+        out = self._sessions(True,
+                             [{"id": "a"}, {"id": "b"}, {"id": "c"}],
+                             busy={"b"})
+        self.assertEqual(out["gemini"], {"working": 1, "idle": 2})
+
+    def test_empty_registry_counts_the_default_entry(self):
+        # 名錄空的時候 /app/v2/sessions 仍給一個 gemini:default 入口列;
+        # 儀表板得跟著算 1,否則「分頁裡看得到一條、儀表板寫 0」。
+        self.assertEqual(self._sessions(True, [])["gemini"],
+                         {"working": 0, "idle": 1})
+
+    def test_failure_degrades_without_key(self):
+        def boom():
+            raise RuntimeError("名錄壞了")
+        restore = _stub_light(self)
+        orig_list = bridge.gemini_provider.list_sessions
+        bridge.GEMINI.configured = lambda: True
+        bridge.gemini_provider.list_sessions = boom
+        try:
+            out = asyncio.run(bridge._dashboard_sessions())
+        finally:
+            bridge.gemini_provider.list_sessions = orig_list
+            restore()
+        self.assertNotIn("gemini", out)
+        self.assertIn("gemini", out["degraded"])
 
 
 if __name__ == "__main__":
