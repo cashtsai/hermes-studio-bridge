@@ -16089,13 +16089,56 @@ async def cc_session_mode(name: str, request: Request):
 
 _CC_MODEL_RE = re.compile(r"^[A-Za-z0-9 ._/-]{1,60}$")
 
+# CC 的 `/model <name>` 在近版會先跳一個「Switch model?」確認框(數字選單,第一顆
+# 是切換、第二顆是保留);舊版則直接切、不跳框。handler **必須把這個確認框按掉**
+# 才算真的換了模型。
+# 建立原因:2026-10-07 查到的真 bug —— 舊程式打完 /model 只 sleep 0.8s、看畫面
+# 尾巴有沒有 model 名字就回,而確認框文字(「switch to <name>?」)裡本來就有那個
+# 名字 → 永遠回 confirmed=true 的假陽性,卻**從來沒按 Yes**。結果:模型沒換、
+# app 以為成功、而且留下一個卡住的確認框(就是 Pocket-Main「換了模型卻叫不起來、
+# 卡 2.5 小時」那個框 —— 選模型這動作本身在製造它)。
+_CC_MODEL_CONFIRM_POLL_SECS = 3.0
+_CC_MODEL_YES_RE = re.compile(r"\b(yes|switch|confirm)\b|\buse\b", re.IGNORECASE)
+_CC_MODEL_NO_RE = re.compile(r"\b(no|keep|cancel|stay)\b|don.?t", re.IGNORECASE)
+_CC_MODEL_ERR_RE = re.compile(
+    r"unknown model|not a valid|invalid model|no such model|couldn.?t find|no model",
+    re.IGNORECASE)
+
+
+def _cc_model_confirm_key(prompt) -> str | None:
+    """若 prompt 是 /model 的「Switch model?」確認框,回該按的「切換(Yes)」鍵;
+    認不出就回 None,呼叫端**不盲按**(避免把一個誤跳的 picker 按成別的模型)。
+    主訊號 = 某顆選項 label 像 yes/switch/confirm/use 且不含 no/keep;抓不到但
+    標題確實在講 switch model → 退回第一個數字選項(CC 切換框第一顆固定是 Yes)。"""
+    if not isinstance(prompt, dict):
+        return None
+    opts = prompt.get("options") or []
+    for o in opts:
+        label = str(o.get("label") or "")
+        if _CC_MODEL_YES_RE.search(label) and not _CC_MODEL_NO_RE.search(label):
+            k = str(o.get("key") or "").strip()
+            if len(k) == 1 and k.isdigit():
+                return k
+    title = str(prompt.get("title") or "").lower()
+    if "switch model" in title or ("model" in title and "?" in title):
+        for o in opts:
+            k = str(o.get("key") or "").strip()
+            if len(k) == 1 and k.isdigit():
+                return k
+    return None
+
 
 @app.post("/ccsessions/{name}/model")
 async def cc_session_model(name: str, request: Request):
-    """Switch the CC model by typing the /model slash command into the live
-    TUI. body {"model": "opus"|"sonnet"|full model name}. Confirmation is
-    best-effort: we re-capture the pane and report whether the requested name
-    shows up (confirmed), but the command is sent either way."""
+    """Switch the CC model by typing the /model slash command into the live TUI
+    and then COMPLETING the "Switch model?" confirmation dialog recent Claude
+    Code shows. body {"model": "opus"|"sonnet"|full model name}.
+
+    Honest result: `confirmed` is only true when the dialog was resolved (or no
+    dialog appeared on older CC) AND no "unknown model" error is on screen. A
+    rejected name → 422; a prompt still stuck on screen → 502. The old handler
+    never pressed Yes and reported a false-positive `confirmed` off the dialog
+    text — see the note on _CC_MODEL_CONFIRM_POLL_SECS."""
     _check_auth(request)
     if not any(r[0] == name for r in _cc_conf_rows()):
         raise http_err(404, "SESSION_NOT_FOUND", "unknown session")
@@ -16108,14 +16151,52 @@ async def cc_session_model(name: str, request: Request):
     pane_before = await _cc_capture_pane_fresh(name)
     if _cc_pane_busy(pane_before):
         raise http_err(409, "CC_BUSY", "turn running; model switch needs an idle prompt")
-    await _cc_paste_text(name, f"/model {model}")
-    await asyncio.sleep(0.8)               # slash command feedback repaint
-    _PANE_CACHE.pop(name, None)
-    pane = await _cc_capture_pane_fresh(name)
-    tail = "\n".join(pane.strip().splitlines()[-12:])
-    confirmed = model.lower() in tail.lower()
-    _log_event("cc_model_switch", session=name, model=model, confirmed=confirmed)
-    return {"ok": True, "model": model, "confirmed": confirmed}
+    # 序列化:同一個 session 的 /model 不要跟 answer/key 交錯送鍵。
+    async with _cc_seq_guard(name, "model"):
+        # 1) 打 /model <name> 送出(_cc_paste_text 會驗證字真的離開輸入框)。
+        await _cc_paste_text(name, f"/model {model}")
+        # 2) 輪詢等「Switch model?」確認框出現(近版 CC 會跳;舊版不跳直接切)。
+        deadline = time.monotonic() + _CC_MODEL_CONFIRM_POLL_SECS
+        yes_key = None
+        pane = pane_before
+        while time.monotonic() < deadline:
+            await asyncio.sleep(0.3)
+            _PANE_CACHE.pop(name, None)
+            pane = await _cc_capture_pane_fresh(name)
+            yes_key = _cc_model_confirm_key(_cc_prompt(pane))
+            if yes_key:
+                break
+        # 3) 有確認框 → 按「切換」把它按掉(部分版面數字即成交,部分要補 Enter)。
+        answered = False
+        if yes_key:
+            await _tmux_run("send-keys", "-t", name, "-l", yes_key)
+            await asyncio.sleep(0.4)
+            _PANE_CACHE.pop(name, None)
+            pane = await _cc_capture_pane_fresh(name)
+            if _cc_prompt(pane) is not None:        # 還停在框上 → 補 Enter 成交
+                await _tmux_run("send-keys", "-t", name, "Enter")
+                await asyncio.sleep(0.4)
+                _PANE_CACHE.pop(name, None)
+                pane = await _cc_capture_pane_fresh(name)
+            answered = True
+        # 4) 誠實判定。
+        still = _cc_prompt(pane)
+        tail = "\n".join(pane.strip().splitlines()[-14:])
+        had_error = bool(_CC_MODEL_ERR_RE.search(tail))
+        _log_event("cc_model_switch", session=name, model=model,
+                   answered_dialog=answered, had_error=had_error,
+                   confirmed=(still is None and not had_error))
+        if had_error:
+            raise http_err(422, "MODEL_REJECTED",
+                           f"CC 不接受模型名稱「{model}」(未知/無效)",
+                           tail[-200:])
+        if still is not None:
+            # 確認框還在/又冒出別的選單 → 沒成交,別謊報成功。
+            raise http_err(502, "MODEL_CONFIRM_UNRESOLVED",
+                           "sent /model but a prompt is still on screen — not switched",
+                           tail[-200:])
+        return {"ok": True, "model": model, "confirmed": True,
+                "answered_dialog": answered}
 
 
 # ───────────────────────── /app/v2 control-plane facade ─────────────────────
