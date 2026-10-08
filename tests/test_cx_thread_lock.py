@@ -582,5 +582,33 @@ class QueueOnLockTests(unittest.TestCase):
         run(main())
 
 
+class LockedStatusLabelTests(unittest.TestCase):
+    """2026-10-08 根因排查:locked 時的 label 不能跟同一個 status 物件裡的
+    phase=="queued" 自相矛盾 —— 否則使用者看到「送不出去」以為訊息沒進去,
+    瘋狂重按,堆出一串等鎖解開才補送、回覆對不上語境的過期訊息。"""
+
+    def test_locked_idle_no_queue_says_cannot_send(self):
+        d = carddigest.CodexThreadDigest()
+        d.locked = True
+        d.queue_depth = 0
+        d._status()
+        label = d.store.status["label"]
+        self.assertIn("送不出去", label)
+
+    def test_locked_with_queue_does_not_claim_cannot_send(self):
+        d = carddigest.CodexThreadDigest()
+        d.locked = True
+        d.queue_depth = 3
+        d._status()
+        status = d.store.status
+        self.assertEqual(status["phase"], "queued")
+        self.assertEqual(status["queue_depth"], 3)
+        label = status["label"]
+        self.assertNotIn("送不出去", label,
+                         "有 3 則排隊中(會自動送出)不該宣稱送不出去")
+        self.assertIn("3", label)
+        self.assertIn("排隊", label)
+
+
 if __name__ == "__main__":
     unittest.main()
