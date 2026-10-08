@@ -885,7 +885,16 @@ class CodexThreadDigest(ApprovalCardMixin):
         if locked and not self.busy:
             # 被鎖住時的 label 必須講出原因:原本 idle 的「閒置」會讓使用者以為
             # 一切正常,然後對著送不出去的輸入框打字。
-            label = "已被桌面版 Codex 佔用,送不出去"
+            #
+            # 2026-10-08 修:depth>0(有訊息在排隊)時不能講「送不出去」——
+            # 佇列是真的,桌面放開鎖就會真的送出去(drain_pending),「送不出去」
+            # 與同一個 status 物件裡的 phase=="queued" 自相矛盾。使用者看到
+            # 「送不出去」會以為訊息沒進去、瘋狂重按,堆出一串等鎖解開後才會
+            # 一次補送的過期訊息,回覆對不上當下語境(根因排查 2026-10-08)。
+            if depth:
+                label = f"已被桌面版 Codex 佔用,{depth} 則訊息已排隊,桌面釋放後自動送出"
+            else:
+                label = "已被桌面版 Codex 佔用,送不出去"
         status = {
             "busy": self.busy, "mode": None, "prompt": self.prompt,
             "phase": phase, "queue_depth": depth, "label": label,
