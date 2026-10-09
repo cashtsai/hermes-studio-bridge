@@ -13872,6 +13872,17 @@ def _cc_composer_region(pane: str) -> str | None:
     return _cc_composer_split(pane)[1]
 
 
+def _cc_shell_mode(pane: str) -> bool:
+    """輸入框是不是停在 shell 模式(提示符 `!` 而不是 `\u276f`)。
+
+    用整行開頭比對、而且要求後面是 NBSP —— transcript 裡指令的回顯是
+    `! echo hello`(普通空格),不能當成輸入框。"""
+    region = _cc_composer_region(pane)
+    if not region:
+        return False
+    return region.splitlines()[0].lstrip().startswith("!\u00a0")
+
+
 def _cc_not_accepted_reason(pane: str) -> str:
     """文字卡在輸入框時,分辨 CLI 是處在哪種「吃掉 Enter」的狀態。"""
     if _CC_CONTEXT_FULL_RE.search(pane):
@@ -13889,6 +13900,8 @@ _CC_NOT_ACCEPTED_HINT = {
                         "處理完再重送",
     "never_rendered_idle": "CC 沒有收下這則訊息(當時是待命中,收到就會立刻開跑),"
                            "請重送",
+    "shell_mode_stuck": "CC 的輸入框卡在 shell 模式(提示符是 !),退不出來 —— "
+                        "到那台機器上按一下 Backspace 或 Esc 清掉再送",
 }
 
 # idle 判死前的最後一次機會:Enter 落地到 spinner 畫出來還有幾百毫秒,
@@ -14006,6 +14019,25 @@ async def _cc_paste_text_locked(name: str, text: str) -> dict:
         raise http_err(409, "CC_INPUT_NOT_ACCEPTED",
                        "session is waiting on an on-screen prompt",
                        _CC_NOT_ACCEPTED_HINT["awaiting_prompt"])
+
+    # shell 模式殘留(2026-10-09 機主實害):送過一則 `!` 開頭的指令之後,
+    # 輸入框會**留在** shell 模式,接下來從手機送的普通訊息就被當成 shell
+    # 指令執行掉 —— 使用者打的中文全餵給 zsh(`command not found: 執行了…`),
+    # 訊息根本沒進對話,而 app 那邊看起來只是「送出失敗」。
+    # 送出前先把模式對齊這一則的意圖:要送普通訊息、而框在 shell 模式 →
+    # C-u 清殘字 + BSpace(空框再退一格就離開 shell 模式)。
+    # **刻意不用 Esc** —— Esc 會中斷進行中的回合。
+    if not text.lstrip().startswith("!") and _cc_shell_mode(pre_pane):
+        await _tmux_run("send-keys", "-t", name, "C-u")
+        await _tmux_run("send-keys", "-t", name, "BSpace")
+        pre_pane = await _cc_capture_pane_fresh(name)
+        _log_event("cc_shell_mode_reset", session=name,
+                   recovered=not _cc_shell_mode(pre_pane))
+        if _cc_shell_mode(pre_pane):
+            # 退不出來就**不准貼** —— 貼下去等於拿使用者的訊息當 shell 指令跑。
+            raise http_err(409, "CC_INPUT_NOT_ACCEPTED",
+                           "composer stuck in shell mode",
+                           _CC_NOT_ACCEPTED_HINT["shell_mode_stuck"])
 
     gen0 = _CC_TURN_GEN.get(name, 0)
     buf = "pa-" + uuid.uuid4().hex[:8]

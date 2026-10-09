@@ -351,24 +351,50 @@ class CCInputDeliveryTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(cm.exception.code, "CC_INPUT_NOT_ACCEPTED")
 
     async def test_shell_mode_paste_is_accepted_not_409(self):
-        """端到端:shell 模式貼上 → Enter → 輸入框清空回 normal → accepted。
-        修之前這條會是 409 composer_missing。"""
-        # 三格:① 貼上前(shell 模式、框是空的)② 貼上後字在框裡
-        # ③ Enter 之後框清空、指令回顯進 transcript。①不可含 TEXT,
-        # 否則會被 stale_echo 正確地判成「這是上一輪的回顯」。
-        shell_empty = "\n".join(["  上一輪的回覆內容", BORDER,
-                                 "!\u00a0", BORDER, "  ! for shell mode"])
+        """端到端:貼 `!` 開頭的指令 → 輸入框切進 shell 模式 → Enter → 指令跑掉、
+        框清空回 normal → accepted。修之前這條會是 409 composer_missing。"""
+        cmd = "!" + TEXT
+        # 三格:① 貼上前(normal 空框)② 貼上後切進 shell 模式、字在框裡
+        # ③ Enter 之後框清空回 normal,指令回顯進 transcript(普通空格)。
         shell_held = "\n".join(["  上一輪的回覆內容", BORDER,
                                 f"!\u00a0{TEXT}", BORDER, "  ! for shell mode"])
         after = "\n".join(["  上一輪的回覆內容", f"! {TEXT}",
                            BORDER, "\u276f\u00a0", BORDER, "  \u23f5\u23f5 auto mode on"])
-        script = PaneScript([shell_empty, shell_held, after])
+        script = PaneScript([pane_idle_empty(), shell_held, after])
         with patch.object(bridge, "_cc_capture_pane_fresh", script):
-            r = await bridge._cc_paste_text("s1", TEXT)
+            r = await bridge._cc_paste_text("s1", cmd)
         self.assertTrue(r["confirmed"])
         self.assertEqual(r["delivery"], "accepted")
         # 只有原本那一次 Enter,不准補送(shell 模式補 Enter = 指令跑第二次)
         self.assertEqual(len(self.enters()), 1)
+
+    async def test_shell_command_is_not_reset(self):
+        """這一則本來就要走 shell —— 不准把模式退掉。"""
+        shell_empty = "\n".join(["  上一輪的回覆內容", BORDER,
+                                 "!\u00a0", BORDER, "  ! for shell mode"])
+        held = "\n".join(["  上一輪的回覆內容", BORDER,
+                          "!\u00a0!echo hi", BORDER, "  ! for shell mode"])
+        after = "\n".join(["  上一輪的回覆內容", "! echo hi",
+                           BORDER, "\u276f\u00a0", BORDER, "  \u23f5\u23f5 auto mode on"])
+        script = PaneScript([shell_empty, held, after])
+        with patch.object(bridge, "_cc_capture_pane_fresh", script):
+            await bridge._cc_paste_text("s1", "!echo hi")
+        keys = [c.args[3] for c in self.tmux.call_args_list
+                if len(c.args) >= 4 and c.args[0] == "send-keys"]
+        self.assertNotIn("BSpace", keys)
+
+    async def test_shell_mode_that_will_not_reset_is_rejected(self):
+        """退不出來就 409 —— 貼下去等於拿使用者的訊息當 shell 指令跑。"""
+        shell_empty = "\n".join(["  上一輪的回覆內容", BORDER,
+                                 "!\u00a0", BORDER, "  ! for shell mode"])
+        script = PaneScript([shell_empty])          # 怎麼讀都還在 shell 模式
+        with patch.object(bridge, "_cc_capture_pane_fresh", script):
+            with self.assertRaises(bridge.HTTPException) as cm:
+                await bridge._cc_paste_text("s1", TEXT)
+        self.assertEqual(cm.exception.status_code, 409)
+        self.assertIn("shell mode", cm.exception.message)
+        # 不准把字貼進去
+        self.assertEqual(len(self.stdin.call_args_list), 0)
 
 class ComposerParsingTest(unittest.TestCase):
     def test_split_stops_at_box_border(self):
