@@ -437,13 +437,25 @@ class GeminiClient:
         row = await self.new_session(key, cwd=cwd)
         return str(row["acp_sid"])
 
-    async def prompt(self, key: str, text: str) -> dict:
-        """送一回合;逐字經 on_update 外流,本呼叫等 turn 結束(stopReason)。"""
+    async def prompt(self, key: str, text: str, blocks: list | None = None) -> dict:
+        """送一回合;逐字經 on_update 外流,本呼叫等 turn 結束(stopReason)。
+
+        `blocks` = 額外的 ACP content block(附件)。ACP 的 `prompt` 本來就是
+        **content block 陣列**,不是單一字串 —— 之前只送一個 text block,所以
+        Gemini 這條線收不了附件(bridge 端明說不支援、不默吞)。影像走
+        `{type:"image", mimeType, data(base64)}`;非影像在 bridge 端轉成路徑
+        附在文字裡(CLI 跑在本機,讀得到檔)。
+        """
         acp_sid = await self.ensure_session(key)
         touch_session(key, title_hint=text)
+        prompt_blocks = []
+        if text:
+            prompt_blocks.append({"type": "text", "text": text})
+        prompt_blocks.extend(blocks or [])
+        if not prompt_blocks:                      # 兩者皆空 = 沒東西可送
+            return {}
         res = await self.call("session/prompt",
-                              {"sessionId": acp_sid,
-                               "prompt": [{"type": "text", "text": text}]},
+                              {"sessionId": acp_sid, "prompt": prompt_blocks},
                               timeout=_TURN_TIMEOUT)
         return res or {}
 
@@ -472,12 +484,37 @@ def session_v2_id(sid: str) -> str:
     return f"gemini:{sid}"
 
 
+def _last_preview(sid: str) -> str | None:
+    """逐字稿最後一則的摘要,給列表當副標。
+
+    2026-10-10:Gemini 列先前 subtitle 恆為 None,所以在 app 的清單裡只有
+    一行標題,跟 CC/CX 的兩行(標題 + 最後一則)對不齊 —— 機主直接看出來了。
+    資料本來就在逐字稿裡,只是沒人去讀最後一行。
+    """
+    try:
+        rows = transcript_read(sid, limit=1)      # 只要最後一則
+    except Exception:
+        return None
+    if not rows:
+        return None
+    last = rows[-1] or {}
+    text = str(last.get("content") or last.get("text") or "").strip()
+    if not text:
+        return None
+    text = " ".join(text.split())                  # 攤平換行,列表只有一行
+    prefix = "你:" if last.get("role") == "user" else ""
+    return (prefix + text)[:120]
+
+
 def session_v2_row(row: dict, busy: bool = False) -> dict:
     sid = str(row.get("id") or "")
+    # 標題可能是「第一句話」整段(title_hint)—— 清單裡要短的,截到看得完。
+    title = " ".join(str(row.get("title") or "Gemini").split())[:48] or "Gemini"
     return {"id": session_v2_id(sid), "provider": "gemini",
-            "title": row.get("title") or "Gemini",
-            "subtitle": None,
+            "title": title,
+            "subtitle": _last_preview(sid),
             "status": "running" if busy else "idle",
             "last_event_at": float(row.get("last") or 0) or None,
-            "capabilities": ["input", "interrupt", "replay", "follow", "approve"],
+            "capabilities": ["input", "interrupt", "attachments",
+                             "replay", "follow", "approve"],
             "meta": {}}
