@@ -20,6 +20,7 @@ import fcntl
 import glob
 import hashlib
 import hmac
+import ipaddress
 import json
 import difflib
 import mimetypes
@@ -9251,9 +9252,50 @@ _POCKET_TUNNEL_URL_FILE = os.path.expanduser(
     os.environ.get("POCKET_TUNNEL_URL_FILE", "~/.pocket/tunnel-url"))
 
 
+# Tailscale 的位址範圍(CGNAT v4 + Tailscale ULA v6)。放行它的理由見
+# _pair_local_only 的 docstring。
+_TAILNET_NETS = (
+    ipaddress.ip_network("100.64.0.0/10"),          # CGNAT,Tailscale v4
+    ipaddress.ip_network("fd7a:115c:a1e0::/48"),    # Tailscale v6 ULA
+)
+# 關掉就回到「只認 loopback」的舊行為(出事時的退路,不必改碼)。
+_PAIR_ALLOW_TAILNET = os.environ.get("POCKET_PAIR_ALLOW_TAILNET", "1") != "0"
+
+
+def _is_tailnet_host(host: str) -> bool:
+    if not _PAIR_ALLOW_TAILNET or not host:
+        return False
+    try:
+        ip = ipaddress.ip_address(host.split("%", 1)[0])   # 去掉 v6 的 zone id
+    except ValueError:
+        return False
+    return any(ip in net for net in _TAILNET_NETS)
+
+
 def _pair_local_only(request: Request) -> None:
-    if _client_host(request) not in ("127.0.0.1", "::1", "localhost"):
-        raise HTTPException(status_code=403, detail="local only")
+    """loopback 或**同一個 tailnet**才放行。
+
+    2026-10-09 修:原本只認 loopback,結果造成一個反向的結果 ——
+      ‧ 公網 cloudflared tunnel:proxy 進 127.0.0.1 → 每個公網訪客都像 loopback
+        → **放行**
+      ‧ Tailscale:來源是真實 tailnet IP → **擋掉**
+    也就是把比較安全的那條擋掉、放行比較不安全的那條。機主實測從
+    `100.67.0.12:8081/console?boot=…` 連過去吃 403「local only」,就是這條。
+
+    tailnet 成員資格本身就是一道認證邊界(WireGuard 金鑰),比「看起來像
+    loopback」強得多,所以一併放行。`_pair_check_boot` 的 boot code 仍是真閘,
+    本函式維持 defense-in-depth 第二層的定位。
+
+    安全性前提:`_client_host` 讀的是**真實 socket peer**(`request.client.host`),
+    不是 `X-Forwarded-For` —— 所以偽造不了來源 IP 來冒充 tailnet。
+    要退回舊行為:`POCKET_PAIR_ALLOW_TAILNET=0`。
+    """
+    host = _client_host(request)
+    if host in ("127.0.0.1", "::1", "localhost"):
+        return
+    if _is_tailnet_host(host):
+        return
+    raise HTTPException(status_code=403, detail="local only")
 
 
 # ── 一次性 boot code:/pair/qr 的真正閘門 ─────────────────────────────────
