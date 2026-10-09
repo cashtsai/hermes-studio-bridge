@@ -16793,6 +16793,113 @@ async def v2_session_interrupt(session_id: str, request: Request):
     return {"ok": True, "session_id": session_id, "interrupted": True}
 
 
+def _v2_config_split(session_id: str) -> tuple[str, str]:
+    """v2 id → (provider, 本體 id)。沒有前綴就當成沒有 provider。"""
+    provider, _, ident = session_id.partition(":")
+    return (provider, ident) if ident else ("", session_id)
+
+
+@app.get("/app/v2/sessions/{session_id}/config")
+async def v2_session_config_read(session_id: str, request: Request):
+    """讀此 session 的設定,給 app 的統一控制面(SessionControlSheet)。
+
+    **為什麼補這支**:app 早就出貨了統一控制面並呼叫 GET/POST
+    `/app/v2/sessions/{id}/config`,但 bridge 從來沒有實作過 —— app 原始碼註解
+    還點名「bridge 分支 feat/cc-cx-full-control 未合併時回 404」,而該分支其實
+    **早已合併、裡面根本沒有這組路由**。結果:使用者在 app 裡改 CX 設定會看到
+    「需要新版 bridge(設定端點尚未部署)」,而且永遠等不到(2026-10-09 機主回報
+    「無法進行模型切換」就是這條)。
+
+    回傳格式照 app 的 SpawnConfigDTO:扁平、snake_case、缺欄就不給
+    (`{model?, effort?, permission_mode?, approval_policy?, sandbox?, …}`)。
+
+    **刻意只支援 codex**:CC 的模型/權限模式是對 live TUI 打 `/model` 與
+    shift+tab(見 `/ccsessions/{name}/model|mode`),app 端也已經走那兩條 v1 路由;
+    在這裡做第二套入口只會多一條會漂移的真相。非 codex 一律 404 →
+    app 既有的 graceful absence(launch-config 區整個藏起來)原樣保留,
+    等於這支端點對 CC/人格是**零行為變化**。
+    """
+    _check_auth(request)
+    provider, ident = _v2_config_split(session_id)
+    if provider != "codex" or not ident:
+        raise HTTPException(status_code=404, detail="not found")
+    if ident not in CODEX_APP.thread_settings:
+        try:
+            await CODEX_APP.ensure_thread_loaded(ident)
+        except Exception as e:  # noqa: BLE001
+            _codex_http_error(e)
+    cached = dict(CODEX_APP.thread_settings.get(ident) or {})
+    cached.pop("at", None)
+    out: dict = {}
+    if cached.get("model"):
+        out["model"] = cached["model"]
+    if cached.get("approvalPolicy"):
+        out["approval_policy"] = cached["approvalPolicy"]
+    if cached.get("effort"):
+        out["effort"] = cached["effort"]
+    sandbox = cached.get("sandbox")
+    # codex 的 sandbox 是物件({type, writableRoots, …}),app 的欄位是字串 →
+    # 只給 type。給整個物件會讓 app 的 `decodeIfPresent(String…)` 吃不下而變 nil。
+    if isinstance(sandbox, dict) and sandbox.get("type"):
+        out["sandbox"] = sandbox["type"]
+    elif isinstance(sandbox, str) and sandbox:
+        out["sandbox"] = sandbox
+    return out
+
+
+@app.post("/app/v2/sessions/{session_id}/config")
+async def v2_session_config_write(session_id: str, request: Request):
+    """寫此 session 的設定(目前:codex 的 model / approval_policy)。
+
+    與 `/codexsessions/{tid}/settings` 走**同一套驗證與寫入**,只是換成 v2 的
+    id 形狀與 snake_case 欄名 —— 包含「寫入前先對 codex 的 model/list 驗一次」
+    那道護欄。這很重要:機主這次踩到的就是一條被釘在 `gpt-6-luna`(不存在)的
+    session,每輪都失敗。護欄會回 400 `CX_UNKNOWN_MODEL` 並**列出可用模型**,
+    app 端把 detail 顯示出來就直接告訴使用者該填什麼。
+
+    `effort` / `sandbox` 目前是 spawn-only(codex 不吃 runtime 更新),收到就
+    原樣忽略並在回應的 `ignored` 裡列出來 —— 不假裝寫成功,也不整個 400 擋掉。
+    """
+    _check_auth(request)
+    provider, ident = _v2_config_split(session_id)
+    if provider != "codex" or not ident:
+        raise HTTPException(status_code=404, detail="not found")
+    body = await request.json()
+    params: dict = {"threadId": ident}
+    model = str(body.get("model") or "").strip()
+    policy = str(body.get("approval_policy") or "").strip()
+    if model:
+        known = await _codex_known_models()
+        if known and model not in known:
+            raise http_err(400, "CX_UNKNOWN_MODEL",
+                           f"codex 不認得這個模型:{model}",
+                           "可用:" + ", ".join(sorted(known)[:12]))
+        params["model"] = model
+    if policy:
+        if policy not in _CODEX_APPROVAL_POLICIES:
+            raise HTTPException(status_code=400,
+                                detail="approval_policy must be one of "
+                                       + "|".join(_CODEX_APPROVAL_POLICIES))
+        params["approvalPolicy"] = policy
+    if len(params) == 1:
+        raise HTTPException(status_code=400,
+                            detail="model or approval_policy required")
+    try:
+        await CODEX_APP.ensure_thread_loaded(ident)
+        await CODEX_APP.call("thread/settings/update", params, timeout=15.0)
+    except Exception as e:  # noqa: BLE001
+        _codex_http_error(e)
+    applied = {k: v for k, v in params.items() if k != "threadId"}
+    CODEX_APP.note_thread_settings(ident, applied)
+    ignored = [k for k in ("effort", "sandbox", "max_budget_usd",
+                           "fallback_model", "append_system_prompt", "profile")
+               if body.get(k) not in (None, "")]
+    _log_event("v2_session_config_update", session=session_id[:32],
+               ignored=",".join(ignored) or None, **applied)
+    return {"ok": True, "session_id": session_id,
+            "applied": applied, "ignored": ignored}
+
+
 @app.post("/app/v2/sessions/{session_id}/key")
 async def v2_session_key(session_id: str, request: Request):
     """統一路由 key(契約 §4.4,capability keys):僅 claude_code。"""
