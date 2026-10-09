@@ -74,6 +74,42 @@ async function chOpen(i, node) {
 
 document.getElementById("ch-reload").addEventListener("click", chLoad);
 
+// ── 第三欄(P2):寬螢幕右側常駐的「這輪改了什麼」 ──
+// 與「變更」分頁共用同一支端點,但只列檔名;點了就跳到變更分頁看內容。
+// 窄螢幕不抓 —— 看不到的東西沒必要花一次請求。
+const RAIL_MIN_WIDTH = 1280;
+function railVisible() { return window.innerWidth >= RAIL_MIN_WIDTH; }
+
+async function railLoad() {
+  const box = document.getElementById("rail-list");
+  if (!box || !railVisible()) return;
+  const id = state.current;
+  if (!id) { box.innerHTML = '<div class="empty">選一條 session</div>'; return; }
+  box.innerHTML = '<div class="empty">讀取中…</div>';
+  try {
+    const d = await apiJSON("/app/v2/sessions/" + encodeURIComponent(id) + "/changes");
+    const fs = d.files || [];
+    if (!fs.length) { box.innerHTML = '<div class="empty">工作目錄乾淨</div>'; return; }
+    box.innerHTML = fs.slice(0, 60).map((f) =>
+      '<div class="rail-item" data-path="' + esc(f.path) + '">' +
+      '<span class="ch-st ch-st-' + (f.untracked ? "new" : "mod") + '">' +
+      esc(f.untracked ? "新" : f.status) + "</span>" +
+      '<span class="ch-path">' + esc(f.path) + "</span></div>").join("");
+    box.querySelectorAll(".rail-item").forEach((n) =>
+      n.addEventListener("click", () => {
+        window.PocketConsoleMode.set("changes");
+        const i = chFiles.findIndex((x) => x.path === n.dataset.path);
+        if (i >= 0) chOpen(i, null);
+      }));
+  } catch (err) {
+    // 人格沒有工作目錄 → 400,是預期狀況
+    box.innerHTML = '<div class="empty">此 provider 無工作目錄</div>';
+  }
+}
+document.getElementById("rail-reload").addEventListener("click", railLoad);
+window.addEventListener("resize", () => { if (railVisible()) railLoad(); });
+window.PocketConsoleRail = { load: railLoad };
+
 // 切到「變更」分頁就自動抓一次(與 memory.js 同一套 onMode 掛法)。
 // 用鏈接而不是覆寫:memory.js 也掛在同一個點上,直接指派會把它蓋掉。
 (function () {

@@ -64,7 +64,7 @@ import workers as workers_store
 from fastapi import (FastAPI, Request, HTTPException, WebSocket, WebSocketDisconnect,
                      File, Form, UploadFile)
 from fastapi.responses import (JSONResponse, StreamingResponse, FileResponse,
-                               HTMLResponse, PlainTextResponse)
+                               HTMLResponse, PlainTextResponse, Response)
 from starlette.websockets import WebSocketState
 
 import acp_client
@@ -9632,6 +9632,37 @@ async def console_page(request: Request):
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail="console not installed")
     return HTMLResponse(html, headers=_CONSOLE_SECURITY_HEADERS)
+
+
+# PWA 的兩個檔案必須從 **/console/** 這一層服務,不能只掛在 /console/static/:
+# service worker 的控制範圍預設是它所在的目錄,放在 static/ 底下就管不到
+# /console 本頁(Service-Worker-Allowed 標頭也一併補上)。manifest 放這裡,
+# start_url / scope 才對得上。
+# 兩者刻意**不經 _console_guard**:內容無機密,而瀏覽器抓 manifest / 註冊 SW 時
+# 不會帶 boot code —— 擋了只會讓 PWA 裝不起來,擋不到任何東西。
+@app.get("/console/sw.js")
+async def console_sw():
+    if not POCKET_CONSOLE_ENABLED:
+        raise HTTPException(status_code=404, detail="not found")
+    try:
+        body = open(os.path.join(_CONSOLE_DIR, "sw.js"), encoding="utf-8").read()
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="not found")
+    return Response(body, media_type="application/javascript",
+                    headers={"Service-Worker-Allowed": "/console",
+                             "Cache-Control": "no-cache"})
+
+
+@app.get("/console/manifest.json")
+async def console_manifest():
+    if not POCKET_CONSOLE_ENABLED:
+        raise HTTPException(status_code=404, detail="not found")
+    try:
+        body = open(os.path.join(_CONSOLE_DIR, "manifest.json"), encoding="utf-8").read()
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="not found")
+    return Response(body, media_type="application/manifest+json",
+                    headers={"Cache-Control": "no-cache"})
 
 
 # 靜態資產(app.js / sse.js / style.css)。旗標關時整個 mount 不掛 → 404。

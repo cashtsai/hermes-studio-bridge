@@ -5,6 +5,11 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Pocket Console</title>
 <link rel="stylesheet" href="/console/static/style.css">
+<link rel="manifest" href="/console/manifest.json">
+<meta name="theme-color" content="#0e1116">
+<link rel="icon" href="/console/static/icon.svg" type="image/svg+xml">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="Pocket">
 </head>
 <body>
 <div id="app">
@@ -20,6 +25,7 @@
     <button id="awaiting" class="awaiting hidden" title="有 session 在等你放行">
       <span id="awaiting-n">0</span> 件待審核
     </button>
+    <span id="usage" class="usage hidden" title="今日用量／花費"></span>
     <div id="conn" class="conn" title="連線狀態"><span class="dot"></span><span id="conn-text">連線中…</span></div>
   </header>
 
@@ -59,6 +65,14 @@
         <button id="send" class="btn btn-primary" type="submit">送出</button>
       </form>
     </section>
+
+    <!-- 第三欄:寬螢幕才出現(P2)。右側常駐「這條 session 改了什麼」,
+         不必切到「變更」分頁 —— 筆電有橫向空間,別浪費。 -->
+    <aside id="rail" class="rail">
+      <div class="side-head"><span>這輪改了什麼</span>
+        <button id="rail-reload" class="icon-btn" title="重新整理">↻</button></div>
+      <div id="rail-list" class="rail-list"><div class="empty">選一條 session</div></div>
+    </aside>
   </main>
 
   <!-- 檔案瀏覽模式 -->

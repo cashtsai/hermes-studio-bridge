@@ -118,6 +118,7 @@ async function openSession(id) {
   $("sh-name").textContent = s.title || id;
   updateStatusChip(s.status, s.meta);
   renderApproval();
+  if (window.PocketConsoleRail) window.PocketConsoleRail.load();
   $("cards").innerHTML = '<div class="placeholder">載入卡片…</div>';
 
   try {
@@ -222,6 +223,7 @@ function renderAwaiting() {
   const el = $("awaiting");
   $("awaiting-n").textContent = String(n);
   el.classList.toggle("hidden", n === 0);
+  notifyAwaiting(n);
 }
 
 // 點徽章 → 跳到第一條在等的 session
@@ -491,10 +493,67 @@ function renderAtts() {
     b.addEventListener("click", () => { state.atts.splice(Number(b.dataset.i), 1); renderAtts(); }));
 }
 
+
+// ───────────────────────── P2:用量／成本 ─────────────────────────
+// 遠端工作最容易失去「燒了多少」的感覺。接既有 /app/v1/usage。
+// 拿不到就整個不顯示(老 bridge / 功能未開)—— 不要在頂部留一塊壞掉的東西。
+async function loadUsage() {
+  try {
+    const d = await apiJSON("/app/v1/usage");
+    const parts = [];
+    const cost = d.cost_usd ?? d.costUSD ?? (d.today && d.today.cost_usd);
+    const tok = d.tokens ?? (d.today && d.today.tokens);
+    if (typeof tok === "number") parts.push(tok >= 1000 ? (tok / 1000).toFixed(1) + "k tok" : tok + " tok");
+    if (typeof cost === "number") parts.push("$" + cost.toFixed(2));
+    const el = $("usage");
+    el.textContent = parts.join(" · ");
+    el.classList.toggle("hidden", !parts.length);
+  } catch (err) { $("usage").classList.add("hidden"); }
+}
+
+// ───────────────────────── P2:通知 ─────────────────────────
+// 有事等你,但你切到別的分頁了 —— 標題閃爍 + 一聲短音(零權限,不碰 Web Push)。
+let titleTimer = null, baseTitle = document.title, lastAwaiting = 0;
+function notifyAwaiting(n) {
+  if (n === lastAwaiting) return;
+  const rose = n > lastAwaiting;
+  lastAwaiting = n;
+  if (!rose) { stopBlink(); return; }
+  if (!document.hidden) return;              // 人就在看,不用吵他
+  beep();
+  clearInterval(titleTimer);
+  let on = false;
+  titleTimer = setInterval(() => {
+    on = !on;
+    document.title = on ? "🔴 " + n + " 件待審核" : baseTitle;
+  }, 1100);
+}
+function stopBlink() { clearInterval(titleTimer); titleTimer = null; document.title = baseTitle; }
+document.addEventListener("visibilitychange", () => { if (!document.hidden) stopBlink(); });
+function beep() {
+  try {
+    const ac = new (window.AudioContext || window.webkitAudioContext)();
+    const o = ac.createOscillator(), g = ac.createGain();
+    o.type = "sine"; o.frequency.value = 880;
+    g.gain.setValueAtTime(0.0001, ac.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.08, ac.currentTime + 0.02);
+    g.gain.exponentialRampToValueAtTime(0.0001, ac.currentTime + 0.32);
+    o.connect(g).connect(ac.destination); o.start(); o.stop(ac.currentTime + 0.34);
+    setTimeout(() => ac.close(), 600);
+  } catch (e) { /* 瀏覽器不給音訊就算了,標題還是會閃 */ }
+}
+
 async function main() {
   wire();
   if (!(await bootstrap())) return;
   await loadSessions();
+  loadUsage(); setInterval(loadUsage, 120000);
+  if ("serviceWorker" in navigator) {
+    // scope 要 /console —— sw.js 由 bridge 從 /console/sw.js 服務並帶
+    // Service-Worker-Allowed 標頭(放在 static/ 下的話管不到本頁)。
+    navigator.serviceWorker.register("/console/sw.js", { scope: "/console" })
+      .catch(() => { /* 裝不起來不影響使用,不要吵使用者 */ });
+  }
   const want = hashSession();              // 深連結:帶 #session= 就直接開
   if (want && state.sessions.some((s) => s.id === want)) openSession(want);
   // 全域 SSE:任何 session 狀態變動都刷新列表(無 410 問題,見規格)

@@ -247,3 +247,15 @@ body{background:var(--bg);color:var(--text);font-family:var(--sans);
        line-height:1;color:inherit;opacity:.65;padding:0 1px;}
 .att-x:hover{opacity:1;}
 #stream.dropping{outline:2px dashed rgba(127,127,127,.6);outline-offset:-6px;}
+
+/* ───── 第三欄 + 用量(P2)───── */
+.rail{display:none;}
+@media (min-width:1280px){
+  .rail{display:flex;flex-direction:column;width:280px;flex:none;min-height:0;
+        border-left:1px solid var(--line);background:var(--panel);}
+}
+.rail-list{overflow:auto;padding:6px;min-height:0;}
+.rail-item{display:flex;gap:7px;align-items:baseline;padding:5px 8px;
+           border-radius:6px;cursor:pointer;font-size:12px;}
+.rail-item:hover{background:rgba(127,127,127,.12);}
+.usage{font-size:11.5px;opacity:.72;font-variant-numeric:tabular-nums;white-space:nowrap;}
