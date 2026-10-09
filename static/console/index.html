@@ -13,8 +13,12 @@
     <nav id="mode-nav">
       <button class="mode-btn active" data-mode="agents">Agents</button>
       <button class="mode-btn" data-mode="files">檔案</button>
+      <button class="mode-btn" data-mode="changes">變更</button>
       <button class="mode-btn" data-mode="memory">記憶</button>
     </nav>
+    <button id="awaiting" class="awaiting hidden" title="有 session 在等你放行">
+      <span id="awaiting-n">0</span> 件待審核
+    </button>
     <div id="conn" class="conn" title="連線狀態"><span class="dot"></span><span id="conn-text">連線中…</span></div>
   </header>
 
@@ -37,6 +41,13 @@
           <button id="interrupt" class="btn btn-danger" title="中斷目前回合">■ 中斷</button>
         </div>
       </div>
+      <div id="approval" class="approval hidden">
+        <div class="ap-head">
+          <span class="ap-icon">🔐</span>
+          <span id="ap-title" class="ap-title"></span>
+        </div>
+        <div id="ap-actions" class="ap-actions"></div>
+      </div>
       <div id="cards"><div class="placeholder">← 從左邊選一條 session</div></div>
       <form id="composer" class="composer hidden">
         <textarea id="input" rows="1" placeholder="送到這條 session…（⌘/Ctrl+Enter 送出）"></textarea>
@@ -54,6 +65,18 @@
     <div id="fb-body" class="fb-body">
       <div id="fb-list" class="fb-list"></div>
       <div id="fb-preview" class="fb-preview"><div class="placeholder">← 選一個檔案預覽</div></div>
+    </div>
+  </section>
+
+  <!-- 變更檢視模式(P0-3) -->
+  <section id="changes-view" class="hidden">
+    <div class="ch-bar">
+      <span id="ch-session" class="ch-session">先在 Agents 選一條 session</span>
+      <button id="ch-reload" class="btn-ghost" title="重新整理">↻</button>
+    </div>
+    <div class="ch-body">
+      <div id="ch-list" class="ch-list"></div>
+      <pre id="ch-diff" class="ch-diff"><div class="placeholder">← 選一個檔案看它改了什麼</div></pre>
     </div>
   </section>
 
@@ -75,6 +98,7 @@
 <script src="/console/static/sse.js"></script>
 <script src="/console/static/app.js"></script>
 <script src="/console/static/filebrowser.js"></script>
+<script src="/console/static/changes.js"></script>
 <script src="/console/static/memory.js"></script>
 </body>
 </html>

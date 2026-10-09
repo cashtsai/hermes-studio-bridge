@@ -101,7 +101,7 @@
       .replace(/\n/g, "<br>");
   }
 
-  // 模式切換(三模式共用;memory.js 掛 onMode 做首次載入)
+  // 模式切換(四模式共用;memory.js / changes.js 掛 onMode 做首次載入)
   window.PocketConsoleMode = { set: setMode, onMode: null };
   function setMode(mode) {
     document.querySelectorAll(".mode-btn").forEach((b) =>
@@ -109,6 +109,7 @@
     $("main").classList.toggle("hidden", mode !== "agents");
     $("files-view").classList.toggle("hidden", mode !== "files");
     const mv = $("memory-view"); if (mv) mv.classList.toggle("hidden", mode !== "memory");
+    const cv = $("changes-view"); if (cv) cv.classList.toggle("hidden", mode !== "changes");
     if (mode === "files" && !booted) { booted = true; navigate(""); }
     if (window.PocketConsoleMode.onMode) window.PocketConsoleMode.onMode(mode);
   }

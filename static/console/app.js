@@ -70,6 +70,8 @@ async function loadSessions() {
     state.sessions = d.sessions || [];
     const degraded = d.degraded_providers || [];
     renderSessions(degraded);
+    renderAwaiting();
+    renderApproval();
     setConn(true, degraded.length ? ("降級:" + degraded.join(",")) : "已連線");
   } catch (err) {
     setConn(false, "取列表失敗");
@@ -113,6 +115,7 @@ async function openSession(id) {
   $("sh-provider").textContent = PROVIDER_LABEL[s.provider] || s.provider || "";
   $("sh-name").textContent = s.title || id;
   updateStatusChip(s.status, s.meta);
+  renderApproval();
   $("cards").innerHTML = '<div class="placeholder">載入卡片…</div>';
 
   try {
@@ -124,6 +127,106 @@ async function openSession(id) {
   } catch (err) {
     $("cards").innerHTML = '<div class="placeholder err">卡片載入失敗:' + esc(err.message) + "</div>";
   }
+}
+
+// ───────────────────────── 待審核(P0:唯一的硬阻塞)─────────────────────────
+// 偵測不需要新端點:pending 待審核已經在 session.meta 裡
+//   ‧ meta.prompt   —— CC 的選單/權限提示 {title, options:[{key,label}]}
+//   ‧ meta.approval —— 統一的審核列(hermes / openclaw / CC watcher 建的)
+// 動作走 /app/v2/sessions/{id}/approve,三 provider 的 body 形狀不同:
+//   ‧ CC      {key}
+//   ‧ CX      {approve: bool}
+//   ‧ hermes / openclaw {approval_id, key|approve}
+//   ‧ 有 approval_id 時一律帶上 —— bridge 會走統一的 _approval_decide_core
+function currentSession() {
+  return state.sessions.find((x) => x.id === state.current) || null;
+}
+
+function approvalIdOf(meta) {
+  const a = meta && meta.approval;
+  if (!a) return null;
+  return a.aid || a.id || a.approval_id || null;
+}
+
+function renderApproval() {
+  const bar = $("approval");
+  const s = currentSession();
+  const meta = (s && s.meta) || {};
+  const prompt = meta.prompt;
+  const aid = approvalIdOf(meta);
+  const opts = (prompt && Array.isArray(prompt.options) && prompt.options.length)
+    ? prompt.options : null;
+
+  if (!opts && !aid) { bar.classList.add("hidden"); return; }
+  bar.classList.remove("hidden");
+  $("ap-title").textContent =
+    (prompt && prompt.title) || (meta.approval && meta.approval.title) || "等待你放行";
+
+  const box = $("ap-actions");
+  box.innerHTML = "";
+  if (opts) {
+    // 有選項就照選項畫(CC 的數字選單/權限提示;label 可能是任何語言)
+    opts.slice(0, 8).forEach((o) => {
+      const b = document.createElement("button");
+      b.className = "ap-btn";
+      b.textContent = (o.key ? o.key + ". " : "") + (o.label || "");
+      b.addEventListener("click", () => decide({ key: String(o.key) }, b));
+      box.appendChild(b);
+    });
+  } else {
+    const yes = document.createElement("button");
+    yes.className = "ap-btn ap-yes"; yes.textContent = "核准";
+    yes.addEventListener("click", () => decide({ approve: true }, yes));
+    const no = document.createElement("button");
+    no.className = "ap-btn ap-no"; no.textContent = "否決";
+    no.addEventListener("click", () => decide({ approve: false }, no));
+    box.append(yes, no);
+  }
+}
+
+async function decide(choice, btn) {
+  const id = state.current;
+  if (!id) return;
+  const aid = approvalIdOf((currentSession() || {}).meta);
+  const body = Object.assign({}, choice, aid ? { approval_id: aid } : {});
+  // 樂觀:整排先停用,避免連點送出兩個決定
+  const box = $("ap-actions");
+  box.querySelectorAll("button").forEach((b) => (b.disabled = true));
+  if (btn) btn.classList.add("ap-busy");
+  try {
+    const r = await api("/app/v2/sessions/" + encodeURIComponent(id) + "/approve", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (!r.ok) {
+      const e = await r.json().catch(() => ({}));
+      throw new Error((e.error && e.error.message) || ("HTTP " + r.status));
+    }
+    toast("已送出決定");
+    $("approval").classList.add("hidden");   // 事件流會把真實狀態補回來
+    loadSessions();
+  } catch (err) {
+    toast("放行失敗:" + err.message);
+    box.querySelectorAll("button").forEach((b) => (b.disabled = false));
+    if (btn) btn.classList.remove("ap-busy");
+  }
+}
+
+// 跨 session 彙總:有幾件在等你。資料來源同上(sessions 的 meta/status),
+// 不必另外打 /app/v1/approvals —— 列表本來就每次都抓。
+function renderAwaiting() {
+  const n = state.sessions.filter((s) =>
+    s.status === "waiting_approval" || (s.meta && (s.meta.approval || s.meta.prompt))).length;
+  const el = $("awaiting");
+  $("awaiting-n").textContent = String(n);
+  el.classList.toggle("hidden", n === 0);
+}
+
+// 點徽章 → 跳到第一條在等的 session
+function jumpToAwaiting() {
+  const s = state.sessions.find((x) =>
+    x.status === "waiting_approval" || (x.meta && (x.meta.approval || x.meta.prompt)));
+  if (s) openSession(s.id);
 }
 
 function subscribeCards(id) {
@@ -219,6 +322,7 @@ function autosize() {
 // ───────────────────────── 綁定 + 啟動 ─────────────────────────
 function wire() {
   $("refresh").addEventListener("click", loadSessions);
+  $("awaiting").addEventListener("click", jumpToAwaiting);
   $("interrupt").addEventListener("click", interrupt);
   $("composer").addEventListener("submit", (e) => { e.preventDefault(); sendInput($("input").value); });
   $("input").addEventListener("input", autosize);
