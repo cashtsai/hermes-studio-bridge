@@ -12,6 +12,7 @@ const state = {
   cards: [],          // 目前 session 的卡片
   latestSeq: 0,
   stopStream: null,   // 當前 session SSE 的中止函式
+  atts: [],           // 待送附件 [{kind,filename,mime,data}]
 };
 
 // ───────────────────────── bootstrap(取得 token)─────────────────────────
@@ -70,6 +71,8 @@ async function loadSessions() {
     state.sessions = d.sessions || [];
     const degraded = d.degraded_providers || [];
     renderSessions(degraded);
+    renderAwaiting();
+    renderApproval();
     setConn(true, degraded.length ? ("降級:" + degraded.join(",")) : "已連線");
   } catch (err) {
     setConn(false, "取列表失敗");
@@ -107,12 +110,15 @@ async function openSession(id) {
   state.current = id;
   state.cards = []; state.latestSeq = 0;
   renderSessions([]);                      // 重畫 active 標記
+  writeHash(id);                           // 深連結:可加書籤 / 重整不掉頁
   $("stream-head").classList.remove("hidden");
   $("composer").classList.remove("hidden");
   const s = state.sessions.find((x) => x.id === id) || {};
   $("sh-provider").textContent = PROVIDER_LABEL[s.provider] || s.provider || "";
   $("sh-name").textContent = s.title || id;
   updateStatusChip(s.status, s.meta);
+  renderApproval();
+  if (window.PocketConsoleRail) window.PocketConsoleRail.load();
   $("cards").innerHTML = '<div class="placeholder">載入卡片…</div>';
 
   try {
@@ -124,6 +130,107 @@ async function openSession(id) {
   } catch (err) {
     $("cards").innerHTML = '<div class="placeholder err">卡片載入失敗:' + esc(err.message) + "</div>";
   }
+}
+
+// ───────────────────────── 待審核(P0:唯一的硬阻塞)─────────────────────────
+// 偵測不需要新端點:pending 待審核已經在 session.meta 裡
+//   ‧ meta.prompt   —— CC 的選單/權限提示 {title, options:[{key,label}]}
+//   ‧ meta.approval —— 統一的審核列(hermes / openclaw / CC watcher 建的)
+// 動作走 /app/v2/sessions/{id}/approve,三 provider 的 body 形狀不同:
+//   ‧ CC      {key}
+//   ‧ CX      {approve: bool}
+//   ‧ hermes / openclaw {approval_id, key|approve}
+//   ‧ 有 approval_id 時一律帶上 —— bridge 會走統一的 _approval_decide_core
+function currentSession() {
+  return state.sessions.find((x) => x.id === state.current) || null;
+}
+
+function approvalIdOf(meta) {
+  const a = meta && meta.approval;
+  if (!a) return null;
+  return a.aid || a.id || a.approval_id || null;
+}
+
+function renderApproval() {
+  const bar = $("approval");
+  const s = currentSession();
+  const meta = (s && s.meta) || {};
+  const prompt = meta.prompt;
+  const aid = approvalIdOf(meta);
+  const opts = (prompt && Array.isArray(prompt.options) && prompt.options.length)
+    ? prompt.options : null;
+
+  if (!opts && !aid) { bar.classList.add("hidden"); return; }
+  bar.classList.remove("hidden");
+  $("ap-title").textContent =
+    (prompt && prompt.title) || (meta.approval && meta.approval.title) || "等待你放行";
+
+  const box = $("ap-actions");
+  box.innerHTML = "";
+  if (opts) {
+    // 有選項就照選項畫(CC 的數字選單/權限提示;label 可能是任何語言)
+    opts.slice(0, 8).forEach((o) => {
+      const b = document.createElement("button");
+      b.className = "ap-btn";
+      b.textContent = (o.key ? o.key + ". " : "") + (o.label || "");
+      b.addEventListener("click", () => decide({ key: String(o.key) }, b));
+      box.appendChild(b);
+    });
+  } else {
+    const yes = document.createElement("button");
+    yes.className = "ap-btn ap-yes"; yes.textContent = "核准";
+    yes.addEventListener("click", () => decide({ approve: true }, yes));
+    const no = document.createElement("button");
+    no.className = "ap-btn ap-no"; no.textContent = "否決";
+    no.addEventListener("click", () => decide({ approve: false }, no));
+    box.append(yes, no);
+  }
+}
+
+async function decide(choice, btn) {
+  const id = state.current;
+  if (!id) return;
+  const aid = approvalIdOf((currentSession() || {}).meta);
+  const body = Object.assign({}, choice, aid ? { approval_id: aid } : {});
+  // 樂觀:整排先停用,避免連點送出兩個決定
+  const box = $("ap-actions");
+  box.querySelectorAll("button").forEach((b) => (b.disabled = true));
+  if (btn) btn.classList.add("ap-busy");
+  try {
+    const r = await api("/app/v2/sessions/" + encodeURIComponent(id) + "/approve", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (!r.ok) {
+      const e = await r.json().catch(() => ({}));
+      throw new Error((e.error && e.error.message) || ("HTTP " + r.status));
+    }
+    toast("已送出決定");
+    $("approval").classList.add("hidden");   // 事件流會把真實狀態補回來
+    loadSessions();
+  } catch (err) {
+    toast("放行失敗:" + err.message);
+    box.querySelectorAll("button").forEach((b) => (b.disabled = false));
+    if (btn) btn.classList.remove("ap-busy");
+  }
+}
+
+// 跨 session 彙總:有幾件在等你。資料來源同上(sessions 的 meta/status),
+// 不必另外打 /app/v1/approvals —— 列表本來就每次都抓。
+function renderAwaiting() {
+  const n = state.sessions.filter((s) =>
+    s.status === "waiting_approval" || (s.meta && (s.meta.approval || s.meta.prompt))).length;
+  const el = $("awaiting");
+  $("awaiting-n").textContent = String(n);
+  el.classList.toggle("hidden", n === 0);
+  notifyAwaiting(n);
+}
+
+// 點徽章 → 跳到第一條在等的 session
+function jumpToAwaiting() {
+  const s = state.sessions.find((x) =>
+    x.status === "waiting_approval" || (x.meta && (x.meta.approval || x.meta.prompt)));
+  if (s) openSession(s.id);
 }
 
 function subscribeCards(id) {
@@ -177,15 +284,18 @@ function updateStatusChip(phase, meta) {
 
 // ───────────────────────── 送出 / 中斷 ─────────────────────────
 async function sendInput(text) {
-  if (!state.current || !text.trim()) return;
+  if (!state.current) return;
+  if (!text.trim() && !state.atts.length) return;
   const cid = (crypto.randomUUID ? crypto.randomUUID() : String(Date.now()));
   try {
     const r = await api("/app/v2/sessions/" + encodeURIComponent(state.current) + "/input", {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ content: text, client_id: cid }),
+      body: JSON.stringify(Object.assign({ content: text, client_id: cid },
+        state.atts.length ? { attachments: state.atts } : {})),
     });
     if (!r.ok) { const e = await r.json().catch(() => ({})); throw new Error((e.error && e.error.message) || ("HTTP " + r.status)); }
     $("input").value = ""; autosize();
+    state.atts = []; renderAtts();
   } catch (err) { toast("送出失敗:" + err.message); }
 }
 
@@ -219,6 +329,26 @@ function autosize() {
 // ───────────────────────── 綁定 + 啟動 ─────────────────────────
 function wire() {
   $("refresh").addEventListener("click", loadSessions);
+  $("awaiting").addEventListener("click", jumpToAwaiting);
+  $("newsess-open").addEventListener("click", () => $("newsess").classList.remove("hidden"));
+  $("newsess-cancel").addEventListener("click", () => $("newsess").classList.add("hidden"));
+  $("newsess-go").addEventListener("click", createSession);
+  $("pal-q").addEventListener("input", (e) => renderPalette(e.target.value));
+  $("palette").addEventListener("click", (e) => { if (e.target.id === "palette") closePalette(); });
+  wireKeys();
+  $("attach").addEventListener("click", () => $("file-pick").click());
+  $("file-pick").addEventListener("change", (e) => { addFiles(e.target.files); e.target.value = ""; });
+  const dz = $("stream");
+  dz.addEventListener("dragover", (e) => { e.preventDefault(); dz.classList.add("dropping"); });
+  dz.addEventListener("dragleave", () => dz.classList.remove("dropping"));
+  dz.addEventListener("drop", (e) => {
+    e.preventDefault(); dz.classList.remove("dropping");
+    if (state.current) addFiles(e.dataTransfer.files);
+  });
+  $("input").addEventListener("paste", (e) => {
+    const f = Array.from(e.clipboardData.files || []);
+    if (f.length) { e.preventDefault(); addFiles(f); }   // 直接貼截圖
+  });
   $("interrupt").addEventListener("click", interrupt);
   $("composer").addEventListener("submit", (e) => { e.preventDefault(); sendInput($("input").value); });
   $("input").addEventListener("input", autosize);
@@ -227,10 +357,205 @@ function wire() {
   });
 }
 
+
+// ───────────────────────── P1:深連結(可加書籤)─────────────────────────
+// #session=<id> —— 把常用的工作釘成書籤,開筆電直接進去;重新整理也不會掉回首頁。
+function hashSession() {
+  const m = /(?:^|&)session=([^&]+)/.exec(location.hash.slice(1));
+  return m ? decodeURIComponent(m[1]) : null;
+}
+function writeHash(id) {
+  const next = id ? "#session=" + encodeURIComponent(id) : "";
+  if (location.hash !== next) history.replaceState(null, "", location.pathname + location.search + next);
+}
+
+// ───────────────────────── P1:鍵盤操作(筆電的本體優勢)──────────────────
+// ⌘K 快速切 session / j·k 上下移動 / a·d 核准·否決 / ⌘↵ 送出(既有)
+// 刻意不攔在輸入框裡打字的狀況 —— 只有焦點不在 input/textarea 時才作用。
+function typingNow() {
+  const t = document.activeElement;
+  return t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable);
+}
+function moveSelection(delta) {
+  const ids = state.sessions.map((s) => s.id);
+  if (!ids.length) return;
+  const i = ids.indexOf(state.current);
+  const next = ids[Math.max(0, Math.min(ids.length - 1, (i < 0 ? 0 : i + delta)))];
+  if (next && next !== state.current) openSession(next);
+}
+function firstApprovalButton(wantYes) {
+  const btns = Array.from($("ap-actions").querySelectorAll("button"));
+  if (!btns.length) return null;
+  const hit = btns.find((b) => b.classList.contains(wantYes ? "ap-yes" : "ap-no"));
+  return hit || (wantYes ? btns[0] : btns[btns.length - 1]);
+}
+function wireKeys() {
+  document.addEventListener("keydown", (e) => {
+    if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
+      e.preventDefault(); openPalette(); return;
+    }
+    if (e.key === "Escape") { closePalette(); return; }
+    if (typingNow()) return;
+    if (e.key === "j") { e.preventDefault(); moveSelection(1); }
+    else if (e.key === "k") { e.preventDefault(); moveSelection(-1); }
+    else if (e.key === "a" || e.key === "d") {
+      const b = firstApprovalButton(e.key === "a");
+      if (b && !b.disabled) { e.preventDefault(); b.click(); }
+    }
+  });
+}
+
+// ⌘K 快速切換面板
+function openPalette() {
+  const p = $("palette");
+  p.classList.remove("hidden");
+  const q = $("pal-q"); q.value = ""; renderPalette(""); q.focus();
+}
+function closePalette() { $("palette").classList.add("hidden"); }
+function renderPalette(q) {
+  const needle = q.trim().toLowerCase();
+  const hits = state.sessions.filter((s) =>
+    !needle || (s.title || s.id).toLowerCase().includes(needle) ||
+    (s.provider || "").toLowerCase().includes(needle)).slice(0, 12);
+  $("pal-list").innerHTML = hits.length
+    ? hits.map((s, i) => '<div class="pal-item' + (i === 0 ? " sel" : "") +
+        '" data-id="' + esc(s.id) + '"><span class="pill">' +
+        esc(PROVIDER_LABEL[s.provider] || s.provider || "") + "</span>" +
+        esc(s.title || s.id) + "</div>").join("")
+    : '<div class="empty">沒有符合的 session</div>';
+  $("pal-list").querySelectorAll(".pal-item").forEach((n) =>
+    n.addEventListener("click", () => { closePalette(); openSession(n.dataset.id); }));
+}
+
+// ───────────────────────── P1:開新工作 ─────────────────────────
+async function createSession() {
+  const kind = $("new-kind").value;
+  const name = $("new-name").value.trim();
+  const wd = $("new-dir").value.trim();
+  if (kind === "cc" && !name) { toast("CC 需要 session 名稱"); return; }
+  try {
+    if (kind === "cc") {
+      const r = await api("/ccsessions", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name, workdir: wd }),
+      });
+      if (!r.ok) throw new Error("HTTP " + r.status);
+    } else {
+      const r = await api("/codexsessions", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text: name || "新工作", cwd: wd || undefined }),
+      });
+      if (!r.ok) throw new Error("HTTP " + r.status);
+    }
+    toast("已開新工作");
+    $("newsess").classList.add("hidden");
+    $("new-name").value = ""; $("new-dir").value = "";
+    setTimeout(loadSessions, 600);     // 給 bridge 一點時間把它登記進列表
+  } catch (err) { toast("開新工作失敗:" + err.message); }
+}
+
+
+// ───────────────────────── P1:附件 ─────────────────────────
+// input 的 attachments 直接收 {kind,filename,mime,data(dataURI)} —— 所以
+// **不需要碰 multipart 上傳端點**,瀏覽器讀成 data URI 就能送。
+// 代價是整包塞進 JSON body,所以設上限;大檔請用檔案瀏覽面的路徑引用。
+const ATT_MAX_BYTES = 8 * 1024 * 1024;
+
+function attKind(mime) {
+  if (!mime) return "file";
+  if (mime.startsWith("image/")) return "image";
+  if (mime.startsWith("video/")) return "video";
+  if (mime.startsWith("audio/")) return "audio";
+  return "file";
+}
+
+function addFiles(files) {
+  Array.from(files || []).forEach((f) => {
+    if (f.size > ATT_MAX_BYTES) { toast(f.name + " 超過 8MB,改用檔案路徑引用"); return; }
+    const fr = new FileReader();
+    fr.onload = () => {
+      state.atts.push({ kind: attKind(f.type), filename: f.name,
+                        mime: f.type || "application/octet-stream", data: fr.result });
+      renderAtts();
+    };
+    fr.onerror = () => toast("讀取 " + f.name + " 失敗");
+    fr.readAsDataURL(f);
+  });
+}
+
+function renderAtts() {
+  const box = $("atts");
+  box.classList.toggle("hidden", !state.atts.length);
+  box.innerHTML = state.atts.map((a, i) =>
+    '<span class="att">' + esc(a.filename) +
+    '<button class="att-x" data-i="' + i + '" title="移除">×</button></span>').join("");
+  box.querySelectorAll(".att-x").forEach((b) =>
+    b.addEventListener("click", () => { state.atts.splice(Number(b.dataset.i), 1); renderAtts(); }));
+}
+
+
+// ───────────────────────── P2:用量／成本 ─────────────────────────
+// 遠端工作最容易失去「燒了多少」的感覺。接既有 /app/v1/usage。
+// 拿不到就整個不顯示(老 bridge / 功能未開)—— 不要在頂部留一塊壞掉的東西。
+async function loadUsage() {
+  try {
+    const d = await apiJSON("/app/v1/usage");
+    const parts = [];
+    const cost = d.cost_usd ?? d.costUSD ?? (d.today && d.today.cost_usd);
+    const tok = d.tokens ?? (d.today && d.today.tokens);
+    if (typeof tok === "number") parts.push(tok >= 1000 ? (tok / 1000).toFixed(1) + "k tok" : tok + " tok");
+    if (typeof cost === "number") parts.push("$" + cost.toFixed(2));
+    const el = $("usage");
+    el.textContent = parts.join(" · ");
+    el.classList.toggle("hidden", !parts.length);
+  } catch (err) { $("usage").classList.add("hidden"); }
+}
+
+// ───────────────────────── P2:通知 ─────────────────────────
+// 有事等你,但你切到別的分頁了 —— 標題閃爍 + 一聲短音(零權限,不碰 Web Push)。
+let titleTimer = null, baseTitle = document.title, lastAwaiting = 0;
+function notifyAwaiting(n) {
+  if (n === lastAwaiting) return;
+  const rose = n > lastAwaiting;
+  lastAwaiting = n;
+  if (!rose) { stopBlink(); return; }
+  if (!document.hidden) return;              // 人就在看,不用吵他
+  beep();
+  clearInterval(titleTimer);
+  let on = false;
+  titleTimer = setInterval(() => {
+    on = !on;
+    document.title = on ? "🔴 " + n + " 件待審核" : baseTitle;
+  }, 1100);
+}
+function stopBlink() { clearInterval(titleTimer); titleTimer = null; document.title = baseTitle; }
+document.addEventListener("visibilitychange", () => { if (!document.hidden) stopBlink(); });
+function beep() {
+  try {
+    const ac = new (window.AudioContext || window.webkitAudioContext)();
+    const o = ac.createOscillator(), g = ac.createGain();
+    o.type = "sine"; o.frequency.value = 880;
+    g.gain.setValueAtTime(0.0001, ac.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.08, ac.currentTime + 0.02);
+    g.gain.exponentialRampToValueAtTime(0.0001, ac.currentTime + 0.32);
+    o.connect(g).connect(ac.destination); o.start(); o.stop(ac.currentTime + 0.34);
+    setTimeout(() => ac.close(), 600);
+  } catch (e) { /* 瀏覽器不給音訊就算了,標題還是會閃 */ }
+}
+
 async function main() {
   wire();
   if (!(await bootstrap())) return;
   await loadSessions();
+  loadUsage(); setInterval(loadUsage, 120000);
+  if ("serviceWorker" in navigator) {
+    // scope 要 /console —— sw.js 由 bridge 從 /console/sw.js 服務並帶
+    // Service-Worker-Allowed 標頭(放在 static/ 下的話管不到本頁)。
+    navigator.serviceWorker.register("/console/sw.js", { scope: "/console" })
+      .catch(() => { /* 裝不起來不影響使用,不要吵使用者 */ });
+  }
+  const want = hashSession();              // 深連結:帶 #session= 就直接開
+  if (want && state.sessions.some((s) => s.id === want)) openSession(want);
   // 全域 SSE:任何 session 狀態變動都刷新列表(無 410 問題,見規格)
   sseStream("/app/v2/events?follow=true&since_seq=0", state.token, {
     onEvent: () => { /* 去抖:每次事件觸發輕量刷新 */ scheduleListRefresh(); },

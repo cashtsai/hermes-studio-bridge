@@ -64,7 +64,7 @@ import workers as workers_store
 from fastapi import (FastAPI, Request, HTTPException, WebSocket, WebSocketDisconnect,
                      File, Form, UploadFile)
 from fastapi.responses import (JSONResponse, StreamingResponse, FileResponse,
-                               HTMLResponse, PlainTextResponse)
+                               HTMLResponse, PlainTextResponse, Response)
 from starlette.websockets import WebSocketState
 
 import acp_client
@@ -9058,6 +9058,54 @@ async def v2_session_diff(session_id: str, request: Request, path: str):
     raise http_err(400, "UNSUPPORTED_PROVIDER", "persona session 沒有工作目錄")
 
 
+async def _session_workdir_changes(workdir: str) -> dict:
+    """Session workdir 內「現在有哪些檔被動過」。
+
+    `/diff` 是**單檔**的(必須帶 ?path=),所以光有它還是回答不了「agent 到底改了
+    什麼」—— 得先知道有哪些檔。這支補上缺的那一半:`git status --porcelain` 整理
+    成清單,前端拿它列檔案,再逐檔打 `/diff` 看內容。
+    """
+    wd = os.path.realpath(os.path.expanduser(workdir or ""))
+    if not workdir or not os.path.isdir(wd):
+        raise HTTPException(status_code=404, detail="session 沒有可用的工作目錄")
+    rc, top = await _git_capture("git", "-C", wd, "rev-parse", "--show-toplevel")
+    if rc != 0 or not top.strip():
+        raise HTTPException(status_code=404, detail="session 工作目錄不是 git repo")
+    root = top.strip()
+    rc, out = await _git_capture("git", "-C", root, "status", "--porcelain=v1", "-uall")
+    if rc != 0:
+        raise http_err(502, "GIT_FAILED", "git status 失敗")
+    files = []
+    for line in (out or "").splitlines():
+        if len(line) < 4:
+            continue
+        code, rel = line[:2], line[3:].strip()
+        # rename 是 "old -> new",只取新路徑(那才是看得到內容的那個)
+        if " -> " in rel:
+            rel = rel.split(" -> ", 1)[1]
+        files.append({"path": rel, "status": code.strip() or "?",
+                      "untracked": code == "??"})
+    files.sort(key=lambda f: f["path"])
+    return {"workdir": root, "files": files[:400], "truncated": len(files) > 400}
+
+
+@app.get("/app/v2/sessions/{session_id}/changes")
+async def v2_session_changes(session_id: str, request: Request):
+    """列出此 session 工作目錄現在有哪些待定變更(搭配 `/diff` 逐檔看內容)。
+
+    2026-10-09 補:桌面主控台要能回答「agent 改了什麼」,但既有 `/diff` 只收單一
+    path,而 bridge 沒有任何「列出改動檔」的路由 —— 缺這一半就只能叫使用者自己
+    猜檔名。provider 支援與 `/diff` 一致(cc / cx 有工作目錄;人格沒有)。
+    """
+    _check_auth(request)
+    src = _v2_card_source(session_id)
+    if src[0] == "cc":
+        return await _session_workdir_changes(src[2])
+    if src[0] == "cx":
+        return await _session_workdir_changes(await _codex_thread_workdir(src[1]))
+    raise http_err(400, "UNSUPPORTED_PROVIDER", "persona session 沒有工作目錄")
+
+
 # --- Client error log ------------------------------------------------------
 # The app ships every error it hits (failed send, dropped stream, crash, …) here
 # the moment it happens. We append to ONE file on the Mac so Claude can fetch +
@@ -9584,6 +9632,37 @@ async def console_page(request: Request):
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail="console not installed")
     return HTMLResponse(html, headers=_CONSOLE_SECURITY_HEADERS)
+
+
+# PWA 的兩個檔案必須從 **/console/** 這一層服務,不能只掛在 /console/static/:
+# service worker 的控制範圍預設是它所在的目錄,放在 static/ 底下就管不到
+# /console 本頁(Service-Worker-Allowed 標頭也一併補上)。manifest 放這裡,
+# start_url / scope 才對得上。
+# 兩者刻意**不經 _console_guard**:內容無機密,而瀏覽器抓 manifest / 註冊 SW 時
+# 不會帶 boot code —— 擋了只會讓 PWA 裝不起來,擋不到任何東西。
+@app.get("/console/sw.js")
+async def console_sw():
+    if not POCKET_CONSOLE_ENABLED:
+        raise HTTPException(status_code=404, detail="not found")
+    try:
+        body = open(os.path.join(_CONSOLE_DIR, "sw.js"), encoding="utf-8").read()
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="not found")
+    return Response(body, media_type="application/javascript",
+                    headers={"Service-Worker-Allowed": "/console",
+                             "Cache-Control": "no-cache"})
+
+
+@app.get("/console/manifest.json")
+async def console_manifest():
+    if not POCKET_CONSOLE_ENABLED:
+        raise HTTPException(status_code=404, detail="not found")
+    try:
+        body = open(os.path.join(_CONSOLE_DIR, "manifest.json"), encoding="utf-8").read()
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="not found")
+    return Response(body, media_type="application/manifest+json",
+                    headers={"Cache-Control": "no-cache"})
 
 
 # 靜態資產(app.js / sse.js / style.css)。旗標關時整個 mount 不掛 → 404。
