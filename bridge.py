@@ -13908,6 +13908,10 @@ _CC_NOT_ACCEPTED_HINT = {
 # 驗證預算剛好卡在這個空隙用完時不能就地判死。
 _CC_IDLE_REGRASP_SECS = 1.5
 
+# 退出 shell 模式之後等重畫:0.2s × 5 = 1s 預算(實機一次重畫 ~100-300ms)。
+_CC_SHELL_RESET_POLL_SECS = 0.2
+_CC_SHELL_RESET_POLLS = 5
+
 
 async def _cc_verify_submitted(name: str, probe: str, gen0: int,
                                pre_pane: str = "") -> dict:
@@ -14030,7 +14034,15 @@ async def _cc_paste_text_locked(name: str, text: str) -> dict:
     if not text.lstrip().startswith("!") and _cc_shell_mode(pre_pane):
         await _tmux_run("send-keys", "-t", name, "C-u")
         await _tmux_run("send-keys", "-t", name, "BSpace")
-        pre_pane = await _cc_capture_pane_fresh(name)
+        # 退出之後要**等 TUI 重畫完**再判定。2026-10-09 實機:立刻回讀會讀到
+        # 還沒重畫的舊畫面 → recovered=false → 回一個假的 409,使用者看到紅字
+        # 失敗、app 自動重送才成功(功能是對的,但多閃一次錯誤)。輪詢到退出
+        # 為止,預算 1 秒,夠一次重畫還有餘。
+        for _ in range(_CC_SHELL_RESET_POLLS):
+            await asyncio.sleep(_CC_SHELL_RESET_POLL_SECS)
+            pre_pane = await _cc_capture_pane_fresh(name)
+            if not _cc_shell_mode(pre_pane):
+                break
         _log_event("cc_shell_mode_reset", session=name,
                    recovered=not _cc_shell_mode(pre_pane))
         if _cc_shell_mode(pre_pane):
