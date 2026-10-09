@@ -13974,8 +13974,21 @@ async def _cc_verify_submitted(name: str, probe: str, gen0: int,
                         "attempts": attempts, "pane": pane}
             attempts += 1
             held_streak = 0
+            # 補 Enter 之前先關掉可能開著的**自動完成選單**(2026-10-09 治本)。
+            #
+            # 機主從 Pocket 送含路徑的指令一直失敗(`composer_stuck`,attempts=4),
+            # 而 `!date` 這種沒有路徑的卻正常 —— 真因是貼上的文字只要結尾是路徑
+            # 片段,Claude Code 就會跳出路徑自動完成的下拉選單,**Enter 被選單吃掉**
+            # (變成「選這一項」而不是「送出」),補幾次都一樣。實機驗證:
+            #   貼 `!ls /private/tmp/claude-502/` → 選單出現 → Enter 無效 ×N
+            #   → Escape 關掉選單 → Enter 立刻送出。
+            # Escape 的安全性也實測過:**沒有選單時按它,輸入框的字原封不動**。
+            # 但 pane 正在跑回合時 Escape = 中斷那個回合,所以只在不忙時送。
+            if not _cc_pane_busy(pane):
+                await _tmux_run("send-keys", "-t", name, "Escape")
             _log_event("cc_paste_enter_retry", session=name,
-                       probe_chars=len(probe), attempt=attempts)
+                       probe_chars=len(probe), attempt=attempts,
+                       escaped=not _cc_pane_busy(pane))
             await _tmux_run("send-keys", "-t", name, "Enter")
             continue
         held_streak = 0
