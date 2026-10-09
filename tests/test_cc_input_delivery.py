@@ -127,6 +127,8 @@ class CCInputDeliveryTest(unittest.IsolatedAsyncioTestCase):
         bridge._CC_VERIFY_MAX_ENTER_RETRIES = 3
         self.regrasp = bridge._CC_IDLE_REGRASP_SECS
         bridge._CC_IDLE_REGRASP_SECS = 0.05
+        self.shell_poll = bridge._CC_SHELL_RESET_POLL_SECS
+        bridge._CC_SHELL_RESET_POLL_SECS = 0.01
         bridge._CC_PASTE_LOCKS.clear()
         bridge._CC_TURN_GEN.clear()
         self.tmux = AsyncMock(return_value=(0, "", ""))
@@ -148,6 +150,7 @@ class CCInputDeliveryTest(unittest.IsolatedAsyncioTestCase):
         bridge._CC_VERIFY_POLL_SECS = self.poll
         bridge._CC_VERIFY_MAX_ENTER_RETRIES = self.retries
         bridge._CC_IDLE_REGRASP_SECS = self.regrasp
+        bridge._CC_SHELL_RESET_POLL_SECS = self.shell_poll
 
     def enters(self):
         return [c for c in self.tmux.call_args_list
@@ -367,6 +370,18 @@ class CCInputDeliveryTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(r["delivery"], "accepted")
         # 只有原本那一次 Enter,不准補送(shell 模式補 Enter = 指令跑第二次)
         self.assertEqual(len(self.enters()), 1)
+
+    async def test_shell_reset_waits_for_repaint(self):
+        """TUI 重畫慢一拍不可以判成「退不出來」。2026-10-09 實機:立刻回讀
+        讀到舊畫面 → 假的 409,使用者看到紅字、app 重送一次才成功。"""
+        shell_empty = "\n".join(["  上一輪的回覆內容", BORDER,
+                                 "!\u00a0", BORDER, "  ! for shell mode"])
+        # ① pre_pane ② 退出後第一次回讀「還沒重畫」③ 第二次才看到 normal
+        script = PaneScript([shell_empty, shell_empty, pane_idle_empty(),
+                             pane_echoed(busy=True)])
+        with patch.object(bridge, "_cc_capture_pane_fresh", script):
+            r = await bridge._cc_paste_text("s1", TEXT)
+        self.assertTrue(r["confirmed"])
 
     async def test_shell_command_is_not_reset(self):
         """這一則本來就要走 shell —— 不准把模式退掉。"""
