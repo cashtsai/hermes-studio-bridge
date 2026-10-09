@@ -399,6 +399,37 @@ class CCInputDeliveryTest(unittest.IsolatedAsyncioTestCase):
         # 只有原本那一次 Enter,不准補送(shell 模式補 Enter = 指令跑第二次)
         self.assertEqual(len(self.enters()), 1)
 
+    async def test_shell_reset_clears_residue_before_exiting(self):
+        """框裡有殘字時要**清到空**才退 —— 2026-10-09 實害第二輪:
+        Pocket-branch 卡著一段折成兩行的舊 `!` 指令,連 4 次
+        `recovered: false`,那條 session 一則訊息都送不進去。
+        病根:`C-u` 只清一行,框沒空 `BSpace` 就只是刪一個字。"""
+        residue = "\n".join(["  上一輪的回覆內容", BORDER,
+                             "!\u00a0sed -i '' 's|aaa|bbb|g' /private/tmp/很長的",
+                             "  路徑/折到第二行",
+                             BORDER, "  ! for shell mode"])
+        shell_empty = "\n".join(["  上一輪的回覆內容", BORDER,
+                                 "!\u00a0", BORDER, "  ! for shell mode"])
+        # ① pre_pane 有殘字 ② 清一次還沒空 ③ 清乾淨 ④ 退出 shell 模式 ⑤ 驗證
+        script = PaneScript([residue, residue, shell_empty,
+                             pane_idle_empty(), pane_echoed(busy=True)])
+        with patch.object(bridge, "_cc_capture_pane_fresh", script):
+            r = await bridge._cc_paste_text("s1", TEXT)
+        self.assertTrue(r["confirmed"])
+        keys = [c.args[3] for c in self.tmux.call_args_list
+                if len(c.args) >= 4 and c.args[0] == "send-keys"]
+        self.assertIn("BSpace", keys)
+        self.assertGreaterEqual(keys[:keys.index("BSpace")].count("C-u"), 2,
+                                "殘字要清到空才准退出 shell 模式")
+
+    def test_composer_is_empty_detects_residue(self):
+        empty = "\n".join([BORDER, "!\u00a0", BORDER])
+        dirty = "\n".join([BORDER, "!\u00a0還沒清掉的字", BORDER])
+        self.assertTrue(bridge._cc_composer_is_empty(empty))
+        self.assertFalse(bridge._cc_composer_is_empty(dirty))
+        # 看不到輸入框 → 保守當成「不確定」,不可當成已清空
+        self.assertFalse(bridge._cc_composer_is_empty(pane_no_composer()))
+
     async def test_shell_reset_waits_for_repaint(self):
         """TUI 重畫慢一拍不可以判成「退不出來」。2026-10-09 實機:立刻回讀
         讀到舊畫面 → 假的 409,使用者看到紅字、app 重送一次才成功。"""
