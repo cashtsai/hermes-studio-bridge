@@ -14089,9 +14089,17 @@ async def _cc_paste_text_locked(name: str, text: str) -> dict:
         # 重開機的殭屍草稿,下一則送出時被 C-u 吃掉也可能與新字黏在一起。
         # 這裡先把「我們貼的那段」清掉(框裡確定是我們的字才清),再誠實回 409。
         await _tmux_run("send-keys", "-t", name, "C-u")
+        # 失敗時把**驗證器實際看到的畫面**留下來 —— 2026-10-09 連兩輪
+        # `composer_stuck`(attempts=4)查不出原因:指令明明跑掉了,驗證器卻
+        # 一直在輸入框裡看到那段字。沒有現場快照就只能猜,所以這裡補上
+        # 輸入框區域與畫面尾巴(都先 squash/截短,只夠辨識狀態)。
         _log_event("cc_input_not_accepted", session=name, stage="verify",
                    reason=verdict["reason"], attempts=verdict["attempts"],
-                   text_chars=len(text), busy=_cc_pane_busy(pane))
+                   text_chars=len(text), busy=_cc_pane_busy(pane),
+                   probe=_cc_squash(text[:24])[:48],
+                   composer=_cc_squash(_cc_composer_region(pane) or "")[:120],
+                   pane_tail=" | ".join(
+                       l.strip() for l in pane.splitlines()[-4:] if l.strip())[:220])
         raise http_err(409, "CC_INPUT_NOT_ACCEPTED",
                        f"message not accepted by the TUI ({verdict['reason']})",
                        _CC_NOT_ACCEPTED_HINT.get(verdict["reason"],
