@@ -350,6 +350,25 @@ class CCInputDeliveryTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(cm.exception.status_code, 409)
         self.assertEqual(cm.exception.code, "CC_INPUT_NOT_ACCEPTED")
 
+    async def test_shell_mode_paste_is_accepted_not_409(self):
+        """端到端:shell 模式貼上 → Enter → 輸入框清空回 normal → accepted。
+        修之前這條會是 409 composer_missing。"""
+        # 三格:① 貼上前(shell 模式、框是空的)② 貼上後字在框裡
+        # ③ Enter 之後框清空、指令回顯進 transcript。①不可含 TEXT,
+        # 否則會被 stale_echo 正確地判成「這是上一輪的回顯」。
+        shell_empty = "\n".join(["  上一輪的回覆內容", BORDER,
+                                 "!\u00a0", BORDER, "  ! for shell mode"])
+        shell_held = "\n".join(["  上一輪的回覆內容", BORDER,
+                                f"!\u00a0{TEXT}", BORDER, "  ! for shell mode"])
+        after = "\n".join(["  上一輪的回覆內容", f"! {TEXT}",
+                           BORDER, "\u276f\u00a0", BORDER, "  \u23f5\u23f5 auto mode on"])
+        script = PaneScript([shell_empty, shell_held, after])
+        with patch.object(bridge, "_cc_capture_pane_fresh", script):
+            r = await bridge._cc_paste_text("s1", TEXT)
+        self.assertTrue(r["confirmed"])
+        self.assertEqual(r["delivery"], "accepted")
+        # 只有原本那一次 Enter,不准補送(shell 模式補 Enter = 指令跑第二次)
+        self.assertEqual(len(self.enters()), 1)
 
 class ComposerParsingTest(unittest.TestCase):
     def test_split_stops_at_box_border(self):
@@ -365,6 +384,34 @@ class ComposerParsingTest(unittest.TestCase):
     def test_squash_kills_nbsp_and_wrap(self):
         self.assertIn(bridge._cc_squash(TEXT),
                       bridge._cc_squash(pane_holding_wrapped()))
+
+    # ── shell 模式(輸入以 `!` 開頭)────────────────────────────────────
+    #
+    # 2026-10-09 機主回報:在 Pocket 的 CC 分頁貼 `!` 開頭的指令一直送不出去,
+    # 官方 app 正常。實機 capture-pane 證據(Pocket-branch):
+    #   normal: '\u276f\u00a0'
+    #   shell : '!\u00a0 launchctl kickstart -k gui/$(id -u)/ai.studio.hermes-bridge'
+    # 只認 \u276f/\u203a 的話整段驗證預算都找不到輸入框 → composer_missing →
+    # 409,而且訊息被 C-u 清掉。
+    def test_shell_mode_prompt_is_a_composer(self):
+        pane = "\n".join(["  上一輪的回覆內容", BORDER,
+                          "!\u00a0echo hello", BORDER, "  ! for shell mode"])
+        body, region = bridge._cc_composer_split(pane)
+        self.assertIsNotNone(region)
+        self.assertIn("echo hello", region)
+        self.assertNotIn("echo hello", body)
+
+    def test_shell_mode_transcript_echo_is_not_a_composer(self):
+        """transcript 的回顯用**普通空格**('! echo hello'),輸入框是 NBSP。
+        拿裸 `!` 當標記就會把回顯誤判成輸入框 —— 這條釘住那個分界。"""
+        pane = "\n".join(["  上一輪的回覆內容",
+                          "! echo hello",          # transcript 回顯(普通空格)
+                          "  \u23bf\u00a0hello",
+                          BORDER, "\u276f\u00a0", BORDER, "  \u23f5\u23f5 auto mode on"])
+        body, region = bridge._cc_composer_split(pane)
+        self.assertIsNotNone(region)
+        self.assertNotIn("echo hello", region)     # 輸入框是空的
+        self.assertIn("echo hello", body)          # 回顯留在 transcript 側
 
     def test_context_full_regex(self):
         self.assertTrue(bridge._CC_CONTEXT_FULL_RE.search("100% context used"))

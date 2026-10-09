@@ -13810,7 +13810,15 @@ async def _tmux_run_stdin(args: list, data: bytes,
 #      的間隔,長句在 80 欄會折行,兩者都會讓 probe 對不上 → 假清空。
 # 另外多路徑併發送出(app 的 drainNext + 離線補送 + 使用者手動)會交錯打進
 # 同一個 pane,C-u/paste/Enter 三步互相插隊 —— 這裡補 per-session 序列化鎖。
-_CC_COMPOSER_MARKS = ("❯", "›")
+# 第三個標記是 **shell 模式**(輸入以 `!` 開頭時 Claude Code 把提示符從 `❯`
+# 換成 `!`)。2026-10-09 機主回報「在 Pocket 的 CC 分頁貼 ! 開頭的指令一直送
+# 不出去,官方 app 卻正常」—— 真因就在這裡:只認 ❯/› 的話 shell 模式下整段
+# 驗證預算都找不到輸入框,`_cc_verify_submitted` 判 `composer_missing` →
+# 409「CC 現在不在可輸入狀態」,訊息還被 C-u 清掉。實測 pane:
+#   normal → '❯ '            shell → '! echo hello'
+# 用 `!` + U+00A0 而不是裸 `!`:transcript 裡的回顯是普通空格
+# ('! echo hello'),拿裸 `!` 當標記會把回顯誤判成輸入框。
+_CC_COMPOSER_MARKS = ("❯", "›", "!\u00a0")   # \u00a0 寫成逸出序列:裸 NBSP 太容易被編輯器吃掉
 _CC_CONTEXT_FULL_RE = re.compile(r"(?:9[5-9]|100)\s*%\s*context\s+used",
                                  re.IGNORECASE)
 _CC_VERIFY_BUDGET_SECS = 8.0        # 驗證總預算(手機 POST 可接受的等待上限)
