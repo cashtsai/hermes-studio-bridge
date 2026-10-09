@@ -36,6 +36,17 @@ _TURN_TIMEOUT = float(os.environ.get("GEMINI_TURN_TIMEOUT", "600"))
 _SPAWN_TIMEOUT = float(os.environ.get("GEMINI_SPAWN_TIMEOUT", "45"))
 _DEFAULT_CWD = os.path.expanduser(
     os.environ.get("GEMINI_WORKDIR", "~/.pocket/gemini/workspace"))
+# 指定 CLI 用哪個模型(空字串 = 沿用 CLI 自己的預設,行為與本次改動前完全一致)。
+#
+# 為什麼需要這個把手:2026-10-09 追「Gemini 回覆很慢」—— 實測端到端 56s,
+# 機器空載且 ACP 行程常駐,所以不是冷啟。CLI stderr 顯示
+# `Attempt N failed. Retrying with backoff...`;而本機這把 API key 直打 HTTP 時,
+# gemini-2.5-* 一律回「This model is no longer available to new users」(快速 404),
+# gemini-3.5-flash 則回 200 且 server-timing 僅約 1.9s。
+# 若 CLI 預設模型落在 2.5 系,就會每次 404 → 退避重試 → 時間這樣被吃掉。
+# ⚠️ 換模型是**有機會**的解,尚未端到端證實(CLI 側量測互相矛盾,見 commit note)。
+# 原本整支 provider 沒有任何模型設定,連換都換不了 —— 先把把手補上。
+_MODEL = (os.environ.get("GEMINI_MODEL") or "").strip()
 
 
 class GeminiError(Exception):
@@ -219,14 +230,32 @@ class GeminiClient:
             env = dict(os.environ)
             env["GEMINI_API_KEY"] = cfg["api_key"]
             env.setdefault("GEMINI_CLI_TRUST_WORKSPACE", "true")
+            # CLI 會自我重啟一次(再 spawn 一個 node 並配「實體記憶體一半」的
+            # old-space;本機 128GB → 64GB)。實測 gemini --version:原樣 ~4.2s、
+            # 關掉重啟 ~2.5s;而「有重啟但不配大 heap」並沒有比較快 → 成本在
+            # 重啟本身(約 1.7s),不在 heap 大小。只影響 spawn,不影響每輪。
+            env.setdefault("GEMINI_CLI_NO_RELAUNCH", "1")
             os.makedirs(_DEFAULT_CWD, exist_ok=True)
-            stderr_to = asyncio.subprocess.DEVNULL
-            errlog = os.environ.get("GEMINI_STDERR_LOG")
-            if errlog:
-                stderr_to = open(errlog, "ab")
+            # CLI stderr 預設**丟 DEVNULL** —— 這正是「Gemini 很慢」難查的原因:
+            # CLI 的 `Attempt N failed. Retrying with backoff...` 全被丟掉,
+            # 56 秒看起來像憑空消失。改成預設寫進 state dir(仍可用
+            # GEMINI_STDERR_LOG 覆寫;設成 "off" 可回到丟棄)。
+            errlog = os.environ.get("GEMINI_STDERR_LOG",
+                                    os.path.join(_STATE_DIR, "cli-stderr.log"))
+            if errlog.lower() in ("off", "none", "devnull", ""):
+                stderr_to = asyncio.subprocess.DEVNULL
+            else:
+                try:
+                    os.makedirs(os.path.dirname(errlog) or ".", exist_ok=True)
+                    stderr_to = open(errlog, "ab")
+                except OSError:
+                    stderr_to = asyncio.subprocess.DEVNULL
+            argv = [gemini_bin(), "--acp"]
+            if _MODEL:
+                argv += ["-m", _MODEL]
             try:
                 self.proc = await asyncio.create_subprocess_exec(
-                    gemini_bin(), "--acp",
+                    *argv,
                     stdin=asyncio.subprocess.PIPE,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=stderr_to,
@@ -251,7 +280,10 @@ class GeminiClient:
                 await self._drop_proc()
                 raise
             self._log("gemini_connected",
-                      protocol=(self.server_info or {}).get("protocolVersion"))
+                      protocol=(self.server_info or {}).get("protocolVersion"),
+                      # 用了哪個模型要留痕:查「很慢」時第一個要問的就是這個,
+                      # 而原本日誌完全看不出來(空=沿用 CLI 預設)。
+                      model=_MODEL or "(cli-default)")
 
     async def _drop_proc(self):
         proc, self.proc = self.proc, None
