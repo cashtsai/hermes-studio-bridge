@@ -14064,7 +14064,7 @@ _CC_SHELL_RESET_POLLS = 5
 _CC_SHELL_CLEAR_TRIES = 4
 
 
-async def _cc_verify_submitted(name: str, probe: str, gen0: int,
+async def _cc_verify_submitted(name: str, probes, gen0: int,
                                pre_pane: str = "") -> dict:
     """送 Enter 之後回讀 pane,判定貼上的文字**到底有沒有被 CLI 收走**。
 
@@ -14086,10 +14086,17 @@ async def _cc_verify_submitted(name: str, probe: str, gen0: int,
     held_streak = 0
     pane = ""
     delay = _CC_VERIFY_SETTLE_SECS
-    squashed_probe = _cc_squash(probe)
+    if isinstance(probes, str):                      # 舊呼叫法相容
+        probes = [probes]
+    squashed_probes = [q for q in (_cc_squash(p) for p in probes) if q]
+
+    def _seen_in(hay: str) -> bool:
+        """頭尾任一探針出現就算看到(捲動時只有尾巴在畫面上)。"""
+        squashed = _cc_squash(hay)
+        return any(q in squashed for q in squashed_probes)
     # 重送同一句話時,舊那則的回顯還留在畫面上 —— 拿它當「這次送出了」的
     # 證據會再度變成假成功。貼上前畫面就有的字一律不計分。
-    stale_echo = bool(squashed_probe) and squashed_probe in _cc_squash(pre_pane)
+    stale_echo = bool(squashed_probes) and _seen_in(pre_pane)
     while True:
         await asyncio.sleep(delay)
         delay = _CC_VERIFY_POLL_SECS
@@ -14106,11 +14113,11 @@ async def _cc_verify_submitted(name: str, probe: str, gen0: int,
         # 抓到重複)。只要它已經出現在輸入框以外,就是收下了,絕不再補 Enter。
         # region is None(看不到輸入框)時不採信:分不出那段字是回顯還是被
         # overlay 蓋住的輸入框殘字。
-        if region is not None and squashed_probe and not stale_echo \
-                and squashed_probe in _cc_squash(body):
+        if region is not None and squashed_probes and not stale_echo \
+                and _seen_in(body):
             return {"state": "accepted", "reason": "echoed_in_pane",
                     "attempts": attempts, "pane": pane}
-        held = region is not None and squashed_probe in _cc_squash(region)
+        held = region is not None and _seen_in(region)
         if held:
             seen_in_composer = True
             held_streak += 1
@@ -14138,7 +14145,7 @@ async def _cc_verify_submitted(name: str, probe: str, gen0: int,
             if not _cc_pane_busy(pane):
                 await _tmux_run("send-keys", "-t", name, "Escape")
             _log_event("cc_paste_enter_retry", session=name,
-                       probe_chars=len(probe), attempt=attempts,
+                       probe_chars=sum(len(p) for p in probes), attempt=attempts,
                        escaped=not _cc_pane_busy(pane))
             await _tmux_run("send-keys", "-t", name, "Enter")
             continue
@@ -14257,10 +14264,15 @@ async def _cc_paste_text_locked(name: str, text: str) -> dict:
         _log_event("cc_paste_clear_warn", session=name,
                    rc=rc_clear, stderr=(e_clear or "")[:120])
 
-    probe = text[:24].strip()
-    if not probe:
+    # 頭 + 尾兩個探針(2026-10-10 治本):**長訊息會把輸入框捲動**,畫面上
+    # 只看得到尾巴 —— 只拿前 24 字去找,捲走之後永遠找不到,於是判「字沒卡在
+    # 框裡」,加上 pane 在忙就回 `queued` + 200。機主 07:28 那則(含附件註記
+    # 的長路徑)就是這樣被靜默吞掉:app 顯示「等待背景工作結果…」等到天荒
+    # 地老,訊息其實一直躺在輸入框裡。游標在尾端,所以尾巴一定看得到。
+    probes = [p for p in (text[:24].strip(), text[-24:].strip()) if p]
+    if not probes:
         return {"delivery": "accepted", "confirmed": False, "attempts": 0}
-    verdict = await _cc_verify_submitted(name, probe, gen0, pre_pane)
+    verdict = await _cc_verify_submitted(name, probes, gen0, pre_pane)
     pane = verdict.get("pane") or ""
     if verdict["state"] == "stranded":
         # 2026-07-14 草稿擱淺 / 2026-07-28 靜默掉訊息:重試耗盡文字還在框裡。
@@ -14275,7 +14287,7 @@ async def _cc_paste_text_locked(name: str, text: str) -> dict:
         _log_event("cc_input_not_accepted", session=name, stage="verify",
                    reason=verdict["reason"], attempts=verdict["attempts"],
                    text_chars=len(text), busy=_cc_pane_busy(pane),
-                   probe=_cc_squash(text[:24])[:48],
+                   probe=" | ".join(_cc_squash(p)[:48] for p in probes),
                    composer=_cc_squash(_cc_composer_region(pane) or "")[:120],
                    pane_tail=" | ".join(
                        l.strip() for l in pane.splitlines()[-4:] if l.strip())[:220])

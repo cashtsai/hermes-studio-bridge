@@ -291,6 +291,34 @@ class CCInputDeliveryTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(cm.exception.code, "CC_INPUT_NOT_ACCEPTED")
         self.assertIn("composer_missing", cm.exception.message)
 
+    async def test_scrolled_composer_is_detected_by_tail_probe(self):
+        """長訊息會把輸入框**捲動**,畫面上只剩尾巴 —— 只比對前 24 字就會
+        判成「字沒卡在框裡」,pane 又在忙 → 回 queued + 200 = 靜默吞訊息。
+
+        2026-10-10 機主實害:07:28 送出一則帶附件註記(長路徑)的訊息,app
+        顯示「等待背景工作結果…」等了近 20 分鐘,訊息其實一直躺在輸入框裡,
+        而 bridge 回的是 200。這條釘住「尾巴看得到就算還卡著」。
+        """
+        long_text = "剛剛我測試 gemini 成功回覆了,也回覆很快,現在幫我看一下列表樣式," \
+                    "請幫我做的跟其他一樣,然後也幫我檢查 gemini 對話欄內的功能" \
+                    "是否都能夠對比 cc cx 的功能把他補全"
+        # 捲動後的畫面:**開頭那段不在畫面上**,只有尾巴。
+        scrolled = "\n".join([
+            "  上一輪的回覆內容",
+            "✽ Fiddle-faddling… (0m 57s · ↓ 1.2k tokens)",
+            BORDER,
+            "❯ 請幫我做的跟其他一樣,然後也幫我檢查 gemini 對話欄內的功能",
+            "  是否都能夠對比 cc cx 的功能把他補全",
+            BORDER,
+            "  ⏵⏵ auto mode on",
+        ])
+        script = PaneScript([pane_idle_empty(), scrolled])
+        with patch.object(bridge, "_cc_capture_pane_fresh", script):
+            with self.assertRaises(bridge.HTTPException) as cm:
+                await bridge._cc_paste_text("s1", long_text)
+        self.assertEqual(cm.exception.status_code, 409,
+                         "字還卡在框裡卻回了 200 —— 這就是靜默吞訊息")
+
     async def test_never_rendered_while_busy_is_queued_not_success(self):
         """字沒出現在畫面、但 pane 確實在忙 → CLI 可能已收進自己的佇列,
         誠實回 queued/unconfirmed,但絕不宣稱 accepted。"""
