@@ -9286,10 +9286,26 @@ def _pair_local_only(request: Request) -> None:
     loopback」強得多,所以一併放行。`_pair_check_boot` 的 boot code 仍是真閘,
     本函式維持 defense-in-depth 第二層的定位。
 
-    安全性前提:`_client_host` 讀的是**真實 socket peer**(`request.client.host`),
-    不是 `X-Forwarded-For` —— 所以偽造不了來源 IP 來冒充 tailnet。
-    要退回舊行為:`POCKET_PAIR_ALLOW_TAILNET=0`。
+    ⚠️ **安全前提(2026-10-09 實測修正,原本我寫錯過一次)**:
+    `request.client.host` **不一定**是真實 socket peer。uvicorn 預設
+    `--proxy-headers` 開啟且信任 `127.0.0.1` 當 proxy,而 cloudflared 正是從
+    loopback 連進來 —— 所以 tunnel 流量的 `request.client` 會被 `X-Forwarded-For`
+    覆寫成**訪客 IP**。本機日誌實證:經 tunnel 的 `/console` 403 記到的 client 是
+    `150.117.155.2`(公網 v4)與公網 v6,不是 `127.0.0.1`。
+
+    因此**不能**只比對 IP 就放行 tailnet —— 若 uvicorn 取的是 XFF 最左那一段
+    (客戶端可控),公網訪客只要送 `X-Forwarded-For: 100.64.0.1` 就能冒充 tailnet。
+    不去賭 uvicorn 的取法,改成:**只要帶了任何轉送標頭就一律拒絕**。
+      ‧ 真正的 Tailscale 連線是直連 uvicorn,不會有 XFF → 放行
+      ‧ 經 cloudflared/Cloudflare 的一定會有 XFF → 拒絕(攻擊者無法移除)
+    語意也更誠實:這道門要的是「**直連**且來自 loopback 或 tailnet」。
+
+    要退回舊行為:`POCKET_PAIR_ALLOW_TAILNET=0`(只認 loopback,且同樣擋轉送)。
     """
+    # 任一轉送標頭存在 = 這不是直連,來源 IP 不可信 → 直接擋。
+    for h in ("x-forwarded-for", "forwarded", "cf-connecting-ip", "x-real-ip"):
+        if request.headers.get(h):
+            raise HTTPException(status_code=403, detail="local only")
     host = _client_host(request)
     if host in ("127.0.0.1", "::1", "localhost"):
         return
