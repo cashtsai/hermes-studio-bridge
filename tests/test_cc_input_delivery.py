@@ -190,6 +190,34 @@ class CCInputDeliveryTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("composer_stuck", cm.exception.message)
 
     # ── 2. 重試後成功 → 回 200 ──────────────────────────────────────────
+    async def test_enter_retry_escapes_completion_popup_first(self):
+        """含路徑的指令會跳出自動完成選單,**Enter 被選單吃掉** —— 補 Enter
+        之前要先 Escape 關掉它。2026-10-09 實機:`!date` 正常、含路徑的全失敗,
+        reason=composer_stuck/attempts=4;Escape 之後 Enter 立刻送出。"""
+        # 不忙(沒有 spinner)但字卡在框裡 = 選單吃掉 Enter 的現場。
+        script = PaneScript([pane_idle_empty(), pane_holding_wrapped(),
+                             pane_holding_wrapped(), pane_echoed(busy=False)])
+        with patch.object(bridge, "_cc_capture_pane_fresh", script):
+            r = await bridge._cc_paste_text("s1", TEXT)
+        keys = [c.args[3] for c in self.tmux.call_args_list
+                if len(c.args) >= 4 and c.args[0] == "send-keys"]
+        # Escape 必須排在補送的那個 Enter 前面
+        self.assertIn("Escape", keys)
+        self.assertLess(keys.index("Escape"), len(keys) - 1)
+        self.assertEqual(keys[keys.index("Escape") + 1], "Enter")
+        self.assertTrue(r["confirmed"])
+
+    async def test_no_escape_while_pane_is_busy(self):
+        """pane 在跑回合時 Escape = 中斷那個回合 —— 絕對不准送。"""
+        script = PaneScript([pane_idle_empty(), pane_busy_holding(),
+                             pane_busy_holding()])
+        with patch.object(bridge, "_cc_capture_pane_fresh", script):
+            with self.assertRaises(bridge.HTTPException):
+                await bridge._cc_paste_text("s1", TEXT)
+        keys = [c.args[3] for c in self.tmux.call_args_list
+                if len(c.args) >= 4 and c.args[0] == "send-keys"]
+        self.assertNotIn("Escape", keys)
+
     async def test_retry_then_accepted(self):
         script = PaneScript([
             pane_idle_empty(),          # pre-check
