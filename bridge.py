@@ -13914,6 +13914,18 @@ def _cc_composer_region(pane: str) -> str | None:
     return _cc_composer_split(pane)[1]
 
 
+def _cc_composer_is_empty(pane: str) -> bool:
+    """輸入框裡除了提示符之外還有沒有字。看不到輸入框時保守回 False
+    (不知道 = 不要當成清乾淨了)。"""
+    region = _cc_composer_region(pane)
+    if region is None:
+        return False
+    body = region
+    for mark in _CC_COMPOSER_MARKS:
+        body = body.replace(mark, "")
+    return not body.strip()
+
+
 def _cc_shell_mode(pane: str) -> bool:
     """輸入框是不是停在 shell 模式(提示符 `!` 而不是 `\u276f`)。
 
@@ -13953,6 +13965,8 @@ _CC_IDLE_REGRASP_SECS = 1.5
 # 退出 shell 模式之後等重畫:0.2s × 5 = 1s 預算(實機一次重畫 ~100-300ms)。
 _CC_SHELL_RESET_POLL_SECS = 0.2
 _CC_SHELL_RESET_POLLS = 5
+# 退出 shell 模式前要先把框清空,折行的殘字一次 C-u 清不完 —— 最多清幾次。
+_CC_SHELL_CLEAR_TRIES = 4
 
 
 async def _cc_verify_submitted(name: str, probe: str, gen0: int,
@@ -14087,7 +14101,22 @@ async def _cc_paste_text_locked(name: str, text: str) -> dict:
     # C-u 清殘字 + BSpace(空框再退一格就離開 shell 模式)。
     # **刻意不用 Esc** —— Esc 會中斷進行中的回合。
     if not text.lstrip().startswith("!") and _cc_shell_mode(pre_pane):
-        await _tmux_run("send-keys", "-t", name, "C-u")
+        # ⚠️ 第三層(2026-10-09 機主實害第二輪):**框裡有殘字時退不出去**。
+        # 當時 Pocket-branch 卡著一段折成兩行的舊 `!` 指令,連續 4 次
+        # `cc_shell_mode_reset {recovered: false}` —— 因為 `C-u` 只清一行,
+        # 框沒空 `BSpace` 就只是刪一個字,模式當然退不掉,那條 session 從此
+        # 一則訊息都送不進去。所以要**清到真的空為止**才退。
+        #
+        # 先 Escape:殘字若帶路徑,路徑自動完成選單可能開著,擋住後續按鍵。
+        # (Escape 只在 pane 不忙時送 —— 忙的時候它會中斷回合。)
+        if not _cc_pane_busy(pre_pane):
+            await _tmux_run("send-keys", "-t", name, "Escape")
+        for _ in range(_CC_SHELL_CLEAR_TRIES):
+            await _tmux_run("send-keys", "-t", name, "C-u")
+            await asyncio.sleep(_CC_SHELL_RESET_POLL_SECS)
+            pre_pane = await _cc_capture_pane_fresh(name)
+            if _cc_composer_is_empty(pre_pane):
+                break
         await _tmux_run("send-keys", "-t", name, "BSpace")
         # 退出之後要**等 TUI 重畫完**再判定。2026-10-09 實機:立刻回讀會讀到
         # 還沒重畫的舊畫面 → recovered=false → 回一個假的 409,使用者看到紅字
