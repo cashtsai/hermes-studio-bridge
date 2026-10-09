@@ -110,6 +110,7 @@
     $("files-view").classList.toggle("hidden", mode !== "files");
     const mv = $("memory-view"); if (mv) mv.classList.toggle("hidden", mode !== "memory");
     const cv = $("changes-view"); if (cv) cv.classList.toggle("hidden", mode !== "changes");
+    const tv = $("term-view"); if (tv) tv.classList.toggle("hidden", mode !== "term");
     if (mode === "files" && !booted) { booted = true; navigate(""); }
     if (window.PocketConsoleMode.onMode) window.PocketConsoleMode.onMode(mode);
   }

@@ -12,6 +12,7 @@ const state = {
   cards: [],          // 目前 session 的卡片
   latestSeq: 0,
   stopStream: null,   // 當前 session SSE 的中止函式
+  atts: [],           // 待送附件 [{kind,filename,mime,data}]
 };
 
 // ───────────────────────── bootstrap(取得 token)─────────────────────────
@@ -109,6 +110,7 @@ async function openSession(id) {
   state.current = id;
   state.cards = []; state.latestSeq = 0;
   renderSessions([]);                      // 重畫 active 標記
+  writeHash(id);                           // 深連結:可加書籤 / 重整不掉頁
   $("stream-head").classList.remove("hidden");
   $("composer").classList.remove("hidden");
   const s = state.sessions.find((x) => x.id === id) || {};
@@ -280,15 +282,18 @@ function updateStatusChip(phase, meta) {
 
 // ───────────────────────── 送出 / 中斷 ─────────────────────────
 async function sendInput(text) {
-  if (!state.current || !text.trim()) return;
+  if (!state.current) return;
+  if (!text.trim() && !state.atts.length) return;
   const cid = (crypto.randomUUID ? crypto.randomUUID() : String(Date.now()));
   try {
     const r = await api("/app/v2/sessions/" + encodeURIComponent(state.current) + "/input", {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ content: text, client_id: cid }),
+      body: JSON.stringify(Object.assign({ content: text, client_id: cid },
+        state.atts.length ? { attachments: state.atts } : {})),
     });
     if (!r.ok) { const e = await r.json().catch(() => ({})); throw new Error((e.error && e.error.message) || ("HTTP " + r.status)); }
     $("input").value = ""; autosize();
+    state.atts = []; renderAtts();
   } catch (err) { toast("送出失敗:" + err.message); }
 }
 
@@ -323,6 +328,25 @@ function autosize() {
 function wire() {
   $("refresh").addEventListener("click", loadSessions);
   $("awaiting").addEventListener("click", jumpToAwaiting);
+  $("newsess-open").addEventListener("click", () => $("newsess").classList.remove("hidden"));
+  $("newsess-cancel").addEventListener("click", () => $("newsess").classList.add("hidden"));
+  $("newsess-go").addEventListener("click", createSession);
+  $("pal-q").addEventListener("input", (e) => renderPalette(e.target.value));
+  $("palette").addEventListener("click", (e) => { if (e.target.id === "palette") closePalette(); });
+  wireKeys();
+  $("attach").addEventListener("click", () => $("file-pick").click());
+  $("file-pick").addEventListener("change", (e) => { addFiles(e.target.files); e.target.value = ""; });
+  const dz = $("stream");
+  dz.addEventListener("dragover", (e) => { e.preventDefault(); dz.classList.add("dropping"); });
+  dz.addEventListener("dragleave", () => dz.classList.remove("dropping"));
+  dz.addEventListener("drop", (e) => {
+    e.preventDefault(); dz.classList.remove("dropping");
+    if (state.current) addFiles(e.dataTransfer.files);
+  });
+  $("input").addEventListener("paste", (e) => {
+    const f = Array.from(e.clipboardData.files || []);
+    if (f.length) { e.preventDefault(); addFiles(f); }   // 直接貼截圖
+  });
   $("interrupt").addEventListener("click", interrupt);
   $("composer").addEventListener("submit", (e) => { e.preventDefault(); sendInput($("input").value); });
   $("input").addEventListener("input", autosize);
@@ -331,10 +355,148 @@ function wire() {
   });
 }
 
+
+// ───────────────────────── P1:深連結(可加書籤)─────────────────────────
+// #session=<id> —— 把常用的工作釘成書籤,開筆電直接進去;重新整理也不會掉回首頁。
+function hashSession() {
+  const m = /(?:^|&)session=([^&]+)/.exec(location.hash.slice(1));
+  return m ? decodeURIComponent(m[1]) : null;
+}
+function writeHash(id) {
+  const next = id ? "#session=" + encodeURIComponent(id) : "";
+  if (location.hash !== next) history.replaceState(null, "", location.pathname + location.search + next);
+}
+
+// ───────────────────────── P1:鍵盤操作(筆電的本體優勢)──────────────────
+// ⌘K 快速切 session / j·k 上下移動 / a·d 核准·否決 / ⌘↵ 送出(既有)
+// 刻意不攔在輸入框裡打字的狀況 —— 只有焦點不在 input/textarea 時才作用。
+function typingNow() {
+  const t = document.activeElement;
+  return t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable);
+}
+function moveSelection(delta) {
+  const ids = state.sessions.map((s) => s.id);
+  if (!ids.length) return;
+  const i = ids.indexOf(state.current);
+  const next = ids[Math.max(0, Math.min(ids.length - 1, (i < 0 ? 0 : i + delta)))];
+  if (next && next !== state.current) openSession(next);
+}
+function firstApprovalButton(wantYes) {
+  const btns = Array.from($("ap-actions").querySelectorAll("button"));
+  if (!btns.length) return null;
+  const hit = btns.find((b) => b.classList.contains(wantYes ? "ap-yes" : "ap-no"));
+  return hit || (wantYes ? btns[0] : btns[btns.length - 1]);
+}
+function wireKeys() {
+  document.addEventListener("keydown", (e) => {
+    if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
+      e.preventDefault(); openPalette(); return;
+    }
+    if (e.key === "Escape") { closePalette(); return; }
+    if (typingNow()) return;
+    if (e.key === "j") { e.preventDefault(); moveSelection(1); }
+    else if (e.key === "k") { e.preventDefault(); moveSelection(-1); }
+    else if (e.key === "a" || e.key === "d") {
+      const b = firstApprovalButton(e.key === "a");
+      if (b && !b.disabled) { e.preventDefault(); b.click(); }
+    }
+  });
+}
+
+// ⌘K 快速切換面板
+function openPalette() {
+  const p = $("palette");
+  p.classList.remove("hidden");
+  const q = $("pal-q"); q.value = ""; renderPalette(""); q.focus();
+}
+function closePalette() { $("palette").classList.add("hidden"); }
+function renderPalette(q) {
+  const needle = q.trim().toLowerCase();
+  const hits = state.sessions.filter((s) =>
+    !needle || (s.title || s.id).toLowerCase().includes(needle) ||
+    (s.provider || "").toLowerCase().includes(needle)).slice(0, 12);
+  $("pal-list").innerHTML = hits.length
+    ? hits.map((s, i) => '<div class="pal-item' + (i === 0 ? " sel" : "") +
+        '" data-id="' + esc(s.id) + '"><span class="pill">' +
+        esc(PROVIDER_LABEL[s.provider] || s.provider || "") + "</span>" +
+        esc(s.title || s.id) + "</div>").join("")
+    : '<div class="empty">沒有符合的 session</div>';
+  $("pal-list").querySelectorAll(".pal-item").forEach((n) =>
+    n.addEventListener("click", () => { closePalette(); openSession(n.dataset.id); }));
+}
+
+// ───────────────────────── P1:開新工作 ─────────────────────────
+async function createSession() {
+  const kind = $("new-kind").value;
+  const name = $("new-name").value.trim();
+  const wd = $("new-dir").value.trim();
+  if (kind === "cc" && !name) { toast("CC 需要 session 名稱"); return; }
+  try {
+    if (kind === "cc") {
+      const r = await api("/ccsessions", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name, workdir: wd }),
+      });
+      if (!r.ok) throw new Error("HTTP " + r.status);
+    } else {
+      const r = await api("/codexsessions", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text: name || "新工作", cwd: wd || undefined }),
+      });
+      if (!r.ok) throw new Error("HTTP " + r.status);
+    }
+    toast("已開新工作");
+    $("newsess").classList.add("hidden");
+    $("new-name").value = ""; $("new-dir").value = "";
+    setTimeout(loadSessions, 600);     // 給 bridge 一點時間把它登記進列表
+  } catch (err) { toast("開新工作失敗:" + err.message); }
+}
+
+
+// ───────────────────────── P1:附件 ─────────────────────────
+// input 的 attachments 直接收 {kind,filename,mime,data(dataURI)} —— 所以
+// **不需要碰 multipart 上傳端點**,瀏覽器讀成 data URI 就能送。
+// 代價是整包塞進 JSON body,所以設上限;大檔請用檔案瀏覽面的路徑引用。
+const ATT_MAX_BYTES = 8 * 1024 * 1024;
+
+function attKind(mime) {
+  if (!mime) return "file";
+  if (mime.startsWith("image/")) return "image";
+  if (mime.startsWith("video/")) return "video";
+  if (mime.startsWith("audio/")) return "audio";
+  return "file";
+}
+
+function addFiles(files) {
+  Array.from(files || []).forEach((f) => {
+    if (f.size > ATT_MAX_BYTES) { toast(f.name + " 超過 8MB,改用檔案路徑引用"); return; }
+    const fr = new FileReader();
+    fr.onload = () => {
+      state.atts.push({ kind: attKind(f.type), filename: f.name,
+                        mime: f.type || "application/octet-stream", data: fr.result });
+      renderAtts();
+    };
+    fr.onerror = () => toast("讀取 " + f.name + " 失敗");
+    fr.readAsDataURL(f);
+  });
+}
+
+function renderAtts() {
+  const box = $("atts");
+  box.classList.toggle("hidden", !state.atts.length);
+  box.innerHTML = state.atts.map((a, i) =>
+    '<span class="att">' + esc(a.filename) +
+    '<button class="att-x" data-i="' + i + '" title="移除">×</button></span>').join("");
+  box.querySelectorAll(".att-x").forEach((b) =>
+    b.addEventListener("click", () => { state.atts.splice(Number(b.dataset.i), 1); renderAtts(); }));
+}
+
 async function main() {
   wire();
   if (!(await bootstrap())) return;
   await loadSessions();
+  const want = hashSession();              // 深連結:帶 #session= 就直接開
+  if (want && state.sessions.some((s) => s.id === want)) openSession(want);
   // 全域 SSE:任何 session 狀態變動都刷新列表(無 410 問題,見規格)
   sseStream("/app/v2/events?follow=true&since_seq=0", state.token, {
     onEvent: () => { /* 去抖:每次事件觸發輕量刷新 */ scheduleListRefresh(); },

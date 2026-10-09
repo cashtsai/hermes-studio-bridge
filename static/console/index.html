@@ -14,6 +14,7 @@
       <button class="mode-btn active" data-mode="agents">Agents</button>
       <button class="mode-btn" data-mode="files">檔案</button>
       <button class="mode-btn" data-mode="changes">變更</button>
+      <button class="mode-btn" data-mode="term">終端機</button>
       <button class="mode-btn" data-mode="memory">記憶</button>
     </nav>
     <button id="awaiting" class="awaiting hidden" title="有 session 在等你放行">
@@ -27,6 +28,7 @@
     <aside id="sidebar">
       <div class="side-head">
         <span>Sessions</span>
+        <button id="newsess-open" class="icon-btn" title="開新工作">＋</button>
         <button id="refresh" class="icon-btn" title="重新整理">↻</button>
       </div>
       <div id="session-list"><div class="empty">載入中…</div></div>
@@ -49,7 +51,10 @@
         <div id="ap-actions" class="ap-actions"></div>
       </div>
       <div id="cards"><div class="placeholder">← 從左邊選一條 session</div></div>
+      <div id="atts" class="atts hidden"></div>
       <form id="composer" class="composer hidden">
+        <input id="file-pick" type="file" multiple class="hidden-input">
+        <button id="attach" class="btn-ghost" type="button" title="附加檔案（也可拖放或貼上）">📎</button>
         <textarea id="input" rows="1" placeholder="送到這條 session…（⌘/Ctrl+Enter 送出）"></textarea>
         <button id="send" class="btn btn-primary" type="submit">送出</button>
       </form>
@@ -80,6 +85,22 @@
     </div>
   </section>
 
+  <!-- 終端機(PTY over WebSocket) -->
+  <section id="term-view" class="hidden">
+    <div class="tm-bar">
+      <input id="tm-name" class="mem-input tm-name" value="console"
+             title="tmux session 名稱 —— 帶同一個名字重連就接回同一條 shell">
+      <button id="tm-connect" class="btn btn-primary">連線</button>
+      <button id="tm-clear" class="btn-ghost" title="清畫面（不影響遠端）">清除</button>
+      <span id="tm-status" class="tm-status bad">未連線</span>
+    </div>
+    <pre id="tm-out" class="tm-out"></pre>
+    <div class="tm-inbar">
+      <input id="tm-in" class="tm-in" placeholder="輸入指令後按 Enter（Ctrl+C 中斷、Tab 補全）" autocomplete="off" spellcheck="false">
+    </div>
+    <div class="tm-note">全螢幕 TUI（vim／tmux 內層）不會正確顯示 —— 這一頁是給跑指令和看 log 用的。</div>
+  </section>
+
   <!-- 記憶檢索模式 -->
   <section id="memory-view" class="hidden">
     <div class="mem-bar">
@@ -93,12 +114,46 @@
     <div id="mem-results" class="mem-results"><div class="placeholder">輸入關鍵字，跨所有 session 找「當時做了什麼、改了哪、結論是什麼」</div></div>
   </section>
 
+  <!-- ⌘K 快速切換 -->
+  <div id="palette" class="palette hidden">
+    <div class="pal-box">
+      <input id="pal-q" class="pal-q" placeholder="切換 session…（↑↓ 選，Enter 開，Esc 關）" autocomplete="off">
+      <div id="pal-list" class="pal-list"></div>
+    </div>
+  </div>
+
+  <!-- 開新工作 -->
+  <div id="newsess" class="palette hidden">
+    <div class="pal-box ns-box">
+      <div class="ns-row">
+        <label for="new-kind">類型</label>
+        <select id="new-kind" class="mem-sel">
+          <option value="cc">Claude Code</option>
+          <option value="cx">Codex</option>
+        </select>
+      </div>
+      <div class="ns-row">
+        <label for="new-name">名稱／任務</label>
+        <input id="new-name" class="mem-input" placeholder="CC 是 session 名；CX 是第一句任務">
+      </div>
+      <div class="ns-row">
+        <label for="new-dir">工作目錄</label>
+        <input id="new-dir" class="mem-input" placeholder="留空 = 預設 home">
+      </div>
+      <div class="ns-actions">
+        <button id="newsess-cancel" class="btn-ghost">取消</button>
+        <button id="newsess-go" class="btn btn-primary">開始</button>
+      </div>
+    </div>
+  </div>
+
   <div id="toast" class="toast hidden"></div>
 </div>
 <script src="/console/static/sse.js"></script>
 <script src="/console/static/app.js"></script>
 <script src="/console/static/filebrowser.js"></script>
 <script src="/console/static/changes.js"></script>
+<script src="/console/static/terminal.js"></script>
 <script src="/console/static/memory.js"></script>
 </body>
 </html>
