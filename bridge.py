@@ -20090,20 +20090,41 @@ async def gemini_config_get(request: Request):
     _check_auth(request)
     cfg = gemini_provider.load_config()
     return {"configured": GEMINI.configured(), "source": cfg["source"],
-            "key_set": bool(cfg["api_key"])}
+            "key_set": bool(cfg["api_key"]),
+            # 模型:空字串 = 沿用 CLI 預設。**全域**(是 CLI 的 spawn 參數,整個
+            # provider 共用一個 ACP 行程)—— app 要照這個語意標示,不可做成
+            # per-session 的樣子。`model_source == "env"` 時選擇器要唯讀:env
+            # 優先,寫檔蓋不過去,不先講會變成「改了沒反應」。
+            "model": cfg["model"], "model_source": cfg["model_source"],
+            "model_scope": "global"}
 
 
 @app.put("/app/v1/gemini/config")
 async def gemini_config_put(request: Request):
-    """App「進階」頁寫入 API key(0600 落檔;env 有值時 env 仍優先)。"""
+    """App「進階」頁/設定面板寫入 API key 與模型(0600 落檔;env 仍優先)。
+
+    兩個欄位都是**選填**,只帶一個就只改一個(`save_config` 合併寫入)——
+    設定面板只改模型時不可以把 key 洗掉。
+    """
     _check_auth(request)
     body = await request.json()
-    cfg = gemini_provider.save_config(str(body.get("api_key") or ""))
-    await GEMINI._drop_proc()   # 讓下一次呼叫以新 key 重新握手
+    has_key = "api_key" in body
+    has_model = "model" in body
+    if not has_key and not has_model:
+        raise http_err(400, "EMPTY", "api_key 與 model 至少要帶一個")
+    cfg = gemini_provider.save_config(
+        str(body.get("api_key") or "") if has_key else None,
+        str(body.get("model") or "") if has_model else None)
+    # 模型是 spawn 參數,改了一定要重新握手才生效(同改 key 的路徑)。
+    await GEMINI._drop_proc()
     _log_event("gemini_config_updated", configured=GEMINI.configured(),
-               source=cfg["source"])
+               source=cfg["source"], model=cfg["model"] or "(cli-default)",
+               changed=",".join([k for k, v in (("api_key", has_key),
+                                                ("model", has_model)) if v]))
     return {"ok": True, "configured": GEMINI.configured(),
-            "source": cfg["source"]}
+            "source": cfg["source"],
+            "model": cfg["model"], "model_source": cfg["model_source"],
+            "model_scope": "global"}
 
 
 def _dashboard_active_provider() -> str:
