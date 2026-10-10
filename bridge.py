@@ -14083,6 +14083,31 @@ _CC_CLEAR_MAX_KEYS = 2000
 # 只是回讀到還沒重畫的舊畫面」。加碼等待比加輪數便宜(空框時仍然零成本)。
 _CC_CLEAR_WAIT_STEP_SECS = 0.1
 
+# 輸入框裡的**灰字**(SGR 2 dim)是 Claude Code 記著的「上一則沒送出的草稿」
+# 提示,**不是**框裡真的有字:BSpace 刪不掉(框本來就是空的),而 `capture-pane`
+# 的純文字畫面上它跟真殘字長得一模一樣。
+#
+# 2026-10-10 機主實害:Pocket-branch 整條線一則都送不進去、重試也沒用。現場
+# `capture-pane -pe` 是 `ESC[39m❯ ESC[2m把 gateway.shan.house 那兩個 preset…`
+# —— 灰的。打一個字進去,整行灰字就被取代(= 框真的是空的);刪掉那個字,
+# 灰字又回來。於是「清框」永遠失敗,而清框失敗一律 409 的新守門把**每一則**
+# 都擋掉了。框線走的是 256 色灰(`38;5;244`)不是 dim,所以只剪 dim 不會把
+# 輸入框的邊界剪掉。
+_CC_DIM_RUN_RE = re.compile(r"\x1b\[2m.*?(?:\x1b\[(?:0|22)m|$)", re.M)
+_CC_ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]"
+                         r"|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
+
+
+async def _cc_ghostless_pane(name: str) -> str | None:
+    """帶色碼抓一次畫面,**剪掉灰字草稿提示**後回純文字畫面(抓不到回 None)。
+
+    判「輸入框到底空不空」只能用這個視圖 —— 純文字畫面分不出真殘字和灰字。
+    """
+    rc, pane, _ = await _tmux_run("capture-pane", "-pe", "-t", name)
+    if rc or not pane:
+        return None
+    return _CC_ANSI_RE.sub("", _CC_DIM_RUN_RE.sub("", pane))
+
 
 async def _cc_force_clear_composer(name: str, pane: str):
     """把輸入框清到空,回 (清乾淨了嗎, 最新畫面)。
@@ -14098,12 +14123,21 @@ async def _cc_force_clear_composer(name: str, pane: str):
     看不到輸入框(啟動中的信任對話框、全螢幕 overlay…)時**立刻放棄且不送
     任何鍵** —— 往對話框裡盲打幾十顆 BSpace 等於替機主亂按。
     """
+    # 快路徑:純文字畫面就說是空的 → 收工,零 tmux 呼叫。
+    if _cc_composer_is_empty(pane):
+        return True, pane
     escaped = False
     for attempt in range(_CC_CLEAR_ROUNDS):
-        region = _cc_composer_region(pane)
+        # 看起來有殘字 —— 先用剪掉灰字的視圖問一次「是不是其實空的」。
+        # 刪完一輪之後灰字會再冒出來(刪到空就顯示草稿提示),所以**每一輪**
+        # 都要用這個視圖判定,不能只在第一輪問。
+        view = await _cc_ghostless_pane(name)
+        if view is None:
+            view = pane
+        region = _cc_composer_region(view)
         if region is None:
             return False, pane
-        if _cc_composer_is_empty(pane):
+        if _cc_composer_is_empty(view):
             return True, pane
         # 殘字帶路徑時,路徑自動完成選單可能開著:它會把刪掉的字補回來
         # (越刪越多),選單本身又畫在輸入框裡,怎麼讀都不是空的。先 Escape
@@ -14116,7 +14150,10 @@ async def _cc_force_clear_composer(name: str, pane: str):
         await asyncio.sleep(_CC_SHELL_RESET_POLL_SECS
                             + attempt * _CC_CLEAR_WAIT_STEP_SECS)
         pane = await _cc_capture_pane_fresh(name)
-    return _cc_composer_is_empty(pane), pane
+    # 判死前最後一次也要用剪掉灰字的視圖 —— 不然「刪乾淨了但草稿提示冒出來」
+    # 會被判成清不掉,整條線就再也送不進東西(就是上面那筆實害)。
+    final = await _cc_ghostless_pane(name)
+    return _cc_composer_is_empty(final if final is not None else pane), pane
 
 
 async def _cc_verify_submitted(name: str, probes, gen0: int,
