@@ -444,11 +444,18 @@ class CCInputDeliveryTest(unittest.IsolatedAsyncioTestCase):
         with patch.object(bridge, "_cc_capture_pane_fresh", script):
             r = await bridge._cc_paste_text("s1", TEXT)
         self.assertTrue(r["confirmed"])
-        keys = [c.args[3] for c in self.tmux.call_args_list
-                if len(c.args) >= 4 and c.args[0] == "send-keys"]
-        self.assertIn("BSpace", keys)
-        self.assertGreaterEqual(keys[:keys.index("BSpace")].count("C-u"), 2,
-                                "殘字要清到空才准退出 shell 模式")
+        calls = [c.args for c in self.tmux.call_args_list if c.args and c.args[0] == "send-keys"]
+        # 逐字刪(`-N <n> BSpace`)—— 2026-10-10 實測:C-u 清不掉多行殘字,
+        # C-u+BSpace 交替會誤觸自動建議把字補回來,只有逐字刪可靠。
+        bulk = [a for a in calls if "-N" in a and a[-1] == "BSpace"]
+        self.assertTrue(bulk, "殘字沒有被逐字刪掉 —— 又改回 C-u 了?")
+        # 刪的次數要照輸入框字數給,不能只刪一兩下交差
+        self.assertGreater(int(bulk[0][bulk[0].index("-N") + 1]), 20)
+        # 清空之後才准送退出 shell 模式的那一下 BSpace
+        plain_bspace = [i for i, a in enumerate(calls) if a[-1] == "BSpace" and "-N" not in a]
+        self.assertTrue(plain_bspace, "沒有送退出 shell 模式的 BSpace")
+        self.assertGreater(plain_bspace[-1], calls.index(bulk[0]),
+                           "要先清空再退出,順序不能顛倒")
 
     def test_composer_is_empty_detects_residue(self):
         empty = "\n".join([BORDER, "!\u00a0", BORDER])

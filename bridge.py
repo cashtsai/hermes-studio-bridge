@@ -14062,6 +14062,30 @@ _CC_SHELL_RESET_POLL_SECS = 0.2
 _CC_SHELL_RESET_POLLS = 5
 # 退出 shell 模式前要先把框清空,折行的殘字一次 C-u 清不完 —— 最多清幾次。
 _CC_SHELL_CLEAR_TRIES = 4
+# 逐字刪的輪數與單輪上限(照輸入框字數算,上限擋住畫面解析異常時的暴走)。
+_CC_CLEAR_ROUNDS = 3
+_CC_CLEAR_MAX_KEYS = 2000
+
+
+async def _cc_force_clear_composer(name: str, pane: str):
+    """把輸入框清到空,回 (清乾淨了嗎, 最新畫面)。
+
+    2026-10-10 在機主兩條卡死的 session 上實測三種手法:
+      ‧ `C-u`              → 只清游標那一行,**多行殘字清不掉**(FLiPER 連按 6 次無效)
+      ‧ `C-u`+`BSpace` 交替 → 會誤觸自動建議**把字補回來**,越清越多
+      ‧ `BSpace` ×N 逐字刪  → 唯一可靠
+    所以逐字刪:照輸入框目前的字數算次數(多給一點餘裕),重讀畫面確認,
+    最多幾輪。空框時**一顆鍵都不送、也不多抓一次畫面**,正常送出零成本。
+    """
+    for _ in range(_CC_CLEAR_ROUNDS):
+        if _cc_composer_is_empty(pane):
+            return True, pane
+        region = _cc_composer_region(pane) or ""
+        n = min(len(region) + 16, _CC_CLEAR_MAX_KEYS)
+        await _tmux_run("send-keys", "-t", name, "-N", str(n), "BSpace")
+        await asyncio.sleep(_CC_SHELL_RESET_POLL_SECS)
+        pane = await _cc_capture_pane_fresh(name)
+    return _cc_composer_is_empty(pane), pane
 
 
 async def _cc_verify_submitted(name: str, probes, gen0: int,
@@ -14213,12 +14237,7 @@ async def _cc_paste_text_locked(name: str, text: str) -> dict:
         # (Escape 只在 pane 不忙時送 —— 忙的時候它會中斷回合。)
         if not _cc_pane_busy(pre_pane):
             await _tmux_run("send-keys", "-t", name, "Escape")
-        for _ in range(_CC_SHELL_CLEAR_TRIES):
-            await _tmux_run("send-keys", "-t", name, "C-u")
-            await asyncio.sleep(_CC_SHELL_RESET_POLL_SECS)
-            pre_pane = await _cc_capture_pane_fresh(name)
-            if _cc_composer_is_empty(pre_pane):
-                break
+        _, pre_pane = await _cc_force_clear_composer(name, pre_pane)
         await _tmux_run("send-keys", "-t", name, "BSpace")
         # 退出之後要**等 TUI 重畫完**再判定。2026-10-09 實機:立刻回讀會讀到
         # 還沒重畫的舊畫面 → recovered=false → 回一個假的 409,使用者看到紅字
@@ -14236,6 +14255,14 @@ async def _cc_paste_text_locked(name: str, text: str) -> dict:
             raise http_err(409, "CC_INPUT_NOT_ACCEPTED",
                            "composer stuck in shell mode",
                            _CC_NOT_ACCEPTED_HINT["shell_mode_stuck"])
+
+    # 貼上前**確定輸入框是空的**(2026-10-10 治本)。原本只送一次 C-u 當清場,
+    # 但 C-u 清不掉多行殘字 —— 上一則送失敗留下的字就會跟這一則黏在一起,
+    # 或是把驗證搞糊塗。空框時這一步零成本(不送鍵、不多抓畫面)。
+    cleared, pre_pane = await _cc_force_clear_composer(name, pre_pane)
+    if not cleared:
+        _log_event("cc_composer_clear_failed", session=name,
+                   composer=_cc_squash(_cc_composer_region(pre_pane) or "")[:120])
 
     gen0 = _CC_TURN_GEN.get(name, 0)
     buf = "pa-" + uuid.uuid4().hex[:8]
