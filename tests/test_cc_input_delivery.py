@@ -62,6 +62,17 @@ def pane_idle_empty():
     return "\n".join(["  上一輪的回覆內容", BORDER, "❯ ", BORDER, "  ⏵⏵ auto mode on"])
 
 
+def pane_ghost_draft(text="把 gateway.shan.house 那兩個 preset 清掉", colored=False):
+    """輸入框**其實是空的**,畫面上那行是 CC 記著的「上一則沒送出的草稿」提示
+    (灰字 SGR 2)。`colored=True` 是 `capture-pane -pe` 看到的樣子 —— 只有帶
+    色碼的那份分得出灰字;純文字那份跟真殘字長得一模一樣。
+    框線走 256 色灰(38;5;244)不是 dim,剪 dim 不可以把它剪掉。"""
+    body = f"❯ \x1b[2m{text}\x1b[0m" if colored else f"❯ {text}"
+    border = f"\x1b[38;5;244m{BORDER}\x1b[39m" if colored else BORDER
+    return "\n".join(["  上一輪的回覆內容", border, body, border,
+                      "  ⏵⏵ auto mode on"])
+
+
 def pane_echoed(text=TEXT, busy=True):
     """送出成功:字進了 transcript,輸入框空了。"""
     lines = ["  上一輪的回覆內容", f"> {text}"]
@@ -229,6 +240,29 @@ class CCInputDeliveryTest(unittest.IsolatedAsyncioTestCase):
         bspaces = [c for c in self.tmux.call_args_list
                    if len(c.args) >= 5 and c.args[-1] == "BSpace"]
         self.assertGreaterEqual(len(bspaces), 3, "逐字刪不夠有耐心")
+
+    async def test_ghost_draft_is_not_residue(self):
+        """2026-10-10 機主實害(上一刀的回火):Pocket-branch 整條線一則都送不
+        進去。現場 `capture-pane -pe` 是 `❯ ESC[2m把 gateway…` —— **灰字**,
+        是 CC 記著的「上一則沒送出的草稿」提示,框本身是空的(打一個字進去
+        整行就被取代)。純文字畫面分不出來 → 清框永遠「失敗」→ 清框失敗一律
+        409 的守門把每一則都擋掉。灰字不是殘字,必須照常送出。"""
+        colored = pane_ghost_draft(colored=True)
+
+        async def tmux(*args, **kwargs):
+            if args and args[0] == "capture-pane":      # -pe 帶色碼那次
+                return (0, colored, "")
+            return (0, "", "")
+        self.tmux.side_effect = tmux
+
+        script = PaneScript([pane_ghost_draft(), pane_echoed()])
+        with patch.object(bridge, "_cc_capture_pane_fresh", script):
+            r = await bridge._cc_paste_text("s1", TEXT)
+        self.assertTrue(r["confirmed"], "灰字草稿被當成殘字,訊息被擋掉了")
+        # 而且不准為了清一段「其實不存在的字」狂按 BSpace。
+        bspaces = [c for c in self.tmux.call_args_list
+                   if len(c.args) >= 5 and c.args[-1] == "BSpace"]
+        self.assertEqual(bspaces, [], f"對著灰字按了 BSpace:{bspaces}")
 
     async def test_clear_never_blind_presses_keys_without_composer(self):
         """看不到輸入框(信任對話框 / 全螢幕 overlay)時,絕不往畫面裡盲打
