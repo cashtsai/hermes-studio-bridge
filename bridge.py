@@ -1072,6 +1072,15 @@ def _save_part_payload(value: str | None, filename: str) -> str | None:
 # ───────────────────────── voice transcription (語音訊息) ───────────────────
 # The bridge persists transport bytes, then asks the persona's Hermes profile
 # to transcribe. Provider/model/endpoint/secret selection never lives here.
+
+# 沒帶 stt_lang 時的語言兜底。lang 空字串會讓 hermes_media 查不到 language 與
+# prompt → Whisper 自動判語言 → 中文語音被誤判成英文,吐出同一句英文重複十幾
+# 次的幻覺迴圈(2026-10-10 機主對 CC 線口述繁體中文,收到的就是這個)。單人
+# bridge 的正確預設就是機主的語言;要改寫 env `POCKET_STT_LANG`,值對齊
+# hermes_media._LOCALE_LANGUAGE 的鍵(zh-Hant / zh-Hans / zh / en)。
+STT_LANG_DEFAULT = os.environ.get("POCKET_STT_LANG", "zh-Hant")
+
+
 def _transcribe(path: str, home: str = "", lang: str = "") -> str:
     """Audio file path → Hermes transcript (best-effort; '' on failure).
 
@@ -1084,8 +1093,14 @@ def _transcribe(path: str, home: str = "", lang: str = "") -> str:
     app 顯示「伺服器暫時有問題,請稍後再試」。音檔其實有上傳成功
     (`app_upload_raw_saved voice.m4a`),是轉文字這一步整個請求炸掉。
     改成給預設值而不是只補那兩個呼叫點 —— 未來新開的通道漏帶也不會再炸。
+
+    2026-10-10 第二次實害(同一條路、不同參數):`lang` 漏帶不會炸,會**安靜地
+    辨識錯**。人格線 `_transcribe_attachments` 一直有傳 lang,所以人格語音正常;
+    CC / Codex / 委派四個呼叫點都只給 path → locale="" → 幻覺迴圈。同樣的解法:
+    **在這裡兜底,而不是只補呼叫點**。呼叫端有真實的使用者語言時照樣覆寫。
     """
     home = home or HOME_ROOT
+    lang = lang or STT_LANG_DEFAULT
     try:
         result = hermes_media.transcribe_audio(home, path, locale=lang)
     except Exception as e:  # noqa: BLE001
@@ -8305,7 +8320,10 @@ async def _cx_history_from_cards(thread_id: str):
     return ("".join(parts), users) if parts else None
 
 
-async def _codex_input_items(text: str, attachments: list) -> list:
+async def _codex_input_items(text: str, attachments: list,
+                             stt_lang: str = "") -> list:
+    """`stt_lang` = app 的介面語言,優先於 `STT_LANG_DEFAULT`。帶預設是刻意的:
+    這支有六個呼叫點,其中委派/系統註記那幾個沒有使用者語言可帶,落兜底才對。"""
     text = (text or "").strip()
     _att_guard(attachments)   # 修復單「附件限制」:直送口件數閥
     note_paths = []
@@ -8316,7 +8334,7 @@ async def _codex_input_items(text: str, attachments: list) -> list:
         if not path:
             continue
         if a.get("kind") == "audio":
-            t = await asyncio.to_thread(_transcribe, path)
+            t = await asyncio.to_thread(_transcribe, path, "", stt_lang)
             if t:
                 voice_lines.append(t)
         elif a.get("kind") == "image":
@@ -8698,7 +8716,8 @@ async def codex_session_create(request: Request):
     body = await request.json()
     text = (body.get("text") or body.get("task") or "").strip()
     attachments = body.get("attachments") or []
-    input_items = await _codex_input_items(text, attachments)
+    input_items = await _codex_input_items(text, attachments,
+                                           str(body.get("stt_lang") or ""))
     if not input_items:
         raise HTTPException(status_code=400, detail="text or attachment required")
     cwd = body.get("cwd") or HOME_ROOT
@@ -10418,7 +10437,8 @@ async def codex_session_input(thread_id: str, request: Request):
     body = await _json_body(request)
     _registry_call_safe("touch", f"codex:{thread_id}")   # 戶政:活動記帳
     input_items = await _codex_input_items((body.get("text") or "").strip(),
-                                           body.get("attachments") or [])
+                                           body.get("attachments") or [],
+                                           str(body.get("stt_lang") or ""))
     if not input_items:
         raise HTTPException(status_code=400, detail="empty")
     _codex_history_invalidate(thread_id)     # new user turn → history changed
@@ -13866,12 +13886,15 @@ async def _cc_input_core(name: str, body: dict) -> dict:
     saved = []
     att_meta = []
     voice_lines = []
+    # app 的介面語言(v2 input 的 `stt_lang`)優先於 STT_LANG_DEFAULT —— 介面切
+    # 英文時語音就該用英文辨識,不能被機主的預設鎖成中文。沒帶就落兜底。
+    stt_lang = str(body.get("stt_lang") or "")
     for a in (body.get("attachments") or []):
         path = _save_attachment(a, a.get("filename") or "file")
         if not path:
             continue
         if a.get("kind") == "audio":
-            t = await asyncio.to_thread(_transcribe, path)
+            t = await asyncio.to_thread(_transcribe, path, "", stt_lang)
             if t:
                 voice_lines.append(t)
         else:
@@ -16908,7 +16931,8 @@ async def v2_session_input(session_id: str, request: Request):
         attachments = body.get("attachments") or []
         if not content and not attachments:
             raise HTTPException(status_code=400, detail="empty")
-        items = await _codex_input_items(content, attachments)
+        items = await _codex_input_items(content, attachments,
+                                         str(body.get("stt_lang") or ""))
         text = _codex_user_input_text(items)
         client_id = body.get("client_id")
         # 與 v1 同一套冪等閘門(排隊層拿掉 409 → 重試 = 保證重複執行)。
