@@ -1072,8 +1072,20 @@ def _save_part_payload(value: str | None, filename: str) -> str | None:
 # ───────────────────────── voice transcription (語音訊息) ───────────────────
 # The bridge persists transport bytes, then asks the persona's Hermes profile
 # to transcribe. Provider/model/endpoint/secret selection never lives here.
-def _transcribe(path: str, home: str, lang: str = "") -> str:
-    """Audio file path → Hermes transcript (best-effort; '' on failure)."""
+def _transcribe(path: str, home: str = "", lang: str = "") -> str:
+    """Audio file path → Hermes transcript (best-effort; '' on failure).
+
+    `home` 省略 = 預設 Hermes home(`HOME_ROOT`)。CC / Codex 這種**沒有人格**
+    的通道本來就沒有 persona profile 可帶,`home_for()` 對它們也是回 HOME_ROOT。
+
+    2026-10-10 實害:這個參數原本是必填,而 CC(:13861)與 Codex(:8307)兩個
+    呼叫點都只給了 path —— 機主對 FLiPER 送 1 分 20 秒語音,**連續 7 次 500**
+    (`TypeError: _transcribe() missing 1 required positional argument: 'home'`),
+    app 顯示「伺服器暫時有問題,請稍後再試」。音檔其實有上傳成功
+    (`app_upload_raw_saved voice.m4a`),是轉文字這一步整個請求炸掉。
+    改成給預設值而不是只補那兩個呼叫點 —— 未來新開的通道漏帶也不會再炸。
+    """
+    home = home or HOME_ROOT
     try:
         result = hermes_media.transcribe_audio(home, path, locale=lang)
     except Exception as e:  # noqa: BLE001
