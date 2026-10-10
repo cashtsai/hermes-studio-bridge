@@ -19744,12 +19744,17 @@ async def _gm_input_core(key: str, session_id: str, body: dict) -> dict:
     #     這比丟掉有用得多(與 codex 的 note_paths 同精神)
     blocks: list = []
     note_paths: list = []
+    att_meta: list = []          # 給卡片流用(與 hermes 的 att_meta 同形狀)
     if attachments:
         _att_guard(attachments)
         for a in attachments:
             path = _save_attachment(a, (a or {}).get("filename") or "file")
             if not path:
                 continue
+            att_meta.append({"kind": (a or {}).get("kind"),
+                             "filename": (a or {}).get("filename"),
+                             "mime": (a or {}).get("mime"),
+                             "path": path})
             if (a or {}).get("kind") == "image":
                 mime = (a.get("mime") or mimetypes.guess_type(path)[0]
                         or "image/png")
@@ -19773,8 +19778,17 @@ async def _gm_input_core(key: str, session_id: str, body: dict) -> dict:
     d = await _gm_card_digest(key)
     mid = await asyncio.to_thread(
         gemini_provider.transcript_append, key, "user", content)
+    # 附件要**同時**做兩件事,少一件圖就不會出現在對話裡:
+    #   1) _schedule_media_capture —— 把檔案收進媒體庫,卡片才拿得到
+    #      media_id / download_url(app 靠它抓圖)
+    #   2) message_card 帶 attachments —— 卡片本身要有附件欄
+    # 2026-10-10:先前只把附件送進 ACP(模型看得到、也確實認得出內容),
+    # 卻沒有走這兩步 → 機主回報「有辨識但對話框沒顯示照片」。
+    if att_meta:
+        _schedule_media_capture(session_id,
+                                {"content": content, "attachments": att_meta})
     d.message_card({"id": mid, "role": "user", "content": content,
-                    "ts": time.time()})
+                    "attachments": att_meta, "ts": time.time()})
     task = asyncio.create_task(_gm_run_turn(key, content, blocks))
     _BG_TASKS.add(task)
     task.add_done_callback(_BG_TASKS.discard)
