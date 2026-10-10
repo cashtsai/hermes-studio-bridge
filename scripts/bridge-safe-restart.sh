@@ -7,18 +7,35 @@
 set -u
 MAX=${1:-600}
 T0=$(date +%s)
+# 等的不只是人格回合 —— **CC / CX 也在跑就不准重啟**(2026-10-10 實害)。
+#
+# 舊版只看 turns_in_flight(人格)。機主當時正在跑一個 CX 任務(rollout 顯示
+# 它在執行 xcodebuild),腳本看到 0 就重啟 —— 重啟清掉記憶體裡的 card digest,
+# 重新播種只拿得到已落地的舊 turn,那段對話就從他視窗上消失了,他看到的是
+# 「指令跑一跑不見了」。`?agents=1` 會多問 CC/CX 的忙碌數。
+# cc 回 -1 = 問不到 → 當成「不確定」,寧可等也不要重啟。
 while true; do
-  N=$(curl -s -m 5 http://127.0.0.1:8081/health | /usr/bin/python3 -c "import json,sys
-try: print(json.load(sys.stdin).get('turns_in_flight', 0))
-except Exception: print(-1)")
-  if [ "$N" = "0" ]; then break; fi
-  if [ "$N" = "-1" ]; then echo "⚠️ health 讀不到(bridge 掛了?),直接重啟"; break; fi
+  N=$(curl -s -m 10 'http://127.0.0.1:8081/health?agents=1' | /usr/bin/python3 -c "import json,sys
+try:
+    d = json.load(sys.stdin)
+    a = d.get('agents_in_flight') or {}
+    cc, cx = a.get('cc', 0), a.get('cx', 0)
+    if cc == -1:
+        print('-2 cc狀態問不到')          # 不確定 → 不重啟
+    else:
+        total = d.get('turns_in_flight', 0) + cc + cx
+        print(f\"{total} 人格{d.get('turns_in_flight', 0)}/CC{cc}/CX{cx}\")
+except Exception: print('-1 health讀不到')")
+  COUNT=${N%% *}
+  DETAIL=${N#* }
+  if [ "$COUNT" = "0" ]; then break; fi
+  if [ "$COUNT" = "-1" ]; then echo "⚠️ health 讀不到(bridge 掛了?),直接重啟"; break; fi
   EL=$(( $(date +%s) - T0 ))
   if [ "$EL" -ge "$MAX" ]; then
-    echo "✗ 等了 ${EL}s 仍有 $N 個活回合 — 不硬殺,中止。加大上限或稍後再試。"
+    echo "✗ 等了 ${EL}s 仍在忙($DETAIL)— 不硬殺,中止。加大上限或稍後再試。"
     exit 1
   fi
-  echo "… $N 個活回合進行中,已等 ${EL}s(上限 ${MAX}s)"
+  echo "… 還在忙($DETAIL),已等 ${EL}s(上限 ${MAX}s)"
   sleep 10
 done
 rm -f /tmp/hermes-bridge-watchdog.fails
