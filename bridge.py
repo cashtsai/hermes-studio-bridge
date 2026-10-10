@@ -14075,8 +14075,13 @@ _CC_SHELL_RESET_POLLS = 5
 # 退出 shell 模式前要先把框清空,折行的殘字一次 C-u 清不完 —— 最多清幾次。
 _CC_SHELL_CLEAR_TRIES = 4
 # 逐字刪的輪數與單輪上限(照輸入框字數算,上限擋住畫面解析異常時的暴走)。
-_CC_CLEAR_ROUNDS = 3
+_CC_CLEAR_ROUNDS = 5
 _CC_CLEAR_MAX_KEYS = 2000
+# 每輪刪完等重畫的秒數逐輪加碼:0.2+0.3+0.4+0.5+0.6 ≈ 2s 總預算。
+# 2026-10-10 實機:滿載(100% context)的 TUI 要消化兩百多顆 BSpace,固定
+# 0.2s × 3 輪不夠 —— 當天 17 筆 cc_composer_clear_failed 多半是「其實刪掉了,
+# 只是回讀到還沒重畫的舊畫面」。加碼等待比加輪數便宜(空框時仍然零成本)。
+_CC_CLEAR_WAIT_STEP_SECS = 0.1
 
 
 async def _cc_force_clear_composer(name: str, pane: str):
@@ -14087,15 +14092,29 @@ async def _cc_force_clear_composer(name: str, pane: str):
       ‧ `C-u`+`BSpace` 交替 → 會誤觸自動建議**把字補回來**,越清越多
       ‧ `BSpace` ×N 逐字刪  → 唯一可靠
     所以逐字刪:照輸入框目前的字數算次數(多給一點餘裕),重讀畫面確認,
-    最多幾輪。空框時**一顆鍵都不送、也不多抓一次畫面**,正常送出零成本。
+    最多幾輪、每輪多等一點。空框時**一顆鍵都不送、也不多抓一次畫面**,
+    正常送出零成本。
+
+    看不到輸入框(啟動中的信任對話框、全螢幕 overlay…)時**立刻放棄且不送
+    任何鍵** —— 往對話框裡盲打幾十顆 BSpace 等於替機主亂按。
     """
-    for _ in range(_CC_CLEAR_ROUNDS):
+    escaped = False
+    for attempt in range(_CC_CLEAR_ROUNDS):
+        region = _cc_composer_region(pane)
+        if region is None:
+            return False, pane
         if _cc_composer_is_empty(pane):
             return True, pane
-        region = _cc_composer_region(pane) or ""
+        # 殘字帶路徑時,路徑自動完成選單可能開著:它會把刪掉的字補回來
+        # (越刪越多),選單本身又畫在輸入框裡,怎麼讀都不是空的。先 Escape
+        # 關掉選單再刪。pane 忙的時候不送 —— Escape 會中斷進行中的回合。
+        if not escaped and not _cc_pane_busy(pane):
+            await _tmux_run("send-keys", "-t", name, "Escape")
+            escaped = True
         n = min(len(region) + 16, _CC_CLEAR_MAX_KEYS)
         await _tmux_run("send-keys", "-t", name, "-N", str(n), "BSpace")
-        await asyncio.sleep(_CC_SHELL_RESET_POLL_SECS)
+        await asyncio.sleep(_CC_SHELL_RESET_POLL_SECS
+                            + attempt * _CC_CLEAR_WAIT_STEP_SECS)
         pane = await _cc_capture_pane_fresh(name)
     return _cc_composer_is_empty(pane), pane
 
@@ -14273,8 +14292,19 @@ async def _cc_paste_text_locked(name: str, text: str) -> dict:
     # 或是把驗證搞糊塗。空框時這一步零成本(不送鍵、不多抓畫面)。
     cleared, pre_pane = await _cc_force_clear_composer(name, pre_pane)
     if not cleared:
-        _log_event("cc_composer_clear_failed", session=name,
+        # 清不乾淨就**不准貼**(2026-10-10 機主實害)。原本只記一筆 log 然後
+        # 照樣貼下去,殘字和這一則就黏成一團送出去 —— 當天 log 裡抓到
+        # `!cd …bridge-safe-restart.sh!cd …bridge-safe` 同一條指令黏兩次。
+        # 寧可回 409 讓人處理(app 收到 409 不會自動重送,是標成可重試、等人
+        # 按重試),也不准送出一則機主根本沒打過的話。
+        reason = ("composer_missing" if _cc_composer_region(pre_pane) is None
+                  else _cc_not_accepted_reason(pre_pane))
+        _log_event("cc_composer_clear_failed", session=name, reason=reason,
+                   text_chars=len(text),
                    composer=_cc_squash(_cc_composer_region(pre_pane) or "")[:120])
+        raise http_err(409, "CC_INPUT_NOT_ACCEPTED",
+                       f"composer still holds earlier text ({reason})",
+                       _CC_NOT_ACCEPTED_HINT[reason])
 
     gen0 = _CC_TURN_GEN.get(name, 0)
     buf = "pa-" + uuid.uuid4().hex[:8]

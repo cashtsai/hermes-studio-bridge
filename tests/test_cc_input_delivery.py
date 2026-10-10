@@ -162,7 +162,9 @@ class CCInputDeliveryTest(unittest.IsolatedAsyncioTestCase):
 
     # ── 1. 輸入行沒清空 → 不准回 200 ────────────────────────────────────
     async def test_stranded_text_never_returns_ok(self):
-        script = PaneScript([pane_busy_holding()])
+        # 第一張是**貼上之前**的畫面(框是空的)。貼上前框裡就有殘字是另一個
+        # 案子,見 test_uncleanable_residue_is_rejected_not_concatenated。
+        script = PaneScript([pane_idle_empty(), pane_busy_holding()])
         with patch.object(bridge, "_cc_capture_pane_fresh", script):
             with self.assertRaises(bridge.HTTPException) as cm:
                 await bridge._cc_paste_text("s1", TEXT)
@@ -176,18 +178,70 @@ class CCInputDeliveryTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_stranded_wrapped_cjk_still_detected(self):
         """折行 + NBSP 的輸入框:squash 比對要抓得到,不能判成已清空。"""
-        script = PaneScript([pane_holding_wrapped()])
+        script = PaneScript([pane_idle_empty(), pane_holding_wrapped()])
         with patch.object(bridge, "_cc_capture_pane_fresh", script):
             with self.assertRaises(bridge.HTTPException) as cm:
                 await bridge._cc_paste_text("s1", TEXT)
         self.assertEqual(cm.exception.status_code, 409)
 
     async def test_stranded_reason_composer_stuck_without_context_full(self):
-        script = PaneScript([pane_busy_holding(context_full=False)])
+        script = PaneScript([pane_idle_empty(),
+                             pane_busy_holding(context_full=False)])
         with patch.object(bridge, "_cc_capture_pane_fresh", script):
             with self.assertRaises(bridge.HTTPException) as cm:
                 await bridge._cc_paste_text("s1", TEXT)
         self.assertIn("composer_stuck", cm.exception.message)
+
+    # ── 1b. 貼上前的殘字清不掉 → 不准貼在殘字後面 ──────────────────────
+    async def test_uncleanable_residue_is_rejected_not_concatenated(self):
+        """2026-10-10 機主實害:context 滿 → 上一則擱淺在框裡 → app 重送 →
+        舊碼清框失敗只記一筆 log **然後照樣貼**,殘字和新字黏成一團送出去
+        (log 實證:`!cd …bridge-safe-restart.sh!cd …bridge-safe`)。
+        清不乾淨就必須回 409,而且**一個字都不准貼**。"""
+        script = PaneScript([pane_busy_holding(text="上一則擱淺的字")])
+        with patch.object(bridge, "_cc_capture_pane_fresh", script):
+            with self.assertRaises(bridge.HTTPException) as cm:
+                await bridge._cc_paste_text("s1", TEXT)
+        self.assertEqual(cm.exception.status_code, 409)
+        self.assertEqual(cm.exception.code, "CC_INPUT_NOT_ACCEPTED")
+        self.assertIn("context_full", cm.exception.message)       # 滿載要認得出
+        self.assertIn("/compact", cm.exception.detail)             # 給得出下一步
+        # 真正的紅線:沒有把文字送進 tmux buffer、也沒有貼、也沒有 Enter。
+        self.assertEqual(self.stdin.call_count, 0, "殘字清不掉卻還是貼了")
+        pastes = [c for c in self.tmux.call_args_list
+                  if c.args and c.args[0] == "paste-buffer"]
+        self.assertEqual(pastes, [])
+        self.assertEqual(self.enters(), [])
+
+    async def test_residue_cleared_after_redraw_lag_still_sends(self):
+        """滿載的 TUI 消化兩百顆 BSpace 要時間:前幾次回讀都還是舊畫面。
+        舊碼只等 3 × 0.2s 就判「清不乾淨」—— 當天 17 筆 clear_failed 多半是
+        這個假陽性。多等幾輪就該清掉並正常送出。"""
+        script = PaneScript([pane_busy_holding(text="殘字"),   # pre-check
+                             pane_busy_holding(text="殘字"),   # 還沒重畫
+                             pane_busy_holding(text="殘字"),   # 還沒重畫
+                             pane_idle_empty(),                # 終於清掉了
+                             pane_echoed()])                   # 送出成功
+        with patch.object(bridge, "_cc_capture_pane_fresh", script):
+            r = await bridge._cc_paste_text("s1", TEXT)
+        self.assertTrue(r["confirmed"])            # 進了 transcript = 真送出
+        self.assertEqual(r["reason"], "echoed_in_pane")
+        bspaces = [c for c in self.tmux.call_args_list
+                   if len(c.args) >= 5 and c.args[-1] == "BSpace"]
+        self.assertGreaterEqual(len(bspaces), 3, "逐字刪不夠有耐心")
+
+    async def test_clear_never_blind_presses_keys_without_composer(self):
+        """看不到輸入框(信任對話框 / 全螢幕 overlay)時,絕不往畫面裡盲打
+        幾十顆 BSpace —— 那等於替機主亂按。直接回 409 讓人處理完再送。"""
+        script = PaneScript([pane_no_composer()])
+        with patch.object(bridge, "_cc_capture_pane_fresh", script):
+            with self.assertRaises(bridge.HTTPException) as cm:
+                await bridge._cc_paste_text("s1", TEXT)
+        self.assertEqual(cm.exception.status_code, 409)
+        self.assertIn("composer_missing", cm.exception.message)
+        keys = [c.args[3:] for c in self.tmux.call_args_list
+                if c.args and c.args[0] == "send-keys"]
+        self.assertEqual(keys, [], f"對著 overlay 盲打了按鍵:{keys}")
 
     # ── 2. 重試後成功 → 回 200 ──────────────────────────────────────────
     async def test_enter_retry_escapes_completion_popup_first(self):
@@ -322,7 +376,9 @@ class CCInputDeliveryTest(unittest.IsolatedAsyncioTestCase):
     async def test_never_rendered_while_busy_is_queued_not_success(self):
         """字沒出現在畫面、但 pane 確實在忙 → CLI 可能已收進自己的佇列,
         誠實回 queued/unconfirmed,但絕不宣稱 accepted。"""
-        script = PaneScript([pane_busy_holding(text="別的字")])
+        # 貼上前框是空的(busy 畫面裡的「別的字」是上一輪的回顯,不是殘字)。
+        script = PaneScript([pane_echoed(text="別的字"),
+                             pane_busy_holding(text="別的字")])
         with patch.object(bridge, "_cc_capture_pane_fresh", script):
             r = await bridge._cc_paste_text("s1", TEXT)
         self.assertFalse(r["confirmed"])
