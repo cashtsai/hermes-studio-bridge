@@ -270,8 +270,13 @@ install_bridge_runtime() {
     fi
   fi
   "$BRIDGE_VENV/bin/python" -m pip install --upgrade pip >/dev/null
+  # ⚠️ 這份清單與 requirements.txt 是同一組依賴的兩個抄本 —— 改一邊要改兩邊。
+  # 2026-10-10 實害:requirements.txt 寫 httpx,這裡也寫 httpx,兩邊都漏了
+  # `[http2]` extras。APNs 強制 HTTP/2,少了 h2 每一通推播都丟 ImportError 被
+  # 吞掉 —— 機主那台 204 次嘗試 0 次送達,而且**每個照 DMG 裝桌面端的使用者
+  # 都一樣壞**,因為 DMG 跑的就是這支腳本。
   "$BRIDGE_VENV/bin/python" -m pip install \
-    fastapi uvicorn httpx PyJWT cryptography websockets python-multipart eval_type_backport >/dev/null
+    fastapi uvicorn 'httpx[http2]' PyJWT cryptography websockets python-multipart eval_type_backport >/dev/null
 }
 
 install_requested_provider
