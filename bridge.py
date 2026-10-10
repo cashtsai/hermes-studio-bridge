@@ -16960,6 +16960,71 @@ async def _v2_persona_input(session: str, session_id: str, body: dict,
             "queued": queued, "message_id": user_mid, "content": content}
 
 
+_CX_COMPACT_RUNNING: dict = {}   # thread_id -> started_ts(防重複點)
+
+
+@app.post("/app/v2/sessions/{session_id}/compact")
+async def v2_session_compact(session_id: str, request: Request):
+    """統一路由「壓縮」—— 讓一條會話可以**一直接續下去**,不必換新的。
+
+    機主 2026-10-10:「cx 內的 session 有什麼辦法可以跟 cc 一樣一直能夠接續」。
+    CC 早就有壓縮鈕(`/ccsessions/{name}/compress`,自建 ccsess 工具),
+    CX / Gemini 的底層其實都有,只是 bridge 沒接:
+      ‧ cx     → app-server 的 `thread/compact/start {threadId}`(0.149 實測)
+      ‧ gemini → gemini-cli 的 `/compress`(它也會在 context 快滿時自動壓,
+                 這裡給的是**手動**入口:想在長任務前先清一次的時候用)
+    兩者都是 fire-and-forget:壓縮要跑一陣子,立即回 started,
+    進度由該 session 自己的卡片流呈現。
+
+    ⚠️ 順帶澄清一個常見誤解(查這題時實測):壓縮清的是**模型的 context**,
+    不是磁碟上的 rollout 檔。rollout 是 append-only 流水帳,壓縮後照樣變大。
+    而「thread/read 逾時」實測與檔案大小無關(158MB 的 thread 熱機讀只要
+    0.1s),那是 bridge 重啟後 app-server 冷啟 30 秒的現象 —— 另外修。
+    """
+    _check_auth(request)
+    src = _v2_card_source(session_id)
+    now = time.time()
+    if src[0] == "cx":
+        tid = src[1]
+        started = _CX_COMPACT_RUNNING.get(tid, 0)
+        if started and now - started < 900:
+            raise http_err(409, "COMPACT_RUNNING",
+                           f"壓縮已在進行({int(now - started)}s 前啟動)")
+        _CX_COMPACT_RUNNING[tid] = now
+        try:
+            await CODEX_APP.call("thread/compact/start", {"threadId": tid},
+                                 timeout=30.0)
+        except CodexAppServerError as e:
+            _CX_COMPACT_RUNNING.pop(tid, None)
+            _log_event("cx_compact_failed", thread=tid[:16], error=str(e)[:200])
+            _codex_http_error(e)
+        _log_event("cx_compact_started", thread=tid[:16])
+        return {"ok": True, "session_id": session_id, "action": "compact",
+                "started": True,
+                "message": "已開始壓縮這條會話的脈絡,壓完就能繼續接著聊"}
+    if src[0] == "gm":
+        key = src[1]
+        if not GEMINI.configured():
+            raise http_err(404, "SESSION_NOT_FOUND", "gemini not configured")
+        if _gm_busy(key):
+            raise http_err(409, "SESSION_BUSY",
+                           "這條 Gemini 會話正在回合中,等它跑完再壓縮")
+        # gemini-cli 的壓縮是 slash 指令,走與一般送話完全相同的管線
+        # (不另開第二條送出路徑 —— 那是上一刀學到的教訓)。
+        await _gm_input_core(key, session_id, {"content": "/compress"})
+        _log_event("gemini_compact_started", session=key[:32])
+        return {"ok": True, "session_id": session_id, "action": "compact",
+                "started": True,
+                "message": "已請 Gemini 壓縮脈絡,壓完就能繼續接著聊"}
+    if src[0] in ("cc", "cc2"):
+        # CC 走自建 ccsess 工具(接力包落盤 → 清 context → 重啟接回),
+        # 介面在 /ccsessions/{name}/compress,這裡不重複實作,明確指路。
+        raise http_err(409, "USE_CC_COMPRESS",
+                       "Claude Code 的壓縮走 /ccsessions/{name}/compress")
+    raise http_err(400, "UNSUPPORTED_PROVIDER",
+                   f"這個 provider 沒有壓縮:{src[0]}")
+
+
 @app.post("/app/v2/sessions/{session_id}/interrupt")
 async def v2_session_interrupt(session_id: str, request: Request):
     """統一路由 interrupt(契約 §4.4):cc=Esc 驗證重試、cx=turn/interrupt、
@@ -17985,6 +18050,71 @@ CX_SEED_DEGRADED_CARD_TEXT = (
     "\n\n下拉重新整理可再試一次;若一直讀不到,建議另開一條新的會話 —— "
     "歷史檔太大時每次重讀都會逾時。"
 )
+_CX_DEGRADED_CARD_ID = "card-cx-seed-degraded"
+# 冷啟重試節奏:bridge 重啟後 codex app-server 實測要 ~30s 才答得動
+# (2026-10-10:重啟 +22s thread/list 逾時、+32s thread/read 逾時),
+# 所以重試窗要蓋過那段。
+_CX_SEED_RETRY_DELAYS = (5.0, 15.0, 40.0)
+CX_SEED_RECOVERED_CARD_TEXT = "✅ 已讀到最新進度,上面的內容是現況。"
+
+
+def _cx_feed_seed_recovered(thread_id: str) -> None:
+    """重試成功 → 把那張「這不是現況」的卡**原地換成**已恢復。"""
+    d = _CX_CARD_DIGESTS.get(thread_id)
+    if d is None or _CX_DEGRADED_CARD_ID not in d.store.cards:
+        return
+    try:
+        d.store.upsert_card(carddigest.make_card(
+            _CX_DEGRADED_CARD_ID, d.store.turn_id, "system", "text",
+            {"text": CX_SEED_RECOVERED_CARD_TEXT,
+             "fallback_text": CX_SEED_RECOVERED_CARD_TEXT}))
+        _log_event("cx_seed_recovered", thread=thread_id[:16])
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("_cx_feed_seed_recovered", _exc, expected=True)
+
+
+def _cx_schedule_seed_retry(thread_id: str) -> None:
+    """seed 失敗 → 背景重試,不要讓使用者自己下拉。
+
+    2026-10-10 實害:bridge 重啟後 app-server 冷啟 30 秒,期間的 seed 全逾時,
+    畫面就停在舊內容 + 一張「這不是現況」—— 但其實再等 30 秒就讀得到了。
+    會自己好的東西不該要使用者動手。
+    """
+    d = _CX_CARD_DIGESTS.get(thread_id)
+    if d is None or getattr(d, "seed_retry_task", None) is not None:
+        return
+
+    async def _retry():
+        try:
+            for delay in _CX_SEED_RETRY_DELAYS:
+                await asyncio.sleep(delay)
+                dd = _CX_CARD_DIGESTS.get(thread_id)
+                if dd is None or dd.seeded:
+                    return
+                dd.seeded = False
+                await _cx_seed_card_digest(thread_id, dd, required=True)
+                if dd.seeded:
+                    _cx_feed_seed_recovered(thread_id)
+                    _log_event("cx_seed_retry_ok", thread=thread_id[:16],
+                               after_s=delay)
+                    return
+            _log_event("cx_seed_retry_exhausted", thread=thread_id[:16])
+        except Exception as _exc:  # noqa: BLE001
+            _log_exc("_cx_schedule_seed_retry", _exc, expected=True)
+        finally:
+            dd = _CX_CARD_DIGESTS.get(thread_id)
+            if dd is not None:
+                dd.seed_retry_task = None
+
+    try:
+        t = asyncio.get_running_loop().create_task(_retry())
+        d.seed_retry_task = t
+        _BG_TASKS.add(t)
+        t.add_done_callback(_BG_TASKS.discard)
+    except RuntimeError:
+        pass
+
+
 def _cx_feed_seed_degraded(thread_id: str) -> None:
     """seed 失敗 / 逾時 → 推一張「現在看到的不是最新」的卡。
 
@@ -17996,8 +18126,10 @@ def _cx_feed_seed_degraded(thread_id: str) -> None:
         return
     try:
         d.seed_degraded_carded = True
+        # 穩定 id:恢復時用同一個 id upsert 覆蓋成「已讀到最新」,
+        # 而不是再疊一張新卡(聊天室不該變成公告欄)。
         d.store.upsert_card(carddigest.make_card(
-            f"card-cx-degraded-{d.store.seq}", d.store.turn_id, "system", "text",
+            _CX_DEGRADED_CARD_ID, d.store.turn_id, "system", "text",
             {"text": CX_SEED_DEGRADED_CARD_TEXT,
              "fallback_text": CX_SEED_DEGRADED_CARD_TEXT,
              "error_code": "CX_SEED_DEGRADED"}))
@@ -18225,6 +18357,7 @@ async def _cx_seed_card_digest(thread_id: str, d, required: bool = False) -> Non
             # app 顯示連線問題,本來就不會誤導。
             if d.store.cards:
                 _cx_feed_seed_degraded(thread_id)
+                _cx_schedule_seed_retry(thread_id)
                 return
             _codex_http_error(e)
         _log_event("cx_card_reseed_error", thread=thread_id[:16],
