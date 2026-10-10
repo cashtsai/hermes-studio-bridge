@@ -71,6 +71,38 @@ class CXSeedDegradedTest(unittest.TestCase):
         codes = [c.get("body", {}).get("error_code") for c in d.store.cards.values()]
         self.assertEqual(codes.count("CX_SEED_DEGRADED"), 1)
 
+    def test_retry_is_scheduled_and_recovers_in_place(self):
+        """會自己好的東西不該要使用者下拉 —— 背景重試,成功後把那張卡
+        **原地換成**「已讀到最新」,不是再疊一張。"""
+        import bridge as b
+        d = _fresh_digest(with_old_cards=True)
+        calls = {"n": 0}
+
+        async def flaky(*a, **k):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise b.CodexAppServerError("thread/turns/list timed out")
+            return {"data": []}
+
+        b.CODEX_APP.call = flaky
+        orig_delays = b._CX_SEED_RETRY_DELAYS
+        b._CX_SEED_RETRY_DELAYS = (0.01,)       # 測試不要真的等 5 秒
+
+        async def run():
+            await b._cx_seed_card_digest(THREAD, d, required=True)
+            t = getattr(d, "seed_retry_task", None)
+            assert t is not None, "沒有排重試"
+            await t
+        try:
+            asyncio.run(run())
+        finally:
+            b._CX_SEED_RETRY_DELAYS = orig_delays
+
+        cards = list(d.store.cards.values())
+        degraded = [c for c in cards if c["id"] == b._CX_DEGRADED_CARD_ID]
+        self.assertEqual(len(degraded), 1, "降級卡應該只有一張(原地覆蓋)")
+        self.assertIn("已讀到最新", str(degraded[0]["body"]["text"]))
+
     def test_recovery_allows_warning_again_next_time(self):
         """讀得到之後旗標要歸位,下次再壞還要能再講一次。"""
         d = _fresh_digest(with_old_cards=True)
