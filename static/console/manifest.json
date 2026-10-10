@@ -1,0 +1,13 @@
+{
+  "name": "Pocket Console",
+  "short_name": "Pocket",
+  "description": "從任何一台電腦操控你自己 Mac 上的 agents",
+  "start_url": "/console",
+  "scope": "/console",
+  "display": "standalone",
+  "background_color": "#0e1116",
+  "theme_color": "#0e1116",
+  "icons": [
+    { "src": "/console/static/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }
+  ]
+}

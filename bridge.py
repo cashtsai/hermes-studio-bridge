@@ -64,7 +64,7 @@ import workers as workers_store
 from fastapi import (FastAPI, Request, HTTPException, WebSocket, WebSocketDisconnect,
                      File, Form, UploadFile)
 from fastapi.responses import (JSONResponse, StreamingResponse, FileResponse,
-                               HTMLResponse, PlainTextResponse)
+                               HTMLResponse, PlainTextResponse, Response)
 from starlette.websockets import WebSocketState
 
 import acp_client
@@ -9058,6 +9058,54 @@ async def v2_session_diff(session_id: str, request: Request, path: str):
     raise http_err(400, "UNSUPPORTED_PROVIDER", "persona session 沒有工作目錄")
 
 
+async def _session_workdir_changes(workdir: str) -> dict:
+    """Session workdir 內「現在有哪些檔被動過」。
+
+    `/diff` 是**單檔**的(必須帶 ?path=),所以光有它還是回答不了「agent 到底改了
+    什麼」—— 得先知道有哪些檔。這支補上缺的那一半:`git status --porcelain` 整理
+    成清單,前端拿它列檔案,再逐檔打 `/diff` 看內容。
+    """
+    wd = os.path.realpath(os.path.expanduser(workdir or ""))
+    if not workdir or not os.path.isdir(wd):
+        raise HTTPException(status_code=404, detail="session 沒有可用的工作目錄")
+    rc, top = await _git_capture("git", "-C", wd, "rev-parse", "--show-toplevel")
+    if rc != 0 or not top.strip():
+        raise HTTPException(status_code=404, detail="session 工作目錄不是 git repo")
+    root = top.strip()
+    rc, out = await _git_capture("git", "-C", root, "status", "--porcelain=v1", "-uall")
+    if rc != 0:
+        raise http_err(502, "GIT_FAILED", "git status 失敗")
+    files = []
+    for line in (out or "").splitlines():
+        if len(line) < 4:
+            continue
+        code, rel = line[:2], line[3:].strip()
+        # rename 是 "old -> new",只取新路徑(那才是看得到內容的那個)
+        if " -> " in rel:
+            rel = rel.split(" -> ", 1)[1]
+        files.append({"path": rel, "status": code.strip() or "?",
+                      "untracked": code == "??"})
+    files.sort(key=lambda f: f["path"])
+    return {"workdir": root, "files": files[:400], "truncated": len(files) > 400}
+
+
+@app.get("/app/v2/sessions/{session_id}/changes")
+async def v2_session_changes(session_id: str, request: Request):
+    """列出此 session 工作目錄現在有哪些待定變更(搭配 `/diff` 逐檔看內容)。
+
+    2026-10-09 補:桌面主控台要能回答「agent 改了什麼」,但既有 `/diff` 只收單一
+    path,而 bridge 沒有任何「列出改動檔」的路由 —— 缺這一半就只能叫使用者自己
+    猜檔名。provider 支援與 `/diff` 一致(cc / cx 有工作目錄;人格沒有)。
+    """
+    _check_auth(request)
+    src = _v2_card_source(session_id)
+    if src[0] == "cc":
+        return await _session_workdir_changes(src[2])
+    if src[0] == "cx":
+        return await _session_workdir_changes(await _codex_thread_workdir(src[1]))
+    raise http_err(400, "UNSUPPORTED_PROVIDER", "persona session 沒有工作目錄")
+
+
 # --- Client error log ------------------------------------------------------
 # The app ships every error it hits (failed send, dropped stream, crash, …) here
 # the moment it happens. We append to ONE file on the Mac so Claude can fetch +
@@ -9584,6 +9632,37 @@ async def console_page(request: Request):
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail="console not installed")
     return HTMLResponse(html, headers=_CONSOLE_SECURITY_HEADERS)
+
+
+# PWA 的兩個檔案必須從 **/console/** 這一層服務,不能只掛在 /console/static/:
+# service worker 的控制範圍預設是它所在的目錄,放在 static/ 底下就管不到
+# /console 本頁(Service-Worker-Allowed 標頭也一併補上)。manifest 放這裡,
+# start_url / scope 才對得上。
+# 兩者刻意**不經 _console_guard**:內容無機密,而瀏覽器抓 manifest / 註冊 SW 時
+# 不會帶 boot code —— 擋了只會讓 PWA 裝不起來,擋不到任何東西。
+@app.get("/console/sw.js")
+async def console_sw():
+    if not POCKET_CONSOLE_ENABLED:
+        raise HTTPException(status_code=404, detail="not found")
+    try:
+        body = open(os.path.join(_CONSOLE_DIR, "sw.js"), encoding="utf-8").read()
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="not found")
+    return Response(body, media_type="application/javascript",
+                    headers={"Service-Worker-Allowed": "/console",
+                             "Cache-Control": "no-cache"})
+
+
+@app.get("/console/manifest.json")
+async def console_manifest():
+    if not POCKET_CONSOLE_ENABLED:
+        raise HTTPException(status_code=404, detail="not found")
+    try:
+        body = open(os.path.join(_CONSOLE_DIR, "manifest.json"), encoding="utf-8").read()
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="not found")
+    return Response(body, media_type="application/manifest+json",
+                    headers={"Cache-Control": "no-cache"})
 
 
 # 靜態資產(app.js / sse.js / style.css)。旗標關時整個 mount 不掛 → 404。
@@ -13983,9 +14062,33 @@ _CC_SHELL_RESET_POLL_SECS = 0.2
 _CC_SHELL_RESET_POLLS = 5
 # 退出 shell 模式前要先把框清空,折行的殘字一次 C-u 清不完 —— 最多清幾次。
 _CC_SHELL_CLEAR_TRIES = 4
+# 逐字刪的輪數與單輪上限(照輸入框字數算,上限擋住畫面解析異常時的暴走)。
+_CC_CLEAR_ROUNDS = 3
+_CC_CLEAR_MAX_KEYS = 2000
 
 
-async def _cc_verify_submitted(name: str, probe: str, gen0: int,
+async def _cc_force_clear_composer(name: str, pane: str):
+    """把輸入框清到空,回 (清乾淨了嗎, 最新畫面)。
+
+    2026-10-10 在機主兩條卡死的 session 上實測三種手法:
+      ‧ `C-u`              → 只清游標那一行,**多行殘字清不掉**(FLiPER 連按 6 次無效)
+      ‧ `C-u`+`BSpace` 交替 → 會誤觸自動建議**把字補回來**,越清越多
+      ‧ `BSpace` ×N 逐字刪  → 唯一可靠
+    所以逐字刪:照輸入框目前的字數算次數(多給一點餘裕),重讀畫面確認,
+    最多幾輪。空框時**一顆鍵都不送、也不多抓一次畫面**,正常送出零成本。
+    """
+    for _ in range(_CC_CLEAR_ROUNDS):
+        if _cc_composer_is_empty(pane):
+            return True, pane
+        region = _cc_composer_region(pane) or ""
+        n = min(len(region) + 16, _CC_CLEAR_MAX_KEYS)
+        await _tmux_run("send-keys", "-t", name, "-N", str(n), "BSpace")
+        await asyncio.sleep(_CC_SHELL_RESET_POLL_SECS)
+        pane = await _cc_capture_pane_fresh(name)
+    return _cc_composer_is_empty(pane), pane
+
+
+async def _cc_verify_submitted(name: str, probes, gen0: int,
                                pre_pane: str = "") -> dict:
     """送 Enter 之後回讀 pane,判定貼上的文字**到底有沒有被 CLI 收走**。
 
@@ -14007,10 +14110,17 @@ async def _cc_verify_submitted(name: str, probe: str, gen0: int,
     held_streak = 0
     pane = ""
     delay = _CC_VERIFY_SETTLE_SECS
-    squashed_probe = _cc_squash(probe)
+    if isinstance(probes, str):                      # 舊呼叫法相容
+        probes = [probes]
+    squashed_probes = [q for q in (_cc_squash(p) for p in probes) if q]
+
+    def _seen_in(hay: str) -> bool:
+        """頭尾任一探針出現就算看到(捲動時只有尾巴在畫面上)。"""
+        squashed = _cc_squash(hay)
+        return any(q in squashed for q in squashed_probes)
     # 重送同一句話時,舊那則的回顯還留在畫面上 —— 拿它當「這次送出了」的
     # 證據會再度變成假成功。貼上前畫面就有的字一律不計分。
-    stale_echo = bool(squashed_probe) and squashed_probe in _cc_squash(pre_pane)
+    stale_echo = bool(squashed_probes) and _seen_in(pre_pane)
     while True:
         await asyncio.sleep(delay)
         delay = _CC_VERIFY_POLL_SECS
@@ -14027,11 +14137,11 @@ async def _cc_verify_submitted(name: str, probe: str, gen0: int,
         # 抓到重複)。只要它已經出現在輸入框以外,就是收下了,絕不再補 Enter。
         # region is None(看不到輸入框)時不採信:分不出那段字是回顯還是被
         # overlay 蓋住的輸入框殘字。
-        if region is not None and squashed_probe and not stale_echo \
-                and squashed_probe in _cc_squash(body):
+        if region is not None and squashed_probes and not stale_echo \
+                and _seen_in(body):
             return {"state": "accepted", "reason": "echoed_in_pane",
                     "attempts": attempts, "pane": pane}
-        held = region is not None and squashed_probe in _cc_squash(region)
+        held = region is not None and _seen_in(region)
         if held:
             seen_in_composer = True
             held_streak += 1
@@ -14059,7 +14169,7 @@ async def _cc_verify_submitted(name: str, probe: str, gen0: int,
             if not _cc_pane_busy(pane):
                 await _tmux_run("send-keys", "-t", name, "Escape")
             _log_event("cc_paste_enter_retry", session=name,
-                       probe_chars=len(probe), attempt=attempts,
+                       probe_chars=sum(len(p) for p in probes), attempt=attempts,
                        escaped=not _cc_pane_busy(pane))
             await _tmux_run("send-keys", "-t", name, "Enter")
             continue
@@ -14127,12 +14237,7 @@ async def _cc_paste_text_locked(name: str, text: str) -> dict:
         # (Escape 只在 pane 不忙時送 —— 忙的時候它會中斷回合。)
         if not _cc_pane_busy(pre_pane):
             await _tmux_run("send-keys", "-t", name, "Escape")
-        for _ in range(_CC_SHELL_CLEAR_TRIES):
-            await _tmux_run("send-keys", "-t", name, "C-u")
-            await asyncio.sleep(_CC_SHELL_RESET_POLL_SECS)
-            pre_pane = await _cc_capture_pane_fresh(name)
-            if _cc_composer_is_empty(pre_pane):
-                break
+        _, pre_pane = await _cc_force_clear_composer(name, pre_pane)
         await _tmux_run("send-keys", "-t", name, "BSpace")
         # 退出之後要**等 TUI 重畫完**再判定。2026-10-09 實機:立刻回讀會讀到
         # 還沒重畫的舊畫面 → recovered=false → 回一個假的 409,使用者看到紅字
@@ -14150,6 +14255,14 @@ async def _cc_paste_text_locked(name: str, text: str) -> dict:
             raise http_err(409, "CC_INPUT_NOT_ACCEPTED",
                            "composer stuck in shell mode",
                            _CC_NOT_ACCEPTED_HINT["shell_mode_stuck"])
+
+    # 貼上前**確定輸入框是空的**(2026-10-10 治本)。原本只送一次 C-u 當清場,
+    # 但 C-u 清不掉多行殘字 —— 上一則送失敗留下的字就會跟這一則黏在一起,
+    # 或是把驗證搞糊塗。空框時這一步零成本(不送鍵、不多抓畫面)。
+    cleared, pre_pane = await _cc_force_clear_composer(name, pre_pane)
+    if not cleared:
+        _log_event("cc_composer_clear_failed", session=name,
+                   composer=_cc_squash(_cc_composer_region(pre_pane) or "")[:120])
 
     gen0 = _CC_TURN_GEN.get(name, 0)
     buf = "pa-" + uuid.uuid4().hex[:8]
@@ -14178,10 +14291,15 @@ async def _cc_paste_text_locked(name: str, text: str) -> dict:
         _log_event("cc_paste_clear_warn", session=name,
                    rc=rc_clear, stderr=(e_clear or "")[:120])
 
-    probe = text[:24].strip()
-    if not probe:
+    # 頭 + 尾兩個探針(2026-10-10 治本):**長訊息會把輸入框捲動**,畫面上
+    # 只看得到尾巴 —— 只拿前 24 字去找,捲走之後永遠找不到,於是判「字沒卡在
+    # 框裡」,加上 pane 在忙就回 `queued` + 200。機主 07:28 那則(含附件註記
+    # 的長路徑)就是這樣被靜默吞掉:app 顯示「等待背景工作結果…」等到天荒
+    # 地老,訊息其實一直躺在輸入框裡。游標在尾端,所以尾巴一定看得到。
+    probes = [p for p in (text[:24].strip(), text[-24:].strip()) if p]
+    if not probes:
         return {"delivery": "accepted", "confirmed": False, "attempts": 0}
-    verdict = await _cc_verify_submitted(name, probe, gen0, pre_pane)
+    verdict = await _cc_verify_submitted(name, probes, gen0, pre_pane)
     pane = verdict.get("pane") or ""
     if verdict["state"] == "stranded":
         # 2026-07-14 草稿擱淺 / 2026-07-28 靜默掉訊息:重試耗盡文字還在框裡。
@@ -14196,7 +14314,7 @@ async def _cc_paste_text_locked(name: str, text: str) -> dict:
         _log_event("cc_input_not_accepted", session=name, stage="verify",
                    reason=verdict["reason"], attempts=verdict["attempts"],
                    text_chars=len(text), busy=_cc_pane_busy(pane),
-                   probe=_cc_squash(text[:24])[:48],
+                   probe=" | ".join(_cc_squash(p)[:48] for p in probes),
                    composer=_cc_squash(_cc_composer_region(pane) or "")[:120],
                    pane_tail=" | ".join(
                        l.strip() for l in pane.splitlines()[-4:] if l.strip())[:220])
