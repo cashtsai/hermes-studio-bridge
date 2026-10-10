@@ -17974,6 +17974,38 @@ CX_EMPTY_HISTORY_CARD_TEXT = (
     "但手機這邊補不回來;在這裡送出新訊息仍然可以正常對話。")
 
 
+
+# seed 讀不到最新進度時推的卡。**不可以拿舊 turn 假裝是現況** ——
+# 2026-10-10 實害:機主的 CX 任務跑到一半遇上 bridge 重啟,重新播種只拿得到
+# 已落地的舊 turn,視窗被舊對話蓋過去,他看到的是「指令跑一跑不見了」。
+# 全部 API 回 200、畫面上也沒有任何線索。寧可明說「看不到最新的」。
+CX_SEED_DEGRADED_CARD_TEXT = (
+    "⚠️ 這條會話的最新進度**暫時讀不到**(Codex 回應逾時,常見於歷史很長的"
+    "會話,或 bridge 剛重啟)。\n\n下面顯示的是**已落地的較早內容**,不是現況。"
+    "\n\n下拉重新整理可再試一次;若一直讀不到,建議另開一條新的會話 —— "
+    "歷史檔太大時每次重讀都會逾時。"
+)
+def _cx_feed_seed_degraded(thread_id: str) -> None:
+    """seed 失敗 / 逾時 → 推一張「現在看到的不是最新」的卡。
+
+    與 `_cx_feed_empty_history` 同精神:bridge 修不了資料面,但**有責任不讓
+    使用者把舊內容當成現況**。一條 session 只推一張,seed 成功時清旗標。
+    """
+    d = _CX_CARD_DIGESTS.get(thread_id)
+    if d is None or getattr(d, "seed_degraded_carded", False):
+        return
+    try:
+        d.seed_degraded_carded = True
+        d.store.upsert_card(carddigest.make_card(
+            f"card-cx-degraded-{d.store.seq}", d.store.turn_id, "system", "text",
+            {"text": CX_SEED_DEGRADED_CARD_TEXT,
+             "fallback_text": CX_SEED_DEGRADED_CARD_TEXT,
+             "error_code": "CX_SEED_DEGRADED"}))
+        _log_event("cx_seed_degraded", thread=thread_id[:16])
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("_cx_feed_seed_degraded", _exc, expected=True)
+
+
 def _cx_feed_empty_history(thread_id: str) -> None:
     """seed 完全空(turns/list 回 0 筆、卡片庫也空)→ 推一張說明卡。
 
@@ -18168,6 +18200,7 @@ async def _cx_seed_card_digest(thread_id: str, d, required: bool = False) -> Non
             d.handle_approval(rec)
         d.seeded = True
         d.last_seed_at = now
+        d.seed_degraded_carded = False   # 讀得到了 → 下次再壞還要能再講一次
         # 靜默空白防線(2026-10-08):turns/list 回 0 筆、卡片庫也空 —— 對使用者
         # 就是一個「打得開但什麼都沒有」的聊天室,所有 API 都回 200,沒有任何
         # 線索可循。實錄:codex_delegation 建的委派型 session,歷史被壓成單筆
@@ -18187,6 +18220,12 @@ async def _cx_seed_card_digest(thread_id: str, d, required: bool = False) -> Non
             d.seeded = False   # 下次請求重試 seed
             _log_event("cx_card_seed_error", thread=thread_id[:16],
                        error=str(e)[:200])
+            # 已經有舊卡在庫裡時**一定要講** —— 否則使用者會把那些舊卡當成
+            # 現況(2026-10-10 實害)。沒有舊卡的話 _codex_http_error 會丟錯,
+            # app 顯示連線問題,本來就不會誤導。
+            if d.store.cards:
+                _cx_feed_seed_degraded(thread_id)
+                return
             _codex_http_error(e)
         _log_event("cx_card_reseed_error", thread=thread_id[:16],
                    error=str(e)[:200])
@@ -25635,18 +25674,38 @@ def _host_capabilities() -> dict:
 
 
 @app.get("/health")
-async def health():
+async def health(agents: int = 0):
     # turns_in_flight:給安全重啟腳本(scripts/bridge-safe-restart.sh)看的 ——
     # 重啟會無聲殺掉進行中人格回合(2026-08-04 實害:連環部署殺了善彰的模型
     # 測試回合),腳本等這個歸零才 kickstart。
     inflight = sum(
         1 for entry in list(_APP_TURN_INFLIGHT.values())
         if entry.get("task") is not None and not entry["task"].done())
-    return {"ok": True, "personas": list(PERSONAS),
-            "subsessions": len(SUBSESSIONS),
-            "bg_tasks": len(_BG_TASKS),
-            "turns_in_flight": inflight,
-            "capabilities": _host_capabilities()}
+    out = {"ok": True, "personas": list(PERSONAS),
+           "subsessions": len(SUBSESSIONS),
+           "bg_tasks": len(_BG_TASKS),
+           "turns_in_flight": inflight,
+           "capabilities": _host_capabilities()}
+    # `?agents=1`:**CC / CX 也在忙嗎**(2026-10-10 實害)。
+    #
+    # turns_in_flight 只數人格回合,對 CC/CX 完全沒有概念。機主 08:28 還在跑
+    # 一個 CX 任務(rollout 顯示正在執行 xcodebuild),08:31 照「安全」重啟 ——
+    # 腳本看到 0 就動手。重啟清掉記憶體裡的 card digest,重新播種只拿得到
+    # 已落地的舊 turn,那段進行中的對話就從視窗上消失了,使用者只看到
+    # 「指令跑一跑不見了」。
+    #
+    # 代價:要抓 CC 每條 session 的 busy 旗標(走既有 _cc_sessions,含 hook
+    # 狀態),所以**不放進預設 health** —— 看門狗每分鐘打一次,不該付這個錢。
+    if agents:
+        cx_busy = len(getattr(CODEX_APP, "active_turns", {}) or {})
+        cc_busy = 0
+        try:
+            cc_busy = sum(1 for r in (await _cc_sessions()) if r.get("busy"))
+        except Exception as e:  # noqa: BLE001
+            _log_exc("health_agents_cc", e, expected=True)
+            cc_busy = -1          # -1 = 問不到,呼叫端要當成「不確定,別重啟」
+        out["agents_in_flight"] = {"cc": cc_busy, "cx": cx_busy}
+    return out
 
 
 # ───────────────────────── log rotation (issue #7 item 6) ──────────────────
