@@ -19677,7 +19677,8 @@ GEMINI.on_update = _gm_on_update
 GEMINI.on_request = _gm_on_request
 
 
-async def _gm_run_turn(key: str, content: str) -> None:
+async def _gm_run_turn(key: str, content: str,
+                       blocks: list | None = None) -> None:
     d = await _gm_card_digest(key)
     cid = uuid.uuid4().hex[:10]
     acp_sid = ""
@@ -19688,8 +19689,10 @@ async def _gm_run_turn(key: str, content: str) -> None:
         gemini_provider.touch_session(key, title_hint=content)
         res = await GEMINI.call(
             "session/prompt",
+            # ACP 的 prompt 是 **content block 陣列**;附件就是多掛幾個 block。
             {"sessionId": acp_sid,
-             "prompt": [{"type": "text", "text": content}]},
+             "prompt": ([{"type": "text", "text": content}] if content else [])
+                       + (blocks or [])},
             timeout=float(os.environ.get("GEMINI_TURN_TIMEOUT", "600")))
         full = _GM_TURNS.get(acp_sid, {}).get("text", "")
         mid = ""
@@ -19734,13 +19737,36 @@ async def _gm_input_core(key: str, session_id: str, body: dict) -> dict:
         raise http_err(404, "SESSION_NOT_FOUND", "gemini not configured")
     content = (body.get("content") or body.get("text") or "").strip()
     attachments = body.get("attachments") or []
+    # 2026-10-10:Gemini 從「附件一律不收」改成真的收。ACP 的 prompt 本來就是
+    # content block 陣列,之前只送一個 text block 才收不了 —— 不是協定限制。
+    #   ‧ 影像 → {type:"image", mimeType, data(base64)},模型直接看得到
+    #   ‧ 其他 → 存檔後把**路徑**附在文字裡;gemini CLI 跑在本機,讀得到檔,
+    #     這比丟掉有用得多(與 codex 的 note_paths 同精神)
+    blocks: list = []
+    note_paths: list = []
     if attachments:
-        _log_event("gemini_attachments_dropped", session=key[:32],
-                   count=len(attachments), has_text=bool(content))
-        if not content:
-            raise http_err(400, "GEMINI_ATTACHMENTS_UNSUPPORTED",
-                           "Gemini 尚不支援附件;請改用文字內容")
-    if not content:
+        _att_guard(attachments)
+        for a in attachments:
+            path = _save_attachment(a, (a or {}).get("filename") or "file")
+            if not path:
+                continue
+            if (a or {}).get("kind") == "image":
+                mime = (a.get("mime") or mimetypes.guess_type(path)[0]
+                        or "image/png")
+                try:
+                    with open(path, "rb") as fh:
+                        blocks.append({"type": "image", "mimeType": mime,
+                                       "data": base64.b64encode(fh.read()).decode()})
+                except OSError as _exc:          # 讀不到就退成路徑,不要整輪失敗
+                    _log_exc("_gm_input_core.image", _exc, expected=True)
+                    note_paths.append(path)
+            else:
+                note_paths.append(path)
+        if note_paths:
+            content = (content + "\n\n[附件:" + " ".join(note_paths) + "]").strip()
+        _log_event("gemini_attachments", session=key[:32],
+                   images=len(blocks), paths=len(note_paths))
+    if not content and not blocks:
         raise http_err(400, "EMPTY_CONTENT", "content required")
     if _gm_busy(key):
         raise http_err(409, "TURN_IN_PROGRESS", "上一輪還在回覆中，稍候或先中斷。")
@@ -19749,7 +19775,7 @@ async def _gm_input_core(key: str, session_id: str, body: dict) -> dict:
         gemini_provider.transcript_append, key, "user", content)
     d.message_card({"id": mid, "role": "user", "content": content,
                     "ts": time.time()})
-    task = asyncio.create_task(_gm_run_turn(key, content))
+    task = asyncio.create_task(_gm_run_turn(key, content, blocks))
     _BG_TASKS.add(task)
     task.add_done_callback(_BG_TASKS.discard)
     out = {"ok": True, "session_id": session_id, "accepted": True,
