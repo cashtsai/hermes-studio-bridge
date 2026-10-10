@@ -28343,7 +28343,7 @@ def _harness_apply(row: dict) -> str:
 
 # ── 端點(晨報審核面)──────────────────────────────────────────────────────
 
-def _harness_public(row: dict) -> dict:
+def _harness_public(row: dict, proposed_rows: list[dict] | None = None) -> dict:
     """回給 app/晨報的提案形狀。內容早在正規化階段就過遮罩,這裡不再改寫。"""
     out = {k: row.get(k) for k in
            ("id", "store", "scope", "key", "version", "state", "rationale",
@@ -28351,7 +28351,109 @@ def _harness_public(row: dict) -> dict:
             "decided_by", "applied", "apply_note", "meta")}
     _pfx, extra = harness_store.STORES[row["store"]]
     out["payload"] = {name: row.get(name) for name, _d in extra}
+    advice, reason = _harness_review_advice(row, proposed_rows=proposed_rows)
+    out["recommendation"] = advice
+    out["recommendation_reason"] = reason
     return out
+
+
+def _harness_review_advice(row: dict, *,
+                           proposed_rows: list[dict] | None = None) -> tuple[str, str]:
+    """把提案證據轉成人能直接採取的建議。
+
+    這不是自動核准：只提供可追溯的審查提示，最後仍由人按鈕決定。
+    門檻刻意保守，避免把一次性事件或無法核對的模型輸出當成長期規則。
+    """
+    if str(row.get("state") or "") != "proposed":
+        return "none", "這筆提案已經處理過，僅供回顧。"
+
+    # 同一個 key 可以在夜批中連續產生多個版本。舊版本即使證據很多,
+    # 也不應該再核准,否則使用者會先套用舊規則、再被迫處理新版覆蓋。
+    if proposed_rows is not None:
+        same_key = [other for other in proposed_rows
+                    if str(other.get("state") or "") == "proposed"
+                    and other.get("store") == row.get("store")
+                    and other.get("scope") == row.get("scope")
+                    and other.get("key") == row.get("key")]
+        versions = [int(other["version"]) for other in same_key
+                    if isinstance(other.get("version"), int)]
+        version = row.get("version")
+        if isinstance(version, int) and versions and version < max(versions):
+            latest = max(versions)
+            return ("reject",
+                    f"同一個提案已有較新的 v{latest}，這是舊版 v{version}；"
+                    "建議駁回舊版，只審核最新版。")
+
+    evidence_n = len(row.get("evidence") or [])
+    rationale = str(row.get("rationale") or "").strip()
+    preview = str(row.get("preview") or "").strip()
+    if evidence_n == 0:
+        return "reject", "沒有可核對的軌跡證據，無法證明這是可長期保留的模式。"
+    if not rationale:
+        return "reject", "提案沒有說明為什麼值得保留，無法進行有效人審。"
+    if not preview:
+        return "reject", "沒有變更預覽，無法確認核准後會改變什麼。"
+
+    # 對外分享權限與猜填資料是人審的硬風險。用「明確的正向指令」比
+    # 只搜關鍵字保守,避免把「嚴禁猜填」這類安全規則誤判成危險提案。
+    review_text = " ".join(
+        str(row.get(name) or "")
+        for name in ("rationale", "preview", "fact", "fragment", "when_to_use")
+    )
+    if _harness_has_unrestricted_sharing(review_text):
+        return ("reject",
+                "內容會放寬文件或資料的公開權限，可能讓未授權的人讀取；"
+                "建議駁回，除非你能先確認分享範圍與資料分類。")
+    if _harness_has_unsafe_guessing(review_text):
+        return ("reject",
+                "內容要求直接猜填或捏造未知資料，會造成法律、帳務或紀錄風險；"
+                "建議駁回，改成缺資料就停下來詢問。")
+
+    meta = row.get("meta") or {}
+    if str(row.get("store") or "") == "subagent_route":
+        try:
+            sample_n = int(meta.get("sample_n") or 0)
+        except (TypeError, ValueError):
+            sample_n = 0
+        try:
+            rate = float(meta.get("rate") or 0)
+        except (TypeError, ValueError):
+            rate = 0.0
+        if sample_n < 20 or rate < 0.7:
+            return "reject", f"路由統計樣本或成功率不足（{sample_n} 次、{rate * 100:.0f}%），不宜改派工作。"
+        return "approve", f"有 {sample_n} 次樣本、成功率 {rate * 100:.0f}%，已通過路由門檻。"
+    if evidence_n < 3:
+        return "reject", f"只有 {evidence_n} 條依據，尚不足以確認是重複模式。"
+    return "approve", f"有 {evidence_n} 條依據、具體理由與變更預覽，已達蒸餾人審門檻。"
+
+
+def _harness_has_unrestricted_sharing(text: str) -> bool:
+    """只攔截沒有被否定詞修飾的公開分享指令。"""
+    markers = ("任何擁有連結者皆可閱讀", "任何擁有連結者可閱讀",
+               "公開分享", "公開權限", "不需登入即可閱讀")
+    negations = ("不要", "禁止", "嚴禁", "避免", "不得", "不應")
+    for marker in markers:
+        start = 0
+        while True:
+            at = text.find(marker, start)
+            if at < 0:
+                break
+            context = text[max(0, at - 12):at]
+            if not any(negation in context for negation in negations):
+                return True
+            start = at + len(marker)
+    return False
+
+
+def _harness_has_unsafe_guessing(text: str) -> bool:
+    markers = ("依上下文推估填寫", "自行猜測填寫", "自行捏造", "直接猜填")
+    negations = ("不要", "禁止", "嚴禁", "避免", "不得", "不應")
+    for marker in markers:
+        at = text.find(marker)
+        if at >= 0 and not any(negation in text[max(0, at - 12):at]
+                               for negation in negations):
+            return True
+    return False
 
 
 @app.get("/app/v2/harness/proposals")
@@ -28373,7 +28475,9 @@ async def v2_harness_proposals(request: Request, state: str = "proposed",
                             detail=f"state 需為 {'/'.join(harness_store.STATES)} 其一")
     rows = _harness_store().list(store=store, state=state or None, scope=scope,
                                  limit=max(1, min(limit, 500)))
-    return {"proposals": [_harness_public(r) for r in rows],
+    proposed_rows = [r for r in rows if r.get("state") == "proposed"]
+    return {"proposals": [_harness_public(r, proposed_rows=proposed_rows)
+                          for r in rows],
             "stores": list(harness_store.STORES),
             "last_run": _harness_store().last_run()}
 
@@ -28482,10 +28586,13 @@ def _harness_report_content(pending: list, last_run: dict | None) -> str:
     label = {"memory": "記憶", "skill": "技能", "prompt": "系統提示",
              "subagent_route": "路由"}
     for p in pending[:12]:
+        advice, reason = _harness_review_advice(p, proposed_rows=pending)
         lines += [
             f"### [{label.get(p['store'], p['store'])}] {p['key']}",
             f"- 範圍:`{p['scope']}` · 版本 v{p['version']}",
-            f"- 理由:{p.get('rationale') or '(無)'}",
+            f"- 建議:{'核准' if advice == 'approve' else '駁回' if advice == 'reject' else '人工判斷'}",
+            f"- 建議理由:{reason}",
+            f"- 蒸餾理由:{p.get('rationale') or '(無)'}",
             f"- 證據:{len(p.get('evidence') or [])} 條軌跡",
             "",
             "```diff",

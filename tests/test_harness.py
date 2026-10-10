@@ -679,6 +679,46 @@ class TestHarnessEndpoints(HarnessApiBase):
         self.assertEqual(item["evidence"], ["traj-1"])
         self.assertEqual(item["preview"], "+ 事實")
         self.assertEqual(item["payload"]["fact"], "事實")
+        self.assertEqual(item["recommendation"], "reject")
+        self.assertIn("1 條依據", item["recommendation_reason"])
+
+    async def test_同_key舊版本建議駁回只看最新版(self):
+        old = self.st.propose("prompt", key="node-a", scope="node:node-a",
+                              payload={"node": "node-a", "fragment": "舊"},
+                              rationale="重複出現", evidence=["a", "b", "c", "d"],
+                              preview="+ 舊")
+        latest = self.st.propose("prompt", key="node-a", scope="node:node-a",
+                                 payload={"node": "node-a", "fragment": "新"},
+                                 rationale="重複出現", evidence=["e", "f", "g"],
+                                 preview="+ 新")
+        out = await bridge.v2_harness_proposals(FakeRequest())
+        by_id = {item["id"]: item for item in out["proposals"]}
+        self.assertEqual(by_id[old["id"]]["recommendation"], "reject")
+        self.assertIn("較新的 v2", by_id[old["id"]]["recommendation_reason"])
+        self.assertEqual(by_id[latest["id"]]["recommendation"], "approve")
+
+    async def test_公開分享權限建議駁回(self):
+        p = self.st.propose(
+            "prompt", key="node-a", scope="node:node-a",
+            payload={"node": "node-a", "fragment": "優先使用任何擁有連結者皆可閱讀"},
+            rationale="文件同步", evidence=["a", "b", "c"],
+            preview="+ 權限設為任何擁有連結者皆可閱讀",
+        )
+        item = (await bridge.v2_harness_proposals(FakeRequest()))["proposals"][0]
+        self.assertEqual(item["id"], p["id"])
+        self.assertEqual(item["recommendation"], "reject")
+        self.assertIn("公開權限", item["recommendation_reason"])
+
+    def test_安全否定句不被公開分享規則誤判(self):
+        row = {
+            "state": "proposed", "store": "memory", "scope": "global",
+            "key": "safe", "version": 1, "evidence": ["a", "b", "c"],
+            "rationale": "避免公開分享", "preview": "+ 不得讓任何擁有連結者皆可閱讀",
+            "meta": {},
+        }
+        advice, reason = bridge._harness_review_advice(row)
+        self.assertEqual(advice, "approve")
+        self.assertIn("3 條依據", reason)
 
     async def test_state_過濾與非法值(self):
         self.st.propose("memory", key="k", payload={"fact": "x"})
