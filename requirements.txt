@@ -4,7 +4,10 @@
 # 一致;要釘版時在這裡釘,不要回去改安裝腳本。
 fastapi
 uvicorn
-httpx
+# APNs 走 HTTP/2 —— `httpx` 不帶 h2,少了它每一通推播都會丟
+# ImportError 被吞掉(2026-10-10 實害:204 次嘗試 0 次送達,整整幾週
+# 回合跑完手機不會響)。extras 一定要帶。
+httpx[http2]
 PyJWT
 cryptography
 websockets
