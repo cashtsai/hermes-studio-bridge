@@ -142,21 +142,50 @@ def check_codex_sessions(base, token, res: Result):
     return sessions
 
 
+# 冷啟首讀的預算:重啟後第一次讀卡片要現場把 digest 重建起來,30 秒不一定夠。
+# 2026-10-10 實錄:重啟後第一發 TimeoutError,同一條 session 第二發 0.x 秒回
+# 60 張。單次就判死 = **每次重啟都喊一次狼來了**,喊幾次之後真的壞了也沒人
+# 當真,這支煙測就白做了。所以逾時先當「冷的」,暖機後重試一次再判;真的兩次
+# 都不行才紅。重試成功會留一條 ⚠(exit code 仍 0)—— 冷啟慢是常態但不該變成
+# 沒人看的常駐噪音,若每次重啟都要重試就該去查 digest 重建成本。
+_CARD_READ_TIMEOUT = 30.0
+_CARD_READ_RETRY_TIMEOUT = 90.0
+
+
+def _read_cards(base, token, tid, limit, timeout):
+    return get(base, f"/app/v2/sessions/codex:{tid}/cards?limit={limit}",
+               token, timeout=timeout)
+
+
 def check_card_stream(base, token, sessions, res: Result):
     """卡片流:回得出來、按時間遞增、小 limit 拿的是最新段。"""
     target = next((s for s in sessions if s.get("thread_id")), None)
     if not target:
         return res.add("卡片流可讀", False, "沒有可測的 session", warn=True)
     tid = target["thread_id"]
+    t0 = time.monotonic()
+    cold = ""
     try:
-        few = get(base, f"/app/v2/sessions/codex:{tid}/cards?limit=5",
-                  token, timeout=30)
-        many = get(base, f"/app/v2/sessions/codex:{tid}/cards?limit=60",
-                   token, timeout=30)
+        few = _read_cards(base, token, tid, 5, _CARD_READ_TIMEOUT)
+    except Exception as exc:  # noqa: BLE001
+        cold = f"{type(exc).__name__}: {exc}"
+        try:
+            few = _read_cards(base, token, tid, 5, _CARD_READ_RETRY_TIMEOUT)
+        except Exception as exc2:  # noqa: BLE001
+            return res.add("卡片流可讀", False,
+                           f"重試後仍讀不到(首讀 {cold};"
+                           f"重試 {type(exc2).__name__}: {exc2})")
+    try:
+        many = _read_cards(base, token, tid, 60, _CARD_READ_RETRY_TIMEOUT)
     except Exception as exc:  # noqa: BLE001
         return res.add("卡片流可讀", False, f"{type(exc).__name__}: {exc}")
+    if cold:
+        res.add("卡片流首讀不必重試", False,
+                f"首讀 {cold},暖機後才讀到 —— 偶爾(剛重啟)是正常的 digest "
+                f"重建;每次重啟都這樣就要查重建成本", warn=True)
     fc, mc = few.get("cards") or [], many.get("cards") or []
-    res.add("卡片流可讀", bool(mc), "卡片流回不出東西", note=f"{len(mc)} 張")
+    res.add("卡片流可讀", bool(mc), "卡片流回不出東西",
+            note=f"{len(mc)} 張,{time.monotonic() - t0:.1f}s")
     if not fc or not mc:
         return False
     ts = [c.get("ts") or 0 for c in mc]
