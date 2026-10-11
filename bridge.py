@@ -19846,6 +19846,14 @@ GEMINI = gemini_provider.GeminiClient(log=_log_event)
 _GM_CARD_DIGESTS: dict = {}
 _GM_TURNS: dict = {}     # acp_sid -> {"cid","text","key"}(進行中 turn 的路由表)
 
+# 權限請求等待者:approval id -> Future。語意照 cc2 seam —— **真相在等待者
+# 手上**,決定端點只負責叫醒,DB mark 與卡片收尾由等待者協程統一做(決議與
+# 逾時走同一條收尾路,不會出現「卡片已決、agent 還在等」)。
+# 等待者不存在(已決/逾時/bridge 重啟過)→ 決定端點回 409;ACP 側逾時一律
+# fail-closed 回 cancelled,不會懸空。
+_GM_PERM_WAITERS: dict = {}
+_GM_PERM_TIMEOUT = float(os.environ.get("POCKET_GEMINI_APPROVAL_SEC", "180"))
+
 
 def _gemini_key_from_session_id(session_id: str) -> str | None:
     sid = str(session_id or "")
@@ -19901,27 +19909,181 @@ def _gm_on_update(acp_sid: str, update: dict) -> None:
         d.turn_status(f"使用工具:{title}")
 
 
+def _gm_approval_insert(record: dict) -> bool:
+    """pending approval 落 canonical approvals 表 —— 讓審核中心/推播/過期
+    全部沿用既有機制(照 `_oc_approval_upsert` 同款,只是 provider=gemini)。"""
+    import sqlite3
+    con = sqlite3.connect(CANON_DB, timeout=30)
+    try:
+        con.execute("INSERT INTO approvals"
+                    "(id,title,source,risk,detail,created_at,expires_at,status,"
+                    "decided_at,result,callback,session_id,provider,kind,options) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (record["id"], record["title"], record["source"],
+                     record["risk"], record["detail"], record["created_at"],
+                     record["expires_at"], "pending", None, None, None,
+                     record["session_id"], "gemini", "permission",
+                     json.dumps(record["options"], ensure_ascii=False)))
+        con.commit()
+        return True
+    except Exception as e:  # noqa: BLE001
+        _log_event("gemini_approval_insert_failed", error=type(e).__name__,
+                   error_message=str(e)[:160])
+        return False
+    finally:
+        con.close()
+
+
+def _gm_pick_option(options: list, approve: bool) -> str | None:
+    """把「核准/駁回」對回 ACP 的 optionId。
+
+    ACP 的 `session/request_permission` 帶 `options:[{optionId,name,kind}]`,
+    kind ∈ allow_once / allow_always / reject_once / reject_always。
+    我們只做二元,所以取第一個 allow*(或 reject*)。
+    ⚠️ 對不到就回 None → 呼叫端退回 `cancelled`(= 這刀之前的行為),
+    寧可退化成舊行為,也不要瞎猜一個 optionId 送出去。
+    """
+    want = "allow" if approve else "reject"
+    for o in options or []:
+        if not isinstance(o, dict):
+            continue
+        if str(o.get("kind") or "").startswith(want) and o.get("optionId"):
+            return str(o["optionId"])
+    return None
+
+
+def _gm_perm_card(key: str, text: str) -> None:
+    d = _GM_CARD_DIGESTS.get(key)
+    if d is None:
+        return
+    d.store.upsert_card(carddigest.make_card(
+        f"card-gm-perm-{uuid.uuid4().hex[:10]}", d.store.turn_id,
+        "system", "text", {"text": text, "fallback_text": text}))
+
+
 async def _gm_on_request(req: dict):
-    """server→client 請求。v1 刀:權限請求一律保守拒絕 + 卡片明示 ——
-    「自動拒絕」要看得見,不能無聲(互動審批接 Approval Hub 是下一刀)。"""
+    """server→client 請求。權限請求落審核中心等人放行(接上 Approval Hub)。
+
+    這刀之前是**無條件自動拒絕** —— 所以 App Store 文案的「在它卡住時放行」
+    對 Gemini 根本不成立(2026-10-10 上架前稽核查出來的不實宣稱之一)。
+
+    收尾路只有一條(在這裡):不論是「使用者決定」還是「逾時」,都由本協程
+    mark DB + 出卡 + 回 ACP outcome。決定端點只負責叫醒(同 cc2 seam)。
+    """
     method = str(req.get("method") or "")
     params = req.get("params") or {}
-    if method == "session/request_permission":
-        acp_sid = str(params.get("sessionId") or "")
-        t = _GM_TURNS.get(acp_sid)
-        tool = ((params.get("toolCall") or {}).get("title")
-                or (params.get("toolCall") or {}).get("kind") or "工具")
-        _log_event("gemini_permission_autodenied", tool=str(tool)[:60])
-        if t:
-            d = _GM_CARD_DIGESTS.get(t["key"])
-            if d is not None:
-                note = (f"⚠️ Gemini 請求使用「{tool}」權限 —— v1 尚未接審批中心,"
-                        "已自動拒絕。")
-                d.store.upsert_card(carddigest.make_card(
-                    f"card-gm-perm-{uuid.uuid4().hex[:10]}", d.store.turn_id,
-                    "system", "text", {"text": note, "fallback_text": note}))
+    if method != "session/request_permission":
+        return None
+
+    acp_sid = str(params.get("sessionId") or "")
+    t = _GM_TURNS.get(acp_sid)
+    call = params.get("toolCall") or {}
+    tool = str(call.get("title") or call.get("kind") or "工具")[:60]
+    options = params.get("options") or []
+    # 第一次遇到就把原始形狀記下來 —— ACP 各家實作的 options 不盡相同,
+    # 有實際 payload 才能確認 _gm_pick_option 的對位是對的。
+    _log_event("gemini_permission_requested", tool=tool,
+               options=json.dumps(options, ensure_ascii=False)[:400])
+
+    key = t.get("key") if t else (GEMINI.acp_to_key(acp_sid) or "")
+    if not key:
+        # 認不出是哪條對話 → 無法出卡也無法讓人找到它,退回舊行為。
+        _log_event("gemini_permission_unroutable", tool=tool)
         return {"outcome": {"outcome": "cancelled"}}
-    return None
+
+    # 沒有可用的 allow 選項 = **沒辦法把「放行」表達回 agent**。這種請求掛住
+    # 等人決定是錯的 —— 等到逾時也一樣只能回 cancelled,等於白卡住一個回合、
+    # 還在審核中心留一張永遠無法生效的卡。直接退回舊行為(立刻拒絕 + 看得見
+    # 的卡)。駁回不需要選項(cancelled 本身就是合法的拒絕)。
+    if not _gm_pick_option(options, True):
+        _log_event("gemini_permission_autodenied", tool=tool,
+                   reason="no_allow_option")
+        _gm_perm_card(key, f"⚠️ Gemini 請求使用「{tool}」權限,但沒有給可放行的"
+                           "選項,已自動拒絕。")
+        return {"outcome": {"outcome": "cancelled"}}
+
+    aid = f"gm-{uuid.uuid4().hex[:12]}"
+    now = int(time.time())
+    record = {
+        "id": aid,
+        "title": f"Gemini 要使用「{tool}」",
+        "source": f"gemini:{key}",
+        "risk": "danger" if not options else "normal",
+        "detail": str(call.get("rawInput") or call.get("title") or tool)[:800],
+        "created_at": now,
+        "expires_at": now + int(_GM_PERM_TIMEOUT),
+        "session_id": f"gemini:{key}",
+        "options": options,
+    }
+    if not _gm_approval_insert(record):
+        return {"outcome": {"outcome": "cancelled"}}
+
+    loop = asyncio.get_running_loop()
+    fut: asyncio.Future = loop.create_future()
+    _GM_PERM_WAITERS[aid] = fut
+    _gm_perm_card(key, f"⏳ Gemini 請求使用「{tool}」—— 等你在審核中心放行。")
+    _approval_push(aid, record["title"], record["detail"], record["session_id"])
+
+    try:
+        approve = await asyncio.wait_for(fut, timeout=_GM_PERM_TIMEOUT)
+    except asyncio.TimeoutError:
+        _gm_approval_set_status(aid, "expired")
+        _gm_perm_card(key, f"⌛ 「{tool}」等不到放行({int(_GM_PERM_TIMEOUT)} 秒),"
+                           "已自動拒絕。")
+        _log_event("gemini_permission_expired", approval_id=aid, tool=tool)
+        return {"outcome": {"outcome": "cancelled"}}
+    finally:
+        _GM_PERM_WAITERS.pop(aid, None)
+
+    if approve:
+        # allow 選項一定存在(上面已經擋過沒有的情況)。
+        opt = _gm_pick_option(options, True) or ""
+        _gm_approval_set_status(aid, "approved")
+        _gm_perm_card(key, f"✅ 已放行「{tool}」。")
+        _log_event("gemini_permission_approved", approval_id=aid, tool=tool,
+                   option=opt)
+        return {"outcome": {"outcome": "selected", "optionId": opt}}
+    _gm_approval_set_status(aid, "denied")
+    _gm_perm_card(key, f"⛔ 已駁回「{tool}」。")
+    # 有 reject 選項就明確選它;沒有就回 cancelled —— ACP 的 cancelled 本身
+    # 就是合法的拒絕,不必為了「看起來有選」而硬塞一個 optionId。
+    opt = _gm_pick_option(options, False)
+    _log_event("gemini_permission_denied", approval_id=aid, tool=tool,
+               option=opt or "(cancelled)")
+    if opt:
+        return {"outcome": {"outcome": "selected", "optionId": opt}}
+    return {"outcome": {"outcome": "cancelled"}}
+
+
+def _gm_approval_set_status(aid: str, status: str) -> None:
+    import sqlite3
+    con = sqlite3.connect(CANON_DB, timeout=30)
+    try:
+        con.execute("UPDATE approvals SET status=?, decided_at=? "
+                    "WHERE id=? AND status='pending'",
+                    (status, int(time.time()), aid))
+        con.commit()
+    except Exception as e:  # noqa: BLE001
+        _log_event("gemini_approval_status_failed", error=str(e)[:160])
+    finally:
+        con.close()
+
+
+def _gm_approval_decide(aid: str, b: dict) -> dict:
+    """決定端點的 gemini 分支 —— **只叫醒等待者**,收尾由等待者協程做。
+
+    等待者不在 = 已決/逾時/bridge 重啟過 → 409(同 cc2 seam 的語意),
+    不要在這裡改 DB,否則會出現「app 顯示已核准、agent 其實早就被拒了」。
+    """
+    fut = _GM_PERM_WAITERS.get(aid)
+    if fut is None or fut.done():
+        raise HTTPException(status_code=409,
+                            detail="already decided or expired")
+    approve = bool(b.get("approve"))
+    fut.set_result(approve)
+    _log_event("gemini_approval_decision", approval_id=aid, approve=approve)
+    return {"id": aid, "status": "approved" if approve else "denied",
+            "key": "approve" if approve else "deny"}
 
 
 GEMINI.on_update = _gm_on_update
@@ -25132,6 +25294,9 @@ async def _approval_decide_core(aid: str, b: dict) -> dict:
         _log_event("cc_approval_decision", session=name, approval_id=aid,
                    status=decision, key=key)
         return {"id": aid, "status": decision, "key": key}
+    if d and src.startswith("gemini:"):
+        # 真相在 _gm_on_request 的等待者手上(同 cc2 seam)——這裡只叫醒。
+        return _gm_approval_decide(aid, b)
     if d and src.startswith("openclaw"):
         # openclaw 的審批真相在 gateway 手上(bridge 只是鏡像)——一定要先
         # 打 `*.approval.resolve`,成功了才改 DB。反過來寫會出現「app 顯示
