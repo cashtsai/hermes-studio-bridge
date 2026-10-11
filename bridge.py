@@ -4152,11 +4152,29 @@ def _push_pref_drop(token: str) -> None:
 
 async def _apns_send(token: str, title: str, body: str, data: dict | None = None,
                      category: str | None = None, thread_id: str | None = None,
-                     content_available: bool = False):
+                     content_available: bool = False, silent: bool = False):
     import httpx
     headers = {"authorization": f"bearer {_apns_jwt()}",
                "apns-topic": APNS_BUNDLE_ID,
                "apns-push-type": "alert", "apns-priority": "10"}
+    if silent:
+        # **真靜默**(背景資料更新,使用者看不到任何東西)。給候選網址變更這類
+        # 純機器訊息用 —— 用 alert 類型的話,使用者每次 tunnel 換網址都會收到
+        # 一則莫名其妙的通知。
+        #
+        # Apple 的要求缺一不可:push-type=background、priority=5、且 aps **只能**
+        # 帶 content-available(一旦帶了 alert/sound 就會被當成 alert 推播,
+        # push-type 寫 background 反而會被拒)。
+        headers["apns-push-type"] = "background"
+        headers["apns-priority"] = "5"
+        aps: dict = {"content-available": 1}
+        payload = {"aps": aps}
+        if data:
+            payload.update(data)
+        async with httpx.AsyncClient(http2=True, timeout=10) as client:
+            r = await client.post(f"{APNS_HOST}/3/device/{token}",
+                                  headers=headers, json=payload)
+            return r.status_code, r.text
     aps = {"alert": {"title": title, "body": body}, "sound": "default"}
     if content_available:
         # 讓通知本體也能喚醒 app 在背景拉新訊息(通知本身已帶 title/body,
@@ -4182,7 +4200,8 @@ async def push_notify(title: str, body: str, data: dict | None = None,
                       thread_id: str | None = None,
                       content_available: bool = False,
                       persona: str | None = None,
-                      no_preview_body: str | None = None) -> dict:
+                      no_preview_body: str | None = None,
+                      silent: bool = False) -> dict:
     """Fan a push to every registered device; prune dead tokens (410/BadToken).
 
     Returns {sent, total, failures:[{code,detail}]}. **不再吞錯** —— 非 200/410 的
@@ -4215,7 +4234,8 @@ async def push_notify(title: str, body: str, data: dict | None = None,
         try:
             code, text = await _apns_send(tok, title, tok_body, data,
                                           category=category, thread_id=thread_id,
-                                          content_available=content_available)
+                                          content_available=content_available,
+                                          silent=silent)
             if code == 200:
                 sent += 1
             elif (code == 410 or "BadDeviceToken" in text or "Unregistered" in text
@@ -9517,6 +9537,80 @@ def _pair_host_candidates(force: bool = False):
     return hosts, bool(ts)
 
 
+# ── 候選網址變了就靜默推給手機 ────────────────────────────────────────────
+# 免費的 quick tunnel **每次重啟就換網址**,而出貨路徑(配對 QR)是一次性的
+# —— 所以網址一變,手機就再也連不回來,使用者只能回桌面重掃 QR。官網文案講的
+# 正是這個(「通道網址變了?回桌面端掃一次新的 QR 就好」),而 App Store 文案
+# 卻寫「換地方不用重設」。
+#
+# 原本的設計是靠 CloudKit 同步候選(`Device.hostCandidates`),但 CloudKit 在
+# 出貨的 kernel build 是關掉的 → 出貨版沒有任何管道知道新網址。
+#
+# 這裡改用**已經存在的通道**:手機早就在 bridge 註冊了 APNs token,所以網址
+# 變了就發一則真靜默推播帶新候選。零新基礎設施、不碰 iCloud、不需要開發者
+# 的伺服器(APNs 是 Apple 的,本來就在信任模型裡)。
+_HOSTS_PUSH_STATE = os.path.expanduser(
+    os.environ.get("POCKET_HOSTS_PUSH_STATE", "~/.pocket/last-pushed-hosts.json"))
+_HOSTS_WATCH_SEC = float(os.environ.get("POCKET_HOSTS_WATCH_SEC", "300"))
+
+
+def _hosts_push_last() -> list:
+    try:
+        with open(_HOSTS_PUSH_STATE, "r", encoding="utf-8") as f:
+            return [str(x) for x in (json.load(f) or [])]
+    except Exception:  # noqa: BLE001 — 缺檔/壞檔都當成「還沒記錄過」
+        return []
+
+
+def _hosts_push_save(hosts: list) -> None:
+    try:
+        os.makedirs(os.path.dirname(_HOSTS_PUSH_STATE), exist_ok=True)
+        tmp = _HOSTS_PUSH_STATE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(list(hosts), f)
+        os.replace(tmp, _HOSTS_PUSH_STATE)
+    except OSError as e:
+        _log_event("hosts_push_state_write_failed", error=str(e)[:160])
+
+
+async def _hosts_watch_loop() -> None:
+    """候選清單變了 → 靜默推播給所有已註冊裝置。
+
+    **第一次觀測不推**:剛部署這個功能時 last 是空的,若照「不同就推」會對
+    所有裝置發一輪沒有意義的推播。第一次只落檔當基準,之後真的變了才推。
+
+    `/pair/qr.json` 另外會 force 重算,所以這裡的 30s 快取不會讓它漏判。
+    """
+    while True:
+        await asyncio.sleep(_HOSTS_WATCH_SEC)
+        try:
+            hosts, _ = _pair_host_candidates(force=True)
+            if not hosts:
+                continue                      # headless/無網 → 不要把基準清掉
+            last = _hosts_push_last()
+            if hosts == last:
+                continue
+            if not last:
+                _hosts_push_save(hosts)       # 第一次:只建立基準
+                _log_event("hosts_watch_seeded", hosts=len(hosts))
+                continue
+            if not _devices():
+                _hosts_push_save(hosts)       # 沒裝置可推,但基準要跟上
+                continue
+            res = await push_notify(
+                "", "", data={"kind": "hosts", "hosts": hosts},
+                content_available=True, silent=True)
+            _hosts_push_save(hosts)
+            _log_event("hosts_push_sent", sent=res.get("sent"),
+                       total=res.get("total"), hosts=len(hosts),
+                       changed_from=len(last))
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001 — 這個迴圈不准把自己弄死
+            _log_event("hosts_watch_failed", error=type(e).__name__,
+                       error_message=str(e)[:160])
+
+
 @app.get("/pair/qr.json")
 async def pair_qr_json(request: Request):
     """鑄新碼 + 組 payload + 產 QR SVG,一次回齊(頁面 TTL 到期後再打一次換新碼)。
@@ -9921,6 +10015,18 @@ async def _pocket_id_loop() -> None:
                 fail_logged = True
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 3600.0)
+
+
+@app.on_event("startup")
+async def _start_hosts_watch():
+    """候選網址變更監看。APNs 沒配置就不啟動 —— 沒有推播通道,算了也沒用。"""
+    if not apns_configured():
+        _log_event("hosts_watch_disabled", reason="apns_not_configured")
+        return
+    task = asyncio.create_task(_hosts_watch_loop())
+    _BG_TASKS.add(task)
+    task.add_done_callback(_BG_TASKS.discard)
+    _log_event("hosts_watch_started", interval_sec=_HOSTS_WATCH_SEC)
 
 
 @app.on_event("startup")
