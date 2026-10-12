@@ -46,6 +46,7 @@ state.db 側的乾淨正文同形,萬一將來 gateway 真的開始回收這些�
 """
 import asyncio
 import collections
+import json
 import os
 import re
 
@@ -67,10 +68,50 @@ _SENT_MAX = 4096
 _OUTBOX: "collections.deque" = collections.deque(maxlen=200)
 
 
+# 使用者偏好落檔(App 設定 →「同步到 Telegram」)。
+#
+# 2026-10-12 機主:這條鏡射原本只有 env 旗標,而兩支 installer 都沒設 →
+# 出貨等於永遠關著,但 App Store 文案寫「桌面與手機同一份對話」。
+# 改成**預設開 + 使用者可自行關掉**:
+#   ‧ 預設開是安全的 —— `mirror()` 解不到 target(沒接 TG bot)就
+#     `skipped="no_target"` 空轉,沒接 Telegram 的人完全不受影響
+#   ‧ 已經接了 TG bot 的人本來就預期兩邊看到同一份對話(這就是 #32 的初衷)
+#   ‧ 鏡射內容是**使用者自己的訊息與自己人格的回覆**,投到**自己的** bot
+#     聊天室,沒有第三方
+_SYNC_FILE = os.path.expanduser(
+    os.environ.get("POCKET_TG_SYNC_FILE", "~/.pocket/telegram-sync.json"))
+
+
+def user_enabled():
+    """App 設定的偏好。``None`` = 沒設過(用預設)。"""
+    try:
+        with open(_SYNC_FILE, "r", encoding="utf-8") as f:
+            v = (json.load(f) or {}).get("mirror_outbound")
+    except Exception:  # noqa: BLE001 — 缺檔/壞檔一律視為沒設過
+        return None
+    return bool(v) if isinstance(v, bool) else None
+
+
+def set_user_enabled(on: bool) -> bool:
+    """寫入偏好,回寫入後的值。"""
+    os.makedirs(os.path.dirname(_SYNC_FILE), exist_ok=True)
+    tmp = _SYNC_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({"mirror_outbound": bool(on)}, f)
+    os.replace(tmp, _SYNC_FILE)
+    return bool(on)
+
+
 def mode() -> str:
-    """``off`` | ``dry`` | ``on``。每次讀環境變數,測試可即時翻。"""
+    """``off`` | ``dry`` | ``on``。每次讀,測試與 App 設定都可即時翻。
+
+    優先序:**env > 使用者偏好 > 預設(on)**。env 有值就一槌定音(含明示
+    `off`)—— 維運要能強制關掉,不該被 App 設定蓋過。
+    """
     v = (os.environ.get("POCKET_TG_MIRROR_OUTBOUND") or "").strip().lower()
-    return v if v in ("dry", "on") else "off"
+    if v:
+        return v if v in ("dry", "on") else "off"
+    return "off" if user_enabled() is False else "on"
 
 
 def outbox():

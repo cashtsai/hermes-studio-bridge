@@ -11767,10 +11767,29 @@ def _tg_clean_content(text: str):
     return out or None
 
 
-def _persona_history(home: str, limit: int = 100):
+def _persona_history(home: str, limit: int = 100, chat_id: str | None = None):
     """Full recent transcript of the persona's canonical Telegram session, so a
     fresh app install / new device can render the conversation instead of a
-    blank thread. Returns oldest→newest [{role, content, ts, attachments}]."""
+    blank thread. Returns oldest→newest [{role, content, ts, attachments}].
+
+    ## ⚠️ 為什麼不按 session 分組(多聊天室的坑,先標起來)
+
+    `chat_id=None`(預設)會把這個 home 底下**所有** `source='telegram'` 的
+    訊息壓成一條時間軸。**那在今天是正確的**:實測主 home 有 33 條 telegram
+    session 但 `COUNT(DISTINCT chat_id) == 1` —— 它們是同一個聊天室在 session
+    輪替(過期換新)下的紀錄,壓平才是對的;若改成按 session 分組,現在這條
+    對話會被切成 33 段。
+
+    但第二個聊天室出現的那一刻,壓平就會把不同聊天室混進同一條對話。屆時
+    **必須 `GROUP BY chat_id`,不是按 session 分** —— 這個坑現在看不到,等真的
+    踩到時也不會聯想到 session 輪替,所以先把參數與理由留在這裡。
+    `sessions` 表已經有 `chat_id` / `chat_type` / `user_id` / `display_name`,
+    不需要改 schema。
+
+    ⚠️ 另外:要支援「別人也能對 bot 說話」之前,先看送審問卷
+    (`SUBMISSION_CHECKLIST.md:57` 的「使用者生成內容 否」)—— 別人的訊息
+    一進 app,那個答案就是假的,年齡分級與 Guideline 1.2 都要重走。
+    """
     import sqlite3
     db = os.path.join(home, "state.db")
     if not os.path.exists(db):
@@ -11778,12 +11797,17 @@ def _persona_history(home: str, limit: int = 100):
     try:
         con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=5)
         try:
-            cur = con.execute(
-                "SELECT m.role, m.content, m.timestamp FROM messages m "
-                "JOIN sessions s ON s.id = m.session_id "
-                "WHERE s.source='telegram' AND m.role IN ('user','assistant') "
-                "AND m.content IS NOT NULL AND m.content != '' "
-                "ORDER BY m.timestamp DESC LIMIT ?", (limit,))
+            sql = ("SELECT m.role, m.content, m.timestamp FROM messages m "
+                   "JOIN sessions s ON s.id = m.session_id "
+                   "WHERE s.source='telegram' AND m.role IN ('user','assistant') "
+                   "AND m.content IS NOT NULL AND m.content != '' ")
+            params: list = []
+            if chat_id:
+                sql += "AND s.chat_id = ? "
+                params.append(str(chat_id))
+            sql += "ORDER BY m.timestamp DESC LIMIT ?"
+            params.append(limit)
+            cur = con.execute(sql, tuple(params))
             rows = cur.fetchall()
             con.close()
             rows.reverse()  # oldest → newest for natural top-to-bottom rendering
@@ -20083,6 +20107,55 @@ async def _gemini_v1_post_message(body: dict, request: Request):
         agen(), media_type="text/event-stream",
         headers={"Cache-Control": "no-cache, no-transform",
                  "X-Accel-Buffering": "no"})
+
+
+def _tg_any_target() -> bool:
+    """任一人格解得出 TG 投遞目標嗎(= 這台主機真的接了 TG bot)。
+
+    `resolve_target` 要帶 home,所以逐個人格問一遍。純讀檔/讀 db,很便宜;
+    任何一個丟例外就跳過 —— 這只是給 app 顯示說明用的提示,不該因此 500。
+    """
+    for _id, meta in (PERSONAS or {}).items():
+        try:
+            if tg_outbound.resolve_target(meta[1]):
+                return True
+        except Exception:  # noqa: BLE001
+            continue
+    return False
+
+
+@app.get("/app/v1/telegram/sync")
+async def telegram_sync_get(request: Request):
+    """App 設定 →「同步到 Telegram」的讀取端。
+
+    `source`:`env`(維運旗標一槌定音)/ `user`(App 設過)/ `default`。
+    `env` 時 app 要把開關設唯讀 —— 不然會變成「關了沒反應」。
+    `available` = 這台主機到底有沒有接 TG bot;沒接的話開關開著也不會有事
+    (`mirror()` 解不到 target 就空轉),但 app 可以據此說明為什麼沒作用。
+    """
+    _check_auth(request)
+    env = (os.environ.get("POCKET_TG_MIRROR_OUTBOUND") or "").strip().lower()
+    user = tg_outbound.user_enabled()
+    source = "env" if env else ("user" if user is not None else "default")
+    return {"mode": tg_outbound.mode(), "enabled": tg_outbound.mode() != "off",
+            "source": source,
+            "available": _tg_any_target()}
+
+
+@app.put("/app/v1/telegram/sync")
+async def telegram_sync_put(request: Request):
+    """寫入偏好。env 有值時仍以 env 為準(回傳會顯示 source=env)。"""
+    _check_auth(request)
+    body = await request.json()
+    if "enabled" not in body:
+        raise http_err(400, "EMPTY", "要帶 enabled")
+    tg_outbound.set_user_enabled(bool(body.get("enabled")))
+    env = (os.environ.get("POCKET_TG_MIRROR_OUTBOUND") or "").strip().lower()
+    _log_event("telegram_sync_updated", enabled=bool(body.get("enabled")),
+               effective=tg_outbound.mode(), env_override=bool(env))
+    return {"mode": tg_outbound.mode(), "enabled": tg_outbound.mode() != "off",
+            "source": "env" if env else "user",
+            "available": _tg_any_target()}
 
 
 @app.get("/app/v1/gemini/config")
