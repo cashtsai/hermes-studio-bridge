@@ -9604,7 +9604,11 @@ def _hosts_push_last() -> list:
     try:
         with open(_HOSTS_PUSH_STATE, "r", encoding="utf-8") as f:
             return [str(x) for x in (json.load(f) or [])]
-    except Exception:  # noqa: BLE001 — 缺檔/壞檔都當成「還沒記錄過」
+    except Exception as e:  # noqa: BLE001 — 缺檔/壞檔都當成「還沒記錄過」
+        # 留痕(節流):缺檔是首次執行的正常狀態,但**壞檔**會讓候選清單每次都
+        # 重推一次,不留痕就查不出來。護欄 test_no_silent_except_exception_left
+        # 就是為這種「吞掉又沒痕跡」立的。
+        _log_exc("hosts_push_last", e, expected=True)
         return []
 
 
@@ -20330,7 +20334,10 @@ def _tg_any_target() -> bool:
         try:
             if tg_outbound.resolve_target(meta[1]):
                 return True
-        except Exception:  # noqa: BLE001
+        except Exception as e:  # noqa: BLE001
+            # 單一人格解不出 TG 目標不該中斷整圈,但要留痕 —— 否則「TG 同步
+            # 明明開著卻沒動靜」會完全查不到原因。
+            _log_exc("tg_any_target_resolve", e, expected=True)
             continue
     return False
 

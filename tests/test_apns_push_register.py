@@ -70,8 +70,11 @@ check("apns_configured() False", bridge.apns_configured() is False)
 _sent_calls = []
 
 
+# **kwargs:`_apns_send` 的簽章會長(2026-10-11 加了 silent=,靜默推候選清單
+# 用)。既有測試只關心「有沒有送、送給誰、內容是什麼」,不該因為多一個不相干
+# 的參數就整檔紅 —— 這是整併時才會爆的那種假性衝突。
 async def _mock_send(token, title, body, data=None, category=None,
-                     thread_id=None, content_available=False):
+                     thread_id=None, content_available=False, **kwargs):
     _sent_calls.append({"token": token, "title": title, "body": body,
                         "data": data, "thread_id": thread_id})
     return 200, ""
@@ -160,7 +163,7 @@ check("非人格推播(任務完成)不受人格訂閱影響", res["sent"] == 2)
 
 # ── 410 剪 token + 偏好一併清掉 ─────────────────────────────────────────────
 async def _mock_send_410(token, title, body, data=None, category=None,
-                         thread_id=None, content_available=False):
+                         thread_id=None, content_available=False, **kwargs):
     if token == "tok-b":
         return 410, "Unregistered"
     return 200, ""
