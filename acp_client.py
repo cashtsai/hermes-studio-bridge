@@ -171,6 +171,53 @@ def _telegram_entry_from_statedb(home: str):
                      "updated_at": row[2] or 0, "origin": "statedb"})
 
 
+#: 絕不自動挑的選項(kind 或 name 命中就跳過)。`*_always` 授出的是**永久**
+#: 權限 —— 替使用者按下「以後都不要再問」是最不該自動做的事。
+#:
+#: ⚠️ 這裡的詞必須夠精確:第一版放了裸 `"all"`,結果子字串命中 **"allow"**,
+#: 把 "Allow once" 也排除掉了(自家測試當場抓到)。要擋「全部」就寫
+#: "allow all",不要寫 "all"。
+_NEVER_AUTO = ("always", "allow all", "all tools", "永久", "全部", "不再詢問",
+               "don't ask", "do not ask")
+
+#: 「只允許這一次」的 ACP kind。有 kind 就用 kind,比比對 name 可靠得多
+#: (name 是人看的字串,會隨 agent 版本與語言變)。
+_ALLOW_ONCE_KINDS = ("allow_once",)
+#: 退路:沒有 kind 時才看 name。刻意**不含** "always"。
+_ALLOW_ONCE_NAMES = ("allow", "yes", "approve", "accept", "允許", "同意")
+
+
+def _pick_allow_once(opts: list):
+    """從 ACP 的 options 挑出「只允許這一次」的 optionId;挑不到回 ``None``。
+
+    回 ``None`` 的意思是**拒絕**(呼叫端回 ``cancelled``),不是「隨便挑一個」。
+
+    2026-10-13 修前的行為有兩個危險:
+      1. 關鍵字含 ``always`` → agent 給 ``["Allow always","Allow once","Reject"]``
+         時選中的是 **Allow always**,授出永久權限;
+      2. 都比不到就 ``opts[0]`` 盲選 —— 選項順序由 agent 決定,等於替使用者
+         按下一個不知道是什麼的選項。
+    """
+    # 第一輪:看 kind(ACP 規格欄位,最可靠)
+    for o in opts or []:
+        if not isinstance(o, dict) or not o.get("optionId"):
+            continue
+        kind = str(o.get("kind") or "").lower()
+        if kind in _ALLOW_ONCE_KINDS:
+            return str(o["optionId"])
+    # 第二輪:退回比對 name,但先排除任何「永久」字樣
+    for o in opts or []:
+        if not isinstance(o, dict) or not o.get("optionId"):
+            continue
+        kind = str(o.get("kind") or "").lower()
+        name = str(o.get("name") or "").lower()
+        if any(bad in kind or bad in name for bad in _NEVER_AUTO):
+            continue
+        if any(k in name for k in _ALLOW_ONCE_NAMES):
+            return str(o["optionId"])
+    return None
+
+
 def canonical_telegram_session(home: str):
     """The session id the TG gateway is CURRENTLY driving for this persona.
 
@@ -431,22 +478,30 @@ class ACPSession:
                 elif kind == "usage_update":
                     q.put_nowait(("usage", {"used": upd.get("used"), "size": upd.get("size")}))
             elif msg.get("method") == "session/request_permission" and mid is not None:
-                opts = (msg.get("params") or {}).get("options") or []
-                allow = None
-                for o in opts:
-                    name = (o.get("name") or "").lower()
-                    if any(k in name for k in ("allow", "always", "yes", "approve", "accept")):
-                        allow = o.get("optionId")
-                        break
-                if allow is None and opts:
-                    allow = opts[0].get("optionId")
-                await self._send({"jsonrpc": "2.0", "id": mid,
-                                  "result": {"outcome": {"outcome": "selected", "optionId": allow}}})
-                # surface what was auto-approved so the client can show it
-                if self._active_q is not None:
-                    title = ((msg.get("params") or {}).get("toolCall") or {}).get("title") \
-                        or (msg.get("params") or {}).get("title") or "工具"
-                    self._active_q.put_nowait(("perm", str(title).split(":", 1)[0].strip()))
+                params = msg.get("params") or {}
+                opts = params.get("options") or []
+                allow = _pick_allow_once(opts)
+                title = ((params.get("toolCall") or {}).get("title")
+                         or params.get("title") or "工具")
+                short = str(title).split(":", 1)[0].strip()
+                if allow is None:
+                    # **fail-closed**:認不出「只允許這一次」就拒絕。
+                    # 舊行為是 `allow = opts[0]` —— 選項順序由 agent 決定,
+                    # 等於替使用者按下一個不知道是什麼的選項。
+                    _log("acp_permission_denied_unrecognized", tool=short,
+                         options=json.dumps(opts, ensure_ascii=False)[:300])
+                    await self._send({"jsonrpc": "2.0", "id": mid,
+                                      "result": {"outcome": {"outcome": "cancelled"}}})
+                    if self._active_q is not None:
+                        self._active_q.put_nowait(("perm_denied", short))
+                else:
+                    _log("acp_permission_auto_allowed", tool=short, option=allow)
+                    await self._send({"jsonrpc": "2.0", "id": mid,
+                                      "result": {"outcome": {"outcome": "selected",
+                                                             "optionId": allow}}})
+                    # surface what was auto-approved so the client can show it
+                    if self._active_q is not None:
+                        self._active_q.put_nowait(("perm", short))
         # process died — fail any waiters so callers don't hang
         for fut in self._pending.values():
             if not fut.done():
