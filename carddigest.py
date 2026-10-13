@@ -837,6 +837,7 @@ class CodexThreadDigest(ApprovalCardMixin):
         self.store = SessionCardStore(chronological=True)
         self.agent_text: dict[str, str] = {}   # itemId → delta 累積文字
         self.busy = False
+        self.turn_started_at = 0.0   # turn/started 的時間(見該處註解)
         self.prompt = None                     # pending approval title（label 素材）
         self.seeded = False
         self.seeding = False
@@ -909,6 +910,10 @@ class CodexThreadDigest(ApprovalCardMixin):
             status["lock_reason"] = (getattr(self, "lock_reason", "")
                                      or "thread_store_conflict")
             status["lock_message"] = getattr(self, "lock_message", "") or ""
+        # 回合計時(見 turn/started 那段註解)。只在真的在跑時給 —— phase
+        # "queued" 的 busy 是善意謊言,回合還沒開始,給起算點就是說謊。
+        if self.busy and self.turn_started_at and phase != "queued":
+            status["busy_since"] = self.turn_started_at
         self.store.set_status(status)
 
     @staticmethod
@@ -997,6 +1002,12 @@ class CodexThreadDigest(ApprovalCardMixin):
             turn = params.get("turn") or {}
             self.store.turn_id = str(turn.get("id") or "")
             self.busy = True
+            # 回合起算時間 —— 與 CC 的 `busy_since` 同一件事、同一個理由:app 的
+            # WorkingBar 只有一顆脈動點,2 秒與 20 分鐘看起來一模一樣,而遠端
+            # 遙控最怕分不出「在跑」和「死了」。這是 `turn/started` **事件**
+            # 的時間,不是「app 第一次來看的時間」—— 後者會對跑了半小時的回合
+            # 說「已 2 秒」。
+            self.turn_started_at = time.time()
             self.store.saw_output = False
             self.store.last_tool = ""
             self.store.push_turn("begin", self.store.turn_id)
@@ -1006,6 +1017,7 @@ class CodexThreadDigest(ApprovalCardMixin):
             err = turn.get("error") if isinstance(turn, dict) else None
             self.busy = False
             self.prompt = None
+            self.turn_started_at = 0.0     # 起算點跟著回合走,不留給下一輪
             self.store.push_turn("end", self.store.turn_id or str(turn.get("id") or ""))
             if err:
                 msg = str(err.get("message", err))

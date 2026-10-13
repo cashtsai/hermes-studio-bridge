@@ -246,5 +246,97 @@ class WiringTest(unittest.TestCase):
                                 "定義 + 至少一個呼叫點")
 
 
+class CodexTurnStartedAtTest(unittest.TestCase):
+    """CX 也要有回合計時 —— 不然 CC 有、CX 沒有,同一支 App 兩套體驗。
+
+    資料本來就在(`turn/started` 早就記了 `CODEX_APP.turn_started_at`),缺的
+    只是回給 app 這一步。
+    """
+
+    def setUp(self):
+        self.tid = "th-unit-cx"
+        CODEX_APP = bridge.CODEX_APP
+        self._saved_active = dict(CODEX_APP.active_turns)
+        self._saved_started = dict(CODEX_APP.turn_started_at)
+        self._saved_rs = CODEX_APP.runtime_status
+        self._saved_alive = CODEX_APP.is_server_alive
+        CODEX_APP.is_server_alive = lambda: True
+
+    def tearDown(self):
+        CODEX_APP = bridge.CODEX_APP
+        CODEX_APP.active_turns.clear(); CODEX_APP.active_turns.update(self._saved_active)
+        CODEX_APP.turn_started_at.clear(); CODEX_APP.turn_started_at.update(self._saved_started)
+        CODEX_APP.runtime_status = self._saved_rs
+        CODEX_APP.is_server_alive = self._saved_alive
+
+    def _summary(self, runtime="running"):
+        bridge.CODEX_APP.runtime_status = lambda tid, raw="": runtime
+        return bridge._codex_enrich_summary({"thread_id": self.tid, "status": runtime})
+
+    def test_active_turn_reports_its_start(self):
+        started = time.time() - 420
+        bridge.CODEX_APP.active_turns[self.tid] = "turn-1"
+        bridge.CODEX_APP.turn_started_at[self.tid] = started
+        s = self._summary()
+        self.assertTrue(s["activeTurn"])
+        self.assertAlmostEqual(s["turnStartedAt"], started, places=3)
+
+    def test_provider_started_turn_gets_no_fake_start(self):
+        """provider 自己起的回合(桌面版/VS Code/CLI)我們沒有 turn/started。
+
+        上一輪的殘值絕不可以頂上去 —— 那會對剛開始的回合說「已 3 小時」。
+        """
+        bridge.CODEX_APP.turn_started_at[self.tid] = time.time() - 9999
+        bridge.CODEX_APP.active_turns.pop(self.tid, None)   # 我們沒看到 turn/started
+        s = self._summary(runtime="running")
+        self.assertTrue(s["activeTurn"], "provider 說 running 仍算在跑")
+        self.assertNotIn("turnStartedAt", s, "但不得給一個我們其實不知道的起算點")
+
+    def test_idle_thread_has_no_start(self):
+        bridge.CODEX_APP.active_turns.pop(self.tid, None)
+        bridge.CODEX_APP.turn_started_at.pop(self.tid, None)
+        s = self._summary(runtime="idle")
+        self.assertNotIn("turnStartedAt", s)
+
+    def test_turn_completed_clears_the_start(self):
+        src = open(os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "bridge.py"), encoding="utf-8").read()
+        self.assertIn("self.turn_started_at.pop(tid, None)", src,
+                      "turn/completed 必須清掉起算點,否則殘值會被下一輪繼承")
+
+
+class CodexDigestBusySinceTest(unittest.TestCase):
+    """CX 的卡片流 status 也要帶 busy_since。
+
+    出貨版的 CX 畫面走卡片流(CodexCardSessionView),它讀的是
+    `session.status`,不是 v1 的 session 列表 —— 只改 `_codex_enrich_summary`
+    會是一個看不到的修(同 CC 那條的教訓)。
+    """
+
+    def _digest(self):
+        import carddigest
+        return carddigest.CodexThreadDigest()
+
+    def test_turn_started_sets_busy_since(self):
+        d = self._digest()
+        d.seeded = True
+        d.handle("turn/started", {"turn": {"id": "t1"}})
+        st = d.store.status
+        self.assertTrue(st["busy"])
+        self.assertAlmostEqual(st["busy_since"], d.turn_started_at, places=3)
+        self.assertLess(time.time() - st["busy_since"], 5)
+
+    def test_turn_completed_drops_busy_since(self):
+        d = self._digest()
+        d.seeded = True
+        d.handle("turn/started", {"turn": {"id": "t1"}})
+        d.handle("turn/completed", {"turn": {"id": "t1"}})
+        st = d.store.status
+        self.assertFalse(st["busy"])
+        self.assertNotIn("busy_since", st,
+                         "回合結束仍留著 → 下一輪會繼承過早的起算點")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

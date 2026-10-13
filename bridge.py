@@ -6867,6 +6867,10 @@ class CodexAppServerClient:
             return
         if method == "turn/completed" and tid:
             self.active_turns.pop(tid, None)
+            # 起算點跟著回合走。殘著的話,下一個由 provider 自己起的回合
+            # (桌面版/VS Code/CLI —— 我們收不到 turn/started)會繼承一個過早
+            # 的時間,畫面謊報「已 3 小時」。
+            self.turn_started_at.pop(tid, None)
             self.turn_terminal_at[tid] = time.time()
             self.retry_escalations.pop(tid, None)   # 回合結束 → 重試計數歸零
             if self.pending_inputs.get(tid):     # 這輪結束 → 送出排隊中的下一則
@@ -7903,6 +7907,20 @@ def _codex_enrich_summary(summary: dict) -> dict:
     summary["activeTurn"] = (CODEX_APP.is_active(tid)
                              or summary["runtimeStatus"] in ("running", "stalled"))
     summary["status"] = summary["runtimeStatus"]
+    # 回合起算時間 —— 與 CC 的 `busy_since` 同一件事、同一個理由:app 的
+    # WorkingBar 只有一顆脈動點,2 秒與 20 分鐘看起來一模一樣,遠端遙控最怕
+    # 分不出「在跑」和「死了」。`turn/started` 早就記了這個時間(見
+    # `CODEX_APP.turn_started_at`),只是沒回給 app。
+    # 只在真的有回合時給,且不知道就不給 —— 不拿「我第一次看到它在忙」充當
+    # 起算點(那個數字會對跑了半小時的回合說「已 2 秒」)。provider 自己起的
+    # 回合(桌面版/VS Code/CLI)我們沒有 turn/started,所以這裡會是缺欄。
+    if CODEX_APP.is_active(tid):
+        # 刻意用 `is_active` 而不是上面那個放寬過的 `activeTurn`:後者在
+        # provider 說 running 時也為真,而那種回合我們沒有 turn/started,
+        # 給出去的會是上一輪的殘值。
+        started = getattr(CODEX_APP, "turn_started_at", {}).get(tid)
+        if started:
+            summary["turnStartedAt"] = started
     usage = _codex_usage_map(CODEX_APP.token_usage.get(tid),
                              model=_codex_thread_model(tid, summary),
                              # getattr:這條路徑在測試裡會被各種 stub 取代,
