@@ -210,6 +210,19 @@ class WiringTest(unittest.TestCase):
                         "新輸入 = 新回合,舊起算點必須被覆寫")
         bridge._CC_TURN_STARTED_AT.pop(NAME, None)
 
+    def test_v2_card_follower_forwards_both_fields(self):
+        """**出貨版的 CC 畫面走卡片流**,不是 v1 /ccsessions status。
+
+        follower 的 status 是逐欄手組的 —— 漏掉這兩欄,整個修就只在使用者關掉
+        卡片流旗標時才有效(= 沒人看得到的修)。這正是 `_cc_pane_blocked` 當年
+        的下場:函式寫好了,沒接線,洞開兩個月。
+        """
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(root, "bridge.py"), encoding="utf-8") as f:
+            src = f.read()
+        self.assertIn('status["busy_since"] = st["busy_since"]', src)
+        self.assertIn('status["blocked"] = True', src)
+
     def test_pane_blocked_has_a_production_call_site(self):
         """這支 2026-08-16 寫好但沒人呼叫,洞因此開到 10-13。別再變孤兒。"""
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

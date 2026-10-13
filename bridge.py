@@ -17926,6 +17926,17 @@ async def _cc_card_follower(name: str, workdir: str):
                 # 有才帶 —— 缺鍵 = 舊行為,不會把 None 灌給 app)。
                 if st.get("usage"):
                     status["usage"] = st["usage"]
+                # busy_since / blocked 同樣要帶進 v2 —— **出貨版的 CC 畫面走卡片
+                # 流,不是 v1 /ccsessions status**。這裡的 status 是逐欄手組的,
+                # 漏掉就等於那兩欄只在使用者關掉卡片流旗標時才有效(= 沒人看得
+                # 到的修)。`busy_since` 只在 st.busy 為真時存在,所以上面
+                # 「已排入佇列」那條假 busy 不會拿到一個還沒開始的起算點。
+                if st.get("busy_since"):
+                    status["busy_since"] = st["busy_since"]
+                if st.get("blocked"):
+                    # 刻意不受 phase 分支影響:它在等人這件事比「已送達,等待
+                    # Claude Code 開始…」更接近真相,app 端優先級也照這個排。
+                    status["blocked"] = True
                 store.set_status(status)
                 # CC_TOKEN_STREAM(預設 OFF):busy + 有訂閱者才啟動快節奏
                 # pane-diff 子迴圈(約 1s,取代外圈 sleep);idle/無人看零成本。
