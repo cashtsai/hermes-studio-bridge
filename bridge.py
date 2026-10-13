@@ -11864,6 +11864,19 @@ _CC_HOOK_TTL = 600.0
 # 小時)。偵測到世代已變就立刻停手,不再送下一次 Escape。
 _CC_TURN_GEN: dict[str, int] = {}
 
+# 回合起算時間(epoch 秒),給 app 的 WorkingBar 顯示「已 N 秒」。
+#
+# 刻意**不**沿用 `_CC_HOOK_STATE[name]["updated_at"]`:那份有 600 秒 TTL,而
+# 長回合跑過 10 分鐘正是最需要「它還活著」訊號的時候 —— TTL 一過,計時就會
+# 憑空消失,畫面退回只有一顆脈動點,跟 2 秒前看起來一模一樣。
+#
+# 寫入:UserPromptSubmit hook(= CLI 真的收到一則使用者輸入)。
+# 清除:Stop hook,以及 `_cc_status_core` 每次看到 busy=False —— 後者是對
+# 「Stop hook 漏掉」的防線:卡片開著時 status 每 1.2~2.5 秒打一次,所以殘留
+# 最多只會活到下一次輪詢,不會讓下一個回合繼承一個過早的起算點(那會讓畫面
+# 謊報「已 3 小時」)。
+_CC_TURN_STARTED_AT: dict[str, float] = {}
+
 # Hard ceiling for any single tmux invocation. tmux normally answers in ms; a
 # hung tmux server used to hang the handler (and its _BG_TASKS entry) forever.
 _TMUX_TIMEOUT = 15.0
@@ -14455,8 +14468,11 @@ def _cc_pane_busy(pane: str, title: str | None = None) -> bool:
 
 def _cc_pane_blocked(pane: str, title: str | None = None) -> bool:
     """CC pane 卡審批判讀(權限/確認選單 → blocked)—— herdr 語意的新能力。
-    給 agent_call「target 卡審批提前回報」等後續功能取用;本檔刻意不在既有
-    路徑接線(選單的**結構化解析**仍走 _cc_prompt,那邊要選項不是 bool)。"""
+
+    選單的**結構化解析**仍走 `_cc_prompt`(那邊要選項、不是 bool)。這支只回
+    「它在等人」這個事實,用在 `_cc_prompt` **解不出**選項的時候 —— 見
+    `_cc_status_core` 裡 `st["blocked"]` 的註解(2026-08-18 隱形卡住事故)。
+    2026-10-13 之前這支沒有任何生產呼叫點,所以那個事故的洞一直沒被補上。"""
     return cc_detect.classify(pane, title)["state"] == "blocked"
 
 
@@ -14885,11 +14901,15 @@ def _cc_hook_commit(name: str, event: str, body: dict, hook_sid: str,
              "source": "hook"}
     if event == "Stop":
         state["last_assistant_message"] = body.get("last_assistant_message")
+        _CC_TURN_STARTED_AT.pop(name, None)
     if event == "UserPromptSubmit":
         # P0 修復(root cause #3):新 turn 開始 → 世代編號 +1,讓仍在跑的
         # _cc_interrupt_core 重試迴圈偵測「原目標 turn 已結束」,不再誤送
         # Escape 進新 turn。放在 commit 統一寫入點 → 延後消歧路徑也會 bump。
         _CC_TURN_GEN[name] = _CC_TURN_GEN.get(name, 0) + 1
+        # 回合起算點(見 _CC_TURN_STARTED_AT 的註解)。不覆寫既有值沒有意義 ——
+        # UserPromptSubmit 本身就代表一則新輸入,舊起算點已經過期。
+        _CC_TURN_STARTED_AT[name] = state["updated_at"]
     _CC_HOOK_STATE[name] = state
     _log_event("cc_hook_state",
                name=name,
@@ -15182,6 +15202,7 @@ async def _cc_status_core(name: str) -> dict:
     """CC session 的 busy/mode/prompt 判讀 — /ccsessions status 端點與
     Phase 0 卡片 follower 共用同一份真相。"""
     if not await _tmux_alive(name):
+        _CC_TURN_STARTED_AT.pop(name, None)
         return {"busy": False, "running": False, "mode": None, "prompt": None}
     pane = await _tmux_capture_cached(name)
     hook_state = _cc_fresh_hook_state(name)
@@ -15225,6 +15246,28 @@ async def _cc_status_core(name: str) -> dict:
             prompt = ask
     await _cc_refine_q_index(name, prompt)
     st = {"busy": busy, "running": True, "mode": mode, "prompt": prompt}
+    # ── 兩個新增欄,舊 app 不讀不受影響 ────────────────────────────────
+    # `busy_since`:回合起算時間(epoch 秒)。app 的 WorkingBar 原本只有一顆
+    # 脈動點,在 2 秒與 20 分鐘看起來一模一樣 —— 遠端遙控最怕的就是這個:
+    # 使用者分不出「在跑」和「死了」。跳動的秒數是「還活著」最直接的訊號。
+    # 不知道就不報(省略欄位),不拿「我第一次看到它在忙」充當起算點 —— 那個
+    # 數字會對一個跑了半小時的回合說「已 2 秒」。
+    if busy:
+        started = _CC_TURN_STARTED_AT.get(name)
+        if started:
+            st["busy_since"] = started
+    else:
+        # 防 Stop hook 漏掉:看到不忙就把起算點清掉,殘留最多活到下一次輪詢。
+        _CC_TURN_STARTED_AT.pop(name, None)
+    # `blocked`:**它在等人,但我解不出選項**。
+    # 2026-08-18 的「session 叫不起來」事故就是這個狀態:pane 停在一個 Pocket
+    # 的結構化解析接不住的確認框 → hook 沒在忙、`_cc_prompt` 回 None → 回給
+    # app 的狀態與「真的閒置」逐欄相同,畫面上完全看不出差別。當時得靠
+    # scripts/cc-stuck-scan.sh 掃出來、再請人走到電腦前按鍵。
+    # 這裡只回報「在等人」這個事實,**不猜選項** —— 猜了就是替使用者按鈕。
+    # 保守性來自 cc_detect.classify 的預設 fallback 是 idle:沒有規則明確命中
+    # blocked 就不會亮,所以不會對正常閒置的 session 誤報。
+    st["blocked"] = bool(prompt is None and not busy and _cc_pane_blocked(pane))
     if jsonl:
         usage, plan = _cc_scan_jsonl(jsonl)
         if usage:
