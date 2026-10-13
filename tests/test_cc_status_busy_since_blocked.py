@@ -168,6 +168,7 @@ class BlockedTest(_Harness):
         """前提自檢:上面那條靠的是 manifest 規則,規則漂了這裡會先紅。"""
         self.assertEqual(cc_detect.classify(BLOCKED_PANE)["state"], "blocked")
 
+
     def test_plain_idle_is_not_blocked(self):
         """不得誤報 —— 誤報的代價是使用者去找一個不存在的確認框。"""
         self.pane = IDLE_PANE
@@ -194,6 +195,19 @@ class BlockedTest(_Harness):
 
 
 class WiringTest(unittest.TestCase):
+    """這個 class **不** stub 任何東西 —— 問的是真貨。"""
+
+    def test_real_cc_prompt_cannot_parse_the_blocked_pane(self):
+        """**前提的真正自檢。**
+
+        BlockedTest 把 `_cc_prompt` 換成回 None 的假貨。如果真貨其實解得出這個
+        框,那整條修就是在補一個不存在的洞 —— 而測試會一直綠。這條直接問真貨。
+        """
+        self.assertIsNone(bridge._cc_prompt(BLOCKED_PANE),
+                          "真的 _cc_prompt 若解得出來,blocked 這條就沒必要")
+        self.assertFalse(bridge._cc_pane_busy(BLOCKED_PANE))
+        self.assertTrue(bridge._cc_pane_blocked(BLOCKED_PANE))
+
 
     def test_hook_commit_records_and_clears_turn_start(self):
         body = {"cwd": "/tmp", "last_assistant_message": "done"}
