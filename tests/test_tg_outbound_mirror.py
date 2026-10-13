@@ -8,7 +8,11 @@ Pocket 對人格發話 / 人格回覆 → 貼進同一條 Telegram 聊天室」�
 **不會真的呼叫 Bot API、不碰任何正式聊天室**。
 
 驗的條款:
-1. 預設關閉:沒設 `POCKET_TG_MIRROR_OUTBOUND` → 完全不動作(production 零改變)。
+1. 關得掉:env 明示 `off`、或使用者在 App 關掉 → 完全不動作。
+   (2026-10-12 機主拍板把**預設**從 off 翻成 on —— 原本兩支 installer
+   都沒設 env,出貨等於永遠關著,而文案寫「桌面與手機同一份對話」。
+   原條款保護的「不要悄悄對外投遞」改由兩道守門延續:預設開仍然
+   **解不到 target 就空轉**,而且 env 與使用者偏好都能強制關。)
 2. chat 解析:從 gateway session_key 取 chat_id/thread_id,含 dm/群組/畸形 key。
 3. 目標解析:chat 與 ACP session-pinning 挑的是**同一筆** sessions.json entry
    (寫進哪條 session,就貼到哪個聊天室);缺 bot token / 缺對映 → 不投。
@@ -50,8 +54,8 @@ import time
 _TMP_CANON = tempfile.mkdtemp(prefix="tgout-canon-")
 os.environ["POCKET_CANON_DB"] = os.path.join(_TMP_CANON, "canonical.db")
 os.environ.setdefault("BRIDGE_TOKEN", "test-unit-token")
-# 預設關閉的條款要先測,所以這裡刻意不預設開啟。
-os.environ.pop("POCKET_TG_MIRROR_OUTBOUND", None)
+# 「關得掉」的條款要先測,所以這裡刻意用 env 明示 off(預設已改為 on)。
+os.environ["POCKET_TG_MIRROR_OUTBOUND"] = "off"
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import bridge  # noqa: E402  (import 觸發 _canon_init)
@@ -124,12 +128,16 @@ REPLY_WITH_STEPS = (REPLY_BODY +
                     "讀取班表\n查詢日曆\n</details>")
 
 
-# ── 1. 預設關閉 ─────────────────────────────────────────────────────────
-check("mode() 預設 off", tg_outbound.mode() == "off")
+# ── 1. 關得掉 ───────────────────────────────────────────────────────────
+check("env off → mode() off", tg_outbound.mode() == "off")
 tg_outbound.reset_state()
 r = run(tg_outbound.mirror(_home, SESSION, "user", "在嗎", "mid-off"))
-check("預設關閉:不投遞", r["sent"] == 0 and r["skipped"] == "disabled")
-check("預設關閉:outbox 空", tg_outbound.outbox() == [])
+check("關掉時:不投遞", r["sent"] == 0 and r["skipped"] == "disabled")
+check("關掉時:outbox 空", tg_outbound.outbox() == [])
+# 預設(無 env、使用者沒設過)現在是 on —— 翻預設那一刀的核心斷言。
+# 細部優先序(env > 使用者 > 預設)另有 tests/test_telegram_sync_setting.py。
+os.environ.pop("POCKET_TG_MIRROR_OUTBOUND", None)
+check("無 env → 預設 on", tg_outbound.mode() == "on")
 
 # 之後全部在 dry-run 下跑 —— 不會有任何真的 Bot API 呼叫。
 os.environ["POCKET_TG_MIRROR_OUTBOUND"] = "dry"
