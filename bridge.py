@@ -4630,6 +4630,15 @@ async def _persona_content_stream(model: str, prompt: str):
                 else:
                     steps.append({"name": str(val), "cmd": "", "result": "",
                                   "note": "🔐 自動允許"})
+            elif kind == "perm_denied":
+                # 認不出「只允許這一次」→ acp_client fail-closed 拒絕了。
+                # 一定要看得見:工具沒跑完,回覆可能因此不完整。
+                note = f"⛔ 已拒絕 {val}(認不出可放行的選項)"
+                if steps:
+                    steps[-1]["note"] = note
+                else:
+                    steps.append({"name": str(val), "cmd": "", "result": "",
+                                  "note": note})
             elif kind == "status":
                 yield ("status", val)
             elif kind == "usage":
@@ -25453,6 +25462,8 @@ def _fmt_item(kind, val):
         return f"<details><summary>↳ 結果</summary>\n\n```\n{short}{more}\n```\n\n</details>\n"
     if kind == "perm":
         return f"\n› 🔐 自動允許 **{val}**\n"
+    if kind == "perm_denied":
+        return f"\n› ⛔ 已拒絕 **{val}** —— 認不出可放行的選項,該步驟沒有執行\n"
     return None
 
 
