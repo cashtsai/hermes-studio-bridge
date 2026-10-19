@@ -64,7 +64,8 @@ import workers as workers_store
 from fastapi import (FastAPI, Request, HTTPException, WebSocket, WebSocketDisconnect,
                      File, Form, UploadFile)
 from fastapi.responses import (JSONResponse, StreamingResponse, FileResponse,
-                               HTMLResponse, PlainTextResponse, Response)
+                               HTMLResponse, PlainTextResponse, RedirectResponse,
+                               Response)
 from starlette.websockets import WebSocketState
 
 import acp_client
@@ -9477,6 +9478,22 @@ def _pair_boot_code() -> str:
         return code
 
 
+def _pair_boot_ok(request: Request, *, allow_cookie: bool = False) -> bool:
+    """`_pair_check_boot` 的述詞版(回 bool,不丟例外)。常數時間比較。
+
+    拆出來的理由(2026-10-19 輸入頁):`GET /console` 要能分辨「憑證不對」與
+    「來源不可信」—— 前者要回輸入頁、後者必須維持裸 403。用 try/except 去
+    接自己丟的 HTTPException 當控制流很髒,直接給述詞。
+    """
+    supplied = (request.query_params.get("boot") or "").strip()
+    # 比 bytes 不比 str:`hmac.compare_digest` 對含非 ASCII 的 str 會丟 TypeError
+    # (`?boot=中文` 原本會變 500)。bytes 版對任何輸入都安全,仍是常數時間。
+    if supplied and hmac.compare_digest(supplied.encode("utf-8", "ignore"),
+                                        _pair_boot_code().encode("utf-8")):
+        return True
+    return bool(allow_cookie and _console_cookie_ok(request))
+
+
 def _pair_check_boot(request: Request, *, allow_cookie: bool = False) -> None:
     """boot code 閘:缺/錯一律 403(錯誤形狀同其他 pair 4xx)。常數時間比較。
 
@@ -9486,12 +9503,8 @@ def _pair_check_boot(request: Request, *, allow_cookie: bool = False) -> None:
     鑄配對碼的端點(`/pair/qr`、`/pair/qr.json`)**一律維持只認 query** ——
     cookie 外洩頂多能看 console 頁面殼,換不到可以接管主機的 pairing code。
     """
-    supplied = (request.query_params.get("boot") or "").strip()
-    if supplied and hmac.compare_digest(supplied, _pair_boot_code()):
-        return
-    if allow_cookie and _console_cookie_ok(request):
-        return
-    raise HTTPException(status_code=403, detail="invalid boot code")
+    if not _pair_boot_ok(request, allow_cookie=allow_cookie):
+        raise HTTPException(status_code=403, detail="invalid boot code")
 
 
 try:  # 啟動即產生/載入,安裝器與人工查檔都能立刻拿到同一枚碼
@@ -9781,7 +9794,10 @@ _CONSOLE_SECURITY_HEADERS = {
         "default-src 'none'; "
         "script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; "
         "img-src 'self' data: blob:; media-src 'self' blob:; "
-        "connect-src 'self'; base-uri 'none'; frame-ancestors 'none'"),
+        # form-action **不會** fallback 到 default-src(CSP 規格),所以要明寫 ——
+        # 輸入頁是個 <form>,少了這條就等於沒限制它能 POST 去哪。
+        "connect-src 'self'; form-action 'self'; "
+        "base-uri 'none'; frame-ancestors 'none'"),
     "Referrer-Policy": "no-referrer",
     "X-Content-Type-Options": "nosniff",
     "X-Frame-Options": "DENY",
@@ -9865,21 +9881,209 @@ def _console_set_cookie(request: Request, resp: Response) -> None:
     )
 
 
+# ── 一次性 claim cookie:把「剛驗過碼」交棒給前端(2026-10-19)──────────
+# 問題:輸入頁讓人進得了 /console,但**全新的瀏覽器**進去之後 console 仍是
+# 「未配對」—— static/console/app.js 的 bootstrap 要嘛從 localStorage 拿舊
+# token、要嘛從 `location.search` 讀 `?boot=` 去換 device token;303 之後網址上
+# 沒有 `?boot=`(這正是「碼不留在網址列」的本意),它就卡住。
+#
+# 解法:`POST /console/auth` 驗過碼的**那一瞬間**,伺服器手上正好有碼 ——
+# 就地鑄一枚一次性 pairing code(沿用 `_pair_mint_code`,就是 /pair/qr.json
+# 在發的那種),放進一枚**獨立的短命 cookie** 交給前端,前端拿去打
+# `/pair/claim` 換 device token。權限等價於「他本來就能用 ?boot= 連結拿到的
+# 東西」,沒有擴大。
+#
+# ⚠️ **安全邊界(不准動)**:鑄碼**只發生在這一次 POST 驗過碼的當下**。長命的
+# `pocket_console` cookie 仍然換不到 pairing code —— `GET /console` 不論帶
+# 的是 cookie 還是 ?boot=,都**不會**簽發 claim cookie。這條守著 cookie 閘
+# 原本的設計前提:「cookie 外洩頂多能看頁面殼,換不到可以接管主機的碼」。
+#
+# 三個刻意的設計:
+#   1. **與 `pocket_console` 分開的 cookie**:那枚是 HttpOnly 的長命憑證,
+#      這枚非 HttpOnly(前端要讀)且 60 秒就死 —— 兩種壽命/用途不混在一起。
+#   2. **非 HttpOnly 不是退步**:這枚裝的是一次性碼,用掉即失效;而它換到的
+#      device token 本來就存在前端讀得到的 localStorage 裡(同一個 XSS 面)。
+#   3. **pairing code 的 TTL 跟著 cookie 走**(60 秒,`_pair_clamp_ttl` 的下限),
+#      不放寬既有機制。cookie 死了碼也沒人拿得到,留長只是讓死碼佔 `_PAIR_CODES`。
+_CONSOLE_CLAIM_COOKIE_NAME = "pocket_console_claim"
+_CONSOLE_CLAIM_COOKIE_TTL = 60          # 秒;短到只夠「303 落地 → 立刻 claim」
+
+
+def _console_mint_claim_code() -> str:
+    """驗過碼的當下鑄一枚一次性配對碼;鑄不出來(被節流)回空字串。
+
+    鑄碼節流**沿用 `/pair/qr.json` 那一桶**(`_pair_qr_check_mint_rate`,
+    10/min)—— 同一個 boot code 持有者的總鑄碼預算是**一個**桶,這條路不另開。
+    超額時**不讓登入失敗**:console cookie 照種、照樣 303 進頁面,只是這次拿
+    不到 claim cookie(前端會停在「未配對」,使用者重按一次即可)。
+    """
+    try:
+        _pair_qr_check_mint_rate()
+    except HTTPException:
+        _log_event("console_claim_mint_throttled")
+        return ""
+    return _pair_mint_code(None, ttl=_pair_clamp_ttl(_CONSOLE_CLAIM_COOKIE_TTL))
+
+
+def _console_set_claim_cookie(request: Request, resp: Response, code: str) -> None:
+    """種一次性 claim cookie。`httponly=False` 是**刻意的** —— 前端要用
+    `document.cookie` 讀它(見本節開頭的安全論證)。"""
+    if not code:
+        return
+    scheme = (getattr(getattr(request, "url", None), "scheme", "") or "").lower()
+    resp.set_cookie(
+        _CONSOLE_CLAIM_COOKIE_NAME, code,
+        max_age=_CONSOLE_CLAIM_COOKIE_TTL, path=_CONSOLE_COOKIE_PATH,
+        httponly=False, samesite="strict", secure=(scheme == "https"),
+    )
+
+
+# ── 配對碼輸入頁(2026-10-19)──────────────────────────────────────────────
+# 缺口:機主在電腦前開 `http://<tailnet-host>:8081/console`(沒帶 ?boot=)只會
+# 吃一個**裸 403**,畫面上沒有任何可以輸入的地方 —— 他只能自己把碼拼進網址列。
+# 實際情境是:人在電腦前 → 從 iPhone 的 Pocket(設定 → 桌面控制台)讀出碼 →
+# 手打進網頁。所以沒帶碼時改回一頁極簡輸入頁,POST 驗過就種 cookie。
+#
+# 這是一道**認證門面**,不是普通頁面,所以有三條硬規矩:
+#   1. **輸入頁只在 `_pair_local_only` 通過時才給**(必須直連,帶任何轉送標頭
+#      一律拒)。公網 tunnel / tailscale serve / 任何 proxy 進來的維持裸 403,
+#      連表單都看不到 —— 否則等於把一個可暴力破解的登入框掛到網路上。
+#   2. **錯誤訊息永遠同一句**,不透露碼長度/前綴對不對(見 `_CONSOLE_LOGIN_ERR`)。
+#   3. **碼不進日誌**:走 POST body(不是 query,uvicorn access log 會記 query
+#      string),失敗事件只記來源 IP 與次數,一個字的碼都不寫。
+_CONSOLE_LOGIN_ERR = "bad-code"       # 哨兵:只是「要不要顯示錯誤列」的旗號。
+# 刻意只有一種 —— 錯誤原因(空的/太短/前綴對)一律同一句,見下方 role="alert"。
+
+
+def _console_login_html(error: str = "") -> str:
+    """輸入頁 HTML。自包含(inline CSS、零外部資源、零 JS),繁中+英文並陳。
+
+    刻意不引 /console/static/* —— 這頁在「還沒認證」的狀態下送出,不該讓未認證
+    的瀏覽器去抓 console 的資產,也不該依賴 service worker 的快取狀態。
+    """
+    err = ("<p class=\"err\" role=\"alert\">配對碼不正確,請再試一次。<br>"
+           "<span class=\"en\">That pairing code didn’t work. Please try again."
+           "</span></p>\n") if error else ""
+    return """<!doctype html><html lang="zh-Hant"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Pocket 桌面控制台</title><style>
+:root{color-scheme:light dark;font-family:-apple-system,system-ui,"Noto Sans TC",sans-serif}
+body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:32px 16px}
+main{max-width:420px;width:100%}
+h1{font-size:1.3rem;margin:0 0 6px}
+p{margin:0 0 18px;line-height:1.6}
+.sub{opacity:.75;font-size:.95rem}
+.en{opacity:.6;font-size:.85rem}
+label{display:block;font-size:.85rem;opacity:.75;margin:0 0 6px}
+input{width:100%;box-sizing:border-box;font:inherit;font-size:1.05rem;padding:11px 12px;
+  border:1px solid color-mix(in srgb,currentColor 30%,transparent);border-radius:9px;
+  background:color-mix(in srgb,currentColor 6%,transparent);color:inherit;
+  letter-spacing:.02em}
+input:focus{outline:2px solid color-mix(in srgb,currentColor 45%,transparent);outline-offset:1px}
+button{width:100%;margin-top:12px;font:inherit;font-weight:600;padding:11px 12px;border:0;
+  border-radius:9px;background:currentColor;cursor:pointer}
+button span{color:Canvas;mix-blend-mode:normal}
+.where{margin:20px 0 0;font-size:.88rem;padding:13px 14px;border-radius:9px;
+  border:1px solid color-mix(in srgb,currentColor 22%,transparent)}
+.err{color:#d9534f;font-size:.9rem;margin:0 0 14px}
+.note{margin:14px 0 0;font-size:.78rem;opacity:.55}
+</style></head><body><main>
+<h1>Pocket 桌面控制台</h1>
+<p class="sub">請輸入配對碼以開啟控制台。<br>
+<span class="en">Enter your pairing code to open the console.</span></p>
+__ERR__<form method="post" action="/console/auth">
+<label for="code">配對碼 / Pairing code</label>
+<input id="code" name="code" type="text" required autofocus
+ autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false"
+ enterkeyhint="go" aria-label="配對碼 Pairing code">
+<button type="submit"><span>進入控制台 / Continue</span></button>
+</form>
+<p class="where">配對碼在 iPhone 的 Pocket:<b>設定 → 桌面控制台</b>。<br>
+<span class="en">Find the code in Pocket on your iPhone:
+<b>Settings → Desktop Console</b>.</span></p>
+<p class="note">驗證成功後,這個瀏覽器會記住 14 天。<br>
+<span class="en">This browser stays signed in for 14 days.</span></p>
+</main></body></html>""".replace("__ERR__", err)
+
+
+def _console_login_response(request: Request, *, error: str = "") -> HTMLResponse:
+    """401 + 輸入頁。401 而不是 200:語意是「還沒認證」,而且不會被誤當成
+    console 本體快取(`_CONSOLE_SECURITY_HEADERS` 已帶 `Cache-Control: no-store`)。
+    瀏覽器對 401 + HTML body 照樣正常渲染。"""
+    return HTMLResponse(_console_login_html(error), status_code=401,
+                        headers=_CONSOLE_SECURITY_HEADERS)
+
+
+# 輸入頁的嘗試節流:**沿用** token 閘那張 per-client 有界表
+# (`_AUTH_FAILS_BY_CLIENT`,60 秒滑動窗 + `_AUTH_TABLE_MAX` 硬上限 + 自動清理),
+# 不另外發明一張會漏記憶體的 dict。差別只有門檻:token 是機器帶的
+# (`_AUTH_FAIL_MAX` = 12),這個是**人手打的**,6 次/分鐘已經很寬容。
+# 超額時**連比都不比**(直接 429 + Retry-After),這樣才是真的退避 —— 只回 429
+# 但照樣驗碼的話,暴力破解者根本不在乎狀態碼。
+_CONSOLE_AUTH_FAIL_MAX = 6
+_CONSOLE_CODE_MAX_LEN = 256       # 比對前先夾長度(錯誤訊息仍同一句,不洩漏)
+
+
+def _console_auth_retry_after(request: Request) -> float:
+    """已超額時還要等幾秒(= 最舊那筆滑出 60 秒窗);沒超額回 0。"""
+    now = time.monotonic()
+    with _AUTH_LOCK:
+        dq = _AUTH_FAILS_BY_CLIENT.get(_client_host(request) or "?")
+        if not dq:
+            return 0.0
+        while dq and now - dq[0] > _AUTH_FAIL_WINDOW:
+            dq.popleft()
+        if len(dq) < _CONSOLE_AUTH_FAIL_MAX:
+            return 0.0
+        return max(1.0, _AUTH_FAIL_WINDOW - (now - dq[0]))
+
+
+def _console_auth_note_failure(request: Request) -> None:
+    """記一次輸入頁失敗(進同一張 per-client 桶)。**不記碼**,只記來源。"""
+    with _AUTH_LOCK:
+        _auth_fail_bump_locked(request, time.monotonic())
+    _log_event("console_auth_failed", client=_client_host(request))
+
+
+def _console_login_cross_site(request: Request) -> bool:
+    """擋跨站送來的表單 POST。
+
+    `_pair_local_only` 只能證明「這個 **socket** 是直連本機/tailnet」,不能證明
+    「是**本機的人**按的」:機主瀏覽器開到的任何惡意網頁,都能對
+    `http://127.0.0.1:8081/console/auth` 送 no-cors 表單 POST —— 從 bridge 看
+    就是一條完美的本機直連。它讀不到回應(CORS),所以拿不到成敗,但等於白送
+    一條猜碼通道。`Sec-Fetch-Site` 是瀏覽器貼的、網頁改不掉,跨站時值是
+    `cross-site`/`same-site` → 擋。非瀏覽器客戶端(curl/測試)不送這個標頭 →
+    放行(它們本來就過了 local-only 那關)。
+    """
+    site = (request.headers.get("sec-fetch-site") or "").strip().lower()
+    return bool(site) and site not in ("same-origin", "none")
+
+
 def _console_guard(request: Request) -> None:
     """/console 的門:旗標關 → 404(對外表現同不存在);boot code 仍是真閘。
 
     `allow_cookie=True` 只在這裡 —— PWA 的 start_url 不帶 query,見
     `_pair_check_boot` 與 `_console_set_cookie` 的註解。
+
+    順序是刻意的:**先 `_pair_local_only`**。輸入頁上線後,「來源不可信」與
+    「憑證不對」要走不同結局(裸 403 vs 輸入頁),先驗來源才分得開。
     """
     if not POCKET_CONSOLE_ENABLED:
         raise HTTPException(status_code=404, detail="not found")
+    _pair_local_only(request)       # 第一關:必須是直連的 loopback/tailnet
     _pair_check_boot(request, allow_cookie=True)   # 真閘:boot code 或簽過名的 cookie
-    _pair_local_only(request)       # defense-in-depth 第二層
 
 
 @app.get("/console")
 async def console_page(request: Request):
-    _console_guard(request)
+    if not POCKET_CONSOLE_ENABLED:
+        raise HTTPException(status_code=404, detail="not found")
+    # local-only 先驗:不是直連(帶了 XFF/Forwarded/CF-Connecting-IP/X-Real-IP)
+    # 就維持裸 403 —— **連輸入框都不給**,見上方 _console_login_html 的規矩 1。
+    _pair_local_only(request)
+    if not _pair_boot_ok(request, allow_cookie=True):
+        return _console_login_response(request)     # 沒碼/碼錯/cookie 過期 → 輸入頁
     index = os.path.join(_CONSOLE_DIR, "index.html")
     try:
         html = open(index, encoding="utf-8").read()
@@ -9887,6 +10091,69 @@ async def console_page(request: Request):
         raise HTTPException(status_code=404, detail="console not installed")
     resp = HTMLResponse(html, headers=_CONSOLE_SECURITY_HEADERS)
     _console_set_cookie(request, resp)   # 滑動視窗:每次成功開頁都續命
+    return resp
+
+
+async def _console_auth_submitted_code(request: Request) -> str:
+    """從 POST body 取碼。表單(瀏覽器)與 JSON(自動化)都收。
+
+    **刻意不收 query string** —— uvicorn 的 access log 會記整條帶 query 的路徑,
+    碼走 query 就等於寫進日誌(`/console?boot=` 的既有包袱不擴大到這裡)。
+    """
+    ctype = (request.headers.get("content-type") or "").lower()
+    code = ""
+    if "json" in ctype:
+        try:
+            body = await request.json()
+        except Exception as _exc:  # noqa: BLE001 — 壞 JSON 當作沒填,不回 500
+            _log_exc("console_auth_json", _exc, expected=True)
+            body = None
+        if isinstance(body, dict):
+            code = str(body.get("code") or body.get("boot") or "")
+    else:
+        try:
+            form = await request.form()
+        except Exception as _exc:  # noqa: BLE001 — 壞 multipart 同上
+            _log_exc("console_auth_form", _exc, expected=True)
+            form = {}
+        code = str(form.get("code") or "")
+    return code.strip()[:_CONSOLE_CODE_MAX_LEN]
+
+
+@app.post("/console/auth")
+async def console_auth(request: Request):
+    """驗配對碼 → 種 cookie → **303 到 /console(不帶任何 query)**。
+
+    303 而不是 200/HTML:成功後網址列與瀏覽歷史裡**不留碼**,重新整理也不會
+    重送表單。憑證完全沿用 `_console_cookie_value()` 那套(HMAC(boot, ts),
+    boot 一換全部失效),不另發一種新憑證。
+
+    鑄配對碼的端點(`/pair/qr`、`/pair/qr.json`)一個字都沒動,維持只認 query。
+    """
+    if not POCKET_CONSOLE_ENABLED:
+        raise HTTPException(status_code=404, detail="not found")
+    _pair_local_only(request)       # 與 GET 同一條線:非直連連表單都不該看到
+    if _console_login_cross_site(request):
+        raise HTTPException(status_code=403, detail="cross-site form post")
+    wait = _console_auth_retry_after(request)
+    if wait > 0:
+        # 超額 → 連比都不比(真退避)。訊息不提碼的任何性質。
+        raise HTTPException(status_code=429, detail="too many attempts; slow down",
+                            headers={"Retry-After": str(int(wait) + 1)})
+    code = await _console_auth_submitted_code(request)
+    if not code or not hmac.compare_digest(code.encode("utf-8", "ignore"),
+                                           _pair_boot_code().encode("utf-8")):
+        _console_auth_note_failure(request)
+        return _console_login_response(request, error=_CONSOLE_LOGIN_ERR)
+    resp = RedirectResponse("/console", status_code=303,
+                            headers=dict(_CONSOLE_SECURITY_HEADERS))
+    _console_set_cookie(request, resp)
+    # 交棒給前端:只有「這一次驗過碼」才鑄碼,長命 cookie 永遠換不到(見
+    # _CONSOLE_CLAIM_COOKIE_NAME 上方的安全邊界)。碼放 cookie 不放 query。
+    claim = _console_mint_claim_code()
+    _console_set_claim_cookie(request, resp, claim)
+    _log_event("console_auth_ok", client=_client_host(request),
+               claim=bool(claim))      # 只記「有沒有鑄」,不記碼
     return resp
 
 
