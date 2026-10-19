@@ -9966,41 +9966,83 @@ def _console_login_html(error: str = "") -> str:
            "</span></p>\n") if error else ""
     return """<!doctype html><html lang="zh-Hant"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Pocket 桌面控制台</title><style>
-:root{color-scheme:light dark;font-family:-apple-system,system-ui,"Noto Sans TC",sans-serif}
-body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:32px 16px}
-main{max-width:420px;width:100%}
-h1{font-size:1.3rem;margin:0 0 6px}
-p{margin:0 0 18px;line-height:1.6}
-.sub{opacity:.75;font-size:.95rem}
-.en{opacity:.6;font-size:.85rem}
-label{display:block;font-size:.85rem;opacity:.75;margin:0 0 6px}
-input{width:100%;box-sizing:border-box;font:inherit;font-size:1.05rem;padding:11px 12px;
-  border:1px solid color-mix(in srgb,currentColor 30%,transparent);border-radius:9px;
-  background:color-mix(in srgb,currentColor 6%,transparent);color:inherit;
-  letter-spacing:.02em}
-input:focus{outline:2px solid color-mix(in srgb,currentColor 45%,transparent);outline-offset:1px}
-button{width:100%;margin-top:12px;font:inherit;font-weight:600;padding:11px 12px;border:0;
-  border-radius:9px;background:currentColor;cursor:pointer}
-button span{color:Canvas;mix-blend-mode:normal}
-.where{margin:20px 0 0;font-size:.88rem;padding:13px 14px;border-radius:9px;
-  border:1px solid color-mix(in srgb,currentColor 22%,transparent)}
-.err{color:#d9534f;font-size:.9rem;margin:0 0 14px}
-.note{margin:14px 0 0;font-size:.78rem;opacity:.55}
+<title>Pocket 桌面控制台</title>
+<meta name="theme-color" content="#FFF2D6" media="(prefers-color-scheme:light)">
+<meta name="theme-color" content="#131317" media="(prefers-color-scheme:dark)">
+<style>
+/* 品牌色 = CIS v2 / App 的 PocketPalettes(pocket 與 dark 兩套)。
+   這頁沒有 JS,讀不到 console 的 data-theme 選擇,所以跟系統偏好走。
+   icon 用 inline SVG:維持「零外部資源」,又能無損縮放。 */
+:root{
+  --bg:#FFF2D6; --card:#FFFFFF; --ink:#17171A; --muted:#6E6A64;
+  --line:rgba(23,23,26,.14); --accent:#EE2D2A; --on-accent:#FFFFFF; --bad:#C62828;
+  color-scheme:light dark;
+  font-family:-apple-system,system-ui,"PingFang TC","Noto Sans TC",sans-serif;
+}
+@media (prefers-color-scheme:dark){
+  :root{--bg:#131317; --card:#1E1E25; --ink:#F2F2F5; --muted:#9A9AA2;
+        --line:rgba(255,255,255,.12); --accent:#FF4D4A; --bad:#E5484D;}
+}
+*{box-sizing:border-box}
+body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;
+  padding:32px 16px;background:var(--bg);color:var(--ink)}
+main{max-width:400px;width:100%}
+.head{display:flex;flex-direction:column;align-items:center;text-align:center;margin:0 0 20px}
+.ico{width:60px;height:60px;border-radius:14px;display:block;
+  box-shadow:0 6px 18px rgba(23,23,26,.16)}
+h1{font-size:1.25rem;margin:14px 0 4px;letter-spacing:.2px}
+p{margin:0;line-height:1.6}
+.sub{color:var(--muted);font-size:.93rem}
+.en{opacity:.72;font-size:.84rem}
+.card{background:var(--card);border:1px solid var(--line);border-radius:14px;
+  padding:20px 18px;box-shadow:0 10px 30px rgba(23,23,26,.08)}
+label{display:block;font-size:.82rem;color:var(--muted);margin:0 0 7px;font-weight:600}
+input{width:100%;font:inherit;font-size:1.05rem;padding:12px;letter-spacing:.02em;
+  border:1px solid var(--line);border-radius:12px;background:var(--bg);color:var(--ink)}
+input:focus{outline:none;border-color:var(--accent);
+  box-shadow:0 0 0 3px color-mix(in srgb,var(--accent) 20%,transparent)}
+button{width:100%;margin-top:14px;font:inherit;font-weight:700;padding:12px;border:0;
+  border-radius:12px;background:var(--accent);color:var(--on-accent);cursor:pointer}
+button:hover{filter:brightness(1.07)}
+button:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.where{margin:16px 0 0;font-size:.86rem;color:var(--muted);padding:12px 13px;
+  border-radius:12px;border:1px solid var(--line)}
+.err{color:var(--bad);font-size:.9rem;margin:0 0 13px;font-weight:600}
+.note{margin:14px 0 0;font-size:.76rem;color:var(--muted);text-align:center}
 </style></head><body><main>
+<div class="head">
+<svg class="ico" viewBox="0 0 64 64" role="img" aria-label="Pocket">
+<defs><clipPath id="c"><rect width="64" height="64" rx="14"/></clipPath>
+<pattern id="s" width="13" height="13" patternUnits="userSpaceOnUse"
+ patternTransform="rotate(26)"><rect width="13" height="13" fill="#E03027"/>
+<rect width="6.5" height="13" fill="#FDF6E8"/></pattern></defs>
+<g clip-path="url(#c)">
+<rect width="64" height="64" fill="url(#s)"/>
+<path d="M0 17 64 30 64 64 0 64Z" fill="#4A70A5"/>
+<path d="M0 17 64 30" stroke="#D9A05B" stroke-width="1.2"
+ stroke-dasharray="2.6 2.6" fill="none"/>
+<g transform="rotate(-2.5 24 50)">
+<rect x="6" y="44" width="36" height="12.5" rx="1" fill="#EE2D2A"/>
+<text x="24" y="52.9" font-size="8.2" font-weight="800" fill="#fff"
+ text-anchor="middle" font-family="system-ui,sans-serif"
+ letter-spacing=".3">POCKET</text></g>
+</g></svg>
 <h1>Pocket 桌面控制台</h1>
 <p class="sub">請輸入配對碼以開啟控制台。<br>
 <span class="en">Enter your pairing code to open the console.</span></p>
+</div>
+<div class="card">
 __ERR__<form method="post" action="/console/auth">
 <label for="code">配對碼 / Pairing code</label>
 <input id="code" name="code" type="text" required autofocus
  autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false"
  enterkeyhint="go" aria-label="配對碼 Pairing code">
-<button type="submit"><span>進入控制台 / Continue</span></button>
+<button type="submit">進入控制台 / Continue</button>
 </form>
 <p class="where">配對碼在 iPhone 的 Pocket:<b>設定 → 桌面控制台</b>。<br>
 <span class="en">Find the code in Pocket on your iPhone:
 <b>Settings → Desktop Console</b>.</span></p>
+</div>
 <p class="note">驗證成功後,這個瀏覽器會記住 14 天。<br>
 <span class="en">This browser stays signed in for 14 days.</span></p>
 </main></body></html>""".replace("__ERR__", err)

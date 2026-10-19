@@ -4,17 +4,24 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Pocket Console</title>
+<!-- 主題要在第一次繪製前就套上,否則會閃一下預設色。CSP 允許 inline script。 -->
+<script>try{document.documentElement.dataset.theme=
+  localStorage.getItem("pocket-console-theme")||"pocket";}catch(e){}</script>
 <link rel="stylesheet" href="/console/static/style.css">
 <link rel="manifest" href="/console/manifest.json">
 <meta name="theme-color" content="#0e1116">
-<link rel="icon" href="/console/static/icon.svg" type="image/svg+xml">
+<link rel="icon" href="/console/static/icon-192.png" type="image/png">
+<link rel="apple-touch-icon" href="/console/static/icon-192.png">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-title" content="Pocket">
 </head>
 <body>
 <div id="app">
   <header id="topbar">
-    <div class="brand">Pocket <span class="brand-dim">Console</span></div>
+    <div class="brand">
+      <img class="brand-ico" src="/console/static/icon-192.png" alt="" width="22" height="22">
+      <span>Pocket <span class="brand-dim">Console</span></span>
+    </div>
     <nav id="mode-nav">
       <button class="mode-btn active" data-mode="agents">Agents</button>
       <button class="mode-btn" data-mode="files">檔案</button>
@@ -26,6 +33,7 @@
       <span id="awaiting-n">0</span> 件待審核
     </button>
     <span id="usage" class="usage hidden" title="今日用量／花費"></span>
+    <button id="theme-btn" class="icon-btn theme-btn" title="切換主題（Pocket／White／Dark，同 App）">◑</button>
     <div id="conn" class="conn" title="連線狀態"><span class="dot"></span><span id="conn-text">連線中…</span></div>
   </header>
 

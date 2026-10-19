@@ -16,33 +16,65 @@ const state = {
 };
 
 // ───────────────────────── bootstrap(取得 token)─────────────────────────
+const CLAIM_COOKIE = "pocket_console_claim";
+
+/** 讀一枚 cookie(claim cookie 刻意非 HttpOnly,就是要給這裡讀)。 */
+function readCookie(name) {
+  const hit = document.cookie.split("; ").find((c) => c.startsWith(name + "="));
+  return hit ? decodeURIComponent(hit.slice(name.length + 1)) : "";
+}
+
+/** 用完就地抹掉 —— 碼本來就是一次性,留著只是多一個可被 XSS 撿走的東西。 */
+function dropCookie(name) {
+  document.cookie = name + "=; Max-Age=0; path=/console; SameSite=Strict";
+}
+
+/** 一次性配對碼 → pdev- token(/pair/claim 不需 bearer)。 */
+async function claimToken(code) {
+  const r = await fetch("/pair/claim", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ code, device_name: "Console", platform: "web" }),
+  });
+  const claim = await r.json().catch(() => ({}));
+  if (!claim.token) throw new Error(claim.detail || "claim 無 token");
+  return claim.token;
+}
+
 async function bootstrap() {
   const saved = localStorage.getItem(TOKEN_KEY);
   if (saved) { state.token = saved; return true; }
 
+  // ① 主路徑(2026-10-19 起):在輸入頁打對碼 → bridge 303 回本頁,並種一枚
+  //    60 秒的一次性 claim cookie。網址上**不留碼**,所以要從 cookie 取。
+  const cookieCode = readCookie(CLAIM_COOKIE);
+  // ② 相容路徑:舊的 /console?boot=… 連結(書籤/捷徑)仍要能用。
   const boot = new URLSearchParams(location.search).get("boot");
-  if (!boot) { fatalAuth("缺 boot code —— 請用桌面印出的 /console?boot=… 連結開啟"); return false; }
+
+  if (!cookieCode && !boot) {
+    // 沒碼也沒 cookie:多半是 claim cookie 已過 60 秒。重新整理會被 bridge
+    // 擋回輸入頁(401),使用者再打一次碼即可。
+    fatalAuth("尚未配對 —— 請重新整理本頁，於輸入頁再輸入一次配對碼");
+    return false;
+  }
 
   try {
-    // 1) 用 boot code 鑄一次性配對碼
-    const qr = await (await fetch("/pair/qr.json?boot=" + encodeURIComponent(boot))).json();
-    if (!qr.ok) throw new Error(qr.error || "鑄碼失敗");
-    // payload = pocket://pair?...&code=<claim-code>
-    const code = new URLSearchParams(qr.payload.split("?")[1]).get("code");
-    if (!code) throw new Error("payload 無 code");
-    // 2) 裸 /pair/claim 換 pdev- token(不需 bearer/帳號)
-    const claim = await (await fetch("/pair/claim", {
-      method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ code, device_name: "Console", platform: "web" }),
-    })).json();
-    if (!claim.token) throw new Error("claim 無 token");
-    state.token = claim.token;
-    localStorage.setItem(TOKEN_KEY, claim.token);
-    // 3) 把 ?boot= 從網址列抹掉(別留在歷史/Referer)
-    history.replaceState(null, "", location.pathname);
+    let code = cookieCode;
+    if (!code) {
+      // 舊路徑才需要自己鑄碼;cookie 那枚是 bridge 已經鑄好的,不可重鑄。
+      const qr = await (await fetch("/pair/qr.json?boot=" + encodeURIComponent(boot))).json();
+      if (!qr.ok) throw new Error(qr.error || "鑄碼失敗");
+      code = new URLSearchParams(qr.payload.split("?")[1]).get("code");
+      if (!code) throw new Error("payload 無 code");
+    }
+    state.token = await claimToken(code);
+    localStorage.setItem(TOKEN_KEY, state.token);
+    if (cookieCode) dropCookie(CLAIM_COOKIE);
+    // 舊路徑:把 ?boot= 從網址列抹掉(別留在歷史/Referer)
+    if (boot) history.replaceState(null, "", location.pathname);
     return true;
   } catch (err) {
-    fatalAuth("配對失敗:" + err.message);
+    if (cookieCode) dropCookie(CLAIM_COOKIE);   // 壞/過期的碼不要留著重試
+    fatalAuth("配對失敗:" + err.message + "（重新整理可回到輸入頁重試）");
     return false;
   }
 }
@@ -259,16 +291,87 @@ function cardText(c) {
   return b.text || b.fallback_text || b.typed_text || (typeof c.body === "string" ? c.body : "");
 }
 
+// ───────────────────────── 主題(與 App 的 PocketPalettes 同名同值)─────────────
+// App 端三個 preset:pocket(預設,奶油暖底)/ white / dark。console 不能讀手機上
+// 的選擇(不同裝置),所以本機記一份,預設與 App 預設相同。
+const THEMES = ["pocket", "white", "dark"];
+const THEME_LABEL = { pocket: "Pocket", white: "White", dark: "Dark" };
+
+function applyTheme(id) {
+  const t = THEMES.includes(id) ? id : "pocket";
+  document.documentElement.dataset.theme = t;
+  try { localStorage.setItem("pocket-console-theme", t); } catch (e) {}
+  // PWA 的狀態列/標題列顏色跟著主題走(standalone 模式下看得出來)。
+  const meta = document.querySelector('meta[name="theme-color"]');
+  if (meta) {
+    meta.content = getComputedStyle(document.documentElement)
+      .getPropertyValue("--bg").trim() || "#FFF2D6";
+  }
+  const btn = $("theme-btn");
+  if (btn) btn.title = "主題:" + THEME_LABEL[t] + "（點擊切換，同 App 的三個主題）";
+}
+
+function cycleTheme() {
+  const now = document.documentElement.dataset.theme || "pocket";
+  applyTheme(THEMES[(THEMES.indexOf(now) + 1) % THEMES.length]);
+}
+
+// 散文類 kind 用無襯線讀;其餘(工具輸出/diff/log)才等寬。
+const PROSE_KINDS = new Set(["text", "markdown"]);
+
+function cardTime(ts) {
+  if (!ts) return "";
+  const d = new Date(ts * 1000);
+  if (isNaN(d)) return "";
+  const hhmm = String(d.getHours()).padStart(2, "0") + ":" +
+               String(d.getMinutes()).padStart(2, "0");
+  const today = new Date();
+  const sameDay = d.toDateString() === today.toDateString();
+  return sameDay ? hhmm : (d.getMonth() + 1) + "/" + d.getDate() + " " + hhmm;
+}
+
+// 依 turn_id 把卡片收成一個個回合;turn_id 缺漏時以「連續同 role」退而求其次,
+// 至少不會把一來一往黏成一整片。
+function groupTurns(cards) {
+  const turns = [];
+  for (const c of cards) {
+    const role = c.role === "user" ? "user" : "agent";
+    const key = c.turn_id != null ? "t:" + c.turn_id : null;
+    const last = turns[turns.length - 1];
+    const sameTurn = last && last.role === role &&
+                     (key != null ? last.key === key : last.key == null);
+    if (sameTurn) last.cards.push(c);
+    else turns.push({ key, role, cards: [c] });
+  }
+  return turns;
+}
+
 function renderCards() {
   const el = $("cards");
   const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
   if (!state.cards.length) { el.innerHTML = '<div class="placeholder">（還沒有卡片）</div>'; return; }
-  el.innerHTML = state.cards.map((c) => {
-    const role = c.role === "user" ? "user" : "agent";
-    const txt = cardText(c);
-    const kind = c.kind && c.kind !== "text" ? '<span class="kind">' + esc(c.kind) + "</span>" : "";
-    return '<div class="card ' + role + '">' + kind +
-           '<div class="card-body">' + esc(txt).replace(/\n/g, "<br>") + "</div></div>";
+  // 排序:優先用 ts(伺服器時間),缺的保持原插入順序 —— SSE 亂序到達時
+  // 才不會把回合排錯。slice() 避免就地改動 state.cards。
+  const ordered = state.cards
+    .map((c, i) => ({ c, i }))
+    .sort((a, b) => ((a.c.ts || 0) - (b.c.ts || 0)) || (a.i - b.i))
+    .map((x) => x.c);
+
+  el.innerHTML = groupTurns(ordered).map((t) => {
+    const who = t.role === "user" ? "你" : "Agent";
+    const time = cardTime(t.cards[t.cards.length - 1].ts);
+    const meta = '<div class="turn-meta"><span class="turn-who">' + who + "</span>" +
+                 (time ? '<span class="turn-time">' + esc(time) + "</span>" : "") + "</div>";
+    const body = t.cards.map((c) => {
+      const mono = PROSE_KINDS.has(c.kind || "text") ? "" : " mono";
+      const streaming = c.final === false ? " streaming" : "";
+      const kind = c.kind && c.kind !== "text"
+        ? '<span class="kind">' + esc(c.kind) + "</span>" : "";
+      return '<div class="card ' + t.role + mono + streaming + '">' + kind +
+             '<div class="card-body">' + esc(cardText(c)).replace(/\n/g, "<br>") +
+             "</div></div>";
+    }).join("");
+    return '<div class="turn ' + t.role + '">' + meta + body + "</div>";
   }).join("");
   if (atBottom) el.scrollTop = el.scrollHeight;
 }
@@ -330,6 +433,7 @@ function autosize() {
 function wire() {
   $("refresh").addEventListener("click", loadSessions);
   $("awaiting").addEventListener("click", jumpToAwaiting);
+  $("theme-btn").addEventListener("click", cycleTheme);
   $("newsess-open").addEventListener("click", () => $("newsess").classList.remove("hidden"));
   $("newsess-cancel").addEventListener("click", () => $("newsess").classList.add("hidden"));
   $("newsess-go").addEventListener("click", createSession);

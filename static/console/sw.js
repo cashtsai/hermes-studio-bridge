@@ -4,7 +4,9 @@
 // 給你一份三分鐘前的 session 列表比明說連不上更糟。所以:
 //   ‧ 靜態殼(HTML/CSS/JS/icon)→ 預先快取,離線也開得起來
 //   ‧ 其他所有請求 → 一律直接走網路,失敗就讓前端自己處理
-const SHELL = "pocket-console-shell-v1";
+// v2:icon 換成與 iOS／Android 出貨版同一顆 App icon(PNG 多尺寸)。版本號一併
+// 跳,讓舊的殼快取(含舊的紅色 icon.svg)在 activate 時被清掉。
+const SHELL = "pocket-console-shell-v2";
 const ASSETS = [
   "/console",
   "/console/static/style.css",
@@ -14,7 +16,7 @@ const ASSETS = [
   "/console/static/changes.js",
   "/console/static/terminal.js",
   "/console/static/memory.js",
-  "/console/static/icon.svg",
+  "/console/static/icon-192.png",
 ];
 
 self.addEventListener("install", (e) => {
