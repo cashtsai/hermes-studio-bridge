@@ -9477,11 +9477,21 @@ def _pair_boot_code() -> str:
         return code
 
 
-def _pair_check_boot(request: Request) -> None:
-    """boot code 閘:缺/錯一律 403(錯誤形狀同其他 pair 4xx)。常數時間比較。"""
+def _pair_check_boot(request: Request, *, allow_cookie: bool = False) -> None:
+    """boot code 閘:缺/錯一律 403(錯誤形狀同其他 pair 4xx)。常數時間比較。
+
+    `allow_cookie=True` **只有 `_console_guard` 傳**:/console 存成 PWA 之後,
+    manifest 的 `start_url` 啟動時不會帶 query string(規格如此),每次開都吃
+    403 → PWA 等於廢的。所以 console 那一道門額外接受一枚簽過名的 cookie。
+    鑄配對碼的端點(`/pair/qr`、`/pair/qr.json`)**一律維持只認 query** ——
+    cookie 外洩頂多能看 console 頁面殼,換不到可以接管主機的 pairing code。
+    """
     supplied = (request.query_params.get("boot") or "").strip()
-    if not supplied or not hmac.compare_digest(supplied, _pair_boot_code()):
-        raise HTTPException(status_code=403, detail="invalid boot code")
+    if supplied and hmac.compare_digest(supplied, _pair_boot_code()):
+        return
+    if allow_cookie and _console_cookie_ok(request):
+        return
+    raise HTTPException(status_code=403, detail="invalid boot code")
 
 
 try:  # 啟動即產生/載入,安裝器與人工查檔都能立刻拿到同一枚碼
@@ -9523,9 +9533,9 @@ def _pair_lan_ip():
         return None
 
 
-def _pair_tailscale_host():
-    """tailnet MagicDNS 名(兩端都在 tailnet 時最穩的私網路徑)。PATH 優先,
-    mac App 內建路徑保底;沒裝/沒起 → None(頁面據此顯示安裝建議)。"""
+def _pair_tailscale_self() -> dict:
+    """`tailscale status --json` 的 Self 節點(要 DNSName 也要 TailscaleIPs)。
+    PATH 優先,mac App 內建路徑保底;沒裝/沒起 → {}。"""
     for ts in (shutil.which("tailscale"),
                "/Applications/Tailscale.app/Contents/MacOS/Tailscale"):
         if not ts or not os.path.exists(ts):
@@ -9536,16 +9546,23 @@ def _pair_tailscale_host():
             if out.returncode != 0:
                 continue
             self_ = json.loads(out.stdout).get("Self") or {}
-            dns = (self_.get("DNSName") or "").rstrip(".")
-            if dns:
-                return dns
-            ips = self_.get("TailscaleIPs") or []
-            if ips:
-                return str(ips[0])
+            if self_:
+                return self_
         except Exception as _exc:  # noqa: BLE001
             _log_exc("_local_ip_dns", _exc, expected=True)
             continue
-    return None
+    return {}
+
+
+def _pair_tailscale_host():
+    """tailnet MagicDNS 名(兩端都在 tailnet 時最穩的私網路徑)。
+    沒裝/沒起 → None(頁面據此顯示安裝建議)。"""
+    self_ = _pair_tailscale_self()
+    dns = (self_.get("DNSName") or "").rstrip(".")
+    if dns:
+        return dns
+    ips = self_.get("TailscaleIPs") or []
+    return str(ips[0]) if ips else None
 
 
 def _pair_tunnel_url():
@@ -9771,11 +9788,92 @@ _CONSOLE_SECURITY_HEADERS = {
 }
 
 
+# ── PWA 啟動用的 console cookie(2026-10-19)─────────────────────────────
+# 問題:把 /console 存成 PWA 之後,manifest 的 `start_url` 啟動時**不會帶
+# query string** → 每次開都是 `/console`(沒有 ?boot=)→ 403。使用者被迫每次
+# 手貼完整網址,PWA 等於沒用。
+#
+# 修法:/console 這一道門額外接受一枚 cookie。三個刻意的設計:
+#   1. **cookie 的值不是 boot code 本身**,是用 boot code 當 HMAC key 衍生出來的
+#      簽章 → cookie 外洩拿不到原碼,打不了 /pair/qr(鑄碼端點維持只認 query);
+#      而且**換掉 boot code 即自動讓所有舊 cookie 失效**(key 變了,簽章全不合)。
+#   2. **簽發時間簽進值裡**(`<ts>.<hmac(boot, ts)>`)並在驗證時檢查有效期 ——
+#      純 `HMAC(boot, 固定字串)` 是定值,等於一張永不過期、只能靠換碼撤銷的
+#      通行證。console 能瀏覽檔案與記憶面板(等同那台機器的鑰匙),不給長命。
+#   3. 每次成功開 /console 都重新簽發(滑動視窗):常用的人不會被踢,
+#      閒置超過 TTL 就得再用一次 boot 連結。
+_CONSOLE_COOKIE_NAME = "pocket_console"
+_CONSOLE_COOKIE_TTL = int(os.environ.get("POCKET_CONSOLE_COOKIE_TTL",
+                                         str(14 * 24 * 3600)))   # 14 天
+# cookie 的 path 刻意只放 /console(見下方 _console_set_cookie 的註解)。
+_CONSOLE_COOKIE_PATH = "/console"
+_CONSOLE_COOKIE_CLOCK_SKEW = 300.0       # 機器時鐘微調不要害人重新配對
+_CONSOLE_COOKIE_DOMAIN_SEP = "pocket-console-cookie.v1"
+
+
+def _console_cookie_sign(ts: str) -> str:
+    """HMAC(boot_code, "<domain-sep>.<ts>")。boot code 一換,全部舊簽章失效。"""
+    return hmac.new(_pair_boot_code().encode("utf-8"),
+                    f"{_CONSOLE_COOKIE_DOMAIN_SEP}.{ts}".encode("utf-8"),
+                    hashlib.sha256).hexdigest()
+
+
+def _console_cookie_value(now: float | None = None) -> str:
+    ts = str(int(now if now is not None else time.time()))
+    return f"{ts}.{_console_cookie_sign(ts)}"
+
+
+def _console_cookie_ok(request: Request) -> bool:
+    """驗 cookie:形狀 → 有效期 → 常數時間比簽章。任何一關不過都是 False。"""
+    try:
+        raw = (request.cookies.get(_CONSOLE_COOKIE_NAME) or "").strip()
+        if not raw:
+            return False
+        ts_s, sep, sig = raw.partition(".")
+        if not sep or not sig or not ts_s.isdigit():
+            return False
+        age = time.time() - int(ts_s)
+        if age > _CONSOLE_COOKIE_TTL or age < -_CONSOLE_COOKIE_CLOCK_SKEW:
+            return False                       # 過期(或時間戳在未來)
+        return hmac.compare_digest(sig, _console_cookie_sign(ts_s))
+    except Exception as e:  # noqa: BLE001 — 壞 cookie 不該讓頁面 500,但要留痕
+        _log_exc("console_cookie_check", e, expected=True)
+        return False
+
+
+def _console_set_cookie(request: Request, resp: Response) -> None:
+    """成功開 /console 就(重新)簽發 cookie。
+
+    `path="/console"` 是**查過才敢收這麼窄的**:整個 console 只有 `GET /console`
+    這一條走 `_console_guard`,其餘全部不靠 cookie ——
+      ‧ 資料面 `/app/v2/*`、`/app/v1/usage`、`/app/v1/terminal`(WS)走
+        `Authorization: Bearer <pdev- token>`(token 在 localStorage);
+      ‧ bootstrap 的 `/pair/qr.json`、`/pair/claim` 刻意只認 query boot;
+      ‧ `/console/sw.js`、`/console/manifest.json`、`/console/static/*` 本來就
+        不經 guard。
+    所以 /console(含 PWA 的 start_url)是唯一需要 cookie 的請求,path 收到
+    `/console` 既夠用、又不會把憑證灑到 `/app/*`。
+
+    `secure` 跟著 request scheme 走:走 http(tailnet 直連 8081)時若硬加
+    `Secure`,瀏覽器會直接丟掉這枚 cookie,PWA 照樣壞。
+    """
+    scheme = (getattr(getattr(request, "url", None), "scheme", "") or "").lower()
+    resp.set_cookie(
+        _CONSOLE_COOKIE_NAME, _console_cookie_value(),
+        max_age=_CONSOLE_COOKIE_TTL, path=_CONSOLE_COOKIE_PATH,
+        httponly=True, samesite="strict", secure=(scheme == "https"),
+    )
+
+
 def _console_guard(request: Request) -> None:
-    """/console 的門:旗標關 → 404(對外表現同不存在);boot code 仍是真閘。"""
+    """/console 的門:旗標關 → 404(對外表現同不存在);boot code 仍是真閘。
+
+    `allow_cookie=True` 只在這裡 —— PWA 的 start_url 不帶 query,見
+    `_pair_check_boot` 與 `_console_set_cookie` 的註解。
+    """
     if not POCKET_CONSOLE_ENABLED:
         raise HTTPException(status_code=404, detail="not found")
-    _pair_check_boot(request)       # 真閘:一次性 boot code(同 /pair/qr)
+    _pair_check_boot(request, allow_cookie=True)   # 真閘:boot code 或簽過名的 cookie
     _pair_local_only(request)       # defense-in-depth 第二層
 
 
@@ -9787,7 +9885,9 @@ async def console_page(request: Request):
         html = open(index, encoding="utf-8").read()
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail="console not installed")
-    return HTMLResponse(html, headers=_CONSOLE_SECURITY_HEADERS)
+    resp = HTMLResponse(html, headers=_CONSOLE_SECURITY_HEADERS)
+    _console_set_cookie(request, resp)   # 滑動視窗:每次成功開頁都續命
+    return resp
 
 
 # PWA 的兩個檔案必須從 **/console/** 這一層服務,不能只掛在 /console/static/:
@@ -9819,6 +9919,98 @@ async def console_manifest():
         raise HTTPException(status_code=404, detail="not found")
     return Response(body, media_type="application/manifest+json",
                     headers={"Cache-Control": "no-cache"})
+
+
+# ── 已配對的手機自己拿 console 的 boot code(2026-10-19)──────────────────
+# 現況:要開 console 得人工去終端機翻 `~/.pocket/pair-boot-code` 再手打進網頁。
+# 但手機早就配對過了,它手上的 device token 是**比 boot code 更強**的憑證,
+# 沒道理讓人繞一圈。
+#
+# 這算不算權限擴大?查過一輪:**不算**。全 repo 只有三個地方吃 boot code ——
+# `/pair/qr`、`/pair/qr.json`、`/console`。boot code 能換到的最強東西是
+# 「一枚一次性 pairing code → /pair/claim → 一枚 `pdev-` device token」,
+# 而 master `BRIDGE_TOKEN` 從 boot code 推不出來(唯一需要 master 的
+# `_require_master_auth` 只守 Hermes 設定那一條,console 自己也打不了)。
+# console 頁面本身用的也正是 `/pair/claim` 發的 device token —— 也就是
+# console ⊆ device token 的能力範圍,不會看到別台裝置的東西。
+#
+# ⚠️ 唯一的真差異(已回報機主):boot code 是**一機一碼、常駐**的。手機拿到之後,
+# 就算之後把這台手機的 device token 撤銷,它仍握著能再鑄新 token 的 boot code。
+# 要堵這個洞得換碼(`rm ~/.pocket/pair-boot-code` + 重啟),而換碼會順便讓所有
+# console cookie 失效。更嚴格的設計見回報裡的建議(短效一次性 ticket)。
+_CONSOLE_BOOT_URL_CACHE = {"ts": 0.0, "urls": []}
+_CONSOLE_BOOT_URL_TTL = 30.0
+
+
+def _console_boot_hosts() -> list:
+    """能**真的**開起 /console 的 host 候選,依優先序。
+
+    刻意不直接套 `_pair_host_candidates()` —— 那份是給「配對」用的
+    (LAN → tailnet → 公網 tunnel),而 `/console` 的門比配對窄一層:
+    `_pair_local_only` 要求**直連**,且只要帶了任何轉送標頭
+    (XFF / Forwarded / CF-Connecting-IP / X-Real-IP)就一律拒絕。對照下來:
+      ‧ LAN(`http://192.168.x.x:8081`)→ 來源既非 loopback 也非 tailnet → 403
+      ‧ 公網 cloudflared tunnel → 一定帶 XFF → 403
+      ‧ `tailscale serve` 的 `https://<magicdns>`(443)→ 也會補 XFF → 403
+      ‧ **tailnet 直連 bridge 埠**(`<magicdns>:8081` / `100.x:8081`)→ 放行 ✅
+    手機本來就是 tailnet 成員,所以只回 tailnet 直連這一種。MagicDNS 名優先
+    (tailnet IP 會換),tailnet IP 當保底(對方沒開 MagicDNS 時仍通)。
+    """
+    now = time.monotonic()
+    if (_CONSOLE_BOOT_URL_CACHE["urls"]
+            and now - _CONSOLE_BOOT_URL_CACHE["ts"] < _CONSOLE_BOOT_URL_TTL):
+        return list(_CONSOLE_BOOT_URL_CACHE["urls"])
+    self_ = _pair_tailscale_self()
+    dns = (self_.get("DNSName") or "").rstrip(".")
+    raw = ([dns] if dns else []) + [str(x) for x in (self_.get("TailscaleIPs") or [])]
+    hosts: list = []
+    for h in raw:
+        if not h:
+            continue
+        if ":" in h:                       # v6 字面值要包方括號才合法
+            h = "[%s]" % h
+        host = "%s:%d" % (h, _BRIDGE_PORT)
+        if host not in hosts:
+            hosts.append(host)
+    if hosts:
+        _CONSOLE_BOOT_URL_CACHE.update({"ts": now, "urls": list(hosts)})
+    return hosts
+
+
+@app.get("/app/v1/console/boot")
+async def app_v1_console_boot(request: Request):
+    """已配對的裝置用自己的 device token 換 console 的開啟連結。
+
+    回傳形狀(iOS 設定頁的「開啟桌面控制台」照這個接):
+        {"boot": "<碼>",
+         "url":  "http://<magicdns>:8081/console?boot=<碼>" | null,
+         "urls": [...依優先序的同款網址...],
+         "reachable": true|false,
+         "hint": "<reachable=false 時的人話說明>"}
+    `reachable=false`(這台沒 tailnet)時 `url` 是 null,但 `boot` 照給 ——
+    使用者在那台機器上自己開 `http://127.0.0.1:8081/console?boot=…` 仍然通。
+    """
+    if not POCKET_CONSOLE_ENABLED:
+        raise HTTPException(status_code=404, detail="not found")
+    _check_auth(request)         # master 或 device token;401/429 與節流都在裡面
+    boot = _pair_boot_code()
+    hosts = _console_boot_hosts()
+    qs = "?boot=" + urllib.parse.quote(boot)
+    urls = ["http://%s/console%s" % (h, qs) for h in hosts]
+    auth = request.headers.get("authorization", "")
+    tok = auth[7:].strip() if auth.lower().startswith("bearer ") else ""
+    # 只記「誰拿了、有幾個候選」—— boot code 本身絕不進日誌。
+    _log_event("console_boot_issued", token_hash=_short_hash(tok),
+               hosts=len(hosts))
+    return {
+        "boot": boot,
+        "url": urls[0] if urls else None,
+        "urls": urls,
+        "reachable": bool(urls),
+        "hint": "" if urls else
+                "這台主機沒有可用的 tailnet 位址(Tailscale 沒裝或沒登入)。"
+                "/console 只接受 loopback 或 tailnet 的直連,請先把兩端都加入同一個 tailnet。",
+    }
 
 
 # 靜態資產(app.js / sse.js / style.css)。旗標關時整個 mount 不掛 → 404。
