@@ -9881,6 +9881,63 @@ def _console_set_cookie(request: Request, resp: Response) -> None:
     )
 
 
+# ── 一次性 claim cookie:把「剛驗過碼」交棒給前端(2026-10-19)──────────
+# 問題:輸入頁讓人進得了 /console,但**全新的瀏覽器**進去之後 console 仍是
+# 「未配對」—— static/console/app.js 的 bootstrap 要嘛從 localStorage 拿舊
+# token、要嘛從 `location.search` 讀 `?boot=` 去換 device token;303 之後網址上
+# 沒有 `?boot=`(這正是「碼不留在網址列」的本意),它就卡住。
+#
+# 解法:`POST /console/auth` 驗過碼的**那一瞬間**,伺服器手上正好有碼 ——
+# 就地鑄一枚一次性 pairing code(沿用 `_pair_mint_code`,就是 /pair/qr.json
+# 在發的那種),放進一枚**獨立的短命 cookie** 交給前端,前端拿去打
+# `/pair/claim` 換 device token。權限等價於「他本來就能用 ?boot= 連結拿到的
+# 東西」,沒有擴大。
+#
+# ⚠️ **安全邊界(不准動)**:鑄碼**只發生在這一次 POST 驗過碼的當下**。長命的
+# `pocket_console` cookie 仍然換不到 pairing code —— `GET /console` 不論帶
+# 的是 cookie 還是 ?boot=,都**不會**簽發 claim cookie。這條守著 cookie 閘
+# 原本的設計前提:「cookie 外洩頂多能看頁面殼,換不到可以接管主機的碼」。
+#
+# 三個刻意的設計:
+#   1. **與 `pocket_console` 分開的 cookie**:那枚是 HttpOnly 的長命憑證,
+#      這枚非 HttpOnly(前端要讀)且 60 秒就死 —— 兩種壽命/用途不混在一起。
+#   2. **非 HttpOnly 不是退步**:這枚裝的是一次性碼,用掉即失效;而它換到的
+#      device token 本來就存在前端讀得到的 localStorage 裡(同一個 XSS 面)。
+#   3. **pairing code 的 TTL 跟著 cookie 走**(60 秒,`_pair_clamp_ttl` 的下限),
+#      不放寬既有機制。cookie 死了碼也沒人拿得到,留長只是讓死碼佔 `_PAIR_CODES`。
+_CONSOLE_CLAIM_COOKIE_NAME = "pocket_console_claim"
+_CONSOLE_CLAIM_COOKIE_TTL = 60          # 秒;短到只夠「303 落地 → 立刻 claim」
+
+
+def _console_mint_claim_code() -> str:
+    """驗過碼的當下鑄一枚一次性配對碼;鑄不出來(被節流)回空字串。
+
+    鑄碼節流**沿用 `/pair/qr.json` 那一桶**(`_pair_qr_check_mint_rate`,
+    10/min)—— 同一個 boot code 持有者的總鑄碼預算是**一個**桶,這條路不另開。
+    超額時**不讓登入失敗**:console cookie 照種、照樣 303 進頁面,只是這次拿
+    不到 claim cookie(前端會停在「未配對」,使用者重按一次即可)。
+    """
+    try:
+        _pair_qr_check_mint_rate()
+    except HTTPException:
+        _log_event("console_claim_mint_throttled")
+        return ""
+    return _pair_mint_code(None, ttl=_pair_clamp_ttl(_CONSOLE_CLAIM_COOKIE_TTL))
+
+
+def _console_set_claim_cookie(request: Request, resp: Response, code: str) -> None:
+    """種一次性 claim cookie。`httponly=False` 是**刻意的** —— 前端要用
+    `document.cookie` 讀它(見本節開頭的安全論證)。"""
+    if not code:
+        return
+    scheme = (getattr(getattr(request, "url", None), "scheme", "") or "").lower()
+    resp.set_cookie(
+        _CONSOLE_CLAIM_COOKIE_NAME, code,
+        max_age=_CONSOLE_CLAIM_COOKIE_TTL, path=_CONSOLE_COOKIE_PATH,
+        httponly=False, samesite="strict", secure=(scheme == "https"),
+    )
+
+
 # ── 配對碼輸入頁(2026-10-19)──────────────────────────────────────────────
 # 缺口:機主在電腦前開 `http://<tailnet-host>:8081/console`(沒帶 ?boot=)只會
 # 吃一個**裸 403**,畫面上沒有任何可以輸入的地方 —— 他只能自己把碼拼進網址列。
@@ -10091,7 +10148,12 @@ async def console_auth(request: Request):
     resp = RedirectResponse("/console", status_code=303,
                             headers=dict(_CONSOLE_SECURITY_HEADERS))
     _console_set_cookie(request, resp)
-    _log_event("console_auth_ok", client=_client_host(request))
+    # 交棒給前端:只有「這一次驗過碼」才鑄碼,長命 cookie 永遠換不到(見
+    # _CONSOLE_CLAIM_COOKIE_NAME 上方的安全邊界)。碼放 cookie 不放 query。
+    claim = _console_mint_claim_code()
+    _console_set_claim_cookie(request, resp, claim)
+    _log_event("console_auth_ok", client=_client_host(request),
+               claim=bool(claim))      # 只記「有沒有鑄」,不記碼
     return resp
 
 

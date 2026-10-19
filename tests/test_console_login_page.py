@@ -110,6 +110,21 @@ class _LoginBase(unittest.TestCase):
         self.assertNotIn(self.boot, r.text)
         self.assertEqual(r.headers.get("set-cookie", ""), "")
 
+    def cookie_raw(self, r, name):
+        """回應裡名為 name 的那條 Set-Cookie 原文(沒有就回 "")。
+
+        一定要用 `get_list` —— 成功的 POST 會種**兩枚** cookie,
+        `headers.get("set-cookie")` 只拿得到第一枚,會驗錯對象。
+        """
+        for raw in r.headers.get_list("set-cookie"):
+            if raw.split("=", 1)[0].strip() == name:
+                return raw
+        return ""
+
+    def cookie_value(self, r, name):
+        raw = self.cookie_raw(r, name)
+        return raw.split("=", 1)[1].split(";")[0] if raw else ""
+
     def post(self, code=None, *, headers=None, json_body=False, follow=False):
         kw = {"headers": headers or {}, "follow_redirects": follow}
         if json_body:
@@ -199,8 +214,8 @@ class TestAuthSuccess(_LoginBase):
         self.assertEqual(r.status_code, 303)
         self.assertEqual(r.headers["location"], "/console")  # 不帶任何 query
         self.assertNotIn("boot", r.headers["location"])
-        raw = r.headers.get("set-cookie", "")
-        self.assertIn(bridge._CONSOLE_COOKIE_NAME + "=", raw)
+        raw = self.cookie_raw(r, bridge._CONSOLE_COOKIE_NAME)
+        self.assertTrue(raw, "沒種 pocket_console")
         # 沿用既有憑證:值是 HMAC 衍生,**不是** boot code 本身
         self.assertNotIn(self.boot, raw)
         low = raw.lower()
@@ -220,17 +235,18 @@ class TestAuthSuccess(_LoginBase):
     def test_json_body_accepted(self):
         r = self.post(self.boot, json_body=True)
         self.assertEqual(r.status_code, 303)
-        self.assertIn(bridge._CONSOLE_COOKIE_NAME + "=",
-                      r.headers.get("set-cookie", ""))
+        self.assertTrue(self.cookie_raw(r, bridge._CONSOLE_COOKIE_NAME))
 
     def test_whitespace_is_trimmed(self):
         """手打/貼上難免帶前後空白,不該因此失敗。"""
         self.assertEqual(self.post("  " + self.boot + "\n").status_code, 303)
 
-    def test_success_does_not_mint_pairing_codes(self):
-        """登入只換 console cookie,不該順手鑄出任何 pairing code。"""
+    def test_success_mints_exactly_one_unbound_code(self):
+        """驗過碼的當下鑄**一枚**一次性碼交棒給前端(不是零、也不是一串)。"""
         self.post(self.boot)
-        self.assertEqual(len(bridge._PAIR_CODES), 0)
+        self.assertEqual(len(bridge._PAIR_CODES), 1)
+        meta = bridge._pair_code_meta(list(bridge._PAIR_CODES.values())[0])
+        self.assertIsNone(meta.get("apple_user_id"), "不該綁到任何帳號")
 
 
 # ═══ 4. POST 錯誤碼 → 不種 cookie、不洩漏細節 ═════════════════════════
@@ -321,6 +337,8 @@ class TestThrottle(_LoginBase):
         """對的碼不該進失敗桶(不然自己把自己鎖出去)。"""
         for _ in range(bridge._CONSOLE_AUTH_FAIL_MAX + 3):
             self.assertEqual(self.post(self.boot).status_code, 303)
+            with bridge._PAIR_LOCK:      # 這條只驗失敗桶,別撞到鑄碼桶
+                bridge._PAIR_QR_MINTS.clear()
 
     def test_throttle_does_not_block_the_login_page_itself(self):
         """被節流時 GET /console 仍要看得到頁面(不然使用者只剩白畫面)。"""
@@ -345,6 +363,169 @@ class TestCookieSkipsLoginPage(_LoginBase):
         self.assertNotIn('action="/console/auth"', r.text)
 
 
+# ═══ 一次性 claim cookie:把「剛驗過碼」交棒給前端 ═══════════════════════
+# 背景:輸入頁讓人進得了 /console,但**全新的瀏覽器**進去後 console 仍是
+# 「未配對」—— app.js 的 bootstrap 要嘛從 localStorage 拿舊 token、要嘛從
+# `?boot=` 換 token,而 303 之後網址上沒有 `?boot=`。修法:驗過碼的當下伺服器
+# 就地鑄一枚一次性 pairing code,放進一枚 60 秒、JS 讀得到的獨立 cookie。
+class TestClaimCookie(_LoginBase):
+    def setUp(self):
+        super().setUp()
+        # device token 不落盤(production 的 ~/.pocket/device-tokens.json 不准碰)
+        self.extra = [patch.object(bridge, "_save_device_tokens", lambda d: None),
+                      patch.object(bridge, "_account_device_for_token",
+                                   return_value=None)]
+        for p in self.extra:
+            p.start()
+        self.issued = []
+
+    def tearDown(self):
+        for p in reversed(self.extra):
+            p.stop()
+        with bridge._PAIR_LOCK:          # 測試發出的 device token 不留在行程裡
+            for t in self.issued:
+                bridge._DEVICE_TOKENS.pop(t, None)
+        super().tearDown()
+
+    def claim(self, code):
+        r = self.client.post("/pair/claim",
+                             json={"code": code, "device_name": "Console",
+                                   "platform": "web"})
+        if r.status_code == 200 and r.json().get("token"):
+            self.issued.append(r.json()["token"])
+        return r
+
+    # ── 1. 成功 → 兩枚 cookie 同時到,屬性各自正確 ────────────────────
+    def test_success_sets_both_cookies(self):
+        r = self.post(self.boot)
+        long_raw = self.cookie_raw(r, bridge._CONSOLE_COOKIE_NAME)
+        claim_raw = self.cookie_raw(r, bridge._CONSOLE_CLAIM_COOKIE_NAME)
+        self.assertTrue(long_raw, "沒種長命的 pocket_console")
+        self.assertTrue(claim_raw, "沒種短命的 claim cookie")
+        # 長命的:HttpOnly(JS 讀不到)
+        self.assertIn("httponly", long_raw.lower())
+        # 短命的:**不是** HttpOnly(前端要用 document.cookie 讀),且 ≤60 秒
+        low = claim_raw.lower()
+        self.assertNotIn("httponly", low, "claim cookie 要讓前端讀得到")
+        self.assertIn("samesite=strict", low)
+        self.assertIn("path=/console", low)
+        self.assertNotIn("secure", low)          # http → 加了會被瀏覽器丟掉
+        age = int(low.split("max-age=")[1].split(";")[0])
+        self.assertLessEqual(age, 60, "claim cookie 必須極短命")
+        self.assertEqual(age, bridge._CONSOLE_CLAIM_COOKIE_TTL)
+
+    def test_claim_cookie_is_not_the_boot_code(self):
+        """裝的是一次性 pairing code,不是 boot code —— 外洩換不到長期權限。"""
+        value = self.cookie_value(self.post(self.boot),
+                                  bridge._CONSOLE_CLAIM_COOKIE_NAME)
+        self.assertTrue(value)
+        self.assertNotEqual(value, self.boot)
+        self.assertIn(value, bridge._PAIR_CODES, "值必須是真的鑄出來的那枚碼")
+
+    def test_claim_cookie_secure_follows_scheme(self):
+        from starlette.responses import Response as _Resp
+
+        class _Req:
+            def __init__(self, scheme):
+                self.url = type("U", (), {"scheme": scheme})()
+        for scheme, want in (("http", False), ("https", True)):
+            resp = _Resp()
+            bridge._console_set_claim_cookie(_Req(scheme), resp, "abc123")
+            self.assertEqual("secure" in resp.headers["set-cookie"].lower(), want)
+
+    # ── 2. 失敗 → 兩種 cookie 都不種 ─────────────────────────────────
+    def test_failure_sets_neither_cookie(self):
+        for r in (self.post("wrong-code"), self.post(None),
+                  self.post("wrong", json_body=True)):
+            self.assertEqual(r.headers.get("set-cookie", ""), "")
+            self.assertEqual(self.cookie_raw(r, bridge._CONSOLE_CLAIM_COOKIE_NAME), "")
+        self.assertEqual(len(bridge._PAIR_CODES), 0, "失敗不准鑄碼")
+
+    def test_throttled_sets_neither_cookie(self):
+        for i in range(bridge._CONSOLE_AUTH_FAIL_MAX):
+            self.post("wrong-%d" % i)
+        r = self.post(self.boot)
+        self.assertEqual(r.status_code, 429)
+        self.assertEqual(r.headers.get("set-cookie", ""), "")
+        self.assertEqual(len(bridge._PAIR_CODES), 0)
+
+    def test_forwarded_post_sets_neither_cookie(self):
+        r = self.post(self.boot, headers={"X-Forwarded-For": "203.0.113.9"})
+        self.assertEqual(r.status_code, 403)
+        self.assertEqual(r.headers.get("set-cookie", ""), "")
+        self.assertEqual(len(bridge._PAIR_CODES), 0)
+
+    # ── 3. 【最重要】長命 cookie 換不到 claim cookie ──────────────────
+    def test_long_lived_cookie_never_yields_a_claim_cookie(self):
+        """守著 cookie 閘原本的設計前提:「`pocket_console` 外洩頂多能看頁面殼,
+        **換不到可以接管主機的 pairing code**」。鑄碼只發生在驗過碼的那一次
+        POST,`GET /console` 不論憑證是 cookie 還是 ?boot= 都不准鑄。"""
+        hdr = {"Cookie": "%s=%s" % (bridge._CONSOLE_COOKIE_NAME,
+                                    bridge._console_cookie_value())}
+        r = self.client.get("/console", headers=hdr)
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(self.cookie_raw(r, bridge._CONSOLE_CLAIM_COOKIE_NAME), "",
+                         "長命 cookie 居然換到了 claim cookie —— 安全邊界破了")
+        self.assertEqual(len(bridge._PAIR_CODES), 0, "GET /console 不准鑄碼")
+
+    def test_query_boot_get_also_mints_nothing(self):
+        """連帶 ?boot= 的 GET 也不鑄 —— 那條路前端本來就自己打 /pair/qr.json。"""
+        r = self.client.get("/console", params={"boot": self.boot})
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(self.cookie_raw(r, bridge._CONSOLE_CLAIM_COOKIE_NAME), "")
+        self.assertEqual(len(bridge._PAIR_CODES), 0)
+
+    def test_following_the_303_does_not_re_mint(self):
+        """走完整一遍(含跟著 303 落地)總共只鑄一枚,不會每開一次頁就一枚。"""
+        self.post(self.boot, follow=True)
+        self.assertEqual(len(bridge._PAIR_CODES), 1)
+        self.client.get("/console")
+        self.client.get("/console")
+        self.assertEqual(len(bridge._PAIR_CODES), 1)
+
+    # ── 4. 單次性:用掉之後再用 → 既有機制擋下 ───────────────────────
+    def test_code_is_single_use(self):
+        code = self.cookie_value(self.post(self.boot),
+                                 bridge._CONSOLE_CLAIM_COOKIE_NAME)
+        first = self.claim(code)
+        self.assertEqual(first.status_code, 200)
+        self.assertTrue(first.json()["token"].startswith("pdev-"))
+        self.assertNotIn(code, bridge._PAIR_CODES, "用掉就該從表裡消失")
+        again = self.claim(code)
+        self.assertNotEqual(again.status_code, 200, "一次性碼居然能用第二次")
+
+    def test_claimed_token_actually_works(self):
+        """端到端:claim cookie → /pair/claim → 這枚 token 真的打得動 /app/*。"""
+        code = self.cookie_value(self.post(self.boot),
+                                 bridge._CONSOLE_CLAIM_COOKIE_NAME)
+        token = self.claim(code).json()["token"]
+        r = self.client.get("/app/v1/console/boot",
+                            headers={"Authorization": "Bearer " + token})
+        self.assertEqual(r.status_code, 200)
+
+    def test_code_ttl_matches_cookie_ttl(self):
+        """碼的壽命跟 cookie 綁在一起 —— 不放寬既有鑄碼機制。"""
+        self.post(self.boot)
+        meta = bridge._pair_code_meta(list(bridge._PAIR_CODES.values())[0])
+        left = meta["expiry"] - time.monotonic()
+        self.assertLessEqual(left, bridge._CONSOLE_CLAIM_COOKIE_TTL + 1)
+        self.assertGreater(left, 0)
+        self.assertLess(bridge._CONSOLE_CLAIM_COOKIE_TTL, bridge._PAIR_CODE_TTL,
+                        "不該比既有預設 TTL 更長")
+
+    # ── 鑄碼節流與 /pair/qr.json 共用一桶,且不讓登入失敗 ──────────────
+    def test_mint_throttle_is_shared_and_degrades_gracefully(self):
+        with bridge._PAIR_LOCK:                 # 把鑄碼桶灌滿
+            for _ in range(bridge._PAIR_QR_MINT_LIMIT):
+                bridge._PAIR_QR_MINTS.append(time.monotonic())
+        r = self.post(self.boot)
+        self.assertEqual(r.status_code, 303, "鑄碼被節流不該讓登入失敗")
+        self.assertTrue(self.cookie_raw(r, bridge._CONSOLE_COOKIE_NAME),
+                        "console cookie 照種")
+        self.assertEqual(self.cookie_raw(r, bridge._CONSOLE_CLAIM_COOKIE_NAME), "")
+        self.assertEqual(len(bridge._PAIR_CODES), 0)
+
+
 # ═══ 碼不進日誌 ═══════════════════════════════════════════════════════
 class TestNoCodeInLogs(_LoginBase):
     def test_code_never_logged(self):
@@ -362,10 +543,24 @@ class TestNoCodeInLogs(_LoginBase):
         events = {ev for ev, _ in seen}
         self.assertIn("console_auth_failed", events, "失敗要留痕(但不留碼)")
         self.assertIn("console_auth_ok", events)
-        # 失敗事件只准帶來源,不准帶任何碼的衍生物
+        # 事件只准帶來源與一個 bool,不准帶任何碼的衍生物
         for ev, kw in seen:
             if ev.startswith("console_auth"):
-                self.assertEqual(set(kw), {"client"}, f"{ev} 的欄位太多:{kw}")
+                self.assertLessEqual(set(kw), {"client", "claim"},
+                                     f"{ev} 的欄位太多:{kw}")
+                self.assertIsInstance(kw.get("claim", False), bool)
+
+    def test_claim_code_never_logged(self):
+        """交棒給前端的那枚一次性碼也不准進日誌(延伸上一條)。"""
+        seen = []
+        with patch.object(bridge, "_log_event",
+                          side_effect=lambda ev, **kw: seen.append((ev, kw))):
+            r = self.post(self.boot)
+        code = self.cookie_value(r, bridge._CONSOLE_CLAIM_COOKIE_NAME)
+        self.assertTrue(code)
+        blob = json.dumps(seen, default=str, ensure_ascii=False)
+        self.assertNotIn(code, blob, "一次性 pairing code 不准出現在日誌")
+        self.assertNotIn(self.boot, blob)
 
 
 # ═══ 跨站表單 POST ════════════════════════════════════════════════════
