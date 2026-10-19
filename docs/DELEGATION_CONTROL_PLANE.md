@@ -62,7 +62,7 @@ Request:
   "subtask_code": "APPLELOGIN",
   "title": "Fix PocketAgent QR pairing",
   "objective": "Implement and verify the QR pairing flow",
-  "cwd": "/Users/xcash/apps/pocketagent",
+  "cwd": "/Users/you/apps/pocketagent",
   "spec_path": "docs/ACCOUNT_CROSS_DEVICE_ARCH.md",
   "acceptance": "curl smoke test plus app build"
 }

@@ -31,10 +31,10 @@ import host_discovery as hd  # noqa: E402
 # 注意第二欄:**是版本字串 `2.1.207`,不是 `claude`** —— 這就是不能靠
 # pane_current_command 認 agent 的原因。
 TMUX_FIXTURE = "\n".join([
-    "FLiPER|2.1.207|2722|/Users/xcash/apps/fliper-mobile|1786355258",
-    "amulet-hunter|2.1.207|6756|/Users/xcash/apps/amulet-hunter|1786355516",
-    "sidequest|zsh|9001|/Users/xcash/apps/sidequest|1786355600",
-    "just-a-shell|zsh|9500|/Users/xcash|1786355700",
+    "FLiPER|2.1.207|2722|/Users/you/apps/fliper-mobile|1786355258",
+    "amulet-hunter|2.1.207|6756|/Users/you/apps/amulet-hunter|1786355516",
+    "sidequest|zsh|9001|/Users/you/apps/sidequest|1786355600",
+    "just-a-shell|zsh|9500|/Users/you|1786355700",
     "",
 ])
 
@@ -42,17 +42,17 @@ PS_FIXTURE = {
     1: (0, "/sbin/launchd"),
     2721: (1, "tmux: server"),
     2722: (2721, "/bin/bash --noprofile --norc"),
-    2723: (2722, "/Users/xcash/.local/bin/claude --resume "
+    2723: (2722, "/Users/you/.local/bin/claude --resume "
                  "69fd4b82-050d-4191-8251-3537a037f74e --remote-control FLiPER "
                  "--model opus --debug-file /tmp/rc-fliper.log"),
     6756: (2721, "/bin/bash --noprofile --norc"),
     6757: (6756, "-zsh"),
-    6758: (6757, "/Users/xcash/.local/bin/claude --remote-control amulet-hunter"),
+    6758: (6757, "/Users/you/.local/bin/claude --remote-control amulet-hunter"),
     9001: (2721, "/bin/zsh"),
-    9002: (9001, "node /Users/xcash/.nvm/versions/node/v22/lib/node_modules/"
+    9002: (9001, "node /Users/you/.nvm/versions/node/v22/lib/node_modules/"
                  "@anthropic-ai/claude-code/cli.js --model sonnet"),
     9500: (2721, "/bin/zsh"),
-    9501: (9500, "tail -f /Users/xcash/.claude/claude.log"),
+    9501: (9500, "tail -f /Users/you/.claude/claude.log"),
 }
 
 # 名單裡有 FLiPER(啟用)與 amulet-hunter(封存,enabled=0);sidequest 完全
@@ -61,9 +61,9 @@ CONF_FIXTURE = """\
 # ccsess 常駐 Claude Code remote session 設定
 # 一行一個 session。欄位以 | 分隔: name | workdir | enabled
 
-FLiPER|/Users/xcash/apps/fliper-mobile|1
-amulet-hunter|/Users/xcash/apps/amulet-hunter|0
-xw-old-lane-20260711|/Users/xcash/apps/pocket-connect|0
+FLiPER|/Users/you/apps/fliper-mobile|1
+amulet-hunter|/Users/you/apps/amulet-hunter|0
+xw-old-lane-20260711|/Users/you/apps/pocket-connect|0
 """
 
 
@@ -104,13 +104,13 @@ class TestPaneParsing(unittest.TestCase):
         self.assertEqual(first["session"], "FLiPER")
         self.assertEqual(first["command"], "2.1.207")   # 版本字串,不是 claude
         self.assertEqual(first["pane_pid"], 2722)
-        self.assertEqual(first["path"], "/Users/xcash/apps/fliper-mobile")
+        self.assertEqual(first["path"], "/Users/you/apps/fliper-mobile")
         self.assertEqual(first["created_ts"], 1786355258.0)
 
     def test_path_with_pipe_is_preserved(self):
-        out = "weird|2.1.207|42|/Users/xcash/a|b/c|1786355258"
+        out = "weird|2.1.207|42|/Users/you/a|b/c|1786355258"
         pane = hd.parse_tmux_panes(out)[0]
-        self.assertEqual(pane["path"], "/Users/xcash/a|b/c")
+        self.assertEqual(pane["path"], "/Users/you/a|b/c")
         self.assertEqual(pane["created_ts"], 1786355258.0)
 
     def test_rows_without_pid_are_dropped(self):
@@ -119,9 +119,9 @@ class TestPaneParsing(unittest.TestCase):
         self.assertEqual(hd.parse_tmux_panes(""), [])
 
     def test_missing_created_column_is_tolerated(self):
-        pane = hd.parse_tmux_panes("s|zsh|7|/Users/xcash")[0]
+        pane = hd.parse_tmux_panes("s|zsh|7|/Users/you")[0]
         self.assertIsNone(pane["created_ts"])
-        self.assertEqual(pane["path"], "/Users/xcash")
+        self.assertEqual(pane["path"], "/Users/you")
 
     def test_claude_detected_through_process_tree_not_command_name(self):
         """pane_current_command 是 `2.1.207`,只有走行程樹才認得出 claude。"""
@@ -175,7 +175,7 @@ class TestCcClassification(unittest.TestCase):
         it = self._items()["claude_code:FLiPER"]
         self.assertEqual(it["state"], hd.STATE_MANAGED)
         self.assertEqual(it["source"], "ccsess")
-        self.assertEqual(it["workdir"], "/Users/xcash/apps/fliper-mobile")
+        self.assertEqual(it["workdir"], "/Users/you/apps/fliper-mobile")
         self.assertEqual(it["model"], "opus")
         self.assertEqual(it["since_ts"], 1786355258.0)
         self.assertTrue(it["alive"])
@@ -184,7 +184,7 @@ class TestCcClassification(unittest.TestCase):
         it = self._items()["claude_code:sidequest"]
         self.assertEqual(it["state"], hd.STATE_DISCOVERED)
         self.assertEqual(it["source"], "tmux")
-        self.assertEqual(it["workdir"], "/Users/xcash/apps/sidequest")
+        self.assertEqual(it["workdir"], "/Users/you/apps/sidequest")
         self.assertEqual(it["model"], "sonnet")
 
     def test_archived_conf_lane_still_alive_is_discovered(self):
@@ -200,10 +200,10 @@ class TestCcClassification(unittest.TestCase):
         self.assertNotIn("claude_code:xw-old-lane-20260711", self._items())
 
     def test_multi_pane_session_prefers_the_pane_running_claude(self):
-        out = ("dual|zsh|700|/Users/xcash/shell|1786355000\n"
-               "dual|2.1.207|800|/Users/xcash/work|1786355000\n")
+        out = ("dual|zsh|700|/Users/you/shell|1786355000\n"
+               "dual|2.1.207|800|/Users/you/work|1786355000\n")
         procs = {700: (1, "/bin/zsh"), 800: (1, "/bin/bash"),
-                 801: (800, "/Users/xcash/.local/bin/claude --model haiku")}
+                 801: (800, "/Users/you/.local/bin/claude --model haiku")}
         panes = hd.parse_tmux_panes(out)
         items = hd.cc_discovery_items(panes, [], _claude_by_pane(panes, procs))
         self.assertEqual(len(items), 1)
@@ -212,11 +212,11 @@ class TestCcClassification(unittest.TestCase):
 
     def test_adopting_never_rewrites_an_existing_lane_workdir(self):
         """名單 workdir 是權威;pane 當下 cd 到別處不會污染它。"""
-        out = "FLiPER|2.1.207|2722|/Users/xcash/apps/fliper-mobile/deep|1786355258"
+        out = "FLiPER|2.1.207|2722|/Users/you/apps/fliper-mobile/deep|1786355258"
         panes = hd.parse_tmux_panes(out)
         items = hd.cc_discovery_items(panes, hd.parse_conf_rows(CONF_FIXTURE),
                                       _claude_by_pane(panes, PS_FIXTURE))
-        self.assertEqual(items[0]["workdir"], "/Users/xcash/apps/fliper-mobile")
+        self.assertEqual(items[0]["workdir"], "/Users/you/apps/fliper-mobile")
 
 
 # ─────────────── 3. cx / hermes / openclaw 來源分類 ───────────────
@@ -224,7 +224,7 @@ class TestCcClassification(unittest.TestCase):
 class TestOtherProviders(unittest.TestCase):
     SUMMARIES = [
         {"thread_id": "t-cli", "name": "本機 CLI", "source": "cli",
-         "workdir": "/Users/xcash/apps/a", "status": "running",
+         "workdir": "/Users/you/apps/a", "status": "running",
          "updatedAt": 1786355258000},
         {"thread_id": "t-vscode", "name": "VSCode", "source": "vscode",
          "status": "idle"},
@@ -332,16 +332,16 @@ class TestConfTransforms(unittest.TestCase):
     def test_upsert_appends_and_preserves_comments(self):
         lines = CONF_FIXTURE.splitlines()
         out = hd.conf_upsert_lines(lines, "sidequest",
-                                   "/Users/xcash/apps/sidequest", "1")
+                                   "/Users/you/apps/sidequest", "1")
         self.assertEqual(out[:len(lines)], lines)      # 原本每一行原樣保留
-        self.assertEqual(out[-1], "sidequest|/Users/xcash/apps/sidequest|1")
+        self.assertEqual(out[-1], "sidequest|/Users/you/apps/sidequest|1")
 
     def test_upsert_replaces_in_place_keeping_order(self):
         out = hd.conf_upsert_lines(CONF_FIXTURE.splitlines(), "amulet-hunter",
-                                   "/Users/xcash/apps/amulet-hunter", "1")
+                                   "/Users/you/apps/amulet-hunter", "1")
         self.assertEqual(len(out), len(CONF_FIXTURE.splitlines()))
-        self.assertIn("amulet-hunter|/Users/xcash/apps/amulet-hunter|1", out)
-        self.assertNotIn("amulet-hunter|/Users/xcash/apps/amulet-hunter|0", out)
+        self.assertIn("amulet-hunter|/Users/you/apps/amulet-hunter|1", out)
+        self.assertNotIn("amulet-hunter|/Users/you/apps/amulet-hunter|0", out)
 
     def test_remove_lines(self):
         out, hit = hd.conf_remove_lines(CONF_FIXTURE.splitlines(), "FLiPER")
@@ -379,9 +379,9 @@ class TestConfAdoptOnDisk(unittest.TestCase):
     def test_adopt_appends_backs_up_and_preserves_format(self):
         before = self._read()
         self.assertTrue(bridge._cc_conf_adopt("sidequest",
-                                              "/Users/xcash/apps/sidequest"))
+                                              "/Users/you/apps/sidequest"))
         after = self._read()
-        self.assertIn("sidequest|/Users/xcash/apps/sidequest|1", after)
+        self.assertIn("sidequest|/Users/you/apps/sidequest|1", after)
         self.assertIn("# ccsess 常駐 Claude Code remote session 設定", after)
         self.assertTrue(after.startswith(before.rstrip() + "\n"))
         self.assertEqual(len(self._backups()), 1)
@@ -389,16 +389,16 @@ class TestConfAdoptOnDisk(unittest.TestCase):
             self.assertEqual(f.read(), before)
 
     def test_adopt_is_idempotent_and_second_call_does_not_write(self):
-        bridge._cc_conf_adopt("sidequest", "/Users/xcash/apps/sidequest")
+        bridge._cc_conf_adopt("sidequest", "/Users/you/apps/sidequest")
         after_first = self._read()
         self.assertFalse(bridge._cc_conf_adopt("sidequest",
-                                               "/Users/xcash/apps/sidequest"))
+                                               "/Users/you/apps/sidequest"))
         self.assertEqual(self._read(), after_first)
         self.assertEqual(len(self._backups()), 1)   # 沒動檔案就不再備份
 
     def test_adopt_reenables_archived_lane_without_touching_its_workdir(self):
         self.assertTrue(bridge._cc_conf_adopt("amulet-hunter", "/somewhere/else"))
-        self.assertIn("amulet-hunter|/Users/xcash/apps/amulet-hunter|1",
+        self.assertIn("amulet-hunter|/Users/you/apps/amulet-hunter|1",
                       self._read())
         self.assertNotIn("/somewhere/else", self._read())
 
@@ -409,9 +409,9 @@ class TestConfAdoptOnDisk(unittest.TestCase):
         self.assertFalse(bridge._cc_conf_release("FLiPER"))   # 冪等
 
     def test_conf_rows_roundtrip_after_adopt(self):
-        bridge._cc_conf_adopt("sidequest", "/Users/xcash/apps/sidequest")
+        bridge._cc_conf_adopt("sidequest", "/Users/you/apps/sidequest")
         rows = dict((n, (w, e)) for n, w, e in bridge._cc_conf_rows())
-        self.assertEqual(rows["sidequest"], ("/Users/xcash/apps/sidequest", "1"))
+        self.assertEqual(rows["sidequest"], ("/Users/you/apps/sidequest", "1"))
         self.assertEqual(rows["FLiPER"][1], "1")
 
 
@@ -493,7 +493,7 @@ class TestAdoptIsBookkeepingOnly(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(any(bad in " ".join(str(a) for a in call)
                                  for bad in ("send-keys", "kill")))
         with open(self.conf, encoding="utf-8") as f:
-            self.assertIn("sidequest|/Users/xcash/apps/sidequest|1", f.read())
+            self.assertIn("sidequest|/Users/you/apps/sidequest|1", f.read())
 
     async def test_adopt_is_idempotent_second_call_is_200(self):
         first = await bridge.v2_discovery_adopt(
@@ -662,11 +662,11 @@ class TestRegistryAdoptRelease(unittest.TestCase):
         reg = _fresh_registry(task_cap=0)      # 配額全滿也要收得進來
         row = reg.adopt("claude_code:sidequest", provider="claude_code",
                         name="sidequest", purpose="側線", cls="task",
-                        worktree="/Users/xcash/apps/sidequest")
+                        worktree="/Users/you/apps/sidequest")
         self.assertTrue(row["registered"])
         self.assertEqual(row["purpose"], "側線")
         self.assertEqual(row["ttl_secs"], 100.0)
-        self.assertEqual(row["worktree"], "/Users/xcash/apps/sidequest")
+        self.assertEqual(row["worktree"], "/Users/you/apps/sidequest")
         self.assertIn("adopted_ts", row["meta"])
 
     def test_adopt_promotes_an_unregistered_row_in_place(self):

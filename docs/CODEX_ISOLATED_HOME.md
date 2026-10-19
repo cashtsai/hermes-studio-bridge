@@ -186,11 +186,11 @@ tail -f ~/apps/hermes-openwebui-bridge/bridge.out.log | grep -E \
 預期會看到：
 
 ```json
-{"event": "codex_isolated_home_ready", "home": "/Users/xcash/.pocket/codex-home",
+{"event": "codex_isolated_home_ready", "home": "/Users/you/.pocket/codex-home",
  "auth": "symlinked", "config": "copied", "created": true}
 {"event": "codex_transport_selected", "transport": "stdio",
  "mode": "auto", "effective_mode": "stdio", "isolated": true}
-{"event": "codex_app_server_started", "codex_home": "/Users/xcash/.pocket/codex-home",
+{"event": "codex_app_server_started", "codex_home": "/Users/you/.pocket/codex-home",
  "isolated": true, "transport": "stdio"}
 ```
 

@@ -35,7 +35,7 @@ class FakeHookRequest:
 
 class TestCCSessionSidDisambiguation(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
-        self.workdir = "/Users/xcash/apps/studio-os"
+        self.workdir = "/Users/you/apps/studio-os"
         self.project_dir = tempfile.mkdtemp(prefix="cc-sid-project-")
         self.main_old_sid = "11111111-1111-1111-1111-111111111111"
         self.cc_old_sid = "22222222-2222-2222-2222-222222222222"
@@ -153,7 +153,7 @@ class TestCCHookDropObservability(unittest.IsolatedAsyncioTestCase):
         return result
 
     async def test_untracked_event_is_logged(self):
-        r = await self._drop({"hook_event_name": "PreToolUse", "cwd": "/Users/xcash"})
+        r = await self._drop({"hook_event_name": "PreToolUse", "cwd": "/Users/you"})
         self.assertTrue(r["ignored"])
         drops = [f for n, f in self.events if n == "cc_hook_dropped"]
         self.assertEqual(len(drops), 1)
@@ -170,7 +170,7 @@ class TestCCHookDropObservability(unittest.IsolatedAsyncioTestCase):
         body = {"hook_event_name": "UserPromptSubmit",
                 "session_id": "11111111-1111-1111-1111-111111111111",
                 "transcript_path": "/tmp/proj/22222222-2222-2222-2222-222222222222.jsonl",
-                "cwd": "/Users/xcash",
+                "cwd": "/Users/you",
                 "prompt": "使用者打的字,絕對不可以進 log"}
         await self._drop(body)
         drops = [f for n, f in self.events if n == "cc_hook_dropped"]
@@ -187,7 +187,7 @@ class TestCCHookDropObservability(unittest.IsolatedAsyncioTestCase):
         sid = "44444444-4444-4444-4444-444444444444"
         body = {"hook_event_name": "Stop", "session_id": sid,
                 "transcript_path": f"/somewhere/else/{sid}.jsonl",
-                "cwd": "/Users/xcash"}
+                "cwd": "/Users/you"}
         with patch.object(bridge, "_cc_transcript_path_matches_cwd", return_value=False):
             await self._drop(body)
         self.assertEqual([f["reason"] for n, f in self.events if n == "cc_hook_dropped"],

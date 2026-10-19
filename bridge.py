@@ -8068,7 +8068,7 @@ def _codex_is_child_thread(thread: dict) -> bool:
     if source_label in {"subagent", "guardian"} or thread_source == "subagent":
         return True
     # The translation test burst was launched from /private/tmp. Keep this
-    # rule narrow so normal exec-backed maintenance under /Users/xcash stays
+    # rule narrow so normal exec-backed maintenance under /Users/you stays
     # visible in the main list.
     return cwd == "/private/tmp" or cwd.startswith("/private/tmp/")
 
@@ -22606,7 +22606,7 @@ async def app_subscription_notify(request: Request):
 
     **這個端點沒有 bridge bearer 驗證**,因為呼叫者是 Apple,不可能帶我們的
     token。它的認證完全來自 signedPayload 的憑證鏈 —— 驗不過就 401,不寫任何
-    東西。這也是為什麼它必須公網可達(cloudflare tunnel `pocket.tsai.cash`)。
+    東西。這也是為什麼它必須公網可達(cloudflare tunnel `pocket.example.com`)。
 
     回應碼對 Apple 有意義:非 2xx 會被重試(最長數天)。因此「我們這邊沒配置
     訂閱」「這是 TEST 通知」「這筆不是我們的 app」都回 200 —— 那些重試無意義。
@@ -27532,7 +27532,7 @@ def _codex_child_worker_rows(threads: list[dict], parent: dict,
       thread 記錄上出現 `parentThreadId` 之類的欄位,下面的 explicit 分支會
       自動優先採用。
     - 現況唯一可用的訊號是 **cwd**:實測 subagent thread 與其 parent 共用 cwd
-      (guardian 228 筆在 /Users/xcash、38 筆在 hermes-agent/home,都與該目錄
+      (guardian 228 筆在 /Users/you、38 筆在 hermes-agent/home,都與該目錄
       下的操作者 thread 對得上)。所以用 cwd 相等當連線,並在 meta 標
       `link:"cwd"` 誠實告訴 app 這是啟發式、不是 provider 給的事實。
     """

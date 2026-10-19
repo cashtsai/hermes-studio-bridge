@@ -109,7 +109,7 @@ ACTIONS = [
     {"label": "影片", "url": "https://drive.google.com/file/d/vid123/view"},
     {"label": "IG", "url": "https://www.instagram.com/stories/fliper.mag/1/"},
     {"label": "FB", "url": "https://www.facebook.com/61550/posts/123"},
-    {"label": "Console", "url": "https://console.tsai.cash/#story"},
+    {"label": "Console", "url": "https://console.example.com/#story"},
     {"label": "叫天晴回報", "text": "限動成效如何?", "target_session": ""},
     {"label": "壞顆", "url": "javascript:alert(1)"},   # 略過
 ]
@@ -141,7 +141,7 @@ r = client.post("/app/v1/persona-report", headers=AUTH, json={
     "session": "demo-b", "label": "新文章發佈", "name": "fed-story",
     "content": "# Today Pick v2", "ts": NOW - 30,
     "external_source": "fed", "external_id": "urlact:story:1",
-    "actions": [{"label": "Console", "url": "https://console.tsai.cash/#story"}]})
+    "actions": [{"label": "Console", "url": "https://console.example.com/#story"}]})
 r = client.get("/app/v1/reports/urlact:story:1", headers=AUTH)
 check("重發 → 整組替換成 1 顆連結型",
       [a["label"] for a in r.json()["report"]["actions"]] == ["Console"])

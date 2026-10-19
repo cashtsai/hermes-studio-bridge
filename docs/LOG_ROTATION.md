@@ -5,8 +5,8 @@
 launchd 把 bridge 的 stdout/stderr 導到兩個檔案，**從來不輪替**：
 
 ```
-StandardOutPath  → /Users/xcash/apps/hermes-openwebui-bridge/bridge.out.log
-StandardErrorPath → /Users/xcash/apps/hermes-openwebui-bridge/bridge.err.log
+StandardOutPath  → /Users/you/apps/hermes-openwebui-bridge/bridge.out.log
+StandardErrorPath → /Users/you/apps/hermes-openwebui-bridge/bridge.err.log
 ```
 
 稽核當天 `bridge.out.log` 41MB，2026-07-26 已經 43MB。bridge 是 launchd 常駐、

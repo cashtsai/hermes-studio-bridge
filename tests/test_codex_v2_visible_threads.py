@@ -71,7 +71,7 @@ class TestCodexV2VisibleThreads(unittest.IsolatedAsyncioTestCase):
             "id": "xcash-thread",
             "name": "XCash",
             "source": "exec",
-            "cwd": "/Users/xcash",
+            "cwd": "/Users/you",
         }
         app = FakeCodexApp([
             {"data": child_rows, "nextCursor": "next-page"},
@@ -92,7 +92,7 @@ class TestCodexV2VisibleThreads(unittest.IsolatedAsyncioTestCase):
             "id": "xcash-thread",
             "name": "XCash",
             "source": "exec",
-            "cwd": "/Users/xcash",
+            "cwd": "/Users/you",
             "status": "idle",
         }
         with patch.object(bridge, "CODEX_APP", FailingCodexApp()), patch.object(
@@ -107,7 +107,7 @@ class TestCodexV2VisibleThreads(unittest.IsolatedAsyncioTestCase):
             "id": "xcash-thread",
             "name": "XCash",
             "source": "exec",
-            "cwd": "/Users/xcash",
+            "cwd": "/Users/you",
             "status": "idle",
         }
         cache_key = (False, "", False)

@@ -7418,7 +7418,7 @@ def _codex_is_child_thread(thread: dict) -> bool:
     if source_label in {"subagent", "guardian"} or thread_source == "subagent":
         return True
     # The translation test burst was launched from /private/tmp. Keep this
-    # rule narrow so normal exec-backed maintenance under /Users/xcash stays
+    # rule narrow so normal exec-backed maintenance under /Users/you stays
     # visible in the main list.
     return cwd == "/private/tmp" or cwd.startswith("/private/tmp/")
 

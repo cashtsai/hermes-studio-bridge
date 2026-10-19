@@ -35,7 +35,7 @@ with bridge._PAIR_BOOT_CODE_LOCK:
     bridge._PAIR_BOOT_CODE_CACHE["code"] = ""
 
 _TS_SELF = {
-    "DNSName": "cashcamp.tail905550.ts.net.",
+    "DNSName": "<your-host>.<your-tailnet>.ts.net.",
     "TailscaleIPs": ["100.67.0.12", "fd7a:115c:a1e0::1234"],
 }
 
@@ -107,7 +107,7 @@ class TestConsoleBootEndpoint(unittest.TestCase):
         # MagicDNS 名優先(tailnet IP 會換),且必須帶 bridge 埠 → 直連
         self.assertEqual(
             d["url"],
-            "http://cashcamp.tail905550.ts.net:%d/console?boot=%s"
+            "http://<your-host>.<your-tailnet>.ts.net:%d/console?boot=%s"
             % (bridge._BRIDGE_PORT, self.boot))
         for u in d["urls"]:
             self.assertTrue(u.startswith("http://"), u)
@@ -165,7 +165,7 @@ class TestConsoleBootEndpoint(unittest.TestCase):
     # ── 回歸:_pair_tailscale_host 經重構後語意不變 ───────────────────
     def test_tailscale_host_prefers_dnsname(self):
         self.assertEqual(bridge._pair_tailscale_host(),
-                         "cashcamp.tail905550.ts.net")
+                         "<your-host>.<your-tailnet>.ts.net")
         with patch.object(bridge, "_pair_tailscale_self",
                           return_value={"TailscaleIPs": ["100.1.2.3"]}):
             self.assertEqual(bridge._pair_tailscale_host(), "100.1.2.3")
