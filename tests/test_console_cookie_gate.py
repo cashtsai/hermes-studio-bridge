@@ -82,6 +82,17 @@ class _ConsoleCookieBase(unittest.TestCase):
     def _cookie_header(self, value):
         return {"Cookie": f"{bridge._CONSOLE_COOKIE_NAME}={value}"}
 
+    # 2026-10-19 起,「直連 + 憑證缺/壞」不再是裸 403,而是 401 + 配對碼輸入頁
+    # (feat/console-login-page)。安全性質一字未改:**拿不到 console 本體、
+    # 不種 cookie**;只有外觀從空白 403 變成一個能打字的框。非直連(帶轉送
+    # 標頭)仍是裸 403 —— 那條由 tests/test_console_login_page.py 守。
+    def assertLoginPage(self, r, why=""):
+        self.assertEqual(r.status_code, 401, why)
+        self.assertIn('action="/console/auth"', r.text, why)
+        self.assertNotIn('id="app"', r.text, "不准漏出 console 本體")
+        self.assertEqual(r.headers.get("set-cookie", ""), "",
+                         "沒過關不准種 cookie")
+
 
 class TestConsoleCookieGate(_ConsoleCookieBase):
     # ── 1. 行為不變:帶正確 ?boot= → 200,並簽發 cookie ──────────────────
@@ -93,9 +104,8 @@ class TestConsoleCookieGate(_ConsoleCookieBase):
         # cookie 的值**不是** boot code 本身(外洩也換不到 pairing code)
         self.assertNotIn(self.boot, raw)
 
-    def test_bare_console_without_cookie_is_403(self):
-        r = self.client.get("/console")
-        self.assertEqual(r.status_code, 403)
+    def test_bare_console_without_cookie_shows_login_page(self):
+        self.assertLoginPage(self.client.get("/console"))
 
     # ── 2. 沒 boot、帶有效 cookie → /console 過(PWA start_url 的情境)──
     def test_valid_cookie_opens_console_without_query(self):
@@ -126,7 +136,7 @@ class TestConsoleCookieGate(_ConsoleCookieBase):
         self.assertEqual(ctx.exception.status_code, 403)
         bridge._pair_check_boot(req, allow_cookie=True)   # 放寬才過
 
-    # ── 4. 竄改一個字元 → 403 ─────────────────────────────────────────
+    # ── 4. 竄改一個字元 → 不得進 console ──────────────────────────────
     def test_tampered_cookie_rejected(self):
         value = bridge._console_cookie_value()
         ts, _, sig = value.partition(".")
@@ -138,9 +148,9 @@ class TestConsoleCookieGate(_ConsoleCookieBase):
                     f"notanumber.{sig}",               # ts 不是數字
                     ""):
             r = self.client.get("/console", headers=self._cookie_header(bad))
-            self.assertEqual(r.status_code, 403, f"壞 cookie 居然過了:{bad!r}")
+            self.assertLoginPage(r, f"壞 cookie 居然過了:{bad!r}")
 
-    # ── 5. ts 超過有效期 → 403 ────────────────────────────────────────
+    # ── 5. ts 超過有效期 → 不得進 console ─────────────────────────────
     def test_expired_cookie_rejected(self):
         fresh = bridge._console_cookie_value()
         self.assertTrue(bridge._console_cookie_ok(
@@ -148,8 +158,8 @@ class TestConsoleCookieGate(_ConsoleCookieBase):
 
         old_ts = time.time() - bridge._CONSOLE_COOKIE_TTL - 60
         expired = bridge._console_cookie_value(now=old_ts)
-        r = self.client.get("/console", headers=self._cookie_header(expired))
-        self.assertEqual(r.status_code, 403)
+        self.assertLoginPage(
+            self.client.get("/console", headers=self._cookie_header(expired)))
 
         # 剛好還在期限內的(TTL 前一分鐘)仍要過 —— 別把邊界算反
         almost = bridge._console_cookie_value(
@@ -161,9 +171,8 @@ class TestConsoleCookieGate(_ConsoleCookieBase):
         # 時間戳在遙遠未來(超過容許偏移)→ 擋掉
         future = bridge._console_cookie_value(
             now=time.time() + bridge._CONSOLE_COOKIE_CLOCK_SKEW + 600)
-        self.assertEqual(
-            self.client.get("/console",
-                            headers=self._cookie_header(future)).status_code, 403)
+        self.assertLoginPage(
+            self.client.get("/console", headers=self._cookie_header(future)))
 
     def test_ttl_is_14_days(self):
         self.assertEqual(bridge._CONSOLE_COOKIE_TTL, 14 * 24 * 3600)
@@ -181,7 +190,7 @@ class TestConsoleCookieGate(_ConsoleCookieBase):
             new_boot = bridge._pair_boot_code()
             self.assertNotEqual(new_boot, self.boot)
             r = self.client.get("/console", headers=self._cookie_header(value))
-            self.assertEqual(r.status_code, 403, "換碼後舊 cookie 必須失效")
+            self.assertLoginPage(r, "換碼後舊 cookie 必須失效")
             # 新碼照樣能開、並簽出新的 cookie
             self.assertEqual(
                 self.client.get("/console",
