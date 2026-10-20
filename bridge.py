@@ -9503,7 +9503,22 @@ def _pair_check_boot(request: Request, *, allow_cookie: bool = False) -> None:
     鑄配對碼的端點(`/pair/qr`、`/pair/qr.json`)**一律維持只認 query** ——
     cookie 外洩頂多能看 console 頁面殼,換不到可以接管主機的 pairing code。
     """
+    # 失敗退避(2026-10-20 補):原本**只有** `/console/auth` 有退避,
+    # `/pair/qr` 與 `/pair/qr.json` 一次都沒有 —— 因為這裡在
+    # `_pair_qr_check_mint_rate()` 之前就 raise,鑄碼節流那桶根本輪不到
+    # (實測連打 8 次錯碼拿到 8 個 403,毫無節流)。碼還是 ~128 bits 時這只是
+    # 難看;一旦 console 改用 6 位數短效碼,`/pair/qr.json` 就會變成 10^6
+    # 約 5.5 小時可窮舉的旁門。退避放在這個函式裡,所有呼叫點一次涵蓋。
+    #
+    # 沿用 `/console/auth` 那張 per-client 表與同一個門檻(`_AUTH_FAILS_BY_CLIENT`
+    # + `_CONSOLE_AUTH_FAIL_MAX`),不另外發明一張會漏記憶體的 dict。
+    # 超額時**連比都不比**,這樣才是真退避。
+    wait = _console_auth_retry_after(request)
+    if wait > 0:
+        raise HTTPException(status_code=429, detail="too many attempts; slow down",
+                            headers={"Retry-After": str(int(wait) + 1)})
     if not _pair_boot_ok(request, allow_cookie=allow_cookie):
+        _console_auth_note_failure(request)
         raise HTTPException(status_code=403, detail="invalid boot code")
 
 
@@ -10066,6 +10081,70 @@ _CONSOLE_AUTH_FAIL_MAX = 6
 _CONSOLE_CODE_MAX_LEN = 256       # 比對前先夾長度(錯誤訊息仍同一句,不洩漏)
 
 
+# ── console 短效 6 位數碼(2026-10-20)────────────────────────────────────
+# 為什麼要換:`/app/v1/console/boot` 原本回的是 `_pair_boot_code()` ——
+# 一機一碼、**永久常駐**的 22 碼英數混大小寫。難打,而且手機拿到之後就算之後
+# 撤銷該機的 device token,它仍握著能再鑄新 token 的長碼。
+#
+# **獨立 store,刻意不混用 `_PAIR_CODES`**:那是裝置配對命名空間,碼換得到
+# `pdev-` device token;這裡的碼只換得到 console 的 cookie。能力不同就不該
+# 共用命名空間,免得哪天一邊的碼在另一邊也能用。
+#
+# 長碼**保留當救援路徑**(`/console/auth` 仍接受),手機不在手邊時不會被鎖在
+# 門外;`/console?boot=<長碼>` 的既有入口也原封不動。
+_CONSOLE_CODE_TTL = 300.0         # 秒;5 分鐘,夠從手機走到桌面打完
+_CONSOLE_CODE_MAX_LIVE = 5        # 同時存活上限;滿了先擠掉最舊的
+_CONSOLE_CODES: dict = {}         # code -> expiry(monotonic)
+_CONSOLE_CODE_LOCK = threading.Lock()
+
+
+def _console_mint_short_code() -> tuple:
+    """鑄一枚 6 位數短效碼,回 `(code, expires_at_epoch)`。
+
+    `secrets.randbelow` 不是 `random` —— 這是憑證,要 CSPRNG。
+    上限用「擠掉最舊」而不是「拒絕鑄碼」:使用者連點兩下不該換來一個錯誤,
+    而舊碼本來就該讓位給新碼。
+    """
+    now = time.monotonic()
+    with _CONSOLE_CODE_LOCK:
+        for c in [c for c, exp in _CONSOLE_CODES.items() if exp <= now]:
+            _CONSOLE_CODES.pop(c, None)              # 順手清過期
+        while len(_CONSOLE_CODES) >= _CONSOLE_CODE_MAX_LIVE:
+            _CONSOLE_CODES.pop(min(_CONSOLE_CODES, key=_CONSOLE_CODES.get), None)
+        code = "%06d" % secrets.randbelow(1000000)
+        for _ in range(16):                          # 撞號就重抽(機率極低)
+            if code not in _CONSOLE_CODES:
+                break
+            code = "%06d" % secrets.randbelow(1000000)
+        _CONSOLE_CODES[code] = now + _CONSOLE_CODE_TTL
+    return code, time.time() + _CONSOLE_CODE_TTL
+
+
+def _console_short_code_ok(code: str) -> bool:
+    """驗一枚短效碼;**命中即作廢**(一次性)。
+
+    先用形狀(6 位數字)擋掉明顯不是短碼的輸入 —— 這樣長碼救援路徑進來時
+    不會白走一趟,也不會意外消耗任何短碼。比對用 `compare_digest`;迴圈次數
+    只洩漏「目前有幾枚碼存活」,那不是秘密。
+    """
+    if not code or len(code) != 6 or not code.isdigit():
+        return False
+    probe = code.encode("ascii", "ignore")
+    now = time.monotonic()
+    with _CONSOLE_CODE_LOCK:
+        for c in [c for c, exp in _CONSOLE_CODES.items() if exp <= now]:
+            _CONSOLE_CODES.pop(c, None)
+        hit = ""
+        for c in _CONSOLE_CODES:
+            if hmac.compare_digest(c.encode("ascii"), probe):
+                hit = c
+                break
+        if hit:
+            _CONSOLE_CODES.pop(hit, None)            # 一次性:用過就沒了
+            return True
+    return False
+
+
 def _console_auth_retry_after(request: Request) -> float:
     """已超額時還要等幾秒(= 最舊那筆滑出 60 秒窗);沒超額回 0。"""
     now = time.monotonic()
@@ -10183,8 +10262,14 @@ async def console_auth(request: Request):
         raise HTTPException(status_code=429, detail="too many attempts; slow down",
                             headers={"Retry-After": str(int(wait) + 1)})
     code = await _console_auth_submitted_code(request)
-    if not code or not hmac.compare_digest(code.encode("utf-8", "ignore"),
-                                           _pair_boot_code().encode("utf-8")):
+    # 兩條都收:短效 6 位數(手機給的,一次性)或長 boot code(救援路徑 ——
+    # 手機不在手邊、或短碼管線壞掉時,機主仍進得去)。短碼先驗:它的形狀檢查
+    # 會把長碼直接擋在門外,所以長碼不會誤耗任何一枚短碼。
+    ok = bool(code) and (
+        _console_short_code_ok(code)
+        or hmac.compare_digest(code.encode("utf-8", "ignore"),
+                               _pair_boot_code().encode("utf-8")))
+    if not ok:
         _console_auth_note_failure(request)
         return _console_login_response(request, error=_CONSOLE_LOGIN_ERR)
     resp = RedirectResponse("/console", status_code=303,
@@ -10302,17 +10387,21 @@ async def app_v1_console_boot(request: Request):
     if not POCKET_CONSOLE_ENABLED:
         raise HTTPException(status_code=404, detail="not found")
     _check_auth(request)         # master 或 device token;401/429 與節流都在裡面
-    boot = _pair_boot_code()
+    boot, expires_at = _console_mint_short_code()
     hosts = _console_boot_hosts()
-    qs = "?boot=" + urllib.parse.quote(boot)
-    urls = ["http://%s/console%s" % (h, qs) for h in hosts]
+    # 碼**不進 URL**:uvicorn 的 access log 會把整條帶 query 的路徑記下來,
+    # 碼走 query 等於寫進日誌。所以 url/urls 只負責「把人帶到登入頁」,
+    # 碼由使用者照著手機上的 6 位數手打(或 app 代填進 POST body)。
+    urls = ["http://%s/console" % h for h in hosts]
     auth = request.headers.get("authorization", "")
     tok = auth[7:].strip() if auth.lower().startswith("bearer ") else ""
     # 只記「誰拿了、有幾個候選」—— boot code 本身絕不進日誌。
     _log_event("console_boot_issued", token_hash=_short_hash(tok),
                hosts=len(hosts))
     return {
-        "boot": boot,
+        "boot": boot,                      # 6 位數字,字串(保留前導零)
+        "expires_at": int(expires_at),     # Unix epoch 秒(UTC);給 app 倒數用
+        "expires_in": int(_CONSOLE_CODE_TTL),
         "url": urls[0] if urls else None,
         "urls": urls,
         "reachable": bool(urls),

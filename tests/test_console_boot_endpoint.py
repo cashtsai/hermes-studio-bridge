@@ -17,6 +17,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 
@@ -35,7 +36,7 @@ with bridge._PAIR_BOOT_CODE_LOCK:
     bridge._PAIR_BOOT_CODE_CACHE["code"] = ""
 
 _TS_SELF = {
-    "DNSName": "cashcamp.tail905550.ts.net.",
+    "DNSName": "examplehost.tailnet-example.ts.net.",
     "TailscaleIPs": ["100.67.0.12", "fd7a:115c:a1e0::1234"],
 }
 
@@ -51,6 +52,12 @@ class TestConsoleBootEndpoint(unittest.TestCase):
                 "apple_user_id": None, "device_id": None,
             }
         bridge._CONSOLE_BOOT_URL_CACHE.update({"ts": 0.0, "urls": []})
+        # 短效碼 store 與失敗退避桶都是模組層全域:不洗乾淨的話,前一個
+        # case 殘留的碼或失敗次數會讓後面的 case 莫名 401/429。
+        with bridge._CONSOLE_CODE_LOCK:
+            bridge._CONSOLE_CODES.clear()
+        with bridge._AUTH_LOCK:
+            bridge._AUTH_FAILS_BY_CLIENT.clear()
         self.patches = [
             patch.object(bridge, "POCKET_CONSOLE_ENABLED", True),
             patch.object(bridge, "_pair_tailscale_self", return_value=dict(_TS_SELF)),
@@ -85,7 +92,13 @@ class TestConsoleBootEndpoint(unittest.TestCase):
         r = self._get(self.dev_token)
         self.assertEqual(r.status_code, 200)
         d = r.json()
-        self.assertEqual(d["boot"], self.boot)
+        # 短效碼:6 位**數字字串** —— 必須是 str,否則 "039583" 的前導零
+        # 會在 app 端被吃掉(實測鑄得出這種碼)。
+        self.assertIsInstance(d["boot"], str)
+        self.assertRegex(d["boot"], r"^\d{6}$")
+        self.assertNotEqual(d["boot"], self.boot)   # 不再回永久長碼
+        self.assertEqual(d["expires_in"], int(bridge._CONSOLE_CODE_TTL))
+        self.assertGreater(d["expires_at"], time.time())
         self.assertTrue(d["reachable"])
         self.assertTrue(d["url"])
 
@@ -93,7 +106,7 @@ class TestConsoleBootEndpoint(unittest.TestCase):
         """master 是嚴格更強的憑證,沒有理由擋(其餘 /app/* 端點也都收)。"""
         r = self._get(os.environ["BRIDGE_TOKEN"])
         self.assertEqual(r.status_code, 200)
-        self.assertEqual(r.json()["boot"], self.boot)
+        self.assertRegex(r.json()["boot"], r"^\d{6}$")
 
     def test_revoked_token_rejected(self):
         self.assertEqual(self._get(self.dev_token).status_code, 200)
@@ -107,16 +120,20 @@ class TestConsoleBootEndpoint(unittest.TestCase):
         # MagicDNS 名優先(tailnet IP 會換),且必須帶 bridge 埠 → 直連
         self.assertEqual(
             d["url"],
-            "http://cashcamp.tail905550.ts.net:%d/console?boot=%s"
-            % (bridge._BRIDGE_PORT, self.boot))
+            "http://examplehost.tailnet-example.ts.net:%d/console"
+            % bridge._BRIDGE_PORT)
         for u in d["urls"]:
             self.assertTrue(u.startswith("http://"), u)
-            self.assertIn(":%d/console?boot=" % bridge._BRIDGE_PORT, u)
+            self.assertTrue(u.endswith(":%d/console" % bridge._BRIDGE_PORT), u)
+            # 碼**不准**出現在 URL:uvicorn 的 access log 會把整條帶 query
+            # 的路徑記下來,碼走 query 等於寫進日誌。
+            self.assertNotIn("boot=", u)
+            self.assertNotIn(d["boot"], u)
         # tailnet IP 保底也在清單裡,v6 要包方括號
-        self.assertIn("http://100.67.0.12:%d/console?boot=%s"
-                      % (bridge._BRIDGE_PORT, self.boot), d["urls"])
-        self.assertIn("http://[fd7a:115c:a1e0::1234]:%d/console?boot=%s"
-                      % (bridge._BRIDGE_PORT, self.boot), d["urls"])
+        self.assertIn("http://100.67.0.12:%d/console"
+                      % bridge._BRIDGE_PORT, d["urls"])
+        self.assertIn("http://[fd7a:115c:a1e0::1234]:%d/console"
+                      % bridge._BRIDGE_PORT, d["urls"])
 
     def test_url_never_lan_or_public_tunnel(self):
         """LAN 與公網 tunnel 都開不起 /console(前者非 tailnet,後者帶 XFF)
@@ -134,17 +151,42 @@ class TestConsoleBootEndpoint(unittest.TestCase):
         with patch.object(bridge, "_pair_tailscale_self", return_value={}):
             bridge._CONSOLE_BOOT_URL_CACHE.update({"ts": 0.0, "urls": []})
             d = self._get(self.dev_token).json()
-        self.assertEqual(d["boot"], self.boot)
+        self.assertRegex(d["boot"], r"^\d{6}$")
         self.assertIsNone(d["url"])
         self.assertEqual(d["urls"], [])
         self.assertFalse(d["reachable"])
         self.assertTrue(d["hint"])
 
-    # ── 拿到的碼真的能開 /console ─────────────────────────────────────
-    def test_returned_code_actually_opens_console(self):
+    # ── 拿到的碼真的能開 console(改走 POST,碼不進 query)──────────────
+    def _auth(self, code):
+        return self.client.post("/console/auth", data={"code": code},
+                                follow_redirects=False)
+
+    def test_returned_code_opens_console_via_auth_post(self):
+        """短效碼的入口是登入頁的 POST,不是 `GET /console?boot=`。
+
+        使用者流程:手機顯示 6 位數 → 桌面開 url(登入頁)→ 手打進去。
+        """
         d = self._get(self.dev_token).json()
-        r = self.client.get("/console", params={"boot": d["boot"]})
-        self.assertEqual(r.status_code, 200)
+        self.assertEqual(self._auth(d["boot"]).status_code, 303)
+
+    def test_short_code_is_single_use(self):
+        """驗過就作廢 —— 碼被人從肩上看去也只能用那一次。"""
+        d = self._get(self.dev_token).json()
+        self.assertEqual(self._auth(d["boot"]).status_code, 303)
+        self.assertEqual(self._auth(d["boot"]).status_code, 401)
+
+    def test_long_boot_code_still_rescues(self):
+        """長碼是救援路徑:手機不在手邊、或短碼管線壞掉時仍進得去。"""
+        self.assertEqual(self._auth(self.boot).status_code, 303)
+
+    def test_short_code_expires(self):
+        """TTL 到期即失效(直接把 store 裡的到期時間推到過去,不等 5 分鐘)。"""
+        d = self._get(self.dev_token).json()
+        with bridge._CONSOLE_CODE_LOCK:
+            for c in list(bridge._CONSOLE_CODES):
+                bridge._CONSOLE_CODES[c] = time.monotonic() - 1.0
+        self.assertEqual(self._auth(d["boot"]).status_code, 401)
 
     # ── boot code 不准進日誌 ─────────────────────────────────────────
     def test_boot_code_never_logged(self):
@@ -165,7 +207,7 @@ class TestConsoleBootEndpoint(unittest.TestCase):
     # ── 回歸:_pair_tailscale_host 經重構後語意不變 ───────────────────
     def test_tailscale_host_prefers_dnsname(self):
         self.assertEqual(bridge._pair_tailscale_host(),
-                         "cashcamp.tail905550.ts.net")
+                         "examplehost.tailnet-example.ts.net")
         with patch.object(bridge, "_pair_tailscale_self",
                           return_value={"TailscaleIPs": ["100.1.2.3"]}):
             self.assertEqual(bridge._pair_tailscale_host(), "100.1.2.3")
