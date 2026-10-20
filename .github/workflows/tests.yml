@@ -1,0 +1,55 @@
+name: tests
+
+# 這個 repo 公開了幾個月,**從來沒有 CI**。對外部貢獻者來說那代表:他送一個
+# PR,沒有任何東西告訴他有沒有打壞什麼,只能等維護者在自己機器上跑。
+#
+# 跑的就是維護者本機跑的那一套,沒有另開一條 CI 專用路徑 —— CI 與本機跑不同
+# 的東西,是「本機綠、CI 紅」這類爭論的來源。
+#   · `scripts/run-tests.sh` 逐檔跑 tests/*.py(詳見該檔開頭:這個 repo 的測試
+#     有兩種血統,discover 收不全)
+#   · 出鏡守門 `tests/test_no_private_infra_leak.py` 也在裡面,所以 PR 帶進
+#     tailnet 名/家目錄路徑會在這裡被擋下來
+#
+# ⚠️ Actions 日誌是**公開**的。守門失敗時預設不印洩漏原文(見該檔 `_sample`),
+#    要看原文請在本機帶 `LEAK_GUARD_VERBOSE=1` 跑。
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      # bridge 透過 tmux 驅動 Claude Code / Codex。測試幾乎都把 tmux 攔掉用
+      # 假的,但有幾支會探測 binary 存不存在,裝了比較不容易出現平台差異。
+      - name: Install tmux
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends tmux
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Run test suite
+        run: ./scripts/run-tests.sh
+        env:
+          # runner 預設指向維護者的 venv;CI 用 runner 自己的 python。
+          PYTHON: python

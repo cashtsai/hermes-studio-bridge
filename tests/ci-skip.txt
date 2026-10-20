@@ -1,0 +1,28 @@
+# CI 跳過清單 —— **每一行都是待辦,不是永久豁免。**
+#
+# `scripts/run-tests.sh` 只在 `CI=true` 時讀這份(本機跑永遠跑全套)。
+# 格式:`<測試檔名>  # <為什麼在 CI 上跑不起來>`
+#
+# 為什麼要有這份而不是讓 CI 紅著、或悄悄不跑:
+#   · 紅著 → 外部貢獻者看到紅勾會以為是自己弄壞的,或乾脆學會無視 CI。
+#     一條沒人修的紅線會讓整份報告失去意義。
+#   · 悄悄不跑 → 更糟。看起來「全綠=全都驗過了」,實際上沒有。
+#   runner 會把跳過的檔名與理由**印出來**並算進總數,所以不會假裝覆蓋。
+#
+# 共同病根:這幾支依賴的不是程式碼,而是**維護者那台機器上的東西**
+# (Hermes agent 安裝、codex binary、macOS 的 zsh)。要讓它們進 CI,正解是
+# 讓它們在依賴缺席時 `SkipTest` 而不是炸掉 —— 那是下一刀,不是這一刀。
+
+# 需要 Hermes agent 安裝(`hermes_constants` 等模組不在本 repo 內)
+test_hermes_media            # ModuleNotFoundError: hermes_constants
+test_acp_client_workspace_cwd  # 斷言吃維護者的 hermes profile 佈局
+
+# 需要真的 codex binary(會起 app-server)
+test_codex_transport         # CodexAppServerError: codex app-server stopped
+test_cx_transport_upgrade    # 同上,另外在 Linux 上出現 asyncio「Event loop is closed」
+
+# 需要 macOS 預設 shell
+test_terminal_pty            # FileNotFoundError: /bin/zsh
+
+# 待查:Linux 上的 traceback 尚未定位(2026-10-20)
+test_pocket_agent_lanes      # errors=1,原因未查明
