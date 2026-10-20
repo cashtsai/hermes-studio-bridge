@@ -37,7 +37,7 @@ colima start
 BRIDGE_TOKEN=<your token> ./deploy/run-openwebui.sh
 ```
 
-Reach it from your phone over Tailscale: **http://100.67.0.12:3000**
+Reach it from your phone over Tailscale: **http://<your-tailnet-ip>:3000**
 (first visit: create the admin account → pick a persona model → chat).
 
 ## Security

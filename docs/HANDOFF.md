@@ -5,7 +5,7 @@ Hermes install lives at `~/apps/hermes-agent`.
 
 ## Key facts
 
-- **Host**: cashcamp (Tailscale `100.67.0.12`). Phone reaches services over Tailscale.
+- **Host**: cashcamp (Tailscale `<your-tailnet-ip>`). Phone reaches services over Tailscale.
 - **Bridge token**: stored in the LaunchAgent env `BRIDGE_TOKEN` (`~/Library/LaunchAgents/ai.studio.hermes-bridge.plist`). Open WebUI's `OPENAI_API_KEY` must match it.
 - **Ports**: bridge `8081`, Open WebUI `3000`.
 - **Hermes homes** (= persona memory/state, shared with Telegram bots):
