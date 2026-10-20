@@ -98,3 +98,30 @@ Cloudflare named tunnels are copied.
 - `hermes -z` shares the persona `state.db` with its live Telegram gateway — fine in practice, watch for write contention on very long turns.
 
 See `docs/HANDOFF.md` for maintenance & troubleshooting.
+
+---
+
+## Security
+
+This is **an agent gateway that executes tools on the host it runs on** — tmux
+sessions, a WebSocket terminal, a file browser. A bridge token is equivalent to
+shell access on that machine. Do not expose it directly to the public internet;
+reach it over your own private network (Tailscale or equivalent) or a tunnel you
+control.
+
+Found a hole? **Do not open a public issue** — see [SECURITY.md](SECURITY.md).
+
+## License
+
+**AGPL-3.0-or-later** (see [LICENSE](LICENSE)).
+
+Why AGPL rather than MIT: this project is the server half of a product whose
+other half (the Pocket iOS app) is how the author makes a living. AGPL keeps the
+code open **and** keeps it open if someone runs a modified copy as a hosted
+service — section 13 requires offering the modified source to users of that
+service. Running it yourself, privately, for your own machines (the normal case)
+carries no obligation at all.
+
+The client-side components are deliberately **not** AGPL: the desktop app
+(`pocket-connect`) is Apache-2.0, so integrating or embedding it stays easy.
+
