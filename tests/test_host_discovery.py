@@ -137,7 +137,7 @@ class TestPaneParsing(unittest.TestCase):
         self.assertNotIn(9500, found)
 
     def test_is_claude_cmdline_edge_cases(self):
-        self.assertTrue(hd.is_claude_cmdline("/Users/x/.local/bin/claude --model opus"))
+        self.assertTrue(hd.is_claude_cmdline("/Users/you/.local/bin/claude --model opus"))
         self.assertTrue(hd.is_claude_cmdline("claude"))
         self.assertTrue(hd.is_claude_cmdline("node /x/@anthropic-ai/claude-code/cli.js"))
         self.assertFalse(hd.is_claude_cmdline("tail -f /var/log/claude.log"))
