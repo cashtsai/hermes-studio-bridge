@@ -2,6 +2,12 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+	<!-- 安裝:把 __POCKET_HOME__ 換成實際家目錄再載入(與 ai.studio.hermes-bridge.plist
+	     的 __POCKET_BRIDGE_ROOT__ 同一套慣例)。launchd **不會**展開 $HOME,
+	     所以這裡只能用佔位 + 安裝時替換;硬寫絕對路徑會把維護者的使用者名
+	     publish 到這個公開 repo(2026-10-19 守門抓到過一次)。
+	     例:sed "s|__POCKET_HOME__|$HOME|g" deploy/ai.studio.pocket-console-tls.plist \
+	           > ~/Library/LaunchAgents/ai.studio.pocket-console-tls.plist -->
 	<key>EnvironmentVariables</key>
 	<dict>
 		<key>PATH</key>
@@ -18,17 +24,17 @@
 	<key>ProgramArguments</key>
 	<array>
 		<string>/usr/bin/python3</string>
-		<string>/Users/xcash/.local/bin/pocket-console-tls.py</string>
+		<string>__POCKET_HOME__/.local/bin/pocket-console-tls.py</string>
 	</array>
 	<key>RunAtLoad</key>
 	<true/>
 	<key>StandardErrorPath</key>
-	<string>/Users/xcash/Library/Logs/pocket-console-tls.err.log</string>
+	<string>__POCKET_HOME__/Library/Logs/pocket-console-tls.err.log</string>
 	<key>StandardOutPath</key>
-	<string>/Users/xcash/Library/Logs/pocket-console-tls.log</string>
+	<string>__POCKET_HOME__/Library/Logs/pocket-console-tls.log</string>
 	<key>ThrottleInterval</key>
 	<integer>10</integer>
 	<key>WorkingDirectory</key>
-	<string>/Users/xcash</string>
+	<string>__POCKET_HOME__</string>
 </dict>
 </plist>

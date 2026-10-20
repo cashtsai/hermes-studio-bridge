@@ -47,12 +47,12 @@
     -e BRIDGE_URL=http://127.0.0.1:8081 \
     -e BRIDGE_TOKEN=<token> \
     -e AGENT_CALL_SELF=claude_code:<本 lane 名> \
-    -- python3 /Users/xcash/apps/hermes-openwebui-bridge/scripts/agent-call-mcp.py
+    -- python3 /Users/you/apps/hermes-openwebui-bridge/scripts/agent-call-mcp.py
 
   或 .mcp.json:
   {"mcpServers": {"agent-call": {
       "command": "python3",
-      "args": ["/Users/xcash/apps/hermes-openwebui-bridge/scripts/agent-call-mcp.py"],
+      "args": ["/Users/you/apps/hermes-openwebui-bridge/scripts/agent-call-mcp.py"],
       "env": {"BRIDGE_URL": "http://127.0.0.1:8081",
               "BRIDGE_TOKEN": "<token>",
               "AGENT_CALL_SELF": "claude_code:<本 lane 名>"}}}}
@@ -60,7 +60,7 @@
 ── 註冊到 Codex(~/.codex/config.toml)────────────────────────────────────
   [mcp_servers.agent_call]
   command = "python3"
-  args = ["/Users/xcash/apps/hermes-openwebui-bridge/scripts/agent-call-mcp.py"]
+  args = ["/Users/you/apps/hermes-openwebui-bridge/scripts/agent-call-mcp.py"]
   env = { BRIDGE_URL = "http://127.0.0.1:8081", BRIDGE_TOKEN = "<token>",
           AGENT_CALL_SELF = "codex:<thread_id>" }
 

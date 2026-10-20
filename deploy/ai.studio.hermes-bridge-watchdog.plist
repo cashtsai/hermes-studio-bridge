@@ -7,7 +7,7 @@
 	<key>ProgramArguments</key>
 	<array>
 		<string>/bin/zsh</string>
-		<string>/Users/xcash/apps/hermes-openwebui-bridge/deploy/bridge-watchdog.sh</string>
+		<string>/Users/you/apps/hermes-openwebui-bridge/deploy/bridge-watchdog.sh</string>
 	</array>
 	<key>StartInterval</key>
 	<integer>60</integer>

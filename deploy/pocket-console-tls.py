@@ -14,7 +14,7 @@ console 的 `_pair_local_only` 只要在請求上看到**任何**轉送標頭
 ## 為什麼不直接把 :8081 改成 TLS
 
 還有兩條東西靠 8081 的純 HTTP 跑:
-  * 具名 tunnel `pocket.tsai.cash → http://127.0.0.1:8081`(iPhone 在用)
+  * 具名 tunnel `pocket.example.com → http://127.0.0.1:8081`(手機在用)
   * Pocket.app 內部**寫死**的 `cloudflared --url http://127.0.0.1:8081`(改不到)
 所以 8081 必須保持原樣,TLS 另開一道門。
 

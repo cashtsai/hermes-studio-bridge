@@ -73,7 +73,7 @@ FAKE_SECRETS = [
     _mk("1234567890", ":AAH", "dqTcvCH1vGWJxfSeofSAs0K5PALDsaw"),
 ]
 # 「不該被誤殺」的正常字串(遮罩過激會把軌跡洗成一片 redacted)
-INNOCENT = ["Read /Users/xcash/apps/pocketagent/README.md",
+INNOCENT = ["Read /Users/you/apps/pocketagent/README.md",
             "git commit -m '修好卡頓'", "pytest tests/test_agent_call.py -x",
             "success: 12 passed", "sk-"]
 

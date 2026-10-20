@@ -23,13 +23,20 @@ import urllib.parse
 import urllib.request
 
 PLIST = os.path.expanduser("~/Library/LaunchAgents/ai.studio.hermes-bridge.plist")
-# Public surface (works on any network, no Tailscale on phone) — Cloudflare
-# named tunnel `pocket.tsai.cash`, kept alive by launchd
-# (com.cloudflare.cloudflared.pocket, RunAtLoad+KeepAlive). NOT the Tailscale
-# Funnel hostname (<your-host>*.<tailnet>.ts.net) — that one requires Tailscale
-# Funnel to be enabled on the tailnet and was found unreachable (2026-07-11).
-HOST = os.environ.get("POCKET_FUNNEL_HOST", "pocket.tsai.cash")
+# Public surface (works on any network, no Tailscale on the phone) — typically a
+# Cloudflare named tunnel kept alive by launchd. NOT a Tailscale Funnel hostname:
+# Funnel has to be enabled on the tailnet and was found unreachable (2026-07-11).
+#
+# **No default.** This used to fall back to the maintainer's own tunnel hostname,
+# which meant anyone running this script without the env var would mint a QR
+# pointing at someone else's machine — and it published that hostname in a public
+# repo. Set POCKET_FUNNEL_HOST (see README) instead.
+HOST = os.environ.get("POCKET_FUNNEL_HOST", "")
 SCHEME = os.environ.get("POCKET_FUNNEL_SCHEME", "https")
+if not HOST:
+    raise SystemExit(
+        "POCKET_FUNNEL_HOST is not set — point it at your own public hostname\n"
+        "(for example: POCKET_FUNNEL_HOST=pocket.example.com %s)" % sys.argv[0])
 BRIDGE_PORT = int(os.environ.get("POCKET_BRIDGE_PORT", "8081"))
 
 

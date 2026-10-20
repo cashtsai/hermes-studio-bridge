@@ -69,7 +69,7 @@ runtime paths through environment variables:
 | `OPENCLAW_CONFIG_FILE` | Optional OpenClaw provider config, usually `~/.pocket/openclaw.json`. |
 
 This keeps clean installs separate from production: do not reuse
-`pocket.tsai.cash`, Telegram gateway LaunchAgents, or copied production Hermes
+`pocket.example.com`, Telegram gateway LaunchAgents, or copied production Hermes
 credentials on a test host.
 
 For a full clean-machine bootstrap, set `POCKET_PROVIDER=auto` before running

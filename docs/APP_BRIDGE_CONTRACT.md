@@ -100,7 +100,7 @@ entitlement. Pocket uses a three-step browser flow instead:
 3. `POST /app/v1/auth/apple/web/status`
 
 These three endpoints form the fixed-domain public auth broker at
-`pocket.tsai.cash`; they do not run against each user's changing local tunnel.
+`pocket.example.com`; they do not run against each user's changing local tunnel.
 `start` is IP-rate-limited and returns a short-lived `flow_id`, a separate
 high-entropy `poll_secret`, and Apple's authorization URL. `status` requires
 both opaque values. The callback accepts only a single-use state, verifies the
@@ -282,7 +282,7 @@ plan changes). **Unauthenticated by design** — Apple cannot carry a bridge bea
 token, so the JWS certificate chain *is* the authentication. This is the only
 subscription endpoint that must be publicly reachable; it is served through the
 fixed-domain cloudflare tunnel, so the URL to register in App Store Connect is
-`https://pocket.tsai.cash/app/v1/subscription/notify`.
+`https://pocket.example.com/app/v1/subscription/notify`.
 
 Request: `{"signedPayload": "<JWS>"}`.
 
@@ -705,7 +705,7 @@ Pins Pocket's provider lane to a native agent session. `{provider}` accepts
   "id": "claude_code:pocket-agent",   // 全域唯一,{provider}:{native_id} 全寫（6/29 決策 #1）
   "provider": "claude_code|codex|hermes",
   "title": "pocket-agent",
-  "subtitle": "/Users/xcash/apps/pocketagent",  // workdir / 來源說明
+  "subtitle": "/Users/you/apps/pocketagent",  // workdir / 來源說明
   "status": "idle|running|waiting_approval|failed|stalled|done",
   "last_event_at": "2026-07-04T10:33:42Z",
   "capabilities": ["input","interrupt","approve","attachments","keys","replay","follow"],
@@ -1047,7 +1047,7 @@ app 端先行件（不等 bridge）：卡片渲染元件 + 傳輸層抽象
     "id": "claude_code:amulet-hunter",   // = registry session id,收編/釋放用它
     "provider": "claude_code|codex|hermes|dispatch|openclaw",
     "name": "amulet-hunter",
-    "workdir": "/Users/xcash/apps/amulet-hunter",
+    "workdir": "/Users/you/apps/amulet-hunter",
     "state": "managed|discovered",       // discovered = 看得到、還沒收編
     "registry_state": "active|idle|done|archived|null",  // null = 還沒有戶口
     "purpose": "…", "class": "task",     // 有戶口才有
@@ -1382,17 +1382,17 @@ CC 這一家是善彰真正要看的東西(「看見 Claude 自己派了幾隻�
     "PreToolUse": [{
       "matcher": "Agent|Task",
       "hooks": [{"type": "command", "timeout": 5,
-                 "command": "/Users/xcash/apps/hermes-openwebui-bridge/scripts/worker-report-hook.py"}]
+                 "command": "/Users/you/apps/hermes-openwebui-bridge/scripts/worker-report-hook.py"}]
     }],
     "PostToolUse": [{
       "matcher": "Agent|Task",
       "hooks": [{"type": "command", "timeout": 5,
-                 "command": "/Users/xcash/apps/hermes-openwebui-bridge/scripts/worker-report-hook.py"}]
+                 "command": "/Users/you/apps/hermes-openwebui-bridge/scripts/worker-report-hook.py"}]
     }],
     "PostToolUseFailure": [{
       "matcher": "Agent|Task",
       "hooks": [{"type": "command", "timeout": 5,
-                 "command": "/Users/xcash/apps/hermes-openwebui-bridge/scripts/worker-report-hook.py"}]
+                 "command": "/Users/you/apps/hermes-openwebui-bridge/scripts/worker-report-hook.py"}]
     }]
   }
 }

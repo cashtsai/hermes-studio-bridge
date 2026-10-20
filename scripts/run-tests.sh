@@ -31,7 +31,7 @@ set -u
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$ROOT" || exit 1
 
-PYTHON=${PYTHON:-/Users/xcash/apps/hermes-agent/runtime/venv/bin/python}
+PYTHON=${PYTHON:-$HOME/apps/hermes-agent/runtime/venv/bin/python}
 [ -x "$PYTHON" ] || PYTHON=$(command -v python3) || {
     echo "找不到可用的 python(設 PYTHON=... 指定)" >&2; exit 1; }
 

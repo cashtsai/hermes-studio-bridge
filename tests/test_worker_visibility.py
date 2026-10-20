@@ -51,8 +51,8 @@ def _pre_hook(tool_use_id="toolu_01A", desc="審 PR #92 的 blocker",
     """實測自 claude 2.1.207 binary 的 PreToolUse payload 形狀。"""
     out = {
         "session_id": session_id,
-        "transcript_path": "/Users/xcash/.claude/projects/x/y.jsonl",
-        "cwd": "/Users/xcash/apps/hermes-openwebui-bridge",
+        "transcript_path": "/Users/you/.claude/projects/x/y.jsonl",
+        "cwd": "/Users/you/apps/hermes-openwebui-bridge",
         "prompt_id": "p-uuid",
         "permission_mode": "default",
         "hook_event_name": "PreToolUse",
@@ -275,12 +275,12 @@ class FakeCodexApp:
         return tid in self.active
 
 
-_PARENT = {"id": "t-parent", "cwd": "/Users/xcash/apps/x", "source": "vscode",
+_PARENT = {"id": "t-parent", "cwd": "/Users/you/apps/x", "source": "vscode",
            "name": "operator lane", "updatedAt": 1000, "createdAt": 900}
-_CHILD = {"id": "t-child", "cwd": "/Users/xcash/apps/x",
+_CHILD = {"id": "t-child", "cwd": "/Users/you/apps/x",
           "source": {"subagent": {"other": "guardian"}}, "thread_source": "subagent",
           "name": "guardian sweep", "updatedAt": 1000, "createdAt": 990}
-_OTHER_CWD_CHILD = {"id": "t-elsewhere", "cwd": "/Users/xcash/apps/other",
+_OTHER_CWD_CHILD = {"id": "t-elsewhere", "cwd": "/Users/you/apps/other",
                     "source": {"subagent": {"other": "guardian"}},
                     "name": "someone else's", "updatedAt": 1000, "createdAt": 990}
 
