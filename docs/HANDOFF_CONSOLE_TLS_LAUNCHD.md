@@ -1,6 +1,6 @@
 # 交辦:`ai.studio.pocket-console-tls` 的 launchd 不自動啟動也不重生
 
-> 事實基準:2026-10-20 實機查證(cashcamp)。
+> 事實基準:2026-10-20 實機查證。
 > 任務 A 的 TLS 前門**功能已完成並驗收通過**,只剩這一個韌性缺口。
 
 ---
@@ -69,18 +69,18 @@ launchctl kickstart gui/$(id -u)/ai.studio.pocket-console-tls
 驗收(這台 MagicDNS 目前沒運作,要用 `--resolve` 強制指向 tailnet IP):
 ```bash
 curl -s -o /dev/null -w '%{http_code}\n' \
-  --resolve cashcamp.tail905550.ts.net:8443:100.67.0.12 \
-  https://cashcamp.tail905550.ts.net:8443/console    # 401 = 成功
+  --resolve <your-host>.<your-tailnet>.ts.net:8443:<tailnet IP> \
+  https://<your-host>.<your-tailnet>.ts.net:8443/console    # 401 = 成功
 ```
 
 ---
 
 ## 附帶觀察(不是待辦,但會影響你驗收)
 
-cashcamp 的 **MagicDNS 沒有運作**:`cashcamp.tail905550.ts.net` 解析到公網 IP
-`103.84.155.153` 而非 tailnet 的 `100.67.0.12`,`scutil --dns` 查不到 ts.net
+這台的 **MagicDNS 沒有運作**:`<your-host>.<your-tailnet>.ts.net` 解析到公網 IP
+`<公網 IP>` 而非 tailnet 的 `<tailnet IP>`,`scutil --dns` 查不到 ts.net
 resolver,且 `tailscale` CLI 本身啟動失敗(`Tailscale.CLIError error 1`)。
 
-tailnet 資料面是通的(介面有 100.67.0.12,直連 8443 正常),只有 DNS 這一層壞。
-Pixelbook 端若 MagicDNS 正常就不受影響,但從 cashcamp 本機驗收時必須加
+tailnet 資料面是通的(介面有 <tailnet IP>,直連 8443 正常),只有 DNS 這一層壞。
+Pixelbook 端若 MagicDNS 正常就不受影響,但從該機本機驗收時必須加
 `--resolve`,否則會連到公網 IP 而得到 `000`。

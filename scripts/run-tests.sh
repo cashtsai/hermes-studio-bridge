@@ -56,6 +56,23 @@ export POCKET_CODEX_HOME
 export PYTHONPATH=.${PYTHONPATH:+:$PYTHONPATH}
 
 pass=0; fail=0; failed_list=''
+skipped=0; skipped_list=''
+
+# CI 跳過清單:只在 CI 上生效,本機永遠跑全套。清單與理由見 tests/ci-skip.txt
+# ——那幾支依賴的是維護者機器上的東西(Hermes 安裝 / codex binary / zsh),
+# 不是程式碼。**跳過的會印出來並算進總數**,不假裝覆蓋。
+SKIPLIST=''
+if [ "${CI:-}" = "true" ] && [ -f tests/ci-skip.txt ]; then
+    SKIPLIST=$(sed 's/#.*//' tests/ci-skip.txt | tr -s ' \t' ' ' | tr -d '\r')
+fi
+
+is_ci_skipped() {
+    [ -n "$SKIPLIST" ] || return 1
+    for s in $SKIPLIST; do
+        [ "$s" = "$1" ] && return 0
+    done
+    return 1
+}
 
 for f in tests/test_*.py; do
     [ -e "$f" ] || continue
@@ -64,6 +81,13 @@ for f in tests/test_*.py; do
         *"$FILTER"*) ;;
         *) continue ;;
     esac
+
+    if is_ci_skipped "$name"; then
+        skipped=$((skipped + 1))
+        skipped_list="$skipped_list $name"
+        printf 'SKIP  %s  (CI:見 tests/ci-skip.txt)\n' "$name"
+        continue
+    fi
 
     log="$LOGDIR/$name.log"
     # 沒有 GNU timeout 也要能跑:用背景 + 輪詢守著,逾時就殺掉。
@@ -90,7 +114,14 @@ done
 
 echo
 echo "──────────────────────────────────────────"
-echo "逐檔結果:$pass 綠 / $fail 紅  (共 $((pass + fail)) 檔)"
+if [ "$skipped" -gt 0 ]; then
+    echo "逐檔結果:$pass 綠 / $fail 紅 / $skipped 跳過  (共 $((pass + fail + skipped)) 檔)"
+    echo "CI 跳過(**每一行都是待辦**,理由見 tests/ci-skip.txt):"
+    for n in $skipped_list; do echo "  - $n"; done
+    echo
+else
+    echo "逐檔結果:$pass 綠 / $fail 紅  (共 $((pass + fail)) 檔)"
+fi
 if [ "$fail" -gt 0 ]; then
     echo "紅的:"
     for n in $failed_list; do echo "  - $n    → $LOGDIR/$n.log"; done

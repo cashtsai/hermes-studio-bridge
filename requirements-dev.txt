@@ -1,0 +1,9 @@
+# 只有測試需要的依賴(runtime 不需要 → 不放進 requirements.txt)。
+#
+# 為什麼要有這份:`tests/test_hermes_media.py` 用 PyYAML 讀寫 Hermes 的
+# `config.yaml`。它長期**不在任何依賴清單裡**,結果本機 venv 缺 PyYAML 時那支
+# 就一直紅著,被當成「既有環境債」帶了好幾週 —— 一條沒人修的紅線會讓整份
+# 測試報告失去意義(反正本來就有一條紅的,再多一條也看不出來)。
+#
+#   pip install -r requirements.txt -r requirements-dev.txt
+PyYAML
