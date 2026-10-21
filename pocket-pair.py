@@ -136,7 +136,7 @@ def main() -> int:
         payload = "pocket://pair?scheme=%s&host=%s&hosts=%s&code=%s" % (
             urllib.parse.quote(SCHEME), urllib.parse.quote(HOST), hosts_q,
             urllib.parse.quote(code))
-        note = "一次性配對碼(5 分鐘有效),master token 不外流。"
+        note = "一次性配對碼(10 分鐘有效),master token 不外流。"
     else:
         # Fallback: bridge not running / older bridge → embed the token directly.
         payload = "pocket://pair?scheme=%s&host=%s&hosts=%s&token=%s" % (
