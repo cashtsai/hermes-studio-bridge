@@ -22,6 +22,7 @@ import hashlib
 import hmac
 import ipaddress
 import json
+import math
 import difflib
 import mimetypes
 import os
@@ -13890,9 +13891,380 @@ async def cc_session_rename(name: str, request: Request):
         raise HTTPException(status_code=502, detail=str(e))
 
 
+def _resolve_ccsess() -> str | None:
+    """找既有的 `ccsess`。找不到回 None → 呼叫端走原生實作。
+
+    解析順序(由明示到慣例):
+      1. `CCSESS_BIN` env —— 自己指定的優先,指到不存在的檔就當沒有。
+      2. `~/.local/bin/ccsess` —— 維護者機器上的那支。
+      3. `PATH` 上的 `ccsess`。
+    """
+    env = os.environ.get("CCSESS_BIN")
+    if env:
+        p = os.path.expanduser(env)
+        return p if os.access(p, os.X_OK) else None
+    legacy = os.path.expanduser("~/.local/bin/ccsess")
+    if os.access(legacy, os.X_OK):
+        return legacy
+    return shutil.which("ccsess")
+
+
+# ── 原生 CC session 管理(不依賴 ccsess)──────────────────────────────────
+#
+# 為什麼存在:bridge 建立 Claude Code session 一律 shell out 到
+# `~/.local/bin/ccsess` —— 一支 1216 行的 zsh,**只存在維護者的機器上**
+# (不在 repo、不在安裝腳本、不在 DMG)。照官網流程裝完的人從手機建 session
+# 一律 502。
+#
+# 曾經考慮把那支腳本收進公開 repo,查下去發現不必:
+#
+#  · `sessions.conf` 的讀寫 bridge **本來就有自己的一套**
+#    (`_cc_conf_rows` / `_cc_conf_upsert` / `_cc_conf_backup`)——
+#    `register` 這個動詞呼叫出去做,等於同一份名單有兩個寫者。
+#  · 那支腳本的厚度是**維護者個人多 session 艦隊**用的(park/wake、壓縮接力包、
+#    開機自癒、auth 卡住發 TG 通知)。bridge 只用到六個動詞,每一個都是
+#    「寫 conf」或「兩行 tmux」。
+#  · 它最關鍵的兩段邏輯(spawn flags 映射、hooks 寫入)**本來就是 Python**,
+#    只是內嵌在 zsh 裡。搬進 bridge 是回家,不是重寫。
+#
+# 所以策略是**優先用既有的 ccsess,沒有就走這裡**(見 `_run_ccsess`):
+# 維護者的機器行為零變化,其他人也能用,而且沒有任何私人腳本進公開 repo。
+
+_CC_PANE_SHELL = os.environ.get("CCSESS_PANE_SHELL", "/bin/bash")
+_CC_HOOK_URL = os.environ.get(
+    "CCSESS_HOOK_URL", "http://127.0.0.1:8081/ccsessions/_hook")
+_CC_MODEL_PIN_DIR = os.path.expanduser("~/.config/ccsess/model")
+_CC_REMOTE_PIN_DIR = os.path.expanduser("~/.config/ccsess/remote-control")
+_CC_STRICT_MCP_DIR = os.path.expanduser("~/.config/ccsess/strict-mcp")
+_CC_ARCHIVE_DIR = os.path.expanduser("~/.local/share/ccsess/archive")
+
+# `claude --help` 實測(2.1.207)。permission-mode 比 bridge 自己的白名單多一個
+# `dontAsk` —— 對 CLI 有效的值就不該在這裡被擋掉。
+_CC_EFFORTS = ("low", "medium", "high", "xhigh", "max")
+_CC_PERMISSION_MODES = ("acceptEdits", "auto", "bypassPermissions",
+                        "manual", "dontAsk", "plan")
+_CC_MAX_APPEND_PROMPT = 8000      # send-keys 是逐字打進 pane,超長 prompt 不走這條
+
+
+def _cc_pin_name(name: str) -> str:
+    """pin 檔名的消毒規則,必須與 `_cc_write_remote_control_pin` 一致。"""
+    return re.sub(r"[^A-Za-z0-9._-]", "_", name or "")
+
+
+def _cc_read_pin(directory: str, name: str) -> str:
+    """讀一個 pin 檔;沒設定就回空字串。
+
+    「檔案不存在」是**預期**的(大多數 session 沒有 model/remote pin),安靜
+    跳過;其他錯(權限、編碼、壞掉的符號連結)要留痕 —— 那種失敗會讓 session
+    少掉一個旗標而完全看不出原因。repo 的 `test_robustness_pack` 守門就是在
+    擋「吞掉例外又不留痕」,它抓到了這裡的第一版寫法。
+    """
+    path = os.path.join(directory, _cc_pin_name(name))
+    try:
+        with open(path, encoding="utf-8") as f:
+            return f.read().strip()
+    except FileNotFoundError:
+        return ""
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("cc_read_pin", _exc, expected=True)
+        return ""
+
+
+def _cc_spawn_flags(name: str, model_done: bool) -> list[str]:
+    """把 bridge 自己寫的 spawn pin(JSON)映射成 claude 的 argv。
+
+    規則逐條照搬 ccsess 的 `spawn_pin_flags`,包含它的寬容姿態:
+    **任何看不懂的值都只跳過那一項,絕不擋住啟動** —— 一個打錯的 effort
+    不該讓使用者連 session 都開不起來。
+    """
+    path = os.path.join(CCSESS_SPAWN_DIR, name + ".json")
+    try:
+        with open(path, encoding="utf-8") as f:
+            cfg = json.load(f)
+    except FileNotFoundError:
+        return []
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("cc_spawn_flags.load", _exc, expected=True)
+        return []
+    if not isinstance(cfg, dict):
+        _log_event("cc_spawn_flags_ignored", session=name, why="not_an_object")
+        return []
+
+    def text(key):
+        v = cfg.get(key)
+        return v.strip() or None if isinstance(v, str) else None
+
+    argv: list[str] = []
+    if not model_done:
+        m = text("model")
+        if m:
+            argv += ["--model", m]
+
+    e = cfg.get("effort")
+    if e is not None:
+        e = str(e).strip()
+        if e in _CC_EFFORTS:
+            argv += ["--effort", e]
+        else:
+            _log_event("cc_spawn_flag_skipped", session=name, field="effort", value=e)
+
+    pm = cfg.get("permission_mode")
+    if pm is not None:
+        pm = str(pm).strip()
+        if pm in _CC_PERMISSION_MODES:
+            argv += ["--permission-mode", pm]
+        else:
+            _log_event("cc_spawn_flag_skipped", session=name,
+                       field="permission_mode", value=pm)
+
+    # --max-budget-usd / --fallback-model 官方註明只在 --print 生效;實測互動
+    # TUI 會接受而不報錯,所以照傳,讓 pin 的意圖完整保留給支援它的版本。
+    b = cfg.get("max_budget_usd")
+    if b is not None:
+        if isinstance(b, bool) or not isinstance(b, (int, float)) \
+                or not math.isfinite(b) or b <= 0:
+            _log_event("cc_spawn_flag_skipped", session=name, field="max_budget_usd")
+        else:
+            argv += ["--max-budget-usd",
+                     ("%.4f" % float(b)).rstrip("0").rstrip(".") or "0"]
+
+    fb = text("fallback_model")
+    if fb:
+        argv += ["--fallback-model", fb]
+
+    ap = cfg.get("append_system_prompt")
+    if isinstance(ap, str) and ap.strip():
+        if len(ap) > _CC_MAX_APPEND_PROMPT:
+            _log_event("cc_spawn_flag_skipped", session=name,
+                       field="append_system_prompt", length=len(ap))
+        else:
+            argv += ["--append-system-prompt", ap]
+    return argv
+
+
+def _cc_native_hooks(workdir: str) -> None:
+    """把 UserPromptSubmit / Stop 兩個 hook 併進 `<workdir>/.claude/settings.json`。
+
+    這不是選配:app 的回合追蹤、審核流程都靠 `/ccsessions/_hook` 收事件。
+    少了它 session 開得起來,但「現在跑到哪」會永遠停住 —— 又一種安靜的壞。
+
+    合併而不是覆寫:那個檔案是**使用者的**,裡面可能有他自己的 hook 與設定。
+    壞 JSON 一律不動(寧可沒有 hook,也不要把人家的設定檔寫壞)。
+    """
+    wd = workdir if os.path.isdir(workdir) else os.path.expanduser("~")
+    path = os.path.join(wd, ".claude", "settings.json")
+    cmd = (f"curl -s --max-time 2 -X POST {_CC_HOOK_URL} "
+           "-H 'Content-Type: application/json' -d @- >/dev/null 2>&1 || true")
+    data: dict = {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            loaded = json.load(f)
+        if not isinstance(loaded, dict):
+            _log_event("cc_hooks_skipped", path=path, why="root_not_object")
+            return
+        data = loaded
+    except FileNotFoundError:
+        pass
+    except Exception as _exc:  # noqa: BLE001 — 壞 JSON:不碰
+        _log_exc("cc_native_hooks.read", _exc, expected=True)
+        return
+
+    hooks = data.setdefault("hooks", {})
+    if not isinstance(hooks, dict):
+        _log_event("cc_hooks_skipped", path=path, why="hooks_not_object")
+        return
+    entry = {"hooks": [{"type": "command", "command": cmd}]}
+    changed = False
+    for event in ("UserPromptSubmit", "Stop"):
+        lst = hooks.setdefault(event, [])
+        if not isinstance(lst, list):
+            _log_event("cc_hooks_skipped", path=path, why=f"{event}_not_list")
+            return
+        # 已經有一條指向同一個 URL 的就不重複加(重跑 ensure 不該越疊越多)。
+        if any(_CC_HOOK_URL in json.dumps(h, ensure_ascii=False) for h in lst):
+            continue
+        lst.append(entry)
+        changed = True
+    if not changed:
+        return
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, path)          # 換檔而不是就地改寫:中途失敗不留半截
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("cc_native_hooks.write", _exc, expected=True)
+
+
+def _cc_native_claude_cmd(workdir: str, name: str) -> str:
+    """組出要 send-keys 進 pane 的那一行 claude 啟動指令。"""
+    _cc_native_hooks(workdir)
+    argv: list[str] = [CLAUDE_BIN]
+
+    model = _cc_read_pin(_CC_MODEL_PIN_DIR, name)
+    if model:
+        argv += ["--model", model]
+    if os.path.exists(os.path.join(_CC_STRICT_MCP_DIR, _cc_pin_name(name))):
+        argv.append("--strict-mcp-config")
+    remote = _cc_read_pin(_CC_REMOTE_PIN_DIR, name)
+    if remote:
+        log_dir = os.path.expanduser("~/.local/share/ccsess/logs")
+        os.makedirs(log_dir, exist_ok=True)
+        argv += ["--remote-control", remote,
+                 "--debug-file", os.path.join(log_dir,
+                                              f"remote-control-{_cc_pin_name(name)}.log")]
+    argv += _cc_spawn_flags(name, model_done=bool(model))
+
+    line = " ".join(shlex.quote(a) for a in argv)
+
+    # BYO API key:值只在 pane 裡就地 `$(cat ...)` 展開成該程序的環境變數 ——
+    # 不進 argv(ps 看不到)、不進 log、scrollback 也只看得到路徑。
+    secret = os.path.join(CCSESS_SECRET_DIR, name)
+    if os.path.isfile(secret) and os.path.getsize(secret) > 0:
+        line = f'ANTHROPIC_API_KEY="$(cat {shlex.quote(secret)})" ' + line
+        _log_event("cc_spawn_byo_key", session=name)
+    return line
+
+
+async def _cc_native_trust_unblock(name: str, workdir: str) -> None:
+    """Claude Code 在新 workdir 第一次啟動會卡在「Yes, I trust this folder」。
+
+    對 bridge 來說那看起來像 session 死掉:程序活著,但歷史與輸入都不前進。
+    只對**使用者自己登記過的 workdir**(就是這條 session 的 dir)自動確認,
+    不對任意路徑按 —— 自動回答「我信任這個資料夾」是安全決定,範圍只能窄。
+    """
+    for _ in range(30):
+        await asyncio.sleep(1)
+        rc, pane, _ = await _tmux_run("capture-pane", "-p", "-t", f"={name}:")
+        if rc != 0:
+            return
+        if "trust" in pane.lower() and "folder" in pane.lower():
+            await _tmux_run("send-keys", "-t", f"={name}:", "Enter")
+            _log_event("cc_trust_prompt_confirmed", session=name, workdir=workdir)
+            return
+        if pane.strip():
+            # 畫面已經有別的東西(TUI 起來了)→ 沒有信任提示要處理。
+            return
+
+
+async def _cc_native_launch(name: str, workdir: str) -> None:
+    wd = workdir if os.path.isdir(workdir) else os.path.expanduser("~")
+    rc, _, err = await _tmux_run("new-session", "-d", "-s", name, "-c", wd,
+                                 _CC_PANE_SHELL, "--noprofile", "--norc")
+    if rc != 0:
+        raise http_err(502, "TMUX_FAILED", "tmux new-session failed", err[:300])
+    # 用 send-keys 啟動而不是把 claude 當 pane 指令:claude 退出時 pane 會回到
+    # shell,自癒才看得出「session 在、但 claude 死了」。
+    cmd = _cc_native_claude_cmd(wd, name)
+    rc, _, err = await _tmux_run("send-keys", "-t", f"={name}:", cmd, "Enter")
+    if rc != 0:
+        raise http_err(502, "TMUX_FAILED", "tmux send-keys failed", err[:300])
+    _log_event("cc_native_launched", session=name, workdir=wd)
+    asyncio.create_task(_cc_native_trust_unblock(name, wd))
+
+
+async def _cc_native(verb: str, *rest) -> str:
+    """ccsess 的原生替身。只實作 bridge 真正用到的那幾個動詞。"""
+    if verb in ("new", "register"):
+        name = rest[0] if rest else ""
+        workdir = rest[1] if len(rest) > 1 else os.path.expanduser("~")
+        if not name:
+            raise http_err(400, "BAD_REQUEST", "session name required", "")
+        # 同 workdir 防呆:兩條 CC session 共用一個目錄會因為 `claude --continue`
+        # 按 workdir 接續而**互搶同一條對話歷史**(2026-07-12 實害)。
+        for n, wd, _en in _cc_conf_rows():
+            if n != name and wd and os.path.abspath(wd) == os.path.abspath(workdir):
+                raise http_err(409, "WORKDIR_TAKEN",
+                               f"workdir already used by session '{n}'",
+                               "同一個目錄給兩條 session 會互搶對話歷史;"
+                               "換個目錄,或先封存舊的那條。")
+        _cc_conf_backup()
+        _cc_conf_upsert(name, workdir, "1")
+        if len(rest) > 2 and rest[2]:
+            os.makedirs(_CC_MODEL_PIN_DIR, exist_ok=True)
+            with open(os.path.join(_CC_MODEL_PIN_DIR, _cc_pin_name(name)),
+                      "w", encoding="utf-8") as f:
+                f.write(str(rest[2]).strip() + "\n")
+        if verb == "new":
+            await _cc_native_launch(name, workdir)
+        return ""
+
+    if verb == "enable":
+        name = rest[0]
+        row = next((r for r in _cc_conf_rows() if r[0] == name), None)
+        if not row:
+            raise http_err(404, "SESSION_NOT_FOUND", f"no such session '{name}'", "")
+        _cc_conf_backup()
+        _cc_conf_upsert(name, row[1], "1")
+        return ""
+
+    if verb == "ensure":
+        started = []
+        for n, wd, en in _cc_conf_rows():
+            if en != "1":
+                continue
+            rc, _, _ = await _tmux_run("has-session", "-t", f"={n}")
+            if rc == 0:
+                continue
+            try:
+                await _cc_native_launch(n, wd)
+                started.append(n)
+            except Exception as _exc:  # noqa: BLE001 — 一條起不來不該擋住其他條
+                _log_exc("cc_native_ensure", _exc, expected=True)
+        return "\n".join(started)
+
+    if verb == "archive":
+        name = rest[0]
+        # 先存 scrollback 再殺 —— 反過來就什麼都留不下。
+        try:
+            os.makedirs(_CC_ARCHIVE_DIR, exist_ok=True)
+            rc, pane, _ = await _tmux_run("capture-pane", "-p", "-S", "-10000",
+                                          "-t", f"={name}:")
+            if rc == 0 and pane:
+                stamp = time.strftime("%Y%m%d-%H%M%S")
+                with open(os.path.join(_CC_ARCHIVE_DIR,
+                                       f"{_cc_pin_name(name)}-{stamp}.log"),
+                          "w", encoding="utf-8") as f:
+                    f.write(pane)
+        except Exception as _exc:  # noqa: BLE001 — 存不下也要能封存
+            _log_exc("cc_native_archive.scrollback", _exc, expected=True)
+        await _tmux_run("kill-session", "-t", f"={name}")
+        row = next((r for r in _cc_conf_rows() if r[0] == name), None)
+        if row:
+            _cc_conf_backup()
+            _cc_conf_upsert(name, row[1], "0")
+        return ""
+
+    if verb == "login":
+        name = rest[0]
+        rc, _, _ = await _tmux_run("has-session", "-t", f"={name}")
+        if rc != 0:
+            raise http_err(409, "SESSION_NOT_RUNNING",
+                           "session not running",
+                           "這條 session 沒在跑,先啟動它再登入。")
+        await _tmux_run("send-keys", "-t", f"={name}:", "/login", "Enter")
+        return "login sent"
+
+    raise http_err(501, "CCSESS_VERB_UNSUPPORTED",
+                   f"native ccsess does not implement '{verb}'",
+                   f"原生實作只支援 new/register/enable/ensure/archive/login;"
+                   f"需要 '{verb}' 的話請安裝 ccsess 並用 CCSESS_BIN 指定。")
+
+
 async def _run_ccsess(*args):
+    """跑 ccsess 的一個動詞 —— 有那支腳本就用它,沒有就走原生實作。
+
+    順序是刻意的:**維護者機器上的 `~/.local/bin/ccsess` 優先**。那支腳本
+    累積了很多現場硬化(park/wake、壓縮接力包、auth 卡住通知),他的工作流
+    依賴它,不該因為 bridge 多了原生路徑就被換掉。其他人沒有那支腳本,走
+    原生,只做 app 真正需要的六個動詞。
+    """
+    exe = _resolve_ccsess()
+    if not exe:
+        return await _cc_native(*args)
     p = await asyncio.create_subprocess_exec(
-        os.path.expanduser("~/.local/bin/ccsess"), *args,
+        exe, *args,
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
     try:
         out, err = await asyncio.wait_for(p.communicate(), 30)
