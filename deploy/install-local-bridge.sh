@@ -25,7 +25,20 @@ if [ -z "$PROVIDER_CHOICE" ] && [ "${POCKET_INSTALL_PROVIDERS:-0}" = "1" ]; then
 fi
 DEFAULT_PROVIDER="${POCKET_DEFAULT_PROVIDER:-hermes}"
 INSTALL_HERMES="${POCKET_INSTALL_HERMES:-1}"
-INSTALL_OPENCLAW="${POCKET_INSTALL_OPENCLAW:-1}"
+# OpenClaw 預設**不裝**(2026-10-21 從 1 改成 0)。
+#
+# 它原本預設會:下載一份 Node、npm 裝 openclaw、再寫一個**常駐 LaunchAgent**
+# 把 gateway 掛起來。問題是**出貨版的 iOS app 根本沒有 OpenClaw 入口** ——
+# 底欄第四顆是已隱藏的 Gemini,抽屜、儀表板、推播深連結都沒有路徑進去。
+# 唯一到得了 OpenClaw session 列表的情況是「這台主機完全沒有 Hermes 人格」,
+# 那時人格列會改標 OpenClaw —— 而這支腳本預設就會裝 Hermes,所以連那條窄路
+# 都走不到。
+#
+# 結論:每個新使用者都被裝了一個下載量不小、而且**開機常駐**的背景服務,
+# 換來零個看得到的功能。要用的人自己帶 POCKET_INSTALL_OPENCLAW=1。
+# (已經設定過的機器不受影響:下面 install_openclaw_provider 一開始就會偵測
+#  既有的 config 並跳過。)
+INSTALL_OPENCLAW="${POCKET_INSTALL_OPENCLAW:-0}"
 HERMES_REPO_URL="${HERMES_REPO_URL:-https://github.com/NousResearch/hermes-agent.git}"
 HERMES_INSTALL_DIR="${HERMES_INSTALL_DIR:-$HOME/apps/hermes-agent}"
 OPENCLAW_VERSION="${OPENCLAW_VERSION:-2026.7.1-2}"
@@ -65,11 +78,7 @@ install_hermes_provider() {
   existing_hermes="$(find_existing_hermes_bin || true)"
   if [ -n "$existing_hermes" ]; then
     HERMES_BIN="${HERMES_BIN:-$existing_hermes}"
-    mkdir -p "$HERMES_HOME_ROOT" \
-      "$HERMES_HOME_ROOT/profiles/fliper" \
-      "$HERMES_HOME_ROOT/profiles/xcash" \
-      "$HERMES_HOME_ROOT/profiles/shuijing" \
-      "$HERMES_HOME_ROOT/uploads"
+    mkdir -p "$HERMES_HOME_ROOT" "$HERMES_HOME_ROOT/uploads"
     log_step "Using existing Hermes"
     echo "Hermes already installed: $existing_hermes"
     return 0
@@ -81,12 +90,18 @@ install_hermes_provider() {
     git clone "$HERMES_REPO_URL" "$HERMES_INSTALL_DIR"
   fi
 
+  # 只建 home 與 uploads,**不預先建任何 profiles/<名字>**。
+  #
+  # 2026-10-21:這裡原本會建 `profiles/fliper`、`profiles/xcash`、
+  # `profiles/shuijing` —— 維護者自己的三個人格。而 bridge 的
+  # `_personas_from_disk()` 是**直接拿目錄名當人格 id 與顯示名**的,所以每一個
+  # 新使用者裝完、配對完、打開 app 的第一眼,看到的人格清單是三個陌生人的名字。
+  #
+  # 那不是設定問題,是我們把自己的東西寫進了給別人跑的安裝器。留下 `main`
+  # 一個人格就好(`_personas_from_disk` 永遠會給它),要幾個人格、叫什麼名字,
+  # 是使用者自己的事。
   log_step "Preparing Hermes home"
-  mkdir -p "$HERMES_HOME_ROOT" \
-    "$HERMES_HOME_ROOT/profiles/fliper" \
-    "$HERMES_HOME_ROOT/profiles/xcash" \
-    "$HERMES_HOME_ROOT/profiles/shuijing" \
-    "$HERMES_HOME_ROOT/uploads"
+  mkdir -p "$HERMES_HOME_ROOT" "$HERMES_HOME_ROOT/uploads"
 
   if [ ! -x "$HERMES_INSTALL_DIR/venv/bin/hermes" ] && [ -x "$HERMES_INSTALL_DIR/setup-hermes.sh" ]; then
     log_step "Installing Hermes runtime"
