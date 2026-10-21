@@ -391,8 +391,35 @@ else
   echo "Run: launchctl bootstrap gui/$(id -u) \"$LAUNCH_AGENT\""
 fi
 
+# 免登入的配對頁 —— 印出那條連結。
+#
+# `/pair/qr` 的門票是 boot code(`~/.pocket/pair-boot-code`,0600)。頁面在
+# boot code 不對時的錯誤訊息寫著「請用**安裝器印出的完整連結**開啟本頁」,
+# 但在此之前**沒有任何東西印過那條連結** —— bridge 是第一次用到才生成那個碼,
+# 安裝當下檔案根本還不存在。於是這條路徑雖然做好了,實際上沒有人找得到。
+#
+# 它值得被看見:這是**唯一不需要 Apple 登入、也不需要 iCloud** 的配對方式。
+# 桌面 app 那條要先登入才給 QR。
+PAIR_BOOT_FILE="${PAIR_BOOT_CODE_FILE:-$HOME/.pocket/pair-boot-code}"
+if [ ! -s "$PAIR_BOOT_FILE" ]; then
+  mkdir -p "$(dirname "$PAIR_BOOT_FILE")"
+  # 與 bridge 的 `_pair_boot_code()` 同一種碼(token_urlsafe(16))。它讀到既有
+  # 檔案就沿用,所以這裡先寫等於替它預先生成,不會變成兩個碼。
+  (umask 077; python3 -c 'import secrets; print(secrets.token_urlsafe(16))' > "$PAIR_BOOT_FILE")
+  chmod 600 "$PAIR_BOOT_FILE" 2>/dev/null || true
+fi
+PAIR_BOOT_CODE="$(tr -d '\n' < "$PAIR_BOOT_FILE" 2>/dev/null || true)"
+
 log_step "Pocket bridge installed"
 echo "Bridge installed: $INSTALL_ROOT"
 echo "LaunchAgent: $LAUNCH_AGENT"
 echo "Provider: $REQUESTED_PROVIDER"
 echo "Health: http://127.0.0.1:8081/health"
+if [ -n "$PAIR_BOOT_CODE" ]; then
+  echo
+  echo "配對頁(在這台 Mac 上開,免登入、免 iCloud):"
+  echo "  http://127.0.0.1:8081/pair/qr?boot=$PAIR_BOOT_CODE"
+  echo "  用手機的 Pocket 掃頁面上的 QR 就完成配對。"
+  echo "  ⚠ 這條連結等同這台機器的配對權限,別貼到聊天室或截圖外流。"
+  echo "    要換一組:刪掉 $PAIR_BOOT_FILE 再重啟服務。"
+fi

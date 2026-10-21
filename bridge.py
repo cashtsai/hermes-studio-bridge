@@ -9237,8 +9237,13 @@ async def pair_new(request: Request):
 
 
 def _pair_clamp_ttl(raw) -> int:
-    """配對碼 TTL:預設 5 分鐘;免掃碼的「配對連結」場景(雲端主機把連結傳到
-    手機再點)人工傳遞有延遲,允許放寬 —— 上限 30 分鐘,下限 1 分鐘。"""
+    """配對碼 TTL:預設 `_PAIR_CODE_TTL`(**10 分鐘**);免掃碼的「配對連結」
+    場景(雲端主機把連結傳到手機再點)人工傳遞有延遲,允許放寬 ——
+    上限 30 分鐘,下限 1 分鐘。
+
+    註解原本寫「預設 5 分鐘」而常數是 600 秒。那種註解比沒有更糟:它會被
+    抄進 UI 文案(桌面端的「5 分鐘內完成配對」、`pocket-pair.py` 的提示都是
+    這樣來的),使用者因此被告知一個錯的數字。"""
     try:
         ttl = int(raw)
     except (TypeError, ValueError):
@@ -9289,7 +9294,8 @@ def _pair_issue_device_token(name: str, platform: str, claim_user_id=None,
 @app.post("/pair/claim")
 async def pair_claim(request: Request):
     """Phone exchanges a one-time code for its OWN device token. The code IS the
-    credential (no bearer needed); it's single-use and expires in 5 minutes."""
+    credential (no bearer needed); it is single-use and expires after
+    `_PAIR_CODE_TTL` (10 minutes by default; the minting call may widen it)."""
     try:
         body = await request.json()
     except Exception as _exc:
@@ -9767,7 +9773,7 @@ async function load(){
   // boot code 隨頁面網址帶入,轉發給 qr.json(缺/錯會 403)
   const boot=new URLSearchParams(location.search).get('boot')||'';
   const r=await fetch('/pair/qr.json?boot='+encodeURIComponent(boot));const d=await r.json();
-  if(r.status===403){document.getElementById('qr').textContent='boot code 無效 — 請用安裝器印出的完整連結開啟本頁';return}
+  if(r.status===403){document.getElementById('qr').textContent='boot code 無效。完整連結在安裝器輸出的最後一段;也可以在這台 Mac 上執行 cat ~/.pocket/pair-boot-code 取得該碼,再用 /pair/qr?boot=<碼> 開啟。';return}
   if(r.status===429){document.getElementById('qr').textContent='產碼太頻繁,稍候再試';return}
   if(!d.ok){document.getElementById('qr').textContent=d.error||'失敗';return}
   document.getElementById('qr').innerHTML=d.svg||('<small style="word-break:break-all">'+d.payload+'</small>');
