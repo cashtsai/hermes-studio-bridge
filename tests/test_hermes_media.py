@@ -12,7 +12,13 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-import yaml
+import _requires
+
+# 這支需要兩樣**機器上的東西**,缺了就誠實跳過(不是紅、也不是假裝通過):
+#  · PyYAML —— 用來讀寫 Hermes 的 config.yaml
+#  · Hermes agent 安裝 —— bridge 的匯入鏈會拉到 hermes_constants
+yaml = _requires.module("yaml", "讀寫 Hermes 的 config.yaml 要用它")
+_requires.module("hermes_constants", "本檔驗的是 Hermes 媒體路徑,需要 Hermes 安裝")
 
 _ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_ROOT))

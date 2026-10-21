@@ -14,7 +14,9 @@
 # 讓它們在依賴缺席時 `SkipTest` 而不是炸掉 —— 那是下一刀,不是這一刀。
 
 # 需要 Hermes agent 安裝(`hermes_constants` 等模組不在本 repo 內)
-test_hermes_media            # ModuleNotFoundError: hermes_constants
+#   test_hermes_media —— **2026-10-21 已從本清單移除**:它改用 tests/_requires.py
+#   自己跳過了(缺 PyYAML 或缺 Hermes 安裝 → exit 77 → runner 記成 SKIP)。
+#   那才是正解 —— 列在這裡只有 CI 生效,本機還是紅著。
 test_acp_client_workspace_cwd  # 斷言吃維護者的 hermes profile 佈局
 
 # 需要真的 codex binary(會起 app-server)
