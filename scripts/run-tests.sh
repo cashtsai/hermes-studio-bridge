@@ -105,6 +105,12 @@ for f in tests/test_*.py; do
     if [ "$rc" -eq 0 ]; then
         pass=$((pass + 1))
         printf 'PASS  %s\n' "$name"
+    elif [ "$rc" -eq 77 ]; then
+        # 77 = 這台機器缺了該測試需要的東西(見 tests/_requires.py)。
+        # **刻意不當成 PASS** —— 「看起來全綠、其實沒跑」比紅色更危險。
+        skipped=$((skipped + 1))
+        skipped_list="$skipped_list $name"
+        printf 'SKIP  %s  (缺依賴)\n' "$name"
     else
         fail=$((fail + 1))
         failed_list="$failed_list $name"
@@ -116,7 +122,7 @@ echo
 echo "──────────────────────────────────────────"
 if [ "$skipped" -gt 0 ]; then
     echo "逐檔結果:$pass 綠 / $fail 紅 / $skipped 跳過  (共 $((pass + fail + skipped)) 檔)"
-    echo "CI 跳過(**每一行都是待辦**,理由見 tests/ci-skip.txt):"
+    echo "跳過(CI 清單 tests/ci-skip.txt,或這台機器缺依賴):"
     for n in $skipped_list; do echo "  - $n"; done
     echo
 else
