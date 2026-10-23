@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: 🔒 Security vulnerability / 安全漏洞
+    url: https://github.com/cashtsai/hermes-studio-bridge/blob/main/SECURITY.md
+    about: "Do NOT open a public issue. Email instead. / 不要開公開 issue，請寄信。"
+  - name: 💬 Using the Pocket app (not the bridge) / 使用上的問題
+    url: https://pocket.shan.house/#faq
+    about: "Install, pairing, offline, notifications — answered on the site. / 安裝、配對、離線、推播都在官網 FAQ。"

@@ -1,5 +1,7 @@
 # Studio · Hermes — OpenAI-compatible bridge + Open WebUI
 
+**English** · [繁體中文](README.zh-Hant.md)
+
 A thin, stable front door to a **Hermes** multi-persona agent: it exposes each
 Hermes persona as an OpenAI "model", so any OpenAI-compatible client
 (**Open WebUI**, mobile apps, scripts) can chat with it — with the persona's

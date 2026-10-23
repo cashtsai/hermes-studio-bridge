@@ -55,6 +55,15 @@ to a temp directory and installs an audit hook that **raises** on any write to a
 production path. If a new test tries to write to `~/.pocket`, you will get a loud
 failure rather than a corrupted local install. Keep that import first.
 
+### Where to start
+
+Two tasks with a clear boundary, both genuinely useful:
+
+- **Add a provider** — one agent backend the phone can talk to. Additive, four worked
+  examples, cannot reach the security-sensitive parts of the bridge.
+  See [`docs/ADDING_A_PROVIDER.md`](docs/ADDING_A_PROVIDER.md).
+- **Un-skip a test** — see the list below.
+
 CI runs the same script on Ubuntu. Six files are skipped there because they need
 things that live on a maintainer's machine (a Hermes agent install, a real
 `codex` binary, macOS's zsh) — see `tests/ci-skip.txt`. **That list is a to-do
