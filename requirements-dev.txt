@@ -6,4 +6,17 @@
 # 測試報告失去意義(反正本來就有一條紅的,再多一條也看不出來)。
 #
 #   pip install -r requirements.txt -r requirements-dev.txt
+#
+# ⚠️ 維護者那台機器**不能用 pip** —— `~/apps/hermes-agent/runtime/venv` 是
+#    **uv 建的,裡面連 pip 模組都沒有**(2026-10-23 查證:
+#    `import pip` → ModuleNotFoundError;`pyvenv.cfg` 寫著 `uv = 0.11.28`)。
+#    在那個環境裝東西要用:
+#
+#      uv pip install --no-deps --python ~/apps/hermes-agent/runtime/venv PyYAML
+#
+#    (`--no-deps` 是保守起見:那是 Hermes 的 production runtime,不讓
+#     解相依有機會動到別的套件。PyYAML 本來就沒有相依。)
+#
+# 不裝也可以:`tests/_requires.py` 會讓缺依賴的測試誠實跳過(exit 77 → SKIP),
+# 不會變成紅線。裝了的差別只是 `test_hermes_media` 會真的跑起來。
 PyYAML
