@@ -13,7 +13,7 @@
 		<key>PATH</key>
 		<string>/usr/bin:/bin:/usr/sbin:/sbin</string>
 		<key>POCKET_CONSOLE_TLS_BIND</key>
-		<string>100.67.0.12</string>
+		<string>__POCKET_TAILNET_IP__</string>
 		<key>POCKET_CONSOLE_TLS_PORT</key>
 		<string>8443</string>
 	</dict>
