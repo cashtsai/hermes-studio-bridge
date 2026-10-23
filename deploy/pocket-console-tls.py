@@ -33,7 +33,17 @@ import ssl
 import sys
 from pathlib import Path
 
-BIND = os.environ.get("POCKET_CONSOLE_TLS_BIND", "100.67.0.12")
+# 綁哪個位址**沒有預設值**。
+#
+# 2026-10-23:這裡原本寫死維護者的 tailnet IP。那不只是把內網位址公開出去 ——
+# 任何人跑這支而沒設 env,就會去綁一個不屬於他的位址(然後失敗,或更糟:
+# 在某台剛好有那個 IP 的機器上綁成功)。
+#
+# 跟 `pocket-pair.py` 的 HOST 同一條教訓:**安靜地用別人的值,是最糟的預設**。
+BIND = os.environ.get("POCKET_CONSOLE_TLS_BIND", "")
+if not BIND:
+    sys.exit("POCKET_CONSOLE_TLS_BIND is not set — 請設成這台機器要綁的位址"
+             "(例如它的 tailnet IP),本程式不猜。")
 PORT = int(os.environ.get("POCKET_CONSOLE_TLS_PORT", "8443"))
 UPSTREAM_HOST = "127.0.0.1"
 UPSTREAM_PORT = int(os.environ.get("POCKET_CONSOLE_TLS_UPSTREAM", "8081"))

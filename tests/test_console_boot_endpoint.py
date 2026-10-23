@@ -37,7 +37,7 @@ with bridge._PAIR_BOOT_CODE_LOCK:
 
 _TS_SELF = {
     "DNSName": "examplehost.tailnet-example.ts.net.",
-    "TailscaleIPs": ["100.67.0.12", "fd7a:115c:a1e0::1234"],
+    "TailscaleIPs": ["100.64.0.12", "fd7a:115c:a1e0::1234"],
 }
 
 
@@ -130,7 +130,7 @@ class TestConsoleBootEndpoint(unittest.TestCase):
             self.assertNotIn("boot=", u)
             self.assertNotIn(d["boot"], u)
         # tailnet IP 保底也在清單裡,v6 要包方括號
-        self.assertIn("http://100.67.0.12:%d/console"
+        self.assertIn("http://100.64.0.12:%d/console"
                       % bridge._BRIDGE_PORT, d["urls"])
         self.assertIn("http://[fd7a:115c:a1e0::1234]:%d/console"
                       % bridge._BRIDGE_PORT, d["urls"])

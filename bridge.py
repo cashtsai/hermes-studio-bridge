@@ -9414,7 +9414,7 @@ def _pair_local_only(request: Request) -> None:
         → **放行**
       ‧ Tailscale:來源是真實 tailnet IP → **擋掉**
     也就是把比較安全的那條擋掉、放行比較不安全的那條。機主實測從
-    `100.67.0.12:8081/console?boot=…` 連過去吃 403「local only」,就是這條。
+    從 tailnet IP 連 `:8081/console?boot=…` 過去吃 403「local only」,就是這條。
 
     tailnet 成員資格本身就是一道認證邊界(WireGuard 金鑰),比「看起來像
     loopback」強得多,所以一併放行。`_pair_check_boot` 的 boot code 仍是真閘,
@@ -9425,7 +9425,9 @@ def _pair_local_only(request: Request) -> None:
     `--proxy-headers` 開啟且信任 `127.0.0.1` 當 proxy,而 cloudflared 正是從
     loopback 連進來 —— 所以 tunnel 流量的 `request.client` 會被 `X-Forwarded-For`
     覆寫成**訪客 IP**。本機日誌實證:經 tunnel 的 `/console` 403 記到的 client 是
-    `150.117.155.2`(公網 v4)與公網 v6,不是 `127.0.0.1`。
+    **訪客的公網 IP**(v4 與 v6),不是 `127.0.0.1`。
+    (原本這裡抄了日誌裡那個實際位址 —— 那是**第三方的個資**,不該留在公開
+     repo 的註解裡。結論不需要那個數字就成立。)
 
     因此**不能**只比對 IP 就放行 tailnet —— 若 uvicorn 取的是 XFF 最左那一段
     (客戶端可控),公網訪客只要送 `X-Forwarded-For: 100.64.0.1` 就能冒充 tailnet。
