@@ -467,5 +467,96 @@ class TestGeminiLane(unittest.TestCase):
         self.assertIn("gemini", out["degraded"])
 
 
+class TestDashboardCcTimeout(unittest.TestCase):
+    """tmux 卡住時,儀表板不能跟著卡住(2026-10-24)。
+
+    起因:macOS 升級後 tmux 伺服器間歇停住,`_cc_sessions()` 逐 session 打 tmux,
+    動輒 40–90s;儀表板 gather 等最慢的那個,app 端逾時只有 15s,於是「最後同步」
+    凍結。Codex / OpenClaw 早就有 5s 上限 + degraded,CC 沒有。
+
+    既有測試的 `_stub_light` 把 `_cc_sessions` 換成回 [] —— 所以 CC 這條路從來沒
+    被真的「卡住」打過,這組補的就是那個洞。
+    """
+
+    def _run(self, fake_cc, timeout=None):
+        restore = _stub_light(self)
+        orig_timeout = bridge._DASH_CC_TIMEOUT
+        bridge._cc_sessions = fake_cc
+        if timeout is not None:
+            bridge._DASH_CC_TIMEOUT = timeout
+        try:
+            t0 = time.monotonic()
+            out = asyncio.run(bridge._dashboard_sessions())
+            return out, time.monotonic() - t0
+        finally:
+            bridge._DASH_CC_TIMEOUT = orig_timeout
+            restore()
+
+    def test_hung_tmux_degrades_instead_of_hanging(self):
+        async def hang():
+            await asyncio.sleep(60)
+        out, elapsed = self._run(hang, timeout=0.2)
+        self.assertLess(elapsed, 3, "逾時後必須很快回,不能等完 60s")
+        self.assertIn("claude_code", out["degraded"])
+        self.assertEqual(out["cc"], {"working": 0, "idle": 0})
+        # 其他欄位不受 CC 卡住影響。
+        self.assertIn("persona", out)
+        self.assertIn("cx", out)
+
+    def test_healthy_cc_is_still_counted(self):
+        # 守住「包了 wait_for 沒改變正常行為」。
+        async def ok():
+            return [{"status": "running", "busy": True},
+                    {"status": "running", "busy": False},
+                    {"status": "down"}]
+        out, _ = self._run(ok)
+        self.assertEqual(out["cc"], {"working": 1, "idle": 2})
+        self.assertNotIn("claude_code", out["degraded"])
+
+    def test_cc_error_still_degrades(self):
+        async def boom():
+            raise RuntimeError("tmux 壞了")
+        out, _ = self._run(boom)
+        self.assertIn("claude_code", out["degraded"])
+
+    def test_cancel_kills_the_tmux_child(self):
+        """外層取消 `_tmux_run` 時,tmux 子行程要一起死。
+
+        沒有 CancelledError 那條的時候,子行程會原地留著等卡住的 tmux 伺服器;
+        儀表板的總逾時每觸發一次就多一個孤兒。這裡用 /bin/sleep 當替身 tmux。
+        """
+        import unittest.mock as mock
+        spawned = []
+        real = asyncio.create_subprocess_exec
+
+        async def spy(*a, **k):
+            p = await real(*a, **k)
+            spawned.append(p)
+            return p
+
+        orig_bin = bridge.TMUX_BIN
+
+        async def scenario():
+            bridge.TMUX_BIN = "/bin/sleep"
+            with mock.patch.object(asyncio, "create_subprocess_exec", spy):
+                try:
+                    await asyncio.wait_for(bridge._tmux_run("30", timeout=30), 0.3)
+                except asyncio.TimeoutError:
+                    pass
+            await asyncio.sleep(0.5)          # 給 child watcher 收屍
+            return spawned[0].returncode
+
+        try:
+            rc = asyncio.run(scenario())
+        finally:
+            bridge.TMUX_BIN = orig_bin
+            for p in spawned:                 # 測試失敗時別留一顆 sleep 30
+                try:
+                    p.kill()
+                except ProcessLookupError:
+                    pass
+        self.assertIsNotNone(rc, "子行程還活著 = 取消時沒被殺掉")
+
+
 if __name__ == "__main__":
     unittest.main()
