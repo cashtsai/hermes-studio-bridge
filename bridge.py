@@ -16,6 +16,7 @@ import base64
 import carddigest
 import collections
 import contextlib
+import contextvars
 import fcntl
 import glob
 import hashlib
@@ -12661,6 +12662,14 @@ _CC_TURN_STARTED_AT: dict[str, float] = {}
 # hung tmux server used to hang the handler (and its _BG_TASKS entry) forever.
 _TMUX_TIMEOUT = 15.0
 
+# 「tmux 沒回我」與「tmux 說 session 不存在」是兩回事,但 `_tmux_alive` 之類的
+# 包裝都把兩者壓成同一個 False —— tmux 一停,活著的 session 就被讀成 down。
+# 逾時時在**目前這個 task 的 context** 留個記號,讓上層(CC 列表建構)事後問得到
+# 「剛剛有沒有哪一次 tmux 呼叫是逾時的」,而不必改那些包裝函式的簽名(既有測試
+# 都把它們當替身接縫)。ContextVar 是 per-task 的:並行的各列互不干擾。
+_TMUX_TIMED_OUT: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "tmux_timed_out", default=False)
+
 
 async def _tmux_run(*args, timeout: float = _TMUX_TIMEOUT):
     """Run one tmux command with a kill-on-timeout guard.
@@ -12675,6 +12684,7 @@ async def _tmux_run(*args, timeout: float = _TMUX_TIMEOUT):
             p.kill()
         except ProcessLookupError:
             pass
+        _TMUX_TIMED_OUT.set(True)
         _log_event("tmux_timeout", args=" ".join(str(a) for a in args[:4]),
                    timeout_s=timeout)
         return 124, "", "tmux timed out"
@@ -12878,11 +12888,34 @@ def _cc_reseed_pins_from_files() -> int:
     return seeded
 
 
+_PS_SNAP_INFLIGHT = None     # 正在跑的那一顆 ps(多個呼叫者共用,見 _ps_snapshot)
+
+
 async def _ps_snapshot():
-    global _PS_SNAP
+    """行程表快照(5 秒 TTL)。並行呼叫者**共用同一顆正在跑的 ps**。
+
+    為什麼要共用:CC 列表現在對每個 session 並行建列,每一列都可能問「這個 pane 底下
+    跑的是哪個 claude sid」,冷快取時原本會同時 spawn N 顆 `ps -axo`。2026-10-24 這台機器上
+    `ps -A` 本身就會卡到好幾分鐘,N 顆一起卡只會讓事情更糟。
+    共用的那一顆用 shield 隔開:某個呼叫者被取消(例如儀表板的總逾時)不會連累其他人,
+    那一顆自己有 10s 上限,逾時自己殺。"""
+    global _PS_SNAP_INFLIGHT
     now = time.monotonic()
     if now - _PS_SNAP[0] < _PS_SNAP_TTL:
         return _PS_SNAP[1]
+    loop = asyncio.get_running_loop()
+    fut = _PS_SNAP_INFLIGHT
+    if fut is None or fut.done() or fut.get_loop() is not loop:
+        fut = loop.create_task(_ps_snapshot_run())
+        # 沒人在等時(全被取消)結果/例外也要取走,免得噴 "never retrieved"。
+        fut.add_done_callback(lambda f: f.cancelled() or f.exception())
+        _PS_SNAP_INFLIGHT = fut
+    return await asyncio.shield(fut)
+
+
+async def _ps_snapshot_run():
+    global _PS_SNAP
+    now = time.monotonic()
     p = await asyncio.create_subprocess_exec(
         "/bin/ps", "-axo", "pid=,ppid=,command=",
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
@@ -12894,6 +12927,13 @@ async def _ps_snapshot():
         except ProcessLookupError:
             pass
         return _PS_SNAP[1]
+    except asyncio.CancelledError:
+        # 同 _tmux_run:被取消(關機、event loop 收尾)時 ps 子行程要一起死。
+        try:
+            p.kill()
+        except ProcessLookupError:
+            pass
+        raise
     procs = {}
     for line in (out or b"").decode("utf-8", "replace").splitlines():
         parts = line.strip().split(None, 2)
@@ -13553,50 +13593,108 @@ def _cc_session_head(jsonl):
     return res
 
 
+# 列表端點的時間預算。App 的 /ccsessions 逾時是 10s,儀表板另有自己的 4s 總逾時;
+# 這裡取 6s:tmux 正常時遠低於此,卡住時寧可回「上一次的好資料 + stale」也不要讓 App 逾時。
+_CC_LIST_BUDGET = 6.0
+_CC_ROW_CACHE: dict = {}      # name -> 最後一次「可信」的列(tmux 沒逾時算出來的)
+_CC_ROW_TASKS: dict = {}      # name -> 正在建的那一個 task(並行呼叫共用,不重複打 tmux)
+
+
+async def _cc_row_build(name: str, workdir: str):
+    """建一條 session 列。回 (row, reliable);reliable=False 表示過程中 tmux 逾時過,
+    這時 `alive`/`busy` 是被吞掉逾時後的假值(「down」「閒置」),不能當事實也不能進快取。"""
+    _TMUX_TIMED_OUT.set(False)
+    alive = await _tmux_alive(name)
+    busy = False
+    awaiting = False
+    if alive:
+        hook_state = _cc_fresh_hook_state(name)
+        # Mid-turn? Capture the pane and look for the working spinner — so the
+        # home list can animate a running CC session (parity with Codex).
+        try:
+            pane = await _tmux_capture_cached(name)
+            if hook_state:
+                busy = bool(hook_state.get("busy"))
+            else:
+                busy = _cc_pane_busy(pane)
+            # Parked on a permission / approval prompt → the home list flags it
+            # ("待放行") so a session waiting on you is never invisible.
+            if not busy and _cc_prompt(pane) is not None:
+                awaiting = True
+        except Exception as _exc:  # noqa: BLE001
+            _log_exc("_cc_sessions", _exc, expected=True)
+            busy = False
+    jsonl = await _cc_session_jsonl(name, workdir)
+    mtime, preview = _cc_last_activity(jsonl)
+    sid, stitle = _cc_session_head(jsonl)
+    # Claude 標題(桌面 App rename 改的就是這個,存在終端 pane_title,主名仍是 ccsess 名)
+    # → app 當副標題。取不到就 None,不影響列表。
+    claude_title = await _cc_pane_title(name) if alive else None
+    row = {"name": name, "workdir": workdir,
+           "status": "running" if alive else "down", "busy": busy,
+           "awaiting": awaiting, "updatedAt": mtime, "preview": preview,
+           "sessionId": sid, "sessionTitle": stitle,
+           "claudeTitle": claude_title}
+    # context 用量(與 Codex 同款 {used,size});取不到就不放這個 key,
+    # app 端整條隱藏而不是顯示 0%。P2-F5:有 usage 時順手併累計 token/
+    # 估算花費(加欄不改形;ctx 的 used/size 永遠壓過 cum 同名欄)。
+    ctx = _cc_context_usage_cached(jsonl)
+    if ctx:
+        cum = _cc_cum_usage_cached(jsonl)
+        row["usage"] = {**cum, **ctx} if cum else ctx
+    return row, not _TMUX_TIMED_OUT.get()
+
+
+async def _cc_row_task(name: str, workdir: str):
+    row, reliable = await _cc_row_build(name, workdir)
+    if reliable:
+        _CC_ROW_CACHE[name] = row
+    return row, reliable
+
+
+def _cc_row_fallback(name: str, workdir: str) -> dict:
+    """這一條來不及/不可信時的替身:有上次好資料就用它並標 stale;沒有就回 unknown 佔位
+    (App 只認 status=="running" 為執行中,其餘畫灰點,不會被誤標成「已停止」的事實)。"""
+    last = _CC_ROW_CACHE.get(name)
+    if last is not None:
+        return {**last, "stale": True}
+    return {"name": name, "workdir": workdir, "status": "unknown", "busy": False,
+            "awaiting": False, "updatedAt": None, "preview": None,
+            "sessionId": None, "sessionTitle": None, "claudeTitle": None,
+            "stale": True}
+
+
 async def _cc_sessions():
+    """CC session 列表。各 session 並行建列、整體有時間預算:tmux 一停,超時或不可信的列
+    改回上次好資料(`stale: True`)或 unknown 佔位,而不是讓整支端點掛到 App 逾時。
+    慢的 task 不取消(取消會中斷 tmux 子行程的收尾),留著跑完好把快取補上。"""
+    rows = [(n, w) for n, w, e in _cc_conf_rows() if e == "1"]
+    loop = asyncio.get_running_loop()
+    tasks = {}
+    for name, workdir in rows:
+        t = _CC_ROW_TASKS.get(name)
+        if t is None or t.done() or t.get_loop() is not loop:
+            t = loop.create_task(_cc_row_task(name, workdir))
+            t.add_done_callback(lambda f: f.cancelled() or f.exception())
+            _CC_ROW_TASKS[name] = t
+        tasks[name] = t
+    if tasks:
+        await asyncio.wait(list(tasks.values()), timeout=_CC_LIST_BUDGET)
     out = []
-    for name, workdir, enabled in _cc_conf_rows():
-        if enabled != "1":
-            continue
-        alive = await _tmux_alive(name)
-        busy = False
-        awaiting = False
-        if alive:
-            hook_state = _cc_fresh_hook_state(name)
-            # Mid-turn? Capture the pane and look for the working spinner — so the
-            # home list can animate a running CC session (parity with Codex).
-            try:
-                pane = await _tmux_capture_cached(name)
-                if hook_state:
-                    busy = bool(hook_state.get("busy"))
-                else:
-                    busy = _cc_pane_busy(pane)
-                # Parked on a permission / approval prompt → the home list flags it
-                # ("待放行") so a session waiting on you is never invisible.
-                if not busy and _cc_prompt(pane) is not None:
-                    awaiting = True
-            except Exception as _exc:  # noqa: BLE001
-                _log_exc("_cc_sessions", _exc, expected=True)
-                busy = False
-        jsonl = await _cc_session_jsonl(name, workdir)
-        mtime, preview = _cc_last_activity(jsonl)
-        sid, stitle = _cc_session_head(jsonl)
-        # Claude 標題(桌面 App rename 改的就是這個,存在終端 pane_title)→ app 當
-        # 副標題,主名仍是 ccsess 名。取不到就 None,不影響列表。
-        claude_title = await _cc_pane_title(name) if alive else None
-        row = {"name": name, "workdir": workdir,
-               "status": "running" if alive else "down", "busy": busy,
-               "awaiting": awaiting, "updatedAt": mtime, "preview": preview,
-               "sessionId": sid, "sessionTitle": stitle,
-               "claudeTitle": claude_title}
-        # context 用量(與 Codex 同款 {used,size});取不到就不放這個 key,
-        # app 端整條隱藏而不是顯示 0%。P2-F5:有 usage 時順手併累計 token/
-        # 估算花費(加欄不改形;ctx 的 used/size 永遠壓過 cum 同名欄)。
-        ctx = _cc_context_usage_cached(jsonl)
-        if ctx:
-            cum = _cc_cum_usage_cached(jsonl)
-            row["usage"] = {**cum, **ctx} if cum else ctx
-        out.append(row)
+    late = 0
+    for name, workdir in rows:
+        t = tasks[name]
+        res = None
+        if t.done() and not t.cancelled() and t.exception() is None:
+            res = t.result()
+        if res is not None and res[1]:
+            out.append(res[0])
+        else:
+            late += 1
+            out.append(_cc_row_fallback(name, workdir))
+    if late:
+        _log_event("cc_list_degraded", late=late, total=len(rows),
+                   budget_s=_CC_LIST_BUDGET)
     return out
 
 
@@ -27018,7 +27116,10 @@ async def _dashboard_sessions():
     degraded = []
     cc_w = cc_i = 0
     try:
-        for s in await asyncio.wait_for(_cc_sessions(), timeout=_DASH_CC_TIMEOUT):
+        cc_rows = await asyncio.wait_for(_cc_sessions(), timeout=_DASH_CC_TIMEOUT)
+        if any(s.get("stale") for s in cc_rows):
+            degraded.append("claude_code")     # 有列是 tmux 卡住時的替身,計數不一定準
+        for s in cc_rows:
             if s.get("status") == "running" and (s.get("busy") or s.get("awaiting")):
                 cc_w += 1
             else:
@@ -27191,7 +27292,11 @@ async def health(agents: int = 0):
         cx_busy = len(getattr(CODEX_APP, "active_turns", {}) or {})
         cc_busy = 0
         try:
-            cc_busy = sum(1 for r in (await _cc_sessions()) if r.get("busy"))
+            cc_rows = await _cc_sessions()
+            if any(r.get("stale") for r in cc_rows):
+                cc_busy = -1      # 有列是替身(tmux 卡住),busy 不可信 → 當「不確定」
+            else:
+                cc_busy = sum(1 for r in cc_rows if r.get("busy"))
         except Exception as e:  # noqa: BLE001
             _log_exc("health_agents_cc", e, expected=True)
             cc_busy = -1          # -1 = 問不到,呼叫端要當成「不確定,別重啟」
