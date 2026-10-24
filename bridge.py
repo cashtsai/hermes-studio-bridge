@@ -4042,6 +4042,27 @@ def apns_configured() -> bool:
     return ok
 
 
+def _push_http2_problem() -> str | None:
+    """APNs 只走 HTTP/2,而 httpx 的 `http2=True` 需要 `h2` 套件。
+
+    缺了的話,每一則推播都在 `AsyncClient(http2=True)` 建立時丟 ImportError,被
+    push_notify 逐台裝置捕獲後只剩一行 `push_notify_failed`。2026-08-22 到
+    2026-10-24 之間累計 748 筆、沒有人看見,鎖屏核准整段不能用 —— 日誌「有記」
+    不等於「有人會看」。
+
+    回傳 None = 沒問題;字串 = 人看得懂的原因與修法。只在推播已配置時才有意義,
+    呼叫端自己判斷(沒配金鑰的自架者不該被這個打擾)。
+
+    ⚠️ 這個套件住在 Hermes 的版本化虛擬環境(venvs/hermes-<版本>)裡,Hermes
+    升級若換環境,手動補裝的 h2 會跟著消失 —— 所以才需要每次啟動都檢查。"""
+    try:
+        import h2  # noqa: F401
+    except ImportError:
+        return ("缺 h2 套件:APNs 只走 HTTP/2,沒有它每一則推播都會失敗。"
+                f"修法:uv pip install --python {sys.prefix}/bin/python h2 hpack hyperframe")
+    return None
+
+
 def _apns_jwt() -> str:
     """ES256 JWT for APNs, cached ~50 min (Apple requires < 60 min)."""
     import jwt as pyjwt
@@ -4235,6 +4256,13 @@ async def push_notify(title: str, body: str, data: dict | None = None,
       顯示人格名,訊息內容不出現在鎖屏)。"""
     if not apns_configured():
         return {"sent": 0, "total": 0, "failures": [], "disabled": True}
+    problem = _push_http2_problem()
+    if problem:
+        # 不進逐台迴圈:每台都會因同一個原因失敗,只會多寫 N 行難懂的 httpx 錯誤。
+        _log_event("push_dependency_missing", title=title[:48], problem=problem[:200])
+        return {"sent": 0, "total": len(_devices()), "skipped": 0,
+                "failures": [{"code": "dependency", "detail": problem[:160], "token": "-"}],
+                "dependency_missing": True}
     toks = _devices()
     prefs = _push_prefs_load()
     sent = 0
@@ -10665,6 +10693,23 @@ async def _pocket_id_loop() -> None:
                 fail_logged = True
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 3600.0)
+
+
+async def _check_push_dependency_at_startup() -> None:
+    """推播已配置卻缺 http2 依賴 → 啟動時大聲說一次(事件日誌 + 標準錯誤)。
+    沒配金鑰(多數自架者)或依賴齊全 → 完全安靜。"""
+    if not apns_configured():
+        return
+    problem = _push_http2_problem()
+    if not problem:
+        return
+    _log_event("push_dependency_missing", phase="startup", problem=problem[:200])
+    print(f"⚠️  推播無法運作:{problem}", file=sys.stderr, flush=True)
+
+
+@app.on_event("startup")
+async def _startup_push_dependency_check():
+    await _check_push_dependency_at_startup()
 
 
 @app.on_event("startup")
