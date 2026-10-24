@@ -12678,6 +12678,15 @@ async def _tmux_run(*args, timeout: float = _TMUX_TIMEOUT):
         _log_event("tmux_timeout", args=" ".join(str(a) for a in args[:4]),
                    timeout_s=timeout)
         return 124, "", "tmux timed out"
+    except asyncio.CancelledError:
+        # 被**外層**取消(例如儀表板給 _cc_sessions() 的總逾時),不是自己逾時。
+        # 上面那條只接得到自己的 TimeoutError,接不到 CancelledError —— 沒有這條,
+        # tmux 子行程會原地留著等一個卡住的 tmux 伺服器,每被取消一次就多一個孤兒。
+        try:
+            p.kill()
+        except ProcessLookupError:
+            pass
+        raise
     return (p.returncode,
             (out or b"").decode("utf-8", "replace"),
             (err or b"").decode("utf-8", "replace").strip())
@@ -26987,19 +26996,38 @@ def _dashboard_approvals():
         con.close()
 
 
+# CC 那一段必須有總上限。_cc_sessions() 對每個 session 逐一打 tmux(每次最多
+# _TMUX_TIMEOUT=15s、每個 session 好幾次),tmux 伺服器一停住,N 個 session ×
+# 數次呼叫就是幾分鐘;而 /app/v1/dashboard 是 gather,等最慢的那一個,app 端的
+# 請求逾時只有 15s —— 於是每次刷新都失敗,「最後同步」凍結在最後一次成功的時間。
+# 2026-10-24 實測:儀表板等 120s 仍無回應,同時 /health 與其他端點都在毫秒內回。
+# Codex / OpenClaw 早就有 5s 上限 + degraded,CC 當初被當成「tmux 快取、很便宜」
+# 而漏掉。
+#
+# 預算:這支函式的各段是**依序**的,最壞 = CC + Codex(5s) + OpenClaw(5s),而 app
+# 只等 15s,所以 CC 取 4s(合計最壞 14s,留 1s 餘裕)。要調只改這個,別動 5s 那兩個。
+_DASH_CC_TIMEOUT = float(os.environ.get("POCKET_DASH_CC_TIMEOUT", "4") or 4)
+
+
 async def _dashboard_sessions():
     """cc/cx/persona 各 {working, idle} — 重用既有列表邏輯的最便宜組合:
-    cc 走 _cc_sessions()(tmux 快取 capture),persona 走 PERSONAS +
-    _hermes_pending_by_session(),codex 走 thread/list(短 timeout,掛了標
-    degraded 不拖垮整包)。working = running/waiting_approval 同 v2 語意。"""
+    cc 走 _cc_sessions()(tmux 快取 capture;有 _DASH_CC_TIMEOUT 總上限,逾時標
+    degraded),persona 走 PERSONAS + _hermes_pending_by_session(),codex 走
+    thread/list(短 timeout,掛了標 degraded 不拖垮整包)。
+    working = running/waiting_approval 同 v2 語意。"""
     degraded = []
     cc_w = cc_i = 0
     try:
-        for s in await _cc_sessions():
+        for s in await asyncio.wait_for(_cc_sessions(), timeout=_DASH_CC_TIMEOUT):
             if s.get("status") == "running" and (s.get("busy") or s.get("awaiting")):
                 cc_w += 1
             else:
                 cc_i += 1
+    except asyncio.TimeoutError:
+        # 逾時 ≠ 沒有 session:計數維持 0 只是沿用 Codex 降級的形狀(app 端
+        # 目前讀不到 degraded,會畫成 0/0,見 PR 說明)。
+        _log_event("dashboard_cc_timeout", timeout_s=_DASH_CC_TIMEOUT)
+        degraded.append("claude_code")
     except Exception as e:  # noqa: BLE001
         _log_event("dashboard_cc_failed", error=str(e)[:160])
         degraded.append("claude_code")
