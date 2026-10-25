@@ -15721,7 +15721,9 @@ async def _cc_paste_text_locked(name: str, text: str, expect_dialog: bool = Fals
         _dlg_deadline = time.monotonic() + _CC_EXPECT_DIALOG_POLL_SECS
         while True:
             dlg_pane = await _cc_capture_pane_fresh(name)
-            if _cc_prompt(dlg_pane) is not None:
+            # 兩種都算:一般選單(_cc_prompt)或 /model 的「Switch model?」框
+            # (_cc_prompt 看不到它,要專用偵測器)。
+            if _cc_prompt(dlg_pane) is not None or _cc_model_switch_key(dlg_pane) is not None:
                 _log_event("cc_paste_dialog_accepted", session=name,
                            verify_state=verdict["state"], attempts=verdict["attempts"])
                 return {"delivery": "accepted", "confirmed": True,
@@ -17864,6 +17866,27 @@ def _cc_model_confirm_key(prompt) -> str | None:
     return None
 
 
+def _cc_model_switch_key(pane: str) -> str | None:
+    """直接從畫面認 CC 的「Switch model?」確認框,回「Yes, switch…」那顆的數字鍵。
+
+    為什麼不走 `_cc_prompt`:這個框**沒有** "Enter to select" footer、標題也不含
+    權限關鍵字(wants to / do you want / proceed?),所以 `_cc_prompt` 一律回 None
+    —— 2026-10-25 實測:模型選了沒反應的真因就在這裡,偵測器根本看不到這個框,
+    於是沒人去按它、還謊報切換成功。這支專認它,認不出回 None(不盲按)。"""
+    tail = pane.splitlines()[-14:]
+    if "switch model?" not in "\n".join(tail).lower():
+        return None
+    for ln in tail:
+        s = ln.strip().lstrip("❯>•· ").strip()
+        m = _CC_OPT_NUM_RE.match(s)
+        if m and re.search(r"yes|switch", s, re.IGNORECASE) \
+                and not re.search(r"\bno\b|go back|cancel|keep", s, re.IGNORECASE):
+            k = m.group(1)
+            if len(k) == 1 and k.isdigit():
+                return k
+    return None
+
+
 @app.post("/ccsessions/{name}/model")
 async def cc_session_model(name: str, request: Request):
     """Switch the CC model by typing the /model slash command into the live TUI
@@ -17901,7 +17924,9 @@ async def cc_session_model(name: str, request: Request):
             await asyncio.sleep(0.3)
             _PANE_CACHE.pop(name, None)
             pane = await _cc_capture_pane_fresh(name)
-            yes_key = _cc_model_confirm_key(_cc_prompt(pane))
+            # 主偵測:直接認「Switch model?」框(`_cc_prompt` 看不到它)。
+            # 退路:舊的 prompt-dict 路徑,留著相容其他版面。
+            yes_key = _cc_model_switch_key(pane) or _cc_model_confirm_key(_cc_prompt(pane))
             if yes_key:
                 break
         # 3) 有確認框 → 按「切換」把它按掉(部分版面數字即成交,部分要補 Enter)。
@@ -17911,24 +17936,26 @@ async def cc_session_model(name: str, request: Request):
             await asyncio.sleep(0.4)
             _PANE_CACHE.pop(name, None)
             pane = await _cc_capture_pane_fresh(name)
-            if _cc_prompt(pane) is not None:        # 還停在框上 → 補 Enter 成交
+            # 還停在框上(兩種偵測任一仍看到)→ 補 Enter 成交。
+            if _cc_prompt(pane) is not None or _cc_model_switch_key(pane) is not None:
                 await _tmux_run("send-keys", "-t", name, "Enter")
                 await asyncio.sleep(0.4)
                 _PANE_CACHE.pop(name, None)
                 pane = await _cc_capture_pane_fresh(name)
             answered = True
-        # 4) 誠實判定。
-        still = _cc_prompt(pane)
+        # 4) 誠實判定。兩種框任一還在 = 沒成交(`_cc_prompt` 對 Switch model 框
+        #    永遠回 None,只靠它會把「框還開著」誤判成成功 —— 2026-10-25 的假成功)。
+        still = _cc_prompt(pane) is not None or _cc_model_switch_key(pane) is not None
         tail = "\n".join(pane.strip().splitlines()[-14:])
         had_error = bool(_CC_MODEL_ERR_RE.search(tail))
         _log_event("cc_model_switch", session=name, model=model,
                    answered_dialog=answered, had_error=had_error,
-                   confirmed=(still is None and not had_error))
+                   confirmed=(not still and not had_error))
         if had_error:
             raise http_err(422, "MODEL_REJECTED",
                            f"CC 不接受模型名稱「{model}」(未知/無效)",
                            tail[-200:])
-        if still is not None:
+        if still:
             # 確認框還在/又冒出別的選單 → 沒成交,別謊報成功。
             raise http_err(502, "MODEL_CONFIRM_UNRESOLVED",
                            "sent /model but a prompt is still on screen — not switched",
