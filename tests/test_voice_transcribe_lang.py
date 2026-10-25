@@ -100,7 +100,10 @@ class VoiceTranscribeLangTest(unittest.TestCase):
         """
         with open(_BRIDGE_PY, encoding="utf-8") as fh:
             tree = ast.parse(fh.read())
-        must_pass_lang = {"_cc_input_core", "_codex_input_items"}
+        # `_cc_input_core_locked` 是 CC 輸入**真正做事**的那一層;外面的
+        # `_cc_input_core` 自 2026-10-25 起只做冪等閘門(換網雙送修復),不碰語音。
+        # 跟著改名不是放寬檢查 —— 漏傳語言照樣會紅在下面的 args==4 斷言。
+        must_pass_lang = {"_cc_input_core_locked", "_codex_input_items"}
         checked = set()
         for node in ast.walk(tree):
             if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
