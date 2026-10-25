@@ -59,7 +59,7 @@ class QuickTunnelDiscovery(unittest.TestCase):
             run.side_effect = [
                 _ps(["33888 /Applications/Pocket.app/Contents/Resources/cloudflared "
                      "tunnel --no-autoupdate --url http://127.0.0.1:%d" % port]),
-                _ps(["cloudflared 33888 xcash 9u IPv4 TCP 127.0.0.1:20244 (LISTEN)"]),
+                _ps(["cloudflared 33888 you 9u IPv4 TCP 127.0.0.1:20244 (LISTEN)"]),
             ]
             with patch.object(bridge.urllib.request, "urlopen",
                               return_value=_Resp({"hostname": "ceiling-juan.trycloudflare.com"})):
@@ -72,7 +72,7 @@ class QuickTunnelDiscovery(unittest.TestCase):
         with patch.object(bridge.subprocess, "run") as run:
             run.return_value = _ps([
                 "1793 /opt/homebrew/bin/cloudflared tunnel --config "
-                "/Users/xcash/.cloudflared/fed-console-studio.yml run",
+                "/Users/you/.cloudflared/fed-console-studio.yml run",
                 "1805 /opt/homebrew/bin/cloudflared tunnel --url http://127.0.0.1:8088",
             ])
             self.assertEqual(bridge._cloudflared_metrics_ports(), [])
