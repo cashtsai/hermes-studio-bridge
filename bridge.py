@@ -15574,7 +15574,7 @@ async def _cc_verify_submitted(name: str, probes, gen0: int,
                     "attempts": attempts, "pane": pane}
 
 
-async def _cc_paste_text(name: str, text: str) -> dict:
+async def _cc_paste_text(name: str, text: str, expect_dialog: bool = False) -> dict:
     """tmux 貼字唯一原語(B1):bracketed paste,buffer 內容改走 load-buffer
     stdin——set-buffer 把整段文字放 argv,長貼文/特殊字元踩 exec 邊界就 502,
     這一整類從此消失。每步 rc/stderr 失敗即進 log(502 先可觀測再談修)。
@@ -15586,10 +15586,10 @@ async def _cc_paste_text(name: str, text: str) -> dict:
       * 無法確認 + pane 待命中   → 409(idle 不可能排隊,見下方 idle_recheck)
     """
     async with _cc_paste_lock(name):
-        return await _cc_paste_text_locked(name, text)
+        return await _cc_paste_text_locked(name, text, expect_dialog=expect_dialog)
 
 
-async def _cc_paste_text_locked(name: str, text: str) -> dict:
+async def _cc_paste_text_locked(name: str, text: str, expect_dialog: bool = False) -> dict:
     if not await _tmux_alive(name):
         raise http_err(409, "SESSION_NOT_RUNNING", "session not running")
 
@@ -15699,6 +15699,20 @@ async def _cc_paste_text_locked(name: str, text: str) -> dict:
         return {"delivery": "accepted", "confirmed": False, "attempts": 0}
     verdict = await _cc_verify_submitted(name, probes, gen0, pre_pane)
     pane = verdict.get("pane") or ""
+    # `/model`、`/add-dir` 這類 slash 指令一送出就被 CLI 吃掉、換成一個確認框 ——
+    # 字當然不在輸入框裡了,但那不是「沒送進去」,是**成功**。通用驗證看不到字就
+    # 判失敗(stranded/never_rendered),於是呼叫端收到假的 CC_INPUT_NOT_ACCEPTED,
+    # 而且確認框被晾在那裡沒人按(2026-10-25 機主實測:模型選了沒反應)。
+    # expect_dialog=True 的呼叫端(目前只有 /model)在這裡先看一眼:畫面上真的跳出
+    # 了確認框 → 當成已收下並交棒給呼叫端去按。**刻意不送 C-u** —— 確認框開著時
+    # C-u 會打進那個框。
+    if expect_dialog and verdict["state"] != "accepted":
+        dlg_pane = await _cc_capture_pane_fresh(name)
+        if _cc_prompt(dlg_pane) is not None:
+            _log_event("cc_paste_dialog_accepted", session=name,
+                       verify_state=verdict["state"], attempts=verdict["attempts"])
+            return {"delivery": "accepted", "confirmed": True,
+                    "attempts": verdict["attempts"], "dialog": True}
     if verdict["state"] == "stranded":
         # 2026-07-14 草稿擱淺 / 2026-07-28 靜默掉訊息:重試耗盡文字還在框裡。
         # 舊行為回 200 = 沉默失敗;回 200 之外還有第二個坑 —— 殘字會變成跨
@@ -17859,8 +17873,10 @@ async def cc_session_model(name: str, request: Request):
         raise http_err(409, "CC_BUSY", "turn running; model switch needs an idle prompt")
     # 序列化:同一個 session 的 /model 不要跟 answer/key 交錯送鍵。
     async with _cc_seq_guard(name, "model"):
-        # 1) 打 /model <name> 送出(_cc_paste_text 會驗證字真的離開輸入框)。
-        await _cc_paste_text(name, f"/model {model}")
+        # 1) 打 /model <name> 送出。expect_dialog=True:/model 一送出就跳確認框、
+        #    吃掉輸入框的字,通用貼字驗證會誤判成「沒送進去」—— 旗標讓它看到確認框
+        #    就當成功,交棒給下面的輪詢去按(2026-10-25 修「模型選了沒反應」)。
+        await _cc_paste_text(name, f"/model {model}", expect_dialog=True)
         # 2) 輪詢等「Switch model?」確認框出現(近版 CC 會跳;舊版不跳直接切)。
         deadline = time.monotonic() + _CC_MODEL_CONFIRM_POLL_SECS
         yes_key = None
