@@ -837,6 +837,13 @@ class CodexThreadDigest(ApprovalCardMixin):
         self.store = SessionCardStore(chronological=True)
         self.agent_text: dict[str, str] = {}   # itemId → delta 累積文字
         self.busy = False
+        # `busy` used to be driven only by live turn notifications.  That is
+        # insufficient when the desktop Codex client owns the turn: the
+        # app-server broadcasts the provider status, but no local
+        # `turn/started` is guaranteed to arrive for this bridge.  Keep the
+        # normalized runtime state beside the digest so the card stream can
+        # mirror that authoritative source.
+        self.runtime_status = ""
         self.turn_started_at = 0.0   # turn/started 的時間(見該處註解)
         self.prompt = None                     # pending approval title（label 素材）
         self.seeded = False
@@ -873,17 +880,33 @@ class CodexThreadDigest(ApprovalCardMixin):
         # 所以:在跑就是 run,積壓量走**獨立欄位** queue_depth,人話寫進 label。
         # 「收下了但還沒開跑」(depth>0 且 not busy)才是 queued 的原義,保留。
         depth = int(getattr(self, "queue_depth", 0) or 0)
-        if self.busy:
-            phase = "run"
-        elif depth:
+        runtime = str(getattr(self, "runtime_status", "") or "").lower()
+        waiting = bool(self.prompt) or runtime == "waiting_approval"
+        if runtime == "stalled":
+            phase = "stalled"
+            label = "執行停滯,沒有新進度"
+        elif runtime == "failed":
+            phase = "error"
+            label = "Codex 發生錯誤"
+        elif waiting:
+            phase = "waiting"
+            label = "等待核准"
+        elif depth and not self.busy:
             phase = "queued"
+            label = "已排入佇列,等待接手…"
+        elif self.busy:
+            phase = "run"
+            label = ""
         else:
             phase = "idle"
-        label = cc_status_label(self.busy, self.prompt,
-                                self.store.last_tool, self.store.saw_output)
-        if depth and not self.busy:
-            label = "已排入佇列,等待接手…"
-        elif depth:
+            # Keep the card-stream terminal wording aligned with CC and the
+            # existing Pocket contract: the turn event records completion;
+            # the steady state is ready/idle rather than a transient banner.
+            label = "待命"
+        if phase == "run":
+            label = cc_status_label(self.busy, self.prompt,
+                                    self.store.last_tool, self.store.saw_output)
+        if depth and self.busy and phase == "run":
             label = f"{label} · 另有 {depth} 則排隊"
         locked = bool(getattr(self, "locked", False))
         if locked and not self.busy:
@@ -914,7 +937,33 @@ class CodexThreadDigest(ApprovalCardMixin):
         # "queued" 的 busy 是善意謊言,回合還沒開始,給起算點就是說謊。
         if self.busy and self.turn_started_at and phase != "queued":
             status["busy_since"] = self.turn_started_at
+        if waiting:
+            # A provider-level wait can exist before an approval card is
+            # available.  Keep it distinguishable from an idle session.
+            status["blocked"] = True
         self.store.set_status(status)
+
+    def sync_runtime_status(self, runtime_status: str) -> None:
+        """Project Codex app-server status into this digest.
+
+        `CodexAppServerClient.active_turns` only covers turns started by the
+        bridge.  A desktop/VS Code/CLI turn is visible through
+        `thread/status/changed` and `thread/read`, so that source must also
+        drive the v2 card status.  The status endpoint remains conservative:
+        unknown values do not rewrite the current digest state.
+        """
+        normalized = str(runtime_status or "").strip().lower()
+        if normalized not in {"running", "stalled", "waiting_approval",
+                               "idle", "done", "failed"}:
+            return
+        self.runtime_status = normalized
+        if normalized in {"running", "stalled", "waiting_approval"}:
+            self.busy = True
+        else:
+            self.busy = False
+            if normalized in {"idle", "done", "failed"}:
+                self.turn_started_at = 0.0
+        self._status()
 
     @staticmethod
     def _same_card(prev: dict | None, card: dict) -> bool:
@@ -1002,6 +1051,7 @@ class CodexThreadDigest(ApprovalCardMixin):
             turn = params.get("turn") or {}
             self.store.turn_id = str(turn.get("id") or "")
             self.busy = True
+            self.runtime_status = "running"
             # 回合起算時間 —— 與 CC 的 `busy_since` 同一件事、同一個理由:app 的
             # WorkingBar 只有一顆脈動點,2 秒與 20 分鐘看起來一模一樣,而遠端
             # 遙控最怕分不出「在跑」和「死了」。這是 `turn/started` **事件**
@@ -1016,6 +1066,7 @@ class CodexThreadDigest(ApprovalCardMixin):
             turn = params.get("turn") or {}
             err = turn.get("error") if isinstance(turn, dict) else None
             self.busy = False
+            self.runtime_status = "done"
             self.prompt = None
             self.turn_started_at = 0.0     # 起算點跟著回合走,不留給下一輪
             self.store.push_turn("end", self.store.turn_id or str(turn.get("id") or ""))

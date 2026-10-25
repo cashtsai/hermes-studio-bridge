@@ -604,6 +604,36 @@ class EnrichSummaryTests(unittest.TestCase):
         self.assertEqual(s["status"], "failed")
 
 
+class CardDigestStatusTests(unittest.TestCase):
+    """v2 CX 卡片流也必須反映桌面端擁有的 provider 狀態。"""
+
+    def test_external_running_turn_is_not_rendered_idle(self):
+        digest = bridge.carddigest.CodexThreadDigest()
+        digest.sync_runtime_status("running")
+        self.assertTrue(digest.busy)
+        self.assertEqual(digest.store.status["phase"], "run")
+        self.assertEqual(digest.store.status["label"], "思考中")
+
+    def test_provider_wait_is_visible_without_an_approval_card(self):
+        digest = bridge.carddigest.CodexThreadDigest()
+        digest.sync_runtime_status("waiting_approval")
+        self.assertTrue(digest.busy)
+        self.assertEqual(digest.store.status["phase"], "waiting")
+        self.assertEqual(digest.store.status["label"], "等待核准")
+        self.assertTrue(digest.store.status["blocked"])
+
+    def test_stalled_and_terminal_states_converge(self):
+        digest = bridge.carddigest.CodexThreadDigest()
+        digest.sync_runtime_status("stalled")
+        self.assertTrue(digest.busy)
+        self.assertEqual(digest.store.status["phase"], "stalled")
+        self.assertIn("停滯", digest.store.status["label"])
+        digest.sync_runtime_status("done")
+        self.assertFalse(digest.busy)
+        self.assertEqual(digest.store.status["phase"], "idle")
+        self.assertEqual(digest.store.status["label"], "待命")
+
+
 class WarmFailureLoggingTests(unittest.TestCase):
     """warm 失敗的 log 一定要帶得到人話 —— 實機曾累積上萬筆只有 error type
     的紀錄,完全無法診斷。"""

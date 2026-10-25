@@ -7329,6 +7329,13 @@ class CodexAppServerClient:
                             key=lambda kv: kv[1].get("at", 0.0))
             for tid, _ in oldest[:len(self.provider_status) - keep]:
                 self.provider_status.pop(tid, None)
+        # If the phone card stream has already been opened, update it at the
+        # same edge where the authoritative provider status is recorded.  This
+        # closes the gap where /codexsessions is correct but /app/v2 cards
+        # remains stuck at its last locally-observed turn state.
+        sync_digest = globals().get("_cx_sync_digest_runtime")
+        if sync_digest is not None:
+            sync_digest(thread_id)
         return rec
 
     def provider_status_for(self, thread_id: str) -> dict | None:
@@ -19402,6 +19409,19 @@ _CX_CARD_SEED_TURNS = 50        # 冷載種子:thread/turns/list 的 turn 數
 _CX_CARD_RESEED_TTL = 8.0       # 已 seed 後的 canonical catch-up 最短間隔
 
 
+def _cx_sync_digest_runtime(thread_id: str) -> None:
+    """Mirror the canonical Codex runtime state into an opened card digest."""
+    if not thread_id:
+        return
+    digest = _CX_CARD_DIGESTS.get(thread_id)
+    if digest is None:
+        return
+    try:
+        digest.sync_runtime_status(CODEX_APP.runtime_status(thread_id, ""))
+    except Exception as exc:  # noqa: BLE001
+        _log_exc("_cx_sync_digest_runtime", exc, expected=True)
+
+
 def _cx_cards_feed(method: str, params: dict) -> None:
     """CodexAppServerClient 通知 → 有訂閱過的 thread 餵進 digest。
     digest 只在首次 cards/events 請求時建立,之前的歷史由 seed 補。"""
@@ -19861,6 +19881,10 @@ async def _cx_card_digest(thread_id: str):
     if d is None:
         d = _CX_CARD_DIGESTS[thread_id] = carddigest.CodexThreadDigest()
     await _cx_seed_card_digest(thread_id, d, required=not d.seeded)
+    # The provider may already be running before this phone stream is opened.
+    # Seed/cold-load must therefore reconcile against app-server state instead
+    # of leaving the digest's default idle value on screen.
+    _cx_sync_digest_runtime(thread_id)
     # 每次冷載/接流都把鎖狀態同步進 session.status:app 進到 session 的第一
     # 個 snapshot 就帶著 locked,不必等下一次事件。若鎖是背景(warm loop /
     # stderr)先偵測到的,那時沒有 digest 可推卡 —— 在這裡補上,使用者一進來
