@@ -42,6 +42,7 @@ import termios
 import threading
 import time
 import urllib.parse
+import urllib.request
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -9638,19 +9639,101 @@ def _pair_tailscale_host():
     return str(ips[0]) if ips else None
 
 
+_QUICK_TUNNEL_CACHE = {"ts": 0.0, "url": None}
+
+
+def _cloudflared_metrics_ports() -> list:
+    """正在把本機 bridge port 往外送的 cloudflared,它們的 metrics port。
+
+    認法是**命令列帶了本機 bridge 位址**(`--url http://127.0.0.1:<port>`),
+    不是「名字叫 cloudflared 就算」—— 這台可能同時跑好幾條通道(其他服務的),
+    撈錯會把別人的網址當成 Pocket 的廣告出去。
+    """
+    port = str(_BRIDGE_PORT)
+    try:
+        ps = subprocess.run(["ps", "-axo", "pid=,command="],
+                            capture_output=True, text=True, timeout=5)
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("_cloudflared_ps", _exc, expected=True)
+        return []
+    pids = []
+    for line in ps.stdout.splitlines():
+        line = line.strip()
+        if "cloudflared" not in line or port not in line:
+            continue
+        # `--url http://127.0.0.1:8081` / `--url=localhost:8081` 都要認
+        if not re.search(r"--url[= ]\S*(?:127\.0\.0\.1|localhost|\[::1\]):%s\b" % port, line):
+            continue
+        head = line.split(None, 1)[0]
+        if head.isdigit():
+            pids.append(head)
+    ports = []
+    for pid in pids:
+        try:
+            out = subprocess.run(["lsof", "-nP", "-a", "-p", pid, "-iTCP", "-sTCP:LISTEN"],
+                                 capture_output=True, text=True, timeout=5)
+        except Exception as _exc:  # noqa: BLE001
+            _log_exc("_cloudflared_lsof", _exc, expected=True)
+            continue
+        for m in re.finditer(r":(\d+) \(LISTEN\)", out.stdout):
+            ports.append(int(m.group(1)))
+    return ports
+
+
+def _quick_tunnel_url():
+    """跑著的 cloudflared quick tunnel 的網址,直接問它本人。
+
+    為什麼要這層:macOS 桌面端(Pocket Connect)**預設就會開一條免費 quick
+    tunnel**(`TunnelManager`,見 main.swift 的「免費零設定」),但它只把網址留在
+    自己的 app 裡,從來沒告訴 bridge —— 所以 bridge 的候選清單只有 LAN+tailnet,
+    而**推播中繼還會把這份殘缺清單推給手機覆蓋掉舊的**。使用者一出門(LAN 不可達、
+    又沒裝 Tailscale)就整個連不上,畫面顯示「桌面沒有回應」。
+    寫檔那條路只有 `deploy/install-ubuntu.sh` 有做,macOS 沒有對應物。
+
+    cloudflared 的 metrics server 有專門端點 `/quicktunnel` 回 {"hostname": ...},
+    比解析 log 或 metrics 文字穩。查不到就回 None(沒有公網就是沒有,不猜)。
+    快取 60s —— ps+lsof 不算便宜,而 quick tunnel 網址只在重啟時才變。
+    """
+    now = time.monotonic()
+    if _QUICK_TUNNEL_CACHE["url"] and now - _QUICK_TUNNEL_CACHE["ts"] < 60:
+        return _QUICK_TUNNEL_CACHE["url"]
+    url = None
+    for mport in _cloudflared_metrics_ports():
+        try:
+            with urllib.request.urlopen(
+                    "http://127.0.0.1:%d/quicktunnel" % mport, timeout=2) as r:
+                host = (json.loads(r.read().decode("utf-8")) or {}).get("hostname")
+        except Exception as _exc:  # noqa: BLE001 — 通道沒起來/端點不存在都算查不到
+            _log_exc("_quick_tunnel_probe", _exc, expected=True)
+            continue
+        host = (host or "").strip().rstrip("/")
+        if host:
+            url = host if host.startswith("http") else "https://%s" % host
+            break
+    _QUICK_TUNNEL_CACHE.update({"ts": now, "url": url})
+    return url
+
+
 def _pair_tunnel_url():
-    """公網保底 URL。優先 env POCKET_TUNNEL_URL(named tunnel/funnel);否則讀
-    POCKET_TUNNEL_URL_FILE —— Ubuntu 安裝器的 cloudflared quick-tunnel unit 會把
-    當前 trycloudflare URL 寫進去(URL 會漂,檔案由 unit 維護)。"""
+    """公網保底 URL。**公網是預設,不是進階選項** —— 一般使用者不該為了出門能用
+    而去弄網域或裝 VPN,所以這裡最後一定會去問「現在有沒有跑著的 quick tunnel」。
+
+    優先序(愈上面愈穩定,愈不會漂):
+      1. env `POCKET_TUNNEL_URL` —— 自己的固定網域 / named tunnel(進階、付費)
+      2. `POCKET_TUNNEL_URL_FILE` —— Ubuntu 安裝器的 unit 維護的檔
+      3. **跑著的 cloudflared quick tunnel**(免費零設定,網址每次重啟會漂)
+    """
     env = (os.environ.get("POCKET_TUNNEL_URL") or "").strip()
     if env:
         return env
     try:
         with open(_POCKET_TUNNEL_URL_FILE, encoding="utf-8") as f:
             url = f.read().strip()
-        return url or None
+        if url:
+            return url
     except OSError:
-        return None
+        pass
+    return _quick_tunnel_url()
 
 
 def _pair_host_candidates(force: bool = False):
