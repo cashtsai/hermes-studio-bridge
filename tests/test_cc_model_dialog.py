@@ -136,5 +136,37 @@ class CCModelDialogTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(cm.exception.code, "CC_INPUT_NOT_ACCEPTED")
 
 
+REAL_DIALOG_PANE = """\
+  驗證：assembleDebug 綠、單測 45/45 綠。
+▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
+   Switch model?
+   Your next response will be slower and use more tokens
+
+   This conversation is cached for the current model. Switching to Sonnet 5
+   means the full history gets re-read on your next message.
+
+   ❯ 1. Yes, switch to Sonnet 5
+     2. No, go back
+"""
+
+
+class ModelSwitchKeyTest(unittest.TestCase):
+    """直接針對 2026-10-25 production 擷取的真實「Switch model?」畫面 ——
+    `_cc_prompt` 對它回 None(偵測不到),這支專用偵測器必須認得。"""
+
+    def test_detects_real_switch_model_dialog(self):
+        self.assertIsNone(bridge._cc_prompt(REAL_DIALOG_PANE),
+                          "前提:_cc_prompt 本來就看不到這個框(這正是 bug 根因)")
+        self.assertEqual(bridge._cc_model_switch_key(REAL_DIALOG_PANE), "1")
+
+    def test_quiet_idle_pane_is_none(self):
+        self.assertIsNone(bridge._cc_model_switch_key(
+            "❯ \n────\n   Claude | 5h 66%\n  auto mode on (shift+tab to cycle)"))
+
+    def test_generic_permission_prompt_is_not_a_model_switch(self):
+        self.assertIsNone(bridge._cc_model_switch_key(
+            "Do you want to proceed?\n ❯ 1. Yes\n   2. No"))
+
+
 if __name__ == "__main__":
     unittest.main()
