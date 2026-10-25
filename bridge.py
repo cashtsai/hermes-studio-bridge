@@ -15574,6 +15574,13 @@ async def _cc_verify_submitted(name: str, probes, gen0: int,
                     "attempts": attempts, "pane": pane}
 
 
+# expect_dialog 的輪詢:確認框在 Enter 之後慢一拍才出現,等它最多這麼久。
+# 3.5s 比 cc_session_model 自己的 3.0s 確認框輪詢略長,確保「貼字層先看到框」
+# 不會反而比呼叫端晚。
+_CC_EXPECT_DIALOG_POLL_SECS = 3.5
+_CC_EXPECT_DIALOG_POLL_INTERVAL = 0.3
+
+
 async def _cc_paste_text(name: str, text: str, expect_dialog: bool = False) -> dict:
     """tmux 貼字唯一原語(B1):bracketed paste,buffer 內容改走 load-buffer
     stdin——set-buffer 把整段文字放 argv,長貼文/特殊字元踩 exec 邊界就 502,
@@ -15707,12 +15714,21 @@ async def _cc_paste_text_locked(name: str, text: str, expect_dialog: bool = Fals
     # 了確認框 → 當成已收下並交棒給呼叫端去按。**刻意不送 C-u** —— 確認框開著時
     # C-u 會打進那個框。
     if expect_dialog and verdict["state"] != "accepted":
-        dlg_pane = await _cc_capture_pane_fresh(name)
-        if _cc_prompt(dlg_pane) is not None:
-            _log_event("cc_paste_dialog_accepted", session=name,
-                       verify_state=verdict["state"], attempts=verdict["attempts"])
-            return {"delivery": "accepted", "confirmed": True,
-                    "attempts": verdict["attempts"], "dialog": True}
+        # 確認框是在 Enter 之後**慢一拍**才畫出來的 —— 單看一張畫面會跟它的出現
+        # 賽跑而漏掉(2026-10-25 實測:第一次剛好抓到、第二次沒抓到,然後落進
+        # idle-recheck 分支誤判失敗)。所以在這裡輪詢一小段時間等它出現,而不是
+        # 只截一張。抓到就當已收下,交棒給呼叫端去按;**全程不送 C-u**。
+        _dlg_deadline = time.monotonic() + _CC_EXPECT_DIALOG_POLL_SECS
+        while True:
+            dlg_pane = await _cc_capture_pane_fresh(name)
+            if _cc_prompt(dlg_pane) is not None:
+                _log_event("cc_paste_dialog_accepted", session=name,
+                           verify_state=verdict["state"], attempts=verdict["attempts"])
+                return {"delivery": "accepted", "confirmed": True,
+                        "attempts": verdict["attempts"], "dialog": True}
+            if time.monotonic() >= _dlg_deadline:
+                break
+            await asyncio.sleep(_CC_EXPECT_DIALOG_POLL_INTERVAL)
     if verdict["state"] == "stranded":
         # 2026-07-14 草稿擱淺 / 2026-07-28 靜默掉訊息:重試耗盡文字還在框裡。
         # 舊行為回 200 = 沉默失敗;回 200 之外還有第二個坑 —— 殘字會變成跨
