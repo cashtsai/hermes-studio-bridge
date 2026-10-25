@@ -67,6 +67,9 @@ class CCModelDialogPatch:
         p("_tmux_run_stdin", side_effect=run_stdin)
         p("_cc_shell_mode", return_value=False)
         p("_cc_pane_busy", return_value=False)
+        # 把 expect_dialog 的輪詢窗縮小,讓「沒有確認框」那條測試不用真的等 3.5s。
+        p("_CC_EXPECT_DIALOG_POLL_SECS", new=0.4)
+        p("_CC_EXPECT_DIALOG_POLL_INTERVAL", new=0.1)
         p("_cc_prompt", side_effect=lambda pane: SWITCH_DIALOG if pane == DIALOG_PANE else None)
         # 真鎖會卡;換成無操作的 async context manager
         @asynccontextmanager
@@ -94,6 +97,34 @@ class CCModelDialogTest(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(bridge.BridgeError) as cm:
                 await bridge._cc_paste_text("probe", "/model sonnet")  # expect_dialog 預設 False
         self.assertEqual(cm.exception.code, "CC_INPUT_NOT_ACCEPTED")
+
+    async def test_dialog_that_appears_a_beat_late_is_still_caught(self):
+        # 真正的回歸測試:確認框在 Enter 之後慢一拍才畫出來。單截一張畫面會漏掉
+        # (2026-10-25 production 實測:第一次剛好抓到、第二次沒抓到就誤判失敗)。
+        # 輪詢版必須撐到它出現。這裡讓 verify 之後的前兩次抓畫面是空的,第三次才
+        # 冒出確認框。
+        import contextlib
+        h = CCModelDialogPatch(final_pane=DIALOG_PANE)
+        calls = {"n": 0}
+        orig_final = h.final_pane
+
+        def _late_cap_factory():
+            async def cap(name):
+                if not h._verify_done:
+                    return ""
+                calls["n"] += 1
+                return DIALOG_PANE if calls["n"] >= 3 else ""   # 第 3 次才出現
+            return cap
+
+        with contextlib.ExitStack() as stack:
+            h.install(stack)
+            # 覆蓋掉 install 裝的 cap,換成「慢一拍」版
+            stack.enter_context(patch.object(bridge, "_cc_capture_pane_fresh",
+                                             side_effect=_late_cap_factory()))
+            res = await bridge._cc_paste_text("probe", "/model sonnet", expect_dialog=True)
+        self.assertTrue(res.get("dialog"))
+        self.assertGreaterEqual(calls["n"], 3, "應該是輪詢到第 3 次才抓到,不是一次就中")
+        self.assertFalse(h.cu_sent)
 
     async def test_expect_dialog_without_a_dialog_still_raises(self):
         import contextlib
