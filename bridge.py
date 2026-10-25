@@ -148,6 +148,18 @@ _CX_INPUT_INFLIGHT_TTL = 600.0
 _CX_INPUT_INFLIGHT_WAIT = 30.0     # 前一次還沒完成時,重複請求最多等這麼久
 _CX_INPUT_INFLIGHT_LOCK = asyncio.Lock()
 
+# CC input dedup:(session, client_id) -> {ts, result, event}。
+# persona 有 _APP_TURN_INFLIGHT、CX 有 _CX_INPUT_INFLIGHT,**CC 一直沒有** ——
+# 它雖然收 client_id,卻只拿去餵 input.accepted 卡片,沒有任何去重閘門。
+# 2026-10-25 機主實機:同一則訊息送出兩次(畫面兩顆一樣的泡泡)。bridge 日誌
+# 實證同一則 POST /ccsessions/{name}/input 來自**兩個不同來源位址**
+# (tailnet 100.x 與 IPv6 公網各一次)—— 人在移動、手機換網的瞬間,新舊兩條
+# 連線各送了一次。CC 的送出是「貼進 live TUI 再按 Enter」,重送就是重複執行。
+_CC_INPUT_INFLIGHT: dict = {}
+_CC_INPUT_INFLIGHT_TTL = 600.0
+_CC_INPUT_INFLIGHT_WAIT = 30.0
+_CC_INPUT_INFLIGHT_LOCK = asyncio.Lock()
+
 # Bearer token gate. The bridge fronts a tool-executing agent, so it must not
 # be an open control surface even on the tailnet. Open WebUI sends this as its
 # OpenAI API key. Override via the BRIDGE_TOKEN env var.
@@ -11156,6 +11168,66 @@ async def diagnostics_ingest(request: Request):
     return {"ok": True, "stored": fname}
 
 
+async def _cc_input_claim(name: str, client_id):
+    """CC input 的 (session, client_id) 冪等閘門 —— 與 `_cx_input_claim` 同形。
+
+    回傳 `(entry, prior)`:
+      • `entry` 非 None → 第一次,呼叫端跑完後 `_cc_input_settle()`(成功)或
+        `_cc_input_release()`(失敗,讓重試能重新進來)
+      • `prior` 非 None → 重複請求,改呼叫 `_cc_input_replay(prior)`
+      • 兩者皆 None → 沒帶 client_id,無法去重(維持原行為,不擋)
+    """
+    if not client_id:
+        return None, None
+    key = (str(name), str(client_id))
+    async with _CC_INPUT_INFLIGHT_LOCK:
+        now = time.monotonic()
+        for k in [k for k, e in _CC_INPUT_INFLIGHT.items()
+                  if now - e["ts"] > _CC_INPUT_INFLIGHT_TTL]:
+            _CC_INPUT_INFLIGHT.pop(k, None)      # 順手清 TTL,不會洩漏
+        prior = _CC_INPUT_INFLIGHT.get(key)
+        if prior is not None:
+            return None, prior
+        entry = {"ts": now, "key": key, "result": None, "event": asyncio.Event()}
+        _CC_INPUT_INFLIGHT[key] = entry
+        return entry, None
+
+
+def _cc_input_settle(entry, result: dict) -> None:
+    """第一次跑完 → 記下結果,喚醒正在等的重複請求。"""
+    if entry is None:
+        return
+    entry["result"] = dict(result or {})
+    entry["ts"] = time.monotonic()
+    entry["event"].set()
+
+
+def _cc_input_release(entry) -> None:
+    """第一次就失敗 → 釋放 claim,否則重試會被自己擋整整一個 TTL。
+
+    CC 這邊尤其重要:`_cc_paste_text` 本來就會因為 TUI 狀態回 409
+    (CC_INPUT_NOT_ACCEPTED)要求 app 重送 —— 失敗不釋放的話,那個「請重送」
+    就變成永遠送不進去。
+    """
+    if entry is None:
+        return
+    _CC_INPUT_INFLIGHT.pop(entry["key"], None)
+    entry["event"].set()
+
+
+async def _cc_input_replay(prior) -> dict:
+    """重複請求:回第一次的結果,**不再貼一次字進 TUI**。第一次還沒跑完就等
+    一下(它可能正在 bracketed paste + 回讀驗證),等不到就回「收下了、排隊中」
+    —— 重點是不重複執行。"""
+    if not prior["event"].is_set():
+        try:
+            await asyncio.wait_for(asyncio.shield(prior["event"].wait()),
+                                   timeout=_CC_INPUT_INFLIGHT_WAIT)
+        except (asyncio.TimeoutError, TimeoutError):
+            pass
+    return dict(prior.get("result") or {"queued": True, "delivery": "queued"})
+
+
 async def _cx_input_claim(thread_id: str, client_id):
     """CX input 的 (thread_id, client_id) 冪等閘門。
 
@@ -15176,8 +15248,39 @@ async def cc_session_input(name: str, request: Request):
 
 
 async def _cc_input_core(name: str, body: dict) -> dict:
-    """cc 輸入核心 — /ccsessions/{name}/input 與 v2 統一路由 input 共用。
-    附件轉存＋語音轉寫＋tmux bracketed paste。"""
+    """cc 輸入的**冪等外殼** — v1 `/ccsessions/{name}/input` 與 v2 統一路由共用。
+
+    帶 client_id 的重複請求不再貼第二次字進 TUI,改回放第一次的結果。
+    沒帶 client_id 的呼叫端維持原行為(不擋)—— 去重要有鍵才做得到。
+
+    為什麼需要(2026-10-25 機主實機):同一則訊息送出兩次,畫面兩顆一樣的泡泡。
+    bridge 日誌實證同一則 POST 來自**兩個不同來源位址**(tailnet 與 IPv6 公網
+    各一次)—— 人在移動、手機換網的瞬間新舊兩條連線各送了一次。persona 與 CX
+    早就有這層閘門(`_APP_TURN_INFLIGHT` / `_CX_INPUT_INFLIGHT`),CC 一直沒有:
+    它收了 client_id 卻只拿去餵卡片。CC 的送出是「貼進 live TUI 再按 Enter」,
+    重送就是**重複執行一次指令**,比重複顯示嚴重得多。
+    """
+    client_id = str(body.get("client_id") or "").strip()
+    entry, prior = await _cc_input_claim(name, client_id)
+    if prior is not None:
+        _log_event("cc_input_deduped", session=name, client_id=client_id[:16])
+        return await _cc_input_replay(prior)
+    if entry is None:
+        return await _cc_input_core_locked(name, body)   # 沒帶鍵:原行為
+    try:
+        result = await _cc_input_core_locked(name, body)
+    except BaseException:
+        # 失敗一定要釋放 —— `_cc_paste_text` 本來就會用 409 要求 app 重送,
+        # 不放掉 claim 的話那個「請重送」會被自己擋整整一個 TTL。
+        _cc_input_release(entry)
+        raise
+    _cc_input_settle(entry, result)
+    return result
+
+
+async def _cc_input_core_locked(name: str, body: dict) -> dict:
+    """cc 輸入核心 — 附件轉存＋語音轉寫＋tmux bracketed paste。
+    冪等由外殼 `_cc_input_core` 負責,這裡只管真正把字送進去。"""
     _registry_call_safe("touch", f"claude_code:{name}")   # 戶政:活動記帳
     text = (body.get("text") or body.get("content") or "").strip()
     client_id = str(body.get("client_id") or "").strip()
