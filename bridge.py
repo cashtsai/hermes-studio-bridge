@@ -7759,17 +7759,38 @@ def _codex_thread_model(tid: str, fallback: dict | None = None):
     return m or None
 
 
+# 列表副標只能是「對話」—— 工具步驟、思考、審核、狀態、以及 bridge 自己推的
+# 系統說明卡都不是使用者心中的「最新訊息」。
+#
+# 2026-10-26 機主:「CX 列表怪怪的」。實查 ~/.pocket/cx-previews.json 28 條裡 3 條
+# 中毒:`› 🔧 imageGeneration`(工具卡)、`📭 這條 session 讀不到歷史訊息 …`
+# (bridge 自己的 _cx_feed_empty_history 系統卡,從 2026-10-08 釘到今天)、
+# `I attempted to execute: ```sh …`。原本的實作反向掃 order 取第一張「有文字」的卡,
+# **完全不看 role / kind**,所以 bridge 自己推進 digest 的卡會變成列表副標。
+_CX_PREVIEW_ROLES = ("user", "assistant")      # system 一律排除(bridge 自己推的)
+_CX_PREVIEW_KINDS = ("markdown", "text")       # 排除 tool_call/tool_result/status/
+                                               # approval/reasoning/plan/image
+
+
 def _cx_latest_card_text(thread_id: str) -> str:
-    """卡片流 digest 裡最新一張卡的文字(沒有 digest / 取不到就回空字串)。
+    """卡片流 digest 裡最新一張**對話**卡的文字(沒有 / 取不到就回空字串)。
     只讀已經在記憶體裡的東西,不打 API —— 這是列表路徑,N 條 thread 各打一次
-    thread/turns/list 是不能接受的成本。"""
+    thread/turns/list 是不能接受的成本。
+
+    找不到對話卡就回 "" → 呼叫端退回 codex 自己的 preview(開場白)。
+    寧可退回開場白,也不要把工具步驟或 bridge 的錯誤說明當成「最新訊息」。"""
     d = _CX_CARD_DIGESTS.get(thread_id)
     store = getattr(d, "store", None) if d is not None else None
     if store is None:
         return ""
     try:
         for cid in reversed(getattr(store, "order", []) or []):
-            body = (store.cards.get(cid) or {}).get("body") or {}
+            card = store.cards.get(cid) or {}
+            if card.get("role") not in _CX_PREVIEW_ROLES:
+                continue
+            if card.get("kind") not in _CX_PREVIEW_KINDS:
+                continue
+            body = card.get("body") or {}
             text = (body.get("fallback_text") or body.get("text") or "").strip()
             if text:
                 return " ".join(text.split())
@@ -7787,6 +7808,12 @@ def _cx_latest_card_text(thread_id: str) -> str:
 CX_PREVIEW_CACHE_PATH = os.path.expanduser(os.environ.get(
     "POCKET_CX_PREVIEW_CACHE", "~/.pocket/cx-previews.json"))
 CX_PREVIEW_CACHE_MAX = 200          # LRU 上限(條)
+# 快取只存「文字」,沒存 role/kind —— 所以 2026-10-26 之前寫進去的條目**無法事後
+# 重新分類**(裡面混著工具卡與 bridge 系統卡的文字,見 _cx_latest_card_text 註解)。
+# 用 schema 版號一次作廢:版本不符就整份丟掉,之後各 thread 自然重寫。
+# 這是兜底快取,丟了只是退回開場白,不會壞事。
+CX_PREVIEW_SCHEMA = 2
+CX_PREVIEW_SCHEMA_KEY = "__schema"
 CX_PREVIEW_WRITE_MIN_SECS = 30.0    # 每 thread 寫盤節流(熱串流別狂寫盤)
 CX_PREVIEW_TEXT_CHARS = 120
 
@@ -7805,8 +7832,10 @@ def _cx_preview_cache_load() -> dict:
     try:
         with open(CX_PREVIEW_CACHE_PATH, encoding="utf-8") as f:
             raw = json.load(f)
-        if isinstance(raw, dict):
+        if isinstance(raw, dict) and raw.get(CX_PREVIEW_SCHEMA_KEY) == CX_PREVIEW_SCHEMA:
             for tid, ent in raw.items():
+                if tid == CX_PREVIEW_SCHEMA_KEY:
+                    continue
                 if not (isinstance(tid, str) and isinstance(ent, dict)):
                     continue
                 text = str(ent.get("text") or "").strip()
@@ -7855,8 +7884,11 @@ def _cx_preview_cache_note(thread_id: str) -> None:
         try:
             os.makedirs(os.path.dirname(CX_PREVIEW_CACHE_PATH), exist_ok=True)
             tmp = CX_PREVIEW_CACHE_PATH + ".tmp"
+            # schema 版號跟著寫出去(載入端據此作廢舊格式)。放在 payload 而不是
+            # cache dict 裡,免得它佔掉一格 LRU、或被當成一條 thread。
+            payload = {CX_PREVIEW_SCHEMA_KEY: CX_PREVIEW_SCHEMA, **cache}
             with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(cache, f, ensure_ascii=False)
+                json.dump(payload, f, ensure_ascii=False)
             os.replace(tmp, CX_PREVIEW_CACHE_PATH)
         except Exception as _exc:  # noqa: BLE001 —— 寫不進盤只損失兜底,不能炸餵卡
             _log_exc("_cx_preview_cache_note", _exc, expected=True)
