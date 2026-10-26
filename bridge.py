@@ -102,6 +102,19 @@ _MEDIA_ARTIFACT_ROOT = os.path.expanduser(
 # One SSE keepalive cadence for every streaming endpoint (issue #8: it was
 # 2s / 4s / 10s across chat, ccsessions and codexsessions for no reason).
 SSE_KEEPALIVE_SECS = 2.0
+# 每一條 SSE 回應都要帶的反緩衝標頭。**一條都不能漏** —— 這就是這組常數存在
+# 的理由(2026-10-26):卡片流 `/app/v2/sessions/{id}/events` 是當時唯一漏掉的
+# 那條,而它偏偏是手機實際走 Cloudflare quick tunnel 的那條。實測(同一條 session、
+# 同一時刻):
+#     直連 127.0.0.1:8081      → keepalive 精準每 2 秒一行,30 秒不斷
+#     quick tunnel(手機走的)   → HTTP/2 200,**30 秒 0 byte**
+# 中介層把整條流緩衝住了。結果是 app 端 30 秒 timeout 必然觸發 →
+# 串流每 ~36 秒死一次 → 熱重連踏步機(build 186 實測:逾時 178 次、
+# 串流關 348 次其中 319 次短命、降級 1054 秒)。
+# 有內容的 session 還勉強能用(資料量把緩衝撐滿就吐出來),閒置的必死 ——
+# 這也是為什麼它看起來像「時好時壞的網路問題」而不是 bug。
+SSE_HEADERS = {"Cache-Control": "no-cache, no-transform",
+               "X-Accel-Buffering": "no"}
 # A persona provider may stay connected but emit no ACP events. The timeout is
 # deliberately configurable so the cleanup path can be exercised quickly in
 # regression tests while production keeps the five-minute ceiling.
@@ -4815,7 +4828,8 @@ async def chat_completions(request: Request):
             yield "data: [DONE]\n\n"
 
         if stream:
-            return StreamingResponse(sgen(), media_type="text/event-stream")
+            return StreamingResponse(sgen(), media_type="text/event-stream",
+                                     headers=SSE_HEADERS)
         text = "".join(v for k, v in sub["output"] if k == "text")
         return JSONResponse({"id": cid, "object": "chat.completion", "created": created,
                              "model": model,
@@ -4858,7 +4872,8 @@ async def chat_completions(request: Request):
                                     "context_size": last_usage.get("size")}
             yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
             yield "data: [DONE]\n\n"
-        return StreamingResponse(gen(), media_type="text/event-stream")
+        return StreamingResponse(gen(), media_type="text/event-stream",
+                                 headers=SSE_HEADERS)
 
     try:
         content = "(沒有收到訊息)" if not prompt else await acp_full(model, prompt)
@@ -11821,7 +11836,8 @@ async def codex_session_stream(thread_id: str, request: Request, replay: int = 2
         yield chunk({}, finish="stop")
         yield "data: [DONE]\n\n"
 
-    return StreamingResponse(gen(), media_type="text/event-stream")
+    return StreamingResponse(gen(), media_type="text/event-stream",
+                             headers=SSE_HEADERS)
 
 
 # ═══════════════ cc/cx spawn config「全集控制面」(設計 §2.1/§2.2)═══════════
@@ -15152,7 +15168,8 @@ async def cc_session_stream(name: str, request: Request, replay: int = 80):
                 idle = 0
                 yield ": keepalive\n\n"
 
-    return StreamingResponse(gen(), media_type="text/event-stream")
+    return StreamingResponse(gen(), media_type="text/event-stream",
+                             headers=SSE_HEADERS)
 
 
 def _cc_format_lines(lines):
@@ -21494,8 +21511,7 @@ async def _openclaw_v1_post_message(body: dict, request: Request):
     return StreamingResponse(
         agen(),
         media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache, no-transform",
-                 "X-Accel-Buffering": "no"},
+        headers=SSE_HEADERS,
     )
 
 # ─────────── Phase 0 S5:Gemini(ACP)provider ──────────────────────────────
@@ -21743,8 +21759,7 @@ async def _gemini_v1_post_message(body: dict, request: Request):
 
     return StreamingResponse(
         agen(), media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache, no-transform",
-                 "X-Accel-Buffering": "no"})
+        headers=SSE_HEADERS)
 
 
 def _tg_any_target() -> bool:
@@ -22220,7 +22235,8 @@ async def v2_session_events(session_id: str, request: Request, since_seq: int = 
             store.detach_waker(waker)
             store.subscribers -= 1
 
-    return StreamingResponse(gen(), media_type="text/event-stream")
+    return StreamingResponse(gen(), media_type="text/event-stream",
+                             headers=SSE_HEADERS)
 
 
 # ───────────────────────── scheduled reports + notification toggles ─────────
@@ -24642,8 +24658,8 @@ async def app_get_message_events(session: str, request: Request,
             raise http_err(400, "SESSION_NOT_FOUND", "unknown session")
         if not OPENCLAW.configured():
             raise http_err(404, "SESSION_NOT_FOUND", "openclaw not configured")
-        return StreamingResponse(_oc_events_gen(session, oc_key, since, follow),
-                                 media_type="text/event-stream")
+        return StreamingResponse(_oc_events_gen(session, oc_key, since, follow), media_type="text/event-stream",
+                                 headers=SSE_HEADERS)
 
     async def gen():
         cursor = int(since or 0)
@@ -24689,7 +24705,8 @@ async def app_get_message_events(session: str, request: Request,
             except asyncio.TimeoutError:
                 pass
 
-    return StreamingResponse(gen(), media_type="text/event-stream")
+    return StreamingResponse(gen(), media_type="text/event-stream",
+                             headers=SSE_HEADERS)
 
 
 # ─────────────────── 任務看板聚合器(spec §6-1,Pocket 儀表板)──────────────
@@ -25294,7 +25311,8 @@ async def app_v2_events(request: Request, session: str | None = None,
                 pass
 
     return StreamingResponse(gen() if session is not None else gen_all(),
-                             media_type="text/event-stream")
+                             media_type="text/event-stream",
+                             headers=SSE_HEADERS)
 
 
 def _read_cursor_rows(session: str) -> list[dict]:
@@ -26117,10 +26135,7 @@ async def app_post_message(request: Request):
         return StreamingResponse(
             events,
             media_type="text/event-stream",
-            headers={
-                "Cache-Control": "no-cache, no-transform",
-                "X-Accel-Buffering": "no",
-            },
+            headers=SSE_HEADERS,
         )
 
     # Retry idempotency: if this exact logical send already produced a recorded
