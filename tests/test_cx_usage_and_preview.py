@@ -12,6 +12,7 @@
 import _isolation  # noqa: F401  # 測試隔離閂:必須是第一個 import(2026-08-15 事故防線,見 tests/_isolation.py)
 import json
 import os
+import shutil
 import tempfile
 import unittest
 from unittest import mock
@@ -96,9 +97,16 @@ class UsageShapeTests(unittest.TestCase):
 
 
 class _FakeStore:
+    """真實卡片一定帶 role/kind(carddigest.make_card 的必填參數),
+    fixture 沒給就補成最常見的對話卡 —— 否則測的是一種不存在的卡。
+    要測「非對話卡」的案例就明確傳入 role/kind(見 PreviewKindFilterTests)。"""
+
     def __init__(self, cards):
-        self.cards = {c["id"]: c for c in cards}
-        self.order = [c["id"] for c in cards]
+        norm = [{**c,
+                 "role": c.get("role", "assistant"),
+                 "kind": c.get("kind", "text")} for c in cards]
+        self.cards = {c["id"]: c for c in norm}
+        self.order = [c["id"] for c in norm]
 
 
 class _FakeDigest:
@@ -234,7 +242,10 @@ class PreviewCacheTests(unittest.TestCase):
                 with self._digest(f"t-{i}", f"內容 {i}"):
                     bridge._cx_preview_cache_note(f"t-{i}")
         raw = self._raw()
-        self.assertEqual(set(raw), {"t-2", "t-3", "t-4"},
+        # schema 版號也住在同一份 JSON 裡(見 CX_PREVIEW_SCHEMA_KEY),
+        # 它不是一條 thread,也不佔 LRU 名額 —— 比的是剩下哪幾條 thread。
+        self.assertEqual(set(raw) - {bridge.CX_PREVIEW_SCHEMA_KEY},
+                         {"t-2", "t-3", "t-4"},
                          "超過上限要淘汰最舊的,不是最新的")
 
     def test_unchanged_text_skips_disk_write(self):
@@ -245,6 +256,116 @@ class PreviewCacheTests(unittest.TestCase):
             before = os.stat(self.path).st_mtime_ns
             bridge._cx_preview_cache_note("t-f")
         self.assertEqual(os.stat(self.path).st_mtime_ns, before)
+
+
+class PreviewKindFilterTests(unittest.TestCase):
+    """列表副標只能是「對話」—— 工具步驟/思考/審核/狀態、以及 bridge 自己推的
+    系統卡都不算最新訊息。
+
+    2026-10-26 機主:「CX 列表怪怪的」。實查 ~/.pocket/cx-previews.json 28 條中
+    3 條中毒:`› 🔧 imageGeneration`、`📭 這條 session 讀不到歷史訊息 …`
+    (bridge 自己的 _cx_feed_empty_history 卡,從 10-08 釘到當天)、
+    `I attempted to execute: ```sh …`。
+    """
+
+    def _digest(self, cards):
+        return mock.patch.dict(bridge._CX_CARD_DIGESTS,
+                               {"t1": _FakeDigest(_FakeStore(cards))},
+                               clear=False)
+
+    def test_tool_card_is_not_the_preview(self):
+        """最新一張是工具卡 → 要往回找到上一句真的對話。"""
+        with self._digest([
+            {"id": "c1", "role": "assistant", "kind": "markdown",
+             "body": {"fallback_text": "我來跑這個指令"}},
+            {"id": "c2", "role": "assistant", "kind": "tool_call",
+             "body": {"fallback_text": "› 🔧 imageGeneration"}},
+        ]):
+            self.assertEqual(bridge._cx_latest_card_text("t1"), "我來跑這個指令")
+
+    def test_bridge_system_card_is_not_the_preview(self):
+        """bridge 自己推的說明卡(role=system)不准變成副標 —— 實錄那條
+        「📭 讀不到歷史訊息」在列表上釘了 18 天。"""
+        with self._digest([
+            {"id": "c1", "role": "user", "kind": "text",
+             "body": {"fallback_text": "幫我看一下"}},
+            {"id": "c2", "role": "system", "kind": "text",
+             "body": {"fallback_text": "📭 這條 session 讀不到歷史訊息 ——"}},
+        ]):
+            self.assertEqual(bridge._cx_latest_card_text("t1"), "幫我看一下")
+
+    def test_all_non_conversational_kinds_are_skipped(self):
+        for kind in ("tool_call", "tool_result", "status", "approval",
+                     "reasoning", "plan"):
+            with self.subTest(kind=kind):
+                with self._digest([
+                    {"id": "c1", "role": "assistant", "kind": "text",
+                     "body": {"fallback_text": "真正的回覆"}},
+                    {"id": "c2", "role": "assistant", "kind": kind,
+                     "body": {"fallback_text": f"不該出現的 {kind}"}},
+                ]):
+                    self.assertEqual(bridge._cx_latest_card_text("t1"),
+                                     "真正的回覆")
+
+    def test_user_and_assistant_text_both_count(self):
+        """自己送的話也是對話,照樣可以當副標(app 端另外加「你:」前綴)。"""
+        for role in ("user", "assistant"):
+            with self.subTest(role=role):
+                with self._digest([
+                    {"id": "c1", "role": role, "kind": "text",
+                     "body": {"fallback_text": "這句算數"}},
+                ]):
+                    self.assertEqual(bridge._cx_latest_card_text("t1"), "這句算數")
+
+    def test_only_tool_cards_means_no_preview(self):
+        """整條 digest 都沒有對話卡 → 回空,讓呼叫端退回開場白。
+        寧可退回開場白,也不要拿工具步驟充數。"""
+        with self._digest([
+            {"id": "c1", "role": "assistant", "kind": "tool_call",
+             "body": {"fallback_text": "› 🔧 shell"}},
+        ]):
+            self.assertEqual(bridge._cx_latest_card_text("t1"), "")
+
+
+class PreviewCacheSchemaTests(unittest.TestCase):
+    """舊格式快取要被作廢 —— 它只存文字,無法事後重新分類。"""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.path = os.path.join(self.dir, "cx-previews.json")
+        self._patches = [
+            mock.patch.object(bridge, "CX_PREVIEW_CACHE_PATH", self.path),
+            mock.patch.object(bridge, "_CX_PREVIEW_CACHE", None),
+        ]
+        for p in self._patches:
+            p.start()
+        bridge._CX_PREVIEW_LAST_WRITE.clear()
+
+    def tearDown(self):
+        for p in self._patches:
+            p.stop()
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def test_pre_schema_cache_is_discarded(self):
+        """2026-10-26 之前寫的檔沒有版號 → 整份丟掉(裡面可能混著工具卡文字)。"""
+        with open(self.path, "w", encoding="utf-8") as f:
+            json.dump({"t-old": {"text": "› 🔧 imageGeneration", "ts": 1.0}}, f)
+        bridge._CX_PREVIEW_CACHE = None
+        self.assertEqual(bridge._cx_preview_cache_get("t-old"), "")
+
+    def test_current_schema_cache_is_kept(self):
+        with open(self.path, "w", encoding="utf-8") as f:
+            json.dump({bridge.CX_PREVIEW_SCHEMA_KEY: bridge.CX_PREVIEW_SCHEMA,
+                       "t-new": {"text": "真的訊息", "ts": 1.0}}, f)
+        bridge._CX_PREVIEW_CACHE = None
+        self.assertEqual(bridge._cx_preview_cache_get("t-new"), "真的訊息")
+
+    def test_schema_key_is_not_served_as_a_thread(self):
+        with open(self.path, "w", encoding="utf-8") as f:
+            json.dump({bridge.CX_PREVIEW_SCHEMA_KEY: bridge.CX_PREVIEW_SCHEMA,
+                       "t-new": {"text": "真的訊息", "ts": 1.0}}, f)
+        bridge._CX_PREVIEW_CACHE = None
+        self.assertEqual(bridge._cx_preview_cache_get(bridge.CX_PREVIEW_SCHEMA_KEY), "")
 
 
 if __name__ == "__main__":
