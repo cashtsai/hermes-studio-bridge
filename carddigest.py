@@ -616,10 +616,11 @@ def _cx_item_ts(turn: dict, item: dict, index: int = 0, total: int = 0):
 
 def codex_item_to_cards(item: dict, turn_id: str = "",
                         phase: str = "completed",
-                        ts: float | None = None) -> list[dict]:
+                        ts: float | None = None,
+                        index: int | None = None) -> list[dict]:
     """回放/串流 codex item → 卡片。ts 有值(回放歷史,由 _cx_item_ts 撈到)就
     覆蓋每張卡時間戳,避免歷史全被蓋成現在;None(即時串流)維持 now(正確)。"""
-    cards = _codex_item_to_cards_raw(item, turn_id, phase)
+    cards = _codex_item_to_cards_raw(item, turn_id, phase, index=index)
     if ts:
         for c in cards:
             c["ts"] = ts
@@ -628,7 +629,8 @@ def codex_item_to_cards(item: dict, turn_id: str = "",
 
 
 def _codex_item_to_cards_raw(item: dict, turn_id: str = "",
-                             phase: str = "completed") -> list[dict]:
+                             phase: str = "completed",
+                             index: int | None = None) -> list[dict]:
     """一個 codex app-server item → 0..n 張卡。
 
     item id 是 app-server 的穩定識別 → 卡 id 由它衍生；同一 item 的
@@ -638,7 +640,11 @@ def _codex_item_to_cards_raw(item: dict, turn_id: str = "",
     """
     if not isinstance(item, dict):
         return []
-    iid = item.get("id")
+    # 無 id 的 item(compacted/replayed rollout 常見)原本直接丟掉 → 整條 thread
+    # 逐字稿有內容、v2 卡片庫卻 0 張(機主 2026-10-26 Cashcamp 顯示不出回覆)。給一個
+    # **確定性**後備 id(turn_id + 位置),同一份 turns/list 每次 reseed 都一樣,不會
+    # 產生重複卡。只在 seed/回放(有帶 index)補;即時串流不帶 index → 維持原行為。
+    iid = item.get("id") or (f"{turn_id}-t{index}" if turn_id and index is not None else None)
     if not iid:
         return []
     t = item.get("type")
@@ -1006,7 +1012,7 @@ class CodexThreadDigest(ApprovalCardMixin):
                 # index/total 讓同 turn 的多則訊息在 [started, completed] 內攤開,
                 # 而不是整串同一個時間(codex 的 item 本身沒有時間欄位)。
                 ts = _cx_item_ts(turn, item, index=idx, total=len(items))
-                for card in codex_item_to_cards(item, turn_id=tid, ts=ts):
+                for card in codex_item_to_cards(item, turn_id=tid, ts=ts, index=idx):
                     card = merge_input_accepted_echo(self.store, card)
                     card = dedupe_transcript_message(self.store, card)
                     if not emit_unchanged and self._same_card(
@@ -1290,7 +1296,8 @@ class SessionCardStore(ApprovalCardMixin):
         if before_seq is not None:
             ids = [i for i in ids if self.card_seq.get(i, 0) < before_seq]
         ids = ids[-max(1, limit):]
-        return {"cards": [self.cards[i] for i in ids if i in self.cards],
+        return {"cards": [{**self.cards[i], "seq": self.card_seq.get(i)}
+                          for i in ids if i in self.cards],
                 "latest_seq": self.seq,
                 "status": dict(self.status or {})}
 
