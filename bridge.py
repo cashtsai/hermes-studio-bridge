@@ -9477,6 +9477,32 @@ async def pair_revoke(request: Request):
 # host 候選探測全走純 Python/跨平台指令,mac/ubuntu 同一份。
 
 _PAIR_HOSTS_CACHE = {"ts": 0.0, "hosts": [], "tailscale": False}
+
+# ── 公網候選的「串流可用性」判定 ──────────────────────────────────────────
+# 2026-10-26 事故:機主的手機被廣告到一條 cloudflared **quick tunnel**
+# (`*.trycloudflare.com`)上。`/health` 回 200、一般 JSON 請求 8KB/0.4s 完全正常,
+# **但 SSE 一個 byte 都送不出去**(實測 70 秒 0 byte,連回放都沒有;同一時刻
+# 直連/tailnet/具名 tunnel 三條都是精準每 2 秒一個 keepalive)。
+# 後果:app 開串流 → 30 秒自己 timeout → 3 秒後重連 → 無限踏步機
+# (build 186 實測:逾時 178 次、串流關 348 次其中短命 319 次、降級 1054 秒)。
+# 內容還看得到是因為 app 退回每 10 秒輪詢 —— 所以它**看起來像網路不穩,
+# 不像壞掉**,一整天沒人發現。
+#
+# 教訓:**探活不等於探串流。** 這個產品的核心是即時串流,所以候選的門檻
+# 必須是「SSE 真的通」,不能只是「HTTP 回 200」。
+#
+# ⚠️ 刻意不在請求路徑上探測:一條要等數秒 × N 條,會把 /pair/qr.json 拖垮。
+# 由背景的 `_hosts_watch_loop` 定期更新判定,候選組裝只讀快取(讀不到就
+# 視為未知 → 不據此降級,寧可照舊也不要因為探測失敗而把能用的候選弄掉)。
+_SSE_VERDICTS: dict = {}       # url -> {"ts","reachable","sse"};sse=None 代表未知
+_SSE_PROBE_TTL = float(os.environ.get("POCKET_SSE_PROBE_TTL", "900"))   # 15 分
+_SSE_PROBE_WAIT = float(os.environ.get("POCKET_SSE_PROBE_WAIT", "7"))   # keepalive 2s
+# 零回放探針:event_log 是持久表(沒有卡片 ring 的 410 SEQ_GONE),給一個極大的
+# since_seq 就只會收到 keepalive,不會把整段歷史灌過隧道。
+_SSE_PROBE_PATH = "/app/v2/events?since_seq=999999999999&follow=true"
+# Cloudflare 對 `Python-urllib/3.x` 的 UA 回 403,所以探針必須自報身分。
+_PROBE_UA = "PocketBridge-SSEProbe/1.0"
+
 _BRIDGE_PORT = int(os.environ.get("POCKET_BRIDGE_PORT", "8081"))
 _POCKET_TUNNEL_URL_FILE = os.path.expanduser(
     os.environ.get("POCKET_TUNNEL_URL_FILE", "~/.pocket/tunnel-url"))
@@ -9782,22 +9808,149 @@ def _pair_tunnel_url():
       2. `POCKET_TUNNEL_URL_FILE` —— Ubuntu 安裝器的 unit 維護的檔
       3. **跑著的 cloudflared quick tunnel**(免費零設定,網址每次重啟會漂)
     """
-    env = (os.environ.get("POCKET_TUNNEL_URL") or "").strip()
-    if env:
-        return env
+    urls = _pair_tunnel_urls()
+    return urls[0] if urls else None
+
+
+def _pair_tunnel_urls() -> list:
+    """**全部**可用的公網候選,依設定意圖排序(不含串流實測)。
+
+    2026-10-26 改成回傳清單而不是單一值:原本「有固定網域就只回它」,
+    那個網域一掛(實測 `gateway.shan.house` 當天回 502)就沒有任何退路 ——
+    而 quick tunnel 明明跑著。**單一回傳值本身就是掉線風險。**
+    串流可用性由 `_sort_public_by_sse` 另外加權,兩件事刻意分開:
+    這裡表達「使用者想用哪個」,那裡表達「哪個真的能用」。
+    """
+    out = []
+    for raw in (os.environ.get("POCKET_TUNNEL_URL") or "",
+                _tunnel_url_from_file(),
+                _quick_tunnel_url() or ""):
+        u = (raw or "").strip().rstrip("/")
+        if u and u not in out:
+            out.append(u)
+    return out
+
+
+def _tunnel_url_from_file() -> str:
+    """Ubuntu 安裝器的 unit 維護的那個檔(缺檔是正常狀態)。"""
     try:
         with open(_POCKET_TUNNEL_URL_FILE, encoding="utf-8") as f:
-            url = f.read().strip()
-        if url:
-            return url
+            return f.read().strip()
     except OSError:
-        pass
-    return _quick_tunnel_url()
+        return ""
+
+
+def _probe_candidate_sse(url: str, wait: float | None = None) -> dict:
+    """實際對一個候選開 SSE,看 `wait` 秒內收不收到 byte。
+
+    回 `{"reachable","sse","ts"}`。`sse=None` = 測不出來(連不上/非 200),
+    這種情況**不當成「串流壞掉」** —— 區分「這條路現在不通」與「這條路通但
+    不送串流」很重要,後者才是要降級的那種(前者通常只是暫時的)。
+    """
+    wait = _SSE_PROBE_WAIT if wait is None else wait
+    out = {"ts": time.monotonic(), "reachable": False, "sse": None}
+    req = urllib.request.Request(
+        url.rstrip("/") + _SSE_PROBE_PATH,
+        headers={"Authorization": "Bearer %s" % BRIDGE_TOKEN,
+                 "Accept": "text/event-stream",
+                 # ⚠️ 一定要帶 User-Agent:Cloudflare 會對 `Python-urllib/3.x`
+                 # 直接回 **403**(機器人防護)。沒帶的話具名 tunnel 會被誤判成
+                 # 「不可達」,而真正壞掉的 quick tunnel 反而看起來比較好。
+                 "User-Agent": _PROBE_UA})
+    try:
+        with urllib.request.urlopen(req, timeout=wait) as r:
+            if r.status != 200:
+                return out
+            out["reachable"] = True
+            # 讀到**任何**一個 byte 就算通:keepalive 每 2 秒一次,所以 wait 秒內
+            # 沒有任何 byte = 中介層把流吞了(或根本沒在送)。
+            chunk = r.read(1)
+            out["sse"] = bool(chunk)
+    except TimeoutError:
+        # 連得上、但 `wait` 秒內一個 byte 都沒有 —— 這正是 quick tunnel 的病徵。
+        # urlopen 的 timeout 同時涵蓋連線與讀取,所以要靠 reachable 區分:
+        # 若先前的 /health 探活過得了,就是「通但不送串流」。
+        out["sse"] = False if _candidate_http_ok(url) else None
+        out["reachable"] = bool(out["sse"] is False)
+    except Exception as _exc:  # noqa: BLE001 — 探測失敗只代表未知,不能炸候選組裝
+        _log_exc("probe_candidate_sse", _exc, expected=True)
+    return out
+
+
+def _candidate_http_ok(url: str, timeout: float = 5.0) -> bool:
+    """這條候選的一般(非串流)請求通不通 —— 用來區分「不通」與「通但不送串流」。"""
+    try:
+        req = urllib.request.Request(
+            url.rstrip("/") + "/health",
+            headers={"Authorization": "Bearer %s" % BRIDGE_TOKEN,
+                     "User-Agent": _PROBE_UA})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.status == 200
+    except Exception as _exc:  # noqa: BLE001 — 不細分原因,但一定要留痕
+        _log_exc("candidate_http_ok", _exc, expected=True)
+        return False
+
+
+def refresh_sse_verdicts(urls: list) -> dict:
+    """背景更新串流判定(由 `_hosts_watch_loop` 呼叫)。只測公網候選。
+
+    回傳這一輪實際量到的結果(給測試與日誌用)。判定變化會記 `sse_verdict`
+    事件 —— **這次事故一整天沒人發現,就是因為沒有任何地方會出聲。**
+    """
+    fresh = {}
+    now = time.monotonic()
+    for u in urls:
+        prev = _SSE_VERDICTS.get(u)
+        if prev and now - prev["ts"] < _SSE_PROBE_TTL:
+            fresh[u] = prev
+            continue
+        v = _probe_candidate_sse(u)
+        fresh[u] = v
+        _SSE_VERDICTS[u] = v
+        if not prev or prev.get("sse") != v.get("sse"):
+            _log_event("sse_verdict", host=_redact_host(u),
+                       reachable=v["reachable"], sse=v["sse"])
+        if v["sse"] is False:
+            _log_event("sse_candidate_degraded", host=_redact_host(u),
+                       detail="HTTP 通但 SSE 收不到 byte —— 這條會讓 app 反覆重連")
+    return fresh
+
+
+def _redact_host(url: str) -> str:
+    """日誌用:保留足以辨認通道**種類**的資訊,不洩漏完整私有網址。"""
+    try:
+        h = urllib.parse.urlparse(url).hostname or url
+    except ValueError:
+        return "<unparsable>"
+    parts = h.split(".")
+    if parts[-2:] == ["trycloudflare", "com"]:
+        return "<quick-tunnel>." + ".".join(parts[-2:])
+    # 刻意不寫死 tailnet 的網域字面值 —— 公開 repo 的私有識別守門
+    # (test_no_private_infra_leak)認的就是 `*.<tailnet>.<tld>` 這個形狀。
+    if parts[-2:] == ["ts", "net"]:
+        return "<tailnet>." + ".".join(parts[-2:])
+    if h.replace(".", "").isdigit():
+        return "<lan-ip>"
+    return h
+
+
+def _sort_public_by_sse(urls: list) -> list:
+    """公網候選排序:**SSE 實測可用的排前面**,未知其次,實測不送串流的墊底。
+
+    不直接丟掉「不送串流」的那條 —— 對零設定的使用者來說,它可能是唯一的
+    公網出口,退回輪詢也比完全連不上好。但它絕不該排在能串流的前面。
+    """
+    def rank(u: str) -> int:
+        v = (_SSE_VERDICTS.get(u) or {}).get("sse")
+        return 0 if v is True else (1 if v is None else 2)
+    return sorted(urls, key=rank)
 
 
 def _pair_host_candidates(force: bool = False):
     """依優先序的連線候選(同 pocket-pair.py 的 QR payload v2 語意):
-    1) 私網直連 2) tailnet 3) 公網 tunnel。快取 30s,tailscale 探測不便宜。"""
+    1) 私網直連 2) tailnet 3) 公網 tunnel。快取 30s,tailscale 探測不便宜。
+
+    公網那一段內部再依**實測串流可用性**排序(見 `_sort_public_by_sse`)。"""
     now = time.monotonic()
     if not force and _PAIR_HOSTS_CACHE["hosts"] and now - _PAIR_HOSTS_CACHE["ts"] < 30:
         return list(_PAIR_HOSTS_CACHE["hosts"]), _PAIR_HOSTS_CACHE["tailscale"]
@@ -9808,9 +9961,9 @@ def _pair_host_candidates(force: bool = False):
     ts = _pair_tailscale_host()
     if ts:
         hosts.append("https://%s" % ts)
-    tunnel = _pair_tunnel_url()
-    if tunnel:
-        hosts.append(tunnel)
+    # 公網可能有多條(固定網域 / 安裝器檔 / 跑著的 quick tunnel)。
+    # 排序吃背景探測的結果:實測能串流的在前,墊底的是「HTTP 通但 SSE 不通」。
+    hosts.extend(_sort_public_by_sse(_pair_tunnel_urls()))
     _PAIR_HOSTS_CACHE.update({"ts": now, "hosts": list(hosts), "tailscale": bool(ts)})
     return hosts, bool(ts)
 
@@ -9866,6 +10019,13 @@ async def _hosts_watch_loop() -> None:
     while True:
         await asyncio.sleep(_HOSTS_WATCH_SEC)
         try:
+            # 先更新「這條公網候選到底送不送 SSE」的判定,再組候選 ——
+            # 探測會擋住 event loop 數秒,所以丟到執行緒去(這迴圈每 5 分鐘才跑
+            # 一次,而且判定自己有 15 分鐘 TTL,成本可忽略)。
+            try:
+                await asyncio.to_thread(refresh_sse_verdicts, _pair_tunnel_urls())
+            except Exception as _exc:  # noqa: BLE001 — 探測失敗不能擋住推播本身
+                _log_exc("hosts_watch_sse_probe", _exc, expected=True)
             hosts, _ = _pair_host_candidates(force=True)
             if not hosts:
                 continue                      # headless/無網 → 不要把基準清掉

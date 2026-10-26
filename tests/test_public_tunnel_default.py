@@ -89,10 +89,24 @@ class TunnelUrlPriority(unittest.TestCase):
         bridge._QUICK_TUNNEL_CACHE.update({"ts": 0.0, "url": None})
 
     def test_env_custom_domain_wins(self):
+        """自訂網域**排第一**(本類的本意)。
+
+        2026-10-26 更新:原本這裡還斷言「有自訂網域就不去找 quick tunnel」
+        (`q.assert_not_called()`)。那個短路已**刻意移除** —— 當天實測
+        `gateway.shan.house` 回 502,而 quick tunnel 明明跑著,舊行為下候選
+        清單卻只剩那條掛掉的網域,**等於「設了固定網域反而更容易掉線」**。
+        現在 quick tunnel 照樣收進候選,只是永遠排在自訂網域後面。
+        優先序這個本意沒變,而且下面多釘一條「退路必須存在」。
+        """
         with patch.dict(os.environ, {"POCKET_TUNNEL_URL": "https://pocket.example.com"}):
-            with patch.object(bridge, "_quick_tunnel_url") as q:
+            with patch.object(bridge, "_quick_tunnel_url",
+                              return_value="https://fallback.trycloudflare.com"):
                 self.assertEqual(bridge._pair_tunnel_url(), "https://pocket.example.com")
-                q.assert_not_called()
+                urls = bridge._pair_tunnel_urls()
+                self.assertEqual(urls[0], "https://pocket.example.com",
+                                 "自訂網域必須排第一")
+                self.assertIn("https://fallback.trycloudflare.com", urls,
+                              "自訂網域掛掉時要有退路 —— 單一候選本身就是掉線風險")
 
     def test_falls_back_to_quick_tunnel_when_nothing_configured(self):
         """核心保證:使用者什麼都沒設,照樣要有公網候選。"""
