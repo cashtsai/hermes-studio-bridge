@@ -11017,7 +11017,10 @@ async def _pocket_id_loop() -> None:
 # 這件事必須是使用者主動同意的 —— 不可以因為「他有訂閱」就自動發生。
 # (善彰 2026-10-28 拍板。)
 
-_RELAY_IDLE_SECS = 30.0          # 關閉時的輪詢間隔(等使用者去按開關)
+# 開關的輪詢間隔。只是一次 os.path.exists,便宜到可以常跑 —— 而這個數字
+# 直接決定使用者按下開關到真的生效的延遲,所以寧可快。
+_RELAY_IDLE_SECS = 5.0           # 關著的時候多久看一次「是不是被打開了」
+_RELAY_FLAG_POLL_SECS = 3.0      # frpc 跑著的時候多久看一次「是不是被關掉了」
 _RELAY_UNENTITLED_SECS = 1800.0  # 沒訂閱就別一直敲 —— 訂閱不會在 30 秒內長出來
 
 
@@ -11182,8 +11185,13 @@ def _relay_set_status(state: str, **fields) -> None:
 async def _relay_run_frpc(binary: str) -> str:
     """跑 frpc 直到它結束,回傳輸出尾巴(用來判斷是不是授權問題)。
 
-    frpc 自己會重連,所以正常情況下這個 await 會一直不返回 —— 它返回就代表
-    真的出事了(設定被拒、binary 架構不對、伺服器拒絕授權)。
+    frpc 自己會重連,所以它不會自己結束 —— 因此**必須在跑的時候盯著開關**。
+
+    ⚠️ 第一版只是 `async for` 讀到 EOF 就結束。於是使用者按「關」的時候,
+    旗標寫進去了、API 回 200、UI 顯示已關閉,**而隧道還開著** ——
+    supervisor 卡在這個 await 裡,永遠回不到迴圈頂端那個 `_relay_enabled()`
+    檢查,沒有任何東西去殺 frpc。一個安全開關按了沒反應、而且還跟你說
+    成功了,是這個功能最糟的失敗形態。2026-10-28 端到端實測抓到。
 
     邊讀邊更新狀態:隧道是**中途**才真的通的,等這個函式返回就太晚了
     (它返回的時候隧道已經斷了)。
@@ -11192,17 +11200,40 @@ async def _relay_run_frpc(binary: str) -> str:
         binary, "-c", _relay_conf_path(),
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
     tail: list[str] = []
-    assert proc.stdout is not None
-    async for raw in proc.stdout:
-        line = raw.decode("utf-8", "replace").rstrip()
-        tail.append(line)
-        del tail[:-40]
-        if _RELAY_PROXY_OK in line:
-            _relay_set_status("connected", detail=None)
-        elif _RELAY_PROXY_ERR in line:
-            # 連上了 frps 卻開不了通道 —— 行程還活著,但隧道是不通的。
-            _relay_set_status("rejected", detail=line[-200:])
-    await proc.wait()
+
+    async def _pump() -> None:
+        assert proc.stdout is not None
+        async for raw in proc.stdout:
+            line = raw.decode("utf-8", "replace").rstrip()
+            tail.append(line)
+            del tail[:-40]
+            if _RELAY_PROXY_OK in line:
+                _relay_set_status("connected", detail=None)
+            elif _RELAY_PROXY_ERR in line:
+                # 連上了 frps 卻開不了通道 —— 行程還活著,但隧道是不通的。
+                _relay_set_status("rejected", detail=line[-200:])
+
+    pump = asyncio.create_task(_pump())
+    try:
+        while True:
+            try:
+                await asyncio.wait_for(asyncio.shield(pump), _RELAY_FLAG_POLL_SECS)
+                break                      # frpc 自己結束了(出事了)
+            except asyncio.TimeoutError:
+                if not _relay_enabled():
+                    _log_event("relay_stopping", reason="switched off")
+                    break                  # 使用者關掉了 → 下面 finally 收屍
+    finally:
+        # 不管走哪條路都要確定 frpc 真的死了:留一隻孤兒 frpc 在跑,
+        # 等於開關關了但 Mac 還在公網上 —— 正是這次要修的那個病。
+        if proc.returncode is None:
+            proc.terminate()
+            try:
+                await asyncio.wait_for(proc.wait(), 10)
+            except asyncio.TimeoutError:
+                proc.kill()
+                await proc.wait()
+        pump.cancel()
     return "\n".join(tail)
 
 
@@ -11258,6 +11289,12 @@ async def _relay_loop() -> None:
             fail_logged = False
             backoff = 30.0
             tail = await _relay_run_frpc(binary)
+
+            if not _relay_enabled():
+                # 使用者關掉的 —— frpc 結束是**預期**的,不是故障。
+                # 不先擋掉的話會閃一下 "error" 才轉 off,使用者按個關看到紅字。
+                _relay_set_status("off", hostname=None, detail=None)
+                continue
 
             low = tail.lower()
             if any(h in low for h in _RELAY_STALE_TOKEN_HINTS):
