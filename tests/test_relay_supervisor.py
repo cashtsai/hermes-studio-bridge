@@ -205,6 +205,41 @@ class TestStatusTruthfulness(RelayTestBase):
         self.assertEqual(p["state"], "unentitled")   # 現實
         self.assertIn("訂閱", p["detail"])
 
+    def test_unconfigured_is_distinct_from_off(self):
+        """「沒設定」不可以跟「關著」共用狀態值。
+
+        2026-10-28 端到端實測:plist 沒有 POCKET_ID_URL 時 _start_relay 直接
+        return,狀態留在初始的 "off",使用者看到「開關=開、狀態=已關閉」——
+        矛盾、沒解釋、怎麼按都不會變。兩者的下一步完全不同:一個是去按開關,
+        一個是去接 Pocket ID。
+        """
+        self.enable()
+        with patch.object(bridge, "POCKET_ID_URL", ""):
+            asyncio.run(bridge._start_relay())
+        p = bridge._relay_status_payload()
+        self.assertEqual(p["state"], "not_configured")
+        self.assertNotEqual(p["state"], "off")
+        self.assertIn("Pocket ID", p["detail"])
+
+    def test_cached_grant_runs_without_pocket_id(self):
+        """**enrollment 只擋 claim,不擋執行**。
+
+        已經有 grant 的機器(例如從 mac-join-relay.sh 手動加入的),那張 token
+        就是 frpc 要的全部憑證。把它擋掉等於「pocket-id 暫時連不上 → 一條本來
+        好好的隧道也被弄斷」,跟這個 repo 其他地方的紀律相反。
+        """
+        bridge._relay_save_grant(GRANT)
+        self.enable()
+        # _start_relay 會建立 supervisor task。這個測試只關心「它有沒有被擋下」,
+        # 所以把 frpc 查找釘成 None —— 絕不讓測試行程有任何機會真的 spawn frpc
+        # 去連線上的 frps。(隔離閂把 POCKET_RELAY_ENABLED 硬釘成 0 已經擋了一層,
+        # 但安全性不該只靠單一防線。)
+        with patch.object(bridge, "POCKET_ID_URL", ""), \
+             patch.object(bridge, "_relay_frpc_bin", lambda: None):
+            asyncio.run(bridge._start_relay())
+        # 有 grant 就不該被判成「沒設定」—— supervisor 要照常啟動。
+        self.assertNotEqual(bridge._relay_status_payload()["state"], "not_configured")
+
     def test_proxy_rejection_is_not_connected(self):
         """frpc 行程活著 ≠ 隧道通 —— NewProxy 被拒時行程照樣在重試。"""
         bridge._relay_set_status("connected")
