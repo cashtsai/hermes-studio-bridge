@@ -254,6 +254,72 @@ class TestStatusTruthfulness(RelayTestBase):
         self.assertEqual(bridge._RELAY_STATUS["since"], first)
 
 
+class TestOffSwitchActuallyStops(RelayTestBase):
+    """**關掉必須真的關掉。**
+
+    2026-10-28 端到端實測:按「關」之後旗標寫進去了、API 回 200、UI 顯示已關閉,
+    但外網照樣 200 —— supervisor 卡在 `await _relay_run_frpc()` 裡,frpc 自己
+    永遠不結束,所以迴圈回不到開關檢查,沒有任何東西去殺它。一個安全開關
+    按了沒反應、還跟你說成功了,是這個功能最糟的失敗形態。
+
+    這組用一個「永遠不會自己結束」的假 frpc 來釘:跟真的 frpc 同一個行為。
+    """
+
+    def _fake_frpc(self) -> str:
+        path = os.path.join(self._tmp, "fake-frpc")
+        with open(path, "w") as f:
+            f.write("#!/bin/sh\nwhile true; do sleep 0.2; done\n")
+        os.chmod(path, 0o755)
+        return path
+
+    def test_flag_off_terminates_frpc(self):
+        bridge._relay_save_grant(GRANT)
+        bridge._relay_write_conf(GRANT)
+        binary = self._fake_frpc()
+
+        async def scenario():
+            enabled = {"v": True}
+            with patch.object(bridge, "_relay_enabled", lambda: enabled["v"]), \
+                 patch.object(bridge, "_RELAY_FLAG_POLL_SECS", 0.2):
+                task = asyncio.create_task(bridge._relay_run_frpc(binary))
+                await asyncio.sleep(0.6)
+                self.assertFalse(task.done(), "開關還開著就不該結束")
+                enabled["v"] = False       # 使用者按下「關」
+                # 給它兩個輪詢週期 —— 真的會停的話這裡就會返回。
+                await asyncio.wait_for(task, timeout=5)
+
+        asyncio.run(scenario())
+
+    def test_no_orphan_process_left_behind(self):
+        """收屍要確實 —— 留一隻孤兒 frpc 等於開關關了但 Mac 還在公網上。"""
+        bridge._relay_save_grant(GRANT)
+        bridge._relay_write_conf(GRANT)
+        binary = self._fake_frpc()
+        seen = {}
+
+        real_exec = asyncio.create_subprocess_exec
+
+        async def spy(*a, **k):
+            proc = await real_exec(*a, **k)
+            seen["proc"] = proc
+            return proc
+
+        async def scenario():
+            enabled = {"v": True}
+            with patch.object(bridge, "_relay_enabled", lambda: enabled["v"]), \
+                 patch.object(bridge, "_RELAY_FLAG_POLL_SECS", 0.2), \
+                 patch.object(asyncio, "create_subprocess_exec", spy):
+                task = asyncio.create_task(bridge._relay_run_frpc(binary))
+                await asyncio.sleep(0.6)
+                enabled["v"] = False
+                await asyncio.wait_for(task, timeout=5)
+
+        asyncio.run(scenario())
+        self.assertIsNotNone(seen.get("proc"))
+        self.assertIsNotNone(seen["proc"].returncode,
+                             "frpc 行程還活著 —— 隧道沒真的關掉")
+
+
 class TestRelayEndpoints(RelayTestBase):
     """端點是 owner 專屬 —— 把本機服務端上公網,配對過的手機不該能代為決定。"""
 
