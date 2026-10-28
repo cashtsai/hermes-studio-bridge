@@ -56,6 +56,23 @@ class CXFileCitationAttachTest(unittest.TestCase):
         bad = [dict(self.cap[0], available=False)]
         self.assertEqual(carddigest.attach_captured_media(self.d.store, bad), 0)
 
+    def test_url_captures_are_not_attached(self):
+        """網址被擷取成 source_kind=url、沒有 download_url —— 掛上去是點不開的空殼。"""
+        self.d.store.upsert_card(_card(f'see {self.path} 與 https://example.com/en'))
+        caps = self.cap + [
+            {"media_id": "med_u", "available": True, "source_kind": "url",
+             "source_ref": "https://example.com/en", "filename": "en"},
+        ]
+        self.assertEqual(carddigest.attach_captured_media(self.d.store, caps), 1)
+        atts = self.d.store.cards["card-x"]["body"]["attachments"]
+        self.assertEqual([a["filename"] for a in atts], ["報告.pptx"],
+                         "只能留真檔案,網址片段不得變成附件")
+
+    def test_capture_without_download_url_skipped(self):
+        self.d.store.upsert_card(_card(f'see {self.path}'))
+        bad = [dict(self.cap[0], download_url=None)]
+        self.assertEqual(carddigest.attach_captured_media(self.d.store, bad), 0)
+
     def test_empty_capture_is_noop(self):
         self.d.store.upsert_card(_card(f'see {self.path}'))
         self.assertEqual(carddigest.attach_captured_media(self.d.store, []), 0)
