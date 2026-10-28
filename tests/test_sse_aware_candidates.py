@@ -192,7 +192,10 @@ class RedactionTests(unittest.TestCase):
     def test_quick_tunnel_and_tailnet_are_generalised(self):
         self.assertEqual(bridge._redact_host("https://abc-def.trycloudflare.com"),
                          "<quick-tunnel>.trycloudflare.com")
-        self.assertEqual(bridge._redact_host("https://host.tailnet.ts.net"),
+        # ⚠️ 這裡的主機名要帶 `example`:公開 repo 的私有識別守門
+        # (test_no_private_infra_leak)會攔 `*.<tailnet>.ts.net` 這個形狀,
+        # 只放行佔位寫法。期望值裡的 `<tailnet>` 有角括號,守門本來就放行。
+        self.assertEqual(bridge._redact_host("https://host.example.ts.net"),
                          "<tailnet>.ts.net")
         self.assertEqual(bridge._redact_host("http://192.168.1.33:8081"), "<lan-ip>")
 
