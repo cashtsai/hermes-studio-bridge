@@ -56,6 +56,41 @@ def _take_ts_default(card: dict) -> bool:
     return bool(card.pop(TS_DEFAULT_KEY, False))
 
 
+def attach_captured_media(store, captured: list) -> int:
+    """把媒體倉庫擷取到的檔案掛回**內文提到該路徑**的卡片上。
+
+    為什麼需要:seed 時 bridge 會把 turns 裡引用到的本機檔案擷取進倉庫(拿得到
+    media_id 與下載網址),但擷取結果原本**整個被丟掉**,沒有人寫回卡片的
+    attachments —— 於是 app 只看得到一行裸文字,例如 codex 的
+    `:codex-file-citation{path="/…/x.pptx"}`,點不開也下載不了
+    (機主 2026-10-28 回報「檔案的連結是錯誤的」)。
+
+    比對用「卡片內文是否包含該絕對路徑」,所以同一輪多檔也能各自歸位;
+    已經有 attachments 的卡不動(live 事件帶的附件優先)。回傳掛上幾張卡。
+    """
+    if not captured:
+        return 0
+    items = [c for c in captured if isinstance(c, dict) and c.get("available")]
+    if not items:
+        return 0
+    touched = 0
+    for card in list(getattr(store, "cards", {}).values()):
+        body = card.get("body") or {}
+        if body.get("attachments"):
+            continue
+        text = str(body.get("text") or body.get("fallback_text") or "")
+        if not text:
+            continue
+        hits = [c for c in items
+                if str(c.get("source_ref") or "") and str(c["source_ref"]) in text]
+        if not hits:
+            continue
+        body["attachments"] = [dict(h) for h in hits]
+        card["body"] = body
+        touched += 1
+    return touched
+
+
 def make_card(cid: str, turn_id: str, role: str, kind: str, body: dict,
               ts: float | None = None, rev: int = 1, final: bool = True) -> dict:
     body = dict(body or {})

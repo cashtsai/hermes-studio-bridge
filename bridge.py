@@ -20755,10 +20755,21 @@ async def _cx_seed_card_digest(thread_id: str, d, required: bool = False) -> Non
             "itemsView": "full", "sortDirection": "desc"}, timeout=45.0)
         turns = list((res or {}).get("data", []))
         turns.reverse()
-        await asyncio.to_thread(
+        captured = await asyncio.to_thread(
             _media_capture_sync, f"codex:{thread_id}", turns
         )
         d.seed_turns(turns, emit_unchanged=required)
+        # 擷取結果原本被丟掉 → 卡片沒有 attachments,app 只看得到一行裸的
+        # `:codex-file-citation{path=…}`,點不開(機主 2026-10-28)。
+        # 這裡把倉庫產出的 media_id/下載網址掛回內文提到該路徑的卡片。
+        try:
+            wired = [_media_wire_item(c) for c in (captured or [])]
+            n = carddigest.attach_captured_media(d.store, wired)
+            if n:
+                _log_event("cx_media_attached", thread=thread_id[:16], cards=n)
+        except Exception as _exc:  # noqa: BLE001
+            _log_event("cx_media_attach_error", thread=thread_id[:16],
+                       error=str(_exc)[:120])
         # Seed 期間先收到的 live notification 必須在 canonical 舊→新卡片
         # 落地後重播，否則 live 卡會先佔住 order 尾端，舊歷史反而接在今天後面。
         d.finish_seed()
