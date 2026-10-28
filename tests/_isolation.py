@@ -40,6 +40,10 @@ _ENV_TMP_DEFAULTS = {
     "POCKET_TUNNEL_URL_FILE": os.path.join(_TMP, "tunnel-url"),
     "PAIR_BOOT_CODE_FILE":    os.path.join(_TMP, "pair-boot-code"),
     "POCKET_ID_STATE_FILE":   os.path.join(_TMP, "pocket-id-enrollment.json"),
+    # bridge.py 中繼隧道:grant.json 裡是 frp token(進隧道的鑰匙)、frpc.toml
+    # 是活的設定、旗標檔決定隧道開不開 —— 三個都在 ~/.pocket/relay 底下,
+    # 不導的話測試會改到真機的中繼狀態(落在 guard 層的 ~/.pocket 紅線內)。
+    "POCKET_RELAY_DIR":       os.path.join(_TMP, "relay"),
     # agent_registry.py(2026-08-15 事故的那顆:import bridge 就建表)
     "POCKET_REGISTRY_DB":     os.path.join(_TMP, "agent-registry.db"),
     # harness/store.py
@@ -67,6 +71,13 @@ _ENV_TMP_DEFAULTS = {
 }
 for _k, _v in _ENV_TMP_DEFAULTS.items():
     os.environ.setdefault(_k, _v)
+
+# ⚠️ 這一個**硬蓋,不 setdefault** —— 其餘條目是「路徑導到 tmp」,導錯最多髒了
+# 測試資料;這一個是「要不要把本機 8081 打到公網」。開發機若因為剛測過中繼而
+# 留著 POCKET_RELAY_ENABLED=1,setdefault 會原封不動放行,測試行程就會真的
+# 拉起隧道。安全開關不接受「繼承環境」這種語意。想測開著的路徑請 monkeypatch
+# `bridge._relay_enabled`,不要靠 env。
+os.environ["POCKET_RELAY_ENABLED"] = "0"
 
 # 目錄型的路徑先建好:有程式把它當 cwd / 直接 listdir(codex spawn 拿
 # HOME_ROOT 當工作目錄,目錄不存在 spawn 會 FileNotFoundError)。
