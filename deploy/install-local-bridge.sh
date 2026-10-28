@@ -373,6 +373,14 @@ cat > "$LAUNCH_AGENT" <<PLIST
         <string>$OPENCLAW_CONFIG_FILE</string>
         <key>POCKET_ID_URL</key>
         <string>$POCKET_ID_URL</string>
+        <!-- 安裝時選的 provider。bridge 的 _dashboard_active_provider() 讀這個
+             (或 POCKET_PROVIDER)來決定儀表板顯示哪個 runtime 的人格。
+             ⚠️ 以前**沒有**傳進來,所以 launchd 起的 bridge 永遠拿到 "auto" ——
+             安裝精靈問了使用者要 Hermes 還是 OpenClaw,答案卻傳不到服務端。
+             (這個洞躺在 feat/installer-env-config 分支上三個月沒合,
+              2026-10-28 掃未合併分支時才挖出來。) -->
+        <key>POCKET_ACTIVE_PROVIDER</key>
+        <string>${REQUESTED_PROVIDER:-auto}</string>
     </dict>
 
     <key>RunAtLoad</key>
