@@ -11220,12 +11220,6 @@ async def _relay_loop() -> None:
                 _relay_set_status("off", hostname=None, detail=None)
                 await asyncio.sleep(_RELAY_IDLE_SECS)
                 continue
-            if not _pocket_id_state():
-                # 還沒 enroll 就沒有 host 身分可以 claim。等 _pocket_id_loop。
-                _relay_set_status("not_enrolled",
-                                  detail="這台主機還沒在 Pocket ID 註冊")
-                await asyncio.sleep(_RELAY_IDLE_SECS)
-                continue
             binary = _relay_frpc_bin()
             if not binary:
                 # 講清楚缺什麼 —— 這是「安靜地少一個必要的東西」最愛發生的地方。
@@ -11240,6 +11234,17 @@ async def _relay_loop() -> None:
 
             grant = _relay_load_grant()
             if not grant:
+                # **enrollment 只擋 claim,不擋執行**。已經有 grant 的話,那張
+                # token 本身就是 frpc 要的全部憑證,不需要 host 身分 —— host
+                # 身分只是「去換一張新的」才用得到。寫成擋執行的話,pocket-id
+                # 暫時連不上就會把一條本來好好的隧道也弄斷,跟這個 repo
+                # 其他地方「周邊掛了不准弄死主功能」的紀律不一致。
+                if not POCKET_ID_URL or not _pocket_id_state():
+                    _relay_set_status(
+                        "not_enrolled",
+                        detail="這台 Mac 的 bridge 還沒接上 Pocket ID,無法申請中繼授權")
+                    await asyncio.sleep(_RELAY_IDLE_SECS)
+                    continue
                 _relay_set_status("claiming")
                 grant = await _relay_claim()
                 _relay_save_grant(grant)
@@ -11341,9 +11346,20 @@ async def app_relay_enable(request: Request):
 
 @app.on_event("startup")
 async def _start_relay():
-    # 兩道閘都要過:沒接 pocket-id 就沒有 host 身分可以 claim;
-    # 開關沒開就完全不啟動這條線(連輪詢都省,合併零風險)。
-    if not POCKET_ID_URL:
+    # 沒接 pocket-id 就沒有 host 身分可以 claim,supervisor 不啟動。
+    #
+    # ⚠️ 但**狀態要講清楚是「沒設定」而不是「關著」**。第一版這裡直接 return,
+    # `_RELAY_STATUS` 就留在初始值 "off" —— 於是使用者按了開關,看到的是
+    # 「開關=開、狀態=已關閉」:互相矛盾、沒有解釋、而且怎麼按都不會變。
+    # 2026-10-28 端到端實測踩到(這台 bridge 的 plist 沒有 POCKET_ID_URL)。
+    # 「關著」是使用者的選擇,「沒設定」是這台機器還沒接上 Pocket ID,
+    # 兩件事的下一步完全不同,不可以共用一個狀態值。
+    # 沒接 pocket-id **但已經有 grant** 的機器仍要能跑 —— 那張 token 就是
+    # frpc 要的全部憑證(例如從 mac-join-relay.sh 手動加入隧道的機器)。
+    if not POCKET_ID_URL and not _relay_load_grant():
+        _relay_set_status(
+            "not_configured",
+            detail="這台 Mac 的 bridge 還沒接上 Pocket ID(缺 POCKET_ID_URL)")
         return
     task = asyncio.create_task(_relay_loop())
     _BG_TASKS.add(task)
