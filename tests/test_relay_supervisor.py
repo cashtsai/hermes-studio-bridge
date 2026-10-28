@@ -179,6 +179,94 @@ class TestFrpcDiscovery(RelayTestBase):
             self.assertEqual(bridge._relay_frpc_bin(), os.path.abspath(fake))
 
 
+class TestStatusTruthfulness(RelayTestBase):
+    """燈號必須反映**隧道**,不是開關的位置。
+
+    這兩件事會不一致(按了開但沒訂閱 / token 被撤 / frpc 不在),而那個落差
+    正是使用者唯一需要看到的東西 —— 用開關的位置假裝成狀態就是騙人。
+    """
+
+    def setUp(self):
+        super().setUp()
+        self._saved = dict(bridge._RELAY_STATUS)
+
+    def tearDown(self):
+        bridge._RELAY_STATUS.clear()
+        bridge._RELAY_STATUS.update(self._saved)
+        super().tearDown()
+
+    def test_enabled_and_state_are_separate_fields(self):
+        self.enable()
+        bridge._relay_set_status("unentitled", detail="沒訂閱")
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("POCKET_RELAY_ENABLED", None)
+            p = bridge._relay_status_payload()
+        self.assertTrue(p["enabled"])          # 使用者的意圖
+        self.assertEqual(p["state"], "unentitled")   # 現實
+        self.assertIn("訂閱", p["detail"])
+
+    def test_proxy_rejection_is_not_connected(self):
+        """frpc 行程活著 ≠ 隧道通 —— NewProxy 被拒時行程照樣在重試。"""
+        bridge._relay_set_status("connected")
+        bridge._relay_set_status("rejected", detail="start error: not entitled")
+        self.assertEqual(bridge._RELAY_STATUS["state"], "rejected")
+
+    def test_since_only_moves_on_real_change(self):
+        """同一個狀態重複回報不該刷新時間戳,否則「已連線多久」永遠是 0 秒。"""
+        bridge._relay_set_status("connected")
+        first = bridge._RELAY_STATUS["since"]
+        bridge._relay_set_status("connected")
+        self.assertEqual(bridge._RELAY_STATUS["since"], first)
+
+
+class TestRelayEndpoints(RelayTestBase):
+    """端點是 owner 專屬 —— 把本機服務端上公網,配對過的手機不該能代為決定。"""
+
+    def setUp(self):
+        super().setUp()
+        from fastapi.testclient import TestClient
+        self.client = TestClient(bridge.app)
+        self.owner = {"Authorization": f"Bearer {bridge.BRIDGE_TOKEN}"}
+
+    def test_status_requires_owner_token(self):
+        r = self.client.get("/app/v1/relay/status",
+                            headers={"Authorization": "Bearer wrong-token"})
+        self.assertIn(r.status_code, (401, 403, 429))
+
+    def test_enable_requires_owner_token(self):
+        r = self.client.post("/app/v1/relay/enable", json={"enabled": True},
+                             headers={"Authorization": "Bearer wrong-token"})
+        self.assertIn(r.status_code, (401, 403, 429))
+        self.assertFalse(os.path.exists(bridge._relay_setting_path()))
+
+    def test_toggle_on_then_off(self):
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("POCKET_RELAY_ENABLED", None)
+            r = self.client.post("/app/v1/relay/enable", json={"enabled": True},
+                                 headers=self.owner)
+            self.assertEqual(r.status_code, 200)
+            self.assertTrue(r.json()["enabled"])
+            self.assertTrue(os.path.exists(bridge._relay_setting_path()))
+
+            r = self.client.post("/app/v1/relay/enable", json={"enabled": False},
+                                 headers=self.owner)
+            self.assertFalse(r.json()["enabled"])
+            self.assertFalse(os.path.exists(bridge._relay_setting_path()))
+
+    def test_off_twice_is_not_an_error(self):
+        """冪等 —— 重複關不該 500(檔案本來就不在)。"""
+        r = self.client.post("/app/v1/relay/enable", json={"enabled": False},
+                             headers=self.owner)
+        self.assertEqual(r.status_code, 200)
+
+    def test_missing_field_is_400_not_silently_off(self):
+        """漏欄位不可以被當成 false —— 那會讓一個打錯的請求安靜地關掉隧道。"""
+        self.enable()
+        r = self.client.post("/app/v1/relay/enable", json={}, headers=self.owner)
+        self.assertEqual(r.status_code, 400)
+        self.assertTrue(os.path.exists(bridge._relay_setting_path()))
+
+
 class TestRejectionHandling(unittest.TestCase):
     """frps 的兩種拒絕理由,處理方式相反 —— 分錯就是無限重試或永遠不重試。
 

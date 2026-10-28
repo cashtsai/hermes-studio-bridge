@@ -11157,12 +11157,36 @@ def _relay_write_conf(grant: dict) -> None:
 _RELAY_STALE_TOKEN_HINTS = ("unknown or revoked relay token",)
 _RELAY_UNENTITLED_HINTS = ("subscription inactive", "not entitled")
 
+# frpc 自己的日誌關鍵字 —— 這是**唯一**能知道隧道真的通了的地方。
+# 「frpc 行程活著」不等於「隧道通」:它可能連上 frps 卻在 NewProxy 被拒
+# (沒訂閱 / token 被撤),行程照樣活著重試。拿行程狀態當燈號就是在騙人。
+_RELAY_PROXY_OK = "start proxy success"
+_RELAY_PROXY_ERR = "start error"
+
+# supervisor 的對外狀態。桌面端讀這個畫燈,所以它必須反映**隧道**的現況,
+# 不是旗標檔的值 —— 兩者會不一致,而那個不一致正是使用者需要看到的東西。
+_RELAY_STATUS: dict = {"state": "off", "hostname": None, "detail": None,
+                       "since": None}
+
+
+def _relay_set_status(state: str, **fields) -> None:
+    prev = _RELAY_STATUS.get("state")
+    _RELAY_STATUS.update(fields)
+    _RELAY_STATUS["state"] = state
+    if state != prev:
+        _RELAY_STATUS["since"] = time.time()
+        _log_event("relay_state", state=state,
+                   detail=str(fields.get("detail") or "")[:200])
+
 
 async def _relay_run_frpc(binary: str) -> str:
-    """跑 frpc 直到它結束,回傳 stderr 尾巴(用來判斷是不是授權問題)。
+    """跑 frpc 直到它結束,回傳輸出尾巴(用來判斷是不是授權問題)。
 
     frpc 自己會重連,所以正常情況下這個 await 會一直不返回 —— 它返回就代表
     真的出事了(設定被拒、binary 架構不對、伺服器拒絕授權)。
+
+    邊讀邊更新狀態:隧道是**中途**才真的通的,等這個函式返回就太晚了
+    (它返回的時候隧道已經斷了)。
     """
     proc = await asyncio.create_subprocess_exec(
         binary, "-c", _relay_conf_path(),
@@ -11173,6 +11197,11 @@ async def _relay_run_frpc(binary: str) -> str:
         line = raw.decode("utf-8", "replace").rstrip()
         tail.append(line)
         del tail[:-40]
+        if _RELAY_PROXY_OK in line:
+            _relay_set_status("connected", detail=None)
+        elif _RELAY_PROXY_ERR in line:
+            # 連上了 frps 卻開不了通道 —— 行程還活著,但隧道是不通的。
+            _relay_set_status("rejected", detail=line[-200:])
     await proc.wait()
     return "\n".join(tail)
 
@@ -11188,15 +11217,20 @@ async def _relay_loop() -> None:
     while True:
         try:
             if not _relay_enabled():
+                _relay_set_status("off", hostname=None, detail=None)
                 await asyncio.sleep(_RELAY_IDLE_SECS)
                 continue
             if not _pocket_id_state():
                 # 還沒 enroll 就沒有 host 身分可以 claim。等 _pocket_id_loop。
+                _relay_set_status("not_enrolled",
+                                  detail="這台主機還沒在 Pocket ID 註冊")
                 await asyncio.sleep(_RELAY_IDLE_SECS)
                 continue
             binary = _relay_frpc_bin()
             if not binary:
                 # 講清楚缺什麼 —— 這是「安靜地少一個必要的東西」最愛發生的地方。
+                _relay_set_status("no_binary",
+                                  detail="找不到 frpc(可用 POCKET_FRPC_BIN 指定)")
                 if not fail_logged:
                     _log_event("relay_frpc_missing", hint="set POCKET_FRPC_BIN")
                     fail_logged = True
@@ -11206,6 +11240,7 @@ async def _relay_loop() -> None:
 
             grant = _relay_load_grant()
             if not grant:
+                _relay_set_status("claiming")
                 grant = await _relay_claim()
                 _relay_save_grant(grant)
                 _log_event("relay_claimed", hostname=grant.get("hostname"))
@@ -11213,6 +11248,8 @@ async def _relay_loop() -> None:
 
             _log_event("relay_starting", hostname=grant.get("hostname"),
                        local_port=_relay_local_port())
+            # 先進 connecting;真的通了由 _relay_run_frpc 讀到 frpc 的日誌才改。
+            _relay_set_status("connecting", hostname=grant.get("hostname"))
             fail_logged = False
             backoff = 30.0
             tail = await _relay_run_frpc(binary)
@@ -11228,23 +11265,78 @@ async def _relay_loop() -> None:
                 continue
             if any(h in low for h in _RELAY_UNENTITLED_HINTS):
                 raise _RelayUnentitled()
+            _relay_set_status("error", detail=(tail[-200:] or "frpc 結束"))
             _log_event("relay_frpc_exited", tail=tail[-400:])
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 3600.0)
         except asyncio.CancelledError:
             raise
         except _RelayUnentitled:
+            _relay_set_status("unentitled",
+                              detail="中繼需要訂閱;免費替代是你自己的 Tailscale")
             if not fail_logged:
                 _log_event("relay_unentitled",
                            hint="中繼需要訂閱;免費替代路徑是自己的 Tailscale")
                 fail_logged = True
             await asyncio.sleep(_RELAY_UNENTITLED_SECS)
         except Exception as _exc:  # noqa: BLE001
+            _relay_set_status("error", detail=f"{type(_exc).__name__}: {_exc}"[:200])
             if not fail_logged:
                 _log_exc("relay_loop", _exc, expected=True)
                 fail_logged = True
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 3600.0)
+
+
+def _relay_status_payload() -> dict:
+    """桌面端畫燈用。**開關值與隧道狀態分開回**,因為它們會不一致 ——
+    使用者按了開,但沒訂閱 / token 被撤 / frpc 不在,隧道就是不通。
+    那個落差正是使用者需要看到的東西,不能用開關的位置假裝成狀態。
+    """
+    st = dict(_RELAY_STATUS)
+    return {
+        "enabled": _relay_enabled(),        # 旗標:使用者的意圖
+        "state": st.get("state"),           # 現實:隧道到底怎樣
+        "hostname": st.get("hostname"),
+        "detail": st.get("detail"),
+        "since": st.get("since"),
+        "frpc_present": bool(_relay_frpc_bin()),
+    }
+
+
+@app.get("/app/v1/relay/status")
+async def app_relay_status(request: Request):
+    """中繼隧道現況。owner 專屬 —— 這會吐出這台機器的公網主機名。"""
+    _require_master_auth(request)
+    return _relay_status_payload()
+
+
+@app.post("/app/v1/relay/enable")
+async def app_relay_enable(request: Request):
+    """開/關中繼隧道。**owner 專屬**:這是「把本機服務端上公網」的動作,
+    配對過的手機不該能替機主做這個決定。
+
+    只動旗標檔,不直接去 spawn/kill frpc —— supervisor 本來就在輪詢,
+    讓它當唯一的執行者,避免兩條路徑搶同一個子進程。
+    """
+    _require_master_auth(request)
+    body = await _json_body(request)
+    if "enabled" not in body:
+        raise http_err(400, "RELAY_ENABLED_REQUIRED", "需要 enabled 欄位(true/false)")
+    want = bool(body.get("enabled"))
+    os.makedirs(_relay_dir(), exist_ok=True)
+    if want:
+        with open(_relay_setting_path(), "w") as f:
+            f.write("")
+    else:
+        try:
+            os.remove(_relay_setting_path())
+        except FileNotFoundError:
+            pass
+    _log_event("relay_toggled", enabled=want)
+    # 回當下的狀態:使用者剛按完,state 還會是上一輪的值(supervisor 最多
+    # 30 秒後才會動)。前端要據此顯示「切換中」,不要假裝已經生效。
+    return _relay_status_payload()
 
 
 @app.on_event("startup")
