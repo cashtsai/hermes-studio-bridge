@@ -387,3 +387,87 @@ class TestRejectionHandling(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestAutoEnroll(RelayTestBase):
+    """機主用 Apple 登入桌面端時順手 enroll 這台 Mac。
+
+    **為什麼做在 bridge**:桌面端早就把 Apple identityToken 送過來了,
+    同一張 JWT 就能跟 pocket-id 換 session —— 不必在桌面端新增 pocket-id
+    client、不必多存一份 session,更不必把 enroll token 經過 plist
+    (那是秘密,而且 plist 每次重裝都會被整份覆寫)。
+
+    這組釘的是**失敗時的行為**:自動 enroll 是附帶動作,pocket-id 掛了、
+    aud 沒設、限流擋了,使用者該做的事(登入桌面端)都必須照常完成。
+    """
+
+    def _client(self, auth_status=200, enroll_status=200, auth_json=None,
+                enroll_json=None, raise_on=None):
+        calls = []
+
+        class _Resp:
+            def __init__(self, status, payload):
+                self.status_code = status
+                self._p = payload
+
+            def json(self):
+                return self._p
+
+        class _C:
+            async def __aenter__(self_inner):
+                return self_inner
+
+            async def __aexit__(self_inner, *a):
+                return False
+
+            async def post(self_inner, url, **kw):
+                calls.append(url)
+                if raise_on and raise_on in url:
+                    raise RuntimeError("boom")
+                if url.endswith("/v1/auth/apple"):
+                    return _Resp(auth_status,
+                                 auth_json if auth_json is not None
+                                 else {"session_token": "sess-1"})
+                return _Resp(enroll_status,
+                             enroll_json if enroll_json is not None
+                             else {"enroll_token": "enr-1"})
+
+        return _C, calls
+
+    def _run(self, **kw):
+        C, calls = self._client(**kw)
+        registered = []
+
+        async def fake_register(token=""):
+            registered.append(token)
+
+        with patch.object(bridge, "POCKET_ID_URL", "https://id.example.com"), \
+             patch("httpx.AsyncClient", lambda *a, **k: C()), \
+             patch.object(bridge, "_pocket_id_register", fake_register):
+            asyncio.run(bridge._pocket_id_autoenroll("fake-identity-token"))
+        return calls, registered
+
+    def test_happy_path_registers_with_fresh_token(self):
+        calls, registered = self._run()
+        self.assertTrue(calls[0].endswith("/v1/auth/apple"))
+        self.assertTrue(calls[1].endswith("/v1/enroll/new"))
+        self.assertEqual(registered, ["enr-1"])
+
+    def test_auth_rejected_does_not_register(self):
+        """aud 沒設好就是 401 —— 不可以硬著頭皮往下走。"""
+        _, registered = self._run(auth_status=401)
+        self.assertEqual(registered, [])
+
+    def test_rate_limited_enroll_is_not_fatal(self):
+        """/v1/enroll/new 有每小時限流,429 只是「下次登入再說」。"""
+        _, registered = self._run(enroll_status=429)
+        self.assertEqual(registered, [])
+
+    def test_missing_session_token_does_not_register(self):
+        _, registered = self._run(auth_json={})
+        self.assertEqual(registered, [])
+
+    def test_network_error_is_swallowed(self):
+        """pocket-id 連不上**絕不能讓桌面端登入失敗** —— 這是附帶動作。"""
+        _, registered = self._run(raise_on="/v1/auth/apple")
+        self.assertEqual(registered, [])

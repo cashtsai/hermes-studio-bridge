@@ -19,6 +19,13 @@ BRIDGE_VENV="${POCKET_BRIDGE_VENV:-$INSTALL_ROOT/venv}"
 LAUNCH_AGENT="$HOME/Library/LaunchAgents/$BRIDGE_LABEL.plist"
 HERMES_HOME_ROOT="${HERMES_HOME_ROOT:-$HOME/apps/hermes-agent/home}"
 OPENCLAW_CONFIG_FILE="${OPENCLAW_CONFIG_FILE:-$HOME/.pocket/openclaw.json}"
+# Pocket ID(主機目錄服務)。**不是秘密**,只是服務位址 —— 真正的秘密
+# (enroll token)不經過 plist:機主用 Apple 登入桌面端時,bridge 拿同一張
+# identityToken 當場跟 pocket-id 換,見 bridge.py 的 _pocket_id_autoenroll。
+# 以前這個 env 沒進 plist,所以出貨的 Mac 一律 enroll 不了 ——
+# 使用者打開「遠端連線」只會看到「還沒接上 Pocket ID」然後卡死。
+# 設成空字串即可整段關閉(bridge 那邊是 env 閘,沒值就完全靜默)。
+POCKET_ID_URL="${POCKET_ID_URL-https://id.pocket.shan.house}"
 PROVIDER_CHOICE="${POCKET_PROVIDER:-${POCKET_INSTALL_PROVIDER:-auto}}"
 if [ -z "$PROVIDER_CHOICE" ] && [ "${POCKET_INSTALL_PROVIDERS:-0}" = "1" ]; then
   PROVIDER_CHOICE="auto"
@@ -364,6 +371,8 @@ cat > "$LAUNCH_AGENT" <<PLIST
         <string>$HERMES_HOME_ROOT</string>
         <key>OPENCLAW_CONFIG_FILE</key>
         <string>$OPENCLAW_CONFIG_FILE</string>
+        <key>POCKET_ID_URL</key>
+        <string>$POCKET_ID_URL</string>
     </dict>
 
     <key>RunAtLoad</key>

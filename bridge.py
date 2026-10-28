@@ -10946,10 +10946,14 @@ async def _pocket_id_api(path: str, payload: dict) -> dict:
         return r.json()
 
 
-async def _pocket_id_register() -> None:
-    """一次性 enroll:帶 POCKET_ID_ENROLL_TOKEN 註冊,存回 host 身分 + 服務公鑰。"""
+async def _pocket_id_register(enroll_token: str = "") -> None:
+    """一次性 enroll:帶 enroll token 註冊,存回 host 身分 + 服務公鑰。
+
+    token 預設取 env 的 POCKET_ID_ENROLL_TOKEN(人工裝機那條路);
+    自動 enroll 會把當場換來的 token 傳進來(見 _pocket_id_autoenroll)。
+    """
     data = await _pocket_id_api("/v1/hosts/register", {
-        "enroll_token": POCKET_ID_ENROLL_TOKEN,
+        "enroll_token": enroll_token or POCKET_ID_ENROLL_TOKEN,
         "name": _pocket_id_host_name(),
         "platform": _pocket_id_platform(),
         "candidates": _pocket_id_candidates(),
@@ -10963,6 +10967,50 @@ async def _pocket_id_register() -> None:
     })
     _log_event("pocket_id_enrolled", url=POCKET_ID_URL,
                host_id_hash=_short_hash(str(data["host_id"])))
+
+
+async def _pocket_id_autoenroll(identity_token: str) -> None:
+    """機主用 Apple 登入桌面端時,順手把這台 Mac enroll 進 Pocket ID。
+
+    **為什麼做在 bridge 而不是桌面 app**:桌面端早就把 Apple identityToken
+    送過來換本機 session 了(/app/v1/auth/apple),那張 JWT 同一張就能跟
+    pocket-id 換 session。讓 bridge 轉發一次,就不必在桌面端新增 pocket-id
+    client、不必多存一份 session、更不必把 enroll token 經過 LaunchAgent
+    的 plist(那是秘密,而且 plist 每次重裝都會被整份覆寫)。
+    已經裝好的機器也因此會在下次登入時自動補上,不用重跑安裝器。
+
+    前提:pocket-id 的 POCKET_ID_APPLE_AUDS 要含桌面端的 aud
+    (com.pocketagent.desktop / com.pocketagent.web),否則這裡會拿到 401。
+
+    **絕不讓登入失敗**。這是附帶動作 —— pocket-id 掛了、aud 沒設、網路不通,
+    使用者該做的事(登入桌面端)都必須照常完成。
+    """
+    import httpx
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            r = await client.post(POCKET_ID_URL + "/v1/auth/apple",
+                                  json={"id_token": identity_token})
+            if r.status_code != 200:
+                _log_event("pocket_id_autoenroll_skipped",
+                           stage="auth", status=r.status_code)
+                return
+            session = r.json().get("session_token") or ""
+            if not session:
+                _log_event("pocket_id_autoenroll_skipped", stage="auth",
+                           reason="no session_token")
+                return
+            r = await client.post(POCKET_ID_URL + "/v1/enroll/new",
+                                  headers={"Authorization": f"Bearer {session}"})
+            if r.status_code != 200:
+                # 429 = 同一帳號一小時內要太多次,不是錯誤,下次登入再說。
+                _log_event("pocket_id_autoenroll_skipped",
+                           stage="enroll_new", status=r.status_code)
+                return
+            token = r.json().get("enroll_token") or ""
+        if token:
+            await _pocket_id_register(token)
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("pocket_id_autoenroll", _exc, expected=True)
 
 
 async def _pocket_id_heartbeat() -> None:
@@ -23950,6 +23998,13 @@ async def app_auth_apple(request: Request):
     _log_event("apple_auth_success",
                apple_user_hash=_short_hash(apple_user_id),
                audience=str(claims.get("aud") or ""))
+    # 機主登入 = 唯一能證明「這台 Mac 屬於誰」的時刻,順手把它 enroll 進
+    # Pocket ID(沒接就跳過、已 enroll 就不重做)。背景跑:登入不等它,
+    # 而且它失敗也不該讓登入失敗。
+    if POCKET_ID_URL and not _pocket_id_state():
+        _t = asyncio.create_task(_pocket_id_autoenroll(identity_token))
+        _BG_TASKS.add(_t)
+        _t.add_done_callback(_BG_TASKS.discard)
     return {
         "ok": True,
         "user": _account_public_user(user),
