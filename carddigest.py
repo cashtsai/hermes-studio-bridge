@@ -70,7 +70,14 @@ def attach_captured_media(store, captured: list) -> int:
     """
     if not captured:
         return 0
-    items = [c for c in captured if isinstance(c, dict) and c.get("available")]
+    # 只收**真的能下載的本機檔案**。媒體擷取會把內文裡的網址也一併收進來
+    # (source_kind="url",沒有 download_url),掛上去就是一排點不開的空殼:
+    # `en` / `about` / `)` / `central-lardprao)。` —— 全是網址片段與中文標點被
+    # 當成檔名(機主 2026-10-29 截圖:一個 pptx 旁邊掛了 15 個垃圾)。
+    # 內文裡的網址本來就會被渲染成可點連結,不需要再變成附件。
+    items = [c for c in captured
+             if isinstance(c, dict) and c.get("available")
+             and c.get("download_url") and c.get("source_kind") != "url"]
     if not items:
         return 0
     touched = 0
