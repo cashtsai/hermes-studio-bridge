@@ -46,7 +46,13 @@ _DEFAULT_CWD = os.path.expanduser(
 # 若 CLI 預設模型落在 2.5 系,就會每次 404 → 退避重試 → 時間這樣被吃掉。
 # ⚠️ 換模型是**有機會**的解,尚未端到端證實(CLI 側量測互相矛盾,見 commit note)。
 # 原本整支 provider 沒有任何模型設定,連換都換不了 —— 先把把手補上。
-_MODEL = (os.environ.get("GEMINI_MODEL") or "").strip()
+#
+# 2026-10-10:env 之外再加一層落檔(`~/.pocket/gemini.json` 的 `model`),讓 app
+# 的設定面板改得動。**模型是 CLI 的 spawn 參數**(`gemini --acp -m <model>`)而
+# 且整個 provider 共用一個 ACP 行程 —— 所以這是**全域設定,不是 per-session**,
+# 改完必須重啟行程才生效(同既有的改 API key 路徑)。要做成 per-session 得一條
+# 對話一個行程,那是另一個量級,不在這裡假裝做到。
+_MODEL_ENV = (os.environ.get("GEMINI_MODEL") or "").strip()
 
 
 class GeminiError(Exception):
@@ -60,25 +66,49 @@ class GeminiError(Exception):
 
 # ── 配置 ───────────────────────────────────────────────────────────────────
 
-def load_config() -> dict:
-    """env 優先(GEMINI_API_KEY),否則讀 ~/.pocket/gemini.json。"""
-    key = (os.environ.get("GEMINI_API_KEY") or "").strip()
-    if key:
-        return {"api_key": key, "source": "env"}
+def _read_file() -> dict:
     try:
         with open(_CONFIG_FILE, "r", encoding="utf-8") as f:
-            d = json.load(f) or {}
-        return {"api_key": str(d.get("api_key") or "").strip(), "source": "file"}
+            return json.load(f) or {}
     except Exception:  # noqa: BLE001 — 缺檔/壞檔一律視為未配置
-        return {"api_key": "", "source": "none"}
+        return {}
 
 
-def save_config(api_key: str) -> dict:
-    """App「進階」頁的手動配置落檔(0600)。env 有值時 env 仍優先。"""
+def load_config() -> dict:
+    """env 優先(GEMINI_API_KEY),否則讀 ~/.pocket/gemini.json。
+
+    `model` 與 `api_key` 的來源**各自獨立判定** —— 用 env 帶 key、用檔案設模型
+    是正常組合,不能因為 key 來自 env 就讀不到落檔的模型。
+    """
+    d = _read_file()
+    file_model = str(d.get("model") or "").strip()
+    model = _MODEL_ENV or file_model
+    out = {"model": model,
+           "model_source": ("env" if _MODEL_ENV
+                            else "file" if file_model else "none")}
+    key = (os.environ.get("GEMINI_API_KEY") or "").strip()
+    if key:
+        return {**out, "api_key": key, "source": "env"}
+    return {**out,
+            "api_key": str(d.get("api_key") or "").strip(),
+            "source": "file" if d else "none"}
+
+
+def save_config(api_key: str | None = None, model: str | None = None) -> dict:
+    """App「進階」頁/設定面板的手動配置落檔(0600)。env 有值時 env 仍優先。
+
+    **合併寫入**:只帶 model 的呼叫不可以把 api_key 清掉,反之亦然。原本這支
+    無條件寫 `{"api_key": ...}`,加上 model 欄之後若照舊會把模型洗掉。
+    """
+    d = _read_file()
+    if api_key is not None:
+        d["api_key"] = api_key.strip()
+    if model is not None:
+        d["model"] = model.strip()
     os.makedirs(os.path.dirname(_CONFIG_FILE), exist_ok=True)
     tmp = _CONFIG_FILE + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
-        json.dump({"api_key": (api_key or "").strip()}, f)
+        json.dump(d, f)
     os.chmod(tmp, 0o600)
     os.replace(tmp, _CONFIG_FILE)
     return load_config()
@@ -251,8 +281,11 @@ class GeminiClient:
                 except OSError:
                     stderr_to = asyncio.subprocess.DEVNULL
             argv = [gemini_bin(), "--acp"]
-            if _MODEL:
-                argv += ["-m", _MODEL]
+            # 每次 spawn 重讀 —— 設定面板改完會 _drop_proc(),下一次握手就要
+            # 吃到新模型。讀 module 常數的舊寫法改了也不會生效。
+            model = cfg.get("model") or ""
+            if model:
+                argv += ["-m", model]
             try:
                 self.proc = await asyncio.create_subprocess_exec(
                     *argv,
@@ -283,7 +316,7 @@ class GeminiClient:
                       protocol=(self.server_info or {}).get("protocolVersion"),
                       # 用了哪個模型要留痕:查「很慢」時第一個要問的就是這個,
                       # 而原本日誌完全看不出來(空=沿用 CLI 預設)。
-                      model=_MODEL or "(cli-default)")
+                      model=model or "(cli-default)")
 
     async def _drop_proc(self):
         proc, self.proc = self.proc, None

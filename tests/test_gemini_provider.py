@@ -48,9 +48,48 @@ class ConfigTests(unittest.TestCase):
             pass
 
     def test_unconfigured_by_default(self):
-        self.assertEqual(gemini_provider.load_config(),
-                         {"api_key": "", "source": "none"})
+        # 2026-10-10 契約擴充:load_config() 多了 model / model_source。
+        # 原本是 dict 全等斷言,改成逐欄 —— 以後再加欄位不該讓這條紅。
+        cfg = gemini_provider.load_config()
+        self.assertEqual((cfg["api_key"], cfg["source"]), ("", "none"))
+        self.assertEqual((cfg["model"], cfg["model_source"]), ("", "none"))
         self.assertFalse(bridge.GEMINI.configured())
+
+    def test_model_empty_means_cli_default(self):
+        """空字串 = 不給 -m,沿用 CLI 自己的預設(與加把手之前同行為)。"""
+        self.assertEqual(gemini_provider.load_config()["model"], "")
+
+    def test_model_persists_to_file(self):
+        gemini_provider.save_config(model="gemini-3.5-flash")
+        cfg = gemini_provider.load_config()
+        self.assertEqual((cfg["model"], cfg["model_source"]),
+                         ("gemini-3.5-flash", "file"))
+
+    def test_model_write_does_not_wipe_api_key(self):
+        """設定面板只改模型時不可以把 key 洗掉(save_config 合併寫入)。"""
+        gemini_provider.save_config("file-key")
+        gemini_provider.save_config(model="gemini-3.5-flash")
+        cfg = gemini_provider.load_config()
+        self.assertEqual(cfg["api_key"], "file-key")
+        self.assertEqual(cfg["model"], "gemini-3.5-flash")
+
+    def test_key_write_does_not_wipe_model(self):
+        """反向同理 —— 「進階」頁改 key 不可以把模型洗掉。"""
+        gemini_provider.save_config(model="gemini-3.5-flash")
+        gemini_provider.save_config("new-key")
+        cfg = gemini_provider.load_config()
+        self.assertEqual(cfg["model"], "gemini-3.5-flash")
+        self.assertEqual(cfg["api_key"], "new-key")
+
+    def test_model_source_independent_of_key_source(self):
+        """用 env 帶 key、用檔案設模型是正常組合 —— 不可因為 key 來自 env
+        就讀不到落檔的模型(原本 load_config 的早退 return 會踩到)。"""
+        gemini_provider.save_config(model="gemini-3.5-flash")
+        os.environ["GEMINI_API_KEY"] = "env-key"
+        cfg = gemini_provider.load_config()
+        self.assertEqual(cfg["source"], "env")
+        self.assertEqual((cfg["model"], cfg["model_source"]),
+                         ("gemini-3.5-flash", "file"))
 
     def test_env_wins_over_file(self):
         gemini_provider.save_config("file-key")
