@@ -19953,6 +19953,20 @@ CX_SEED_DEGRADED_CARD_TEXT = (
     "歷史檔太大時每次重讀都會逾時。"
 )
 _CX_DEGRADED_CARD_ID = "card-cx-seed-degraded"
+# turns/list **有回合**、卡片庫卻生不出半張 —— 這是 bridge 自己的缺陷形狀,
+# 不是資料面問題,所以講法要跟「讀不到歷史」分開(那是 codex 索引列不出來)。
+# 2026-10-26 實害:Cashcamp(019f39d3)送出後 Codex 答完、逐字稿有完整回覆,
+# 但卡片庫 cards=0 / latest_seq=1 —— 原因是沒有 per-item id 的 item 被產生器
+# 整批丟掉。當天的守門寫成 `if not turns and not cards`,**要兩個都空才出聲**,
+# 於是這個形狀正好從縫裡掉出去:回 200、空清單、零卡片、零日誌,
+# 使用者只看到一個打得開、送得出、永遠沒反應的空殼,查了一整天。
+CX_CARDS_DROPPED_CARD_TEXT = (
+    "⚠️ 這條會話**讀到了歷史回合,但一張卡片都產不出來** —— 這是 bridge 端的"
+    "缺陷,不是你的對話出問題。\n\n原始紀錄在 Mac 上完好無損。"
+    "\n\n在這裡送出新訊息仍然可以正常對話;若要看回歷史,請回桌面端。"
+    "已記錄 `cx_cards_dropped` 事件供排查。"
+)
+_CX_CARDS_DROPPED_CARD_ID = "card-cx-cards-dropped"
 # 冷啟重試節奏:bridge 重啟後 codex app-server 實測要 ~30s 才答得動
 # (2026-10-10:重啟 +22s thread/list 逾時、+32s thread/read 逾時),
 # 所以重試窗要蓋過那段。
@@ -20064,6 +20078,77 @@ def _cx_feed_empty_history(thread_id: str) -> None:
         _log_event("cx_empty_history", thread=thread_id[:16])
     except Exception as _exc:  # noqa: BLE001
         _log_exc("_cx_feed_empty_history", _exc, expected=True)
+
+
+def _cx_feed_cards_dropped(thread_id: str, turn_count: int) -> None:
+    """turns/list 有回合、卡片庫卻 0 張 → 推一張卡 + **大聲記 log**。
+
+    與 `_cx_feed_empty_history` 的差別:那個是「codex 列不出回合」(資料面,
+    bridge 修不了);這個是「回合讀到了、卡片沒產出來」(**bridge 自己的缺陷**)。
+    兩者對使用者的畫面一模一樣(空白聊天室 + 全部 200),但該做的事相反 ——
+    前者只能說明,後者要有人去修。所以事件名、卡片文案都刻意分開。
+
+    `turn_count` 進 log:下次再發生時,一眼就知道「讀到幾個回合卻掉光」,
+    不用像 2026-10-26 那樣從 189MB 的 rollout 檔一路反推。"""
+    d = _CX_CARD_DIGESTS.get(thread_id)
+    if d is None or getattr(d, "cards_dropped_carded", False):
+        return
+    try:
+        d.cards_dropped_carded = True
+        d.store.upsert_card(carddigest.make_card(
+            _CX_CARDS_DROPPED_CARD_ID, d.store.turn_id, "system", "text",
+            {"text": CX_CARDS_DROPPED_CARD_TEXT,
+             "fallback_text": CX_CARDS_DROPPED_CARD_TEXT,
+             "error_code": "CX_CARDS_DROPPED"}))
+        _log_event("cx_cards_dropped", thread=thread_id[:16], turns=turn_count,
+                   detail="turns/list 有回合但卡片庫 0 張 —— bridge 端缺陷,要修")
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("_cx_feed_cards_dropped", _exc, expected=True)
+
+
+def _cx_empty_digest_reason(turns, cards) -> str | None:
+    """seed 完卡片庫是空的 → 這是哪一種空?(`None` = 不空,沒事)
+
+    **純函式,因為這裡正是 2026-10-26 出事的那道縫**,必須能單獨測。
+    當時的寫法是:
+
+        if not turns and not d.store.cards:    # ← 要兩個都空才出聲
+            _cx_feed_empty_history(thread_id)
+
+    於是「turns 有回合、卡片 0 張」這個形狀整個掉出去 —— 而那偏偏是**最該出聲**
+    的一種,因為它代表 bridge 自己把讀到的東西丟光了,不是 codex 沒東西可給。
+    實害:Cashcamp(019f39d3)回 200 + 空清單 + 零日誌,查了一整天。
+
+    回傳:
+      "cards_dropped" —— 有回合、沒卡片(**bridge 缺陷,要修**)
+      "empty_history" —— 回合也沒有(codex 索引列不出,資料面,只能說明)
+      None            —— 有卡片,一切正常
+    """
+    if cards:
+        return None
+    return "cards_dropped" if turns else "empty_history"
+
+
+CX_CARDS_RECOVERED_CARD_TEXT = "✅ 歷史卡片已經讀得出來了,上面的內容是完整的。"
+
+
+def _cx_feed_cards_recovered(thread_id: str) -> None:
+    """後來產得出卡了 → 把那張警告**原地換成**已恢復,並讓旗標歸零。
+
+    不換掉的話,畫面上會永遠掛著一張「產不出卡片」,而旁邊明明有卡 ——
+    比沒講還糟(同 `_cx_feed_seed_recovered` 的理由)。"""
+    d = _CX_CARD_DIGESTS.get(thread_id)
+    if d is None or _CX_CARDS_DROPPED_CARD_ID not in d.store.cards:
+        return
+    try:
+        d.store.upsert_card(carddigest.make_card(
+            _CX_CARDS_DROPPED_CARD_ID, d.store.turn_id, "system", "text",
+            {"text": CX_CARDS_RECOVERED_CARD_TEXT,
+             "fallback_text": CX_CARDS_RECOVERED_CARD_TEXT}))
+        d.cards_dropped_carded = False   # 下次再壞還要能再講一次
+        _log_event("cx_cards_recovered", thread=thread_id[:16])
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("_cx_feed_cards_recovered", _exc, expected=True)
 
 
 def _cx_feed_thread_unlocked(thread_id: str) -> None:
@@ -20241,8 +20326,14 @@ async def _cx_seed_card_digest(thread_id: str, d, required: bool = False) -> Non
         # `compacted` 紀錄(rollout 第 2 行),codex 的 turns/list 結構上就列不出
         # turn → bridge 永遠 seed 到 0 筆。這不是 bridge 能修的資料面問題,
         # 但「不給任何說明」是 bridge 的責任。推一張卡講清楚現況與去處。
-        if not turns and not d.store.cards:
+        reason = _cx_empty_digest_reason(turns, d.store.cards)
+        if reason == "cards_dropped":
+            _cx_feed_cards_dropped(thread_id, len(turns))
+        elif reason == "empty_history":
             _cx_feed_empty_history(thread_id)
+        else:
+            # 產得出卡了 → 把先前那張警告換成已恢復(同 seed_degraded 的作法)。
+            _cx_feed_cards_recovered(thread_id)
         # 修 ②:seed 完(= 剛把桌面端進度補齊)也刷新持久快取,重啟後只要
         # 有人開過一次 session,之後的列表預覽就不再依賴記憶體。
         _cx_preview_cache_note(thread_id)
