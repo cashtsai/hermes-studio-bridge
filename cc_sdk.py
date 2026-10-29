@@ -122,7 +122,7 @@ def _project_key(workdir: str) -> str:
     非英數字元換成 `-`,超長還會加雜湊後綴。原本這裡寫 `workdir.replace("/","-")`,
     路徑一旦含點號、經過符號連結、或結尾有斜線就**算錯目錄**:
       /tmp/foo            → 現行 -tmp-foo        官方 -private-tmp-foo
-      /Users/x/apps/a.b   → 現行 -Users-x-apps-a.b 官方 -Users-x-apps-a-b
+      /Users/<you>/apps/a.b → 現行 -Users-<you>-apps-a.b 官方 -Users-<you>-apps-a-b
     算錯的後果是 `_seed_history` 找不到檔案後**靜默 return** —— 歷史整段不見,
     而且沒有任何錯誤訊息(2026-10-29 稽核發現)。
     SDK 缺席時退回舊寫法,至少不比修之前差。"""
@@ -1187,7 +1187,12 @@ class CCSdkSession:
             self._collect_tool_results(msg)
             self._collect_tool_images(msg)
             return False
-        if isinstance(msg, sdk.UserMessage):
+        # ⚠️ `getattr` 而不是 `sdk.UserMessage` —— SDK 版本之間型別會增減,
+        # 直接取屬性會在**訊息迴圈正中間**丟 AttributeError,整個回合被
+        # cc2_turn_error 打斷(2026-10-29 實測:舊版 stub 就重現了)。
+        # 取不到時退成空 tuple,`isinstance` 一律 False:少收一種訊息
+        # 比整個回合炸掉好,而且那條路本來就是「順便多收一點」。
+        if isinstance(msg, getattr(sdk, "UserMessage", ())):
             # 工具結果。cc2 原本整個不看 UserMessage —— 工具回傳的圖進不了
             # 卡片庫,文字結果也完全看不到(只看得到「呼叫了什麼」)。
             self._collect_tool_results(msg)
@@ -1412,6 +1417,7 @@ class CCSdkSession:
             # CLI 原生 TUI 自己產生的 `[User answered <header>]: <答案>`,模型
             # 是 native 看得懂的,不必額外解釋。
             picked = ""
+            extract_error = ""      # 「取不到答案」與「使用者略過」必須分得出來
             if isinstance(decision, str) and decision.startswith("ask:"):
                 idx = decision.split(":", 1)[1]
                 if idx != "skip":
@@ -1419,10 +1425,20 @@ class CCSdkSession:
                         q0 = (tool_input.get("questions") or [{}])[0]
                         picked = str((q0.get("options") or [])[int(idx)]
                                      .get("label") or "")
-                    except Exception:  # noqa: BLE001
+                    except Exception as exc:  # noqa: BLE001
+                        # ⚠️ 不可以靜默退成 ""。下面 `if not picked:` 會回
+                        # 「The user did not answer the questions.」—— 使用者明明
+                        # 按了,模型卻被告知沒人回答。**這正是這條分支自己宣稱
+                        # 修好的那個 bug**,從例外這條路爬回來。
+                        # 而且原本那行 _log 會把它記成 picked="(略過)",跟使用者
+                        # 真的按略過**完全無法區分** —— 不是沒留痕,是留了個會
+                        # 誤導的痕跡,比沒留更難查。
                         picked = ""
+                        extract_error = f"{type(exc).__name__}: {exc}"[:120]
             _log("cc2_question_answered", session=self.name,
-                 approval_id=aid, picked=picked[:40] or "(略過)",
+                 approval_id=aid,
+                 picked=picked[:40] or ("(取答案失敗)" if extract_error else "(略過)"),
+                 extract_error=extract_error or None,
                  multi=ask_multi)
             if not picked:
                 # 略過/逾時:回 CLI 原生的那句話,模型自己決定怎麼繼續

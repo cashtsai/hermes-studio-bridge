@@ -125,13 +125,13 @@ class CC2StructuralParityTest(unittest.TestCase):
     def test_project_key_matches_sdk(self):
         """歷史目錄名算錯 → _seed_history 靜默找不到檔案 → 歷史整段不見。"""
         from claude_agent_sdk import project_key_for_directory as official
-        for d in ("/tmp/foo", "/Users/xcash/apps/studio-os"):
+        for d in ("/tmp/foo", "/Users/you/apps/studio-os"):
             self.assertEqual(cc_sdk._project_key(d), official(d),
                              "必須與 SDK 官方演算法一致(realpath + 非英數轉 -)")
 
     def test_dotted_path_no_longer_naive(self):
         """舊寫法 replace('/','-') 會把點號留著 → 對不上真實目錄。"""
-        key = cc_sdk._project_key("/Users/xcash/apps/foo.bar")
+        key = cc_sdk._project_key("/Users/you/apps/foo.bar")
         self.assertNotIn(".", key, "點號必須被正規化掉")
 
     def test_live_holder_detection_ignores_dead_pid(self):
