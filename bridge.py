@@ -21410,6 +21410,35 @@ cc_sdk.configure(log=_log_event,
                  turn_end_push=_cc2_turn_end_push)
 
 
+@app.get("/app/v2/cc2/{name}/history")
+async def v2_cc2_history(name: str, request: Request,
+                         limit: int = 40, offset: int = 0):
+    """歷史分頁(tmux 有、cc2 原本只有進場 seed 的最近 40 則 → 翻不回去)。"""
+    _check_auth(request)
+    if not cc_sdk.enabled():
+        raise http_err(404, "CC2_DISABLED", "cc2 provider 未啟用")
+    sess = cc_sdk.registry().get(name)
+    if sess is None:
+        raise http_err(404, "SESSION_NOT_FOUND", f"找不到 cc2 session {name}")
+    return sess.history_page(limit=max(1, min(int(limit or 40), 200)),
+                             offset=max(0, int(offset or 0)))
+
+
+@app.post("/app/v2/cc2/{name}/compact")
+async def v2_cc2_compact(name: str, request: Request):
+    """壓縮對話(tmux 有 `ccsess compress`;v2 的統一 compact 原本對 cc2 回 409)。"""
+    _check_auth(request)
+    if not cc_sdk.enabled():
+        raise http_err(404, "CC2_DISABLED", "cc2 provider 未啟用")
+    sess = cc_sdk.registry().get(name)
+    if sess is None:
+        raise http_err(404, "SESSION_NOT_FOUND", f"找不到 cc2 session {name}")
+    res = await sess.compact()
+    if not res.get("ok"):
+        raise http_err(409, "CC2_BUSY", res.get("message") or "忙碌中")
+    return {"ok": True, "session_id": f"cc2:{name}", **res}
+
+
 @app.post("/app/v2/cc2/{name}/rename")
 async def v2_cc2_rename(name: str, request: Request):
     """改名(tmux 有、cc2 原本缺)。session 身分是 name,所以是搬鍵不是改欄位。"""

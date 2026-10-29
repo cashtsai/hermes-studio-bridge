@@ -214,3 +214,118 @@ class CC2ManagementParityTest(unittest.TestCase):
         s = self.r.ensure("push-3", workdir="/tmp")
         s.archived = True
         self.assertTrue(s.archived)
+
+
+class CC2AskUserQuestionTest(unittest.TestCase):
+    """多選提問(2026-10-29 機主:「沒有多選提問到底怎麼使用,遇到不就卡住了」)。
+
+    CLI 的 AskUserQuestion 是一個**工具**,所以會進 `can_use_tool`。原本 cc2
+    把它當一般工具,卡片只有「允許/拒絕」—— 使用者看不到選項、只能盲選,
+    而且允許之後工具也拿不到答案。現在:選項攤成卡片按鈕,選擇用
+    `PermissionResultAllow(updated_input=...)` 寫回工具輸入。
+    """
+
+    def setUp(self):
+        self.r = cc_sdk.CCSdkRegistry()
+        self.s = self.r.ensure("ask-1", workdir="/tmp")
+        self.inp = {"questions": [{
+            "question": "要用哪個資料庫?", "header": "DB", "multiSelect": False,
+            "options": [{"label": "PostgreSQL", "description": "關聯式"},
+                        {"label": "SQLite", "description": "輕量"}]}]}
+
+    def test_options_become_card_buttons(self):
+        opts, title, multi = cc_sdk.CCSdkSession._ask_question_options(self.inp)
+        labels = [o["label"] for o in opts]
+        self.assertIn("PostgreSQL", labels)
+        self.assertIn("SQLite", labels)
+        self.assertEqual(title, "要用哪個資料庫?")
+        self.assertFalse(multi)
+
+    def test_skip_button_always_present(self):
+        """CLI 原生 UI 永遠有 Skip —— 不能讓人無路可走。"""
+        opts, _, _ = cc_sdk.CCSdkSession._ask_question_options(self.inp)
+        self.assertEqual(opts[-1]["key"], "ask:skip")
+
+    def test_multiselect_flag_detected(self):
+        inp = {"questions": [{"question": "選多個", "multiSelect": True,
+                              "options": [{"label": "A"}, {"label": "B"}]}]}
+        _, _, multi = cc_sdk.CCSdkSession._ask_question_options(inp)
+        self.assertTrue(multi)
+
+    def test_non_question_tool_unaffected(self):
+        """一般工具不受影響,仍走允許/拒絕。"""
+        opts, title, _ = cc_sdk.CCSdkSession._ask_question_options(
+            {"command": "ls -la"})
+        self.assertEqual(opts, [])
+        self.assertEqual(title, "")
+
+    def test_malformed_input_does_not_crash(self):
+        """壞資料不能炸掉審批流程(會卡住整個回合)。"""
+        for bad in ({}, {"questions": []}, {"questions": [{}]},
+                    {"questions": "not-a-list"},
+                    {"questions": [{"options": []}]}):
+            opts, _, _ = cc_sdk.CCSdkSession._ask_question_options(bad)
+            self.assertEqual(opts, [], f"壞輸入要安全退回一般審批: {bad}")
+
+    def test_decide_accepts_ask_keys(self):
+        """ask:N / ask:skip 要被決議端點接受,否則按了沒反應 = 真的卡住。"""
+        import asyncio
+        self.r.pending_approvals["aid-1"] = {
+            "event": asyncio.Event(), "decision": None,
+            "record": {"id": "aid-1"}, "session": "ask-1"}
+        self.assertEqual(self.r.decide_approval("aid-1", "ask:0"), "approved")
+        self.assertEqual(self.r.pending_approvals["aid-1"]["decision"], "ask:0")
+
+    def test_options_capped(self):
+        """選項太多時截斷,卡片不會爆版。"""
+        inp = {"questions": [{"question": "多", "options":
+                              [{"label": f"opt{i}"} for i in range(20)]}]}
+        opts, _, _ = cc_sdk.CCSdkSession._ask_question_options(inp)
+        self.assertLessEqual(len(opts), 7, "含略過最多 7 顆")
+
+
+class CC2HistoryCompactTest(unittest.TestCase):
+    """歷史分頁與壓縮(2026-10-29 收尾批)。"""
+
+    def setUp(self):
+        self.r = cc_sdk.CCSdkRegistry()
+        self.s = self.r.ensure("hist-1", workdir="/tmp")
+
+    def test_history_page_without_session_id(self):
+        """全新 session 沒有 transcript → 安靜回空,不炸。"""
+        out = self.s.history_page()
+        self.assertEqual(out["messages"], [])
+        self.assertFalse(out["more"])
+
+    def test_history_page_reads_real_transcript(self):
+        """真的讀得到 jsonl,並且回傳 role/text/ts 三欄。"""
+        import json as _j
+        sid = "test-" + "a" * 8
+        d = os.path.join(_TMP, "projects", cc_sdk._project_key("/tmp"))
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, f"{sid}.jsonl"), "w", encoding="utf-8") as f:
+            for i in range(5):
+                f.write(_j.dumps({"type": "user", "timestamp": 1700000000 + i,
+                                  "message": {"content": f"第{i}則"}}) + "\n")
+        old = cc_sdk._claude_projects_root
+        cc_sdk._claude_projects_root = lambda: os.path.join(_TMP, "projects")
+        try:
+            self.s.sdk_session_id = sid
+            out = self.s.history_page(limit=2)
+            self.assertEqual(len(out["messages"]), 2, "limit 要生效")
+            self.assertTrue(out["more"], "還有更早的要講")
+            self.assertEqual(out["total"], 5)
+            self.assertIn("role", out["messages"][0])
+            # offset 往回翻
+            older = self.s.history_page(limit=2, offset=2)
+            self.assertNotEqual(older["messages"], out["messages"])
+        finally:
+            cc_sdk._claude_projects_root = old
+
+    def test_compact_refused_while_busy(self):
+        """忙碌時壓縮會變成排隊,語意就不是「現在壓縮」—— 要明說。"""
+        import asyncio
+        self.s.busy = True
+        res = asyncio.run(self.s.compact())
+        self.assertFalse(res["ok"])
+        self.assertIn("還在跑", res["message"])

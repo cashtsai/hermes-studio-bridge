@@ -439,6 +439,44 @@ class CCSdkSession:
         self.session_allowed_tools: set[str] = set()
         self._seed_history()
 
+    def history_page(self, limit: int = 40, offset: int = 0) -> dict:
+        """歷史分頁(對應 tmux 的 `/ccsessions/{name}/history`)。
+
+        `_seed_history` 只放最近 N 則進卡片流,再往前就沒有了 —— 長對話等於
+        翻不回去。這支直接讀 transcript jsonl,給 app 往前捲:offset 從**最新**
+        往回數,回傳 `more` 告訴它還有沒有更早的。
+        """
+        out = {"messages": [], "more": False, "total": 0}
+        if not self.sdk_session_id:
+            return out
+        path = os.path.join(_claude_projects_root(),
+                            _project_key(self.workdir),
+                            f"{self.sdk_session_id}.jsonl")
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+        except FileNotFoundError:
+            return out
+        except Exception as e:  # noqa: BLE001
+            _log("cc2_history_page_failed", session=self.name, error=str(e)[:160])
+            return out
+        rows = []
+        for ln in lines:
+            try:
+                d = json.loads(ln)        # _seed_row 收的是解析後的 dict
+            except Exception:  # noqa: BLE001
+                continue
+            row = _seed_row(d)
+            if row:
+                rows.append({"role": row[0], "text": row[1], "ts": row[2]})
+        out["total"] = len(rows)
+        if offset:
+            rows = rows[:max(0, len(rows) - offset)]
+        page = rows[-max(1, limit):] if rows else []
+        out["more"] = len(rows) > len(page)
+        out["messages"] = page
+        return out
+
     def _seed_history(self) -> None:
         """歷史種子:sdk_session_id 對應的 transcript jsonl 撈最後 N 則
         (CC_SDK_HISTORY_SEED,預設 40)user/assistant 文字訊息 → final:true
@@ -621,6 +659,20 @@ class CCSdkSession:
             _log("cc2_disconnect_failed", session=self.name,
                  error=type(e).__name__)
 
+    async def compact(self) -> dict:
+        """壓縮對話(對應 tmux 的 `ccsess compress`)。
+
+        SDK 沒有壓縮 API,但 `/compact` 是 CLI 的斜線指令 —— 當成一般訊息送進去
+        即可,CLI 會自己處理並在 transcript 留下壓縮邊界。忙碌中不送(會排隊到
+        下一輪,語意就不是「現在壓縮」了)。
+        """
+        if self.busy:
+            return {"ok": False, "error": "busy",
+                    "message": "這一輪還在跑;等它結束再壓縮"}
+        await self.submit("/compact")
+        _log("cc2_compact_requested", session=self.name)
+        return {"ok": True, "message": "已送出壓縮指令"}
+
     async def interrupt(self) -> bool:
         """停止進行中 turn。回 False = 沒有活躍 turn(呼叫端回 409)。"""
         if not self.busy or self.client is None:
@@ -701,6 +753,39 @@ class CCSdkSession:
 
     # ── 審批(can_use_tool → Pocket 審核中心)──
 
+    @staticmethod
+    def _ask_question_options(tool_input: dict) -> tuple:
+        """AskUserQuestion 的 input → (卡片選項, 題目, 是否多選)。
+
+        CLI 的 AskUserQuestion 工具會帶 `questions: [{question, header,
+        multiSelect, options:[{label, description}]}]`。原本 cc2 把它當成一般
+        工具,卡片只有「允許/拒絕」——使用者看不到選項、只能盲選,等同卡住
+        (機主 2026-10-29)。這裡把真正的選項攤成卡片按鈕。
+        只處理第一題(Pocket 的審批卡一次一題;多題時其餘退回一般審批)。
+        """
+        qs = tool_input.get("questions") or []
+        if not isinstance(qs, list) or not qs:
+            return [], "", False
+        q0 = qs[0] if isinstance(qs[0], dict) else {}
+        opts = q0.get("options") or []
+        if not isinstance(opts, list) or not opts:
+            return [], "", False
+        out = []
+        for i, o in enumerate(opts[:6]):      # 卡片按鈕上限,超過的截斷
+            if not isinstance(o, dict):
+                continue
+            label = str(o.get("label") or "").strip()
+            if not label:
+                continue
+            out.append({"key": f"ask:{i}", "label": label[:40],
+                        "style": "primary" if i == 0 else "secondary"})
+        if not out:
+            return [], "", False
+        # 一律補「略過」—— CLI 的原生 UI 也永遠有 Skip,不能讓人無路可走。
+        out.append({"key": "ask:skip", "label": "略過", "style": "danger"})
+        title = str(q0.get("question") or q0.get("header") or "請選擇")[:200]
+        return out, title, bool(q0.get("multiSelect"))
+
     async def _can_use_tool(self, tool: str, tool_input: dict, _ctx):
         """SDK 的結構化審批回呼。建 pending record(卡片 + DB 鏡像)→ 等
         `/app/v1/approvals/{id}/decision` 叫醒 → 逾時/無決議一律 DENY
@@ -712,8 +797,11 @@ class CCSdkSession:
             _log("cc2_approval_auto_allow", session=self.name, tool=tool)
             return sdk.PermissionResultAllow()
         aid = "cc2-" + uuid.uuid4().hex[:12]
-        title = str(getattr(_ctx, "title", "") or
-                    f"Claude Code 要使用 {tool}")[:200]
+        ask_opts, ask_title, ask_multi = ([], "", False)
+        if tool == "AskUserQuestion":
+            ask_opts, ask_title, ask_multi = self._ask_question_options(tool_input)
+        title = ask_title or str(getattr(_ctx, "title", "") or
+                                 f"Claude Code 要使用 {tool}")[:200]
         now = time.time()
         record = {
             "id": aid, "title": title, "source": f"cc2:{self.name}",
@@ -726,11 +814,15 @@ class CCSdkSession:
             # 零改動):第三顆 key=approve_for_session → 舊 App(只認
             # approve/deny)安全退成一般允許,不會誤送拒絕;style=secondary
             # (較軟的允許)。
-            "options": [{"key": "approve", "label": "允許", "style": "primary"},
-                        {"key": "approve_for_session", "label": "本次全允許",
-                         "style": "secondary"},
-                        {"key": "deny", "label": "拒絕", "style": "danger"}],
+            "options": ask_opts or [
+                {"key": "approve", "label": "允許", "style": "primary"},
+                {"key": "approve_for_session", "label": "本次全允許",
+                 "style": "secondary"},
+                {"key": "deny", "label": "拒絕", "style": "danger"}],
         }
+        if ask_opts:
+            record["kind"] = "question"       # app 可據此換版面(不換也能用)
+            record["risk"] = "low"            # 回答問題不是危險操作
         waiter = {"event": asyncio.Event(), "decision": None,
                   "record": record, "session": self.name}
         self.registry.pending_approvals[aid] = waiter
@@ -755,6 +847,33 @@ class CCSdkSession:
         _db_hook(APPROVAL_DB_MARK, aid, status)
         _log("cc2_approval_decided", session=self.name, approval_id=aid,
              tool=tool, status=status)
+        if ask_opts:
+            # AskUserQuestion:把使用者選的那顆寫回工具輸入(updated_input),
+            # 工具才拿得到答案。沒選/逾時 → 照 CLI 原生語意回「略過」,
+            # 讓模型自己決定怎麼繼續,而不是 fail-closed 把回合打斷。
+            picked = ""
+            if isinstance(decision, str) and decision.startswith("ask:"):
+                idx = decision.split(":", 1)[1]
+                if idx != "skip":
+                    try:
+                        q0 = (tool_input.get("questions") or [{}])[0]
+                        picked = str((q0.get("options") or [])[int(idx)]
+                                     .get("label") or "")
+                    except Exception:  # noqa: BLE001
+                        picked = ""
+            new_input = dict(tool_input)
+            try:
+                qs = [dict(q) for q in (new_input.get("questions") or [])
+                      if isinstance(q, dict)]
+                if qs:
+                    qs[0]["_pocket_answer"] = picked      # 答案;空 = 略過
+                    new_input["questions"] = qs
+            except Exception:  # noqa: BLE001
+                pass
+            _log("cc2_question_answered", session=self.name,
+                 approval_id=aid, picked=picked[:40] or "(略過)",
+                 multi=ask_multi)
+            return sdk.PermissionResultAllow(updated_input=new_input)
         if approved:
             return sdk.PermissionResultAllow()
         return sdk.PermissionResultDeny(
@@ -889,6 +1008,10 @@ class CCSdkRegistry:
         # 三態:approve_for_session 對等待者是獨立決議值(等待者藉此記下
         # session_allowed_tools);對外(DB/卡片/回應)仍是 approved ——
         # 狀態字彙不擴,app 零改動。
+        if isinstance(key, str) and key.startswith("ask:"):
+            waiter["decision"] = key          # 提問:key 原樣帶回(ask:N / ask:skip)
+            waiter["event"].set()
+            return "approved"
         decision = ("deny" if key == "deny" else
                     "approve_for_session" if key == "approve_for_session" else
                     "approve")
