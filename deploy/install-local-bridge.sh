@@ -412,7 +412,7 @@ fi
 #
 # bridge 配對時**早就會**報出 `https://<machine>.<tailnet>.ts.net` 這個候選
 # (見 bridge.py 的 `_pair_host_candidates`),app 也早就認得它
-# (StudioConfig:「.ts.net + http = 私網 Tailscale、+ https = 公網 Funnel」)。
+# (StudioConfig:「<…>.ts.net 配 http = 私網 Tailscale、配 https = 公網 Funnel」)。
 # **但從來沒有任何地方去跑 `tailscale serve`** —— 所以那個候選對新機器是死的,
 # 手機探測逾時後默默跳過。路徑設計好了卻沒人啟用,又一個「功能安靜地不存在」。
 #
