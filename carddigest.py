@@ -1198,6 +1198,14 @@ class CodexThreadDigest(ApprovalCardMixin):
             # 「重播當下」而不是事件發生時間。
             live_ts = _cx_coerce_ts(params.get("startedAtMs")
                                     or params.get("completedAtMs"))
+            # ⚠️ 三個累積器都要在 item 收尾時清掉。`agent_text` 本來就 pop 了,
+            # 新加的 `reason_text` / `exec_text` 一開始沒有清除點 —— 長壽 thread
+            # 的 digest 會隨 item 數線性長大(每 item 最多 2KB),不會立刻出事
+            # 但會慢慢長,而且偏離了同一個檔已經建立的慣例。
+            # 放在型別判斷**之外**:推理與指令輸出不是 agentMessage,
+            # 寫進 if 分支裡就永遠清不到。
+            self.reason_text.pop(item.get("id"), None)
+            self.exec_text.pop(item.get("id"), None)
             if item.get("type") == "agentMessage":
                 self.agent_text.pop(item.get("id"), None)
                 self.store.saw_output = True

@@ -439,6 +439,55 @@ class TestExceptionLogging(unittest.TestCase):
         self.assertIn('"suppressed": 499', lines[0],
                       "被壓掉的筆數要帶出來,否則看不出真實頻率")
 
+    # ⚠️ 下面那道守門**只掃 bridge.py**,而 provider 的程式碼住在別的檔。
+    # 2026-10-29 實例:feat/cc2-parity 把 bridge.py 維持在 0 個無痕 except
+    # (守門照樣綠),卻在**不受管轄的 cc_sdk.py** 從 3 個長到 17 個 ——
+    # 其中一個在要害上:取使用者選的答案失敗時靜默退成 "",接著就告訴模型
+    # 「The user did not answer the questions.」,而那正是該分支自己宣稱
+    # 修好的 bug。守門看不到的地方,病就長在那裡。
+    _SILENT_EXCEPT_RATCHET = {"bridge.py": 0, "cc_sdk.py": 3}
+
+    def _silent_except_lines(self, filename: str) -> list:
+        import ast
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        path = os.path.join(root, filename)
+        if not os.path.exists(path):
+            return []
+        with open(path, encoding="utf-8") as f:
+            tree = ast.parse(f.read())
+        # `_log` 是 cc_sdk.py 的記錄函式;bridge.py 用 `_log_event`/`_log_exc`。
+        LOGGERS = {"_log", "_log_event", "_log_exc", "_codex_http_error"}
+        out = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.ExceptHandler):
+                continue
+            ty = node.type
+            if not (isinstance(ty, ast.Name)
+                    and ty.id in ("Exception", "BaseException")):
+                continue
+            names, raises = set(), False
+            for stmt in node.body:
+                for n in ast.walk(stmt):
+                    if isinstance(n, ast.Raise):
+                        raises = True
+                    if isinstance(n, ast.Call):
+                        f = n.func
+                        names.add(f.id if isinstance(f, ast.Name)
+                                  else getattr(f, "attr", ""))
+            if not (names & LOGGERS) and not raises:
+                out.append(node.lineno)
+        return out
+
+    def test_provider_files_silent_except_ratchet(self):
+        """provider 檔案的無痕 except **只能變少**。數字往上調等於承認又放一個進來。"""
+        for fn, cap in self._SILENT_EXCEPT_RATCHET.items():
+            lines = self._silent_except_lines(fn)
+            self.assertLessEqual(
+                len(lines), cap,
+                f"{fn} 的無痕 except 從 {cap} 長到 {len(lines)} 個:{lines}。"
+                f"要嘛留痕(呼叫 _log/_log_event/_log_exc 或 raise),"
+                f"要嘛把棘輪往**下**調 —— 不准往上。")
+
     def test_no_silent_except_exception_left(self):
         """護欄:不准再有「完全不留痕」的 except Exception。"""
         import ast
