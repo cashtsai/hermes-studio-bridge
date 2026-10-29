@@ -101,6 +101,12 @@ _MEDIA_ARTIFACT_ROOT = os.path.expanduser(
 
 # One SSE keepalive cadence for every streaming endpoint (issue #8: it was
 # 2s / 4s / 10s across chat, ccsessions and codexsessions for no reason).
+# 選路探測持有串流的秒數。**必須大於 app 端 StudioConfig.probeSSE 的
+# timeoutInterval(3s)** —— 小於等於的話,緩衝型代理會在 app 逾時之前拿到
+# response 結束時的 flush,探測又變成恆真(等於沒探)。這是跨端契約,
+# 見 tests/test_sse_probe_profile.py 的 ProbeHoldsTheStream。
+# env 只給測試壓短用,正式部署不要調。
+SSE_PROBE_HOLD_DEFAULT = 6.0
 SSE_KEEPALIVE_SECS = 2.0
 # 每一條 SSE 回應都要帶的反緩衝標頭。**一條都不能漏** —— 這就是這組常數存在
 # 的理由(2026-10-26):卡片流 `/app/v2/sessions/{id}/events` 是當時唯一漏掉的
@@ -23523,8 +23529,31 @@ async def v2_session_events(session_id: str, request: Request, since_seq: int = 
         # 不能改成讓 app 送 `phone` 了事:探測用的 session id 是佔位的 `_`,
         # 走正規路徑會 404,而 app 把 404 當「路通」→ 每條候選都變成「會串流」,
         # 壞掉那條反而被排到**前面**,比現在更糟。
+        # ⚠️ **必須把串流持有住,不能送一個 byte 就關。**
+        #
+        # 第一版是 `yield 一次就結束`。那對這個探測要抓的失效模式(中介層把
+        # 串流吞住不往下送)**零鑑別力** —— 任何緩衝型代理在 response 結束時
+        # 一定會 flush,所以壞掉的那條 quick tunnel 照樣會把這包已完成的短 body
+        # 交出去,app 讀到 byte → 判定「會流」。等於用假陽性取代原本的假陰性。
+        #
+        # 判準要變成「第一個 byte 有沒有在**串流還開著的時候**到達」:
+        #  · 會串流 → 第一個 byte 立刻到 → app 回 true
+        #  · 被緩衝 → 持有期間什麼都收不到 → app 的 3 秒 timeoutInterval 先炸
+        #            → 它 catch 成 nil(量不到),排序在 true 之後
+        #
+        # 所以 **PROBE_HOLD 必須大於 app 的 probe timeout**(目前 3s,見
+        # StudioConfig.probeSSE)。這是跨端耦合,改任一邊都要回來看另一邊。
+        # 同檔 `_probe_candidate_sse`(bridge 自己探候選用)是同一個道理。
+        probe_hold = float(os.environ.get("POCKET_SSE_PROBE_HOLD_SECS",
+                                          SSE_PROBE_HOLD_DEFAULT))
+
         async def probe_gen():
-            yield ": pocket-sse-probe\n\n"
+            yield ": pocket-sse-probe\n\n"      # 立刻 —— 會串流的路徑這裡就到了
+            try:
+                await asyncio.sleep(probe_hold)
+            except asyncio.CancelledError:
+                return                            # app 收到就斷線,正常
+            yield ": pocket-sse-probe-end\n\n"
 
         return StreamingResponse(probe_gen(), media_type="text/event-stream",
                                  headers=SSE_HEADERS)

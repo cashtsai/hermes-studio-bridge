@@ -15,6 +15,10 @@ import sys
 import tempfile
 import unittest
 
+# 測試把持有時間壓短,否則每個打探測端點的 case 都要等 6 秒。
+# 契約(必須 > app 的 3 秒)由 ProbeHoldsTheStream 讀常數另測。
+os.environ.setdefault("POCKET_SSE_PROBE_HOLD_SECS", "0.1")
+
 _TMP = tempfile.mkdtemp(prefix="sse-probe-")
 os.environ.setdefault("POCKET_CANON_DB", os.path.join(_TMP, "canonical.db"))
 os.environ.setdefault("BRIDGE_TOKEN", "test-unit-token")
@@ -69,3 +73,39 @@ class SSEProbeProfileTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ProbeHoldsTheStream(unittest.TestCase):
+    """探測必須**持有串流**,否則對它要抓的東西零鑑別力。
+
+    要抓的失效模式是「中介層把串流吞住不往下送」(quick tunnel 的指紋)。
+    第一版 `yield 一次就 return`,而任何緩衝型代理在 response 結束時一定會
+    flush —— 壞掉那條照樣把已完成的短 body 交出去,app 讀到 byte 判「會流」。
+    用假陽性取代假陰性,比不探還糟(帳面上「已驗過 SSE」是假的)。
+
+    ⚠️ **跨端耦合,改任一邊都要回來看另一邊**:
+    `POCKET_SSE_PROBE_HOLD_SECS` 必須大於 app 端 `StudioConfig.probeSSE` 的
+    `req.timeoutInterval`(目前 3 秒)。大於才會變成:
+      · 會串流 → 第一個 byte 立刻到 → app 回 true
+      · 被緩衝 → 持有期間收不到 → app 逾時 → nil(量不到),排在 true 之後
+    小於等於的話,緩衝的那條會在 app 逾時**之前**收到 flush → 又變成 true。
+    """
+
+    APP_PROBE_TIMEOUT_SECS = 3.0   # 與 StudioConfig.probeSSE 的 timeoutInterval 對齊
+
+    def test_hold_exceeds_app_probe_timeout(self):
+        # 讀**預設常數**而不是 env —— env 被測試壓成 0.1 以免整套變慢,
+        # 要守的契約是正式部署那個值。
+        import bridge as _b
+        self.assertGreater(
+            _b.SSE_PROBE_HOLD_DEFAULT, self.APP_PROBE_TIMEOUT_SECS,
+            "持有時間沒超過 app 的 probe timeout → 緩衝型代理會在逾時前拿到 "
+            "flush,探測又變成恆真。這是跨端契約,改之前先看 StudioConfig.probeSSE。")
+
+    def test_probe_source_actually_sleeps(self):
+        """原始碼層級確認持有邏輯還在 —— 這條在有人「簡化」掉 sleep 時會紅。"""
+        import inspect
+        import bridge as _b
+        src = inspect.getsource(_b.v2_session_events)
+        self.assertIn("POCKET_SSE_PROBE_HOLD_SECS", src)
+        self.assertIn("asyncio.sleep(probe_hold)", src)
