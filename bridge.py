@@ -19204,10 +19204,25 @@ async def v2_session_input(session_id: str, request: Request):
                                "cc2 尚不支援附件;請改用文字內容")
         if not content:
             raise HTTPException(status_code=400, detail="empty")
-        res = await sess.submit(content)
+        # client_id 冪等閘門 —— 與 tmux CC(`_cc_input_core`)、CX、persona 同一套。
+        # cc2 原本收了 client_id 卻只拿去餵卡片:手機換網的瞬間新舊兩條連線各送
+        # 一次,就是**重複執行一次指令**(cc2 能跑 shell,比重複顯示嚴重得多)。
+        # tmux 那邊 2026-10-25 已修,cc2 漏了;而 cc2 現在還是 team worker 的
+        # 預設 provider(CC_DEFAULT_PROVIDER),風險是實際存在的。
+        cid = str(body.get("client_id") or "").strip()
+        entry, prior = await _cc_input_claim(f"cc2:{src[1]}", cid)
+        if prior is not None:
+            _log_event("cc2_input_deduped", session=src[1], client_id=cid[:16])
+            return await _cc_input_replay(prior)
+        try:
+            res = await sess.submit(content)
+        except BaseException:
+            _cc_input_release(entry)   # 失敗要放掉,否則重試被自己擋一個 TTL
+            raise
         out = {"ok": True, "session_id": session_id, "accepted": True, **res}
         if attachments:
             out["attachments_dropped"] = len(attachments)
+        _cc_input_settle(entry, out)
         return out
     if src[0] == "cx":
         content = (body.get("content") or body.get("text") or "").strip()

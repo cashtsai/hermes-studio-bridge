@@ -205,6 +205,10 @@ class CC2Digest(carddigest.ApprovalCardMixin):
     _appr_default_title = "Claude Code 等待核准"
 
     def __init__(self, name: str):
+        self.busy_since: float = 0.0   # 回合起算(epoch);turn_begin 設、turn_end 清
+        self.last_event_at: float = 0.0  # 最後活動(epoch);v2_rows 給 app 排序用
+        self.mode: str = ""            # 權限模式鏡像(CCSdkSession 同步進來)
+        self.model: str = ""           # 模型鏡像(同上);空 = 跟隨 CLI 預設
         self.name = name
         self.store = carddigest.SessionCardStore()
         self.store.media_session_id = f"cc2:{name}"
@@ -221,7 +225,14 @@ class CC2Digest(carddigest.ApprovalCardMixin):
 
     def _status(self, label: str = ""):
         self.store.set_status({
-            "busy": self.busy, "mode": None, "prompt": self.prompt,
+            # busy_since:app 的 WorkingBar 靠它顯示「已 N 秒」—— 沒有的話
+            # 2 秒與 30 分鐘長得一模一樣(tmux 那邊早就有,cc2 漏了)。
+            # mode:權限模式,app 的模式選擇器讀這個;原本硬寫 None → 畫面空白。
+            # mode/model 由 CCSdkSession 在送出前注入(digest 不持有它們)。
+            "busy": self.busy, "mode": self.mode or None,
+            "busy_since": self.busy_since or None,
+            "model": self.model or None,
+            "prompt": self.prompt,
             "phase": "run" if self.busy else "idle",
             "queue_depth": self.queue_depth,
             "label": label or ("等待核准" if self.prompt else
@@ -230,6 +241,8 @@ class CC2Digest(carddigest.ApprovalCardMixin):
 
     def turn_begin(self, turn_id: str):
         self.busy = True
+        self.busy_since = time.time()
+        self.last_event_at = self.busy_since
         self.store.turn_id = turn_id
         self.store.saw_output = False
         self.store.last_tool = ""
@@ -254,6 +267,7 @@ class CC2Digest(carddigest.ApprovalCardMixin):
             self._draft_id = self._next_id("m")
             self._draft_text = ""
         self._draft_text += delta
+        self.last_event_at = time.time()
         self.store.saw_output = True
         self.store.last_tool = ""
         self.store.upsert_card(carddigest.make_card(
@@ -289,6 +303,8 @@ class CC2Digest(carddigest.ApprovalCardMixin):
 
     def turn_end(self, error: str = ""):
         self.busy = False
+        self.busy_since = 0.0            # 回合結束 → 計時器收掉,不跨回合累加
+        self.last_event_at = time.time()
         if error:
             self.error_card(error)
         self.store.push_turn("end", self.store.turn_id)
@@ -316,7 +332,10 @@ class CCSdkSession:
         self.workdir = os.path.expanduser(workdir or "~")
         self.permission_mode = _clamp_mode(permission_mode or "acceptEdits")
         self.sdk_session_id = sdk_session_id or ""
+        self.model: str = ""           # 目前模型(空 = 跟隨 CLI 預設);傳給 ClaudeAgentOptions
         self.digest = CC2Digest(name)
+        # digest 自己不知道權限模式/模型,但 app 的狀態列要顯示 —— 同步鏡像進去。
+        self.digest.mode = self.permission_mode
         self.client = None
         self.queue: list[str] = []       # 忙碌時的輸入佇列(turn end 後 drain)
         self.busy = False
@@ -448,9 +467,13 @@ class CCSdkSession:
         if self.client is not None:
             return self.client
         sdk = _sdk()
+        opts_kwargs = {}
+        if self.model:
+            opts_kwargs["model"] = self.model   # 原本完全沒傳 → cc2 無法切模型
         opts = sdk.ClaudeAgentOptions(
             cwd=self.workdir,
             permission_mode=self.permission_mode,
+            **opts_kwargs,
             include_partial_messages=True,
             resume=self.sdk_session_id or None,
             can_use_tool=self._can_use_tool,
@@ -646,6 +669,9 @@ class CCSdkRegistry:
                 workdir=str(row.get("workdir") or ""),
                 permission_mode=str(row.get("permission_mode") or ""),
                 sdk_session_id=str(row.get("sdk_session_id") or ""))
+            # model 是後加的欄位:舊的 state 檔沒有這個鍵 → 空字串 = 跟隨 CLI 預設,
+            # 與加這段之前的行為相同(純加法,不會把既有 session 弄壞)。
+            self.sessions[name].model = str(row.get("model") or "")
 
     def save(self) -> None:
         """原子落地(tmp+rename);失敗只記 log —— resume id 掉了下次全新
@@ -656,7 +682,8 @@ class CCSdkRegistry:
             payload = {"sessions": {
                 s.name: {"sdk_session_id": s.sdk_session_id,
                          "workdir": s.workdir,
-                         "permission_mode": s.permission_mode}
+                         "permission_mode": s.permission_mode,
+                         "model": s.model}
                 for s in self.sessions.values()}}
             tmp = f"{path}.tmp-{os.getpid()}"
             with open(tmp, "w", encoding="utf-8") as f:
@@ -686,6 +713,8 @@ class CCSdkRegistry:
         else:
             if workdir:
                 sess.workdir = os.path.expanduser(workdir)
+            sess.digest.mode = sess.permission_mode   # 鏡像跟著更新
+            sess.digest.model = sess.model
             if permission_mode:
                 sess.permission_mode = _clamp_mode(permission_mode)
         self.save()
@@ -734,9 +763,22 @@ class CCSdkRegistry:
                 # 終端接手指令(app 未來可直接顯示/複製;對話裡另有同款卡)
                 meta["resume_command"] = \
                     f"claude --resume {sess.sdk_session_id}"
+            # last_event_at 原本硬寫 None → app 列表排序拿不到時間、永遠墊底;
+            # subtitle 改用最後一則對話(拿不到才退回 workdir),與 tmux 列同語意。
+            last_at = getattr(sess.digest, "last_event_at", 0.0) or None
+            preview = ""
+            try:
+                cards = list(getattr(sess.digest.store, "cards", {}).values())
+                for c in reversed(cards):
+                    t = str((c.get("body") or {}).get("text") or "").strip()
+                    if t:
+                        preview = t.replace("\n", " ")[:120]
+                        break
+            except Exception:  # noqa: BLE001
+                preview = ""
             out.append({"id": f"cc2:{name}", "provider": "cc2", "title": name,
-                        "subtitle": sess.workdir, "status": status,
-                        "last_event_at": None,
+                        "subtitle": preview or sess.workdir, "status": status,
+                        "last_event_at": last_at,
                         "capabilities": ["input", "interrupt", "replay",
                                          "follow"] + (["approve"] if pend else []),
                         "meta": meta})
