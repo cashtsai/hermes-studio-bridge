@@ -19188,20 +19188,38 @@ async def v2_session_input(session_id: str, request: Request):
         content = (body.get("content") or body.get("text") or "").strip()
         attachments = body.get("attachments") or []
         sess = cc_sdk.registry().get(src[1])
+        # 附件轉發 —— 與 tmux CC(`_cc_input_core_locked`)同一套:存到本機、
+        # 語音先轉寫成文字、其餘把 on-disk 路徑接進訊息(Claude Code 的 Read
+        # 讀得了檔案、也看得懂圖),並把帶 path 的 metadata 餵進 input.accepted
+        # 卡,app 才顯示得出縮圖而不是「來源已失效」。
+        # 原本 cc2 一律 400 拒收,而附件是 Pocket 的主要輸入方式之一。
+        att_meta: list = []
         if attachments:
-            # cc2 MVP 不轉發附件 —— 限制必須可見:出明確卡 + 回應帶
-            # attachments_dropped,絕不默默丟掉;純附件(無文字)直接 400。
-            try:
-                sess.digest.error_card(
-                    f"cc2 尚不支援附件轉發,已忽略 {len(attachments)} 件附件"
-                    + ("" if content else "(本則無文字內容,未送出)"))
-            except Exception as e:  # noqa: BLE001
-                _log_event("cc2_attachment_card_failed", error=str(e)[:160])
-            _log_event("cc2_attachments_dropped", session=src[1],
-                       count=len(attachments), has_text=bool(content))
-            if not content:
-                raise http_err(400, "CC2_ATTACHMENTS_UNSUPPORTED",
-                               "cc2 尚不支援附件;請改用文字內容")
+            _att_guard(attachments)
+            stt_lang = str(body.get("stt_lang") or "").strip()
+            saved: list[str] = []
+            voice_lines: list[str] = []
+            for a in attachments:
+                path = _save_attachment(a, (a or {}).get("filename") or "file")
+                if not path:
+                    continue
+                if (a or {}).get("kind") == "audio":
+                    t = await asyncio.to_thread(_transcribe, path, "", stt_lang)
+                    if t:
+                        voice_lines.append(t)
+                else:
+                    saved.append(path)
+                    meta = {"path": path, "available": True}
+                    for k in ("kind", "filename", "mime"):
+                        if (a or {}).get(k) not in (None, ""):
+                            meta[k] = a.get(k)
+                    att_meta.append(meta)
+            if voice_lines:
+                content = (content + " " + " ".join(voice_lines)).strip()
+            if saved:
+                refs = " ".join(saved)
+                content = (content
+                           + f"  [附件已存到本機,請用 Read 讀取/檢視: {refs}]").strip()
         if not content:
             raise HTTPException(status_code=400, detail="empty")
         # client_id 冪等閘門 —— 與 tmux CC(`_cc_input_core`)、CX、persona 同一套。
@@ -19215,13 +19233,13 @@ async def v2_session_input(session_id: str, request: Request):
             _log_event("cc2_input_deduped", session=src[1], client_id=cid[:16])
             return await _cc_input_replay(prior)
         try:
-            res = await sess.submit(content)
+            res = await sess.submit(content, attachments=att_meta, client_id=cid)
         except BaseException:
             _cc_input_release(entry)   # 失敗要放掉,否則重試被自己擋一個 TTL
             raise
         out = {"ok": True, "session_id": session_id, "accepted": True, **res}
-        if attachments:
-            out["attachments_dropped"] = len(attachments)
+        if att_meta:
+            out["attachments"] = len(att_meta)
         _cc_input_settle(entry, out)
         return out
     if src[0] == "cx":

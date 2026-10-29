@@ -72,6 +72,26 @@ class CC2ParityTest(unittest.TestCase):
         r2.load()
         self.assertEqual(r2.sessions["old"].model, "")
 
+    def test_user_card_carries_attachments_and_client_id(self):
+        """app 要顯示縮圖、要把待送泡泡對上這張卡 —— 兩個欄位缺一都不行。"""
+        atts = [{"path": "/tmp/a.png", "available": True,
+                 "kind": "image", "filename": "a.png"}]
+        self.s.digest.user_card("看這張圖", attachments=atts, client_id="cid-1")
+        body = list(self.s.digest.store.cards.values())[-1]["body"]
+        self.assertEqual(body["attachments"][0]["path"], "/tmp/a.png")
+        self.assertEqual(body["client_id"], "cid-1")
+
+    def test_queue_preserves_attachments(self):
+        """忙碌時排隊的那則,附件不能在排空時掉。"""
+        import asyncio
+        atts = [{"path": "/tmp/b.png", "available": True}]
+        self.s.busy = True
+        res = asyncio.run(self.s.submit("排隊的", attachments=atts, client_id="cid-2"))
+        self.assertTrue(res["queued"])
+        self.assertEqual(self.s.queue[0][0], "排隊的")
+        self.assertEqual(self.s.queue[0][1], atts)
+        self.assertEqual(self.s.queue[0][2], "cid-2")
+
     def test_row_subtitle_prefers_conversation(self):
         self.s.digest.user_card("這是我送的指令")
         row = [r for r in self.r.v2_rows() if r["id"] == "cc2:t1"][0]

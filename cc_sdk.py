@@ -249,10 +249,17 @@ class CC2Digest(carddigest.ApprovalCardMixin):
         self.store.push_turn("begin", turn_id)
         self._status("已送出,等待回覆。")
 
-    def user_card(self, text: str):
+    def user_card(self, text: str, attachments: list | None = None,
+                  client_id: str = ""):
+        """使用者送出的回顯卡。attachments 帶 on-disk path(bridge 存好的),
+        app 才顯示得出縮圖;client_id 讓 app 的待送泡泡對得上這張卡。"""
+        body = {"text": text, "fallback_text": text}
+        if attachments:
+            body["attachments"] = [dict(a) for a in attachments if isinstance(a, dict)]
+        if client_id:
+            body["client_id"] = str(client_id)
         self.store.upsert_card(carddigest.make_card(
-            self._next_id("u"), self.store.turn_id, "user", "text",
-            {"text": text, "fallback_text": text}))
+            self._next_id("u"), self.store.turn_id, "user", "text", body))
 
     def seed_card(self, role: str, text: str, ts: float):
         """歷史種子卡:final:true、帶原始 ts(權威時間)、不掛 turn。"""
@@ -391,29 +398,32 @@ class CCSdkSession:
 
     # ── 輸入 ──
 
-    async def submit(self, text: str) -> dict:
+    async def submit(self, text: str, attachments: list | None = None,
+                     client_id: str = "") -> dict:
         """統一輸入入口(v2_session_input 的 cc2 分支):忙碌 → 排隊不回 4xx
         (與 CX 同語意,app 靠 `queued` 欄位畫「已排入佇列」)。"""
         if self.busy or (self._task is not None and not self._task.done()):
-            self.queue.append(text)
+            self.queue.append((text, attachments or [], client_id))
             self.digest.queue_depth = len(self.queue)
             self.digest._status()
             _log("cc2_input_queued", session=self.name, depth=len(self.queue))
             return {"delivery": "queued", "queued": True,
                     "queue_depth": len(self.queue)}
-        self._start_turn(text)
+        self._start_turn(text, attachments=attachments, client_id=client_id)
         return {"delivery": "accepted", "queued": False}
 
-    def _start_turn(self, text: str) -> None:
+    def _start_turn(self, text: str, attachments: list | None = None,
+                    client_id: str = "") -> None:
         self.busy = True
         self._task = asyncio.get_event_loop().create_task(
-            self._run_turn_safe(text))
+            self._run_turn_safe(text, attachments or [], client_id))
 
-    async def _run_turn_safe(self, text: str) -> None:
+    async def _run_turn_safe(self, text: str, attachments: list | None = None,
+                             client_id: str = "") -> None:
         """turn 外殼:任何例外都收斂成錯誤卡 + idle,**絕不**讓 provider
         例外往上炸掉 dispatch/通知路徑(bridge 全域慣例)。"""
         try:
-            await self._run_turn(text)
+            await self._run_turn(text, attachments or [], client_id)
         except asyncio.CancelledError:
             self.digest.turn_end()
             raise
@@ -429,12 +439,19 @@ class CCSdkSession:
             if self.queue:                      # turn 結束 → 放行下一則
                 nxt = self.queue.pop(0)
                 self.digest.queue_depth = len(self.queue)
-                self._start_turn(nxt)
+                # 佇列元素是 (text, attachments, client_id);舊格式(純字串)
+                # 也吃得下 —— 升級當下若佇列裡還有舊項目不會炸。
+                if isinstance(nxt, tuple):
+                    self._start_turn(nxt[0], attachments=nxt[1],
+                                     client_id=nxt[2] if len(nxt) > 2 else "")
+                else:
+                    self._start_turn(nxt)
 
-    async def _run_turn(self, text: str) -> None:
+    async def _run_turn(self, text: str, attachments: list | None = None,
+                        client_id: str = "") -> None:
         turn_id = f"turn-cc2-{uuid.uuid4().hex[:10]}"
         self.digest.turn_begin(turn_id)
-        self.digest.user_card(text)
+        self.digest.user_card(text, attachments=attachments, client_id=client_id)
         for attempt in (0, 1):
             try:
                 client = await self._ensure_client()
