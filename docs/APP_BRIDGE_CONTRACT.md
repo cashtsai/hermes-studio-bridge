@@ -703,7 +703,7 @@ Pins Pocket's provider lane to a native agent session. `{provider}` accepts
 ```jsonc
 {
   "id": "claude_code:pocket-agent",   // 全域唯一,{provider}:{native_id} 全寫（6/29 決策 #1）
-  "provider": "claude_code|codex|hermes",
+  "provider": "claude_code|cc2|codex|hermes|gemini",
   "title": "pocket-agent",
   "subtitle": "/Users/you/apps/pocketagent",  // workdir / 來源說明
   "status": "idle|running|waiting_approval|failed|stalled|done",
@@ -765,6 +765,81 @@ client 對接要知道的最小集合（2026-08-01 補：Android 端曾因本節
 - **測試須知**：OpenClaw 是「bridge 代連外部 gateway」，只有配置了 gateway 的
   那台主機才看得到任何 openclaw 內容。對著未配置的 bridge 開發永遠是缺席態——
   這不是 bridge 缺功能。
+
+### 4.1c CC provider v2（`cc2`，Claude Agent SDK 驅動）
+
+> 2026-10-29 補。**本節補的是既有缺口**：`CC_SDK_PROVIDER=1` 在生產環境已經開著，
+> 於是 bridge 一直在吐一個本文件沒有記載的 provider 值。按 §0「本文件是唯一規格」，
+> app 端「不認得 cc2」在契約上是合規的——問題在這裡，不在 app。
+> 實作細節見 `cc_sdk.py` 檔頭。
+
+- **這是與 `claude_code` 並行的第二條 CC 路徑，不是取代。** tmux 路徑靠 pane-diff
+  仿串流、擷取 pane 猜審批選單、`send-keys Esc` 中斷；cc2 走 Agent SDK 的結構化
+  管道（真 token delta／`can_use_tool` 回呼／`interrupt()`）。
+  **兩者同時存在、session id 前綴不同，client 必須當成兩種不同的東西。**
+- **provider 值 = `cc2`，session id = `cc2:{name}`**（同 §4.1 全寫規則）。
+  `/app/v2/agents` 會回 `{"provider":"cc2","name":"Claude Code (SDK)","kind":"code_agent"}`。
+- **列表**：出現在 `GET /app/v2/sessions`（可 `?provider=cc2` 過濾）。
+  ⚠️ **不在 `/ccsessions`**——那支是 tmux 專屬的 takeover 端點。client 若只讀
+  `/ccsessions` 就永遠看不到 cc2 session（2026-10-29 實查：iOS 與 Android 的 CC
+  分頁都是這個情況，cc2 在手機上目前近乎隱形）。
+- **卡片流／輸入／中斷**：直接拿 `cc2:{name}` 打既有 v2 session 端點（§5、§7），
+  卡片 schema 與 CC／CX／persona **完全同款**，渲染端零改動。
+- **旗標關 = 整段缺席**：`CC_SDK_PROVIDER` 未設時 `/app/v2/cc2/*` 全回
+  `404 CC2_DISABLED`、agents 不列 cc2、`cc2:` id 解析 404。
+  正規探針 = **agents 清單裡有沒有 `provider:"cc2"`**。
+- **專屬端點家族**（與 OpenClaw 不同，cc2 **有**自己的一組）：
+
+  | 端點 | 用途 |
+  |---|---|
+  | `GET  /app/v2/cc2/{name}/history?limit&offset` | 歷史分頁（往前翻，見下） |
+  | `GET  /app/v2/cc2/{name}/context` | context 用量 |
+  | `POST /app/v2/cc2/{name}` | 建立 session |
+  | `POST /app/v2/cc2/{name}/settings` | 模型／審核模式 |
+  | `POST /app/v2/cc2/{name}/rename` | 改名 |
+  | `POST /app/v2/cc2/{name}/compact` | 壓縮對話 |
+  | `POST /app/v2/cc2/{name}/archive` | 封存 |
+  | `POST /app/v2/cc2/{name}/yield` | 交還控制權 |
+  | `POST /app/v2/cc2/_resume/{sid}` | 以 SDK session id 接回 |
+
+- **進場歷史（seed）**：開 session 時 bridge 自動把 transcript 最後 N 則
+  （`CC_SDK_HISTORY_SEED`，預設 **40**；0 = 關閉）種成 `final:true` 卡，帶
+  **原始 ts**、不掛 `turn_id`，且**保證在一切 live 事件之前**（§7 snapshot 語意：
+  app 渲染完 snapshot 才從 `latest_seq` 接 SSE）。種子卡 id 由位置決定
+  （`card-cc2-{name}-h{idx}`），**重種是對同一批 id 做 upsert**，不會疊出第二份歷史。
+  ⚠️ **與 tmux 的差異（client 要知道）**：tmux seed 是尾端 200 行 digest、
+  **含工具卡／thinking／附件卡**，必要時再補一張 pending approval 卡；cc2 seed
+  **只有 user／assistant 文字卡**。同一條對話在兩條路徑上「進場看到的東西」
+  不一樣多，這是現況而非 bug。
+
+- **`history` 的回應形狀**：
+
+  ```jsonc
+  { "messages": [ {"role":"user|assistant", "text":"…", "ts": 1761000000.0} ],
+    "total": 123,        // 「讀得到的範圍內」的數量，不假裝是全部
+    "more": true,        // 還有更舊的
+    "truncated": true }  // 只讀了 transcript 尾端，前面讀不到 → more 必為真
+  ```
+  `offset` **從最新往回數**；超過總數回空頁（不繞回去拿最舊那幾則）。
+  ⚠️ 已知不一致：`limit` 在路由層被夾成 `max(1, min(limit, 200))`，所以
+  **`limit=0` 經 HTTP 永遠到不了** `history_page` 內部那條「0 → 空頁」分支。
+  client 不要依賴 `limit=0`。
+
+### 4.1d Gemini（第五 provider，選配）
+
+> 2026-10-29 補，與 §4.1c 同一類缺口：bridge `/app/v2/agents` 會回
+> `{"provider":"gemini","name":"Gemini","kind":"code_agent"}`，但本文件原本
+> 0 次提及。
+
+- **provider 值 = `gemini`，session id = `gemini:{key}`**（同 §4.1 全寫規則）。
+- **名錄制**：列表走 `GET /app/v2/sessions?provider=gemini`；client 可本地生
+  `gemini:{key}` 直接開卡片流，**第一則訊息才在 bridge 建 session**（零建立 API）。
+- 卡片流／輸入走既有 v2 session 端點；審批鏡像到 canonical approvals 表
+  （`provider=gemini`，同 OpenClaw 做法）。
+- 未配置 = 列表回空，client 顯示空狀態。
+- ℹ️ **client 側現況**：iOS／Android 都已實作但以編譯期旗標藏起來
+  （`GeminiSurface.HIDDEN`，2026-10-11 機主拍板：quota 失敗與權限請求只能
+  自動拒絕，怕稀釋信任）。契約照實記錄，與 client 要不要顯示是兩件事。
 
 ### 4.2 Agent
 
@@ -1010,7 +1085,7 @@ app 端先行件（不等 bridge）：卡片渲染元件 + 傳輸層抽象
 > 完整設計見 APPROVAL_HUB_SPEC.md;本節是 app 可依賴的 wire 契約。
 
 - **物件形狀**(v1 list/get、v2 `meta.approval` 共用;舊欄位 `source/result/decided_at` 相容期保留):
-  `{id, session_id, provider: claude_code|codex|hermes, kind: permission|question|notice,
+  `{id, session_id, provider: claude_code|cc2|codex|hermes|gemini, kind: permission|question|notice,
   title, detail, risk, options: [{key,label[,style: primary|secondary|danger]}],
   created_at, expires_at, status}`。
   `options` 缺席時 bridge 給預設(permission→approve/deny、notice→單鍵 ack);
@@ -1045,7 +1120,7 @@ app 端先行件（不等 bridge）：卡片渲染元件 + 傳輸層抽象
 {
   "items": [{
     "id": "claude_code:amulet-hunter",   // = registry session id,收編/釋放用它
-    "provider": "claude_code|codex|hermes|dispatch|openclaw",
+    "provider": "claude_code|cc2|codex|hermes|dispatch|openclaw|gemini",
     "name": "amulet-hunter",
     "workdir": "/Users/you/apps/amulet-hunter",
     "state": "managed|discovered",       // discovered = 看得到、還沒收編
