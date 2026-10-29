@@ -23498,10 +23498,39 @@ async def v2_artifact_download(media_id: str, request: Request):
 @app.get("/app/v2/sessions/{session_id}/events")
 async def v2_session_events(session_id: str, request: Request, since_seq: int = 0,
                             profile: str = "phone"):
-    """契約 §1 SSE 事件流:信封 {seq,ts,type,data};since_seq 補洞;超範圍 410。"""
+    """契約 §1 SSE 事件流:信封 {seq,ts,type,data};since_seq 補洞;超範圍 410。
+
+    `profile=probe` 是**選路探測**專用(見下方)。
+    """
     _check_auth(request)
+    if profile == "probe":
+        # 選路探測:app 要問的是「**這條網路路徑**送不送得出 SSE」,不是
+        # 「這條 session 有什麼」。立刻送一個 byte 再關,不碰 session。
+        #
+        # 為什麼需要這個(2026-10-29 實害):cloudflare quick tunnel 這類通道
+        # /health 回 200、一般 JSON 也正常,但 SSE **一個 byte 都不送**;app
+        # 鎖上去之後 /events 收不到東西 → 逾時 → 退回每 10 秒抓快照 → 人格/
+        # CC/CX 三個逐字流同時變成整塊落下,儀表板還會顯示「Bridge 離線」,
+        # 但手動重試(一般 HTTP)立刻就通。bridge 自己的 `sse_candidate_degraded`
+        # 日誌天天在記這件事。
+        #
+        # app 端 2026-10-28 已經加了 probeSSE 來避開這種通道,但它打的正是
+        # `profile=probe` —— 而這裡原本只收 `phone`,一律回 400。app 又只把
+        # 401/403/404 當成「路是通的」,**400 落在外面 → 每條候選都被判定
+        # 不會串流** → 那個修復整個空轉,照舊選回死掉的通道。
+        # (日誌實證:45 分鐘內 22 次 `UNSUPPORTED_PROFILE` on `/app/v2/sessions/_/events`。)
+        #
+        # 不能改成讓 app 送 `phone` 了事:探測用的 session id 是佔位的 `_`,
+        # 走正規路徑會 404,而 app 把 404 當「路通」→ 每條候選都變成「會串流」,
+        # 壞掉那條反而被排到**前面**,比現在更糟。
+        async def probe_gen():
+            yield ": pocket-sse-probe\n\n"
+
+        return StreamingResponse(probe_gen(), media_type="text/event-stream",
+                                 headers=SSE_HEADERS)
     if profile != "phone":
-        raise http_err(400, "UNSUPPORTED_PROFILE", "v0 只實作 profile=phone(契約 §4)")
+        raise http_err(400, "UNSUPPORTED_PROFILE",
+                       "只實作 profile=phone(契約 §4)與 profile=probe(選路探測)")
     store = await _v2_card_store(session_id)
     backlog = store.since(since_seq)
     if backlog is None:
