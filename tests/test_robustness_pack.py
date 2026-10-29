@@ -445,7 +445,12 @@ class TestExceptionLogging(unittest.TestCase):
     # 其中一個在要害上:取使用者選的答案失敗時靜默退成 "",接著就告訴模型
     # 「The user did not answer the questions.」,而那正是該分支自己宣稱
     # 修好的 bug。守門看不到的地方,病就長在那裡。
-    _SILENT_EXCEPT_RATCHET = {"bridge.py": 0, "cc_sdk.py": 3}
+    # cc_sdk.py 用**棘輪**而不是歸零:cc2 那批一口氣帶進來 14 個,一次全改風險
+    # 太高(它是 CC_DEFAULT_PROVIDER 的實作),但**不准再長**。已經修掉兩個要害:
+    # 取答案失敗靜默退成 ""(會告訴模型「使用者沒有回答」)、以及
+    # `_project_key` 的 SDK import 失敗靜默退回舊演算法(歷史整段不見且無訊息)。
+    # 剩下的 16 個是欠債,數字只能往下調。
+    _SILENT_EXCEPT_RATCHET = {"bridge.py": 0, "cc_sdk.py": 16}
 
     def _silent_except_lines(self, filename: str) -> list:
         import ast

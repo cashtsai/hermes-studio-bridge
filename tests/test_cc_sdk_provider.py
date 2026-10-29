@@ -535,7 +535,14 @@ class TestHistorySeed(CC2Base):
     ]
 
     def _write_jsonl(self, sid, lines):
-        d = os.path.join(self.projects, _TMP.replace("/", "-"))
+        # ⚠️ **用 production 的 `_project_key`,不要自己重刻一遍規則。**
+        # 原本寫死 `_TMP.replace("/", "-")`,而 2026-10-29 的修正把 `_project_key`
+        # 改成呼叫 SDK 官方的 `project_key_for_directory`(原本自己算會跟 CLI
+        # 實際落地的目錄對不上 → 歷史整段不見且毫無訊息)。官方版會解 symlink,
+        # macOS 上 `/var` → `/private/var`,於是這裡算出來的路徑與程式要讀的
+        # 差一截 —— 種子一張都種不出來,而測試看起來像是功能壞了。
+        # 測試重刻實作細節就會這樣:**改對了反而紅**。
+        d = os.path.join(self.projects, cc_sdk._project_key(_TMP))
         os.makedirs(d, exist_ok=True)
         with open(os.path.join(d, f"{sid}.jsonl"), "w", encoding="utf-8") as f:
             f.write("\n".join(lines) + "\n")
@@ -744,37 +751,68 @@ class TestStartupReconcile(CC2Base):
 # ───────────────────────── 附件限制可見(gap #4)─────────────────────────
 
 class TestAttachmentsNotice(CC2Base):
-    def test_attachments_with_text_dropped_visibly(self):
+    """附件契約 **2026-10-29 反轉**:cc2 從「一律拒收」變成「照 tmux 那套轉發」。
+
+    舊的兩條測試釘的是「丟棄 + 回 attachments_dropped + 出一張『不支援附件』卡
+    + 純附件回 400」。那是功能**不存在**時的誠實行為;現在端點會把附件存檔、
+    語音轉文字、並把 on-disk 路徑注入送出的文字(bridge.py 的 cc2 分支,與
+    tmux `_cc_input_core` 同一套 —— Claude Code 用 Read 就讀得到,圖片原生看得懂)。
+    繼續釘舊契約等於斷言一個已經修掉的限制,所以改釘新的。
+
+    ⚠️ 這裡刻意驗**送進模型的那串文字真的帶路徑**,而不只是「回應 200」——
+    附件只進回顯卡、沒進 query 的話,使用者會在對話裡看到自己的圖、
+    以為模型看過了,那是比「不支援」更糟的靜默失敗。
+    """
+
+    # ⚠️ 附件**落盤**在測試裡永遠跑不到:`bridge.UPLOAD_DIR` 是寫死的
+    # production 路徑(~/apps/hermes-agent/home/uploads),不吃 env,而隔離閂的
+    # audit hook 會擋住寫入。所以這裡把 `_save_attachment` 換成固定路徑 ——
+    # 要驗的是**端點的組裝邏輯**(路徑有沒有進到送給模型的文字),不是磁碟 I/O。
+    # (UPLOAD_DIR 不可注入本身是基礎設施缺口,已另記。)
+    FAKE_PATH = "/tmp/pocket-test-upload/x.png"
+
+    def test_attachment_path_reaches_the_model_not_just_the_card(self):
         async def run():
             cc_sdk.registry().ensure("att1", workdir=_TMP)
             FakeClient.batches = [[FakeResultMessage()]]
-            res = await bridge.v2_session_input(
-                "cc2:att1", FakeRequest({"content": "hi", "attachments": [
-                    {"type": "image", "url": "file:///x.png"}]}))
+            with patch.object(bridge, "_save_attachment",
+                              lambda a, d="file": self.FAKE_PATH):
+                res = await bridge.v2_session_input(
+                    "cc2:att1", FakeRequest({"content": "這張圖是什麼",
+                                             "attachments": [{"kind": "image",
+                                                              "filename": "x.png"}]}))
             await _drain(cc_sdk.registry().get("att1"))
             return res
 
         res = asyncio.run(run())
         self.assertTrue(res["accepted"])
-        self.assertEqual(res["attachments_dropped"], 1)
+        self.assertEqual(res.get("attachments"), 1)
+        sent = FakeClient.instances[0].queries[0]
+        self.assertIn("這張圖是什麼", sent)
+        # **這條是整個檔最重要的斷言**:附件只進回顯卡、沒進 query 的話,
+        # 使用者會在對話裡看到自己的圖、以為模型看過了 —— 比「不支援」更糟。
+        self.assertIn(self.FAKE_PATH, sent, "附件路徑沒有進到送給模型的文字")
         store = cc_sdk.registry().get("att1").digest.store
         texts = [c["body"].get("text", "") for c in store.cards.values()]
-        self.assertTrue(any("不支援附件" in t for t in texts))
-        # 文字本體照送
-        self.assertEqual(FakeClient.instances[0].queries, ["hi"])
+        self.assertFalse(any("不支援附件" in t for t in texts),
+                         "附件已經支援了,不該再出『不支援』的卡")
 
-    def test_attachments_only_400_with_notice_card(self):
+    def test_attachments_only_is_accepted_now(self):
+        """純附件(沒有文字)以前回 400,現在應該收下 —— 路徑本身就是內容。"""
         async def run():
             cc_sdk.registry().ensure("att2", workdir=_TMP)
-            with self.assertRaises(HTTPException) as cm:
-                await bridge.v2_session_input(
-                    "cc2:att2", FakeRequest({"attachments": [{"url": "x"}]}))
-            self.assertEqual(cm.exception.status_code, 400)
+            FakeClient.batches = [[FakeResultMessage()]]
+            with patch.object(bridge, "_save_attachment",
+                              lambda a, d="file": self.FAKE_PATH):
+                res = await bridge.v2_session_input(
+                    "cc2:att2", FakeRequest({"attachments": [{"kind": "image",
+                                                              "filename": "y.png"}]}))
+            await _drain(cc_sdk.registry().get("att2"))
+            return res
 
-        asyncio.run(run())
-        store = cc_sdk.registry().get("att2").digest.store
-        texts = [c["body"].get("text", "") for c in store.cards.values()]
-        self.assertTrue(any("不支援附件" in t for t in texts))
+        res = asyncio.run(run())
+        self.assertTrue(res["accepted"])
+        self.assertIn(self.FAKE_PATH, FakeClient.instances[0].queries[0])
 
     def test_no_attachments_unchanged(self):
         async def run():

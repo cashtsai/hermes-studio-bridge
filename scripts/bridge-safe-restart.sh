@@ -12,19 +12,24 @@ T0=$(date +%s)
 # 舊版只看 turns_in_flight(人格)。機主當時正在跑一個 CX 任務(rollout 顯示
 # 它在執行 xcodebuild),腳本看到 0 就重啟 —— 重啟清掉記憶體裡的 card digest,
 # 重新播種只拿得到已落地的舊 turn,那段對話就從他視窗上消失了,他看到的是
-# 「指令跑一跑不見了」。`?agents=1` 會多問 CC/CX 的忙碌數。
-# cc 回 -1 = 問不到 → 當成「不確定」,寧可等也不要重啟。
+# 「指令跑一跑不見了」。`?agents=1` 會多問 CC/CX/cc2 的忙碌數。
+# cc 或 cc2 回 -1 = 問不到 → 當成「不確定」,寧可等也不要重啟。
+#
+# 2026-10-29 補 cc2:SDK 路徑的回合原本完全沒被算進來,腳本會看到 0 就重啟,
+# 把在跑的 cc2 回合安靜殺掉 —— 與上面那起 2026-10-10 實害同一類。
+# 舊版 bridge 的 health 沒有 `cc2` 這個鍵,.get('cc2', 0) 會拿到 0,行為與
+# 加這段之前相同(不會因為部署順序而卡住重啟)。
 while true; do
   N=$(curl -s -m 10 'http://127.0.0.1:8081/health?agents=1' | /usr/bin/python3 -c "import json,sys
 try:
     d = json.load(sys.stdin)
     a = d.get('agents_in_flight') or {}
-    cc, cx = a.get('cc', 0), a.get('cx', 0)
-    if cc == -1:
+    cc, cx, cc2 = a.get('cc', 0), a.get('cx', 0), a.get('cc2', 0)
+    if cc == -1 or cc2 == -1:
         print('-2 cc狀態問不到')          # 不確定 → 不重啟
     else:
-        total = d.get('turns_in_flight', 0) + cc + cx
-        print(f\"{total} 人格{d.get('turns_in_flight', 0)}/CC{cc}/CX{cx}\")
+        total = d.get('turns_in_flight', 0) + cc + cx + cc2
+        print(f\"{total} 人格{d.get('turns_in_flight', 0)}/CC{cc}/CX{cx}/cc2{cc2}\")
 except Exception: print('-1 health讀不到')")
   COUNT=${N%% *}
   DETAIL=${N#* }
