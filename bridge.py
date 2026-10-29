@@ -9229,6 +9229,12 @@ async def v2_session_diff(session_id: str, request: Request, path: str):
     src = _v2_card_source(session_id)
     if src[0] == "cc":
         return await _session_workdir_diff(src[2], path)
+    if src[0] == "cc2":
+        # cc2 自己就知道 workdir(建立時指定),直接走同一套。
+        _s = cc_sdk.registry().get(src[1])
+        if _s is None:
+            raise http_err(404, "SESSION_NOT_FOUND", f"找不到 cc2 session {src[1]}")
+        return await _session_workdir_diff(_s.workdir, path)
     if src[0] == "cx":
         return await _session_workdir_diff(await _codex_thread_workdir(src[1]), path)
     raise http_err(400, "UNSUPPORTED_PROVIDER", "persona session 沒有工作目錄")
@@ -9277,6 +9283,11 @@ async def v2_session_changes(session_id: str, request: Request):
     src = _v2_card_source(session_id)
     if src[0] == "cc":
         return await _session_workdir_changes(src[2])
+    if src[0] == "cc2":
+        _s = cc_sdk.registry().get(src[1])
+        if _s is None:
+            raise http_err(404, "SESSION_NOT_FOUND", f"找不到 cc2 session {src[1]}")
+        return await _session_workdir_changes(_s.workdir)
     if src[0] == "cx":
         return await _session_workdir_changes(await _codex_thread_workdir(src[1]))
     raise http_err(400, "UNSUPPORTED_PROVIDER", "persona session 沒有工作目錄")
@@ -21376,9 +21387,91 @@ def _cc2_approval_db_mark(aid: str, status: str) -> None:
 
 
 # 接線:cc_sdk 不 import bridge(避免循環),觀測/DB 掛鉤由這裡注入。
+def _cc2_turn_end_push(name: str, summary: str) -> None:
+    """cc2 回合完成推播 —— 與 tmux `_cc_turn_end_push` 同一條出口。
+
+    tmux 版由 follower 呼叫、且呼叫端已確認沒人在看;cc2 沒有 follower,
+    所以訂閱數在這裡判:有人正開著這條對話就不推(避免推自己正在看的東西)。
+    """
+    try:
+        sess = cc_sdk.registry().get(name)
+        if sess is not None and getattr(sess.digest.store, "subscribers", 0) > 0:
+            return
+        if _turnend_delegation_covers("cc2", name):
+            return
+        _turn_end_push(f"cc2:{name}", name, summary or "")
+    except Exception as e:  # noqa: BLE001
+        _log_event("cc2_turn_end_push_error", session=name, error=str(e)[:160])
+
+
 cc_sdk.configure(log=_log_event,
                  approval_db_upsert=_cc2_approval_db_upsert,
-                 approval_db_mark=_cc2_approval_db_mark)
+                 approval_db_mark=_cc2_approval_db_mark,
+                 turn_end_push=_cc2_turn_end_push)
+
+
+@app.post("/app/v2/cc2/{name}/rename")
+async def v2_cc2_rename(name: str, request: Request):
+    """改名(tmux 有、cc2 原本缺)。session 身分是 name,所以是搬鍵不是改欄位。"""
+    _check_auth(request)
+    if not cc_sdk.enabled():
+        raise http_err(404, "CC2_DISABLED", "cc2 provider 未啟用")
+    body = await _json_body(request)
+    new = str(body.get("name") or body.get("new_name") or "").strip()
+    if not new:
+        raise http_err(400, "NAME_REQUIRED", "name 必填")
+    reg = cc_sdk.registry()
+    sess = reg.get(name)
+    if sess is None:
+        raise http_err(404, "SESSION_NOT_FOUND", f"找不到 cc2 session {name}")
+    if reg.get(new) is not None:
+        raise http_err(409, "NAME_TAKEN", f"已經有叫 {new} 的 cc2 session")
+    reg.sessions.pop(name, None)
+    sess.name = new
+    reg.sessions[new] = sess
+    reg.save()
+    _log_event("cc2_renamed", old=name, new=new)
+    return {"ok": True, "session_id": f"cc2:{new}"}
+
+
+@app.post("/app/v2/cc2/{name}/archive")
+async def v2_cc2_archive(name: str, request: Request):
+    """封存/取消封存(tmux 有、cc2 原本缺)。封存只是不列出來,對話不刪。"""
+    _check_auth(request)
+    if not cc_sdk.enabled():
+        raise http_err(404, "CC2_DISABLED", "cc2 provider 未啟用")
+    body = await _json_body(request)
+    archived = bool(body.get("archived", True))
+    sess = cc_sdk.registry().get(name)
+    if sess is None:
+        raise http_err(404, "SESSION_NOT_FOUND", f"找不到 cc2 session {name}")
+    sess.archived = archived
+    cc_sdk.registry().save()
+    _log_event("cc2_archived", session=name, archived=archived)
+    return {"ok": True, "session_id": f"cc2:{name}", "archived": archived}
+
+
+@app.delete("/app/v2/cc2/{name}")
+async def v2_cc2_delete(name: str, request: Request):
+    """刪除註冊(tmux 有、cc2 原本缺 → 註冊表只增不減)。
+
+    只移除 bridge 這邊的註冊;`~/.claude/projects/` 下的 transcript **不動**,
+    所以之後還能用 `claude --resume` 或按目錄續接找回來。"""
+    _check_auth(request)
+    if not cc_sdk.enabled():
+        raise http_err(404, "CC2_DISABLED", "cc2 provider 未啟用")
+    reg = cc_sdk.registry()
+    sess = reg.get(name)
+    if sess is None:
+        raise http_err(404, "SESSION_NOT_FOUND", f"找不到 cc2 session {name}")
+    if sess.busy:
+        raise http_err(409, "CC2_BUSY", "這一輪還在跑;先按停止再刪除")
+    await sess._teardown_client()
+    reg.sessions.pop(name, None)
+    reg.save()
+    _log_event("cc2_deleted", session=name)
+    return {"ok": True, "deleted": f"cc2:{name}",
+            "note": "transcript 保留,之後仍可用 claude --resume 或按目錄續接"}
 
 
 @app.post("/app/v2/cc2/{name}/yield")

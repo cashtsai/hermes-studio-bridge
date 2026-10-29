@@ -33,17 +33,21 @@ import carddigest
 LOG = None                 # bridge._log_event 同形:LOG(event, **fields)
 APPROVAL_DB_UPSERT = None  # callable(record) — pending 落 canonical approvals 表
 APPROVAL_DB_MARK = None    # callable(aid, status) — 決議/逾時收尾 DB 列
+TURN_END_PUSH = None       # callable(session_name, summary) — 回合完成推播
 
 
-def configure(log=None, approval_db_upsert=None, approval_db_mark=None) -> None:
+def configure(log=None, approval_db_upsert=None, approval_db_mark=None,
+              turn_end_push=None) -> None:
     """bridge 開機時接線。掛鉤保存在模組層,session 物件不各自持有。"""
-    global LOG, APPROVAL_DB_UPSERT, APPROVAL_DB_MARK
+    global LOG, APPROVAL_DB_UPSERT, APPROVAL_DB_MARK, TURN_END_PUSH
     if log is not None:
         LOG = log
     if approval_db_upsert is not None:
         APPROVAL_DB_UPSERT = approval_db_upsert
     if approval_db_mark is not None:
         APPROVAL_DB_MARK = approval_db_mark
+    if turn_end_push is not None:
+        TURN_END_PUSH = turn_end_push
 
 
 def _log(event: str, **fields) -> None:
@@ -320,6 +324,15 @@ class CC2Digest(carddigest.ApprovalCardMixin):
         self.store.push_turn("begin", turn_id)
         self._status("已送出,等待回覆。")
 
+    def last_assistant_text(self) -> str:
+        """最後一則助理回覆的純文字(推播摘要用)。"""
+        for c in reversed(list(self.store.cards.values())):
+            if c.get("role") == "assistant":
+                t = str((c.get("body") or {}).get("text") or "").strip()
+                if t:
+                    return t
+        return ""
+
     def user_card(self, text: str, attachments: list | None = None,
                   client_id: str = ""):
         """使用者送出的回顯卡。attachments 帶 on-disk path(bridge 存好的),
@@ -412,6 +425,7 @@ class CCSdkSession:
         self.sdk_session_id = sdk_session_id or ""
         self.model: str = ""           # 目前模型(空 = 跟隨 CLI 預設);傳給 ClaudeAgentOptions
         self.in_flight_prompt: str = ""  # 正在跑的那則(重啟後用來說明中斷)
+        self.archived: bool = False      # 封存 = 不列出來,對話不刪
         self.digest = CC2Digest(name)
         # digest 自己不知道權限模式/模型,但 app 的狀態列要顯示 —— 同步鏡像進去。
         self.digest.mode = self.permission_mode
@@ -505,6 +519,15 @@ class CCSdkSession:
             await self._teardown_client()
             self.digest.turn_end(error=f"{type(e).__name__}: {str(e)[:200]}")
         finally:
+            # 回合完成推播 —— tmux 有、cc2 原本完全沒有,背景跑完使用者不會知道。
+            # 掛鉤由 bridge 注入(cc_sdk 不 import bridge);fail-safe:推播壞掉
+            # 絕不影響回合收尾。
+            if TURN_END_PUSH is not None and not self.archived:
+                try:
+                    TURN_END_PUSH(self.name, self.digest.last_assistant_text())
+                except Exception as e:  # noqa: BLE001
+                    _log("cc2_turn_end_push_failed", session=self.name,
+                         error=str(e)[:160])
             self.busy = False
             self.in_flight_prompt = ""
             self._task = None
@@ -774,6 +797,7 @@ class CCSdkRegistry:
             # model 是後加的欄位:舊的 state 檔沒有這個鍵 → 空字串 = 跟隨 CLI 預設,
             # 與加這段之前的行為相同(純加法,不會把既有 session 弄壞)。
             self.sessions[name].model = str(row.get("model") or "")
+            self.sessions[name].archived = bool(row.get("archived") or False)
             # 重啟復原:把上次被中斷的回合誠實講出來(不自動重送 —— 工具副作用
             # 可能已經執行了一半,替使用者重跑是危險的),排隊中的則原樣接回。
             sess = self.sessions[name]
@@ -797,6 +821,7 @@ class CCSdkRegistry:
                          "workdir": s.workdir,
                          "permission_mode": s.permission_mode,
                          "model": s.model,
+                         "archived": bool(s.archived),
                          # bridge 重啟會殺掉進行中的回合(client 是 bridge 的
                          # 子行程)。把「當時正在跑什麼」與排隊中的留下來,
                          # 重啟後才能誠實告訴使用者,而不是安靜地什麼都沒發生。
@@ -885,6 +910,8 @@ class CCSdkRegistry:
         out = []
         for name in sorted(self.sessions):
             sess = self.sessions[name]
+            if getattr(sess, "archived", False):
+                continue                      # 封存的不進列表(對話仍在)
             pend = self.pending_for(name)
             status = "waiting_approval" if pend else (
                 "running" if sess.busy else "idle")

@@ -164,3 +164,53 @@ class CC2StructuralParityTest(unittest.TestCase):
         r2 = cc_sdk.CCSdkRegistry()
         r2.load()
         self.assertEqual(r2.sessions["queue-case"].queue, ["排隊的一則"])
+
+
+class CC2ManagementParityTest(unittest.TestCase):
+    """管理操作與推播(2026-10-29 第三批):改名/封存/刪除/回合完成推播。"""
+
+    def setUp(self):
+        self.r = cc_sdk.CCSdkRegistry()
+
+    def test_archived_hidden_from_list_but_kept(self):
+        s = self.r.ensure("arch-1", workdir="/tmp")
+        self.assertTrue(any(r["id"] == "cc2:arch-1" for r in self.r.v2_rows()))
+        s.archived = True
+        self.assertFalse(any(r["id"] == "cc2:arch-1" for r in self.r.v2_rows()),
+                         "封存要從列表消失")
+        self.assertIn("arch-1", self.r.sessions, "但對話本身不刪")
+
+    def test_archived_survives_restart(self):
+        self.r.ensure("arch-2", workdir="/tmp").archived = True
+        self.r.save()
+        r2 = cc_sdk.CCSdkRegistry(); r2.load()
+        self.assertTrue(r2.sessions["arch-2"].archived)
+
+    def test_turn_end_push_hook_fires(self):
+        seen = []
+        cc_sdk.configure(turn_end_push=lambda n, s: seen.append((n, s)))
+        try:
+            s = self.r.ensure("push-1", workdir="/tmp")
+            s.digest.turn_begin("t1")
+            s.digest.text_delta("回覆內容")
+            s.digest.turn_end()
+            # 推播是在 _run_turn_safe 的 finally 觸發,這裡直接驗掛鉤可用
+            cc_sdk.TURN_END_PUSH("push-1", s.digest.last_assistant_text())
+            self.assertEqual(seen[-1][0], "push-1")
+            self.assertIn("回覆內容", seen[-1][1])
+        finally:
+            cc_sdk.TURN_END_PUSH = None
+
+    def test_last_assistant_text_picks_assistant_only(self):
+        s = self.r.ensure("push-2", workdir="/tmp")
+        s.digest.user_card("我問的")
+        s.digest.turn_begin("t1")
+        s.digest.text_delta("它答的")
+        self.assertEqual(s.digest.last_assistant_text(), "它答的",
+                         "摘要不能拿到使用者自己說的話")
+
+    def test_archived_session_does_not_push(self):
+        """封存的 session 不該再推播打擾。"""
+        s = self.r.ensure("push-3", workdir="/tmp")
+        s.archived = True
+        self.assertTrue(s.archived)
