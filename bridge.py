@@ -16707,13 +16707,27 @@ async def _cc_paste_text_locked(name: str, text: str, expect_dialog: bool = Fals
             busy = True                       # 只是 spinner 慢一拍,確實收下了
         else:
             await _tmux_run("send-keys", "-t", name, "C-u")
+            # ⚠️ 理由**不可以寫死成 never_rendered_idle**。這條路只判了
+            # 「驗不到 + pane 不忙」,沒問畫面上寫了什麼 —— 而 context 滿的
+            # session 正好長這樣:CLI 不收新輸入、也沒有 spinner。
+            # 於是使用者收到的提示是「當時是待命中,收到就會立刻開跑」,
+            # 跟事實完全相反(真相是 100% context used,要先 /compact)。
+            # 2026-10-29 實查 rakutai:`context_full` 5 次、
+            # `never_rendered_idle` 20 次,**同一個原因被標成兩種**,
+            # 而多數那種給的是會把人帶往錯誤方向的話。
+            # 先問畫面,問不出所以然才退回 never_rendered_idle。
+            reason = _cc_not_accepted_reason(late_pane)
+            if reason == "composer_stuck":
+                # composer_stuck 是「字卡在框裡」,但這條路的前提就是驗不到字
+                # → 那個理由在這裡不成立,退回原本的判定。
+                reason = "never_rendered_idle"
             _log_event("cc_input_not_accepted", session=name,
-                       stage="idle_recheck", reason="never_rendered_idle",
+                       stage="idle_recheck", reason=reason,
                        attempts=verdict["attempts"], text_chars=len(text),
                        busy=False)
             raise http_err(409, "CC_INPUT_NOT_ACCEPTED",
-                           "message never reached the TUI (session was idle)",
-                           _CC_NOT_ACCEPTED_HINT["never_rendered_idle"])
+                           f"message never reached the TUI ({reason})",
+                           _CC_NOT_ACCEPTED_HINT[reason])
     # busy 取捨:CLI 自己就有輸入佇列(忙碌中送出會排到本回合結束才處理),
     # bridge 端再疊一層持久佇列會出現兩個排序來源 → 重複送/亂序。所以這裡
     # 不排隊,只把「已被 CLI 收下、但還沒開始跑」誠實標成 queued 讓 app 顯示
