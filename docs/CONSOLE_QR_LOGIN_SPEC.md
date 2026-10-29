@@ -1,7 +1,29 @@
 # Console QR 登入規格（任意電腦開桌面控制台）
 
 > 機主 2026-10-29 提案。本文件是實作依據 —— **改實作先改這裡**。
-> 狀態：**規格待實作**。待 iOS build 189 出完、分享擴充那條整合完畢後開工。
+> 狀態：**bridge 側第一階段已實作**（分支 `feat/console-qr-login`，
+> worktree `~/apps/bridge-console-qr`）。入口分流與能力降級未完成，見 §16。
+
+## 進度速查（2026-10-29）
+
+| 項目 | 狀態 |
+|---|---|
+| 旗標 `POCKET_CONSOLE_QR_LOGIN`（預設 `0`） | ✅ |
+| login request 狀態機（120s TTL／一次性／40 筆上限／**全域**節流） | ✅ |
+| `_console_login_client_key()` 單一來源識別函式 | ✅ |
+| rid／sid 分離（§6.2 的防搶設計） | ✅ |
+| `GET /console/login/status`（含來源一致性比對） | ✅ |
+| `GET /app/v1/console/login/requests/{rid}` | ✅ |
+| `POST .../approve`、`POST .../deny` | ✅ |
+| session cookie 關瀏覽器即死（`_console_set_cookie(session_only=)`） | ✅ |
+| QR 登入頁（自包含、零外部資源） | ✅ |
+| `_pair_local_ok()` 述詞版（判定邏輯零複製） | ✅ |
+| **`console_page()` 入口分流** | ⬜ **未接上 → 功能目前無法觸發**（§16） |
+| **token scope 與能力降級（擋 `/file`、`/filediff`）** | ⬜ 未開始 |
+| iOS／Android 批准頁 | ⬜ 未開始 |
+
+驗證到的程度：`py_compile` 通過；QR 頁字串格式化單獨跑過（payload 代入、
+CSS `100%` escape、rid 進 payload）。**未啟動服務、未合併 main**（CLAUDE.md 鐵則）。
 
 ## 0. 一句話
 
@@ -167,13 +189,15 @@ tailnet 那道門後面當第二層；拆掉第一道門，它就從 defense-in-
 ## 7. QR payload
 
 ```text
-pocket://console-login?rid=<32 hex>&fp=<8 hex>
+pocket://console-login?rid=<32 hex>
 ```
 
 - `rid`：`secrets.token_hex(16)` = **128 bit**
-- `fp`：bridge 身分指紋（`_short_hash` of bridge 的穩定識別，8 hex）。
-  **用途是讓 app 擋掉「掃到別人 bridge 的 QR」** —— app 比對自己配對的 bridge
-  指紋，不符就顯示警告而不是送出批准。
+- ~~`fp`：bridge 身分指紋~~ **已移除（2026-10-29 實作時發現多餘）**。
+  原本想用它讓 app 擋掉「掃到別人 bridge 的 QR」，但 `rid` 是**本 bridge 本地**
+  的隨機值 —— app 拿著 rid 去呼叫**自己配對的那台** bridge，掃到別台的 QR
+  自然就是 404。404 已經提供同樣的保護，再加指紋只是多一個要維護的欄位。
+  app 端據 404 顯示「這個 QR 不是這台桌面的」。
 - **刻意不放 bridge URL** —— app 必須用它**自己既有的連線**去呼叫，絕不可以被
   QR 指去另一個主機（那正好是釣魚要的）。
 - app 端解析沿用既有 `pocket://` 深連結管線（iOS build 126 那批、Android
