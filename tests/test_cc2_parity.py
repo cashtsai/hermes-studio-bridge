@@ -166,12 +166,26 @@ class CC2StructuralParityTest(unittest.TestCase):
                          "絕不自動重送 —— 工具副作用可能已執行一半")
 
     def test_queue_survives_restart(self):
+        """排隊項目要**完整**存活:原本只落文字,重啟後附件與 client_id 都掉了
+        —— 圖不見了、app 的待送泡泡也對不上(2026-10-29 複查抓到)。"""
         s = self.r.ensure("queue-case", workdir="/tmp")
-        s.queue = [("排隊的一則", [], "")]
+        atts = [{"path": "/tmp/q.png", "available": True}]
+        s.queue = [("排隊的一則", atts, "cid-q")]
         self.r.save()
         r2 = cc_sdk.CCSdkRegistry()
         r2.load()
-        self.assertEqual(r2.sessions["queue-case"].queue, ["排隊的一則"])
+        self.assertEqual(r2.sessions["queue-case"].queue,
+                         [("排隊的一則", atts, "cid-q")])
+
+    def test_old_string_queue_format_still_loads(self):
+        """升級當下佇列裡還有舊格式(純字串)不得炸。"""
+        json.dump({"sessions": {"oldq": {"workdir": "/tmp", "sdk_session_id": "",
+                                         "permission_mode": "acceptEdits",
+                                         "queued": ["舊格式那一則"]}}},
+                  open(os.environ["CC_SDK_STATE"], "w", encoding="utf-8"))
+        r2 = cc_sdk.CCSdkRegistry()
+        r2.load()
+        self.assertEqual(r2.sessions["oldq"].queue, [("舊格式那一則", [], "")])
 
 
 class CC2ManagementParityTest(unittest.TestCase):
@@ -504,15 +518,19 @@ class CC2AuditFixesTest(unittest.TestCase):
         self.assertTrue((self.s.digest.store.status or {}).get("blocked"))
 
     def test_spawn_opts_whitelist(self):
-        """白名單外的鍵不准落地(這份 dict 會進 state 檔並直通 SDK 建構子)。"""
+        """白名單外的鍵不准落地(這份 dict 會進 state 檔並直通 SDK 建構子)。
+
+        `allowed_tools` 曾經在白名單裡(我上一批自己加的),後來查出它會
+        **靜默繞過 Pocket 審批閘** → 移出並改為明確拒收,見
+        `CC2SpawnPinSafetyTest`。
+        """
         out = cc_sdk.sanitize_spawn_opts({
-            "effort": "high", "allowed_tools": ["Read"],
-            "max_thinking_tokens": "4096", "cli_path": "/evil/claude",
-            "env": {"X": "1"}, "can_use_tool": "nope"})
+            "effort": "high", "max_thinking_tokens": "4096",
+            "cli_path": "/evil/claude", "env": {"X": "1"},
+            "can_use_tool": "nope"})
         self.assertEqual(out["effort"], "high")
-        self.assertEqual(out["allowed_tools"], ["Read"])
         self.assertEqual(out["max_thinking_tokens"], 4096, "字串數字要轉型")
-        for bad in ("cli_path", "env", "can_use_tool"):
+        for bad in ("cli_path", "env", "can_use_tool", "allowed_tools"):
             self.assertNotIn(bad, out)
 
     def test_tool_images_become_attachment_card(self):
@@ -572,3 +590,392 @@ class CC2AuditFixesTest(unittest.TestCase):
             self.s._collect_tool_images(FakeMsg())   # 不該拋
         finally:
             cc_sdk.MEDIA_SINK = old
+
+
+class CC2ToolResultTest(unittest.TestCase):
+    """工具結果要看得到(2026-10-29)。
+
+    cc2 原本只出「🔧 Bash: git status」,**結果從來不顯示** —— 使用者看得到
+    它跑了什麼,看不到跑出什麼。tmux 路徑在 pane 裡本來就看得到。
+    """
+
+    def setUp(self):
+        self.r = cc_sdk.CCSdkRegistry()
+        self.s = self.r.ensure("tr-1", workdir="/tmp")
+        self.s.digest.store.turn_id = "turn-tr"
+
+    def _result_msg(self, use_id, content, is_error=False):
+        class FakeToolResult:
+            pass
+        FakeToolResult.__name__ = "ToolResultBlock"
+        b = FakeToolResult()
+        b.tool_use_id = use_id
+        b.content = content
+        b.is_error = is_error
+
+        class FakeMsg:
+            pass
+        m = FakeMsg()
+        m.content = [b]
+        return m
+
+    def _card_text(self, cid_fragment="t"):
+        for c in self.s.digest.store.cards.values():
+            if (c.get("body") or {}).get("origin") == "cc2.tool":
+                return str((c.get("body") or {}).get("text") or "")
+        return ""
+
+    def test_result_backfills_same_card(self):
+        self.s.digest.tool_card("Bash", "git status", use_id="tu_1")
+        before = len(self.s.digest.store.cards)
+        self.s._collect_tool_results(
+            self._result_msg("tu_1", "On branch main\nnothing to commit"))
+        self.assertEqual(len(self.s.digest.store.cards), before,
+                         "要回填同一張卡,不得另開新卡(手機上會洗版)")
+        txt = self._card_text()
+        self.assertIn("git status", txt, "呼叫摘要要留著")
+        self.assertIn("nothing to commit", txt, "結果要看得到")
+
+    def test_list_content_text_parts_collected(self):
+        self.s.digest.tool_card("Read", "foo.py", use_id="tu_2")
+        self.s._collect_tool_results(self._result_msg(
+            "tu_2", [{"type": "text", "text": "def main():"},
+                     {"type": "image", "source": {"data": "x"}}]))
+        self.assertIn("def main():", self._card_text())
+
+    def test_error_result_marked(self):
+        self.s.digest.tool_card("Bash", "false", use_id="tu_3")
+        self.s._collect_tool_results(
+            self._result_msg("tu_3", "command failed", is_error=True))
+        self.assertIn("⚠️ 失敗", self._card_text())
+
+    def test_long_result_truncated_and_says_so(self):
+        """編譯輸出動輒上萬字:截斷並明說,不要把卡片流撐爆。"""
+        self.s.digest.tool_card("Bash", "xcodebuild", use_id="tu_4")
+        self.s._collect_tool_results(self._result_msg("tu_4", "x" * 5000))
+        txt = self._card_text()
+        self.assertLess(len(txt), 1200, "不得塞全文")
+        self.assertIn("還有", txt, "要明說截斷了多少")
+
+    def test_empty_result_says_no_output(self):
+        self.s.digest.tool_card("Bash", "true", use_id="tu_5")
+        self.s._collect_tool_results(self._result_msg("tu_5", "   "))
+        self.assertIn("沒有輸出", self._card_text())
+
+    def test_unknown_use_id_ignored(self):
+        """對不上的結果安靜跳過,不得炸、不得亂開卡。"""
+        before = len(self.s.digest.store.cards)
+        self.s._collect_tool_results(self._result_msg("nope", "hi"))
+        self.assertEqual(len(self.s.digest.store.cards), before)
+
+    def test_results_inside_assistant_message_also_collected(self):
+        """工具結果也會夾在 AssistantMessage 裡(SDK 解析器 case "assistant"
+        同樣收 tool_result)。只在 UserMessage 收會安靜漏掉一部分。"""
+        class FakeToolResult:
+            pass
+        FakeToolResult.__name__ = "ToolResultBlock"
+        rb = FakeToolResult()
+        rb.tool_use_id = "tu_mix"
+        rb.content = "mixed-in result"
+        rb.is_error = False
+
+        class FakeMsg:
+            pass
+        m = FakeMsg()
+        m.content = [rb]
+
+        self.s.digest.tool_card("Bash", "pwd", use_id="tu_mix")
+        self.s._collect_tool_results(m)
+        self.assertIn("mixed-in result", self._card_text(),
+                      "AssistantMessage 裡的結果也要收")
+
+    def test_map_cleared_on_turn_end(self):
+        """對照表不跨回合累積(長 session 會無上限長大)。"""
+        self.s.digest.tool_card("Bash", "ls", use_id="tu_6")
+        self.assertTrue(self.s.digest._tool_cards)
+        self.s.digest.turn_end()
+        self.assertFalse(self.s.digest._tool_cards)
+
+
+class CC2SpawnPinSafetyTest(unittest.TestCase):
+    """spawn pin 對齊 tmux 正典 + 拒收會繞過審批的那顆(2026-10-29)。"""
+
+    def setUp(self):
+        self.r = cc_sdk.CCSdkRegistry()
+
+    def test_allowed_tools_refused_not_silently_dropped(self):
+        """allowed_tools 會**靜默繞過 Pocket 審批閘**(SDK 自己會警告),
+        所以拒收 —— 而且要回報理由,不能默默丟掉讓人以為生效了。"""
+        self.assertNotIn("allowed_tools", cc_sdk.SPAWN_PIN_KEYS)
+        self.assertIn("allowed_tools", cc_sdk.SPAWN_PIN_REFUSED)
+        out = cc_sdk.sanitize_spawn_opts({"allowed_tools": ["Bash"]})
+        self.assertEqual(out, {})
+        refused = cc_sdk.refused_spawn_keys({"allowed_tools": ["Bash"]})
+        self.assertIn("allowed_tools", refused)
+        self.assertIn("審批", refused["allowed_tools"], "理由要講人話")
+
+    def test_tmux_canonical_pins_supported(self):
+        """與 tmux 的 spawn pin 正典同一組,兩條路徑語意才一致。"""
+        for k in ("effort", "fallback_model", "max_budget_usd",
+                  "append_system_prompt"):
+            self.assertIn(k, cc_sdk.SPAWN_PIN_KEYS, k)
+        out = cc_sdk.sanitize_spawn_opts({"max_budget_usd": "12.5"})
+        self.assertEqual(out["max_budget_usd"], 12.5, "字串數字要轉型")
+
+    def test_byo_api_key_not_in_state_file(self):
+        """BYO 憑證不准落進 state JSON(那是明文檔)。"""
+        os.environ["CCSESS_SECRET_DIR"] = os.path.join(_TMP, "secret")
+        try:
+            s = self.r.ensure("byo-1", workdir="/tmp",
+                              spawn_opts={"api_key": "sk-super-secret"})
+            cc_sdk.write_spawn_secret("byo-1", "sk-super-secret")
+            self.r.save()
+            blob = open(os.environ["CC_SDK_STATE"], encoding="utf-8").read()
+            self.assertNotIn("sk-super-secret", blob,
+                             "明文憑證絕不落 state")
+            self.assertNotIn("api_key", s.spawn_opts)
+            self.assertEqual(cc_sdk.read_spawn_secret("byo-1"),
+                             "sk-super-secret")
+            # 0600 權限
+            path = os.path.join(os.environ["CCSESS_SECRET_DIR"], "byo-1")
+            self.assertEqual(oct(os.stat(path).st_mode & 0o777), "0o600")
+        finally:
+            os.environ.pop("CCSESS_SECRET_DIR", None)
+
+    def test_byo_key_reaches_client_env_only(self):
+        """key 只經由 env 傳給子行程,不出現在 spawn_opts。
+
+        而且**只傳這一把** —— SDK 的 subprocess transport 本來就繼承
+        os.environ,而且刻意濾掉 CLAUDECODE、設 CLAUDE_CODE_ENTRYPOINT=sdk-py;
+        `options.env` 是最後覆蓋那層,整份灌 os.environ 會把那兩件事都破壞掉。
+        """
+        os.environ["CCSESS_SECRET_DIR"] = os.path.join(_TMP, "secret2")
+        try:
+            s = self.r.ensure("byo-2", workdir="/tmp")
+            cc_sdk.write_spawn_secret("byo-2", "sk-abc")
+            kw = s._spawn_option_kwargs()
+            self.assertEqual(kw["env"], {"ANTHROPIC_API_KEY": "sk-abc"},
+                             "只准傳這一把,不得整份灌 os.environ")
+        finally:
+            os.environ.pop("CCSESS_SECRET_DIR", None)
+
+    def test_no_secret_means_no_env_override(self):
+        """沒設 BYO key 就完全不要碰 env(讓 SDK 的預設繼承邏輯生效)。"""
+        os.environ["CCSESS_SECRET_DIR"] = os.path.join(_TMP, "secret-empty")
+        try:
+            s = self.r.ensure("byo-3", workdir="/tmp")
+            self.assertNotIn("env", s._spawn_option_kwargs())
+        finally:
+            os.environ.pop("CCSESS_SECRET_DIR", None)
+
+    def test_context_usage_has_timeout(self):
+        """它跑在 turn 收尾的 finally 裡 —— 卡住會讓 session 永遠 busy。"""
+        import asyncio
+
+        class WedgedClient:
+            async def get_context_usage(self):
+                await asyncio.sleep(60)      # 半死的 client:不回
+
+        s = self.r.ensure("ctx-wedged", workdir="/tmp")
+        s.client = WedgedClient()
+        os.environ["CC_SDK_CONTEXT_TIMEOUT"] = "0.3"   # 測試不必真的等 8 秒
+
+        async def run():
+            import time as _t
+            t0 = _t.monotonic()
+            out = await asyncio.wait_for(s.refresh_context_usage(), timeout=20)
+            return out, _t.monotonic() - t0
+
+        try:
+            out, elapsed = asyncio.run(run())
+        finally:
+            os.environ.pop("CC_SDK_CONTEXT_TIMEOUT", None)
+        self.assertEqual(out, {}, "逾時要安靜回空,不是拋例外")
+        self.assertLess(elapsed, 5, "必須自己逾時,不能等到外層")
+
+
+class CC2SecondAuditTest(unittest.TestCase):
+    """2026-10-29 第二輪複查抓到的缺陷。
+
+    這一輪的教訓:上一輪我的測試**斷言了錯的契約** —— 只驗路由回傳值 200,
+    沒驗卡片與 DB 真正記成什麼,所以「回答問題被記成拒絕」一路綠。
+    """
+
+    def setUp(self):
+        self.r = cc_sdk.CCSdkRegistry()
+        self.s = self.r.ensure("a2-1", workdir="/tmp")
+
+    _INPUT = {"questions": [{
+        "question": "要用哪個資料庫?", "header": "資料庫",
+        "options": [{"label": "Postgres"}, {"label": "SQLite"}]}]}
+
+    def _run_decision(self, key, tool_input=None):
+        import asyncio
+        marks = []
+        old = cc_sdk.APPROVAL_DB_MARK
+        cc_sdk.APPROVAL_DB_MARK = lambda aid, st: marks.append((aid, st))
+
+        async def run():
+            task = asyncio.ensure_future(self.s._can_use_tool(
+                "AskUserQuestion", tool_input or self._INPUT, None))
+            for _ in range(200):
+                await asyncio.sleep(0.005)
+                if self.r.pending_approvals:
+                    break
+            aid = next(iter(self.r.pending_approvals))
+            self.r.decide_approval(aid, key)
+            return await task
+
+        try:
+            res = asyncio.run(run())
+        finally:
+            cc_sdk.APPROVAL_DB_MARK = old
+        return res, marks
+
+    def test_answering_is_recorded_as_answered_not_denied(self):
+        """選了「Postgres」,卡片不能顯示「已拒絕」。
+
+        原本一律套 approve/deny 二元判斷,`ask:N` 不在允許清單 → 算成 denied。
+        canonical 字彙:permission→approved|denied、question→answered。
+        """
+        _res, marks = self._run_decision("ask:0")
+        self.assertTrue(marks, "要有 DB 收尾")
+        self.assertEqual(marks[-1][1], "answered",
+                         "回答問題不是拒絕 —— DB 不得記成 denied")
+        cards = [c for c in self.s.digest.store.cards.values()
+                 if str(c.get("id", "")).startswith("card-cc2-appr-")]
+        self.assertTrue(cards, "要有審批卡")
+        resolved = str((cards[-1].get("body") or {}).get("resolved") or "")
+        self.assertNotEqual(resolved, "denied",
+                            "卡片不得顯示已拒絕(使用者明明選了選項)")
+
+    def test_question_never_enters_allow_all_memory(self):
+        """AskUserQuestion 進了「本次全允許」就等於永久關掉提問且無聲。"""
+        self._run_decision("approve_for_session")
+        self.assertNotIn("AskUserQuestion", self.s.session_allowed_tools)
+
+    def test_allow_all_memory_does_not_swallow_questions(self):
+        """就算記憶裡真的有它(舊 state/別的路徑塞進去),也不得走早退放行。"""
+        import asyncio
+        self.s.session_allowed_tools.add("AskUserQuestion")
+
+        async def run():
+            task = asyncio.ensure_future(self.s._can_use_tool(
+                "AskUserQuestion", self._INPUT, None))
+            for _ in range(200):
+                await asyncio.sleep(0.005)
+                if self.r.pending_approvals:
+                    break
+            self.assertTrue(self.r.pending_approvals,
+                            "必須照樣出卡問人,不得自動放行")
+            aid = next(iter(self.r.pending_approvals))
+            self.r.decide_approval(aid, "ask:1")
+            return await task
+
+        res = asyncio.run(run())
+        self.assertIn("SQLite", res.message)
+
+    def test_multi_question_tells_model_only_first_was_asked(self):
+        """多題只答得了第一題 —— 不講模型會以為全部答完了。"""
+        inp = {"questions": [
+            dict(self._INPUT["questions"][0]),
+            {"question": "第二題", "header": "第二", "options": [{"label": "X"}]}]}
+        res, _ = self._run_decision("ask:0", inp)
+        self.assertIn("only the first", res.message)
+        self.assertIn("unanswered", res.message)
+
+    def test_tmux_mode_vocab_accepted(self):
+        """app 的模式選擇器送 tmux 字彙(normal);不認的話預設那格直接失敗。"""
+        self.assertEqual(cc_sdk.normalize_mode("normal"), "default")
+        self.assertEqual(cc_sdk.normalize_mode("manual"), "default")
+        self.assertEqual(cc_sdk.normalize_mode("plan"), "plan")
+        self.assertEqual(cc_sdk.normalize_mode("yolo"), "",
+                         "認不出來要回空,讓呼叫端決定 400 還是退預設")
+
+    def test_secret_path_traversal_refused(self):
+        """secret 路徑是 join(dir, name) —— name 含 ../ 就能寫到目錄外。"""
+        os.environ["CCSESS_SECRET_DIR"] = os.path.join(_TMP, "sec-trav")
+        try:
+            self.assertFalse(cc_sdk.write_spawn_secret("../evil", "sk-x"))
+            self.assertFalse(cc_sdk.write_spawn_secret("a/b", "sk-x"))
+            self.assertEqual(cc_sdk.read_spawn_secret("../evil"), "")
+        finally:
+            os.environ.pop("CCSESS_SECRET_DIR", None)
+
+    def test_rename_moves_secret_and_fixes_identity(self):
+        """改名要連帶搬 key、換 digest 身分、搬 pending 審批歸屬。"""
+        import asyncio
+        os.environ["CCSESS_SECRET_DIR"] = os.path.join(_TMP, "sec-rn")
+        try:
+            s = self.r.ensure("rn-old", workdir="/tmp")
+            cc_sdk.write_spawn_secret("rn-old", "sk-keep-me")
+            aid = "cc2-rn"
+            self.r.pending_approvals[aid] = {
+                "event": asyncio.Event(), "decision": None,
+                "record": {"id": aid}, "session": "rn-old"}
+            self.r.rename("rn-old", "rn-new")
+            self.assertEqual(cc_sdk.read_spawn_secret("rn-new"), "sk-keep-me",
+                             "key 沒搬 → 安靜退回預設憑證")
+            self.assertEqual(cc_sdk.read_spawn_secret("rn-old"), "")
+            self.assertEqual(s.digest.name, "rn-new")
+            self.assertEqual(s.digest.store.media_session_id, "cc2:rn-new",
+                             "媒體網址要跟著換,不然已出的圖對不上")
+            self.assertIsNotNone(self.r.pending_for("rn-new"),
+                                 "審批歸屬要搬,不然那筆變成按不下去")
+        finally:
+            os.environ.pop("CCSESS_SECRET_DIR", None)
+
+    def test_delete_removes_secret(self):
+        """刪掉之後同名新 session 不得悄悄繼承上一個人的憑證。"""
+        os.environ["CCSESS_SECRET_DIR"] = os.path.join(_TMP, "sec-del")
+        try:
+            cc_sdk.write_spawn_secret("del-1", "sk-old-owner")
+            cc_sdk.delete_spawn_secret("del-1")
+            self.assertEqual(cc_sdk.read_spawn_secret("del-1"), "")
+        finally:
+            os.environ.pop("CCSESS_SECRET_DIR", None)
+
+    def test_row_exposes_fields_app_needs(self):
+        self.s.digest.turn_begin("t")
+        row = [r for r in self.r.v2_rows() if r["id"] == "cc2:a2-1"][0]
+        self.assertIn("attachments", row["capabilities"],
+                      "app 若以 capabilities 決定顯不顯示附件鈕,漏了就等於沒做")
+        self.assertEqual(row["meta"]["workdir"], "/tmp")
+        self.assertIsNotNone(row["meta"]["busy_since"])
+        self.assertEqual(row["meta"]["queue_depth"], 0)
+
+    def test_empty_second_result_does_not_wipe_real_output(self):
+        """同一 tool_use_id 回兩次:第二次空的不得蓋掉已收到的真輸出。"""
+        self.s.digest.store.turn_id = "t"
+        self.s.digest.tool_card("Bash", "make", use_id="tu_x")
+        self.s.digest.tool_result("tu_x", "BUILD SUCCEEDED")
+        self.s.digest.tool_result("tu_x", "")
+        txt = [str((c.get("body") or {}).get("text") or "")
+               for c in self.s.digest.store.cards.values()
+               if (c.get("body") or {}).get("origin") == "cc2.tool"][0]
+        self.assertIn("BUILD SUCCEEDED", txt)
+        self.assertNotIn("沒有輸出", txt)
+
+    def test_server_tool_result_dict_rendered(self):
+        """server tool(web_search 等)的結果是原始 dict —— 要壓成看得懂的字,
+        不能一片空白。"""
+        class FakeServerResult:
+            pass
+        FakeServerResult.__name__ = "ServerToolResultBlock"
+        b = FakeServerResult()
+        b.tool_use_id = "stu_1"
+        b.content = {"type": "web_search_result", "content": "找到 3 筆結果"}
+        b.is_error = False
+
+        class FakeMsg:
+            pass
+        m = FakeMsg()
+        m.content = [b]
+
+        self.s.digest.store.turn_id = "t"
+        self.s.digest.tool_card("web_search", "pocket app", use_id="stu_1")
+        self.s._collect_tool_results(m)
+        txt = [str((c.get("body") or {}).get("text") or "")
+               for c in self.s.digest.store.cards.values()
+               if (c.get("body") or {}).get("origin") == "cc2.tool"][0]
+        self.assertIn("找到 3 筆結果", txt)

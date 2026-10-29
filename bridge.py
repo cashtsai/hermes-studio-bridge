@@ -21494,12 +21494,17 @@ async def v2_cc2_rename(name: str, request: Request):
     sess = reg.get(name)
     if sess is None:
         raise http_err(404, "SESSION_NOT_FOUND", f"找不到 cc2 session {name}")
+    if not re.fullmatch(cc_sdk.SESSION_NAME_RE, new):
+        raise http_err(400, "BAD_SESSION_NAME",
+                       "cc2 session 名限英數/底線/連字號(≤64)")
     if reg.get(new) is not None:
         raise http_err(409, "NAME_TAKEN", f"已經有叫 {new} 的 cc2 session")
-    reg.sessions.pop(name, None)
-    sess.name = new
-    reg.sessions[new] = sess
-    reg.save()
+    # 忙碌中不准改名:改名要搬 pending 審批的歸屬,半路換名字會讓那筆審批
+    # 在兩個名字之間掉出去(變成按不下去,只能等 fail-closed)。
+    if sess.busy or reg.pending_for(name):
+        raise http_err(409, "SESSION_BUSY",
+                       "這條 session 正在跑或有待決審批;等它結束再改名")
+    reg.rename(name, new)
     _log_event("cc2_renamed", old=name, new=new)
     return {"ok": True, "session_id": f"cc2:{new}"}
 
@@ -21538,6 +21543,9 @@ async def v2_cc2_delete(name: str, request: Request):
         raise http_err(409, "CC2_BUSY", "這一輪還在跑;先按停止再刪除")
     await sess._teardown_client()
     reg.sessions.pop(name, None)
+    # BYO key 一併清掉 —— 留著的話之後同名的新 session 會**悄悄繼承**上一個人
+    # 的憑證(2026-10-29 複查抓到)。
+    cc_sdk.delete_spawn_secret(name)
     reg.save()
     _log_event("cc2_deleted", session=name)
     return {"ok": True, "deleted": f"cc2:{name}",
@@ -21591,19 +21599,40 @@ async def v2_cc2_create(name: str, request: Request):
         raise http_err(400, "BAD_SESSION_NAME",
                        "cc2 session 名限英數/底線/連字號(≤64)")
     body = await _json_body(request)
-    mode = str(body.get("permission_mode") or "").strip()
-    if mode and mode not in cc_sdk.PERMISSION_MODES:
+    raw_mode = str(body.get("permission_mode") or "").strip()
+    # 收 tmux 的字彙(`normal`/`manual`)並轉成 SDK 的 `default` —— app 的模式
+    # 選擇器送的是 tmux 字彙,只認 SDK 字彙的話預設那一格在 cc2 上直接 400。
+    mode = cc_sdk.normalize_mode(raw_mode) if raw_mode else ""
+    if raw_mode and not mode:
         raise http_err(400, "BAD_PERMISSION_MODE",
-                       f"permission_mode 必須是 {list(cc_sdk.PERMISSION_MODES)} 之一")
+                       f"permission_mode 必須是 {list(cc_sdk.PERMISSION_MODES)} "
+                       f"或 {list(cc_sdk.MODE_ALIASES)} 之一")
+    pins = body.get("spawn_opts")
     sess = cc_sdk.registry().ensure(
         name, workdir=str(body.get("workdir") or "").strip(),
         permission_mode=mode,
         model=str(body.get("model") or "").strip(),
-        spawn_opts=body.get("spawn_opts"))
-    return {"ok": True, "session_id": f"cc2:{name}",
-            "workdir": sess.workdir, "permission_mode": sess.permission_mode,
-            "model": sess.model or None,
-            "spawn_opts": dict(sess.spawn_opts or {})}
+        spawn_opts=pins)
+    # BYO ANTHROPIC_API_KEY 走 0600 secret 檔(與 tmux 同一個目錄,設一次兩條
+    # 路徑都吃得到),**不**進 state JSON、不回明文。
+    has_key = False
+    if isinstance(pins, dict) and "api_key" in pins:
+        has_key = cc_sdk.write_spawn_secret(
+            name, str(pins.get("api_key") or "").strip())
+    else:
+        has_key = bool(cc_sdk.read_spawn_secret(name))
+    out = {"ok": True, "session_id": f"cc2:{name}",
+           "workdir": sess.workdir, "permission_mode": sess.permission_mode,
+           "model": sess.model or None,
+           "spawn_opts": dict(sess.spawn_opts or {}),
+           "has_api_key": has_key}
+    # 刻意拒收的鍵要回報,不能靜默丟掉 —— 靜默的話使用者會以為設定生效了。
+    refused = cc_sdk.refused_spawn_keys(pins)
+    if refused:
+        out["refused_spawn_opts"] = refused
+        _log_event("cc2_spawn_pin_refused", session=name,
+                   keys=",".join(sorted(refused)))
+    return out
 
 
 @app.post("/app/v2/cc2/{name}/settings")
@@ -21622,10 +21651,14 @@ async def v2_cc2_settings(name: str, request: Request):
     if sess is None:
         raise http_err(404, "SESSION_NOT_FOUND", f"cc2 session {name} 不存在")
     body = await _json_body(request)
-    mode = str(body.get("permission_mode") or "").strip()
-    if mode and mode not in cc_sdk.PERMISSION_MODES:
+    raw_mode = str(body.get("permission_mode") or "").strip()
+    # 收 tmux 的字彙(`normal`/`manual`)並轉成 SDK 的 `default` —— app 的模式
+    # 選擇器送的是 tmux 字彙,只認 SDK 字彙的話預設那一格在 cc2 上直接 400。
+    mode = cc_sdk.normalize_mode(raw_mode) if raw_mode else ""
+    if raw_mode and not mode:
         raise http_err(400, "BAD_PERMISSION_MODE",
-                       f"permission_mode 必須是 {list(cc_sdk.PERMISSION_MODES)} 之一")
+                       f"permission_mode 必須是 {list(cc_sdk.PERMISSION_MODES)} "
+                       f"或 {list(cc_sdk.MODE_ALIASES)} 之一")
     has_model = "model" in body
     try:
         res = await sess.apply_runtime_settings(

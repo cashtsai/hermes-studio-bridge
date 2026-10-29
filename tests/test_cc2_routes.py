@@ -212,21 +212,46 @@ class CC2RouteTest(unittest.TestCase):
         self.assertNotEqual(self.sess.permission_mode, "acceptEdits-yolo")
 
     def test_create_accepts_model_and_spawn_pins(self):
-        """建立時釘模型與其他 SDK 選項(tmux 有一整個 pin 目錄,cc2 原本只有
+        """建立時釘模型與其他啟動選項(tmux 有一整個 pin 目錄,cc2 原本只有
         workdir/permission_mode)。白名單外的鍵要被丟掉。"""
         r = self.http.post("/app/v2/cc2/r2", headers=self.auth,
                            json={"workdir": "/tmp", "model": "claude-sonnet-5",
                                  "spawn_opts": {
                                      "effort": "high",
                                      "append_system_prompt": "講中文",
-                                     "allowed_tools": ["Read", "Bash"],
+                                     "max_budget_usd": 5,
                                      "evil_key": "rm -rf /"}})
         self.assertEqual(r.status_code, 200, r.text)
         pins = r.json().get("spawn_opts") or {}
         self.assertEqual(pins.get("effort"), "high")
-        self.assertEqual(pins.get("allowed_tools"), ["Read", "Bash"])
+        self.assertEqual(pins.get("max_budget_usd"), 5.0)
         self.assertNotIn("evil_key", pins, "白名單外的鍵不准落地")
         self.assertEqual(r.json().get("model"), "claude-sonnet-5")
+
+    def test_create_reports_refused_pins(self):
+        """拒收的 pin 要回報理由,不能靜默丟掉 —— 靜默的話使用者會以為生效了。"""
+        r = self.http.post("/app/v2/cc2/r4", headers=self.auth,
+                           json={"workdir": "/tmp",
+                                 "spawn_opts": {"allowed_tools": ["Bash"]}})
+        self.assertEqual(r.status_code, 200, r.text)
+        refused = r.json().get("refused_spawn_opts") or {}
+        self.assertIn("allowed_tools", refused,
+                      "會繞過審批閘的 pin 必須明確回報被拒")
+        self.assertNotIn("allowed_tools", r.json().get("spawn_opts") or {})
+
+    def test_create_does_not_echo_api_key(self):
+        """BYO 憑證只回布林,絕不回明文。"""
+        import os as _os
+        _os.environ["CCSESS_SECRET_DIR"] = _os.path.join(_TMP, "rsecret")
+        try:
+            r = self.http.post("/app/v2/cc2/r5", headers=self.auth,
+                               json={"workdir": "/tmp",
+                                     "spawn_opts": {"api_key": "sk-leak-me"}})
+            self.assertEqual(r.status_code, 200, r.text)
+            self.assertNotIn("sk-leak-me", r.text, "明文憑證不准出現在回應裡")
+            self.assertTrue(r.json().get("has_api_key"))
+        finally:
+            _os.environ.pop("CCSESS_SECRET_DIR", None)
 
     def test_append_system_prompt_keeps_claude_code_preset(self):
         """append_system_prompt 要轉成官方 preset+append 形狀。
@@ -278,3 +303,36 @@ class CC2RouteTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CC2ModeVocabRouteTest(unittest.TestCase):
+    """模式字彙別名要走得通(2026-10-29 第二輪複查)。
+
+    tmux 的 `_CC_MODES` 用 `normal`,SDK 用 `default`。app 的模式選擇器送的是
+    tmux 字彙 —— 路由只認 SDK 字彙的話,預設那一格在 cc2 上直接 400。
+    """
+
+    def setUp(self):
+        from fastapi.testclient import TestClient
+        self.auth = {"Authorization": "Bearer " + bridge.BRIDGE_TOKEN}
+        self.http = TestClient(bridge.app)
+        cc_sdk.reset_registry_for_tests()
+        cc_sdk.registry().ensure("mv1", workdir="/tmp")
+
+    def test_create_accepts_tmux_vocab(self):
+        r = self.http.post("/app/v2/cc2/mv2", headers=self.auth,
+                           json={"workdir": "/tmp", "permission_mode": "normal"})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["permission_mode"], "default",
+                         "要轉成 SDK 字彙")
+
+    def test_settings_accepts_tmux_vocab(self):
+        r = self.http.post("/app/v2/cc2/mv1/settings", headers=self.auth,
+                           json={"permission_mode": "normal"})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(cc_sdk.registry().get("mv1").permission_mode, "default")
+
+    def test_still_rejects_nonsense(self):
+        r = self.http.post("/app/v2/cc2/mv1/settings", headers=self.auth,
+                           json={"permission_mode": "yolo"})
+        self.assertEqual(r.status_code, 400, r.text)
