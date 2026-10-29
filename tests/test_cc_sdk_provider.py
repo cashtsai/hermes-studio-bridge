@@ -39,6 +39,14 @@ class FakeToolUseBlock:
         self.id, self.name, self.input = id, name, input
 
 
+class ToolResultBlock:
+    """類別名**必須**叫 `ToolResultBlock` —— `_collect_tool_results` 用
+    `type(block).__name__` 判型(SDK 的 block 不是我們的類)。"""
+
+    def __init__(self, tool_use_id, content, is_error=False):
+        self.tool_use_id, self.content, self.is_error = tool_use_id, content, is_error
+
+
 class FakeAssistantMessage:
     def __init__(self, content, session_id=None):
         self.content = content
@@ -281,10 +289,74 @@ class TestCardStream(CC2Base):
 
         sess = asyncio.run(run())
         store = sess.digest.store
-        texts = [store.cards[i]["body"]["text"] for i in store.order]
-        self.assertIn("🔧 Bash: ls -la", texts)
+        cards = [store.cards[i] for i in store.order]
+        # 2026-10-29 契約改變:工具呼叫出 `kind="tool_call"`(與 tmux 同形狀),
+        # body 是 `{tool, summary, patch?}` 而**不是** `text` —— app 的工具列
+        # 渲染與 diff chip 綁的是這個 kind。一律索引 `body["text"]` 會 KeyError。
+        tc = [c for c in cards if c["kind"] == "tool_call"]
+        self.assertEqual(len(tc), 1, "工具呼叫必須出 tool_call 卡")
+        self.assertEqual(tc[0]["body"]["tool"], "Bash")
+        self.assertEqual(tc[0]["body"]["summary"], "ls -la",
+                         "summary 只取第一行")
+        self.assertIn("ls -la", tc[0]["body"]["fallback_text"])
+        # 錯誤卡仍是 text(system role)
+        texts = [c["body"].get("text") or "" for c in cards]
         self.assertTrue(any(t.startswith("⚠️ boom") for t in texts))
         self.assertFalse(store.status["busy"])
+
+    def test_live_tool_cards_match_tmux_shape(self):
+        """live 工具卡的形狀必須與 tmux 路徑一致(2026-10-29)。
+
+        cc2 原本把工具呼叫/結果/圖都壓成 `kind:"text"`。app 不會壞(fallback_text
+        鐵律),但**看起來就是退步**:工具列變純文字、結果框失效、**diff chip
+        整個消失**。cc2 的目標是取代 tmux,這一格不能退。
+        守三件:tool_call 帶 patch、tool_result 是獨立卡、路徑圖補 attachment。
+        """
+        async def run():
+            sess = cc_sdk.registry().ensure("lt1", workdir=_TMP)
+            FakeClient.batches = [[
+                FakeAssistantMessage([
+                    FakeToolUseBlock("e1", "Edit", {
+                        "file_path": "/tmp/a.py",
+                        "old_string": "old line", "new_string": "new line"}),
+                    FakeToolUseBlock("r1", "Read", {"file_path": "/tmp/pic.png"}),
+                ]),
+                # 結果必須在**同一回合內**到達:`turn_end` 會清 `_tool_cards`
+                # (刻意的 —— 不跨回合累積,長 session 才不會無上限長大)。
+                FakeAssistantMessage([ToolResultBlock("e1", "patched ok")]),
+                FakeResultMessage(),
+            ]]
+            await sess.submit("go")
+            await _drain(sess)
+            return sess
+
+        sess = asyncio.run(run())
+        cards = [sess.digest.store.cards[i] for i in sess.digest.store.order]
+        # ⚠️ 用 list 而不是 dict —— 這一則有**兩張** tool_call(Edit 與 Read),
+        # 以 kind 當 key 會互相覆蓋(我自己先踩了一次)。
+        by_kind = {}
+        for c in cards:
+            by_kind.setdefault(c["kind"], []).append(c)
+
+        # ① Edit 的 tool_call 必須帶 patch —— 那是 app diff chip 的唯一來源
+        self.assertEqual(len(by_kind.get("tool_call", [])), 2,
+                         "兩個工具呼叫要各出一張 tool_call")
+        edit = next(c for c in by_kind["tool_call"] if c["body"]["tool"] == "Edit")
+        self.assertIn("patch", edit["body"],
+                      "Edit 沒有合成 patch —— 改檔案就看不到 diff")
+
+        # ② tool_result 是**獨立**卡,不是把 tool_call 蓋掉
+        self.assertEqual(len(by_kind.get("tool_result", [])), 1,
+                         "工具結果必須是獨立的 tool_result 卡")
+        self.assertEqual(by_kind["tool_result"][0]["body"]["text"], "patched ok")
+        self.assertTrue(any(c["body"]["tool"] == "Edit"
+                            for c in by_kind["tool_call"]),
+                        "tool_result 不該蓋掉對應的 tool_call")
+
+        # ③ 路徑圖(agent Read 一張 PNG)要補 attachment 卡
+        self.assertEqual(len(by_kind.get("attachment", [])), 1,
+                         "agent 看了圖,手機上卻沒有縮圖")
+        self.assertEqual(by_kind["attachment"][0]["body"]["filename"], "pic.png")
 
     def test_turn_end_idle_and_queue_drain(self):
         async def run():

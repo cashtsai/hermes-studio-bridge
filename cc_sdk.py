@@ -563,6 +563,15 @@ class CC2Digest(carddigest.ApprovalCardMixin):
             "context": ({"used": self.ctx_tokens, "size": self.ctx_max,
                          "pct": round(self.ctx_pct, 1)}
                         if self.ctx_max else None),
+            # ⚠️ **也要吐 `usage`**(2026-10-29)。tmux 路徑把上下文用量放在
+            # `status["usage"]`,而 bridge 自己的註解寫著「app 的 ContextUsage
+            # decoder 直接吃」那個鍵。cc2 只放 `context` → app 解不到 →
+            # **整個上下文儀表空白,而且全綠、沒報錯**。這是「名字對不上」那種
+            # 最難查的失效:看起來什麼都正常,就是不顯示。
+            # 兩個鍵都吐(同一份資料),等 app 兩邊都收斂到一個名字再談移除。
+            "usage": ({"used": self.ctx_tokens, "size": self.ctx_max,
+                       "pct": round(self.ctx_pct, 1)}
+                      if self.ctx_max else None),
             "prompt": self.prompt,
             # blocked:對齊 tmux 的同名欄位(2026-08-18「隱形卡住」事故之後
             # 加的)。cc2 卡住的形態只有一種 —— 有審批/提問在等人回答,
@@ -674,15 +683,40 @@ class CC2Digest(carddigest.ApprovalCardMixin):
         self.store.saw_output = True
         self.last_event_at = time.time()
 
-    def tool_card(self, tool: str, summary: str, use_id: str = ""):
-        text = f"🔧 {tool}: {summary}" if summary else f"🔧 {tool}"
-        cid = self._next_id("t")
+    def tool_card(self, tool: str, summary: str, use_id: str = "", inp=None):
+        """工具呼叫卡。**`kind="tool_call"`,與 tmux 路徑同形狀**(2026-10-29)。
+
+        原本出 `kind="text"`(一行「🔧 Bash: git status」)。app 對 `tool_call`
+        有專屬渲染(工具列 + `body.patch` → **diff chip**),壓成 text 之後那些
+        全部失效 —— 使用者看到的是「工具步驟變成一行純文字、改檔案看不到 diff」。
+        cc2 的目標是取代 tmux,不能在這一格退步。
+
+        `patch` 由 `carddigest._tool_patch` 從 tool input 合成(Edit/Write/
+        MultiEdit/NotebookEdit),與 tmux 走同一支 —— 一份 parser(契約 §0)。
+        """
+        cid = f"card-cc2-{self.name}-tc-{use_id}" if use_id else self._next_id("t")
+        cmd = (summary or "").splitlines()[0][:200] if summary else ""
+        fb = f"› 🔧 {tool}" + (f" `{cmd}`" if cmd else "")
+        body = {"tool": tool, "summary": cmd, "fallback_text": fb}
+        patch = carddigest._tool_patch(tool, inp if isinstance(inp, dict) else {})
+        if patch:
+            body["patch"] = patch
         self.store.upsert_card(carddigest.make_card(
-            cid, self.store.turn_id, "assistant", "text",
-            {"text": text, "fallback_text": text, "origin": "cc2.tool"}))
+            cid, self.store.turn_id, "assistant", "tool_call", body))
+        # agent 看圖(Read 一張 PNG 之類):補 attachment 卡,手機直接顯示縮圖。
+        # 這條 cc2 原本完全沒有 —— 只有 base64 的那一半(見 `media_card`)。
+        img = carddigest._image_path_in(inp if isinstance(inp, dict) else {})
+        if img:
+            fname = img.rsplit("/", 1)[-1]
+            ext = "." + fname.rsplit(".", 1)[-1].lower() if "." in fname else ""
+            self.store.upsert_card(carddigest.make_card(
+                f"{cid}-img", self.store.turn_id, "assistant", "attachment",
+                {"filename": fname, "path": img,
+                 "mime": carddigest._IMAGE_MIME.get(ext, "image/png"),
+                 "fallback_text": f"🖼 {fname}"}))
         if use_id:
             # 第四格 = 是否已回填過真輸出(D6:避免被後到的空結果蓋掉)
-            self._tool_cards[str(use_id)] = (cid, tool, summary, False)
+            self._tool_cards[str(use_id)] = (cid, tool, cmd, False)
         self.store.last_tool = tool
         self._status(f"執行 {tool}")
 
@@ -709,15 +743,27 @@ class CC2Digest(carddigest.ApprovalCardMixin):
         if not body:
             body = "(沒有輸出)"
         self._tool_cards[str(use_id)] = (cid, tool, summary, True)
-        limit = 800
+        # 2000 對齊 tmux 路徑的 `carddigest._TOOL_RESULT_MAX`(原本 800,
+        # 同一份編譯輸出在 cc2 上被多截掉一半)。
+        limit = 2000
         if len(body) > limit:
             body = body[:limit] + f"\n…(還有 {len(result.strip()) - limit} 字,"\
                                   "完整輸出在終端機接手時看得到)"
-        mark = "⚠️ 失敗" if is_error else "↳"
-        text = f"{head}\n{mark} {body}"
+        # **獨立的 `tool_result` 卡**,不回填進 tool_call 那張(2026-10-29)。
+        #
+        # 原本是「一張卡原地改寫」—— 刻意避免洗版,但代價是:
+        #   · kind 只能是 `text`(同一張卡不能從 tool_call 變成 tool_result)
+        #   · 於是 app 的可折疊結果框失效,而且 tool_call 的 patch/diff chip
+        #     會被結果文字蓋掉
+        # tmux 路徑一直是兩張分開的卡,app 的渲染也是照那個形狀做的。要取代
+        # 就得同形狀 —— id 用 `tr-{use_id}` 與 tool_call 的 `tc-{use_id}` 配對,
+        # 仍然冪等(同一個 tool_use_id 回來兩次是 upsert 不是新增)。
+        rid = f"card-cc2-{self.name}-tr-{use_id}" if use_id else self._next_id("tr")
+        fb = f"{head}\n{'⚠️ 失敗' if is_error else '↳'} {body}"
         self.store.upsert_card(carddigest.make_card(
-            cid, self.store.turn_id, "assistant", "text",
-            {"text": text, "fallback_text": text, "origin": "cc2.tool"}))
+            rid, self.store.turn_id, "assistant", "tool_result",
+            {"text": body, "fallback_text": fb, "tool": tool,
+             "is_error": bool(is_error), "origin": "cc2.tool"}))
         self.last_event_at = time.time()
 
     def error_card(self, text: str):
@@ -1330,7 +1376,8 @@ class CCSdkSession:
             for block in tools:
                 self.digest.tool_card(block.name,
                                       _tool_summary(block.name, block.input),
-                                      use_id=getattr(block, "id", "") or "")
+                                      use_id=getattr(block, "id", "") or "",
+                                      inp=block.input)
             # 工具結果**也會夾在 AssistantMessage 裡**(SDK message_parser 的
             # case "assistant" 同樣收 tool_result,不只 case "user")。只在
             # UserMessage 收會漏掉一部分,而且安靜無聲 —— 只是結果看不到。
