@@ -5615,6 +5615,7 @@ class CodexAppServerClient:
         self.turn_watchdogs = {}
         self.last_event_at = {}
         self.thread_errors = {}
+        self._unknown_notif_seen: dict = {}   # method -> 上次記錄時間(節流,見 _handle_notification)
         self.loaded_threads = set()
         # thread-store 寫入鎖(被別的 codex app-server 佔用)。
         # thread_id -> {"since": wall, "last_at": wall, "attempts": int,
@@ -6934,6 +6935,18 @@ class CodexAppServerClient:
                 self.loaded_threads.add(tid)
             return
         tid = params.get("threadId")
+        # 看門狗活著訊號:**任何**帶 threadId 的通知都算「這個回合還活著」。
+        #
+        # 原本只有 `_append` 會更新 last_event_at,而 `_append` 只在
+        # `_codex_format_item` 吐得出文字時才被呼叫 —— reasoning 的 item/started
+        # 當下 summary 還是空的(回 ""),而 Codex 長思考時真正在流的
+        # `item/reasoning/textDelta` / `summaryTextDelta` 這個 if 鏈**完全沒處理**。
+        # 結果:Codex 其實一直在思考、事件一直在來,bridge 卻視而不見,
+        # 滿 CODEX_TURN_STALL_SECS(預設 300s)就誤判「turn stalled (no provider
+        # event)」並強制中止使用者的回合(機主 2026-10-29 回報,同一條 thread
+        # 昨晚連續 6 次)。取樣點移到型別分派之前就不會再漏。
+        if tid and method not in ("thread/status/changed",):
+            self.last_event_at[tid] = time.time()
         if method == "thread/status/changed" and tid:
             # **權威狀態**。以前這條完全沒被處理,於是 bridge 只認得自己發起的
             # 回合(active_turns),桌面版/VS Code/CLI 跑的 thread 一律顯示 idle。
@@ -7064,6 +7077,18 @@ class CodexAppServerClient:
             c = _codex_format_file_changes(changes, "inProgress")
             if c:
                 self._append(tid, ("text", c))
+            return
+        # 這條 if 鏈原本沒有 else —— codex 新版發的 deprecationNotice /
+        # configWarning / guardianWarning / warning、以及十餘種較新的 item 型別
+        # 全部靜默落地。下一次 codex 改名或棄用方法時,我們不會收到任何訊號,
+        # 只會看到功能安靜消失。取樣一下(同型別 60s 內只記一次,不洗版)。
+        if method:
+            now = time.time()
+            last = self._unknown_notif_seen.get(method, 0.0)
+            if now - last >= 60.0:
+                self._unknown_notif_seen[method] = now
+                _log_event("codex_notification_unhandled", method=method[:80],
+                           thread=(tid or "")[:16])
 
     def note_thread_settings(self, thread_id: str, payload: dict) -> None:
         """把一份設定併進快取。**兩個來源欄名不一樣**,所以這裡要吃兩套:
