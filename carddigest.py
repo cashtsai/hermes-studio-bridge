@@ -738,6 +738,22 @@ def _codex_item_to_cards_raw(item: dict, turn_id: str = "",
                                    final=final))
         return cards
 
+    if t == "enteredReviewMode":
+        # codex 新版型別。原本落到最後的 return [] → 畫面一片空白,使用者不知道
+        # 它進了審查模式(機主 2026-10-29 相容性稽核)。
+        note = str(item.get("prompt") or item.get("text") or "").strip()
+        body = "🔍 進入審查模式" + (f":{note[:120]}" if note else "")
+        cards.append(make_card(cid, turn_id, "system", "text",
+                               {"text": body, "fallback_text": body}, final=final))
+        return cards
+
+    if t == "contextCompaction":
+        # 同上。壓縮會改變後續回應的上下文,使用者該看得到。
+        body = "🗜️ 已壓縮對話上下文"
+        cards.append(make_card(cid, turn_id, "system", "text",
+                               {"text": body, "fallback_text": body}, final=final))
+        return cards
+
     if t == "commandExecution":
         cmd = (item.get("command") or "").strip()
         cmd1 = cmd.splitlines()[0][:_CMD_MAX] if cmd else ""
@@ -884,6 +900,8 @@ class CodexThreadDigest(ApprovalCardMixin):
         # their existing arrival-order semantics.
         self.store = SessionCardStore(chronological=True)
         self.agent_text: dict[str, str] = {}   # itemId → delta 累積文字
+        self.reason_text: dict[str, str] = {}   # itemId → delta 累積文字
+        self.exec_text: dict[str, str] = {}   # itemId → delta 累積文字
         self.busy = False
         # `busy` used to be driven only by live turn notifications.  That is
         # insufficient when the desktop Codex client owns the turn: the
@@ -1139,6 +1157,38 @@ class CodexThreadDigest(ApprovalCardMixin):
                 f"card-cx-{iid}", self.store.turn_id, "assistant", "markdown",
                 {"text": text, "fallback_text": text}, final=False))
             self._status()
+        elif method in ("item/reasoning/textDelta",
+                        "item/reasoning/summaryTextDelta"):
+            # 長思考的逐字串流。CX 原本只接 agentMessage 的 delta,推理階段完全
+            # 沒有畫面 —— 使用者看到的是一段長長的死寂,然後整塊出現(機主 2026-10-29)。
+            # 沿用 CC(cc_sdk.text_delta)與 agentMessage 同一套:累積進同一張卡、
+            # rev 遞增、final=False,收尾由 item/completed 的全文覆蓋為準。
+            iid = params.get("itemId") or f"reasoning-{self.store.turn_id}"
+            delta = params.get("delta") or params.get("text") or ""
+            if not delta:
+                return
+            text = (self.reason_text.get(iid, "") + delta)[:_THINKING_MAX]
+            self.reason_text[iid] = text
+            self.store.upsert_card(make_card(
+                f"card-cx-{iid}", self.store.turn_id, "assistant", "text",
+                {"text": f"💭 {text}", "fallback_text": f"💭 {text}"},
+                final=False))
+            self._status()
+        elif method == "item/commandExecution/outputDelta":
+            # 指令執行的即時輸出(build/安裝這類長工具最有感)。同一張 tool_result
+            # 卡累積,完成時由 item/completed 的 aggregatedOutput 覆蓋為權威全文。
+            iid = params.get("itemId")
+            chunk = params.get("chunk") or params.get("delta") or ""
+            if not iid or not chunk:
+                return
+            text = (self.exec_text.get(iid, "") + chunk)[-_TOOL_RESULT_MAX:]
+            self.exec_text[iid] = text
+            self.store.saw_output = True
+            self.store.upsert_card(make_card(
+                f"card-cx-{iid}-r", self.store.turn_id, "assistant", "tool_result",
+                {"text": text, "fallback_text": f"↳ 結果\n{text[:1000]}"},
+                final=False))
+            self._status()
         elif method in ("item/started", "item/completed"):
             item = params.get("item") or {}
             phase = "started" if method == "item/started" else "completed"
@@ -1148,6 +1198,14 @@ class CodexThreadDigest(ApprovalCardMixin):
             # 「重播當下」而不是事件發生時間。
             live_ts = _cx_coerce_ts(params.get("startedAtMs")
                                     or params.get("completedAtMs"))
+            # ⚠️ 三個累積器都要在 item 收尾時清掉。`agent_text` 本來就 pop 了,
+            # 新加的 `reason_text` / `exec_text` 一開始沒有清除點 —— 長壽 thread
+            # 的 digest 會隨 item 數線性長大(每 item 最多 2KB),不會立刻出事
+            # 但會慢慢長,而且偏離了同一個檔已經建立的慣例。
+            # 放在型別判斷**之外**:推理與指令輸出不是 agentMessage,
+            # 寫進 if 分支裡就永遠清不到。
+            self.reason_text.pop(item.get("id"), None)
+            self.exec_text.pop(item.get("id"), None)
             if item.get("type") == "agentMessage":
                 self.agent_text.pop(item.get("id"), None)
                 self.store.saw_output = True
