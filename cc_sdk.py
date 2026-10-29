@@ -166,9 +166,25 @@ def _live_session_ids() -> set:
             pid, sid = row.get("pid"), str(row.get("sessionId") or "")
             if not sid:
                 continue
-            try:                      # pid 還活著才算佔用(殘留檔不擋路)
+            # ⚠️ `os.kill(pid, 0)` 的兩種失敗**語意完全相反**,不可以一起 continue:
+            #   ProcessLookupError → 行程不在 → 沒人佔用 → 可以接
+            #   PermissionError    → **行程存在**,只是屬於別的使用者 → 有人佔用
+            # 原本兩者都當成「沒佔用」,於是會去接別人正拿著的 session ——
+            # 依本函式開頭的說明,那會讓 transcript 的父子鏈分岔 =
+            # **對話永久損壞**。這是方向反了,不是邊界沒對齊。
+            # pid 壞掉/缺席也算佔用:登記檔存在就代表有人登記過,
+            # 寧可少接一條(使用者再開一條就好),不要賭一條對話。
+            try:
                 os.kill(int(pid), 0)
-            except Exception:  # noqa: BLE001
+            except ProcessLookupError:
+                continue                      # 真的沒人 → 不佔用
+            except PermissionError:
+                out.add(sid)                  # 別人的行程還活著 → 佔用
+                continue
+            except Exception as exc:  # noqa: BLE001
+                _log("cc2_holder_pid_unreadable", session_id_hash=_short_key(sid),
+                     error=type(exc).__name__)
+                out.add(sid)                  # 判斷不了 → 當成佔用(fail-safe)
                 continue
             out.add(sid)
     except Exception:  # noqa: BLE001

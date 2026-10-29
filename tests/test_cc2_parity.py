@@ -19,6 +19,7 @@ import os
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 _TMP = tempfile.mkdtemp(prefix="cc2-parity-")
 os.environ["CC_SDK_STATE"] = os.path.join(_TMP, "sessions.json")
@@ -105,6 +106,43 @@ class CC2ParityTest(unittest.TestCase):
         row = [r for r in self.r.v2_rows() if r["id"] == "cc2:t1"][0]
         self.assertEqual(row.get("subtitle"), "這是我送的指令",
                          "有對話就該顯示它,不是只顯示 workdir")
+
+
+class HolderDetectionDirection(unittest.TestCase):
+    """`os.kill(pid, 0)` 的兩種失敗**語意完全相反** —— 合在一起就是對話損壞。
+
+    `_live_session_ids()` 回「正被別人持有」的 session。它是唯一的防線:
+    SDK 與 CLI 都沒有檔案鎖,兩個寫入者同時接同一條會讓 transcript 的父子鏈
+    分岔 = **對話永久損壞**。
+
+      ProcessLookupError → 行程不在     → 沒人佔用 → 可以接
+      PermissionError    → **行程存在** → 有人佔用 → 不可以接
+
+    原本兩者都 `continue`(當成沒人佔用),於是會去接別人正拿著的 session。
+    這條在 cc2 成為現役預設 provider 之後風險是實際的。
+    """
+
+    def _with_registry(self, pid_value, kill_effect):
+        d = tempfile.mkdtemp()
+        with open(os.path.join(d, "x.json"), "w", encoding="utf-8") as f:
+            json.dump({"pid": pid_value, "sessionId": "sdk-held"}, f)
+        with patch("glob.glob", lambda _p: [os.path.join(d, "x.json")]), \
+             patch("os.kill", side_effect=kill_effect):
+            return cc_sdk._live_session_ids()
+
+    def test_permission_error_means_occupied(self):
+        """別人的行程還活著 —— 這是最危險的那一格,不可以判成空閒。"""
+        self.assertIn("sdk-held",
+                      self._with_registry(4242, PermissionError()))
+
+    def test_process_gone_means_free(self):
+        self.assertNotIn("sdk-held",
+                         self._with_registry(4242, ProcessLookupError()))
+
+    def test_unreadable_pid_is_treated_as_occupied(self):
+        """判斷不了就當成有人佔用 —— 少接一條只是不方便,接錯是對話損壞。"""
+        self.assertIn("sdk-held",
+                      self._with_registry("not-a-pid", ValueError()))
 
 
 if __name__ == "__main__":

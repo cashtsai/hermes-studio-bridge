@@ -450,7 +450,7 @@ class TestExceptionLogging(unittest.TestCase):
     # 取答案失敗靜默退成 ""(會告訴模型「使用者沒有回答」)、以及
     # `_project_key` 的 SDK import 失敗靜默退回舊演算法(歷史整段不見且無訊息)。
     # 剩下的 16 個是欠債,數字只能往下調。
-    _SILENT_EXCEPT_RATCHET = {"bridge.py": 0, "cc_sdk.py": 16}
+    _SILENT_EXCEPT_RATCHET = {"bridge.py": 0, "cc_sdk.py": 15}
 
     def _silent_except_lines(self, filename: str) -> list:
         import ast
