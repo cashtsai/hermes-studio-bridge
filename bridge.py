@@ -21381,6 +21381,36 @@ cc_sdk.configure(log=_log_event,
                  approval_db_mark=_cc2_approval_db_mark)
 
 
+@app.post("/app/v2/cc2/{name}/yield")
+async def v2_cc2_yield(name: str, request: Request):
+    """把這條對話讓給終端機 —— cc2 版的「SSH 接手」。
+
+    tmux 的交接是直接 attach 同一個 pane。cc2 沒有 pane,而且 SDK/CLI **沒有
+    檔案鎖**:兩個寫入者同時接同一條 session 會讓 transcript 的父子鏈分岔。
+    所以交接改成**依序擁有**:bridge 主動放開 client(對話留在同一個 session id)
+    → 使用者在終端機 `claude --resume <sid>` 接走、做他的事 → 下次從 Pocket 送出
+    時 bridge 以同一個 id 重新連上,**完整繼承**他在終端機做的一切。
+
+    對照 `--fork-session`:那會分岔出新 id,終端機與 Pocket 之後各走各的。
+    這裡刻意不分岔,換來的是來回交接。"""
+    _check_auth(request)
+    if not cc_sdk.enabled():
+        raise http_err(404, "CC2_DISABLED", "cc2 provider 未啟用")
+    sess = cc_sdk.registry().get(name)
+    if sess is None:
+        raise http_err(404, "SESSION_NOT_FOUND", f"找不到 cc2 session {name}")
+    if sess.busy:
+        raise http_err(409, "CC2_BUSY",
+                       "這一輪還在跑;等它結束或先按停止,再交接給終端機")
+    await sess._teardown_client()
+    _log_event("cc2_yielded", session=name,
+               sdk_session_id=(sess.sdk_session_id or "")[:18])
+    return {"ok": True, "session_id": f"cc2:{name}",
+            "resume_command": (f"claude --resume {sess.sdk_session_id}"
+                               if sess.sdk_session_id else ""),
+            "note": "已放開;終端機接手後,下次從 Pocket 送出會接續同一條對話"}
+
+
 @app.post("/app/v2/cc2/{name}")
 async def v2_cc2_create(name: str, request: Request):
     """建立/更新 cc2 session:body {workdir?, permission_mode?}。冪等 ——

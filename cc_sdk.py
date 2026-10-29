@@ -100,6 +100,77 @@ def history_seed_limit() -> int:
         return 40
 
 
+def _project_key(workdir: str) -> str:
+    """workdir → `~/.claude/projects/` 底下的目錄名。
+
+    **必須**用 SDK 官方演算法:它會 realpath(解符號連結)、NFC 正規化、把所有
+    非英數字元換成 `-`,超長還會加雜湊後綴。原本這裡寫 `workdir.replace("/","-")`,
+    路徑一旦含點號、經過符號連結、或結尾有斜線就**算錯目錄**:
+      /tmp/foo            → 現行 -tmp-foo        官方 -private-tmp-foo
+      /Users/x/apps/a.b   → 現行 -Users-x-apps-a.b 官方 -Users-x-apps-a-b
+    算錯的後果是 `_seed_history` 找不到檔案後**靜默 return** —— 歷史整段不見,
+    而且沒有任何錯誤訊息(2026-10-29 稽核發現)。
+    SDK 缺席時退回舊寫法,至少不比修之前差。"""
+    try:
+        from claude_agent_sdk import project_key_for_directory
+        return project_key_for_directory(os.path.expanduser(workdir or "~"))
+    except Exception:  # noqa: BLE001
+        return os.path.expanduser(workdir or "~").replace("/", "-")
+
+
+def _live_session_ids() -> set:
+    """目前**正被別人持有**的 session id(終端機開著的 claude、別的 bridge…)。
+
+    CLI 在 `~/.claude/sessions/<pid>.json` 維護活著的持有者登記。沒有任何
+    檔案鎖存在(SDK 與 CLI 都沒有),兩個寫入者同時接同一條 session 會讓
+    transcript 的父子鏈分岔 —— 所以「不要去接已經有人拿著的」是唯一的防線。
+    讀不到就回空集合(寧可不擋,也不要因為讀檔失敗就癱瘓續接)。
+    """
+    out = set()
+    try:
+        import glob
+        for f in glob.glob(os.path.expanduser("~/.claude/sessions/*.json")):
+            try:
+                with open(f, "r", encoding="utf-8") as fh:
+                    row = json.load(fh)
+            except Exception:  # noqa: BLE001
+                continue
+            pid, sid = row.get("pid"), str(row.get("sessionId") or "")
+            if not sid:
+                continue
+            try:                      # pid 還活著才算佔用(殘留檔不擋路)
+                os.kill(int(pid), 0)
+            except Exception:  # noqa: BLE001
+                continue
+            out.add(sid)
+    except Exception:  # noqa: BLE001
+        return set()
+    return out
+
+
+def newest_session_for(workdir: str) -> str:
+    """這個工作目錄最近一條、**且沒人正在用**的 session id。
+
+    對應 tmux 那邊 `ccsess` 的「--continue 按目錄接回上一段對話」——使用者不必
+    記 session id。SDK 的 `continue_conversation=True` 不適用:它不告訴你挑中
+    哪一條,bridge 就無法把 id 記進 state、下次也接不回同一條。
+    改成自己解析:`list_sessions` 已按最後修改時間排序,挑第一個沒被佔用的。
+    """
+    try:
+        from claude_agent_sdk import list_sessions
+        rows = list_sessions(directory=os.path.expanduser(workdir or "~"),
+                             limit=8, include_worktrees=False)
+    except Exception as e:  # noqa: BLE001
+        _log("cc2_list_sessions_failed", error=str(e)[:160])
+        return ""
+    live = _live_session_ids()
+    for r in rows or []:
+        sid = str(getattr(r, "session_id", "") or "")
+        if sid and sid not in live:
+            return sid
+    return ""
+
+
 def _claude_projects_root() -> str:
     """SDK transcript 落地根目錄(claude CLI 慣例 ~/.claude/projects)。
     測試以 CC_SDK_CLAUDE_PROJECTS 指到 temp fixture,不碰真 ~/.claude。"""
@@ -340,6 +411,7 @@ class CCSdkSession:
         self.permission_mode = _clamp_mode(permission_mode or "acceptEdits")
         self.sdk_session_id = sdk_session_id or ""
         self.model: str = ""           # 目前模型(空 = 跟隨 CLI 預設);傳給 ClaudeAgentOptions
+        self.in_flight_prompt: str = ""  # 正在跑的那則(重啟後用來說明中斷)
         self.digest = CC2Digest(name)
         # digest 自己不知道權限模式/模型,但 app 的狀態列要顯示 —— 同步鏡像進去。
         self.digest.mode = self.permission_mode
@@ -364,7 +436,7 @@ class CCSdkSession:
         if limit <= 0:
             return
         path = os.path.join(_claude_projects_root(),
-                            self.workdir.replace("/", "-"),
+                            _project_key(self.workdir),
                             f"{self.sdk_session_id}.jsonl")
         try:
             with open(path, "r", encoding="utf-8") as f:
@@ -434,6 +506,7 @@ class CCSdkSession:
             self.digest.turn_end(error=f"{type(e).__name__}: {str(e)[:200]}")
         finally:
             self.busy = False
+            self.in_flight_prompt = ""
             self._task = None
             self.registry.save()
             if self.queue:                      # turn 結束 → 放行下一則
@@ -449,6 +522,7 @@ class CCSdkSession:
 
     async def _run_turn(self, text: str, attachments: list | None = None,
                         client_id: str = "") -> None:
+        self.in_flight_prompt = text
         turn_id = f"turn-cc2-{uuid.uuid4().hex[:10]}"
         self.digest.turn_begin(turn_id)
         self.digest.user_card(text, attachments=attachments, client_id=client_id)
@@ -483,6 +557,17 @@ class CCSdkSession:
     async def _ensure_client(self):
         if self.client is not None:
             return self.client
+        # 不去接**已經有人拿著**的 session。SDK 與 CLI 都沒有檔案鎖,兩個寫入者
+        # 同時接同一條會讓 transcript 的父子鏈分岔(= 對話永久損壞)。
+        # 使用者在終端機 `claude --resume` 接走時就是這個情況:寧可明說接不了,
+        # 也不要安靜地把對話寫壞。
+        if self.sdk_session_id and self.sdk_session_id in _live_session_ids():
+            msg = ("這條對話正被另一個 claude 行程持有(例如你在終端機接走了)。"
+                   "等它結束後再送,或改用新的 session。")
+            self.digest.error_card(msg)
+            _log("cc2_session_held_elsewhere", session=self.name,
+                 sdk_session_id=self.sdk_session_id[:18])
+            raise RuntimeError(msg)
         sdk = _sdk()
         opts_kwargs = {}
         if self.model:
@@ -689,6 +774,17 @@ class CCSdkRegistry:
             # model 是後加的欄位:舊的 state 檔沒有這個鍵 → 空字串 = 跟隨 CLI 預設,
             # 與加這段之前的行為相同(純加法,不會把既有 session 弄壞)。
             self.sessions[name].model = str(row.get("model") or "")
+            # 重啟復原:把上次被中斷的回合誠實講出來(不自動重送 —— 工具副作用
+            # 可能已經執行了一半,替使用者重跑是危險的),排隊中的則原樣接回。
+            sess = self.sessions[name]
+            sess.queue = [q for q in (row.get("queued") or []) if isinstance(q, str)]
+            sess.digest.queue_depth = len(sess.queue)
+            unfinished = str(row.get("in_flight") or "").strip()
+            if unfinished:
+                sess.digest.error_card(
+                    "上一則在 bridge 重啟時被中斷,沒有完成:「"
+                    + unfinished[:80] + ("…」" if len(unfinished) > 80 else "」")
+                    + " 需要的話請重送。")
 
     def save(self) -> None:
         """原子落地(tmp+rename);失敗只記 log —— resume id 掉了下次全新
@@ -700,7 +796,13 @@ class CCSdkRegistry:
                 s.name: {"sdk_session_id": s.sdk_session_id,
                          "workdir": s.workdir,
                          "permission_mode": s.permission_mode,
-                         "model": s.model}
+                         "model": s.model,
+                         # bridge 重啟會殺掉進行中的回合(client 是 bridge 的
+                         # 子行程)。把「當時正在跑什麼」與排隊中的留下來,
+                         # 重啟後才能誠實告訴使用者,而不是安靜地什麼都沒發生。
+                         "in_flight": s.in_flight_prompt if s.busy else "",
+                         "queued": [q[0] if isinstance(q, tuple) else q
+                                    for q in s.queue]}
                 for s in self.sessions.values()}}
             tmp = f"{path}.tmp-{os.getpid()}"
             with open(tmp, "w", encoding="utf-8") as f:
@@ -725,6 +827,19 @@ class CCSdkRegistry:
         if sess is None:
             sess = self.sessions[name] = CCSdkSession(
                 self, name, workdir=workdir, permission_mode=permission_mode)
+            # 按工作目錄接回上一段對話(對應 ccsess 的 `--continue`)——
+            # 使用者不必記 session id。只接**沒人正在用**的那條;接到了就
+            # 重新 seed 歷史,畫面一進去就有上下文。預設開,可用
+            # CC_SDK_ADOPT_BY_CWD=0 關掉(接到不相干對話時的逃生口)。
+            if not sess.sdk_session_id and str(
+                    os.environ.get("CC_SDK_ADOPT_BY_CWD", "1")).strip().lower() \
+                    not in ("0", "false", "no", "off"):
+                adopted = newest_session_for(sess.workdir)
+                if adopted:
+                    sess.sdk_session_id = adopted
+                    sess._seed_history()
+                    _log("cc2_adopted_by_cwd", session=name,
+                         sdk_session_id=adopted[:18], workdir=sess.workdir)
             _log("cc2_session_created", session=name, workdir=sess.workdir,
                  permission_mode=sess.permission_mode)
         else:
