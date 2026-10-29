@@ -11378,10 +11378,57 @@ async def _relay_loop() -> None:
             backoff = min(backoff * 2, 3600.0)
 
 
+# Tailscale serve/funnel 狀態。shell 出去不便宜,比照 _PAIR_HOSTS_CACHE 快取。
+_TS_EXPOSE_CACHE: dict = {"ts": 0.0, "val": None}
+_TS_EXPOSE_TTL = 30.0
+
+
+def _tailscale_expose_status() -> dict:
+    """這台 Mac 經由 Tailscale 對外的現況 —— 免費層那條路。
+
+    `tailscale serve` = 只有**同 tailnet** 連得到(私網 HTTPS);
+    `tailscale funnel` = 同一個網址但**對公網開放**。兩者共用
+    `https://<machine>.<tailnet>.ts.net`,所以**光看網址分不出是哪一個** ——
+    一定要問 serve 設定本身,否則桌面端會把「只有自己連得到」畫成
+    「全世界都連得到」,那是最不該說謊的地方。
+    """
+    now = time.time()
+    if _TS_EXPOSE_CACHE["val"] is not None and now - _TS_EXPOSE_CACHE["ts"] < _TS_EXPOSE_TTL:
+        return dict(_TS_EXPOSE_CACHE["val"])
+    out = {"installed": False, "logged_in": False, "mode": "off", "hostname": None}
+    for ts in (shutil.which("tailscale"),
+               "/Applications/Tailscale.app/Contents/MacOS/Tailscale"):
+        if not ts or not os.path.exists(ts):
+            continue
+        out["installed"] = True
+        self_ = _pair_tailscale_self()
+        if self_:
+            out["logged_in"] = True
+            out["hostname"] = (self_.get("DNSName") or "").rstrip(".") or None
+        try:
+            r = subprocess.run([ts, "serve", "status", "--json"],
+                               capture_output=True, text=True, timeout=3)
+            if r.returncode == 0 and r.stdout.strip():
+                cfg = json.loads(r.stdout) or {}
+                # AllowFunnel 有東西 = 公網;只有 Web/TCP = 私網 serve。
+                if cfg.get("AllowFunnel"):
+                    out["mode"] = "funnel"
+                elif cfg.get("Web") or cfg.get("TCP"):
+                    out["mode"] = "serve"
+        except Exception as _exc:  # noqa: BLE001
+            _log_exc("tailscale_serve_status", _exc, expected=True)
+        break
+    _TS_EXPOSE_CACHE.update({"ts": now, "val": dict(out)})
+    return out
+
+
 def _relay_status_payload() -> dict:
     """桌面端畫燈用。**開關值與隧道狀態分開回**,因為它們會不一致 ——
     使用者按了開,但沒訂閱 / token 被撤 / frpc 不在,隧道就是不通。
     那個落差正是使用者需要看到的東西,不能用開關的位置假裝成狀態。
+
+    同時回 Tailscale 那條(免費層)的現況 —— 兩條路是**並存的選項**,
+    使用者要能一眼看出自己現在到底靠哪條從外面連回來。
     """
     st = dict(_RELAY_STATUS)
     return {
@@ -11391,6 +11438,7 @@ def _relay_status_payload() -> dict:
         "detail": st.get("detail"),
         "since": st.get("since"),
         "frpc_present": bool(_relay_frpc_bin()),
+        "tailscale": _tailscale_expose_status(),
     }
 
 

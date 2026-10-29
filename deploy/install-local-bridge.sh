@@ -408,6 +408,57 @@ else
   echo "Run: launchctl bootstrap gui/$(id -u) \"$LAUNCH_AGENT\""
 fi
 
+# ── Tailscale 對外曝光(免費層)────────────────────────────────────────────
+#
+# bridge 配對時**早就會**報出 `https://<machine>.<tailnet>.ts.net` 這個候選
+# (見 bridge.py 的 `_pair_host_candidates`),app 也早就認得它
+# (StudioConfig:「.ts.net + http = 私網 Tailscale、+ https = 公網 Funnel」)。
+# **但從來沒有任何地方去跑 `tailscale serve`** —— 所以那個候選對新機器是死的,
+# 手機探測逾時後默默跳過。路徑設計好了卻沒人啟用,又一個「功能安靜地不存在」。
+#
+#   serve  = 只有**同一個 tailnet 內**連得到,但給真憑證的 HTTPS。對已經在
+#            tailnet 的裝置**不增加任何曝光**(本來就打得到 :8081),只是把那
+#            條路變成 app 認得的形狀 → **預設開**。
+#   funnel = 同一個網址但**對整個公網開放**,這時只剩 BRIDGE_TOKEN 一道閘。
+#            跟中繼開關同一個紀律:**必須明確指定才會開**。
+#            (Tailscale 官方:所有方案含免費 Personal 都能用,但有不可調整、
+#             數值未公開的頻寬上限,定位是輕量用途。)
+#   off    = 完全不碰。
+POCKET_TAILSCALE_EXPOSE="${POCKET_TAILSCALE_EXPOSE:-serve}"
+BRIDGE_PORT_FOR_TS="${BRIDGE_PORT_FOR_TS:-8081}"
+
+ts_expose() {
+  [ "$POCKET_TAILSCALE_EXPOSE" = "off" ] && return 0
+  ts="$(command -v tailscale 2>/dev/null || true)"
+  [ -n "$ts" ] || ts="/Applications/Tailscale.app/Contents/MacOS/Tailscale"
+  if [ ! -x "$ts" ]; then
+    echo "  (沒裝 Tailscale,略過 —— 外網仍可走 Pocket 中繼或 cloudflared)"
+    return 0
+  fi
+  if ! "$ts" status --json >/dev/null 2>&1; then
+    echo "  (Tailscale 沒登入,略過。登入後重跑安裝器即可啟用)"
+    return 0
+  fi
+  # --bg 寫進 tailscaled 設定並常駐,重開機自己回來。
+  if out="$("$ts" "$POCKET_TAILSCALE_EXPOSE" --bg \
+            "http://127.0.0.1:$BRIDGE_PORT_FOR_TS" 2>&1)"; then
+    dns="$("$ts" status --json 2>/dev/null \
+           | python3 -c 'import json,sys;print(json.load(sys.stdin)["Self"]["DNSName"].rstrip("."))' \
+             2>/dev/null)"
+    echo "  Tailscale $POCKET_TAILSCALE_EXPOSE 已啟用${dns:+ → https://$dns}"
+    return 0
+  fi
+  # funnel 第一次用通常是 tailnet ACL 少了 funnel nodeAttr,tailscale 會印一條
+  # 核准連結。那不是失敗,是「要你去點一下」—— 原樣轉述,不要吞掉。
+  echo "  ⚠️ Tailscale $POCKET_TAILSCALE_EXPOSE 沒啟用成功:"
+  printf '%s\n' "$out" | sed 's/^/     /' | head -6
+  echo "     (不影響其他連線路徑;處理完重跑安裝器即可)"
+  return 0
+}
+
+log_step "Tailscale 對外曝光(${POCKET_TAILSCALE_EXPOSE})"
+ts_expose
+
 # 免登入的配對頁 —— 印出那條連結。
 #
 # `/pair/qr` 的門票是 boot code(`~/.pocket/pair-boot-code`,0600)。頁面在
