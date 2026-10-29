@@ -51,7 +51,15 @@ class HealthAgentsInFlightTest(unittest.TestCase):
         bridge._cc_sessions = two_busy_one_idle
         bridge.CODEX_APP.active_turns = {"t1": object(), "t2": object()}
         out = asyncio.run(bridge.health(agents=1))
-        self.assertEqual(out["agents_in_flight"], {"cc": 2, "cx": 2})
+        # ⚠️ **不要對這個 dict 做全等斷言**。provider 會增加(2026-10-29 加了
+        # cc2),而 `scripts/bridge-safe-restart.sh` 正是靠這個端點判斷「現在有
+        # 沒有回合在跑」—— 漏掉哪個 provider,重啟就會殺掉它進行中的回合。
+        # 所以新 provider 出現在這裡是**對的**,全等斷言會把正確的擴充判成失敗。
+        # 改成逐鍵檢查,並要求 cc2 必須在場(它是 CC_DEFAULT_PROVIDER)。
+        flight = out["agents_in_flight"]
+        self.assertEqual(flight["cc"], 2)
+        self.assertEqual(flight["cx"], 2)
+        self.assertIn("cc2", flight, "cc2 沒被算進去 → 安全重啟會殺掉它的回合")
 
     def test_cc_failure_reports_unknown_not_zero(self):
         """問不到要回 -1。回 0 等於「沒人在忙」—— 那正是會害人重啟的謊。"""
