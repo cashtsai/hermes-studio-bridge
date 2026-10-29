@@ -445,8 +445,11 @@ def _tool_summary(tool: str, tool_input: dict) -> str:
 # in-memory —— bridge 重啟後 app 打開會是一片空白,所以 session 重建時把最近
 # 的對話種回去。解析自包含(不 import bridge),過濾清單鏡像 _fmt_cc_event。
 
-_SEED_SKIP_TAGS = ("<task-notification>", "<system-reminder>", "[Internal",
-                   "<command-name>", "<local-command", "[Your previous response")
+# 直接用 carddigest 的那一份,**不留複本**(2026-10-29)。
+# 原本是逐字抄一遍 `carddigest.PLUMBING_TAGS`,兩份必然漂移 —— 而契約 §0/§6
+# 明寫「digest 的責任在 bridge:一份 parser、伺服器端、所有終端共享」。
+# 哪天有人在 carddigest 補一個新的水管標記,cc2 這條路會安靜地漏出來。
+_SEED_SKIP_TAGS = carddigest.PLUMBING_TAGS
 
 
 def _seed_row(d):
@@ -587,10 +590,18 @@ class CC2Digest(carddigest.ApprovalCardMixin):
         self.store.upsert_card(carddigest.make_card(
             self._next_id("u"), self.store.turn_id, "user", "text", body))
 
-    def seed_card(self, role: str, text: str, ts: float):
-        """歷史種子卡:final:true、帶原始 ts(權威時間)、不掛 turn。"""
+    def seed_card(self, role: str, text: str, ts: float, idx: int):
+        """歷史種子卡:final:true、帶原始 ts(權威時間)、不掛 turn。
+
+        `idx` = 這張卡在本次種子序列中的位置,**用來產穩定 id**。
+        原本用 `self._next_id("h")`(共用遞增計數器)—— 那不冪等:同一條對話
+        重種一次,`_seq` 已經往前走,於是同樣的歷史拿到**不同的** card id,
+        app 端(快取 key = session_id + card.id + rev)會把整段歷史**疊第二份**。
+        tmux 路徑是用事件 uuid 衍生 id + `store.seeded` 閂,這裡比照其精神:
+        id 由位置決定,重種就是對同一批 id 做 upsert(契約 §5:同 id → 替換渲染)。
+        """
         self.store.upsert_card(carddigest.make_card(
-            self._next_id("h"), "", role, "markdown",
+            f"card-cc2-{self.name}-h{idx}", "", role, "markdown",
             {"text": text, "fallback_text": text}, ts=ts))
 
     def text_delta(self, delta: str):
@@ -833,6 +844,22 @@ class CCSdkSession:
                 raw = fb.read()
             lines = raw.decode("utf-8", "replace").splitlines()
         except FileNotFoundError:
+            # ⚠️ 這條**不是**「全新對話」—— 那種情況在最上面
+            # `if not self.sdk_session_id` 就已經回去了。走到這裡代表
+            # **有 sdk_session_id 卻找不到它的 transcript**,成因通常是
+            # project key 算不對、或 transcript 被清掉。
+            #
+            # 原本這條完全無聲。後果:2026-10-29 `_project_key` 改用 SDK 官方
+            # 演算法(解 symlink、非英數全換)而測試還自己重刻,seed 去讀了另一個
+            # 目錄 → 歷史整段不見、**零線索**,花了一整輪才追到。
+            # 種子讀不到不該擋 session 起步,但**必須留痕**。
+            #
+            # `dir_exists` 是關鍵鑑別訊號,而且不洩路徑(避免家目錄進 log):
+            #   False → project key 對不上(本次事故的形狀)
+            #   True  → key 是對的,transcript 真的不在
+            _log("cc2_history_seed_missing", session=self.name,
+                 sdk_session=(self.sdk_session_id or "")[:8],
+                 dir_exists=os.path.isdir(os.path.dirname(path)))
             return
         except Exception as e:  # noqa: BLE001
             _log("cc2_history_seed_failed", session=self.name,
@@ -850,8 +877,8 @@ class CCSdkSession:
                 continue
             if row is not None:
                 rows.append(row)
-        for role, text, ts in rows[-limit:]:
-            self.digest.seed_card(role, text, ts)
+        for i, (role, text, ts) in enumerate(rows[-limit:]):
+            self.digest.seed_card(role, text, ts, i)
         if bad:
             _log("cc2_history_seed_bad_lines", session=self.name,
                  skipped=bad)

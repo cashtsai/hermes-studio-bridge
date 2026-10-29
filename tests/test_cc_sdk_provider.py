@@ -587,6 +587,15 @@ class TestHistorySeed(CC2Base):
         with patch.dict(os.environ, {"CC_SDK_HISTORY_SEED": "0"}):
             sess = self._restore("h0", "sdk-h0")
         self.assertEqual(sess.digest.store.order, [])
+        # ⚠️ 反向斷言(2026-10-29 加):光是「空的」**無法區分**「上限生效」與
+        # 「根本沒讀到檔」。那次事故裡 `_project_key` 換了演算法而測試還自己重刻,
+        # seed 靜默讀不到任何檔 —— 這一條照樣綠,只剩另外三條紅去指認問題,
+        # 追查成本高得離譜。同一份 fixture 不設 env 時必須種得出卡,
+        # 這條才算真的在測上限,而不是在測「檔案找不到」。
+        sess2 = self._restore("h0b", "sdk-h0")
+        self.assertTrue(sess2.digest.store.order,
+                        "同一份 fixture 在沒有 CC_SDK_HISTORY_SEED=0 時必須種出卡;"
+                        "空的代表讀不到檔(路徑算錯),不是上限生效")
 
     def test_seed_cards_precede_live_events(self):
         self._write_jsonl("sdk-h3", self.FIXTURE)
@@ -609,14 +618,50 @@ class TestHistorySeed(CC2Base):
     def test_missing_jsonl_silent(self):
         sess = self._restore("h4", "sdk-no-file")
         self.assertEqual(sess.digest.store.order, [])
+        # 「安靜」是指不出錯誤卡、不擋 session —— 但**有 sdk_session_id 卻找不到
+        # transcript** 這件事本身要留痕(2026-10-29):它與「全新對話」不同,
+        # 而原本這條路完全無聲,正是上次零線索追查的來源。
+        with patch.object(cc_sdk, "LOG") as log:
+            self._restore("h4b", "sdk-no-file")
+        events = [c.args[0] for c in log.call_args_list if c.args]
+        self.assertIn("cc2_history_seed_missing", events)
+
+    def test_reseed_is_idempotent_not_duplicated(self):
+        """同一條對話重種不得產生第二份歷史(2026-10-29)。
+
+        原本 `seed_card` 用共用的遞增計數器產 id,重種時 `_seq` 已往前走 →
+        同樣的歷史拿到不同 card id → app 端(快取 key = session_id+card.id+rev)
+        會把整段歷史疊第二份。今天僥倖沒出事只因為兩個呼叫點互斥;任何未來的
+        「自癒後重種」都會當場重複。
+        """
+        self._write_jsonl("sdk-h6", self.FIXTURE)
+        sess = self._restore("h6", "sdk-h6")
+        first = list(sess.digest.store.order)
+        self.assertEqual(len(first), 4)
+        sess._seed_history()          # 模擬自癒 / adopt-by-cwd 再次觸發
+        self.assertEqual(sess.digest.store.order, first,
+                         "重種必須是對同一批 card id 做 upsert,不得新增卡")
+        texts = [sess.digest.store.cards[i]["body"]["text"] for i in first]
+        self.assertEqual(texts, ["第一句", "回覆一", "第二句", "回覆二"])
 
     def test_unreadable_jsonl_logged_not_fatal(self):
         # 路徑是個目錄 → open 直接炸;種子必須容忍,session 照常可用。
-        d = os.path.join(self.projects, _TMP.replace("/", "-"))
+        # ⚠️ 2026-10-29:這裡原本也寫死 `_TMP.replace("/", "-")`(`_write_jsonl`
+        # 的修正漏了這條)。後果是那個「不可讀目錄」被建在**錯的 project key**
+        # 底下,`_seed_history` 走的是 `FileNotFoundError` 分支 → 這條測試
+        # **因為另一個理由通過**,它宣稱覆蓋的「整檔讀不動必須容忍」實際零覆蓋。
+        # 直接證據:修之前跑這組,h1/h2 都有 `cc2_history_seeded` 事件,
+        # h5 連一個 seed 事件都沒有。
+        d = os.path.join(self.projects, cc_sdk._project_key(_TMP))
         os.makedirs(os.path.join(d, "sdk-h5.jsonl"), exist_ok=True)
-        sess = self._restore("h5", "sdk-h5")
+        with patch.object(cc_sdk, "LOG") as log:
+            sess = self._restore("h5", "sdk-h5")
         self.assertIsNotNone(sess)
         self.assertEqual(sess.digest.store.order, [])
+        # 「容忍」不等於「沉默」:讀不動必須留痕,否則下次又是零線索追查。
+        events = [c.args[0] for c in log.call_args_list if c.args]
+        self.assertIn("cc2_history_seed_failed", events,
+                      "整檔讀不動必須 log,不能靜默吞掉")
 
 
 # ───────────────────────── 審批第三態(gap #2)─────────────────────────
