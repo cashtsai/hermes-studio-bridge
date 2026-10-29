@@ -979,3 +979,58 @@ class CC2SecondAuditTest(unittest.TestCase):
                for c in self.s.digest.store.cards.values()
                if (c.get("body") or {}).get("origin") == "cc2.tool"][0]
         self.assertIn("找到 3 筆結果", txt)
+
+
+class CC2ThirdAuditTest(unittest.TestCase):
+    """2026-10-29 第三輪盤查:未登入指路、歷史讀取不擋事件圈。"""
+
+    def setUp(self):
+        self.r = cc_sdk.CCSdkRegistry()
+        self.s = self.r.ensure("a3-1", workdir="/tmp")
+
+    def test_auth_error_becomes_human_readable(self):
+        """主機沒登入時原本只會出現一行 SDK 例外字串,使用者不知道要去登入。
+
+        tmux 有 `/ccsessions/{name}/login`(靠 tmux 把 /login 打進 TUI);
+        cc2 沒有 TUI 做不到那件事,但**可以明確指路**。
+        """
+        hint = cc_sdk.CCSdkSession._auth_hint(
+            RuntimeError("Invalid API key · Please run /login"))
+        self.assertIn("登入", hint)
+        self.assertIn("/login", hint, "要給得出可照做的指令")
+
+    def test_quota_error_distinguished_from_auth(self):
+        hint = cc_sdk.CCSdkSession._auth_hint(
+            RuntimeError("Your credit balance is too low"))
+        self.assertIn("額度", hint)
+        self.assertNotIn("登入", hint, "額度不足不是叫人去登入")
+
+    def test_unrelated_error_keeps_raw_message(self):
+        """不是認證類的錯誤不要硬翻 —— 原文對排查更有用。"""
+        self.assertEqual(
+            cc_sdk.CCSdkSession._auth_hint(RuntimeError("disk full")), "")
+
+    def test_history_read_is_capped_and_honest(self):
+        """超大 transcript 只讀尾端,並誠實標示還有更早的讀不到。"""
+        root = os.path.join(_TMP, "projects-big")
+        d = os.path.join(root, cc_sdk._project_key("/tmp"))
+        os.makedirs(d, exist_ok=True)
+        line = json.dumps({"type": "user", "timestamp": 1700000000,
+                           "message": {"content": "x" * 900}}) + "\n"
+        # 寫到超過 8 MiB 上限
+        with open(os.path.join(d, "big-sid.jsonl"), "w", encoding="utf-8") as f:
+            for _ in range(11000):
+                f.write(line)
+        self.s.sdk_session_id = "big-sid"
+        old = cc_sdk._claude_projects_root
+        cc_sdk._claude_projects_root = lambda: root
+        try:
+            out = self.s.history_page(limit=5)
+        finally:
+            cc_sdk._claude_projects_root = old
+        self.assertEqual(len(out["messages"]), 5)
+        self.assertTrue(out["truncated"], "超過上限要標示截斷")
+        self.assertTrue(out["more"], "截斷時 more 必為真(前面還有讀不到的)")
+
+    def test_history_limit_zero_returns_empty(self):
+        self.assertEqual(self.s.history_page(limit=0)["messages"], [])

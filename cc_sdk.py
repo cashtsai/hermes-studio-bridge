@@ -735,11 +735,22 @@ class CCSdkSession:
             return out
         proj = os.path.join(_claude_projects_root(), _project_key(self.workdir))
         rows = []
+        truncated = False
+        # 每檔讀取上限。transcript 長起來是數十 MB,整檔讀進來(而且這支由
+        # async 路由呼叫)會把事件圈凍住 —— 所有 HTTP、所有 SSE 一起卡
+        # (2026-10-29 盤查)。只讀尾端,翻到底就誠實說還有更早的。
+        cap = 1 << 23          # 8 MiB/檔
         for sid in ids:
             path = os.path.join(proj, f"{sid}.jsonl")
             try:
-                with open(path, "r", encoding="utf-8") as f:
-                    lines = f.readlines()
+                with open(path, "rb") as fb:
+                    size = os.fstat(fb.fileno()).st_size
+                    if size > cap:
+                        fb.seek(size - cap)
+                        fb.readline()      # 丟掉被切半的那一行
+                        truncated = True
+                    raw = fb.read()
+                lines = raw.decode("utf-8", "replace").splitlines()
             except FileNotFoundError:
                 continue
             except Exception as e:  # noqa: BLE001
@@ -760,7 +771,10 @@ class CCSdkSession:
             # offset 從最新往回數;超過總數 → 空頁(不是繞回去拿最舊那幾則)。
             rows = rows[:max(0, len(rows) - max(0, int(offset)))]
         page = rows[-limit:] if (rows and limit) else []
-        out["more"] = len(rows) > len(page)
+        # truncated = 我們只讀了尾端,前面還有讀不到的 → more 必為真,
+        # total 也只是「讀得到的範圍內」的數量,不假裝是全部。
+        out["more"] = (len(rows) > len(page)) or truncated
+        out["truncated"] = truncated
         out["messages"] = page
         return out
 
@@ -851,7 +865,10 @@ class CCSdkSession:
             _log("cc2_turn_error", session=self.name, error=type(e).__name__,
                  error_message=str(e)[:200])
             await self._teardown_client()
-            self.digest.turn_end(error=f"{type(e).__name__}: {str(e)[:200]}")
+            # 認證/額度類錯誤給人看得懂的指路,不要丟 SDK 例外字串。
+            hint = self._auth_hint(e)
+            self.digest.turn_end(
+                error=hint or f"{type(e).__name__}: {str(e)[:200]}")
         finally:
             # 回合收尾刷一次上下文用量 —— 放這裡而不是每個 delta,因為它是一次
             # SDK 來回;每個 token 都問會把串流拖垮。
@@ -919,6 +936,27 @@ class CCSdkSession:
     @staticmethod
     def _is_invalid_resume(e: BaseException) -> bool:
         return "no conversation found" in str(e).lower()
+
+    @staticmethod
+    def _auth_hint(e: BaseException) -> str:
+        """認證類錯誤 → 人看得懂的指路。沒命中回空字串。
+
+        tmux 那邊有 `POST /ccsessions/{name}/login`(靠 tmux 把 `/login` 打進
+        TUI)。cc2 沒有 TUI,登入這件事做不到 —— 但**可以不要丟一串 SDK 例外**。
+        原本完全沒處理:主機沒登入時卡片上只會出現一行英文堆疊訊息,使用者
+        根本不知道要去登入(2026-10-29 盤查)。字樣取自 CLI 二進位裡的實際訊息。
+        """
+        low = str(e).lower()
+        if "run /login" in low or "not authenticated" in low or \
+                "please log in" in low:
+            return ("這台主機還沒登入 Claude Code。請在終端機跑 `claude` 後輸入 "
+                    "`/login`(或在 Pocket 的 CC 頁籤登入),登入後這條對話直接可用。")
+        if "invalid api key" in low or "authentication_error" in low:
+            return ("Claude 憑證無效。若這條 session 設了自備 API key,請重新設定;"
+                    "否則在終端機跑 `claude` 並 `/login` 重新登入。")
+        if "credit balance" in low or "quota" in low or "rate_limit" in low:
+            return "Claude 額度或速率上限擋住了這一輪。等一下再送,或換個模型。"
+        return ""
 
     # ── client 生命週期 ──
 
