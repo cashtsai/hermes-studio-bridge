@@ -21486,8 +21486,12 @@ async def v2_cc2_history(name: str, request: Request,
     sess = cc_sdk.registry().get(name)
     if sess is None:
         raise http_err(404, "SESSION_NOT_FOUND", f"找不到 cc2 session {name}")
-    return sess.history_page(limit=max(1, min(int(limit or 40), 200)),
-                             offset=max(0, int(offset or 0)))
+    # 丟到執行緒跑 —— history_page 會讀磁碟上的 transcript(即使只讀尾端也是
+    # 同步 I/O)。在事件圈上直接讀會把所有 HTTP 與 SSE 一起卡住。
+    return await asyncio.to_thread(
+        sess.history_page,
+        max(1, min(int(limit or 40), 200)),
+        max(0, int(offset or 0)))
 
 
 @app.post("/app/v2/cc2/{name}/compact")
