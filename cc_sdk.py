@@ -755,9 +755,11 @@ class CCSdkSession:
                 if row:
                     rows.append({"role": row[0], "text": row[1], "ts": row[2]})
         out["total"] = len(rows)
+        limit = max(0, int(limit or 0))
         if offset:
-            rows = rows[:max(0, len(rows) - offset)]
-        page = rows[-max(1, limit):] if rows else []
+            # offset 從最新往回數;超過總數 → 空頁(不是繞回去拿最舊那幾則)。
+            rows = rows[:max(0, len(rows) - max(0, int(offset)))]
+        page = rows[-limit:] if (rows and limit) else []
         out["more"] = len(rows) > len(page)
         out["messages"] = page
         return out
@@ -776,8 +778,17 @@ class CCSdkSession:
                             _project_key(self.workdir),
                             f"{self.sdk_session_id}.jsonl")
         try:
-            with open(path, "r", encoding="utf-8") as f:
-                lines = f.readlines()
+            # 只讀尾端。整檔 readlines 不行:transcript 長起來是數十 MB,而這支
+            # 在 `__init__` 裡、由 `load()` 在請求/開機路徑上呼叫 —— 一條長對話
+            # 就能讓那個請求卡住(複查抓到)。種子只要最後 N 則,尾端夠了。
+            tail_bytes = 1 << 20          # 1 MiB,遠大於 40 則對話
+            with open(path, "rb") as fb:
+                size = os.fstat(fb.fileno()).st_size
+                if size > tail_bytes:
+                    fb.seek(size - tail_bytes)
+                    fb.readline()         # 丟掉被切半的那一行
+                raw = fb.read()
+            lines = raw.decode("utf-8", "replace").splitlines()
         except FileNotFoundError:
             return
         except Exception as e:  # noqa: BLE001
@@ -1076,9 +1087,33 @@ class CCSdkSession:
         return {"ok": True, "message": "已送出壓縮指令"}
 
     async def interrupt(self) -> bool:
-        """停止進行中 turn。回 False = 沒有活躍 turn(呼叫端回 409)。"""
-        if not self.busy or self.client is None:
+        """停止進行中 turn。回 False = 沒有活躍 turn(呼叫端回 409)。
+
+        2026-10-29 修兩件事:
+        ① **先解開卡在審批/提問的等待者。** 回合停在 `can_use_tool` 裡等人回答
+           時,光送 client.interrupt() 不會叫醒那個協程 —— 它會一路等到 110 秒
+           fail-closed。使用者按了停止卻什麼都沒發生,最久兩分鐘(複查抓到)。
+           提問 → 當「略過」(回答問題不是危險操作);一般審批 → 拒絕。
+        ② 原本**無條件回 True**,連 client 已死都說成功。改成誠實回報。
+        """
+        if not self.busy:
             return False
+        woke = 0
+        for aid, w in list(self.registry.pending_approvals.items()):
+            if w.get("session") != self.name or w.get("decision") is not None:
+                continue
+            opts = [str(o.get("key") or "")
+                    for o in ((w.get("record") or {}).get("options") or [])]
+            w["decision"] = "ask:skip" if any(
+                k.startswith("ask:") for k in opts) else "deny"
+            w["event"].set()
+            woke += 1
+        if woke:
+            _log("cc2_interrupt_woke_approvals", session=self.name, count=woke)
+        if self.client is None:
+            # 沒有 client 但有 turn task(例如正卡在審批上):叫醒等待者就夠了,
+            # 回合會自己走到收尾。
+            return bool(woke)
         try:
             await self.client.interrupt()
         except Exception as e:  # noqa: BLE001
@@ -1086,6 +1121,7 @@ class CCSdkSession:
             # 例外走 teardown 收尾,這裡不重複收。
             _log("cc2_interrupt_failed", session=self.name,
                  error=type(e).__name__, error_message=str(e)[:160])
+            return bool(woke)
         return True
 
     # ── SDK 訊息 → 卡片流(契約翻譯層)──

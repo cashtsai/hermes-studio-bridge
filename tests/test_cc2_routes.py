@@ -336,3 +336,116 @@ class CC2ModeVocabRouteTest(unittest.TestCase):
         r = self.http.post("/app/v2/cc2/mv1/settings", headers=self.auth,
                            json={"permission_mode": "yolo"})
         self.assertEqual(r.status_code, 400, r.text)
+
+
+class CC2HistoryResumeRouteTest(unittest.TestCase):
+    """把過去的對話接回成 cc2 session(2026-10-29 複查列為 MISSING)。
+
+    `/cchistory` 的列表與逐字稿讀 `~/.claude/projects`,**與 cc2 同一個儲存**,
+    所以那兩支本來就通;缺的只有接回 —— 既有的 `/cchistory/{sid}/resume` 開的是
+    tmux session。
+    """
+
+    def setUp(self):
+        from fastapi.testclient import TestClient
+        self.auth = {"Authorization": "Bearer " + bridge.BRIDGE_TOKEN}
+        self.http = TestClient(bridge.app)
+        cc_sdk.reset_registry_for_tests()
+        self._find = bridge._cchist_find
+        self._meta = bridge._cchist_meta
+
+    def tearDown(self):
+        bridge._cchist_find = self._find
+        bridge._cchist_meta = self._meta
+
+    def _stub(self, cwd="/tmp", found=True):
+        bridge._cchist_find = lambda sid: ("/fake/path.jsonl" if found else None)
+        bridge._cchist_meta = lambda path: {"cwd": cwd}
+
+    def test_resume_creates_cc2_session_bound_to_old_transcript(self):
+        self._stub()
+        r = self.http.post("/app/v2/cc2/_resume/abc12345def", headers=self.auth,
+                           json={"name": "revived"})
+        self.assertEqual(r.status_code, 200, r.text)
+        sess = cc_sdk.registry().get("revived")
+        self.assertIsNotNone(sess)
+        self.assertEqual(sess.sdk_session_id, "abc12345def",
+                         "要綁到那條舊逐字稿,不然接回來是空的")
+        self.assertEqual(sess.workdir, "/tmp")
+
+    def test_resume_refuses_when_cwd_gone(self):
+        """原本的工作目錄不在了就不要接 —— 相對路徑會全錯。"""
+        self._stub(cwd="/no/such/dir/anywhere")
+        r = self.http.post("/app/v2/cc2/_resume/zzz", headers=self.auth, json={})
+        self.assertEqual(r.status_code, 409, r.text)
+
+    def test_resume_unknown_sid_is_404(self):
+        self._stub(found=False)
+        r = self.http.post("/app/v2/cc2/_resume/nope", headers=self.auth, json={})
+        self.assertEqual(r.status_code, 404, r.text)
+
+    def test_resume_refuses_session_held_elsewhere(self):
+        """正被終端機持有的那條不准接 —— 兩個寫入者會讓逐字稿父子鏈分岔。"""
+        self._stub()
+        old = cc_sdk._live_session_ids
+        cc_sdk._live_session_ids = lambda: {"held-sid"}
+        try:
+            r = self.http.post("/app/v2/cc2/_resume/held-sid",
+                               headers=self.auth, json={})
+        finally:
+            cc_sdk._live_session_ids = old
+        self.assertEqual(r.status_code, 409, r.text)
+
+
+class CC2InterruptTest(unittest.TestCase):
+    """停止鈕在「卡在審批/提問」時要真的有用(2026-10-29 複查)。"""
+
+    def setUp(self):
+        cc_sdk.reset_registry_for_tests()
+        self.r = cc_sdk.registry()
+        self.s = self.r.ensure("int-1", workdir="/tmp")
+
+    def test_interrupt_wakes_pending_question_as_skip(self):
+        """提問掛著時按停止 → 當「略過」叫醒,不是等 110 秒 fail-closed。"""
+        import asyncio
+        aid = "cc2-int-q"
+        w = {"event": asyncio.Event(), "decision": None, "session": "int-1",
+             "record": {"id": aid, "options": [
+                 {"key": "ask:0"}, {"key": "ask:skip"}]}}
+        self.r.pending_approvals[aid] = w
+        self.s.busy = True
+        self.assertTrue(asyncio.run(self.s.interrupt()))
+        self.assertEqual(w["decision"], "ask:skip",
+                         "提問要當略過 —— 回答問題不是危險操作")
+        self.assertTrue(w["event"].is_set())
+
+    def test_interrupt_denies_pending_permission(self):
+        import asyncio
+        aid = "cc2-int-p"
+        w = {"event": asyncio.Event(), "decision": None, "session": "int-1",
+             "record": {"id": aid, "options": [
+                 {"key": "approve"}, {"key": "deny"}]}}
+        self.r.pending_approvals[aid] = w
+        self.s.busy = True
+        asyncio.run(self.s.interrupt())
+        self.assertEqual(w["decision"], "deny")
+
+    def test_interrupt_idle_is_false(self):
+        import asyncio
+        self.assertFalse(asyncio.run(self.s.interrupt()))
+
+    def test_interrupt_reports_failure_honestly(self):
+        """原本無條件回 True,連 client 已死都說成功。"""
+        import asyncio
+
+        class DeadClient:
+            async def interrupt(self):
+                raise RuntimeError("client 已死")
+
+        self.s.busy = True
+        self.s.client = DeadClient()
+        try:
+            self.assertFalse(asyncio.run(self.s.interrupt()),
+                             "送不出去又沒叫醒任何等待者 → 不得回報成功")
+        finally:
+            self.s.client = None

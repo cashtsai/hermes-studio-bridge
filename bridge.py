@@ -21669,6 +21669,54 @@ async def v2_cc2_settings(name: str, request: Request):
     return {"ok": True, "session_id": f"cc2:{name}", **res}
 
 
+@app.post("/app/v2/cc2/_resume/{sid}")
+async def v2_cc2_resume_history(sid: str, request: Request):
+    """把 `/cchistory` 列出的某條過去對話接回成一條 **cc2** session。
+
+    為什麼需要:`/cchistory` 的列表與逐字稿讀的是 `~/.claude/projects`,**和 cc2
+    同一個儲存**,所以那兩支對 cc2 建的對話本來就通。缺的只有接回 —— 既有的
+    `/cchistory/{sid}/resume` 是開一個 **tmux** session,cc2 這邊沒有對應入口
+    (2026-10-29 複查列為 MISSING)。
+
+    body {name?}:新 session 名,省略就用 sid 前 8 碼。cwd 取自該條逐字稿自己
+    記的 cwd —— 接回別的目錄會讓相對路徑全錯。
+    """
+    _check_auth(request)
+    if not cc_sdk.enabled():
+        raise http_err(404, "CC_SDK_DISABLED",
+                       "cc2 provider 未啟用(需 CC_SDK_PROVIDER=1)")
+    path = _cchist_find(sid)
+    if not path:
+        raise http_err(404, "SESSION_NOT_FOUND", "找不到這條歷史對話")
+    meta = _cchist_meta(path) or {}
+    cwd = str(meta.get("cwd") or "")
+    if not cwd or not os.path.isdir(cwd):
+        raise http_err(409, "CWD_MISSING",
+                       f"這條對話原本的工作目錄不在了({cwd or '未記錄'}),無法接回")
+    body = await _json_body(request)
+    name = str(body.get("name") or "").strip() or f"hist-{sid[:8]}"
+    if not re.fullmatch(cc_sdk.SESSION_NAME_RE, name):
+        raise http_err(400, "BAD_SESSION_NAME",
+                       "cc2 session 名限英數/底線/連字號(≤64)")
+    reg = cc_sdk.registry()
+    if reg.get(name) is not None:
+        raise http_err(409, "NAME_TAKEN", f"已經有叫 {name} 的 cc2 session")
+    # 不准接**正被別人持有**的那條(終端機開著的 claude、別的 bridge)——
+    # SDK/CLI 都沒有檔案鎖,兩個寫入者會讓 transcript 的父子鏈分岔。
+    if sid in cc_sdk._live_session_ids():
+        raise http_err(409, "SESSION_HELD",
+                       "這條對話正被另一個 claude 行程持有;等它結束再接")
+    sess = reg.ensure(name, workdir=cwd)
+    sess.sdk_session_id = sid
+    sess._seed_history()          # 畫面一進去就有上下文
+    sess._upsert_resume_hint_card()
+    reg.save()
+    _log_event("cc2_history_resumed", session=name, sdk_session=sid[:12],
+               workdir=cwd)
+    return {"ok": True, "session_id": f"cc2:{name}", "workdir": cwd,
+            "sdk_session_id": sid}
+
+
 @app.get("/app/v2/cc2/{name}/context")
 async def v2_cc2_context(name: str, request: Request):
     """這條 session 現在的上下文佔用(等同 CLI 的 `/context`)。
