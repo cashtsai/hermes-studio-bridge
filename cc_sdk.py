@@ -107,12 +107,36 @@ def context_usage_timeout() -> float:
 
 
 def history_seed_limit() -> int:
-    """歷史種子上限(0 = 關閉):session 重建時從 SDK transcript jsonl 撈
-    最後 N 則 user/assistant 文字訊息餵進卡片庫,先於一切 live 事件。"""
+    """歷史種子上限(0 = 關閉)= transcript jsonl 的**尾端原始行數**。
+
+    2026-10-29 改語意:原本是「最後 N 則過濾後的文字訊息」(預設 40)。
+    改走共用 digest 之後一行可能產 0..n 張卡(工具呼叫/結果/thinking/附件),
+    用「則數」切會把工具步驟算進對話額度 —— 同一條對話的可見輪數反而變少。
+    改成切行數,與 tmux 路徑的 `_CC_CARD_SEED_LINES = 200` 同語意、同預設,
+    這樣兩條路徑進場看到的歷史份量一致(cc2 的目標是取代,不是縮水)。
+    """
     try:
-        return int(os.environ.get("CC_SDK_HISTORY_SEED", "") or 40)
+        return int(os.environ.get("CC_SDK_HISTORY_SEED", "") or 200)
     except ValueError:
-        return 40
+        return 200
+
+
+def _seed_card_uid(d: dict, jsonl_path: str, lineno: int) -> str:
+    """種子卡的穩定 id 來源 —— 與 bridge 的 `_cc_card_uid` **同語意**。
+
+    刻意複製而不 import bridge:本模組的鐵律是不 import bridge(循環)。
+    語意必須一致,否則同一條 transcript 在兩條路徑上會產出不同 id,
+    app 的快取(key = session_id + card.id + rev)會疊兩份。
+
+    優先用 jsonl 事件自己的 `uuid`:它綁的是「那一則事件」,所以重讀/重種
+    天然冪等。沒有 uuid 才退回「檔案雜湊 + 行號」。
+    """
+    u = d.get("uuid")
+    if u:
+        return str(u)[:32]
+    import hashlib
+    fh = hashlib.md5((jsonl_path or "").encode()).hexdigest()[:6]
+    return f"{fh}-L{lineno}"
 
 
 def _short_key(value: str) -> str:
@@ -819,14 +843,15 @@ class CCSdkSession:
         return out
 
     def _seed_history(self) -> None:
-        """歷史種子:sdk_session_id 對應的 transcript jsonl 撈最後 N 則
-        (CC_SDK_HISTORY_SEED,預設 40)user/assistant 文字訊息 → final:true
-        卡(原角色/原 ts),先於一切 live 事件。jsonl 缺席 = 全新對話,安靜
-        跳過;整檔讀不動/個別行壞掉容忍,各 log 一次,絕不擋 session 起步。"""
+        """歷史種子:transcript jsonl 的尾端 N 行(CC_SDK_HISTORY_SEED,預設 200)
+        經 **`carddigest.cc_event_to_cards`** 翻成 final:true 卡(原角色/原 ts/
+        uuid 衍生 id),先於一切 live 事件 —— 與 tmux 路徑同一套翻譯、同份量。
+        jsonl 缺席 = 全新對話,安靜跳過(但有 sdk_session_id 卻找不到檔要留痕);
+        整檔讀不動/個別行壞掉容忍,各 log 一次,絕不擋 session 起步。"""
         if not self.sdk_session_id:
             return
-        limit = history_seed_limit()
-        if limit <= 0:
+        limit_lines = history_seed_limit()
+        if limit_lines <= 0:
             return
         path = os.path.join(_claude_projects_root(),
                             _project_key(self.workdir),
@@ -865,26 +890,58 @@ class CCSdkSession:
             _log("cc2_history_seed_failed", session=self.name,
                  error=type(e).__name__, error_message=str(e)[:200])
             return
-        rows, bad = [], 0
-        for line in lines:
+        # ── 走共用 digest(2026-10-29)───────────────────────────────────────
+        #
+        # 原本自己用 `_seed_row` 只撈 user/assistant 的**純文字**,於是進場看到的
+        # 歷史裡:工具步驟、工具結果、thinking、截圖、**diff 全部不見**。
+        # 使用者的感受是「歷史不見了」—— 而 tmux 路徑一直都有,因為它走
+        # `carddigest.cc_event_to_cards`(見 bridge 的 `_cc_digest_lines`)。
+        #
+        # cc2 當初就是為了**取代** tmux,所以進場內容不能比它少。改走同一套翻譯:
+        #   · 一次拿到 tool_call(含 `body.patch` = app 的 diff chip 來源)、
+        #     tool_result、attachment、thinking
+        #   · card id 由 **jsonl 的 uuid** 衍生 → 天然冪等(比我原本的 idx 更對:
+        #     uuid 綁的是「那一則事件」,位置綁的是「這次讀到的第幾筆」)
+        #   · 契約 §0「digest 的責任在 bridge:一份 parser、所有終端共享」
+        #
+        # 上限也跟著改成與 tmux 同語意:切的是**原始行數**(預設 200 行)而不是
+        # 「過濾後 40 則」—— 一行可能產 0..n 張卡,用則數切會把工具步驟算進額度。
+        tail = lines[-limit_lines:] if limit_lines > 0 else lines
+        sink = None
+        if MEDIA_SINK is not None:
+            try:
+                sink = MEDIA_SINK(f"cc2:{self.name}")
+            except Exception as e:  # noqa: BLE001 — 媒體落地是加分項,不擋 seed
+                _log("cc2_history_seed_media_sink_failed", session=self.name,
+                     error=type(e).__name__)
+        cards, bad = 0, 0
+        for off, line in enumerate(tail):
             line = line.strip()
             if not line:
                 continue
             try:
-                row = _seed_row(json.loads(line))
+                d = json.loads(line)
             except Exception:  # noqa: BLE001
                 bad += 1
                 continue
-            if row is not None:
-                rows.append(row)
-        for i, (role, text, ts) in enumerate(rows[-limit:]):
-            self.digest.seed_card(role, text, ts, i)
+            try:
+                for card in carddigest.cc_event_to_cards(
+                        d, _seed_card_uid(d, path, off),
+                        turn_id="",          # 歷史不掛回合
+                        image_sink=sink):
+                    card["final"] = True     # 歷史一律定稿(不是草稿)
+                    self.digest.store.upsert_card(card)
+                    cards += 1
+            except Exception as e:  # noqa: BLE001 — 單一事件翻譯失敗不擋整段
+                bad += 1
+                _log("cc2_history_seed_card_failed", session=self.name,
+                     error=type(e).__name__, error_message=str(e)[:160])
         if bad:
             _log("cc2_history_seed_bad_lines", session=self.name,
                  skipped=bad)
-        if rows:
-            _log("cc2_history_seeded", session=self.name,
-                 cards=min(len(rows), limit))
+        if cards:
+            _log("cc2_history_seeded", session=self.name, cards=cards,
+                 lines=len(tail))
 
     # ── 輸入 ──
 

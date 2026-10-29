@@ -518,8 +518,14 @@ class TestHistorySeed(CC2Base):
         json.dumps({"type": "assistant", "message": {
             "content": [{"type": "text", "text": "回覆一"}]},
             "timestamp": "2026-08-16T01:00:05Z"}, ensure_ascii=False),
-        # 以下四行全都不該成卡:tool_result 水管 / system-reminder / 純工具
-        # assistant / 壞 JSON。
+        # ⚠️ 2026-10-29 契約改變:seed 改走 `carddigest.cc_event_to_cards`
+        # (與 tmux 路徑同一套翻譯)之後,這四行**只有兩行**不該成卡:
+        #   · tool_result 水管  → 現在是 `tool_result` 卡(tmux 一直都有)
+        #   · 純 tool_use      → 現在是 `tool_call` 卡(diff chip 的來源)
+        #   · <system-reminder> → 仍然濾掉(carddigest.PLUMBING_TAGS)
+        #   · 壞 JSON          → 仍然跳過
+        # 原本只撈純文字,所以進場看不到工具步驟 —— 而 cc2 的目標是**取代** tmux,
+        # 進場內容不能比它少。
         json.dumps({"type": "user", "message": {
             "content": [{"type": "tool_result", "content": "ok"}]}}),
         json.dumps({"type": "user", "message": {
@@ -561,11 +567,19 @@ class TestHistorySeed(CC2Base):
         sess = self._restore("h1", "sdk-h1")
         store = sess.digest.store
         cards = [store.cards[i] for i in store.order]
-        self.assertEqual([c["role"] for c in cards],
-                         ["user", "assistant", "user", "assistant"])
-        self.assertEqual([c["body"]["text"] for c in cards],
+        # 新契約(2026-10-29):工具步驟也要進場 —— 順序照 transcript 原順序。
+        self.assertEqual([(c["kind"], c["role"]) for c in cards], [
+            ("text", "user"), ("markdown", "assistant"),
+            ("tool_result", "assistant"),   # 以前被當水管丟掉
+            ("tool_call", "assistant"),     # 以前被當水管丟掉
+            ("text", "user"), ("markdown", "assistant"),
+        ], "工具卡不見了 —— 那就是「進場歷史比 tmux 少」的那個退步")
+        # 對話那四張的文字(工具卡沒有 body.text,不能一律索引)
+        self.assertEqual([c["body"].get("text") for c in cards
+                          if c["kind"] in ("text", "markdown")],
                          ["第一句", "回覆一", "第二句", "回覆二"])
-        self.assertTrue(all(c["final"] for c in cards))
+        self.assertTrue(all(c["final"] for c in cards),
+                        "歷史一律定稿,不是草稿")
         # 原 ts(權威時間),不是 seed 當下的 now
         self.assertAlmostEqual(cards[0]["ts"],
                                carddigest._epoch("2026-08-16T01:00:00Z"),
@@ -611,9 +625,15 @@ class TestHistorySeed(CC2Base):
 
         asyncio.run(run())
         store = sess.digest.store
-        texts = [store.cards[i]["body"]["text"] for i in store.order]
-        self.assertEqual(texts[:4], ["第一句", "回覆一", "第二句", "回覆二"])
-        self.assertEqual(texts[4:], ["live 輸入", "live 回覆"])
+        # `body.get` 而不是 `body["text"]`:工具卡沒有 text 欄(2026-10-29 起
+        # seed 會產工具卡),一律索引會 KeyError。
+        texts = [store.cards[i]["body"].get("text") for i in store.order]
+        # 契約的重點是**順序**:歷史在前、live 在後(§7 snapshot 語意)。
+        self.assertEqual(texts[-2:], ["live 輸入", "live 回覆"],
+                         "live 事件必須在歷史之後")
+        self.assertEqual([t for t in texts[:-2] if t],
+                         ["第一句", "回覆一", "ok", "第二句", "回覆二"],
+                         "歷史(含工具結果)必須是 live 之前的前綴")
 
     def test_missing_jsonl_silent(self):
         sess = self._restore("h4", "sdk-no-file")
@@ -637,12 +657,14 @@ class TestHistorySeed(CC2Base):
         self._write_jsonl("sdk-h6", self.FIXTURE)
         sess = self._restore("h6", "sdk-h6")
         first = list(sess.digest.store.order)
-        self.assertEqual(len(first), 4)
+        # 刻意**不綁數量** —— fixture 改了不該讓這條假性紅。要守的是「重種不增卡」。
+        self.assertTrue(first, "種子一張都沒有,這條測不到冪等")
+        before = {i: sess.digest.store.cards[i]["body"].get("text") for i in first}
         sess._seed_history()          # 模擬自癒 / adopt-by-cwd 再次觸發
         self.assertEqual(sess.digest.store.order, first,
                          "重種必須是對同一批 card id 做 upsert,不得新增卡")
-        texts = [sess.digest.store.cards[i]["body"]["text"] for i in first]
-        self.assertEqual(texts, ["第一句", "回覆一", "第二句", "回覆二"])
+        after = {i: sess.digest.store.cards[i]["body"].get("text") for i in first}
+        self.assertEqual(after, before, "重種把內容改掉了")
 
     def test_unreadable_jsonl_logged_not_fatal(self):
         # 路徑是個目錄 → open 直接炸;種子必須容忍,session 照常可用。
