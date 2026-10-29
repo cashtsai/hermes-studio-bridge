@@ -34,12 +34,15 @@ LOG = None                 # bridge._log_event 同形:LOG(event, **fields)
 APPROVAL_DB_UPSERT = None  # callable(record) — pending 落 canonical approvals 表
 APPROVAL_DB_MARK = None    # callable(aid, status) — 決議/逾時收尾 DB 列
 TURN_END_PUSH = None       # callable(session_name, summary) — 回合完成推播
+MEDIA_SINK = None          # callable(session_id) -> sink(mime, b64) -> dict|None
 
 
 def configure(log=None, approval_db_upsert=None, approval_db_mark=None,
-              turn_end_push=None) -> None:
+              turn_end_push=None, media_sink=None) -> None:
     """bridge 開機時接線。掛鉤保存在模組層,session 物件不各自持有。"""
-    global LOG, APPROVAL_DB_UPSERT, APPROVAL_DB_MARK, TURN_END_PUSH
+    global LOG, APPROVAL_DB_UPSERT, APPROVAL_DB_MARK, TURN_END_PUSH, MEDIA_SINK
+    if media_sink is not None:
+        MEDIA_SINK = media_sink
     if log is not None:
         LOG = log
     if approval_db_upsert is not None:
@@ -197,7 +200,45 @@ def _sdk():
     return _sdk_mod
 
 
-PERMISSION_MODES = ("acceptEdits", "bypassPermissions", "default", "plan")
+# SDK client.set_permission_mode 的 docstring 列了六種;原本這裡只收四種,
+# 多的兩種會被 _clamp_mode 悄悄吞成 acceptEdits —— 使用者選了 dontAsk 卻拿到
+# 自動接受編輯,是「比沒做還糟」的那種錯(2026-10-29 稽核補)。
+PERMISSION_MODES = ("acceptEdits", "bypassPermissions", "default", "plan",
+                    "dontAsk", "auto")
+
+# 建立 session 時可釘住的 ClaudeAgentOptions 子集。`append_system_prompt` 不是
+# SDK 欄位,是我們的糖 —— 轉成官方的 preset+append 形狀(見 _spawn_option_kwargs)。
+SPAWN_PIN_KEYS = ("effort", "fallback_model", "allowed_tools",
+                  "disallowed_tools", "add_dirs", "setting_sources",
+                  "max_thinking_tokens", "append_system_prompt")
+
+
+def sanitize_spawn_opts(raw) -> dict:
+    """外來 body → 可安全落地的 spawn pins。白名單外一律丟掉;型別不對也丟,
+    不要讓壞值撐到 connect 當下才炸(那時錯誤會長得像「SDK 壞了」)。"""
+    if not isinstance(raw, dict):
+        return {}
+    out = {}
+    for k in SPAWN_PIN_KEYS:
+        if k not in raw or raw[k] is None:
+            continue
+        v = raw[k]
+        if k in ("allowed_tools", "disallowed_tools", "add_dirs",
+                 "setting_sources"):
+            if isinstance(v, (list, tuple)):
+                items = [str(x) for x in v if str(x).strip()]
+                if items:
+                    out[k] = items
+        elif k == "max_thinking_tokens":
+            try:
+                out[k] = int(v)
+            except (TypeError, ValueError):
+                pass
+        else:
+            txt = str(v).strip()
+            if txt:
+                out[k] = txt
+    return out
 
 
 def _clamp_mode(mode: str) -> str:
@@ -282,6 +323,9 @@ class CC2Digest(carddigest.ApprovalCardMixin):
     def __init__(self, name: str):
         self.busy_since: float = 0.0   # 回合起算(epoch);turn_begin 設、turn_end 清
         self.last_event_at: float = 0.0  # 最後活動(epoch);v2_rows 給 app 排序用
+        self.ctx_tokens: int = 0       # 目前上下文佔用 token(0 = 還不知道)
+        self.ctx_max: int = 0          # 這個模型的上下文上限
+        self.ctx_pct: float = 0.0      # 佔用百分比(0–100)
         self.mode: str = ""            # 權限模式鏡像(CCSdkSession 同步進來)
         self.model: str = ""           # 模型鏡像(同上);空 = 跟隨 CLI 預設
         self.name = name
@@ -307,7 +351,18 @@ class CC2Digest(carddigest.ApprovalCardMixin):
             "busy": self.busy, "mode": self.mode or None,
             "busy_since": self.busy_since or None,
             "model": self.model or None,
+            # context:tmux 那邊早有(_cc_context_usage_cached),cc2 原本整個
+            # 沒有 —— 長對話逼近上限時使用者完全看不到,只會莫名被壓縮。
+            # 刻意**不**放累計花費:機主 2026-10-28 明確要求拿掉費用預估
+            # (「那個數字很不精準常常看的很奇怪」)。
+            "context": ({"used": self.ctx_tokens, "size": self.ctx_max,
+                         "pct": round(self.ctx_pct, 1)}
+                        if self.ctx_max else None),
             "prompt": self.prompt,
+            # blocked:對齊 tmux 的同名欄位(2026-08-18「隱形卡住」事故之後
+            # 加的)。cc2 卡住的形態只有一種 —— 有審批/提問在等人回答,
+            # 回合就停在那裡。欄位名刻意與 tmux 一致,app 不用分 provider。
+            "blocked": bool(self.prompt),
             "phase": "run" if self.busy else "idle",
             "queue_depth": self.queue_depth,
             "label": label or ("等待核准" if self.prompt else
@@ -325,12 +380,21 @@ class CC2Digest(carddigest.ApprovalCardMixin):
         self._status("已送出,等待回覆。")
 
     def last_assistant_text(self) -> str:
-        """最後一則助理回覆的純文字(推播摘要用)。"""
+        """最後一則**真的回覆**的純文字(推播摘要用)。
+
+        只認 origin=cc2.assistant。不能只看 role=="assistant" —— 工具卡
+        (「🔧 Bash: …」)和終端接手提示卡也都是 assistant,一個沒出文字、
+        只跑了工具的回合會把「🔧 Bash: git status」或「📎 終端接手:
+        claude --resume …」當成推播內容推到手機上。
+        歷史種子卡(origin 空)也排除:那是上一輪的話,不是這一輪的結果。
+        """
         for c in reversed(list(self.store.cards.values())):
-            if c.get("role") == "assistant":
-                t = str((c.get("body") or {}).get("text") or "").strip()
-                if t:
-                    return t
+            body = c.get("body") or {}
+            if body.get("origin") != "cc2.assistant":
+                continue
+            t = str(body.get("text") or "").strip()
+            if t:
+                return t
         return ""
 
     def user_card(self, text: str, attachments: list | None = None,
@@ -363,7 +427,8 @@ class CC2Digest(carddigest.ApprovalCardMixin):
         self.store.last_tool = ""
         self.store.upsert_card(carddigest.make_card(
             self._draft_id, self.store.turn_id, "assistant", "markdown",
-            {"text": self._draft_text, "fallback_text": self._draft_text},
+            {"text": self._draft_text, "fallback_text": self._draft_text,
+             "origin": "cc2.assistant"},
             final=False))
         self._status("回覆中")
 
@@ -375,15 +440,32 @@ class CC2Digest(carddigest.ApprovalCardMixin):
             self.store.saw_output = True
             self.store.upsert_card(carddigest.make_card(
                 cid, self.store.turn_id, "assistant", "markdown",
-                {"text": text, "fallback_text": text}))
+                {"text": text, "fallback_text": text,
+                 "origin": "cc2.assistant"}))
         self._draft_id = ""
         self._draft_text = ""
+
+    def media_card(self, items: list, tool: str = ""):
+        """工具回傳的圖 → 一張 attachment 卡(與 CC/CX/OpenClaw 同款形狀)。
+        cc2 原本完全不處理工具結果,所以截圖/MCP 直回圖一律落空 ——
+        `/app/v2/sessions/cc2:x/media` 永遠是空的(2026-10-29 稽核)。"""
+        items = [i for i in (items or []) if isinstance(i, dict)]
+        if not items:
+            return
+        label = f"🖼 {tool} 回傳 {len(items)} 張圖" if tool else \
+            f"🖼 回傳 {len(items)} 張圖"
+        self.store.upsert_card(carddigest.make_card(
+            self._next_id("img"), self.store.turn_id, "assistant", "text",
+            {"text": label, "fallback_text": label,
+             "origin": "cc2.media", "attachments": items}))
+        self.store.saw_output = True
+        self.last_event_at = time.time()
 
     def tool_card(self, tool: str, summary: str):
         text = f"🔧 {tool}: {summary}" if summary else f"🔧 {tool}"
         self.store.upsert_card(carddigest.make_card(
             self._next_id("t"), self.store.turn_id, "assistant", "text",
-            {"text": text, "fallback_text": text}))
+            {"text": text, "fallback_text": text, "origin": "cc2.tool"}))
         self.store.last_tool = tool
         self._status(f"執行 {tool}")
 
@@ -417,13 +499,21 @@ class CCSdkSession:
 
     def __init__(self, registry: "CCSdkRegistry", name: str,
                  workdir: str = "", permission_mode: str = "",
-                 sdk_session_id: str = ""):
+                 sdk_session_id: str = "", model: str = ""):
         self.registry = registry
         self.name = name
         self.workdir = os.path.expanduser(workdir or "~")
         self.permission_mode = _clamp_mode(permission_mode or "acceptEdits")
         self.sdk_session_id = sdk_session_id or ""
-        self.model: str = ""           # 目前模型(空 = 跟隨 CLI 預設);傳給 ClaudeAgentOptions
+        self.model: str = (model or "").strip()   # 空 = 跟隨 CLI 預設;傳給 ClaudeAgentOptions
+        # 建立時可釘的其他 SDK 選項(tmux 那邊有一整個 pin 目錄,cc2 原本
+        # 只有 workdir/permission_mode)。只收白名單內的鍵 —— 這份 dict 會
+        # 落進 state 檔,不能讓任意鍵直通 ClaudeAgentOptions 建構子。
+        self.spawn_opts: dict = {}
+        # 自癒(invalid resume)換掉的舊 sdk_session_id。保留是為了歷史翻頁 ——
+        # 換 id 之後舊那份 transcript 還在磁碟上,但沒人記得它屬於這條 session,
+        # 於是 history_page 永遠撈不到、重啟後更是徹底失聯(2026-10-29 稽核)。
+        self.prior_session_ids: list[str] = []
         self.in_flight_prompt: str = ""  # 正在跑的那則(重啟後用來說明中斷)
         self.archived: bool = False      # 封存 = 不列出來,對話不刪
         self.digest = CC2Digest(name)
@@ -447,28 +537,35 @@ class CCSdkSession:
         往回數,回傳 `more` 告訴它還有沒有更早的。
         """
         out = {"messages": [], "more": False, "total": 0}
-        if not self.sdk_session_id:
+        # 跨自癒讀:自癒換掉 sdk_session_id 之後,舊那份 transcript 還在磁碟上。
+        # 只讀當前 id 的話,換 id 之前的對話永遠翻不回來。按時間順序(舊→新)
+        # 串起來,舊的在前。
+        ids = [i for i in (self.prior_session_ids or []) if i]
+        if self.sdk_session_id:
+            ids.append(self.sdk_session_id)
+        if not ids:
             return out
-        path = os.path.join(_claude_projects_root(),
-                            _project_key(self.workdir),
-                            f"{self.sdk_session_id}.jsonl")
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                lines = f.readlines()
-        except FileNotFoundError:
-            return out
-        except Exception as e:  # noqa: BLE001
-            _log("cc2_history_page_failed", session=self.name, error=str(e)[:160])
-            return out
+        proj = os.path.join(_claude_projects_root(), _project_key(self.workdir))
         rows = []
-        for ln in lines:
+        for sid in ids:
+            path = os.path.join(proj, f"{sid}.jsonl")
             try:
-                d = json.loads(ln)        # _seed_row 收的是解析後的 dict
-            except Exception:  # noqa: BLE001
+                with open(path, "r", encoding="utf-8") as f:
+                    lines = f.readlines()
+            except FileNotFoundError:
                 continue
-            row = _seed_row(d)
-            if row:
-                rows.append({"role": row[0], "text": row[1], "ts": row[2]})
+            except Exception as e:  # noqa: BLE001
+                _log("cc2_history_page_failed", session=self.name,
+                     sdk_session=sid[:12], error=str(e)[:160])
+                continue
+            for ln in lines:
+                try:
+                    d = json.loads(ln)    # _seed_row 收的是解析後的 dict
+                except Exception:  # noqa: BLE001
+                    continue
+                row = _seed_row(d)
+                if row:
+                    rows.append({"role": row[0], "text": row[1], "ts": row[2]})
         out["total"] = len(rows)
         if offset:
             rows = rows[:max(0, len(rows) - offset)]
@@ -557,6 +654,12 @@ class CCSdkSession:
             await self._teardown_client()
             self.digest.turn_end(error=f"{type(e).__name__}: {str(e)[:200]}")
         finally:
+            # 回合收尾刷一次上下文用量 —— 放這裡而不是每個 delta,因為它是一次
+            # SDK 來回;每個 token 都問會把串流拖垮。
+            try:
+                await self.refresh_context_usage()
+            except Exception:  # noqa: BLE001
+                pass
             # 回合完成推播 —— tmux 有、cc2 原本完全沒有,背景跑完使用者不會知道。
             # 掛鉤由 bridge 注入(cc_sdk 不 import bridge);fail-safe:推播壞掉
             # 絕不影響回合收尾。
@@ -603,6 +706,8 @@ class CCSdkSession:
                 if attempt == 0 and self._is_invalid_resume(e):
                     _log("cc2_resume_invalid", session=self.name,
                          dropped=self.sdk_session_id)
+                    if self.sdk_session_id:
+                        self.prior_session_ids.append(self.sdk_session_id)
                     self.sdk_session_id = ""
                     self.registry.save()
                     await self._teardown_client()
@@ -630,7 +735,7 @@ class CCSdkSession:
                  sdk_session_id=self.sdk_session_id[:18])
             raise RuntimeError(msg)
         sdk = _sdk()
-        opts_kwargs = {}
+        opts_kwargs = self._spawn_option_kwargs()
         if self.model:
             opts_kwargs["model"] = self.model   # 原本完全沒傳 → cc2 無法切模型
         opts = sdk.ClaudeAgentOptions(
@@ -648,6 +753,94 @@ class CCSdkSession:
              resume=bool(self.sdk_session_id), workdir=self.workdir,
              permission_mode=self.permission_mode)
         return client
+
+    def _spawn_option_kwargs(self) -> dict:
+        """spawn pins → ClaudeAgentOptions kwargs。未知鍵在 sanitize 時就擋掉了,
+        這裡只做形狀轉換;轉換失敗寧可丟掉那一顆,不要讓 connect 整個失敗。"""
+        out = {}
+        for k, v in (self.spawn_opts or {}).items():
+            if k == "append_system_prompt":
+                # 官方形狀:保留 claude_code 預設 system prompt,後面接我們的。
+                # 直接塞 system_prompt 字串會**整個換掉**預設提示,那會讓
+                # Claude Code 失去它原本的工具使用規範 —— 不是我們要的。
+                out["system_prompt"] = {"type": "preset",
+                                        "preset": "claude_code",
+                                        "append": str(v)}
+            else:
+                out[k] = v
+        return out
+
+    async def apply_runtime_settings(self, model=None,
+                                     permission_mode=None) -> dict:
+        """改**活著**的 session 的模型/權限模式。
+
+        為什麼需要獨立一條路:`ClaudeAgentOptions` 只在 connect 當下讀一次,
+        所以重 POST create 改了欄位對已連線的 client 完全沒作用(改完畫面顯示
+        新模式、實際仍用舊的 —— 比沒做還糟)。SDK 有 set_model /
+        set_permission_mode 可以熱改,走它。
+        client 還沒建:只記下來,下次 connect 自然生效。
+        """
+        changed = {}
+        if permission_mode:
+            want = _clamp_mode(str(permission_mode))
+            if want != str(permission_mode):
+                raise ValueError(
+                    f"不認得的權限模式 {permission_mode!r};可用:"
+                    + "/".join(PERMISSION_MODES))
+            self.permission_mode = want
+            self.digest.mode = want
+            changed["permission_mode"] = want
+        if model is not None:
+            self.model = str(model).strip()
+            self.digest.model = self.model
+            changed["model"] = self.model or None
+        applied_live = False
+        if changed and self.client is not None:
+            try:
+                if "permission_mode" in changed:
+                    await self.client.set_permission_mode(
+                        changed["permission_mode"])
+                if "model" in changed:
+                    await self.client.set_model(self.model or None)
+                applied_live = True
+            except Exception as e:  # noqa: BLE001
+                # 熱改失敗不是致命:值已經記下來,下次重連就是新的。誠實回報
+                # applied_live=false,呼叫端才知道「這一輪還是舊設定」。
+                _log("cc2_runtime_settings_live_failed", session=self.name,
+                     error=type(e).__name__, error_message=str(e)[:160])
+        self.digest._status()
+        self.registry.save()
+        _log("cc2_runtime_settings", session=self.name,
+             applied_live=applied_live, **{k: str(v) for k, v in changed.items()})
+        return {"ok": True, "changed": changed, "applied_live": applied_live,
+                "note": ("" if applied_live or not changed else
+                         "已記錄,下次重新連線時生效(目前沒有在線的 client)")}
+
+    async def refresh_context_usage(self) -> dict:
+        """問 SDK 現在的上下文佔用(等同 CLI 的 `/context`),寫進狀態。
+
+        tmux 路徑一直有這個數字,cc2 整個沒有 —— 長對話逼近上限時使用者只會
+        莫名被壓縮,完全看不到前兆。client 不在線就跳過(不為了這個數字去
+        建連線,那會憑空開一個 claude 行程)。
+        """
+        if self.client is None:
+            return {}
+        try:
+            usage = await self.client.get_context_usage()
+        except Exception as e:  # noqa: BLE001
+            _log("cc2_context_usage_failed", session=self.name,
+                 error=type(e).__name__, error_message=str(e)[:160])
+            return {}
+        if not isinstance(usage, dict):
+            return {}
+        try:
+            self.digest.ctx_tokens = int(usage.get("totalTokens") or 0)
+            self.digest.ctx_max = int(usage.get("maxTokens") or 0)
+            self.digest.ctx_pct = float(usage.get("percentage") or 0.0)
+        except (TypeError, ValueError):
+            return {}
+        return {"used": self.digest.ctx_tokens, "size": self.digest.ctx_max,
+                "pct": self.digest.ctx_pct}
 
     async def _teardown_client(self) -> None:
         client, self.client = self.client, None
@@ -736,6 +929,12 @@ class CCSdkSession:
                 self.digest.tool_card(block.name,
                                       _tool_summary(block.name, block.input))
             return False
+        if isinstance(msg, sdk.UserMessage):
+            # 工具結果。cc2 原本整個不看 UserMessage,所以工具回傳的圖
+            # (Read 讀圖、Playwright/MCP 截圖)完全進不了卡片庫。只撈圖,
+            # 文字結果不重複出卡(工具卡已經代表這次呼叫了)。
+            self._collect_tool_images(msg)
+            return False
         if isinstance(msg, sdk.ResultMessage):
             err = ""
             if getattr(msg, "is_error", False):
@@ -750,6 +949,44 @@ class CCSdkSession:
             if isinstance(data, dict):
                 self._note_sdk_session(data.get("session_id"))
         return False
+
+    def _collect_tool_images(self, msg) -> None:
+        """ToolResultBlock 裡的 base64 圖 → media store → attachment 卡。
+        整段 fail-safe:圖入庫壞掉絕不影響回合(文字回覆比圖重要)。"""
+        if MEDIA_SINK is None:
+            return
+        try:
+            sink = MEDIA_SINK(f"cc2:{self.name}")
+        except Exception:  # noqa: BLE001
+            return
+        if sink is None:
+            return
+        for block in (getattr(msg, "content", None) or []):
+            if type(block).__name__ != "ToolResultBlock":
+                continue
+            content = getattr(block, "content", None)
+            if not isinstance(content, list):
+                continue
+            items = []
+            for part in content:
+                if not isinstance(part, dict) or part.get("type") != "image":
+                    continue
+                src = part.get("source") or {}
+                data = src.get("data")
+                if not data:
+                    continue
+                try:
+                    wired = sink(str(src.get("media_type") or "image/png"),
+                                 str(data))
+                except Exception as e:  # noqa: BLE001
+                    _log("cc2_media_sink_failed", session=self.name,
+                         error=type(e).__name__, error_message=str(e)[:120])
+                    continue
+                if wired:
+                    items.append(wired)
+            if items:
+                self.digest.media_card(items, tool=self.digest.store.last_tool)
+                _log("cc2_tool_images", session=self.name, count=len(items))
 
     # ── 審批(can_use_tool → Pocket 審核中心)──
 
@@ -848,9 +1085,21 @@ class CCSdkSession:
         _log("cc2_approval_decided", session=self.name, approval_id=aid,
              tool=tool, status=status)
         if ask_opts:
-            # AskUserQuestion:把使用者選的那顆寫回工具輸入(updated_input),
-            # 工具才拿得到答案。沒選/逾時 → 照 CLI 原生語意回「略過」,
-            # 讓模型自己決定怎麼繼續,而不是 fail-closed 把回合打斷。
+            # AskUserQuestion:把使用者選的那顆**當成工具結果**送回模型。
+            #
+            # 為什麼不是 `PermissionResultAllow(updated_input=...)`:試過,無效。
+            # 2026-10-29 實測(真 SDK 0.2.174 + 真 CLI 2.1.207):把答案塞進
+            # tool_input,工具結果一律是
+            #     "The user did not answer the questions."
+            # —— AskUserQuestion 的答案是 CLI **互動式 UI** 自己收的,不在
+            # tool_input 裡(`strings` 掃 CLI 二進位也查不到我們塞的鍵名)。
+            # 在無 TTY 的 SDK 模式下放行它 = 必然「沒人回答」,使用者按了等於
+            # 白按。
+            #
+            # 可行的管道是 deny 的 message:實測它會原文變成 tool_result 送到
+            # 模型眼前(is_error=true,但模型照樣讀懂並正確引用答案)。格式用
+            # CLI 原生 TUI 自己產生的 `[User answered <header>]: <答案>`,模型
+            # 是 native 看得懂的,不必額外解釋。
             picked = ""
             if isinstance(decision, str) and decision.startswith("ask:"):
                 idx = decision.split(":", 1)[1]
@@ -861,19 +1110,29 @@ class CCSdkSession:
                                      .get("label") or "")
                     except Exception:  # noqa: BLE001
                         picked = ""
-            new_input = dict(tool_input)
-            try:
-                qs = [dict(q) for q in (new_input.get("questions") or [])
-                      if isinstance(q, dict)]
-                if qs:
-                    qs[0]["_pocket_answer"] = picked      # 答案;空 = 略過
-                    new_input["questions"] = qs
-            except Exception:  # noqa: BLE001
-                pass
             _log("cc2_question_answered", session=self.name,
                  approval_id=aid, picked=picked[:40] or "(略過)",
                  multi=ask_multi)
-            return sdk.PermissionResultAllow(updated_input=new_input)
+            if not picked:
+                # 略過/逾時:回 CLI 原生的那句話,模型自己決定怎麼繼續
+                # (**不** fail-closed 打斷回合 —— 回答問題不是危險操作)。
+                return sdk.PermissionResultDeny(
+                    message="The user did not answer the questions.",
+                    interrupt=False)
+            header = "the question"
+            try:
+                q0 = (tool_input.get("questions") or [{}])[0]
+                header = str(q0.get("header") or q0.get("question")
+                             or header)[:60]
+            except Exception:  # noqa: BLE001
+                pass
+            # multiSelect 題:Pocket 的審批卡一次只收一顆,所以只送一個答案。
+            # 明講「只選了這一項」而不是假裝涵蓋全部,模型才不會以為使用者
+            # 放棄其餘選項而自行補齊。
+            answer = picked if not ask_multi else f"{picked}(只選了這一項)"
+            return sdk.PermissionResultDeny(
+                message=f"[User answered {header}]: {answer}",
+                interrupt=False)
         if approved:
             return sdk.PermissionResultAllow()
         return sdk.PermissionResultDeny(
@@ -917,6 +1176,11 @@ class CCSdkRegistry:
             # 與加這段之前的行為相同(純加法,不會把既有 session 弄壞)。
             self.sessions[name].model = str(row.get("model") or "")
             self.sessions[name].archived = bool(row.get("archived") or False)
+            self.sessions[name].spawn_opts = sanitize_spawn_opts(
+                row.get("spawn_opts"))
+            self.sessions[name].prior_session_ids = [
+                str(x) for x in (row.get("prior_session_ids") or [])
+                if str(x).strip()]
             # 重啟復原:把上次被中斷的回合誠實講出來(不自動重送 —— 工具副作用
             # 可能已經執行了一半,替使用者重跑是危險的),排隊中的則原樣接回。
             sess = self.sessions[name]
@@ -940,6 +1204,10 @@ class CCSdkRegistry:
                          "workdir": s.workdir,
                          "permission_mode": s.permission_mode,
                          "model": s.model,
+                         "spawn_opts": dict(s.spawn_opts or {}),
+                         # 自癒換過 id 的舊逐字稿:留著才翻得回更早的歷史
+                         # (不留的話那段對話重啟後就永久找不到了)。
+                         "prior_session_ids": list(s.prior_session_ids or [])[-8:],
                          "archived": bool(s.archived),
                          # bridge 重啟會殺掉進行中的回合(client 是 bridge 的
                          # 子行程)。把「當時正在跑什麼」與排隊中的留下來,
@@ -963,14 +1231,22 @@ class CCSdkRegistry:
         return self.sessions.get(name)
 
     def ensure(self, name: str, workdir: str = "",
-               permission_mode: str = "") -> CCSdkSession:
-        """建立或更新(冪等):同名重 POST 只更新 workdir/permission_mode,
-        不打斷進行中的 client/turn。"""
+               permission_mode: str = "", model: str = "",
+               spawn_opts: dict | None = None) -> CCSdkSession:
+        """建立或更新(冪等):同名重 POST 只更新 workdir/permission_mode/model,
+        不打斷進行中的 client/turn。
+
+        注意 model/permission_mode 對**已連線**的 client 不會自動生效 ——
+        `ClaudeAgentOptions` 只在 connect 當下讀一次。要改活著的 session 走
+        `apply_runtime_settings()`(它呼叫 SDK 的 set_model/set_permission_mode)。
+        """
         self.load()
         sess = self.sessions.get(name)
         if sess is None:
             sess = self.sessions[name] = CCSdkSession(
-                self, name, workdir=workdir, permission_mode=permission_mode)
+                self, name, workdir=workdir, permission_mode=permission_mode,
+                model=model)
+            sess.spawn_opts = sanitize_spawn_opts(spawn_opts)
             # 按工作目錄接回上一段對話(對應 ccsess 的 `--continue`)——
             # 使用者不必記 session id。只接**沒人正在用**的那條;接到了就
             # 重新 seed 歷史,畫面一進去就有上下文。預設開,可用
@@ -989,10 +1265,18 @@ class CCSdkRegistry:
         else:
             if workdir:
                 sess.workdir = os.path.expanduser(workdir)
-            sess.digest.mode = sess.permission_mode   # 鏡像跟著更新
-            sess.digest.model = sess.model
+            # 先改值再鏡像 —— 反過來寫的話鏡像會慢一拍(狀態列顯示上一次的
+            # 權限模式,要再 POST 一次才追上)。
             if permission_mode:
                 sess.permission_mode = _clamp_mode(permission_mode)
+            if model:
+                sess.model = model.strip()
+            if spawn_opts:
+                # 冪等更新:只覆蓋這次帶來的鍵,沒帶的沿用(不然每次 create
+                # 都要把所有 pin 重送一遍)。
+                sess.spawn_opts.update(sanitize_spawn_opts(spawn_opts))
+            sess.digest.mode = sess.permission_mode   # 鏡像跟著更新
+            sess.digest.model = sess.model
         self.save()
         return sess
 
@@ -1039,8 +1323,18 @@ class CCSdkRegistry:
             status = "waiting_approval" if pend else (
                 "running" if sess.busy else "idle")
             meta = {"permission_mode": sess.permission_mode}
+            if sess.model:
+                meta["model"] = sess.model
+            if sess.spawn_opts:
+                meta["spawn_opts"] = dict(sess.spawn_opts)
+            ctx_max = getattr(sess.digest, "ctx_max", 0)
+            if ctx_max:
+                meta["context"] = {
+                    "used": sess.digest.ctx_tokens, "size": ctx_max,
+                    "pct": round(sess.digest.ctx_pct, 1)}
             if pend:
                 meta["approval"] = pend
+                meta["blocked"] = True
             if sess.sdk_session_id:
                 # 終端接手指令(app 未來可直接顯示/複製;對話裡另有同款卡)
                 meta["resume_command"] = \

@@ -19159,6 +19159,30 @@ async def v2_session_approve(session_id: str, request: Request):
                            "openclaw approve 需要 approval_id(approval 卡或 GET /app/v1/approvals)")
         result = await _approval_decide_core(aid, body)
         return {"ok": True, "session_id": session_id, **result}
+    if src[0] == "cc2":
+        # cc2:原本**沒有**這個分支 —— 舊形狀 body({"key": "approve"},正是
+        # cc 路徑在送的那種)會一路掉到下面的 Codex 分支,拿 cc2 的 session
+        # 名去呼 `CODEX_APP.decide_thread_approval(thread_id="<cc2名>")`,
+        # 決議送錯子系統、thread id 還是假的(2026-10-29 稽核抓到)。
+        # 這裡自己收:沒帶 approval_id 就用這條 session 當前那筆 pending。
+        aid = str(body.get("approval_id") or "").strip()
+        if not aid:
+            pend = cc_sdk.registry().pending_for(src[1])
+            if not pend:
+                raise http_err(409, "APPROVAL_NOT_PENDING",
+                               "這條 cc2 session 目前沒有待決審批")
+            aid = str(pend.get("id") or "")
+        key = str(body.get("key") or "").strip()
+        if not key:
+            # {approve: bool} 相容糖(與其他 provider 同語意)
+            key = "approve" if _approval_bool_from_body(body) else "deny"
+        status = cc_sdk.registry().decide_approval(aid, key)
+        if status is None:
+            raise http_err(409, "APPROVAL_NOT_PENDING",
+                           "該審批已決議或已逾時")
+        _cc2_approval_db_mark(aid, status)
+        return {"ok": True, "session_id": session_id,
+                "approval_id": aid, "status": status}
     approved = _approval_bool_from_body(body)
     for_session = bool(body.get("for_session") or body.get("approve_for_session") or
                        body.get("remember"))
@@ -19434,8 +19458,22 @@ async def v2_session_compact(session_id: str, request: Request):
         return {"ok": True, "session_id": session_id, "action": "compact",
                 "started": True,
                 "message": "已請 Gemini 壓縮脈絡,壓完就能繼續接著聊"}
-    if src[0] in ("cc", "cc2"):
-        # CC 走自建 ccsess 工具(接力包落盤 → 清 context → 重啟接回),
+    if src[0] == "cc2":
+        # cc2 自己就有壓縮(SDK 送 `/compact` 斜線指令)。原本這裡與 tmux 併成
+        # 一條 409,指路去 `/ccsessions/{name}/compress` —— 但那支要求 name 在
+        # `_cc_conf_rows` 裡,拿 cc2 的名字去打一定 404。結果 app 現有的壓縮鈕
+        # 對 cc2 是**死鈕**(2026-10-29 稽核抓到)。這裡直接收。
+        sess = cc_sdk.registry().get(src[1])
+        if sess is None:
+            raise http_err(404, "SESSION_NOT_FOUND",
+                           f"cc2 session {src[1]} 不存在")
+        res = await sess.compact()
+        if not res.get("ok"):
+            raise http_err(409, "COMPACT_BUSY", res.get("message") or "忙碌中")
+        return {"ok": True, "session_id": session_id, "action": "compact",
+                "started": True, "message": res.get("message") or "已送出壓縮指令"}
+    if src[0] == "cc":
+        # tmux CC 走自建 ccsess 工具(接力包落盤 → 清 context → 重啟接回),
         # 介面在 /ccsessions/{name}/compress,這裡不重複實作,明確指路。
         raise http_err(409, "USE_CC_COMPRESS",
                        "Claude Code 的壓縮走 /ccsessions/{name}/compress")
@@ -21407,7 +21445,10 @@ def _cc2_turn_end_push(name: str, summary: str) -> None:
 cc_sdk.configure(log=_log_event,
                  approval_db_upsert=_cc2_approval_db_upsert,
                  approval_db_mark=_cc2_approval_db_mark,
-                 turn_end_push=_cc2_turn_end_push)
+                 turn_end_push=_cc2_turn_end_push,
+                 # 工具回傳的圖走與 tmux CC 同一顆 sink(同一個 media store、
+                 # 同一種 download_url),所以 app 零改動就看得到。
+                 media_sink=_cc_image_sink)
 
 
 @app.get("/app/v2/cc2/{name}/history")
@@ -21535,9 +21576,13 @@ async def v2_cc2_yield(name: str, request: Request):
 
 @app.post("/app/v2/cc2/{name}")
 async def v2_cc2_create(name: str, request: Request):
-    """建立/更新 cc2 session:body {workdir?, permission_mode?}。冪等 ——
-    同名重 POST 只更新設定,不打斷進行中的 turn。旗標關 → 404(對外表現
-    同不存在,與 _v2_card_source 的 cc2 分支一致)。"""
+    """建立/更新 cc2 session:body {workdir?, permission_mode?, model?,
+    spawn_opts?}。冪等 —— 同名重 POST 只更新設定,不打斷進行中的 turn。
+    旗標關 → 404(對外表現同不存在,與 _v2_card_source 的 cc2 分支一致)。
+
+    注意:model/permission_mode 在這裡只寫設定,**對已連線的 client 不生效**
+    (ClaudeAgentOptions 只在 connect 當下讀一次)。要熱改活著的 session 用
+    `POST /app/v2/cc2/{name}/settings`。"""
     _check_auth(request)
     if not cc_sdk.enabled():
         raise http_err(404, "CC_SDK_DISABLED",
@@ -21552,9 +21597,60 @@ async def v2_cc2_create(name: str, request: Request):
                        f"permission_mode 必須是 {list(cc_sdk.PERMISSION_MODES)} 之一")
     sess = cc_sdk.registry().ensure(
         name, workdir=str(body.get("workdir") or "").strip(),
-        permission_mode=mode)
+        permission_mode=mode,
+        model=str(body.get("model") or "").strip(),
+        spawn_opts=body.get("spawn_opts"))
     return {"ok": True, "session_id": f"cc2:{name}",
-            "workdir": sess.workdir, "permission_mode": sess.permission_mode}
+            "workdir": sess.workdir, "permission_mode": sess.permission_mode,
+            "model": sess.model or None,
+            "spawn_opts": dict(sess.spawn_opts or {})}
+
+
+@app.post("/app/v2/cc2/{name}/settings")
+async def v2_cc2_settings(name: str, request: Request):
+    """熱改活著的 session:body {model?, permission_mode?}。
+
+    為什麼不能靠重 POST create:`ClaudeAgentOptions` 只在 connect 當下讀一次,
+    所以 create 改了欄位對已連線的 client 完全沒作用 —— 畫面顯示新模式、實際
+    仍跑舊的,比沒做還糟。這支走 SDK 的 set_model/set_permission_mode。
+    回傳 `applied_live` 誠實標示這一輪是否真的換過去了。"""
+    _check_auth(request)
+    if not cc_sdk.enabled():
+        raise http_err(404, "CC_SDK_DISABLED",
+                       "cc2 provider 未啟用(需 CC_SDK_PROVIDER=1)")
+    sess = cc_sdk.registry().get(name)
+    if sess is None:
+        raise http_err(404, "SESSION_NOT_FOUND", f"cc2 session {name} 不存在")
+    body = await _json_body(request)
+    mode = str(body.get("permission_mode") or "").strip()
+    if mode and mode not in cc_sdk.PERMISSION_MODES:
+        raise http_err(400, "BAD_PERMISSION_MODE",
+                       f"permission_mode 必須是 {list(cc_sdk.PERMISSION_MODES)} 之一")
+    has_model = "model" in body
+    try:
+        res = await sess.apply_runtime_settings(
+            model=(str(body.get("model") or "").strip() if has_model else None),
+            permission_mode=mode or None)
+    except ValueError as e:
+        raise http_err(400, "BAD_PERMISSION_MODE", str(e))
+    return {"ok": True, "session_id": f"cc2:{name}", **res}
+
+
+@app.get("/app/v2/cc2/{name}/context")
+async def v2_cc2_context(name: str, request: Request):
+    """這條 session 現在的上下文佔用(等同 CLI 的 `/context`)。
+    client 不在線就回 live=false —— 刻意**不**為了這個數字去開一個 claude
+    行程(那等於憑空多一顆常駐進程)。"""
+    _check_auth(request)
+    if not cc_sdk.enabled():
+        raise http_err(404, "CC_SDK_DISABLED",
+                       "cc2 provider 未啟用(需 CC_SDK_PROVIDER=1)")
+    sess = cc_sdk.registry().get(name)
+    if sess is None:
+        raise http_err(404, "SESSION_NOT_FOUND", f"cc2 session {name} 不存在")
+    usage = await sess.refresh_context_usage()
+    return {"ok": True, "session_id": f"cc2:{name}",
+            "live": bool(usage), "context": usage or None}
 
 
 def _cc2_reconcile_orphan_approvals() -> int:
@@ -23229,8 +23325,10 @@ async def _v2_card_store(session_id: str):
     if src[0] == "gm":
         return (await _gm_card_digest(src[1])).store
     if src[0] == "cc2":
-        # cc2 無歷史 seed(MVP:卡片只來自 live SDK 訊息流;歷史在 ~/.claude
-        # jsonl,終端 `claude --resume` 可接手)。digest 常駐於 session 物件。
+        # digest 常駐於 session 物件(不像 tmux 要每次 seed + 跟隨器)。
+        # 歷史:session 建立時 `_seed_history` 會從 ~/.claude 的 transcript
+        # jsonl 撈最近 N 則進卡片庫,再往前翻走 `/app/v2/cc2/{name}/history`。
+        # (這裡原本寫「cc2 無歷史 seed」,那是 MVP 當時的實況,已過時。)
         return cc_sdk.registry().get(src[1]).digest.store
     _, name, workdir = src
     store = _cc_card_store(name)
@@ -26132,7 +26230,8 @@ def _tb_registry_cards(now: float) -> list:
         d = dict(r)
         target = str(d.get("target") or "")
         ref = target if target.startswith(
-            ("claude_code:", "codex:", "hermes:", "delegation:", "openclaw:")) else None
+            ("claude_code:", "codex:", "hermes:", "delegation:", "openclaw:",
+             "cc2:")) else None
         msg = (d.get("message") or "").strip().splitlines()
         out.append(_tb_card(f"call:{d.get('id')}", "registry",
                             f"{d.get('caller')} → {target}", "running",
@@ -26150,8 +26249,9 @@ def _tb_approval_stuck_cards(now: float) -> list:
         CANON_DB,
         "SELECT id,title,session_id,provider,created_at FROM approvals"
         " WHERE status='pending' AND created_at<=?"
-        " AND (provider IN ('claude_code','codex')"
-        "      OR session_id LIKE 'claude_code:%' OR session_id LIKE 'codex:%')"
+        " AND (provider IN ('claude_code','codex','cc2')"
+        "      OR session_id LIKE 'claude_code:%' OR session_id LIKE 'codex:%'"
+        "      OR session_id LIKE 'cc2:%')"
         " ORDER BY created_at ASC LIMIT 50",
         (now - TB_APPROVAL_STUCK_SECS,))
     out = []
@@ -26159,7 +26259,12 @@ def _tb_approval_stuck_cards(now: float) -> list:
         d = dict(r)
         prov = d.get("provider") or ""
         sid = d.get("session_id") or ""
-        src = "cc" if (prov == "claude_code" or sid.startswith("claude_code:")) else "cx"
+        # cc2 也歸到 cc 這一類顯示 —— 對使用者來說都是「Claude Code 在等你
+        # 核准」,不需要知道底層走 tmux 還是 SDK。原本 SQL 根本沒撈 cc2,
+        # 一筆 cc2 審批卡十分鐘沒人按**永遠不會上板**;而 cc2 的 fail-closed
+        # 只等 110 秒,使用者只會看到莫名其妙的拒絕(2026-10-29 稽核)。
+        src = "cc" if (prov in ("claude_code", "cc2")
+                       or sid.startswith(("claude_code:", "cc2:"))) else "cx"
         created = _tb_ts(d.get("created_at"))
         mins = int((now - created) // 60) if created else "?"
         out.append(_tb_card(f"approval:{d.get('id')}", src,
@@ -28759,6 +28864,10 @@ def _host_capabilities() -> dict:
         "openclaw": OPENCLAW.configured(),
         "gemini": GEMINI.configured(),
         "terminal": POCKET_TERMINAL_ENABLED,
+        # cc2 不需要 tmux(這正是 SDK 路徑的重點),但需要 claude 執行檔 +
+        # claude_agent_sdk 套件 + 旗標。原本整個沒有這個鍵 → app 無從判斷
+        # 這台支不支援,只能試了才知道。
+        "cc2": cc_sdk.enabled() and os.path.exists(CLAUDE_BIN),
     }
 
 
@@ -28797,7 +28906,19 @@ async def health(agents: int = 0):
         except Exception as e:  # noqa: BLE001
             _log_exc("health_agents_cc", e, expected=True)
             cc_busy = -1          # -1 = 問不到,呼叫端要當成「不確定,別重啟」
-        out["agents_in_flight"] = {"cc": cc_busy, "cx": cx_busy}
+        # cc2 也要算。原本只算 tmux(cc)與 cx,scripts/bridge-safe-restart.sh
+        # 就是看這個數字決定能不能重啟 —— cc2 漏算等於「安全重啟」會安靜殺掉
+        # 正在跑的 cc2 回合,正是那支腳本當初要防的那類事故(2026-10-10)。
+        cc2_busy = 0
+        if cc_sdk.enabled():
+            try:
+                cc2_busy = sum(1 for sess in cc_sdk.registry().sessions.values()
+                               if sess.busy)
+            except Exception as e:  # noqa: BLE001
+                _log_exc("health_agents_cc2", e, expected=True)
+                cc2_busy = -1     # -1 = 問不到,呼叫端要當成「不確定,別重啟」
+        out["agents_in_flight"] = {"cc": cc_busy, "cx": cx_busy,
+                                   "cc2": cc2_busy}
     return out
 
 
@@ -30817,6 +30938,11 @@ async def _team_spawn_worker(provider: str, *, label: str, workdir: str,
         _registry_validate_parent(lead)
         _registry_precheck_or_429(lead, "task")
         body = {"workdir": workdir} if workdir else {}
+        if model:
+            # 原本這裡**靜默丟掉** model(claude_code/codex 兩條都有傳)——
+            # 而 cc2 正是 team worker 的預設 provider,等於編隊指定模型對
+            # 預設路徑完全無效(2026-10-29 稽核)。
+            body["model"] = model
         await v2_cc2_create(label, _InternalAuthRequest(body))
         _registry_register(f"cc2:{label}", provider="cc2", name=label,
                            purpose=purpose, cls="task", parent=lead)

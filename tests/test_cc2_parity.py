@@ -22,6 +22,14 @@ import unittest
 
 _TMP = tempfile.mkdtemp(prefix="cc2-parity-")
 os.environ["CC_SDK_STATE"] = os.path.join(_TMP, "sessions.json")
+# 測試隔離:不准碰機主真實的 ~/.claude。
+# 原本只隔離了 state 檔,但 `ensure(workdir="/tmp")` 仍會走「按目錄接回上一段
+# 對話」去 list_sessions 真實環境,把真的 /tmp session 接進來、再把它的
+# transcript 當歷史種子讀進卡片庫 —— 測試結果於是取決於機主機器上剛好有什麼
+# 對話。2026-10-29 真的踩到:一條新跑的 /tmp session 讓「全新 session 應為空」
+# 這條測試失敗。兩個旋鈕都要關掉。
+os.environ["CC_SDK_ADOPT_BY_CWD"] = "0"
+os.environ["CC_SDK_CLAUDE_PROJECTS"] = os.path.join(_TMP, "projects")
 os.environ.setdefault("POCKET_CANON_DB", os.path.join(_TMP, "canonical.db"))
 os.environ.setdefault("BRIDGE_TOKEN", "test-unit-token")
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -329,3 +337,238 @@ class CC2HistoryCompactTest(unittest.TestCase):
         res = asyncio.run(self.s.compact())
         self.assertFalse(res["ok"])
         self.assertIn("還在跑", res["message"])
+
+
+class CC2AnswerDeliveryTest(unittest.TestCase):
+    """AskUserQuestion 的答案**真的送到模型**(2026-10-29 修正)。
+
+    原本的做法是 `PermissionResultAllow(updated_input=...)` 把答案塞進
+    tool_input —— 2026-10-29 用真 SDK + 真 CLI 2.1.207 實測,工具結果一律是
+    "The user did not answer the questions."，使用者按了等於白按。
+    答案是 CLI 互動式 UI 自己收的,不在 tool_input 裡。
+    可行的管道是 deny 的 message:實測它會原文變成 tool_result 進到模型眼前。
+    """
+
+    def setUp(self):
+        self.r = cc_sdk.CCSdkRegistry()
+        self.s = self.r.ensure("ans-1", workdir="/tmp")
+        self.s.digest.store.turn_id = "turn-ans"
+
+    _INPUT = {"questions": [{
+        "question": "要用哪個資料庫?", "header": "資料庫", "multiSelect": False,
+        "options": [{"label": "Postgres"}, {"label": "SQLite"}]}]}
+
+    def _decide(self, key, tool_input=None):
+        """跑一次 _can_use_tool,並在它等待時送出決議。回傳 SDK result 物件。"""
+        import asyncio
+
+        async def run():
+            task = asyncio.ensure_future(self.s._can_use_tool(
+                "AskUserQuestion", tool_input or self._INPUT, None))
+            for _ in range(200):           # 等卡片/等待者登記好
+                await asyncio.sleep(0.005)
+                if self.r.pending_approvals:
+                    break
+            aid = next(iter(self.r.pending_approvals))
+            if key is not None:
+                self.r.decide_approval(aid, key)
+            else:                           # 模擬逾時
+                self.r.pending_approvals[aid]["event"].set()
+            return await task
+
+        return asyncio.run(run())
+
+    def test_answer_reaches_model_as_tool_result(self):
+        res = self._decide("ask:1")
+        self.assertEqual(res.behavior, "deny",
+                         "必須走 deny 的 message 管道 —— allow 的話工具會回"
+                         "「沒人回答」,答案根本到不了模型")
+        self.assertIn("SQLite", res.message, "選的那一項要出現在工具結果裡")
+        self.assertIn("[User answered", res.message,
+                      "用 CLI 原生 TUI 自己的格式,模型 native 看得懂")
+        self.assertFalse(getattr(res, "interrupt", False),
+                         "回答問題不是危險操作,不得打斷回合")
+
+    def test_answer_uses_header_not_raw_question(self):
+        res = self._decide("ask:0")
+        self.assertIn("資料庫", res.message)
+        self.assertIn("Postgres", res.message)
+
+    def test_skip_returns_cli_native_wording(self):
+        res = self._decide("ask:skip")
+        self.assertEqual(res.behavior, "deny")
+        self.assertEqual(res.message, "The user did not answer the questions.",
+                         "略過要回 CLI 原生那句,模型才知道這是「沒答」而非錯誤")
+        self.assertFalse(getattr(res, "interrupt", False))
+
+    def test_timeout_is_skip_not_hard_deny(self):
+        """逾時 = 略過,不是 fail-closed 打斷 —— 打斷的話整個回合白跑。"""
+        res = self._decide(None)
+        self.assertEqual(res.message, "The user did not answer the questions.")
+        self.assertFalse(getattr(res, "interrupt", False))
+
+    def test_multiselect_says_only_one_picked(self):
+        """多選題但卡片一次只收一顆 → 要明講,不能讓模型以為使用者棄選其餘。"""
+        inp = json.loads(json.dumps(self._INPUT))
+        inp["questions"][0]["multiSelect"] = True
+        res = self._decide("ask:1", inp)
+        self.assertIn("SQLite", res.message)
+        self.assertIn("只選了這一項", res.message)
+
+    def test_malformed_input_falls_back_to_normal_approval(self):
+        """壞資料不准炸掉審批流程(炸掉才是真的卡住整個回合)。"""
+        for bad in ({}, {"questions": []}, {"questions": [{"options": []}]},
+                    {"questions": "nope"}, {"questions": [None]}):
+            opts, title, multi = cc_sdk.CCSdkSession._ask_question_options(bad)
+            self.assertEqual(opts, [], f"{bad} 應退回一般審批")
+
+
+class CC2AuditFixesTest(unittest.TestCase):
+    """2026-10-29 稽核抓到的其餘缺陷。"""
+
+    def setUp(self):
+        self.r = cc_sdk.CCSdkRegistry()
+        self.s = self.r.ensure("aud-1", workdir="/tmp",
+                               permission_mode="acceptEdits")
+
+    def test_push_summary_skips_tool_and_hint_cards(self):
+        """推播摘要不能抓到工具卡或終端接手提示卡。
+
+        兩者 role 都是 assistant,只跑了工具沒出文字的回合會把
+        「🔧 Bash: git status」推到手機上。
+        """
+        self.s.digest.store.turn_id = "t"
+        self.s.digest.tool_card("Bash", "git status")
+        self.s.sdk_session_id = "abc123"
+        self.s._upsert_resume_hint_card()
+        self.assertEqual(self.s.digest.last_assistant_text(), "",
+                         "沒有真回覆就該回空,讓呼叫端自己決定怎麼說")
+        self.s.digest.assistant_final("好了,我改完了。")
+        self.s.digest.tool_card("Read", "foo.py")   # 真回覆之後又跑了工具
+        self.assertEqual(self.s.digest.last_assistant_text(), "好了,我改完了。")
+
+    def test_ensure_mirrors_mode_same_call(self):
+        """同一次 POST 改權限模式,狀態鏡像就要是新值(原本慢一拍)。"""
+        self.r.ensure("aud-1", permission_mode="plan")
+        self.assertEqual(self.s.permission_mode, "plan")
+        self.assertEqual(self.s.digest.mode, "plan",
+                         "原本先鏡像再改值 → 要再 POST 一次才追上")
+
+    def test_extra_permission_modes_not_silently_clamped(self):
+        """dontAsk/auto 是 SDK 真的支援的模式,不准被吞成 acceptEdits。
+
+        吞掉的後果是使用者選了 dontAsk 卻拿到自動接受編輯 —— 比沒做還糟。
+        """
+        for mode in ("dontAsk", "auto"):
+            self.assertIn(mode, cc_sdk.PERMISSION_MODES)
+            self.assertEqual(cc_sdk._clamp_mode(mode), mode)
+        self.assertEqual(cc_sdk._clamp_mode("yolo"), "acceptEdits")
+
+    def test_history_spans_self_heal_session_ids(self):
+        """自癒換過 sdk_session_id 之後,換 id 前的對話還要翻得回來。"""
+        # 不靠模組層的 CC_SDK_CLAUDE_PROJECTS —— 全套跑時別的測試模組會蓋掉它
+        # (誰最後 import 誰贏),測試就會依賴載入順序。這裡直接攔函式。
+        root = os.path.join(_TMP, "projects")
+        d = os.path.join(root, cc_sdk._project_key("/tmp"))
+        os.makedirs(d, exist_ok=True)
+        for sid, text in (("old-sid", "換id前說的話"), ("new-sid", "換id後說的話")):
+            with open(os.path.join(d, f"{sid}.jsonl"), "w", encoding="utf-8") as f:
+                f.write(json.dumps({"type": "user", "timestamp": 1700000000,
+                                    "message": {"content": text}}) + "\n")
+        self.s.prior_session_ids = ["old-sid"]
+        self.s.sdk_session_id = "new-sid"
+        old = cc_sdk._claude_projects_root
+        cc_sdk._claude_projects_root = lambda: root
+        try:
+            texts = [m["text"] for m in self.s.history_page(limit=10)["messages"]]
+        finally:
+            cc_sdk._claude_projects_root = old
+        self.assertIn("換id前說的話", texts,
+                      "不留舊 id 的話那段對話永久失聯")
+        self.assertIn("換id後說的話", texts)
+
+    def test_prior_session_ids_persisted(self):
+        """舊 id 要落地 —— 只存記憶體的話重啟後歷史就斷了。"""
+        self.s.prior_session_ids = ["sid-a", "sid-b"]
+        self.r.save()
+        blob = json.load(open(os.environ["CC_SDK_STATE"], encoding="utf-8"))
+        self.assertEqual(
+            blob["sessions"]["aud-1"]["prior_session_ids"], ["sid-a", "sid-b"])
+
+    def test_blocked_flag_in_status(self):
+        """卡在等人核准 = blocked(欄位名與 tmux 一致,app 不用分 provider)。"""
+        self.s.digest._status()
+        self.assertFalse((self.s.digest.store.status or {}).get("blocked"))
+        self.s.digest.prompt = "等待核准"
+        self.s.digest._status()
+        self.assertTrue((self.s.digest.store.status or {}).get("blocked"))
+
+    def test_spawn_opts_whitelist(self):
+        """白名單外的鍵不准落地(這份 dict 會進 state 檔並直通 SDK 建構子)。"""
+        out = cc_sdk.sanitize_spawn_opts({
+            "effort": "high", "allowed_tools": ["Read"],
+            "max_thinking_tokens": "4096", "cli_path": "/evil/claude",
+            "env": {"X": "1"}, "can_use_tool": "nope"})
+        self.assertEqual(out["effort"], "high")
+        self.assertEqual(out["allowed_tools"], ["Read"])
+        self.assertEqual(out["max_thinking_tokens"], 4096, "字串數字要轉型")
+        for bad in ("cli_path", "env", "can_use_tool"):
+            self.assertNotIn(bad, out)
+
+    def test_tool_images_become_attachment_card(self):
+        """工具回傳的圖要進卡片庫(原本 cc2 整個不看工具結果 → media 永遠空)。"""
+        captured = []
+
+        def sink_factory(session_id):
+            def sink(mime, b64):
+                captured.append((session_id, mime))
+                return {"media_id": "m1", "download_url": "/d/m1",
+                        "filename": "shot.png", "mime": mime}
+            return sink
+
+        class FakeToolResult:
+            def __init__(self):
+                self.content = [{"type": "image",
+                                 "source": {"type": "base64",
+                                            "media_type": "image/png",
+                                            "data": "AAAA"}}]
+        FakeToolResult.__name__ = "ToolResultBlock"
+
+        class FakeMsg:
+            content = [FakeToolResult()]
+
+        old = cc_sdk.MEDIA_SINK
+        cc_sdk.MEDIA_SINK = sink_factory
+        try:
+            self.s.digest.store.turn_id = "t"
+            self.s._collect_tool_images(FakeMsg())
+        finally:
+            cc_sdk.MEDIA_SINK = old
+        self.assertEqual(captured, [("cc2:aud-1", "image/png")])
+        cards = list(self.s.digest.store.cards.values())
+        atts = [c for c in cards
+                if (c.get("body") or {}).get("attachments")]
+        self.assertEqual(len(atts), 1, "要出一張 attachment 卡")
+        self.assertEqual(atts[0]["body"]["attachments"][0]["media_id"], "m1")
+
+    def test_media_sink_failure_does_not_break_turn(self):
+        """圖入庫壞掉絕不影響回合(文字回覆比圖重要)。"""
+        def sink_factory(session_id):
+            def sink(mime, b64):
+                raise RuntimeError("media store 掛了")
+            return sink
+
+        class FakeToolResult:
+            content = [{"type": "image",
+                        "source": {"media_type": "image/png", "data": "AAAA"}}]
+        FakeToolResult.__name__ = "ToolResultBlock"
+
+        class FakeMsg:
+            content = [FakeToolResult()]
+
+        old = cc_sdk.MEDIA_SINK
+        cc_sdk.MEDIA_SINK = sink_factory
+        try:
+            self.s._collect_tool_images(FakeMsg())   # 不該拋
+        finally:
+            cc_sdk.MEDIA_SINK = old
