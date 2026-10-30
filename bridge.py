@@ -506,6 +506,99 @@ def _auth_fail_summary_locked(request: Request, status: int, now: float) -> dict
     }
 
 
+# ───── console-remote scope(QR 登入發出的受限 token)─────────────────────
+#
+# 機主 2026-10-30 拍板:QR 登入發出的 token **不能**與手機的 device token
+# 同權。但也不是照規格 §9 完全擋掉檔案面 —— 那會讓遠端控制台看不了檔案,
+# 而「手機看家中電腦任何檔案」正是產品的第二條腿。折衷是**唯讀 + 限定目錄**。
+#
+# 預設**一個目錄都不開**:沒設 env 就等於規格原本的「擋掉檔案面」。
+# 要開就明確列出要開哪幾個 —— 安全的那一側當預設,放寬是刻意動作。
+CONSOLE_REMOTE_SCOPE = "console-remote"
+CONSOLE_REMOTE_FILE_ROOTS = [
+    os.path.realpath(os.path.expanduser(r.strip()))
+    for r in (os.environ.get("POCKET_CONSOLE_REMOTE_FILE_ROOTS") or "").split(":")
+    if r.strip()
+]
+
+# console-remote token 打得到的路徑**白名單**。
+#
+# 白名單而不是黑名單:新增端點時,黑名單會**安靜地**把它放行 —— 而這條路的
+# 前提是「人不一定在可信的電腦前」,安靜放行等於把新端點預設交出去。
+# 白名單的代價是新增端點要記得加,但漏加只會壞功能、不會漏權限。
+_CONSOLE_REMOTE_ALLOW = (
+    "/console",            # 控制台本體與其靜態資源
+    "/app/v2/sessions",    # session 清單、卡片流、輸入、核准
+    "/app/v1/approvals",
+    "/ccsessions",
+    "/codexsessions",
+    "/sessions",
+    "/health",
+    "/file",               # 受 CONSOLE_REMOTE_FILE_ROOTS 進一步限制
+    "/filediff",
+)
+
+
+def _token_entry(token: str) -> dict | None:
+    """raw token → device token entry(沒有或不是 device token 回 None)。"""
+    token = (token or "").strip()
+    if not token or hmac.compare_digest(token, BRIDGE_TOKEN):
+        return None
+    with _PAIR_LOCK:
+        return _DEVICE_TOKENS.get(token)
+
+
+def _token_scope(token: str) -> str:
+    """這枚 token 的 scope。一般 device token 沒有 scope → 空字串。"""
+    entry = _token_entry(token) or {}
+    return str(entry.get("scope") or "")
+
+
+def _expires_passed(exp, now: float | None = None) -> bool:
+    """到期判定(**不碰任何鎖**)。缺欄位或格式錯一律視為已過期:
+    那代表發 token 的時候就寫錯了,寧可當場失效也不要無限期有效。
+
+    抽出來是因為持鎖的呼叫端(`_check_auth`)不能再去拿鎖 —— 見該處註解。
+    """
+    try:
+        return float(exp) <= (time.time() if now is None else now)
+    except (TypeError, ValueError):
+        return True
+
+
+def _console_remote_expired(token: str, now: float | None = None) -> bool:
+    """console-remote token 有有效期 —— **一般 device token 完全沒有**,
+    這是這條路獨有的新行為(規格 §9)。沒有 expires 欄位視為已過期:
+    缺欄位代表發的時候就寫錯了,寧可當場失效也不要無限期有效。"""
+    entry = _token_entry(token) or {}
+    if str(entry.get("scope") or "") != CONSOLE_REMOTE_SCOPE:
+        return False
+    return _expires_passed(entry.get("expires"), now)
+
+
+def _console_remote_path_allowed(path: str) -> bool:
+    return any(path == a or path.startswith(a + "/") or path.startswith(a + "?")
+               for a in _CONSOLE_REMOTE_ALLOW)
+
+
+def _console_remote_file_ok(real_path: str) -> bool:
+    """console-remote 能不能讀這個檔。沒設定 = 一個都不能讀。"""
+    if not CONSOLE_REMOTE_FILE_ROOTS:
+        return False
+    return any(real_path == r or real_path.startswith(r + os.sep)
+               for r in CONSOLE_REMOTE_FILE_ROOTS)
+
+
+def _request_token(request: Request) -> str:
+    """這個請求用的 token。`?token=` 只在沒有 Authorization header 時才看 ——
+    與 `/file` 的 fallback 同一套規則,**scope 檢查兩條路都要蓋到**,
+    否則 <img> 那條旁路會變成繞過 scope 的洞。"""
+    auth = request.headers.get("authorization", "")
+    if auth.lower().startswith("bearer "):
+        return auth[7:].strip()
+    return (request.query_params.get("token") or "").strip()
+
+
 def _token_is_valid(token: str) -> bool:
     """Raw token 成員檢查(master 或 device token)。無節流、無 401 副作用 ——
     需要節流的呼叫端用 _check_auth。給 /file 的 ?token= fallback 用:瀏覽器的
@@ -537,6 +630,20 @@ def _check_auth(request: Request) -> None:
         with _PAIR_LOCK:
             dev = _DEVICE_TOKENS.get(token)
             if dev is not None:
+                # console-remote 是**唯一有有效期**的 device token(規格 §9)。
+                # middleware 已經擋過一次,這裡是第二道 —— WS upgrade 之類
+                # 不走 HTTP middleware 的路徑只會經過這裡。
+                #
+                # ⚠️ 直接讀手上的 `dev`,**不要**呼叫 `_console_remote_expired()`。
+                # `_PAIR_LOCK` 是 `threading.Lock`(不可重入),而那支內部會
+                # 再拿一次同一把鎖 —— 在這裡呼叫就是**自己鎖自己**,請求整個
+                # 掛住、沒有錯誤、沒有逾時。2026-10-30 我第一版就這樣寫,
+                # 單獨跑那條測試是綠的(middleware 先擋掉所以走不到這裡),
+                # 五條一起跑才卡死。
+                if str(dev.get("scope") or "") == CONSOLE_REMOTE_SCOPE \
+                        and _expires_passed(dev.get("expires")):
+                    raise http_err(401, "TOKEN_EXPIRED",
+                                   "遠端控制台的授權已到期,請重新掃碼登入")
                 if not dev.get("apple_user_id") or _account_device_for_token(token) is not None:
                     dev["last_seen"] = time.time()
                     return
@@ -823,6 +930,36 @@ async def acp_full(model: str, prompt: str) -> str:
 
 
 app = FastAPI(title="Hermes ↔ OpenAI bridge")
+
+
+@app.middleware("http")
+async def _console_remote_scope_guard(request: Request, call_next):
+    """console-remote token 的統一關卡:**有效期 + 路徑白名單**。
+
+    做成 middleware 而不是在各端點呼叫,理由是規格 §9 那句:「沒明確標記
+    console-remote 可用的敏感端點一律拒」。分散在各端點檢查等於黑名單 ——
+    新增端點時會**安靜地**把它放行,而這條路的前提正是「人不一定在可信的
+    電腦前」。
+
+    兩條取 token 的路都蓋到(header 與 `/file` 的 `?token=` fallback)——
+    只擋 header 那條的話,`<img src="...&token=">` 就是現成的繞過。
+    """
+    token = _request_token(request)
+    if token and _token_scope(token) == CONSOLE_REMOTE_SCOPE:
+        if _console_remote_expired(token):
+            _log_event("console_remote_token_expired", path=request.url.path)
+            return JSONResponse(
+                status_code=401,
+                content={"error": {"code": "TOKEN_EXPIRED",
+                                   "message": "遠端控制台的授權已到期,請重新掃碼登入"}})
+        if not _console_remote_path_allowed(request.url.path):
+            _log_event("console_remote_path_denied", path=request.url.path)
+            return JSONResponse(
+                status_code=403,
+                content={"error": {"code": "SCOPE_FORBIDDEN",
+                                   "message": "遠端控制台沒有這項權限"}})
+        request.state.console_remote = True
+    return await call_next(request)
 
 
 @app.middleware("http")
@@ -9056,6 +9193,15 @@ async def serve_file(request: Request, path: str):
     else:
         _check_auth(request)
     p = os.path.realpath(os.path.expanduser(path))
+    # 遠端控制台(QR 登入)**唯讀 + 限定目錄**。機主 2026-10-30 拍板:規格
+    # 原本要完全擋掉檔案面,但「手機看家中電腦任何檔案」是產品賣點 ——
+    # 折衷成只開指定目錄。沒設 `POCKET_CONSOLE_REMOTE_FILE_ROOTS` 就等於
+    # 規格原本的行為(一個都不給)。
+    # 回 404 而不是 403:不要讓遠端瀏覽器藉錯誤碼**探測檔案存不存在**。
+    if _token_scope(_request_token(request)) == CONSOLE_REMOTE_SCOPE \
+            and not _console_remote_file_ok(p):
+        _log_event("console_remote_file_denied")
+        raise HTTPException(status_code=404, detail="not found")
     roots = [os.path.realpath(os.path.expanduser("~"))]
     # Agents (incl. Claude Code's scratchpad) often emit files under the system
     # temp dirs; allow those too so generated artifacts render instead of 404ing.
@@ -9118,6 +9264,15 @@ async def serve_filediff(request: Request, path: str):
     不在 repo 裡 → 404 人話（目錄沒有「當前內容」可退）。"""
     _check_auth(request)
     p = os.path.realpath(os.path.expanduser(path))
+    # 遠端控制台(QR 登入)**唯讀 + 限定目錄**。機主 2026-10-30 拍板:規格
+    # 原本要完全擋掉檔案面,但「手機看家中電腦任何檔案」是產品賣點 ——
+    # 折衷成只開指定目錄。沒設 `POCKET_CONSOLE_REMOTE_FILE_ROOTS` 就等於
+    # 規格原本的行為(一個都不給)。
+    # 回 404 而不是 403:不要讓遠端瀏覽器藉錯誤碼**探測檔案存不存在**。
+    if _token_scope(_request_token(request)) == CONSOLE_REMOTE_SCOPE \
+            and not _console_remote_file_ok(p):
+        _log_event("console_remote_file_denied")
+        raise HTTPException(status_code=404, detail="not found")
     roots = [os.path.realpath(os.path.expanduser("~"))]
     for t in ("/tmp", "/private/tmp", "/var/folders"):
         rt = os.path.realpath(t)
@@ -9488,9 +9643,16 @@ async def pair_devices(request: Request):
     _check_auth(request)
     with _PAIR_LOCK:
         out = [
+            # scope/expires 一起吐出去:機主 2026-10-30 拍板「可撤銷比可觀察
+            # 重要」。遠端瀏覽器不是一台裝置,清單上要分得出來 —— 否則使用者
+            # 看到一列陌生的「device」只會困惑,不會想到那是他在借來的電腦上
+            # 開的控制台。
             {"id": _short_hash(t), "name": d.get("name", "device"),
              "platform": d.get("platform"), "device_id": d.get("device_id"),
              "account_bound": bool(d.get("apple_user_id")),
+             "scope": d.get("scope") or None,
+             "is_remote_console": str(d.get("scope") or "") == CONSOLE_REMOTE_SCOPE,
+             "expires": d.get("expires"),
              "created": d.get("created"), "last_seen": d.get("last_seen")}
             for t, d in _DEVICE_TOKENS.items()
         ]
@@ -10266,7 +10428,19 @@ def _console_cookie_ok(request: Request) -> bool:
         return False
 
 
-def _console_set_cookie(request: Request, resp: Response) -> None:
+def _console_cookie_secure(request: Request) -> bool:
+    """該不該加 `Secure`。**跟著 request scheme 走,不要硬寫成 True。**
+
+    走 http(tailnet 直連 8081)時若硬加 `Secure`,瀏覽器會直接丟掉 cookie,
+    PWA 照樣壞。抽成一支是因為 QR 登入的 sid cookie 也要同一條規則 ——
+    規則只能有一份,否則兩邊會慢慢漂開。
+    """
+    scheme = (getattr(getattr(request, "url", None), "scheme", "") or "").lower()
+    return scheme == "https"
+
+
+def _console_set_cookie(request: Request, resp: Response, *,
+                        session_only: bool = False) -> None:
     """成功開 /console 就(重新)簽發 cookie。
 
     `path="/console"` 是**查過才敢收這麼窄的**:整個 console 只有 `GET /console`
@@ -10279,14 +10453,17 @@ def _console_set_cookie(request: Request, resp: Response) -> None:
     所以 /console(含 PWA 的 start_url)是唯一需要 cookie 的請求,path 收到
     `/console` 既夠用、又不會把憑證灑到 `/app/*`。
 
-    `secure` 跟著 request scheme 走:走 http(tailnet 直連 8081)時若硬加
-    `Secure`,瀏覽器會直接丟掉這枚 cookie,PWA 照樣壞。
+    `secure` 跟著 request scheme 走(見 `_console_cookie_secure`)。
     """
-    scheme = (getattr(getattr(request, "url", None), "scheme", "") or "").lower()
     resp.set_cookie(
         _CONSOLE_COOKIE_NAME, _console_cookie_value(),
-        max_age=_CONSOLE_COOKIE_TTL, path=_CONSOLE_COOKIE_PATH,
-        httponly=True, samesite="strict", secure=(scheme == "https"),
+        # session_only(QR 登入那條路):**不帶 max-age** → session cookie,
+        # 關掉瀏覽器就死。機主的要求,而且比 14 天滑動視窗緊得多 —— QR 登入
+        # 的前提是「人不一定在可信的電腦前」,憑證不該活過那個分頁。
+        max_age=(None if session_only else _CONSOLE_COOKIE_TTL),
+        path=_CONSOLE_COOKIE_PATH,
+        httponly=True, samesite="strict",
+        secure=_console_cookie_secure(request),
     )
 
 
@@ -10594,18 +10771,45 @@ def _console_guard(request: Request) -> None:
 async def console_page(request: Request):
     if not POCKET_CONSOLE_ENABLED:
         raise HTTPException(status_code=404, detail="not found")
-    # local-only 先驗:不是直連(帶了 XFF/Forwarded/CF-Connecting-IP/X-Real-IP)
-    # 就維持裸 403 —— **連輸入框都不給**,見上方 _console_login_html 的規矩 1。
-    _pair_local_only(request)
-    if not _pair_boot_ok(request, allow_cookie=True):
-        return _console_login_response(request)     # 沒碼/碼錯/cookie 過期 → 輸入頁
+    # ── 入口分流:先問來源可不可信,再決定給哪一種登入方式 ────────────
+    #
+    # 三條路,順序有意義:
+    #
+    #   1. **可信來源**(loopback / 同 tailnet 直連)→ 既有的六碼/cookie 路徑,
+    #      行為**完全不變**(規格 §6.1 的硬要求)。
+    #   2. 不可信來源 + 已有 `pocket_console` cookie → 放行。這是**批准過的
+    #      遠端瀏覽器回頭再開頁**的情況:`/console/login/status` 批准成功時種了
+    #      session cookie。少了這一條,掃碼成功的人會被無限丟回 QR 頁。
+    #   3. 不可信來源 + 沒 cookie → QR 登入頁(旗標開)或裸 403(旗標關,預設)。
+    #
+    # 第 2 條**刻意只認 cookie,不呼叫 `_pair_boot_ok`** —— 那支也收
+    # `?boot=<六碼>`,放在這裡等於「公網只要知道六碼就能進」,把 local-only
+    # 這道門整個拆掉。六碼的熵只有 10⁶(規格 §3 有算術),它只配在可信網路
+    # 裡當第二層,不能當公網的唯一鎖。cookie 不同:它是
+    # `HMAC(boot_code, …)`,偽造不了,而且是**批准流程發出去的**。
+    local = _pair_local_ok(request)
+    if local:
+        if not _pair_boot_ok(request, allow_cookie=True):
+            return _console_login_response(request)  # 沒碼/碼錯/cookie 過期 → 輸入頁
+    elif not _console_cookie_ok(request):
+        if not POCKET_CONSOLE_QR_LOGIN:
+            # 維持裸 403 —— **連輸入框都不給**,見 _console_login_html 的規矩 1。
+            # 旗標預設關,所以這就是預設行為(規格 §14):這支的現狀不變。
+            # 用 `_pair_local_only` 丟而不是自己 raise,是為了讓 403 的內容與
+            # 日誌永遠只有一個來源(它剛剛才回報過 False,必定會丟)。
+            _pair_local_only(request)
+        return _console_qr_login_response(request)
     index = os.path.join(_CONSOLE_DIR, "index.html")
     try:
         html = open(index, encoding="utf-8").read()
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail="console not installed")
     resp = HTMLResponse(html, headers=_CONSOLE_SECURITY_HEADERS)
-    _console_set_cookie(request, resp)   # 滑動視窗:每次成功開頁都續命
+    # 滑動視窗:每次成功開頁都續命。但**遠端來源只能續成 session cookie** ——
+    # 若照本機那樣換發 14 天的,掃碼登入的人每開一次頁就把「關瀏覽器即失效」
+    # (規格 §10)換成一張 14 天通行證,等於這條路徑的安全前提被無聲抵銷。
+    # QR 登入的前提正是「人不一定在可信的電腦前」。
+    _console_set_cookie(request, resp, session_only=not local)
     return resp
 
 
@@ -10803,6 +11007,389 @@ async def app_v1_console_boot(request: Request):
                 "這台主機沒有可用的 tailnet 位址(Tailscale 沒裝或沒登入)。"
                 "/console 只接受 loopback 或 tailnet 的直連,請先把兩端都加入同一個 tailnet。",
     }
+
+
+# ═════════ console QR 登入(2026-10-29)═══════════════════════════════════════
+# 規格:docs/CONSOLE_QR_LOGIN_SPEC.md ——**改實作先改那份**。
+#
+# 問題:`/console` 只能從 loopback 或 tailnet 直連開(`_pair_local_only`),
+# 機主要的是「在一台完全沒有 tailnet 的電腦上也能開」。
+#
+# 為什麼不是「放寬六碼」:節流是 per-IP 6 次/60s、碼活 300s,單一 IP 命中率
+# 0.003%,但 1000 個 IP 並行就 3%、10000 個就 30%(per-IP 節流擋不住殭屍網路),
+# 而命中的代價是那台機器的檔案瀏覽權限。六碼今天可以接受,正因為它躲在 tailnet
+# 那道門後面當第二層;拆掉第一道門它就變成唯一的鎖 —— 那是質變,不做。
+#
+# 這條路把門換成「**已配對的手機明示批准**」:熵從 10⁶ 變 2¹²⁸,而且秘密不再
+# 需要經過不可信的瀏覽器(瀏覽器什麼都不用證明)。業界先例 = WhatsApp Web /
+# Discord 掃碼登入。實作上就是**既有配對流程倒著跑**。
+#
+# 主威脅是 **QR 釣魚**(攻擊者在自己機器開登入頁、把 QR 截圖傳給機主騙他掃),
+# 不是暴力破解。三道防線見 `_console_login_create` / `console_login_status` /
+# `app_v1_console_login_approve` 各自的註解。
+POCKET_CONSOLE_QR_LOGIN = os.environ.get("POCKET_CONSOLE_QR_LOGIN", "0") != "0"
+
+_CONSOLE_LOGIN_TTL = 120.0            # 秒;QR 的壽命(短到釣魚來不及轉手)
+_CONSOLE_LOGIN_SID_COOKIE = "pocket_console_login"
+_CONSOLE_LOGIN_RATE_MAX = 20          # **全域**每分鐘可建的 pending 數(見下)
+_CONSOLE_LOGIN_RATE_WINDOW = 60.0
+_CONSOLE_LOGIN_MAX_LIVE = 40          # 記憶體硬上限(防失控;滿了擠掉最舊)
+_CONSOLE_LOGIN_REQS: dict = {}        # rid -> entry
+_CONSOLE_LOGIN_MINTS: collections.deque = collections.deque()
+_CONSOLE_LOGIN_LOCK = threading.Lock()
+
+
+def _pair_local_ok(request: Request) -> bool:
+    """`_pair_local_only` 的述詞版(回 bool,不丟例外)—— 與 `_pair_boot_ok`
+    對 `_pair_check_boot` 的關係相同。
+
+    加這支是為了讓 `/console` 的分流讀起來是「**先問來源可不可信,再決定給哪種
+    登入方式**」,而不是對一個安全函式做 try/except —— 後者容易被誤讀成繞過,
+    也容易在未來有人重構時把例外吞掉。判定邏輯**完全不複製**,仍由
+    `_pair_local_only` 這個唯一真相來源決定。
+    """
+    try:
+        _pair_local_only(request)
+        return True
+    except HTTPException:
+        return False
+
+
+def _console_login_client_key(request: Request) -> str:
+    """這條路的**單一**來源識別函式。
+
+    ⚠️ 必須只有這一個取法。`_pair_local_only` 的教訓是「一次取 socket peer、
+    一次取 XFF 最左」會開出冒充的縫;這條路**本來就走反向代理**(Caddy/
+    Cloudflare),所以不能像那邊一樣「帶 XFF 就拒」,但取法必須固定:
+    有 XFF 就取**最左**那一段(反代鏈上最靠近客戶端的),否則取 socket peer。
+
+    這個值只用來做**一致性比對**(建 QR 時與輪詢時必須是同一個來源),
+    不當認證憑證 —— 所以「XFF 可偽造」在這裡不致命:攻擊者偽造得了,但偽造
+    的值必須在兩次請求間一致,而他本來就能做到;真正的閘是手機的批准。
+    """
+    xff = (request.headers.get("x-forwarded-for") or "").split(",")[0].strip()
+    return xff or _client_host(request) or "?"
+
+
+def _console_login_gc_locked(now: float) -> None:
+    """清掉過期的 request。必須在 `_CONSOLE_LOGIN_LOCK` 內呼叫。"""
+    for rid in [r for r, v in _CONSOLE_LOGIN_REQS.items()
+                if float(v.get("expires") or 0) < now]:
+        _CONSOLE_LOGIN_REQS.pop(rid, None)
+    while len(_CONSOLE_LOGIN_REQS) > _CONSOLE_LOGIN_MAX_LIVE:
+        _CONSOLE_LOGIN_REQS.pop(next(iter(_CONSOLE_LOGIN_REQS)), None)
+
+
+def _console_login_rate_ok_locked(now: float) -> bool:
+    """**全域**節流(不是 per-IP)。
+
+    per-IP 在這裡沒有意義 —— 這條路對公網開放,攻擊者換 IP 的成本趨近於零
+    (§3 的算術就是這麼破的)。所以限的是「這台 bridge 每分鐘總共願意開幾個
+    登入請求」,把殭屍網路並行這條路直接關掉。
+    """
+    while _CONSOLE_LOGIN_MINTS and now - _CONSOLE_LOGIN_MINTS[0] > _CONSOLE_LOGIN_RATE_WINDOW:
+        _CONSOLE_LOGIN_MINTS.popleft()
+    return len(_CONSOLE_LOGIN_MINTS) < _CONSOLE_LOGIN_RATE_MAX
+
+
+def _console_login_create(request: Request):
+    """建一筆 pending 登入請求。回 `(rid, sid)`;被節流回 `(None, None)`。
+
+    **rid 與 sid 是兩個不同的秘密,刻意的**:
+      · `rid`(128-bit)進 QR,是給**手機**的 —— 它要用來指認「批准哪一筆」。
+      · `sid`(128-bit)只進 httpOnly cookie,**絕不進 QR**,是給**瀏覽器**的。
+    輪詢 `/console/login/status` 要的是 sid。所以旁邊的人拍下機主螢幕上的 QR,
+    也搶不走那一筆 pending session(他沒有 sid)——QR 只能用來「批准」,
+    不能用來「領取」。
+    """
+    now = time.monotonic()
+    rid = secrets.token_hex(16)
+    sid = secrets.token_urlsafe(24)
+    ua = (request.headers.get("user-agent") or "")[:200]
+    with _CONSOLE_LOGIN_LOCK:
+        _console_login_gc_locked(now)
+        if not _console_login_rate_ok_locked(now):
+            _log_event("console_login_rate_limited")
+            return None, None
+        _CONSOLE_LOGIN_MINTS.append(now)
+        _CONSOLE_LOGIN_REQS[rid] = {
+            "sid_hash": _short_hash(sid),
+            "client": _console_login_client_key(request),
+            "ua": ua,
+            "created": now,
+            "created_wall": time.time(),
+            "expires": now + _CONSOLE_LOGIN_TTL,
+            "state": "pending",
+            "approved_by": "",
+            "code": "",                 # 批准時鑄的一次性 claim code
+        }
+    _log_event("console_login_created", ua=ua[:60])
+    return rid, sid
+
+
+def _console_login_ip_label(client: str) -> str:
+    """請求方的**網路種類**人話標籤,給手機批准頁顯示。
+
+    刻意**不做地理推測** —— 那需要 GeoIP 資料或外部查詢,而外部查詢等於把
+    訪客 IP 送給第三方,與本專案的隱私立場衝突(規格 §15 第 3 題的結論)。
+    只講「公網 / 區網 / tailnet / 本機」加上 IP 本身,讓機主自己判斷。
+    """
+    host = (client or "").strip()
+    if not host or host == "?":
+        return "來源不明"
+    bare = host.split("%")[0]
+    try:
+        ip = ipaddress.ip_address(bare)
+    except ValueError:
+        return "網域名稱(%s)" % host[:40]
+    if ip.is_loopback:
+        return "本機 loopback(%s)" % host
+    if _is_tailnet_host(bare):
+        return "tailnet(%s)" % host
+    if ip.is_private:
+        return "區網(%s)" % host
+    return "公網(%s)" % host
+
+
+def _console_qr_login_html(rid: str) -> str:
+    """QR 登入頁。自包含(inline CSS/JS、零外部資源),沿用輸入頁的品牌色票。
+
+    與 `_console_login_html` 的差別:那頁刻意零 JS(只有一個表單),這頁需要
+    輪詢,所以有一小段 inline script —— `_CONSOLE_SECURITY_HEADERS` 的 CSP
+    已含 `script-src 'self' 'unsafe-inline'`,不必為此放寬。
+
+    **QR 裡只放 rid,不放 bridge 位址** —— app 必須用它自己既有的連線去呼叫,
+    絕不可以被 QR 指去另一個主機(那正好是釣魚要的)。
+    """
+    payload = "pocket://console-login?rid=%s" % urllib.parse.quote(rid)
+    svg = ""
+    try:
+        import qrcode
+        from qrcode.image.svg import SvgPathImage
+        qr = qrcode.QRCode(border=2, error_correction=qrcode.constants.ERROR_CORRECT_M)
+        qr.add_data(payload)
+        svg = qr.make_image(image_factory=SvgPathImage).to_string().decode("utf-8")
+    except Exception as _exc:  # noqa: BLE001 — 沒 qrcode 套件時仍給可複製的 payload
+        _log_exc("console_qr_login_svg", _exc, expected=True)
+    return """<!doctype html><html lang="zh-Hant"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Pocket 桌面控制台</title>
+<style>
+:root{--bg:#FFF2D6;--card:#FFF;--ink:#17171A;--muted:#6E6A64;
+  --line:rgba(23,23,26,.14);--accent:#EE2D2A;--bad:#C62828;color-scheme:light dark;
+  font-family:-apple-system,system-ui,"PingFang TC","Noto Sans TC",sans-serif}
+@media (prefers-color-scheme:dark){:root{--bg:#131317;--card:#1E1E25;--ink:#F2F2F5;
+  --muted:#9A9AA2;--line:rgba(255,255,255,.12);--accent:#FF4D4A;--bad:#E5484D}}
+*{box-sizing:border-box}
+body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;
+  padding:32px 16px;background:var(--bg);color:var(--ink)}
+main{max-width:420px;width:100%%;text-align:center}
+h1{font-size:1.2rem;margin:0 0 6px}
+p{margin:0;line-height:1.6}.sub{color:var(--muted);font-size:.93rem}
+.card{background:var(--card);border:1px solid var(--line);border-radius:16px;
+  padding:22px;margin:18px 0}
+.qr{width:220px;height:220px;margin:0 auto;display:block}
+.qr svg{width:100%%;height:100%%}
+code{font-size:.74rem;word-break:break-all;color:var(--muted)}
+.st{margin-top:14px;font-size:.95rem;font-weight:600}
+.bad{color:var(--bad)}
+</style></head><body><main>
+<h1>用手機批准這次登入</h1>
+<p class="sub">打開 Pocket 掃這個 QR，在手機上按「批准」。</p>
+<div class="card">
+  <div class="qr">%(svg)s</div>
+  <p class="sub" style="margin-top:12px">掃不到？用 Pocket 開這個連結：</p>
+  <code>%(payload)s</code>
+</div>
+<p class="st" id="st">等待手機批准…（<span id="t">%(ttl)d</span> 秒內有效）</p>
+<p class="sub" id="hint" style="margin-top:8px">
+  如果這不是你現在面前的電腦，請在手機上按「不是我」。</p>
+<script>
+// 輪詢:2 秒一次。state=approved 時伺服器已種好 cookie,直接進 console。
+var left = %(ttl)d, st = document.getElementById('st'), t = document.getElementById('t');
+setInterval(function(){ left--; if(left>=0) t.textContent = left; }, 1000);
+function poll(){
+  fetch('/console/login/status', {credentials:'same-origin', cache:'no-store'})
+    .then(function(r){ return r.json(); })
+    .then(function(j){
+      if(j.state === 'approved'){ st.textContent = '已批准,正在進入…';
+        location.href = j.redirect || '/console'; return; }
+      if(j.state === 'denied'){ st.className = 'st bad';
+        st.textContent = '已被拒絕。如果你沒有按拒絕,可能有人想誘導你掃描他的 QR。';
+        document.getElementById('hint').textContent = ''; return; }
+      if(j.state === 'expired'){ st.className = 'st bad';
+        st.textContent = '這個 QR 已失效,請重新整理頁面再掃一次。'; return; }
+      setTimeout(poll, 2000);
+    })
+    .catch(function(){ setTimeout(poll, 3000); });
+}
+setTimeout(poll, 2000);
+</script>
+</main></body></html>""" % {
+        "svg": svg or "<p class=\"sub bad\">(這台主機缺 qrcode 套件,請用下面的連結)</p>",
+        "payload": payload,
+        "ttl": int(_CONSOLE_LOGIN_TTL),
+    }
+
+
+def _console_qr_login_response(request: Request) -> Response:
+    """遠端來源的登入方式:鑄一筆 pending 請求 → 種 sid cookie → 回 QR 頁。
+
+    sid cookie 的四個屬性都是刻意的(規格 §6.1):
+      · **httpOnly** —— 頁面的 JS 不需要讀它(輪詢靠瀏覽器自動帶),
+        不給讀就等於 XSS 偷不走這一筆 pending session。
+      · **SameSite=Strict** —— 別人的網站不能從他的頁面觸發我們的輪詢。
+      · **path=/console** —— 和 `pocket_console` 同一個作用域,不外漏到其他端點。
+      · **無 max-age(session cookie)** —— 關瀏覽器即失效(規格 §10)。
+        TTL 由伺服器端的 `_CONSOLE_LOGIN_TTL`(120 秒)決定,不靠 cookie 自律。
+
+    節流超額回 **503 而不是 429**:這道節流是全域的(保護這台主機),不是
+    針對這個來源的配額 —— 503 + Retry-After 才是誠實的語意。per-IP 配額
+    擋不住殭屍網路,所以規格 §8.3 刻意選全域。
+    """
+    rid, sid = _console_login_create(request)
+    if not rid:
+        raise HTTPException(
+            status_code=503,
+            detail="這台主機同時進行的登入請求太多,請過一分鐘再試一次",
+            headers={"Retry-After": "60"})
+    resp = HTMLResponse(_console_qr_login_html(rid),
+                        headers=_CONSOLE_SECURITY_HEADERS)
+    resp.set_cookie(
+        _CONSOLE_LOGIN_SID_COOKIE, sid,
+        httponly=True, samesite="strict",
+        secure=_console_cookie_secure(request),
+        path=_CONSOLE_COOKIE_PATH)       # 無 max_age = session cookie
+    return resp
+
+
+@app.get("/console/login/status")
+async def console_login_status(request: Request):
+    """瀏覽器輪詢。認證靠 httpOnly 的 `sid` cookie —— **不接受 query 帶 rid**。
+
+    rid 在 QR 裡、是給手機的,拿它當瀏覽器憑證就等於「誰看到螢幕誰就能領走」。
+
+    第二道防線在這裡:**來源一致性比對**。批准只標記狀態,真正發憑證是在這支,
+    此時才驗「這次輪詢的來源 == 建立 QR 時的來源」。所以 QR 被轉傳到別的網路
+    使用會失敗(規格 §8.2)。
+    """
+    if not (POCKET_CONSOLE_ENABLED and POCKET_CONSOLE_QR_LOGIN):
+        raise HTTPException(status_code=404, detail="not found")
+    sid = request.cookies.get(_CONSOLE_LOGIN_SID_COOKIE) or ""
+    sid_hash = _short_hash(sid) if sid else ""
+    now = time.monotonic()
+    state = "expired"
+    code = ""
+    with _CONSOLE_LOGIN_LOCK:
+        _console_login_gc_locked(now)
+        entry = None
+        if sid_hash:
+            # sid → rid 是反查(rid 不在瀏覽器手上)。筆數上限 40,線性掃可接受。
+            for v in _CONSOLE_LOGIN_REQS.values():
+                if hmac.compare_digest(str(v.get("sid_hash") or ""), sid_hash):
+                    entry = v
+                    break
+        if entry is not None:
+            if entry.get("state") == "approved":
+                # 來源一致性:不符就當過期(**不回專屬錯誤** —— 不當探測器用)。
+                if entry.get("client") == _console_login_client_key(request):
+                    state = "approved"
+                    code = str(entry.get("code") or "")
+                    entry["state"] = "consumed"      # 一次性
+                else:
+                    _log_event("console_login_client_mismatch")
+            elif entry.get("state") in ("pending", "denied"):
+                state = entry["state"]
+    if state != "approved":
+        return JSONResponse({"state": state}, headers=_CONSOLE_SECURITY_HEADERS)
+    # 批准成立 → 把一次性 claim code 交給前端(與 `/console/auth` 成功後同一套
+    # 機制:claim cookie 非 httpOnly,前端用 document.cookie 讀、換 device token)。
+    resp = JSONResponse({"state": "approved", "redirect": "/console"},
+                        headers=_CONSOLE_SECURITY_HEADERS)
+    _console_set_cookie(request, resp, session_only=True)   # 關瀏覽器即死(規格 §10)
+    _console_set_claim_cookie(request, resp, code)
+    resp.delete_cookie(_CONSOLE_LOGIN_SID_COOKIE, path=_CONSOLE_COOKIE_PATH)
+    _log_event("console_login_approved_consumed")
+    return resp
+
+
+@app.get("/app/v1/console/login/requests/{rid}")
+async def app_v1_console_login_request(rid: str, request: Request):
+    """手機掃到 QR 之後,先讀這支把「誰在請求」顯示在批准頁上。
+
+    第一道防線(規格 §8.1):**批准頁必須顯示請求方資訊、且要使用者明示點擊**。
+    掃到就自動批准 = 把釣魚變成一鍵得手。
+
+    rid 是**本 bridge 本地**的隨機值,所以「掃到別台 bridge 的 QR」在這裡
+    自然表現成 404 —— app 端據此顯示「這個 QR 不是這台桌面的」。這也是規格
+    §7 後來拿掉 `fp` 欄位的理由:404 已經給了同樣的保護,再加指紋是多餘的。
+    """
+    if not (POCKET_CONSOLE_ENABLED and POCKET_CONSOLE_QR_LOGIN):
+        raise HTTPException(status_code=404, detail="not found")
+    _check_auth(request)
+    now = time.monotonic()
+    with _CONSOLE_LOGIN_LOCK:
+        _console_login_gc_locked(now)
+        entry = _CONSOLE_LOGIN_REQS.get(rid)
+        if entry is None:
+            raise HTTPException(status_code=404, detail="no such login request")
+        snap = dict(entry)
+    return {
+        "rid": rid,
+        "state": snap.get("state") or "pending",
+        "ip_label": _console_login_ip_label(str(snap.get("client") or "")),
+        "user_agent": snap.get("ua") or "",
+        "created_at": int(float(snap.get("created_wall") or 0)),
+        "expires_in": max(0, int(float(snap.get("expires") or 0) - now)),
+    }
+
+
+def _console_login_decide(rid: str, request: Request, *, approve: bool) -> dict:
+    """approve / deny 的共同內核。一次性:非 pending 一律 409。"""
+    if not (POCKET_CONSOLE_ENABLED and POCKET_CONSOLE_QR_LOGIN):
+        raise HTTPException(status_code=404, detail="not found")
+    _check_auth(request)
+    auth = request.headers.get("authorization", "")
+    tok = auth[7:].strip() if auth.lower().startswith("bearer ") else ""
+    now = time.monotonic()
+    with _CONSOLE_LOGIN_LOCK:
+        _console_login_gc_locked(now)
+        entry = _CONSOLE_LOGIN_REQS.get(rid)
+        if entry is None:
+            raise HTTPException(status_code=404, detail="no such login request")
+        if entry.get("state") != "pending":
+            # 已批准/已拒絕/已領取 —— 不讓同一個 rid 被重放。
+            raise HTTPException(status_code=409, detail="already decided")
+        if not approve:
+            entry["state"] = "denied"
+            _log_event("console_login_denied", token_hash=_short_hash(tok))
+            return {"ok": True, "state": "denied"}
+        # 批准當下才鑄一次性 claim code(與 `/console/auth` 同一條安全論證:
+        # 鑄碼只發生在「授權成立的那一刻」,長命憑證永遠換不到碼)。
+        code = _console_mint_claim_code()
+        if not code:
+            # 鑄碼被節流 —— **不要**把 state 改掉,讓使用者可以重按。
+            raise HTTPException(status_code=503, detail="mint throttled, retry")
+        entry["state"] = "approved"
+        entry["code"] = code
+        entry["approved_by"] = _short_hash(tok)
+    _log_event("console_login_approved", token_hash=_short_hash(tok))
+    return {"ok": True, "state": "approved"}
+
+
+@app.post("/app/v1/console/login/requests/{rid}/approve")
+async def app_v1_console_login_approve(rid: str, request: Request):
+    return _console_login_decide(rid, request, approve=True)
+
+
+@app.post("/app/v1/console/login/requests/{rid}/deny")
+async def app_v1_console_login_deny(rid: str, request: Request):
+    """「這不是我」。
+
+    存在的理由不只是禮貌:讓瀏覽器**立刻**看到被拒(而不是等 120 秒過期),
+    使用者才知道自己剛剛可能被釣,而不是以為「網路怪怪的再掃一次」。
+    """
+    return _console_login_decide(rid, request, approve=False)
 
 
 # 靜態資產(app.js / sse.js / style.css)。旗標關時整個 mount 不掛 → 404。
