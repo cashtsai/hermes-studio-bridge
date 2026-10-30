@@ -10423,6 +10423,17 @@ def _console_cookie_ok(request: Request) -> bool:
         return False
 
 
+def _console_cookie_secure(request: Request) -> bool:
+    """該不該加 `Secure`。**跟著 request scheme 走,不要硬寫成 True。**
+
+    走 http(tailnet 直連 8081)時若硬加 `Secure`,瀏覽器會直接丟掉 cookie,
+    PWA 照樣壞。抽成一支是因為 QR 登入的 sid cookie 也要同一條規則 ——
+    規則只能有一份,否則兩邊會慢慢漂開。
+    """
+    scheme = (getattr(getattr(request, "url", None), "scheme", "") or "").lower()
+    return scheme == "https"
+
+
 def _console_set_cookie(request: Request, resp: Response, *,
                         session_only: bool = False) -> None:
     """成功開 /console 就(重新)簽發 cookie。
@@ -10437,10 +10448,8 @@ def _console_set_cookie(request: Request, resp: Response, *,
     所以 /console(含 PWA 的 start_url)是唯一需要 cookie 的請求,path 收到
     `/console` 既夠用、又不會把憑證灑到 `/app/*`。
 
-    `secure` 跟著 request scheme 走:走 http(tailnet 直連 8081)時若硬加
-    `Secure`,瀏覽器會直接丟掉這枚 cookie,PWA 照樣壞。
+    `secure` 跟著 request scheme 走(見 `_console_cookie_secure`)。
     """
-    scheme = (getattr(getattr(request, "url", None), "scheme", "") or "").lower()
     resp.set_cookie(
         _CONSOLE_COOKIE_NAME, _console_cookie_value(),
         # session_only(QR 登入那條路):**不帶 max-age** → session cookie,
@@ -10448,7 +10457,8 @@ def _console_set_cookie(request: Request, resp: Response, *,
         # 的前提是「人不一定在可信的電腦前」,憑證不該活過那個分頁。
         max_age=(None if session_only else _CONSOLE_COOKIE_TTL),
         path=_CONSOLE_COOKIE_PATH,
-        httponly=True, samesite="strict", secure=(scheme == "https"),
+        httponly=True, samesite="strict",
+        secure=_console_cookie_secure(request),
     )
 
 
@@ -10756,18 +10766,45 @@ def _console_guard(request: Request) -> None:
 async def console_page(request: Request):
     if not POCKET_CONSOLE_ENABLED:
         raise HTTPException(status_code=404, detail="not found")
-    # local-only 先驗:不是直連(帶了 XFF/Forwarded/CF-Connecting-IP/X-Real-IP)
-    # 就維持裸 403 —— **連輸入框都不給**,見上方 _console_login_html 的規矩 1。
-    _pair_local_only(request)
-    if not _pair_boot_ok(request, allow_cookie=True):
-        return _console_login_response(request)     # 沒碼/碼錯/cookie 過期 → 輸入頁
+    # ── 入口分流:先問來源可不可信,再決定給哪一種登入方式 ────────────
+    #
+    # 三條路,順序有意義:
+    #
+    #   1. **可信來源**(loopback / 同 tailnet 直連)→ 既有的六碼/cookie 路徑,
+    #      行為**完全不變**(規格 §6.1 的硬要求)。
+    #   2. 不可信來源 + 已有 `pocket_console` cookie → 放行。這是**批准過的
+    #      遠端瀏覽器回頭再開頁**的情況:`/console/login/status` 批准成功時種了
+    #      session cookie。少了這一條,掃碼成功的人會被無限丟回 QR 頁。
+    #   3. 不可信來源 + 沒 cookie → QR 登入頁(旗標開)或裸 403(旗標關,預設)。
+    #
+    # 第 2 條**刻意只認 cookie,不呼叫 `_pair_boot_ok`** —— 那支也收
+    # `?boot=<六碼>`,放在這裡等於「公網只要知道六碼就能進」,把 local-only
+    # 這道門整個拆掉。六碼的熵只有 10⁶(規格 §3 有算術),它只配在可信網路
+    # 裡當第二層,不能當公網的唯一鎖。cookie 不同:它是
+    # `HMAC(boot_code, …)`,偽造不了,而且是**批准流程發出去的**。
+    local = _pair_local_ok(request)
+    if local:
+        if not _pair_boot_ok(request, allow_cookie=True):
+            return _console_login_response(request)  # 沒碼/碼錯/cookie 過期 → 輸入頁
+    elif not _console_cookie_ok(request):
+        if not POCKET_CONSOLE_QR_LOGIN:
+            # 維持裸 403 —— **連輸入框都不給**,見 _console_login_html 的規矩 1。
+            # 旗標預設關,所以這就是預設行為(規格 §14):這支的現狀不變。
+            # 用 `_pair_local_only` 丟而不是自己 raise,是為了讓 403 的內容與
+            # 日誌永遠只有一個來源(它剛剛才回報過 False,必定會丟)。
+            _pair_local_only(request)
+        return _console_qr_login_response(request)
     index = os.path.join(_CONSOLE_DIR, "index.html")
     try:
         html = open(index, encoding="utf-8").read()
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail="console not installed")
     resp = HTMLResponse(html, headers=_CONSOLE_SECURITY_HEADERS)
-    _console_set_cookie(request, resp)   # 滑動視窗:每次成功開頁都續命
+    # 滑動視窗:每次成功開頁都續命。但**遠端來源只能續成 session cookie** ——
+    # 若照本機那樣換發 14 天的,掃碼登入的人每開一次頁就把「關瀏覽器即失效」
+    # (規格 §10)換成一張 14 天通行證,等於這條路徑的安全前提被無聲抵銷。
+    # QR 登入的前提正是「人不一定在可信的電腦前」。
+    _console_set_cookie(request, resp, session_only=not local)
     return resp
 
 
@@ -11188,6 +11225,37 @@ setTimeout(poll, 2000);
         "payload": payload,
         "ttl": int(_CONSOLE_LOGIN_TTL),
     }
+
+
+def _console_qr_login_response(request: Request) -> Response:
+    """遠端來源的登入方式:鑄一筆 pending 請求 → 種 sid cookie → 回 QR 頁。
+
+    sid cookie 的四個屬性都是刻意的(規格 §6.1):
+      · **httpOnly** —— 頁面的 JS 不需要讀它(輪詢靠瀏覽器自動帶),
+        不給讀就等於 XSS 偷不走這一筆 pending session。
+      · **SameSite=Strict** —— 別人的網站不能從他的頁面觸發我們的輪詢。
+      · **path=/console** —— 和 `pocket_console` 同一個作用域,不外漏到其他端點。
+      · **無 max-age(session cookie)** —— 關瀏覽器即失效(規格 §10)。
+        TTL 由伺服器端的 `_CONSOLE_LOGIN_TTL`(120 秒)決定,不靠 cookie 自律。
+
+    節流超額回 **503 而不是 429**:這道節流是全域的(保護這台主機),不是
+    針對這個來源的配額 —— 503 + Retry-After 才是誠實的語意。per-IP 配額
+    擋不住殭屍網路,所以規格 §8.3 刻意選全域。
+    """
+    rid, sid = _console_login_create(request)
+    if not rid:
+        raise HTTPException(
+            status_code=503,
+            detail="這台主機同時進行的登入請求太多,請過一分鐘再試一次",
+            headers={"Retry-After": "60"})
+    resp = HTMLResponse(_console_qr_login_html(rid),
+                        headers=_CONSOLE_SECURITY_HEADERS)
+    resp.set_cookie(
+        _CONSOLE_LOGIN_SID_COOKIE, sid,
+        httponly=True, samesite="strict",
+        secure=_console_cookie_secure(request),
+        path=_CONSOLE_COOKIE_PATH)       # 無 max_age = session cookie
+    return resp
 
 
 @app.get("/console/login/status")
