@@ -12210,6 +12210,45 @@ async def _check_push_dependency_at_startup() -> None:
     print(f"⚠️  推播無法運作:{problem}", file=sys.stderr, flush=True)
 
 
+def _qrcode_problem() -> str | None:
+    """QR 登入要畫 QR,而那需要 `qrcode` 套件。
+
+    缺了**不會壞,只會退化**:`_console_qr_login_response` 的 try/except 把
+    ImportError 吞掉(`expected=True`),頁面照出,只是沒有圖 —— 使用者得手打
+    `pocket://console-login?rid=…`。對一個叫「掃碼登入」的功能來說,那等於
+    沒做。而因為它不報錯,沒有人會發現。
+
+    2026-10-30 實測:`requirements.txt` **有**列 qrcode,但 production 的 venv
+    **沒裝**。跟 h2 完全同一個病(見 `_push_http2_problem`)—— 這個服務住在
+    Hermes 的版本化虛擬環境(venvs/hermes-<版本>)裡,**升級換環境,宣告過的
+    相依就跟著消失**。所以光寫進 requirements.txt 不夠,要每次啟動檢查。
+
+    回傳 None = 沒問題;字串 = 人看得懂的原因與修法。
+    """
+    try:
+        import qrcode  # noqa: F401
+    except ImportError:
+        return ("缺 qrcode 套件:QR 登入頁會畫不出 QR,使用者只能手動輸入代碼。"
+                f"修法:uv pip install --python {sys.prefix}/bin/python qrcode")
+    return None
+
+
+async def _check_qrcode_dependency_at_startup() -> None:
+    """QR 登入已啟用卻缺 qrcode → 啟動時大聲說一次。功能沒開就完全安靜。"""
+    if not (POCKET_CONSOLE_ENABLED and POCKET_CONSOLE_QR_LOGIN):
+        return
+    problem = _qrcode_problem()
+    if not problem:
+        return
+    _log_event("qrcode_dependency_missing", phase="startup", problem=problem[:200])
+    print(f"⚠️  QR 登入會退化:{problem}", file=sys.stderr, flush=True)
+
+
+@app.on_event("startup")
+async def _startup_qrcode_dependency_check():
+    await _check_qrcode_dependency_at_startup()
+
+
 @app.on_event("startup")
 async def _startup_push_dependency_check():
     await _check_push_dependency_at_startup()
