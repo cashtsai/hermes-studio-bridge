@@ -163,6 +163,13 @@ class FakeRequest:
         return self._body
 
 
+def _async_const(value):
+    """把一個值包成 async 函式(patch `_cc_sessions` 這種 awaitable 用)。"""
+    async def _f(*a, **k):
+        return value
+    return _f
+
+
 def _events(store, *types):
     return [e for e in store.events if e["type"] in types]
 
@@ -829,6 +836,75 @@ class TestApprovalParity(CC2Base):
         # 不可以說成「使用者拒絕了」(`auto-declined` 裡也有 declined,
         # 所以驗的是那整句主張,不是單字 —— 我自己先用單字驗,錯了一次)。
         self.assertNotIn("The user declined", res.message)
+
+
+class TestCcListMergesCc2(CC2Base):
+    """遷移階段 1:`/ccsessions` 併入 cc2 列(2026-10-30)。
+
+    cc2 的目標是取代 tmux,但兩個 app 的 CC 分頁都只讀 `/ccsessions`
+    (tmux 專屬)→ cc2 session 在使用者眼前整個不存在。
+    守三件:旗標關時零行為改變、開了之後列得出來且形狀對、撞名不出兩條。
+    """
+
+    def _rows(self):
+        return asyncio.run(bridge.cc_list(FakeRequest()))["sessions"]
+
+    def test_flag_off_changes_nothing(self):
+        """最重要的一條:旗標預設關 → 與 2026-10-30 之前**逐字相同**。"""
+        cc_sdk.registry().ensure("merged1", workdir=_TMP)
+        with patch.object(bridge, "CC_LIST_INCLUDES_CC2", False), \
+             patch.object(bridge, "_cc_conf_rows", lambda: []):
+            self.assertEqual(self._rows(), [],
+                             "旗標關著卻把 cc2 列塞進去了 —— 那不是可回退的改動")
+
+    def test_flag_on_lists_cc2_in_cc_shape(self):
+        sess = cc_sdk.registry().ensure("merged2", workdir=_TMP)
+        sess.sdk_session_id = "sdk-m2"
+        with patch.object(bridge, "CC_LIST_INCLUDES_CC2", True), \
+             patch.object(bridge, "_cc_conf_rows", lambda: []):
+            rows = self._rows()
+        self.assertEqual([r["name"] for r in rows], ["merged2"])
+        r = rows[0]
+        # `status` 要照 tmux 的約定:status 是「這條在」,忙碌看 busy。
+        self.assertEqual(r["status"], "running")
+        self.assertFalse(r["busy"], "閒置的 session 不該標 busy")
+        self.assertEqual(r["workdir"], _TMP)
+        self.assertEqual(r["sessionId"], "sdk-m2")
+        self.assertIsNone(r["claudeTitle"],
+                          "cc2 沒有 pane title —— 不可以拿 session 名充當")
+        self.assertEqual(r["backend"], "cc2", "診斷要分得出後端")
+
+    def test_name_collision_keeps_tmux_and_logs(self):
+        """同名時保守選既有的 tmux 那條,不讓使用者看到兩個一樣的名字。
+
+        兩邊是獨立命名空間(tmux 來自 ccsess 設定檔、cc2 來自自己的 registry),
+        遷移期間真的會撞。撞名代表有歷史殘留要清,所以要 log,不能安靜吞掉。
+        """
+        cc_sdk.registry().ensure("dup", workdir=_TMP)
+        events = []
+        with patch.object(bridge, "CC_LIST_INCLUDES_CC2", True), \
+             patch.object(bridge, "_cc_conf_rows",
+                          lambda: [("dup", "/tmp/x", "1")]), \
+             patch.object(bridge, "_cc_sessions",
+                          _async_const([{"name": "dup", "workdir": "/tmp/x",
+                                         "status": "running", "busy": False}])), \
+             patch.object(bridge, "_log_event",
+                          lambda ev, **kw: events.append(ev)):
+            rows = self._rows()
+        self.assertEqual([r["name"] for r in rows], ["dup"],
+                         "撞名出了兩條 —— 使用者會看到兩個一樣的 session")
+        self.assertNotIn("backend", rows[0], "撞名時該留 tmux 那條")
+        self.assertIn("cc_name_collision", events, "撞名必須留痕")
+
+    def test_archived_query_includes_cc2(self):
+        gone = cc_sdk.registry().ensure("arch1", workdir=_TMP)
+        gone.archived = True
+        with patch.object(bridge, "CC_LIST_INCLUDES_CC2", True), \
+             patch.object(bridge, "_cc_conf_rows", lambda: []):
+            rows = asyncio.run(bridge.cc_list(FakeRequest(),
+                                              archived=True))["sessions"]
+        self.assertEqual([r["name"] for r in rows], ["arch1"])
+        self.assertEqual(rows[0]["status"], "archived")
 
 
 class TestGovernanceRegistration(CC2Base):

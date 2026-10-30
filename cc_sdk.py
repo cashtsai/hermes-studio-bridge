@@ -1969,6 +1969,11 @@ class CCSdkRegistry:
                 # 終端接手指令(app 未來可直接顯示/複製;對話裡另有同款卡)
                 meta["resume_command"] = \
                     f"claude --resume {sess.sdk_session_id}"
+                # 裸的 sdk session id(2026-10-30):tmux 列有 `sessionId` 欄,
+                # 而以它為鍵的功能(例如 `_pocket_selected_cc`)對 cc2 原本
+                # 完全無效 —— 只給一條 `claude --resume …` 字串,呼叫端得去
+                # 剖字串才拿得到 id。遷移階段 1 的 `/ccsessions` 翻譯也要用它。
+                meta["sdk_session_id"] = sess.sdk_session_id
             # last_event_at 原本硬寫 None → app 列表排序拿不到時間、永遠墊底;
             # subtitle 改用最後一則對話(拿不到才退回 workdir),與 tmux 列同語意。
             last_at = getattr(sess.digest, "last_event_at", 0.0) or None

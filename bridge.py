@@ -14920,14 +14920,91 @@ def _cc_pending_ask(jsonl, current=None):
     return None
 
 
+# ── 遷移階段 1:`/ccsessions` 併入 cc2 列(2026-10-30)─────────────────────
+#
+# 規格:docs/CC2_REPLACES_TMUX_MIGRATION.md §1b/§6。
+#
+# cc2 當初就是為了**取代** tmux,但兩個 app 的 CC 分頁資料源都是 `/ccsessions`
+# (tmux 專屬)—— 於是 cc2 session 在使用者眼前**整個不存在**。
+# 讓 `/ccsessions` 從「tmux 的 session」變成「**這台機器上的 Claude Code
+# session**」,底下是 tmux 還是 SDK 由 bridge 決定,app 零改動。
+#
+# 旗標預設關 → 行為與 2026-10-30 之前逐字相同。
+CC_LIST_INCLUDES_CC2 = os.environ.get("CC_LIST_INCLUDES_CC2", "0") != "0"
+
+
+def _cc2_as_cc_row(row: dict) -> dict:
+    """cc2 的 v2 列 → `/ccsessions` 的 CC 列形狀。
+
+    **不新增資料,只翻譯** —— cc2 的 `v2_rows()` 已經有需要的每一欄
+    (workdir / busy / queue_depth / busy_since / model / context)。
+
+    `status` 的語意要對齊 tmux 的約定:那邊 `status` 是「tmux 存活」(恆
+    running),忙碌看 `busy`;所以這裡把 cc2 的 running/idle 都映成
+    `status="running"`(= 這條在),真正的忙碌放 `busy`。
+    封存那條照 tmux 的字彙給 `status="archived"`。
+    """
+    meta = row.get("meta") or {}
+    st = row.get("status") or "idle"
+    name = str(row.get("id") or "").split(":", 1)[-1]
+    return {
+        "name": name,
+        "workdir": meta.get("workdir") or "",
+        "status": "archived" if st == "archived" else "running",
+        "busy": st == "running",
+        "awaiting": st == "waiting_approval",
+        # cc2 的 last_event_at 是純記憶體,重啟後是 None —— 照實給,
+        # 不假造時間(app 的排序會把它墊底,那是誠實的結果)。
+        "updatedAt": row.get("last_event_at"),
+        "preview": row.get("subtitle") or None,
+        "sessionId": meta.get("sdk_session_id"),
+        "sessionTitle": row.get("title") or None,
+        # claudeTitle 來自 tmux 的 pane_title,cc2 沒有 pane → 誠實給 None
+        # (不要拿 session 名充當,那會讓 app 以為有標題)。
+        "claudeTitle": None,
+        # 讓診斷分得出這條是哪個後端。app 不認得這個鍵也無妨(未知欄位容忍)。
+        "backend": "cc2",
+    }
+
+
 @app.get("/ccsessions")
 async def cc_list(request: Request, archived: bool = False):
     _check_auth(request)
     if archived:
         # Archived = disabled (enabled != 1) in the ccsess config.
-        return {"sessions": [{"name": n, "workdir": w, "status": "archived", "busy": False}
-                             for n, w, e in _cc_conf_rows() if e != "1"]}
-    return {"sessions": await _cc_sessions()}
+        rows = [{"name": n, "workdir": w, "status": "archived", "busy": False}
+                for n, w, e in _cc_conf_rows() if e != "1"]
+        rows += _cc2_rows_for_cc_list(include_archived=True)
+        return {"sessions": rows}
+    return {"sessions": (await _cc_sessions()) + _cc2_rows_for_cc_list()}
+
+
+def _cc2_rows_for_cc_list(include_archived: bool = False) -> list:
+    """`/ccsessions` 要併的 cc2 列。旗標關 → 空清單(零行為改變)。
+
+    撞名時**以 tmux 為準並略過 cc2 那條**:遷移期間同名可能同時存在於兩個
+    獨立命名空間(tmux 來自 ccsess 設定檔、cc2 來自自己的 registry),而使用者
+    看到兩個一樣的名字只會困惑。保守選既有的那條,並 log 下來 —— 撞名代表有
+    歷史殘留要清,不該安靜吞掉。
+    (規格 §4 建議「解析時 cc2 優先」,那是階段 2 要定的事;階段 1 只併列表,
+     先不改變任何既有 session 的行為。)
+    """
+    if not (CC_LIST_INCLUDES_CC2 and cc_sdk.enabled()):
+        return []
+    try:
+        taken = {n for n, _w, e in _cc_conf_rows() if e == "1"}
+        out = []
+        for row in cc_sdk.registry().v2_rows(include_archived=include_archived):
+            r = _cc2_as_cc_row(row)
+            if r["name"] in taken:
+                _log_event("cc_name_collision", session=r["name"],
+                           kept="tmux", skipped="cc2")
+                continue
+            out.append(r)
+        return out
+    except Exception as _exc:  # noqa: BLE001 — 併列表失敗不該讓整支端點掛
+        _log_exc("_cc2_rows_for_cc_list", _exc, expected=True)
+        return []
 
 
 @app.post("/ccsessions/{name}/rename")
