@@ -2,7 +2,8 @@
 
 > 機主 2026-10-29 定調：**cc2 當初就是為了取代 tmux**，tmux 只是「一直沒辦法
 > remote control」時期的權宜。本文件是遷移的實作依據 —— **改實作先改這裡**。
-> 狀態：**規格，未實作**。
+> 狀態：**階段 0–4 已實作**（分支 `fix/cc2-seed-honesty`，兩個旗標預設關）。
+> 階段 5（移除 tmux 程式碼）未開始。
 >
 > 相關：`APP_BRIDGE_CONTRACT.md` §4.1c（cc2 的 client 契約）、`cc_sdk.py` 檔頭
 > （為什麼要 SDK 路徑）。
@@ -164,14 +165,39 @@ registry（`SESSION_NAME_RE = [A-Za-z0-9_-]{1,64}`）—— **兩個獨立命名
 
 ## 6. 階段與回退
 
-| 階段 | 做什麼 | 回退方式 |
-|---|---|---|
-| **0** | seed parity（§5）。**不碰路由** | 無風險，純改善 |
-| **1** | `GET /ccsessions` 合併 cc2 列（旗標 `CC_LIST_INCLUDES_CC2`，預設關） | 關旗標 |
-| **2** | P0 的 input／interrupt／status dispatch + `_v2_card_source` 解析 | 同上 |
-| **3** | P1／P2 dispatch | 同上 |
-| **4** | `CC_NEW_SESSIONS_BACKEND=cc2`（§2 槓桿）—— **新 session 開始走 SDK** | 改回 tmux |
-| **5** | tmux session 歸零後，才談移除 tmux 程式碼 | — |
+| 階段 | 做什麼 | 狀態 | 回退 |
+|---|---|---|---|
+| **0** | 取代門檻五條（§4.5） | ✅ `dba9e64` `6ae9446` `ba0c8b6` | 無風險，純改善 |
+| **1** | `GET /ccsessions` 合併 cc2 列 | ✅ `2b6c33c` | 關 `CC_LIST_INCLUDES_CC2` |
+| **2** | `claude_code:{name}` 解析後端 | ✅ `c2d2887` | 同上（同一個旗標） |
+| **3** | 寫入面 dispatch（七支） | ✅ `b33ab93` | 同上 |
+| **4** | 新 session 走 SDK | ✅ `fa4c82d` | 改回 `CC_NEW_SESSIONS_BACKEND=tmux` |
+| **5** | tmux session 歸零後，才談移除 tmux 程式碼 | ⬜ 未開始 | — |
+
+### 旗標與啟用順序（2026-10-30）
+
+**兩個旗標都預設關 → 合併進 main 不會改變 production 任何行為。**
+
+```
+CC_LIST_INCLUDES_CC2=1        # 階段 1-3:cc2 session 在 CC 分頁看得到/點得進去/選單能用
+CC_NEW_SESSIONS_BACKEND=cc2   # 階段 4:新開的 CC session 走 SDK
+```
+
+建議**先只開前者**跑一段。那是階段 1–3 的完整驗收，而且出問題只要關旗標。
+確認無誤再開後者 —— 階段 4 之後已建出來的 cc2 session 不會變回 tmux。
+
+### 三處規則必須一致（最容易出的錯）
+
+`_cc_backend()`（寫入面）、`_v2_card_source()`（卡片流）、`_cc2_rows_for_cc_list()`
+（列表去重）**都是「先 tmux，找不到才 cc2」**。不一致會出現「列表顯示 tmux
+那條、點進去開到 cc2、改名又改到第三個東西」—— 各自看起來都對。
+每一處都有測試釘著，而且驗過鑑別力。
+
+### 階段 3 的一個非選配理由
+
+階段 1+2 讓 cc2 對 app 長得像 `claude_code:`，所以 **app 的 ⋮ 選單會對它顯示**，
+而那些端點原本一律 404。所以階段 3 不是 polish，是**把階段 1+2 的破口補起來** —— 
+不做就是「列表上有、點得進去、一按選單就失敗」。
 
 **每一階段都有獨立旗標、預設關、可單獨回退。** 不接受「做完才知道能不能用」的
 大爆炸。
