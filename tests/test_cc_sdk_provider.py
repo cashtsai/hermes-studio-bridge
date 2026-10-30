@@ -952,6 +952,88 @@ class TestCcIdResolvesToCc2(CC2Base):
             self.assertEqual(cm.exception.status_code, 404)
 
 
+class TestCcWriteEndpointsDispatch(CC2Base):
+    """遷移階段 3:`/ccsessions/{name}/*` 的寫入面 dispatch(2026-10-30)。
+
+    **這不是選配** —— 階段 1+2 讓 cc2 session 對 app 長得像 `claude_code:`,
+    於是 app 的 ⋮ 選單(改名/模型/審核模式/壓縮)會對它顯示,而那些端點原本
+    一律 404(名字不在 ccsess 設定檔裡)。不補就是把階段 1+2 留在壞的狀態。
+    """
+
+    def setUp(self):
+        super().setUp()
+        self._flag = patch.object(bridge, "CC_LIST_INCLUDES_CC2", True)
+        self._conf = patch.object(bridge, "_cc_conf_rows", lambda: [])
+        self._flag.start(); self._conf.start()
+        cc_sdk.registry().ensure("w1", workdir=_TMP)
+
+    def tearDown(self):
+        self._conf.stop(); self._flag.stop()
+        super().tearDown()
+
+    def test_backend_resolver_matches_list_and_card_rules(self):
+        """三處規則必須一致:列表去重、`_v2_card_source`、`_cc_backend`。"""
+        self.assertEqual(bridge._cc_backend("w1"), "cc2")
+        self.assertEqual(bridge._cc_backend("never"), "")
+        with patch.object(bridge, "_cc_conf_rows",
+                          lambda: [("w1", "/tmp/z", "1")]):
+            self.assertEqual(bridge._cc_backend("w1"), "cc",
+                             "撞名時 tmux 勝 —— 與列表/卡片流同一條規則")
+
+    def test_mode_and_model_go_to_cc2_settings(self):
+        hits = []
+        async def fake(name, request):
+            hits.append(name); return {"ok": True}
+        with patch.object(bridge, "v2_cc2_settings", fake):
+            asyncio.run(bridge.cc_session_mode("w1", FakeRequest({"mode": "plan"})))
+            asyncio.run(bridge.cc_session_model("w1", FakeRequest({"model": "opus"})))
+        self.assertEqual(hits, ["w1", "w1"],
+                         "⋮ 選單的模式/模型切換沒轉到 cc2 → 使用者按了 404")
+
+    def test_rename_and_archive_and_compress_dispatch(self):
+        seen = []
+        async def mk(tag):
+            async def f(name, request):
+                seen.append(tag); return {"ok": True}
+            return f
+        with patch.object(bridge, "v2_cc2_rename", asyncio.run(mk("rename"))), \
+             patch.object(bridge, "v2_cc2_archive", asyncio.run(mk("archive"))), \
+             patch.object(bridge, "v2_cc2_compact", asyncio.run(mk("compress"))):
+            asyncio.run(bridge.cc_session_rename("w1", FakeRequest({"name": "w1b"})))
+            asyncio.run(bridge.cc_session_archive("w1", FakeRequest({})))
+            asyncio.run(bridge.cc_session_compress("w1", FakeRequest({})))
+        self.assertEqual(sorted(seen), ["archive", "compress", "rename"])
+
+    def test_answer_is_honest_409_not_fake_success(self):
+        """TUI 式多選作答對 cc2 不存在。回 409 + 指路 —— 不可以回 404
+        (app 會以為 session 不存在,它明明在列表上)、更不可以假成功
+        (使用者按了以為送出,模型什麼都沒收到)。"""
+        with self.assertRaises(HTTPException) as cm:
+            asyncio.run(bridge.cc_session_answer("w1", FakeRequest({"keys": ["1"]})))
+        self.assertEqual(cm.exception.status_code, 409)
+        self.assertIn("approvals", str(cm.exception.detail),
+                      "要指路到可行的那條(結構化審批決議)")
+
+    def test_diff_shares_workdir_logic(self):
+        got = []
+        async def fake(workdir, path):
+            got.append((workdir, path)); return {"text": ""}
+        with patch.object(bridge, "_session_workdir_diff", fake):
+            asyncio.run(bridge.cc_session_diff("w1", FakeRequest(), path="a.py"))
+        self.assertEqual(got, [(_TMP, "a.py")],
+                         "diff 只需要 workdir,cc2 也有 —— 該共用同一支")
+
+    def test_history_uses_shared_formatter_shape(self):
+        """回應形狀必須是 app 已經在吃的 `{text, more}`,不是 cc2 原生的
+        `{messages,…}` —— 兩邊 transcript 同格式,給對路徑就自動同形狀。"""
+        sess = cc_sdk.registry().get("w1")
+        sess.sdk_session_id = "sdk-w1"
+        out = asyncio.run(bridge.cc_session_history("w1", FakeRequest()))
+        self.assertIn("text", out)
+        self.assertIn("more", out)
+        self.assertNotIn("messages", out)
+
+
 class TestGovernanceRegistration(CC2Base):
     """cc2 session 要進戶政 + 吃配額(2026-10-30)。
 

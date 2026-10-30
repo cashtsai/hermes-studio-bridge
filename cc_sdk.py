@@ -121,6 +121,21 @@ def history_seed_limit() -> int:
         return 200
 
 
+def transcript_path(sess) -> str:
+    """這條 cc2 session 的 transcript jsonl 路徑(沒有 sdk_session_id 回 "")。
+
+    抽成公開函式是為了讓 bridge 的 `/ccsessions/{name}/history` 對 cc2 能走
+    **同一個格式化器** —— 兩條路徑的 transcript 是同一種 jsonl,給對路徑就
+    自動同形狀(`{text, more}`),不必為 cc2 另寫一套翻頁回應。
+    """
+    sid = getattr(sess, "sdk_session_id", "") or ""
+    if not sid:
+        return ""
+    return os.path.join(_claude_projects_root(),
+                        _project_key(getattr(sess, "workdir", "") or ""),
+                        f"{sid}.jsonl")
+
+
 def _seed_card_uid(d: dict, jsonl_path: str, lineno: int) -> str:
     """種子卡的穩定 id 來源 —— 與 bridge 的 `_cc_card_uid` **同語意**。
 

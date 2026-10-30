@@ -9241,9 +9241,14 @@ async def _session_workdir_diff(workdir: str, path: str) -> dict:
 async def cc_session_diff(name: str, request: Request, path: str):
     _check_auth(request)
     row = next((r for r in _cc_conf_rows() if r[0] == name), None)
-    if not row:
-        raise http_err(404, "SESSION_NOT_FOUND", "unknown session")
-    return await _session_workdir_diff(row[1], path)
+    if row:
+        return await _session_workdir_diff(row[1], path)
+    # cc2 後端:diff 只需要 workdir,而 cc2 的 session 也有 —— 邏輯完全共用,
+    # 不需要另一條實作(遷移階段 3)。
+    if _cc_backend(name) == "cc2":
+        sess = cc_sdk.registry().get(name)
+        return await _session_workdir_diff(getattr(sess, "workdir", "") or "", path)
+    raise http_err(404, "SESSION_NOT_FOUND", "unknown session")
 
 
 @app.get("/codexsessions/{thread_id}/diff")
@@ -14933,6 +14938,46 @@ def _cc_pending_ask(jsonl, current=None):
 CC_LIST_INCLUDES_CC2 = os.environ.get("CC_LIST_INCLUDES_CC2", "0") != "0"
 
 
+def _cc2_answer_unsupported(name: str):
+    """`POST /ccsessions/{name}/answer` 對 cc2 的誠實回應。
+
+    那支是**TUI 式多選作答**:讀 pane 現況、算差集、送數字鍵 toggle、走到內嵌
+    Submit、再過一次 review 頁。cc2 沒有 pane,整套機制在它身上不存在。
+
+    cc2 的提問走結構化審批(`can_use_tool` → 審核中心 →
+    `POST /app/v1/approvals/{id}/decision`),而且目前**一次只收一個答案**
+    (回答模型的管道只有 deny message 一條)。
+
+    所以這裡回 **409 + 可行動的指路**,而不是:
+      · 404 —— 那會讓 app 以為 session 不存在(它明明在列表上)
+      · 200 假成功 —— 使用者按了以為送出,模型那邊什麼都沒收到
+    """
+    raise http_err(409, "CC2_USE_APPROVAL_DECISION",
+                   "這條 session 走 SDK 後端,多選作答請改用 "
+                   "POST /app/v1/approvals/{id}/decision(一次一個答案)")
+
+
+def _cc_backend(name: str) -> str:
+    """這個 CC session 名屬於哪個後端:`"cc"`(tmux)/ `"cc2"` / `""`(不存在)。
+
+    **規則與 `_v2_card_source` 和列表去重完全一致**:先 tmux,找不到才 cc2。
+    三處必須同一條規則 —— 不一致的話會出現「列表顯示 tmux 那條、點進去開到
+    cc2、改名又改到第三個東西」這種各自看起來都對的錯。
+    """
+    try:
+        if any(r[0] == name and r[2] == "1" for r in _cc_conf_rows()):
+            return "cc"
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("_cc_backend#conf", _exc, expected=True)
+    if CC_LIST_INCLUDES_CC2 and cc_sdk.enabled() and name:
+        try:
+            if cc_sdk.registry().get(name) is not None:
+                return "cc2"
+        except Exception as _exc:  # noqa: BLE001
+            _log_exc("_cc_backend#cc2", _exc, expected=True)
+    return ""
+
+
 def _cc2_as_cc_row(row: dict) -> dict:
     """cc2 的 v2 列 → `/ccsessions` 的 CC 列形狀。
 
@@ -15018,6 +15063,9 @@ async def cc_session_rename(name: str, request: Request):
         raise HTTPException(status_code=400, detail="unsupported session name")
     rows = _cc_conf_rows()
     current = next((r for r in rows if r[0] == name), None)
+    # cc2 後端:走結構化 rename(registry 會一併搬 secret/digest/待審等待者)
+    if _cc_backend(name) == "cc2":
+        return await v2_cc2_rename(name, request)
     if not current:
         raise http_err(404, "SESSION_NOT_FOUND", "unknown session")
     try:
@@ -15436,6 +15484,9 @@ async def cc_session_archive(name: str, request: Request):
     except Exception as _exc:  # noqa: BLE001
         _log_exc("cc_session_archive", _exc, expected=True)
         body = {}
+    # cc2 後端:封存只是 registry 的旗標,沒有 tmux 要殺、沒有 scrollback 要存
+    if _cc_backend(name) == "cc2":
+        return await v2_cc2_archive(name, request)
     if body.get("archived") is False:
         await _run_ccsess("enable", name)
         await _run_ccsess("ensure")          # relaunch the now-enabled session
@@ -15453,6 +15504,8 @@ async def cc_session_compress(name: str, request: Request):
     context → 重啟接回)。跑數分鐘,故 fire-and-forget:立即回 started,
     進度由 session 重啟本身呈現(app 端 status 會看到斷線→回來)。"""
     _check_auth(request)
+    if _cc_backend(name) == "cc2":
+        return await v2_cc2_compact(name, request)
     if not any(row[0] == name for row in _cc_conf_rows()):
         raise http_err(404, "SESSION_NOT_FOUND", "unknown session")
     now = time.time()
@@ -15968,9 +16021,16 @@ async def cc_session_history(name: str, request: Request, offset: int = 0, limit
     end `offset` events from the newest. `more` is true if older events remain."""
     _check_auth(request)
     row = next((r for r in _cc_conf_rows() if r[0] == name), None)
-    if not row:
+    if row:
+        jsonl = await _cc_session_jsonl(name, row[1])
+    elif _cc_backend(name) == "cc2":
+        # cc2 後端:**共用同一個格式化器**。兩條路徑的 transcript 是同一種
+        # jsonl,所以只要給對路徑,回應自動是 `{text, more}` 這個 app 已經在吃
+        # 的形狀 —— 不必為 cc2 另寫一套翻頁(對照 `/app/v2/cc2/{name}/history`
+        # 回的是 `{messages,…}`,那是 cc2 的原生面,形狀不同)。
+        jsonl = cc_sdk.transcript_path(cc_sdk.registry().get(name))
+    else:
         raise http_err(404, "SESSION_NOT_FOUND", "unknown session")
-    jsonl = await _cc_session_jsonl(name, row[1])
     if not jsonl or not os.path.exists(jsonl):
         return {"text": "", "more": False}
     try:
@@ -18058,6 +18118,9 @@ async def cc_session_answer(name: str, request: Request):
       `advanced:true`,由 app 接著答下一題。
     """
     _check_auth(request)
+    # cc2 後端:TUI 式多選作答不適用(見 _cc2_answer_unsupported)
+    if _cc_backend(name) == "cc2":
+        return await _cc2_answer_unsupported(name)
     if not any(r[0] == name for r in _cc_conf_rows()):
         raise http_err(404, "SESSION_NOT_FOUND", "unknown session")
     body = await request.json()
@@ -18824,6 +18887,8 @@ async def cc_session_mode(name: str, request: Request):
     "plan"|"auto"}. Sends shift+tab (BTab) and VERIFIES via the pane's bottom
     bar after each press; replies with the mode actually reached."""
     _check_auth(request)
+    if _cc_backend(name) == "cc2":
+        return await v2_cc2_settings(name, request)
     if not any(r[0] == name for r in _cc_conf_rows()):
         raise http_err(404, "SESSION_NOT_FOUND", "unknown session")
     if not await _tmux_alive(name):
@@ -18930,6 +18995,8 @@ async def cc_session_model(name: str, request: Request):
     never pressed Yes and reported a false-positive `confirmed` off the dialog
     text — see the note on _CC_MODEL_CONFIRM_POLL_SECS."""
     _check_auth(request)
+    if _cc_backend(name) == "cc2":
+        return await v2_cc2_settings(name, request)
     if not any(r[0] == name for r in _cc_conf_rows()):
         raise http_err(404, "SESSION_NOT_FOUND", "unknown session")
     if not await _tmux_alive(name):
