@@ -1501,11 +1501,11 @@ class CCSdkSession:
         """
         qs = tool_input.get("questions") or []
         if not isinstance(qs, list) or not qs:
-            return [], "", False
+            return [], "", False, {}
         q0 = qs[0] if isinstance(qs[0], dict) else {}
         opts = q0.get("options") or []
         if not isinstance(opts, list) or not opts:
-            return [], "", False
+            return [], "", False, {}
         out = []
         for i, o in enumerate(opts[:6]):      # 卡片按鈕上限,超過的截斷
             if not isinstance(o, dict):
@@ -1513,14 +1513,28 @@ class CCSdkSession:
             label = str(o.get("label") or "").strip()
             if not label:
                 continue
-            out.append({"key": f"ask:{i}", "label": label[:40],
-                        "style": "primary" if i == 0 else "secondary"})
+            opt = {"key": f"ask:{i}", "label": label[:40],
+                   "style": "primary" if i == 0 else "secondary"}
+            # **保留 description**(2026-10-29):CLI 的每個選項都帶說明,
+            # tmux 路徑會把它帶進卡片(`_cc_approval_payload`)。原本只取 label
+            # → 使用者在選項說明空白的情況下選,等於盲選。
+            desc = str(o.get("description") or "").strip()
+            if desc:
+                opt["detail"] = desc[:200]
+            out.append(opt)
         if not out:
-            return [], "", False
+            return [], "", False, {}
         # 一律補「略過」—— CLI 的原生 UI 也永遠有 Skip,不能讓人無路可走。
         out.append({"key": "ask:skip", "label": "略過", "style": "danger"})
         title = str(q0.get("question") or q0.get("header") or "請選擇")[:200]
-        return out, title, bool(q0.get("multiSelect"))
+        # 第四個回傳值 = 卡片 meta。app 靠它決定「畫單選還是複選」、
+        # 以及顯示「第 N/M 題」——缺了就只能當單選題盲畫(契約見
+        # carddigest.ApprovalCardMixin:multiselect/q_index/q_total/q_headers)。
+        meta = {"multiselect": bool(q0.get("multiSelect")),
+                "q_index": 1, "q_total": len(qs),
+                "q_headers": [str((q.get("header") if isinstance(q, dict) else "")
+                                  or "")[:40] for q in qs][:8]}
+        return out, title, bool(q0.get("multiSelect")), meta
 
     async def _can_use_tool(self, tool: str, tool_input: dict, _ctx):
         """SDK 的結構化審批回呼。建 pending record(卡片 + DB 鏡像)→ 等
@@ -1535,9 +1549,10 @@ class CCSdkSession:
             _log("cc2_approval_auto_allow", session=self.name, tool=tool)
             return sdk.PermissionResultAllow()
         aid = "cc2-" + uuid.uuid4().hex[:12]
-        ask_opts, ask_title, ask_multi = ([], "", False)
+        ask_opts, ask_title, ask_multi, ask_meta = ([], "", False, {})
         if tool == "AskUserQuestion":
-            ask_opts, ask_title, ask_multi = self._ask_question_options(tool_input)
+            (ask_opts, ask_title, ask_multi,
+             ask_meta) = self._ask_question_options(tool_input)
         title = ask_title or str(getattr(_ctx, "title", "") or
                                  f"Claude Code 要使用 {tool}")[:200]
         now = time.time()
@@ -1547,7 +1562,9 @@ class CCSdkSession:
             "created_at": now, "expires_at": now + approval_timeout() + 5.0,
             "status": "pending", "decided_at": None, "result": None,
             "session_id": f"cc2:{self.name}", "provider": "cc2",
-            "kind": "permission",
+            # 提問與權限是**不同的東西**:app 的渲染與 `_approval_decide_core`
+            # 的字彙都分(question→answered / permission→approved|denied)。
+            "kind": "question" if ask_opts else "permission",
             # 三態選項(鏡像 codex _handle_approval_request 的宣告形狀,app
             # 零改動):第三顆 key=approve_for_session → 舊 App(只認
             # approve/deny)安全退成一般允許,不會誤送拒絕;style=secondary
@@ -1561,6 +1578,12 @@ class CCSdkSession:
         if ask_opts:
             record["kind"] = "question"       # app 可據此換版面(不換也能用)
             record["risk"] = "low"            # 回答問題不是危險操作
+            # **卡片 meta**(2026-10-29):`ApprovalCardMixin` 會把這幾個鍵轉進
+            # 卡片 body —— `multiselect` 決定 app 畫單選還是複選,
+            # `q_index/q_total` 讓「第 N/M 題」顯示得出來。原本 cc2 的 record
+            # 根本沒有 `meta` 鍵 → app 只能把複選題當單選畫,而且看不出還有幾題。
+            if ask_meta:
+                record["meta"] = ask_meta
         waiter = {"event": asyncio.Event(), "decision": None,
                   "record": record, "session": self.name}
         self.registry.pending_approvals[aid] = waiter
@@ -1669,8 +1692,24 @@ class CCSdkSession:
             return sdk.PermissionResultDeny(message=msg_text, interrupt=False)
         if approved:
             return sdk.PermissionResultAllow()
+        # 「逾時」與「使用者按了拒絕」必須**分開講**(2026-10-29)。
+        #
+        # 原本兩者共用一句「未核准(逾時或拒絕)」。那句話對模型與對使用者都
+        # 等於沒說:使用者看到卡片寫「拒絕執行」,而他根本沒按過任何東西 ——
+        # 他會以為 app 壞了,或以為自己誤觸。配上原本**完全沒有推播**
+        # (bridge 的 `_cc2_approval_db_upsert` 抄漏了那一行),症狀就是
+        # 「工具莫名被拒,沒人知道為什麼」。
+        #
+        # 逾時的上限(110s)**不能放寬** —— 它必須早於 CLI 端 stdio 審批的
+        # 逾時,我們才保證得了送回一個明確的 deny(fail-closed)。所以解法
+        # 不是等久一點,是:推播讓人及時知道(已補)+ 這裡把原因講清楚。
+        if not decision:
+            return sdk.PermissionResultDeny(
+                message=(f"No one answered within {int(approval_timeout())}s, "
+                         "so Pocket auto-declined this tool call (fail-closed). "
+                         "The user was notified; ask again if you still need it."))
         return sdk.PermissionResultDeny(
-            message="Pocket 未核准(逾時或拒絕),fail-closed 拒絕執行")
+            message="The user declined this tool call in Pocket.")
 
 
 # ── 註冊表(name → session;name→{sdk_session_id,workdir,permission_mode}
@@ -1887,16 +1926,27 @@ class CCSdkRegistry:
 
     # ── v2 sessions 列表 ──
 
-    def v2_rows(self) -> list[dict]:
+    def v2_rows(self, include_archived: bool = False) -> list[dict]:
+        """v2 session 列。
+
+        `include_archived`(2026-10-29 加):封存的 session 原本**只是被跳過**,
+        而 cc2 沒有任何「列出封存」的管道 —— 於是封存一條等於它從 app 永久
+        消失、使用者也無從得知要解除哪一條(解除本身是有的:
+        `POST /app/v2/cc2/{name}/archive` 收 `{"archived": false}`)。
+        tmux 路徑一直有 `GET /ccsessions?archived=true`,cc2 要取代它就得有
+        對等的出口。封存列帶 `status:"archived"`(與 tmux 同字彙)。
+        """
         self.load()
         out = []
         for name in sorted(self.sessions):
             sess = self.sessions[name]
-            if getattr(sess, "archived", False):
-                continue                      # 封存的不進列表(對話仍在)
+            archived = bool(getattr(sess, "archived", False))
+            if archived != include_archived:
+                continue      # 預設只出未封存;要封存列就明確問
             pend = self.pending_for(name)
-            status = "waiting_approval" if pend else (
-                "running" if sess.busy else "idle")
+            status = "archived" if archived else (
+                "waiting_approval" if pend else (
+                    "running" if sess.busy else "idle"))
             # D12:app 列表/詳情要用的欄位原本都沒吐(workdir 連 subtitle 退路
             # 都拿不到、WorkingBar 的計時拿不到、排隊深度看不到)。
             meta = {"permission_mode": sess.permission_mode,

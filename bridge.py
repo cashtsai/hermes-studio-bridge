@@ -18982,7 +18982,8 @@ async def v2_agents(request: Request):
 
 
 @app.get("/app/v2/sessions")
-async def v2_sessions(request: Request, provider: str = "", status: str = ""):
+async def v2_sessions(request: Request, provider: str = "", status: str = "",
+                      archived: bool = False):
     _check_auth(request)
     out = []
     degraded = []   # 取清單失敗的 provider(目前只有 codex 分支會標)
@@ -19116,7 +19117,10 @@ async def v2_sessions(request: Request, provider: str = "", status: str = ""):
     # codex/openclaw 同款標 degraded,不無聲吞錯。
     if cc_sdk.enabled():
         try:
-            out.extend(cc_sdk.registry().v2_rows())
+            # `archived=true` 才出封存列(cc2 原本完全沒有這條出口 ——
+            # 封存一條就從 app 消失且找不回來)。對齊 tmux 的
+            # `GET /ccsessions?archived=true`。
+            out.extend(cc_sdk.registry().v2_rows(include_archived=archived))
         except Exception as e:  # noqa: BLE001
             _log_event("v2_cc2_list_failed", error=type(e).__name__,
                        error_message=str(e)[:200])
@@ -21455,12 +21459,42 @@ def _cc2_approval_db_upsert(record: dict) -> None:
                         (record["id"], record["title"], record["source"],
                          record["risk"], record["detail"], record["created_at"],
                          record["expires_at"], "pending", None, None, None,
-                         record["session_id"], "cc2", "permission",
+                         record["session_id"], "cc2",
+                         # ⚠️ 用 record 自己的 kind,**不要硬寫 "permission"**
+                         # (2026-10-29 修)。cc_sdk 那側已經正確分出
+                         # `question`(AskUserQuestion)與 `permission`,
+                         # 這裡硬寫會讓審核中心把「請選 Postgres / MySQL」
+                         # 渲染成權限確認 —— 使用者看到的是錯的問題類型。
+                         # cc_sdk 花了很長的註解去修「提問被記成 denied」,
+                         # 結果 DB 鏡像這一側又把 kind 弄錯:同一個 bug 的另一半。
+                         record.get("kind") or "permission",
                          json.dumps(record["options"], ensure_ascii=False)))
         con.commit()
         con.close()
     finally:
         con.close()
+    # **推播**(2026-10-29 補)。這支原本幾乎逐行照 `_oc_approval_upsert` 寫,
+    # **唯獨漏了這一行** —— 是抄漏,不是設計選擇。
+    # 後果:cc2 session 停在審批時手機完全沒通知,而 cc_sdk 的等待上限是
+    # 110 秒 fail-closed → 使用者沒盯著畫面,工具就在兩分鐘內被悄悄拒絕。
+    # 兩個缺陷疊起來的症狀是「工具莫名被拒,沒人知道為什麼」。
+    _cc2_approval_push(record)
+
+
+def _cc2_approval_push(record: dict) -> None:
+    """待審推播。語意與 `_oc_approval_push` 完全相同(沿用審核中心既有的
+    `_approval_push`,鎖屏動作鈕/巢形狀一致);無執行中 event loop
+    (純 sync 匯入期/測試)則跳過。"""
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    try:
+        _approval_push(record["id"], record["title"], record["detail"],
+                       record.get("session_id") or "")
+    except Exception as e:  # noqa: BLE001 — 推播失敗不該讓待審整筆掉
+        _log_event("cc2_approval_push_failed", approval_id=record.get("id"),
+                   error=type(e).__name__, error_message=str(e)[:160])
 
 
 def _cc2_approval_db_mark(aid: str, status: str) -> None:

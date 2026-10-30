@@ -760,6 +760,101 @@ class TestHistorySeed(CC2Base):
 
 # ───────────────────────── 審批第三態(gap #2)─────────────────────────
 
+class TestApprovalParity(CC2Base):
+    """審批面與 tmux 的 parity(2026-10-29/30)。cc2 的目標是取代 tmux,
+    這幾條守的是「切過去不會比現在差」。"""
+
+    ASK = {"questions": [
+        {"header": "資料庫", "question": "用哪個?", "multiSelect": True,
+         "options": [{"label": "Postgres", "description": "預設"},
+                     {"label": "MySQL", "description": "舊系統相容"}]},
+        {"header": "快取", "question": "要 Redis 嗎?",
+         "options": [{"label": "要"}, {"label": "不要"}]},
+    ]}
+
+    def test_ask_card_carries_multiselect_and_question_count(self):
+        """app 要畫得出「複選」與「第 N/M 題」—— record 原本根本沒有 meta 鍵。"""
+        async def run():
+            sess = cc_sdk.registry().ensure("ap1", workdir=_TMP)
+            with patch.dict(os.environ, {"CC_SDK_APPROVAL_TIMEOUT": "0.05"}):
+                await sess._can_use_tool("AskUserQuestion", self.ASK,
+                                         type("Ctx", (), {})())
+            return sess
+
+        sess = asyncio.run(run())
+        card = next(e["data"]["card"] for e in
+                    _events(sess.digest.store, "card.upsert")
+                    if e["data"]["card"]["kind"] == "approval")
+        b = card["body"]
+        self.assertTrue(b.get("multiselect"),
+                        "複選題沒標 multiselect → app 只能當單選畫,使用者在盲選")
+        self.assertEqual(b.get("q_total"), 2, "看不出總共幾題")
+        self.assertEqual(b.get("q_index"), 1)
+        # 選項說明必須保留(原本只取 label → 說明空白)
+        opt = next(o for o in b["options"] if o["label"] == "Postgres")
+        self.assertEqual(opt.get("detail"), "預設",
+                         "選項說明被丟掉 —— 使用者看不到每個選項是什麼意思")
+
+    def test_ask_record_kind_is_question_not_permission(self):
+        """提問與權限是不同的東西:DB 鏡像原本把 kind 硬寫成 permission,
+        審核中心於是把「請選 Postgres / MySQL」渲染成權限確認。"""
+        captured = []
+        async def run():
+            sess = cc_sdk.registry().ensure("ap2", workdir=_TMP)
+            with patch.object(cc_sdk, "APPROVAL_DB_UPSERT", captured.append), \
+                 patch.dict(os.environ, {"CC_SDK_APPROVAL_TIMEOUT": "0.05"}):
+                await sess._can_use_tool("AskUserQuestion", self.ASK,
+                                         type("Ctx", (), {})())
+        asyncio.run(run())
+        self.assertEqual(captured[0]["kind"], "question")
+        self.assertEqual(captured[0]["risk"], "low", "回答問題不是危險操作")
+
+    def test_timeout_message_distinguishes_from_user_decline(self):
+        """逾時與「使用者按了拒絕」必須分開講。
+
+        原本兩者共用「未核准(逾時或拒絕)」—— 使用者看到「拒絕執行」卻從沒按過
+        任何東西,只會以為 app 壞了。而 110s 上限不能放寬(必須早於 CLI 端 stdio
+        逾時才保證送得出明確 deny),所以解法是把原因講清楚 + 推播讓人及時知道。
+        """
+        async def run():
+            sess = cc_sdk.registry().ensure("ap3", workdir=_TMP)
+            with patch.dict(os.environ, {"CC_SDK_APPROVAL_TIMEOUT": "0.05"}):
+                return await sess._can_use_tool("Bash", {"command": "ls"},
+                                                type("Ctx", (), {})())
+
+        res = asyncio.run(run())
+        self.assertEqual(res.behavior, "deny")
+        self.assertIn("No one answered", res.message,
+                      "逾時的訊息必須說清楚是「沒人回答」,不是「使用者拒絕」")
+        # 不可以說成「使用者拒絕了」(`auto-declined` 裡也有 declined,
+        # 所以驗的是那整句主張,不是單字 —— 我自己先用單字驗,錯了一次)。
+        self.assertNotIn("The user declined", res.message)
+
+
+class TestArchivedVisibility(CC2Base):
+    def test_archived_sessions_are_queryable_not_lost(self):
+        """封存不得等於消失(2026-10-30)。
+
+        `v2_rows` 原本只是**跳過**封存的 session,而 cc2 沒有任何「列出封存」
+        的管道 → 封存一條就從 app 永久消失、使用者也無從得知要解除哪一條
+        (解除本身是有的)。tmux 一直有 `GET /ccsessions?archived=true`。
+        """
+        reg = cc_sdk.registry()
+        reg.ensure("live1", workdir=_TMP)
+        gone = reg.ensure("gone1", workdir=_TMP)
+        gone.archived = True
+
+        ids = [r["id"] for r in reg.v2_rows()]
+        self.assertIn("cc2:live1", ids)
+        self.assertNotIn("cc2:gone1", ids, "預設列表不該出封存的")
+
+        arch = reg.v2_rows(include_archived=True)
+        self.assertEqual([r["id"] for r in arch], ["cc2:gone1"],
+                         "封存列查不到 —— 那條 session 等於被刪了")
+        self.assertEqual(arch[0]["status"], "archived",
+                         "狀態字彙要與 tmux 一致")
+
+
 class TestApprovalForSession(CC2Base):
     def test_options_shape_has_for_session(self):
         """卡片契約:三顆選項,形狀鏡像 codex(key/label/style),app 零改動。"""
