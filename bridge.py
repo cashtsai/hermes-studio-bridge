@@ -12083,6 +12083,70 @@ async def app_relay_status(request: Request):
     return _relay_status_payload()
 
 
+@app.post("/app/v1/relay/enroll")
+async def app_relay_enroll(request: Request):
+    """把手機帶來的 pocket-id enroll token 兌現成「這台 Mac 的主機身分」。
+
+    ## 為什麼需要這條(2026-10-29)
+
+    中繼放行查的是**主機所屬帳號**有沒有權益。主機原本只有一條註冊路徑:
+    桌面端用 Apple 登入 → `_pocket_id_autoenroll`。於是**匿名付費的人永遠
+    註冊不了主機** —— 他在手機上付了錢、拿到交易帳號的權益,但那個帳號名下
+    沒有任何主機,`/v1/relay/claim` 照樣 402。
+
+    補上這條之後,匿名那條路就完整了:
+      手機付款 → pocket-id 回 session → 手機用它換 enroll token
+      → **交給這裡** → Mac 註冊成那個帳號底下的主機 → claim 通過。
+    全程零登入。
+
+    ## 授權設計(刻意與 /relay/enable 不同級)
+
+    付款發生在**手機**上,而 owner token 在桌面端 —— 要求 owner 授權等於
+    匿名流程走不完。所以:
+
+      · **配對過的裝置就能做第一次綁定** —— 那無害,只是把一台尚未歸屬的
+        Mac 登記到付錢的人名下。
+      · **已經註冊過要重綁,一律要 owner token** —— 那才是危險動作
+        (否則一支配對過的手機可以把機主的 Mac 搬到別人的帳號底下)。
+      · **中繼真正開啟仍是 owner 專屬**(`/app/v1/relay/enable` 不變)——
+        「把本機端上公網」這個決定不下放。
+    """
+    _check_auth(request)
+    if not POCKET_ID_URL:
+        raise http_err(503, "POCKET_ID_NOT_CONFIGURED",
+                       "這台 bridge 沒有設定 pocket-id(POCKET_ID_URL)")
+    body = await _json_body(request)
+    token = str(body.get("enroll_token") or "").strip()
+    if not token:
+        raise http_err(400, "ENROLL_TOKEN_REQUIRED", "需要 enroll_token")
+
+    existing = _pocket_id_state()
+    if existing.get("host_id"):
+        # 重綁 = 把這台機器換到另一個帳號底下。只有 owner 能決定。
+        auth = request.headers.get("authorization", "")
+        tok = auth[7:].strip() if auth.lower().startswith("bearer ") else ""
+        if not hmac.compare_digest(tok, BRIDGE_TOKEN):
+            raise http_err(409, "ALREADY_ENROLLED",
+                           "這台 Mac 已經註冊過了。要改綁到另一個帳號,"
+                           "請在桌面端用機主權限操作。")
+    try:
+        await _pocket_id_register(token)
+    except Exception as e:  # noqa: BLE001
+        _log_event("relay_enroll_failed", error=type(e).__name__,
+                   error_message=str(e)[:200])
+        raise http_err(502, "ENROLL_FAILED",
+                       f"向 pocket-id 註冊失敗:{str(e)[:160]}")
+    st = _pocket_id_state()
+    _log_event("relay_enrolled_via_handover",
+               rebind=bool(existing.get("host_id")),
+               host_id_hash=_short_hash(str(st.get("host_id") or "")))
+    # 刻意**不**順手開啟中繼:那是 owner 的決定(見 /app/v1/relay/enable)。
+    return {"ok": True, "enrolled": bool(st.get("host_id")),
+            "rebound": bool(existing.get("host_id")),
+            "relay": _relay_status_payload(),
+            "note": "已完成主機註冊。中繼仍需在桌面端由機主開啟。"}
+
+
 @app.post("/app/v1/relay/enable")
 async def app_relay_enable(request: Request):
     """開/關中繼隧道。**owner 專屬**:這是「把本機服務端上公網」的動作,
