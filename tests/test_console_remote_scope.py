@@ -51,8 +51,20 @@ class ConsoleRemoteScopeTest(unittest.TestCase):
             }
 
     def tearDown(self):
-        with bridge._PAIR_LOCK:
+        # 刻意**不**用 `with _PAIR_LOCK` —— 如果某個測試踩到鎖重入,那把鎖
+        # 會被卡住的執行緒永久持有,這裡就會跟著卡,然後整套測試掛死、
+        # 看不到任何一條失敗訊息(真實發生過:死鎖是在 /file 那條被偵測到的,
+        # 但掛死的是這裡)。清理不值得用「整套測試的可觀察性」去換。
+        if bridge._PAIR_LOCK.acquire(timeout=5):
+            try:
+                bridge._DEVICE_TOKENS.pop(self.TOKEN, None)
+            finally:
+                bridge._PAIR_LOCK.release()
+        else:
+            # dict.pop 本身是 atomic,拿不到鎖也能清掉,只是少了對其他
+            # _PAIR_LOCK 讀者的一致性保證 —— 這在測試裡可以接受。
             bridge._DEVICE_TOKENS.pop(self.TOKEN, None)
+            print("⚠️ tearDown 拿不到 _PAIR_LOCK(5s)—— 有執行緒卡在鎖裡")
 
     def _hdr(self):
         return {"Authorization": "Bearer " + self.TOKEN}
