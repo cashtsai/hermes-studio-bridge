@@ -831,6 +831,41 @@ class TestApprovalParity(CC2Base):
         self.assertNotIn("The user declined", res.message)
 
 
+class TestGovernanceRegistration(CC2Base):
+    """cc2 session 要進戶政 + 吃配額(2026-10-30)。
+
+    tmux 的 `POST /ccsessions` 一直有 `_registry_precheck_or_429` 與
+    `_registry_register`,cc2 的建立路徑整個沒有 → cc2 session 不進
+    workers/discovery/治理視圖,配額也擋不住。cc2 的目標是取代 tmux,
+    這一格不能少。
+    """
+
+    def test_create_registers_in_governance(self):
+        calls = []
+        with patch.object(bridge, "_registry_register",
+                          lambda sid, **kw: calls.append((sid, kw))):
+            asyncio.run(bridge.v2_cc2_create(
+                "gov1", FakeRequest({"workdir": _TMP})))
+        self.assertEqual(len(calls), 1, "新建的 cc2 session 沒進戶政")
+        sid, kw = calls[0]
+        self.assertEqual(sid, "cc2:gov1")
+        self.assertEqual(kw["provider"], "cc2")
+
+    def test_idempotent_repost_does_not_recharge_quota(self):
+        """重 POST 同名只更新設定(刻意冪等,不打斷進行中的 turn)——
+        那不是開新 session,不該再吃一次配額。否則配額滿了連「改個 model」
+        都會 429。"""
+        pre, reg = [], []
+        with patch.object(bridge, "_registry_precheck_or_429",
+                          lambda *a, **k: pre.append(a)), \
+             patch.object(bridge, "_registry_register",
+                          lambda sid, **kw: reg.append(sid)):
+            asyncio.run(bridge.v2_cc2_create("gov2", FakeRequest({"workdir": _TMP})))
+            asyncio.run(bridge.v2_cc2_create("gov2", FakeRequest({"model": "opus"})))
+        self.assertEqual(len(pre), 1, "冪等重 POST 又吃了一次配額")
+        self.assertEqual(len(reg), 1, "冪等重 POST 又註冊了一次")
+
+
 class TestArchivedVisibility(CC2Base):
     def test_archived_sessions_are_queryable_not_lost(self):
         """封存不得等於消失(2026-10-30)。

@@ -21691,6 +21691,21 @@ async def v2_cc2_create(name: str, request: Request):
                        f"permission_mode 必須是 {list(cc_sdk.PERMISSION_MODES)} "
                        f"或 {list(cc_sdk.MODE_ALIASES)} 之一")
     pins = body.get("spawn_opts")
+    # ── 戶政 + 配額(2026-10-30 補)────────────────────────────────────────
+    #
+    # tmux 的 `POST /ccsessions` 一直有這兩件(`_registry_precheck_or_429` +
+    # `_registry_register`),cc2 的建立路徑**整個沒有** → cc2 session 不進
+    # workers/discovery/治理視圖,配額也擋不住。cc2 的目標是取代 tmux,
+    # 這一格不能少。
+    #
+    # ⚠️ 只對「**真的新建**」收配額:這支是冪等的(同名重 POST 只更新設定,
+    # 刻意不打斷進行中的 turn)。對既有 session 也 precheck 的話,配額滿了
+    # 連「改個 model」都會 429 —— 那是把設定變更當成開新 session 收費。
+    is_new = cc_sdk.registry().get(name) is None
+    reg_parent, reg_cls, reg_purpose = _registry_spawn_fields(body,
+                                                              default_cls="task")
+    if is_new:
+        _registry_precheck_or_429(reg_parent, reg_cls)
     sess = cc_sdk.registry().ensure(
         name, workdir=str(body.get("workdir") or "").strip(),
         permission_mode=mode,
@@ -21704,6 +21719,11 @@ async def v2_cc2_create(name: str, request: Request):
             name, str(pins.get("api_key") or "").strip())
     else:
         has_key = bool(cc_sdk.read_spawn_secret(name))
+    if is_new:
+        # 註冊在 ensure **之後**:註冊代表「這條真的存在了」,ensure 失敗時
+        # 不該留下戶政孤兒(對照 tmux 把 _registry_register 擺在 spawn 之後)。
+        _registry_register(f"cc2:{name}", provider="cc2", name=name,
+                           purpose=reg_purpose, cls=reg_cls, parent=reg_parent)
     out = {"ok": True, "session_id": f"cc2:{name}",
            "workdir": sess.workdir, "permission_mode": sess.permission_mode,
            "model": sess.model or None,
@@ -29535,6 +29555,18 @@ async def _registry_legacy_rows(known_ids: set) -> list:
                 out.append(_registry_legacy_row(sid, "claude_code", name))
     except Exception as _exc:  # noqa: BLE001
         _log_exc("_registry_legacy_rows#cc", _exc, expected=True)
+    # cc2(2026-10-30 補):建立路徑現在會 `_registry_register`,但**既有的**
+    # cc2 session 不會 —— 這次改動之前建的、以及走 `_resume`/adopt-by-cwd
+    # 那兩條路進來的,都沒有戶政。那正是這支「盤點旁路」要收的東西。
+    # 封存的不列(與 v2_rows 的預設一致)。
+    try:
+        if cc_sdk.enabled():
+            for row in cc_sdk.registry().v2_rows():
+                if row["id"] not in known_ids:
+                    out.append(_registry_legacy_row(
+                        row["id"], "cc2", row.get("title") or row["id"]))
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("_registry_legacy_rows#cc2", _exc, expected=True)
     for sid, sub in list(SUBSESSIONS.items()):
         if sid not in known_ids:
             out.append(_registry_legacy_row(sid, "dispatch",
