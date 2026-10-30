@@ -506,6 +506,99 @@ def _auth_fail_summary_locked(request: Request, status: int, now: float) -> dict
     }
 
 
+# ───── console-remote scope(QR 登入發出的受限 token)─────────────────────
+#
+# 機主 2026-10-30 拍板:QR 登入發出的 token **不能**與手機的 device token
+# 同權。但也不是照規格 §9 完全擋掉檔案面 —— 那會讓遠端控制台看不了檔案,
+# 而「手機看家中電腦任何檔案」正是產品的第二條腿。折衷是**唯讀 + 限定目錄**。
+#
+# 預設**一個目錄都不開**:沒設 env 就等於規格原本的「擋掉檔案面」。
+# 要開就明確列出要開哪幾個 —— 安全的那一側當預設,放寬是刻意動作。
+CONSOLE_REMOTE_SCOPE = "console-remote"
+CONSOLE_REMOTE_FILE_ROOTS = [
+    os.path.realpath(os.path.expanduser(r.strip()))
+    for r in (os.environ.get("POCKET_CONSOLE_REMOTE_FILE_ROOTS") or "").split(":")
+    if r.strip()
+]
+
+# console-remote token 打得到的路徑**白名單**。
+#
+# 白名單而不是黑名單:新增端點時,黑名單會**安靜地**把它放行 —— 而這條路的
+# 前提是「人不一定在可信的電腦前」,安靜放行等於把新端點預設交出去。
+# 白名單的代價是新增端點要記得加,但漏加只會壞功能、不會漏權限。
+_CONSOLE_REMOTE_ALLOW = (
+    "/console",            # 控制台本體與其靜態資源
+    "/app/v2/sessions",    # session 清單、卡片流、輸入、核准
+    "/app/v1/approvals",
+    "/ccsessions",
+    "/codexsessions",
+    "/sessions",
+    "/health",
+    "/file",               # 受 CONSOLE_REMOTE_FILE_ROOTS 進一步限制
+    "/filediff",
+)
+
+
+def _token_entry(token: str) -> dict | None:
+    """raw token → device token entry(沒有或不是 device token 回 None)。"""
+    token = (token or "").strip()
+    if not token or hmac.compare_digest(token, BRIDGE_TOKEN):
+        return None
+    with _PAIR_LOCK:
+        return _DEVICE_TOKENS.get(token)
+
+
+def _token_scope(token: str) -> str:
+    """這枚 token 的 scope。一般 device token 沒有 scope → 空字串。"""
+    entry = _token_entry(token) or {}
+    return str(entry.get("scope") or "")
+
+
+def _expires_passed(exp, now: float | None = None) -> bool:
+    """到期判定(**不碰任何鎖**)。缺欄位或格式錯一律視為已過期:
+    那代表發 token 的時候就寫錯了,寧可當場失效也不要無限期有效。
+
+    抽出來是因為持鎖的呼叫端(`_check_auth`)不能再去拿鎖 —— 見該處註解。
+    """
+    try:
+        return float(exp) <= (time.time() if now is None else now)
+    except (TypeError, ValueError):
+        return True
+
+
+def _console_remote_expired(token: str, now: float | None = None) -> bool:
+    """console-remote token 有有效期 —— **一般 device token 完全沒有**,
+    這是這條路獨有的新行為(規格 §9)。沒有 expires 欄位視為已過期:
+    缺欄位代表發的時候就寫錯了,寧可當場失效也不要無限期有效。"""
+    entry = _token_entry(token) or {}
+    if str(entry.get("scope") or "") != CONSOLE_REMOTE_SCOPE:
+        return False
+    return _expires_passed(entry.get("expires"), now)
+
+
+def _console_remote_path_allowed(path: str) -> bool:
+    return any(path == a or path.startswith(a + "/") or path.startswith(a + "?")
+               for a in _CONSOLE_REMOTE_ALLOW)
+
+
+def _console_remote_file_ok(real_path: str) -> bool:
+    """console-remote 能不能讀這個檔。沒設定 = 一個都不能讀。"""
+    if not CONSOLE_REMOTE_FILE_ROOTS:
+        return False
+    return any(real_path == r or real_path.startswith(r + os.sep)
+               for r in CONSOLE_REMOTE_FILE_ROOTS)
+
+
+def _request_token(request: Request) -> str:
+    """這個請求用的 token。`?token=` 只在沒有 Authorization header 時才看 ——
+    與 `/file` 的 fallback 同一套規則,**scope 檢查兩條路都要蓋到**,
+    否則 <img> 那條旁路會變成繞過 scope 的洞。"""
+    auth = request.headers.get("authorization", "")
+    if auth.lower().startswith("bearer "):
+        return auth[7:].strip()
+    return (request.query_params.get("token") or "").strip()
+
+
 def _token_is_valid(token: str) -> bool:
     """Raw token 成員檢查(master 或 device token)。無節流、無 401 副作用 ——
     需要節流的呼叫端用 _check_auth。給 /file 的 ?token= fallback 用:瀏覽器的
@@ -537,6 +630,20 @@ def _check_auth(request: Request) -> None:
         with _PAIR_LOCK:
             dev = _DEVICE_TOKENS.get(token)
             if dev is not None:
+                # console-remote 是**唯一有有效期**的 device token(規格 §9)。
+                # middleware 已經擋過一次,這裡是第二道 —— WS upgrade 之類
+                # 不走 HTTP middleware 的路徑只會經過這裡。
+                #
+                # ⚠️ 直接讀手上的 `dev`,**不要**呼叫 `_console_remote_expired()`。
+                # `_PAIR_LOCK` 是 `threading.Lock`(不可重入),而那支內部會
+                # 再拿一次同一把鎖 —— 在這裡呼叫就是**自己鎖自己**,請求整個
+                # 掛住、沒有錯誤、沒有逾時。2026-10-30 我第一版就這樣寫,
+                # 單獨跑那條測試是綠的(middleware 先擋掉所以走不到這裡),
+                # 五條一起跑才卡死。
+                if str(dev.get("scope") or "") == CONSOLE_REMOTE_SCOPE \
+                        and _expires_passed(dev.get("expires")):
+                    raise http_err(401, "TOKEN_EXPIRED",
+                                   "遠端控制台的授權已到期,請重新掃碼登入")
                 if not dev.get("apple_user_id") or _account_device_for_token(token) is not None:
                     dev["last_seen"] = time.time()
                     return
@@ -823,6 +930,36 @@ async def acp_full(model: str, prompt: str) -> str:
 
 
 app = FastAPI(title="Hermes ↔ OpenAI bridge")
+
+
+@app.middleware("http")
+async def _console_remote_scope_guard(request: Request, call_next):
+    """console-remote token 的統一關卡:**有效期 + 路徑白名單**。
+
+    做成 middleware 而不是在各端點呼叫,理由是規格 §9 那句:「沒明確標記
+    console-remote 可用的敏感端點一律拒」。分散在各端點檢查等於黑名單 ——
+    新增端點時會**安靜地**把它放行,而這條路的前提正是「人不一定在可信的
+    電腦前」。
+
+    兩條取 token 的路都蓋到(header 與 `/file` 的 `?token=` fallback)——
+    只擋 header 那條的話,`<img src="...&token=">` 就是現成的繞過。
+    """
+    token = _request_token(request)
+    if token and _token_scope(token) == CONSOLE_REMOTE_SCOPE:
+        if _console_remote_expired(token):
+            _log_event("console_remote_token_expired", path=request.url.path)
+            return JSONResponse(
+                status_code=401,
+                content={"error": {"code": "TOKEN_EXPIRED",
+                                   "message": "遠端控制台的授權已到期,請重新掃碼登入"}})
+        if not _console_remote_path_allowed(request.url.path):
+            _log_event("console_remote_path_denied", path=request.url.path)
+            return JSONResponse(
+                status_code=403,
+                content={"error": {"code": "SCOPE_FORBIDDEN",
+                                   "message": "遠端控制台沒有這項權限"}})
+        request.state.console_remote = True
+    return await call_next(request)
 
 
 @app.middleware("http")
@@ -9056,6 +9193,15 @@ async def serve_file(request: Request, path: str):
     else:
         _check_auth(request)
     p = os.path.realpath(os.path.expanduser(path))
+    # 遠端控制台(QR 登入)**唯讀 + 限定目錄**。機主 2026-10-30 拍板:規格
+    # 原本要完全擋掉檔案面,但「手機看家中電腦任何檔案」是產品賣點 ——
+    # 折衷成只開指定目錄。沒設 `POCKET_CONSOLE_REMOTE_FILE_ROOTS` 就等於
+    # 規格原本的行為(一個都不給)。
+    # 回 404 而不是 403:不要讓遠端瀏覽器藉錯誤碼**探測檔案存不存在**。
+    if _token_scope(_request_token(request)) == CONSOLE_REMOTE_SCOPE \
+            and not _console_remote_file_ok(p):
+        _log_event("console_remote_file_denied")
+        raise HTTPException(status_code=404, detail="not found")
     roots = [os.path.realpath(os.path.expanduser("~"))]
     # Agents (incl. Claude Code's scratchpad) often emit files under the system
     # temp dirs; allow those too so generated artifacts render instead of 404ing.
@@ -9118,6 +9264,15 @@ async def serve_filediff(request: Request, path: str):
     不在 repo 裡 → 404 人話（目錄沒有「當前內容」可退）。"""
     _check_auth(request)
     p = os.path.realpath(os.path.expanduser(path))
+    # 遠端控制台(QR 登入)**唯讀 + 限定目錄**。機主 2026-10-30 拍板:規格
+    # 原本要完全擋掉檔案面,但「手機看家中電腦任何檔案」是產品賣點 ——
+    # 折衷成只開指定目錄。沒設 `POCKET_CONSOLE_REMOTE_FILE_ROOTS` 就等於
+    # 規格原本的行為(一個都不給)。
+    # 回 404 而不是 403:不要讓遠端瀏覽器藉錯誤碼**探測檔案存不存在**。
+    if _token_scope(_request_token(request)) == CONSOLE_REMOTE_SCOPE \
+            and not _console_remote_file_ok(p):
+        _log_event("console_remote_file_denied")
+        raise HTTPException(status_code=404, detail="not found")
     roots = [os.path.realpath(os.path.expanduser("~"))]
     for t in ("/tmp", "/private/tmp", "/var/folders"):
         rt = os.path.realpath(t)
@@ -9488,9 +9643,16 @@ async def pair_devices(request: Request):
     _check_auth(request)
     with _PAIR_LOCK:
         out = [
+            # scope/expires 一起吐出去:機主 2026-10-30 拍板「可撤銷比可觀察
+            # 重要」。遠端瀏覽器不是一台裝置,清單上要分得出來 —— 否則使用者
+            # 看到一列陌生的「device」只會困惑,不會想到那是他在借來的電腦上
+            # 開的控制台。
             {"id": _short_hash(t), "name": d.get("name", "device"),
              "platform": d.get("platform"), "device_id": d.get("device_id"),
              "account_bound": bool(d.get("apple_user_id")),
+             "scope": d.get("scope") or None,
+             "is_remote_console": str(d.get("scope") or "") == CONSOLE_REMOTE_SCOPE,
+             "expires": d.get("expires"),
              "created": d.get("created"), "last_seen": d.get("last_seen")}
             for t, d in _DEVICE_TOKENS.items()
         ]
