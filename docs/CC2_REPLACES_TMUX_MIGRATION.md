@@ -115,7 +115,35 @@ registry（`SESSION_NAME_RE = [A-Za-z0-9_-]{1,64}`）—— **兩個獨立命名
    `cc_name_collision`（代表有歷史殘留要清）。
 3. **列表去重**：同名只出一列（cc2 那條），避免使用者看到兩個一樣的東西。
 
-## 5. 切過去會像退步的地方（必須先補，否則使用者會抗拒）
+## 4.5 取代門檻的完成狀態（2026-10-30）
+
+機主拍板「先把 SDK 做到齊現有功能再切過去」。§C 的五條門檻**已全部完成**：
+
+| 門檻 | commit | 做了什麼 |
+|---|---|---|
+| 1. seed 走共用 digest | `dba9e64` | tool_call（含 `patch`）／tool_result／attachment／thinking 一次補齊；上限改「尾端 200 行」；id 由 jsonl uuid 衍生（冪等） |
+| 1b. live 卡片同形狀 | `6ae9446` | `kind` 從 `text` 改回 `tool_call`／`tool_result`；補路徑圖的 attachment；結果上限 800→2000 |
+| 2. `status` 吐 `usage` | `6ae9446` | 原本只吐 `context` → app 的儀表整條空白且不報錯 |
+| 3. 審批推播 + 逾時誠實 | `ba0c8b6` | 補抄漏的 `_approval_push`；逾時與「使用者拒絕」分開講 |
+| 4. kind + 複選 meta | `ba0c8b6` | DB 鏡像不再硬寫 `permission`；補 `multiselect`/`q_index`/`q_total`；選項保留說明 |
+| 5. 封存可查 | `ba0c8b6` | `v2_rows(include_archived=)` + `?archived=true`，`status:"archived"` |
+
+**測試 37/37 綠，每一刀都驗過鑑別力**（注入回歸確認測試會轉紅）。
+
+### 仍未做（不阻擋切換，但要知道）
+
+| 項 | 影響 |
+|---|---|
+| live 的 thinking 串流 | 長思考階段畫面安靜（seed 已有 thinking 卡） |
+| 進場不補 pending approval 卡 | 重啟後正在等的審批要靠推播／審核中心看到，卡片流裡沒有 |
+| 複選一次只收一個答案 | 管道限制（只能靠 deny message 回答模型）；`multiselect` 已標真，app 不會畫錯版面 |
+| 多題 ask 只答第一題 | 已在 deny message 裡明講「其餘未回答」 |
+| `claudeTitle`／`sessionTitle`／`sessionId`／`plan` 欄位 | 列表副標與計畫審批的全文 |
+| `last_event_at` 不跨重啟 | bridge 重啟後 cc2 列排到最底 |
+| 無 `failed`／`down` 狀態 | 主機沒登入的 session 顯示「待命」，送出才報錯 |
+| 戶政註冊 + 配額 precheck、delegation 不支援 cc2 | 委派派不給 cc2；**若機主會用委派／工人面板，這條要先補** |
+
+## 5. 切過去會像退步的地方（原始分析，保留備查）
 
 這是 (b) 唯一的真實風險：**同一條對話在 cc2 下「進場看到的東西比 tmux 少」**。
 

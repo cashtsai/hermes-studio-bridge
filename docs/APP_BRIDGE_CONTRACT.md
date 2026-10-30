@@ -780,9 +780,23 @@ client 對接要知道的最小集合（2026-08-01 補：Android 端曾因本節
 - **provider 值 = `cc2`，session id = `cc2:{name}`**（同 §4.1 全寫規則）。
   `/app/v2/agents` 會回 `{"provider":"cc2","name":"Claude Code (SDK)","kind":"code_agent"}`。
 - **列表**：出現在 `GET /app/v2/sessions`（可 `?provider=cc2` 過濾）。
+  **`?archived=true` 回封存的 session**（`status:"archived"`，與 tmux 的
+  `GET /ccsessions?archived=true` 同字彙）；預設只回未封存。
+  解除封存 = `POST /app/v2/cc2/{name}/archive` 帶 `{"archived": false}`。
   ⚠️ **不在 `/ccsessions`**——那支是 tmux 專屬的 takeover 端點。client 若只讀
   `/ccsessions` 就永遠看不到 cc2 session（2026-10-29 實查：iOS 與 Android 的 CC
   分頁都是這個情況，cc2 在手機上目前近乎隱形）。
+- **上下文用量**：`session.status` 同時吐 **`usage`** 與 `context`（同一份資料：
+  `{used, size, pct}`）。`usage` 是 tmux 一直在用、app 的 ContextUsage decoder
+  直接吃的那個鍵 —— cc2 原本只吐 `context`，於是上下文儀表**整條空白而且不報錯**。
+  新 client 請讀 `usage`；`context` 保留相容，等兩邊收斂再談移除。
+- **審批**：`kind` 分 `question`（AskUserQuestion）與 `permission`，字彙與
+  `/app/v1/approvals/{id}/decision` 一致（question→`answered`）。
+  提問卡的 body 帶 `multiselect` / `q_index` / `q_total` / `q_headers`，
+  選項帶 `detail`（選項說明）。**待審會發推播**（與 CC／OpenClaw 同一支）。
+  ⚠️ 等決議上限 110 秒（必須早於 CLI 端 stdio 逾時才保證送得出明確 deny），
+  逾時 = fail-closed 拒絕，卡片 `resolved:"expired"`（**不是** `denied`）。
+  ⚠️ 複選題目前一次只收一個答案（管道限制），`multiselect` 仍會標真。
 - **卡片流／輸入／中斷**：直接拿 `cc2:{name}` 打既有 v2 session 端點（§5、§7），
   卡片 schema 與 CC／CX／persona **完全同款**，渲染端零改動。
 - **旗標關 = 整段缺席**：`CC_SDK_PROVIDER` 未設時 `/app/v2/cc2/*` 全回
@@ -807,10 +821,13 @@ client 對接要知道的最小集合（2026-08-01 補：Android 端曾因本節
   **原始 ts**、不掛 `turn_id`，且**保證在一切 live 事件之前**（§7 snapshot 語意：
   app 渲染完 snapshot 才從 `latest_seq` 接 SSE）。種子卡 id 由位置決定
   （`card-cc2-{name}-h{idx}`），**重種是對同一批 id 做 upsert**，不會疊出第二份歷史。
-  ⚠️ **與 tmux 的差異（client 要知道）**：tmux seed 是尾端 200 行 digest、
-  **含工具卡／thinking／附件卡**，必要時再補一張 pending approval 卡；cc2 seed
-  **只有 user／assistant 文字卡**。同一條對話在兩條路徑上「進場看到的東西」
-  不一樣多，這是現況而非 bug。
+  ✅ **2026-10-30 起與 tmux 同形狀**：seed 與 live 都走
+  `carddigest.cc_event_to_cards`，所以 `tool_call`（含 `body.patch` →
+  app 的 diff chip）、`tool_result`、`attachment`、thinking 都有；上限也改成
+  「尾端 N 行」（預設 200，與 tmux 的 `_CC_CARD_SEED_LINES` 同語意）。
+  種子卡 id 由 **jsonl 的 uuid** 衍生 → 重種是 upsert，不會疊第二份歷史。
+  ⚠️ 仍有的差異：cc2 進場**不補** pending approval 卡（tmux 會）；
+  live 的 thinking 尚未串流（seed 已有）。
 
 - **`history` 的回應形狀**：
 
