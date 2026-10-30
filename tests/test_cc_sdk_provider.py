@@ -1034,6 +1034,108 @@ class TestCcWriteEndpointsDispatch(CC2Base):
         self.assertNotIn("messages", out)
 
 
+class TestNewSessionBackend(CC2Base):
+    """遷移階段 4:新建的 CC session 走哪個後端(2026-10-30)。
+
+    這是**真正的切換點** —— 翻成 cc2 之後新開的每一條都是 SDK 後端。
+    與階段 1-3 的本質差別:那三階段關旗標就全回原狀,這一階段已經建出來的
+    cc2 session 不會變回 tmux。
+    """
+
+    # ⚠️ workdir 必須在 home 底下 —— `/ccsessions` 有這條檢查(沒有它,
+    # 不存在的路徑會讓 ccsess 悄悄退回 $HOME 並帶 --continue,劫持家目錄那條
+    # 對話)。`_TMP` 在 /var/folders,所以這組測試要自己的 home 內目錄。
+    def setUp(self):
+        super().setUp()
+        self.wd = tempfile.mkdtemp(prefix="cc2-stage4-",
+                                   dir=os.path.expanduser("~"))
+
+    def tearDown(self):
+        try:
+            os.rmdir(self.wd)
+        except OSError:
+            pass
+        super().tearDown()
+
+    def _create(self, name, **extra):
+        return asyncio.run(bridge.cc_session_create(
+            FakeRequest({"name": name, "workdir": self.wd, **extra})))
+
+    def test_default_still_tmux(self):
+        """最重要的一條:**預設不改變任何行為**。
+
+        ⚠️ 這條原本寫成 `with patch.object(..., "tmux")` 再斷言結果是 tmux ——
+        那是**空綠**:它 patch 掉了要測的那個值,所以把模組預設改成 cc2 也照樣
+        通過(鑑別力驗證當場抓到)。要測「預設」就不能 patch 它,
+        直接讀模組常數 + 確認沒設 env 時的解析結果。
+        """
+        self.assertEqual(bridge.CC_NEW_SESSIONS_BACKEND, "tmux",
+                         "模組預設不是 tmux —— 那就不是「可選擇啟用」的遷移")
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("CC_NEW_SESSIONS_BACKEND", None)
+            self.assertEqual(
+                (os.environ.get("CC_NEW_SESSIONS_BACKEND", "")
+                 .strip().lower() or "tmux"), "tmux")
+
+    def test_bad_flag_value_falls_back_to_tmux(self):
+        """旗標寫錯不該讓「開新 session」整個壞掉。"""
+        for bad in ("", "sdk", "CC2 ", "tmux2"):
+            with patch.object(bridge, "CC_NEW_SESSIONS_BACKEND", bad):
+                self.assertEqual(bridge._cc_new_backend(), "tmux",
+                                 f"旗標 {bad!r} 應退回 tmux")
+
+    def test_cc2_requires_cc2_enabled(self):
+        with patch.object(bridge, "CC_NEW_SESSIONS_BACKEND", "cc2"), \
+             patch.dict(os.environ, {"CC_SDK_PROVIDER": ""}):
+            self.assertEqual(bridge._cc_new_backend(), "tmux",
+                             "cc2 本身沒啟用時不該把新 session 丟給它")
+
+    def test_creates_cc2_and_returns_tmux_shape(self):
+        """app 零改動是整個遷移策略的前提 —— 回傳必須是 tmux 的形狀。"""
+        with patch.object(bridge, "CC_NEW_SESSIONS_BACKEND", "cc2"), \
+             patch.object(bridge, "_cc_conf_rows", lambda: []), \
+             patch.object(bridge, "_registry_precheck_or_429", lambda *a, **k: None), \
+             patch.object(bridge, "_registry_register", lambda *a, **k: None):
+            out = self._create("n4a")
+        self.assertTrue(out["ok"])
+        sess = out["session"]
+        self.assertEqual(sess["name"], "n4a")
+        self.assertEqual(sess["workdir"], os.path.realpath(self.wd))
+        # cc2 是 lazy 連線,剛建好還沒連 SDK → 照實說 starting
+        self.assertEqual(sess["status"], "starting")
+        self.assertEqual(sess["backend"], "cc2")
+        self.assertNotIn("session_id", out, "不可以回 cc2 原生形狀")
+        # 真的建在 cc2 registry 裡
+        self.assertIsNotNone(cc_sdk.registry().get("n4a"))
+
+    def test_name_collision_across_backends_is_409(self):
+        """命名空間互斥(規格 §4 規則 1):名字存在於**任一**後端就 409。
+        從源頭擋撞名,比事後在列表/解析/寫入三處各自去重可靠。"""
+        cc_sdk.registry().ensure("taken1", workdir=self.wd)
+        with patch.object(bridge, "CC_LIST_INCLUDES_CC2", True), \
+             patch.object(bridge, "_cc_conf_rows", lambda: []):
+            with self.assertRaises(HTTPException) as cm:
+                self._create("taken1")
+        self.assertEqual(cm.exception.status_code, 409)
+
+        with patch.object(bridge, "CC_NEW_SESSIONS_BACKEND", "cc2"), \
+             patch.object(bridge, "_cc_conf_rows",
+                          lambda: [("taken2", "/tmp/q", "1")]):
+            with self.assertRaises(HTTPException) as cm:
+                self._create("taken2")
+        self.assertEqual(cm.exception.status_code, 409,
+                         "tmux 已有同名,cc2 不該硬建一條")
+
+    def test_cc2_rejects_names_tmux_would_accept(self):
+        """tmux 只擋 `/|:` 與空白,cc2 限英數/底線/連字號 —— 提前講清楚,
+        而不是讓它在 v2 端點 400 時回一個 app 沒預期的錯誤碼。"""
+        with patch.object(bridge, "CC_NEW_SESSIONS_BACKEND", "cc2"), \
+             patch.object(bridge, "_cc_conf_rows", lambda: []):
+            with self.assertRaises(HTTPException) as cm:
+                self._create("has.dot")
+        self.assertEqual(cm.exception.status_code, 400)
+
+
 class TestGovernanceRegistration(CC2Base):
     """cc2 session 要進戶政 + 吃配額(2026-10-30)。
 

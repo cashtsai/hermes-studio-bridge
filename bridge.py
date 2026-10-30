@@ -14957,6 +14957,93 @@ def _cc2_answer_unsupported(name: str):
                    "POST /app/v1/approvals/{id}/decision(一次一個答案)")
 
 
+# ── 遷移階段 4:新建的 CC session 走哪個後端(2026-10-30)──────────────────
+#
+# 規格 §2「遷移槓桿」。這是**真正的切換點**:翻成 `cc2` 之後,
+#   · 新開的每一條 CC session 都是 SDK 後端
+#   · 既有的 tmux session 原地活完它的生命週期(不動、不遷移)
+#   · 某天 tmux 沒有 session 了,才談移除那幾十處 `_tmux_*`
+#
+# 仍可回退(改回 `tmux`,新 session 又走舊路),但**已經建出來的 cc2 session
+# 不會變回 tmux** —— 這是與階段 1-3 的本質差別,那三階段關旗標就全回到原狀。
+CC_NEW_SESSIONS_BACKEND = (os.environ.get("CC_NEW_SESSIONS_BACKEND", "")
+                           .strip().lower() or "tmux")
+
+
+def _cc_new_backend() -> str:
+    """新 session 該走的後端。`cc2` 需要 cc2 本身也啟用,否則退回 tmux ——
+    旗標寫錯不該讓「開新 session」整個壞掉。"""
+    if CC_NEW_SESSIONS_BACKEND == "cc2" and cc_sdk.enabled():
+        return "cc2"
+    return "tmux"
+
+
+async def _cc_create_via_cc2(name: str, wd: str, body: dict, request: Request):
+    """階段 4:`POST /ccsessions` 的 cc2 實作。
+
+    **回傳 tmux 的形狀**(`{ok, session:{name, workdir, status, model,
+    spawn_config}}`)—— app 零改動是整個遷移策略的前提,這裡不能回 cc2 原生的
+    `{ok, session_id, …}`。
+
+    內核直接呼叫 `v2_cc2_create`(戶政註冊、配額前檢、spawn_opts 白名單、
+    BYO key、拒收鍵回報全都在它裡面),不複製那些邏輯 —— 複製就會漂移。
+    """
+    # cc2 的 session 名限英數/底線/連字號;tmux 那邊只擋 `/|:` 與空白字元,
+    # 所以可能收到 cc2 不接受的名字。提前講清楚,而不是讓它在 v2 端點 400
+    # 時顯示一個 app 沒預期的錯誤碼。
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", name):
+        raise http_err(400, "BAD_SESSION_NAME",
+                       "SDK 後端的 session 名限英數/底線/連字號(≤64)")
+    spawn_cfg = _spawn_config_validate(body.get("config"), "cc")
+    cc_model = (spawn_cfg.get("model") or body.get("model") or "").strip()
+    # v2_cc2_create 自己讀 request body(FastAPI 的 Request.json() 會快取,
+    # 重複讀安全),但它認的鍵名與 /ccsessions 不同 —— 用一個 shim 餵它。
+    shim = _BodyShim(request, {
+        "workdir": wd,
+        "model": cc_model,
+        "permission_mode": (body.get("permission_mode") or "").strip(),
+        "spawn_opts": body.get("spawn_opts") or (
+            {k: v for k, v in spawn_cfg.items() if k != "model"} or None),
+        # 戶政欄位原樣轉手(parent/cls/purpose 的解析在 v2 端點裡)
+        **{k: v for k, v in body.items()
+           if k in ("parent", "cls", "purpose", "parent_session", "task_class")},
+    })
+    out = await v2_cc2_create(name, shim)
+    _log_event("cc_created_via_cc2", session=name)
+    return {"ok": True, "session": {
+        "name": name, "workdir": out.get("workdir") or wd,
+        # cc2 是 lazy 連線(第一則訊息才真的連 SDK),所以剛建好是 "starting"
+        # 而不是 "running" —— 照實講,不假裝已經跑起來了。
+        "status": "starting",
+        "model": out.get("model") or cc_model or None,
+        "spawn_config": _spawn_config_public(spawn_cfg),
+        "backend": "cc2"}}
+
+
+class _BodyShim:
+    """把既有 Request 包起來、換掉 body 的薄殼(給 `_cc_create_via_cc2` 用)。
+
+    為什麼需要:`v2_cc2_create` 會 `await request.json()`,而 `/ccsessions` 的
+    body 鍵名與它認的不同(例如 `config` vs `spawn_opts`)。直接把原 request
+    傳過去會讓它讀到錯的鍵;複製一份 v2 的建立邏輯又會漂移。
+    只代理 `headers`(`_check_auth` 要)與 `json()`,其餘屬性轉給原 request。
+    """
+
+    def __init__(self, request: Request, body: dict):
+        self._request = request
+        self._body = body
+
+    @property
+    def headers(self):
+        return self._request.headers
+
+    async def json(self):
+        return self._body
+
+    def __getattr__(self, item):
+        return getattr(self._request, item)
+
+
 def _cc_backend(name: str) -> str:
     """這個 CC session 名屬於哪個後端:`"cc"`(tmux)/ `"cc2"` / `""`(不存在)。
 
@@ -15848,6 +15935,20 @@ async def cc_session_create(request: Request):
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"cannot create workdir: {e}")
     _pretrust_claude_dir(wd)
+    # ── 階段 4 分流 ──────────────────────────────────────────────────────
+    #
+    # 擺在這裡(workdir 驗證**之後**)是刻意的:「必須在 home 底下」、「不能是
+    # home 本身」、自動建目錄、pretrust —— 這些檢查對兩個後端都該做,
+    # cc2 不該因為走新路就少掉一層防呆。
+    #
+    # **命名空間互斥**(規格 §4 規則 1):名字已存在於**任一**後端就 409。
+    # 兩邊是獨立命名空間(tmux 來自 ccsess 設定檔、cc2 來自自己的 registry),
+    # 從源頭擋住撞名,比事後在列表/解析三處各自去重可靠。
+    if _cc_backend(name):
+        raise http_err(409, "SESSION_EXISTS",
+                       f"session {name} 已存在(後端:{_cc_backend(name)})")
+    if _cc_new_backend() == "cc2":
+        return await _cc_create_via_cc2(name, wd, body, request)
     # P0 派工分級(2026-07-10):model 參數對應 ccsess 的 per-session model
     # pin(`ccsess model <name> <model>`),讓企劃/大局思考類任務可指定旗艦
     # 模型、機械性任務指定輕量模型,不必全域切換 delegation.model。
