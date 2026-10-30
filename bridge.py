@@ -9241,9 +9241,14 @@ async def _session_workdir_diff(workdir: str, path: str) -> dict:
 async def cc_session_diff(name: str, request: Request, path: str):
     _check_auth(request)
     row = next((r for r in _cc_conf_rows() if r[0] == name), None)
-    if not row:
-        raise http_err(404, "SESSION_NOT_FOUND", "unknown session")
-    return await _session_workdir_diff(row[1], path)
+    if row:
+        return await _session_workdir_diff(row[1], path)
+    # cc2 後端:diff 只需要 workdir,而 cc2 的 session 也有 —— 邏輯完全共用,
+    # 不需要另一條實作(遷移階段 3)。
+    if _cc_backend(name) == "cc2":
+        sess = cc_sdk.registry().get(name)
+        return await _session_workdir_diff(getattr(sess, "workdir", "") or "", path)
+    raise http_err(404, "SESSION_NOT_FOUND", "unknown session")
 
 
 @app.get("/codexsessions/{thread_id}/diff")
@@ -14920,14 +14925,218 @@ def _cc_pending_ask(jsonl, current=None):
     return None
 
 
+# ── 遷移階段 1:`/ccsessions` 併入 cc2 列(2026-10-30)─────────────────────
+#
+# 規格:docs/CC2_REPLACES_TMUX_MIGRATION.md §1b/§6。
+#
+# cc2 當初就是為了**取代** tmux,但兩個 app 的 CC 分頁資料源都是 `/ccsessions`
+# (tmux 專屬)—— 於是 cc2 session 在使用者眼前**整個不存在**。
+# 讓 `/ccsessions` 從「tmux 的 session」變成「**這台機器上的 Claude Code
+# session**」,底下是 tmux 還是 SDK 由 bridge 決定,app 零改動。
+#
+# 旗標預設關 → 行為與 2026-10-30 之前逐字相同。
+CC_LIST_INCLUDES_CC2 = os.environ.get("CC_LIST_INCLUDES_CC2", "0") != "0"
+
+
+def _cc2_answer_unsupported(name: str):
+    """`POST /ccsessions/{name}/answer` 對 cc2 的誠實回應。
+
+    那支是**TUI 式多選作答**:讀 pane 現況、算差集、送數字鍵 toggle、走到內嵌
+    Submit、再過一次 review 頁。cc2 沒有 pane,整套機制在它身上不存在。
+
+    cc2 的提問走結構化審批(`can_use_tool` → 審核中心 →
+    `POST /app/v1/approvals/{id}/decision`),而且目前**一次只收一個答案**
+    (回答模型的管道只有 deny message 一條)。
+
+    所以這裡回 **409 + 可行動的指路**,而不是:
+      · 404 —— 那會讓 app 以為 session 不存在(它明明在列表上)
+      · 200 假成功 —— 使用者按了以為送出,模型那邊什麼都沒收到
+    """
+    raise http_err(409, "CC2_USE_APPROVAL_DECISION",
+                   "這條 session 走 SDK 後端,多選作答請改用 "
+                   "POST /app/v1/approvals/{id}/decision(一次一個答案)")
+
+
+# ── 遷移階段 4:新建的 CC session 走哪個後端(2026-10-30)──────────────────
+#
+# 規格 §2「遷移槓桿」。這是**真正的切換點**:翻成 `cc2` 之後,
+#   · 新開的每一條 CC session 都是 SDK 後端
+#   · 既有的 tmux session 原地活完它的生命週期(不動、不遷移)
+#   · 某天 tmux 沒有 session 了,才談移除那幾十處 `_tmux_*`
+#
+# 仍可回退(改回 `tmux`,新 session 又走舊路),但**已經建出來的 cc2 session
+# 不會變回 tmux** —— 這是與階段 1-3 的本質差別,那三階段關旗標就全回到原狀。
+CC_NEW_SESSIONS_BACKEND = (os.environ.get("CC_NEW_SESSIONS_BACKEND", "")
+                           .strip().lower() or "tmux")
+
+
+def _cc_new_backend() -> str:
+    """新 session 該走的後端。`cc2` 需要 cc2 本身也啟用,否則退回 tmux ——
+    旗標寫錯不該讓「開新 session」整個壞掉。"""
+    if CC_NEW_SESSIONS_BACKEND == "cc2" and cc_sdk.enabled():
+        return "cc2"
+    return "tmux"
+
+
+async def _cc_create_via_cc2(name: str, wd: str, body: dict, request: Request):
+    """階段 4:`POST /ccsessions` 的 cc2 實作。
+
+    **回傳 tmux 的形狀**(`{ok, session:{name, workdir, status, model,
+    spawn_config}}`)—— app 零改動是整個遷移策略的前提,這裡不能回 cc2 原生的
+    `{ok, session_id, …}`。
+
+    內核直接呼叫 `v2_cc2_create`(戶政註冊、配額前檢、spawn_opts 白名單、
+    BYO key、拒收鍵回報全都在它裡面),不複製那些邏輯 —— 複製就會漂移。
+    """
+    # cc2 的 session 名限英數/底線/連字號;tmux 那邊只擋 `/|:` 與空白字元,
+    # 所以可能收到 cc2 不接受的名字。提前講清楚,而不是讓它在 v2 端點 400
+    # 時顯示一個 app 沒預期的錯誤碼。
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", name):
+        raise http_err(400, "BAD_SESSION_NAME",
+                       "SDK 後端的 session 名限英數/底線/連字號(≤64)")
+    spawn_cfg = _spawn_config_validate(body.get("config"), "cc")
+    cc_model = (spawn_cfg.get("model") or body.get("model") or "").strip()
+    # v2_cc2_create 自己讀 request body(FastAPI 的 Request.json() 會快取,
+    # 重複讀安全),但它認的鍵名與 /ccsessions 不同 —— 用一個 shim 餵它。
+    shim = _BodyShim(request, {
+        "workdir": wd,
+        "model": cc_model,
+        "permission_mode": (body.get("permission_mode") or "").strip(),
+        "spawn_opts": body.get("spawn_opts") or (
+            {k: v for k, v in spawn_cfg.items() if k != "model"} or None),
+        # 戶政欄位原樣轉手(parent/cls/purpose 的解析在 v2 端點裡)
+        **{k: v for k, v in body.items()
+           if k in ("parent", "cls", "purpose", "parent_session", "task_class")},
+    })
+    out = await v2_cc2_create(name, shim)
+    _log_event("cc_created_via_cc2", session=name)
+    return {"ok": True, "session": {
+        "name": name, "workdir": out.get("workdir") or wd,
+        # cc2 是 lazy 連線(第一則訊息才真的連 SDK),所以剛建好是 "starting"
+        # 而不是 "running" —— 照實講,不假裝已經跑起來了。
+        "status": "starting",
+        "model": out.get("model") or cc_model or None,
+        "spawn_config": _spawn_config_public(spawn_cfg),
+        "backend": "cc2"}}
+
+
+class _BodyShim:
+    """把既有 Request 包起來、換掉 body 的薄殼(給 `_cc_create_via_cc2` 用)。
+
+    為什麼需要:`v2_cc2_create` 會 `await request.json()`,而 `/ccsessions` 的
+    body 鍵名與它認的不同(例如 `config` vs `spawn_opts`)。直接把原 request
+    傳過去會讓它讀到錯的鍵;複製一份 v2 的建立邏輯又會漂移。
+    只代理 `headers`(`_check_auth` 要)與 `json()`,其餘屬性轉給原 request。
+    """
+
+    def __init__(self, request: Request, body: dict):
+        self._request = request
+        self._body = body
+
+    @property
+    def headers(self):
+        return self._request.headers
+
+    async def json(self):
+        return self._body
+
+    def __getattr__(self, item):
+        return getattr(self._request, item)
+
+
+def _cc_backend(name: str) -> str:
+    """這個 CC session 名屬於哪個後端:`"cc"`(tmux)/ `"cc2"` / `""`(不存在)。
+
+    **規則與 `_v2_card_source` 和列表去重完全一致**:先 tmux,找不到才 cc2。
+    三處必須同一條規則 —— 不一致的話會出現「列表顯示 tmux 那條、點進去開到
+    cc2、改名又改到第三個東西」這種各自看起來都對的錯。
+    """
+    try:
+        if any(r[0] == name and r[2] == "1" for r in _cc_conf_rows()):
+            return "cc"
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("_cc_backend#conf", _exc, expected=True)
+    if CC_LIST_INCLUDES_CC2 and cc_sdk.enabled() and name:
+        try:
+            if cc_sdk.registry().get(name) is not None:
+                return "cc2"
+        except Exception as _exc:  # noqa: BLE001
+            _log_exc("_cc_backend#cc2", _exc, expected=True)
+    return ""
+
+
+def _cc2_as_cc_row(row: dict) -> dict:
+    """cc2 的 v2 列 → `/ccsessions` 的 CC 列形狀。
+
+    **不新增資料,只翻譯** —— cc2 的 `v2_rows()` 已經有需要的每一欄
+    (workdir / busy / queue_depth / busy_since / model / context)。
+
+    `status` 的語意要對齊 tmux 的約定:那邊 `status` 是「tmux 存活」(恆
+    running),忙碌看 `busy`;所以這裡把 cc2 的 running/idle 都映成
+    `status="running"`(= 這條在),真正的忙碌放 `busy`。
+    封存那條照 tmux 的字彙給 `status="archived"`。
+    """
+    meta = row.get("meta") or {}
+    st = row.get("status") or "idle"
+    name = str(row.get("id") or "").split(":", 1)[-1]
+    return {
+        "name": name,
+        "workdir": meta.get("workdir") or "",
+        "status": "archived" if st == "archived" else "running",
+        "busy": st == "running",
+        "awaiting": st == "waiting_approval",
+        # cc2 的 last_event_at 是純記憶體,重啟後是 None —— 照實給,
+        # 不假造時間(app 的排序會把它墊底,那是誠實的結果)。
+        "updatedAt": row.get("last_event_at"),
+        "preview": row.get("subtitle") or None,
+        "sessionId": meta.get("sdk_session_id"),
+        "sessionTitle": row.get("title") or None,
+        # claudeTitle 來自 tmux 的 pane_title,cc2 沒有 pane → 誠實給 None
+        # (不要拿 session 名充當,那會讓 app 以為有標題)。
+        "claudeTitle": None,
+        # 讓診斷分得出這條是哪個後端。app 不認得這個鍵也無妨(未知欄位容忍)。
+        "backend": "cc2",
+    }
+
+
 @app.get("/ccsessions")
 async def cc_list(request: Request, archived: bool = False):
     _check_auth(request)
     if archived:
         # Archived = disabled (enabled != 1) in the ccsess config.
-        return {"sessions": [{"name": n, "workdir": w, "status": "archived", "busy": False}
-                             for n, w, e in _cc_conf_rows() if e != "1"]}
-    return {"sessions": await _cc_sessions()}
+        rows = [{"name": n, "workdir": w, "status": "archived", "busy": False}
+                for n, w, e in _cc_conf_rows() if e != "1"]
+        rows += _cc2_rows_for_cc_list(include_archived=True)
+        return {"sessions": rows}
+    return {"sessions": (await _cc_sessions()) + _cc2_rows_for_cc_list()}
+
+
+def _cc2_rows_for_cc_list(include_archived: bool = False) -> list:
+    """`/ccsessions` 要併的 cc2 列。旗標關 → 空清單(零行為改變)。
+
+    撞名時**以 tmux 為準並略過 cc2 那條**:遷移期間同名可能同時存在於兩個
+    獨立命名空間(tmux 來自 ccsess 設定檔、cc2 來自自己的 registry),而使用者
+    看到兩個一樣的名字只會困惑。保守選既有的那條,並 log 下來 —— 撞名代表有
+    歷史殘留要清,不該安靜吞掉。
+    (規格 §4 建議「解析時 cc2 優先」,那是階段 2 要定的事;階段 1 只併列表,
+     先不改變任何既有 session 的行為。)
+    """
+    if not (CC_LIST_INCLUDES_CC2 and cc_sdk.enabled()):
+        return []
+    try:
+        taken = {n for n, _w, e in _cc_conf_rows() if e == "1"}
+        out = []
+        for row in cc_sdk.registry().v2_rows(include_archived=include_archived):
+            r = _cc2_as_cc_row(row)
+            if r["name"] in taken:
+                _log_event("cc_name_collision", session=r["name"],
+                           kept="tmux", skipped="cc2")
+                continue
+            out.append(r)
+        return out
+    except Exception as _exc:  # noqa: BLE001 — 併列表失敗不該讓整支端點掛
+        _log_exc("_cc2_rows_for_cc_list", _exc, expected=True)
+        return []
 
 
 @app.post("/ccsessions/{name}/rename")
@@ -14941,6 +15150,9 @@ async def cc_session_rename(name: str, request: Request):
         raise HTTPException(status_code=400, detail="unsupported session name")
     rows = _cc_conf_rows()
     current = next((r for r in rows if r[0] == name), None)
+    # cc2 後端:走結構化 rename(registry 會一併搬 secret/digest/待審等待者)
+    if _cc_backend(name) == "cc2":
+        return await v2_cc2_rename(name, request)
     if not current:
         raise http_err(404, "SESSION_NOT_FOUND", "unknown session")
     try:
@@ -15359,6 +15571,9 @@ async def cc_session_archive(name: str, request: Request):
     except Exception as _exc:  # noqa: BLE001
         _log_exc("cc_session_archive", _exc, expected=True)
         body = {}
+    # cc2 後端:封存只是 registry 的旗標,沒有 tmux 要殺、沒有 scrollback 要存
+    if _cc_backend(name) == "cc2":
+        return await v2_cc2_archive(name, request)
     if body.get("archived") is False:
         await _run_ccsess("enable", name)
         await _run_ccsess("ensure")          # relaunch the now-enabled session
@@ -15376,6 +15591,8 @@ async def cc_session_compress(name: str, request: Request):
     context → 重啟接回)。跑數分鐘,故 fire-and-forget:立即回 started,
     進度由 session 重啟本身呈現(app 端 status 會看到斷線→回來)。"""
     _check_auth(request)
+    if _cc_backend(name) == "cc2":
+        return await v2_cc2_compact(name, request)
     if not any(row[0] == name for row in _cc_conf_rows()):
         raise http_err(404, "SESSION_NOT_FOUND", "unknown session")
     now = time.time()
@@ -15718,6 +15935,20 @@ async def cc_session_create(request: Request):
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"cannot create workdir: {e}")
     _pretrust_claude_dir(wd)
+    # ── 階段 4 分流 ──────────────────────────────────────────────────────
+    #
+    # 擺在這裡(workdir 驗證**之後**)是刻意的:「必須在 home 底下」、「不能是
+    # home 本身」、自動建目錄、pretrust —— 這些檢查對兩個後端都該做,
+    # cc2 不該因為走新路就少掉一層防呆。
+    #
+    # **命名空間互斥**(規格 §4 規則 1):名字已存在於**任一**後端就 409。
+    # 兩邊是獨立命名空間(tmux 來自 ccsess 設定檔、cc2 來自自己的 registry),
+    # 從源頭擋住撞名,比事後在列表/解析三處各自去重可靠。
+    if _cc_backend(name):
+        raise http_err(409, "SESSION_EXISTS",
+                       f"session {name} 已存在(後端:{_cc_backend(name)})")
+    if _cc_new_backend() == "cc2":
+        return await _cc_create_via_cc2(name, wd, body, request)
     # P0 派工分級(2026-07-10):model 參數對應 ccsess 的 per-session model
     # pin(`ccsess model <name> <model>`),讓企劃/大局思考類任務可指定旗艦
     # 模型、機械性任務指定輕量模型,不必全域切換 delegation.model。
@@ -15891,9 +16122,16 @@ async def cc_session_history(name: str, request: Request, offset: int = 0, limit
     end `offset` events from the newest. `more` is true if older events remain."""
     _check_auth(request)
     row = next((r for r in _cc_conf_rows() if r[0] == name), None)
-    if not row:
+    if row:
+        jsonl = await _cc_session_jsonl(name, row[1])
+    elif _cc_backend(name) == "cc2":
+        # cc2 後端:**共用同一個格式化器**。兩條路徑的 transcript 是同一種
+        # jsonl,所以只要給對路徑,回應自動是 `{text, more}` 這個 app 已經在吃
+        # 的形狀 —— 不必為 cc2 另寫一套翻頁(對照 `/app/v2/cc2/{name}/history`
+        # 回的是 `{messages,…}`,那是 cc2 的原生面,形狀不同)。
+        jsonl = cc_sdk.transcript_path(cc_sdk.registry().get(name))
+    else:
         raise http_err(404, "SESSION_NOT_FOUND", "unknown session")
-    jsonl = await _cc_session_jsonl(name, row[1])
     if not jsonl or not os.path.exists(jsonl):
         return {"text": "", "more": False}
     try:
@@ -17981,6 +18219,9 @@ async def cc_session_answer(name: str, request: Request):
       `advanced:true`,由 app 接著答下一題。
     """
     _check_auth(request)
+    # cc2 後端:TUI 式多選作答不適用(見 _cc2_answer_unsupported)
+    if _cc_backend(name) == "cc2":
+        return await _cc2_answer_unsupported(name)
     if not any(r[0] == name for r in _cc_conf_rows()):
         raise http_err(404, "SESSION_NOT_FOUND", "unknown session")
     body = await request.json()
@@ -18747,6 +18988,8 @@ async def cc_session_mode(name: str, request: Request):
     "plan"|"auto"}. Sends shift+tab (BTab) and VERIFIES via the pane's bottom
     bar after each press; replies with the mode actually reached."""
     _check_auth(request)
+    if _cc_backend(name) == "cc2":
+        return await v2_cc2_settings(name, request)
     if not any(r[0] == name for r in _cc_conf_rows()):
         raise http_err(404, "SESSION_NOT_FOUND", "unknown session")
     if not await _tmux_alive(name):
@@ -18853,6 +19096,8 @@ async def cc_session_model(name: str, request: Request):
     never pressed Yes and reported a false-positive `confirmed` off the dialog
     text — see the note on _CC_MODEL_CONFIRM_POLL_SECS."""
     _check_auth(request)
+    if _cc_backend(name) == "cc2":
+        return await v2_cc2_settings(name, request)
     if not any(r[0] == name for r in _cc_conf_rows()):
         raise http_err(404, "SESSION_NOT_FOUND", "unknown session")
     if not await _tmux_alive(name):
@@ -18982,7 +19227,8 @@ async def v2_agents(request: Request):
 
 
 @app.get("/app/v2/sessions")
-async def v2_sessions(request: Request, provider: str = "", status: str = ""):
+async def v2_sessions(request: Request, provider: str = "", status: str = "",
+                      archived: bool = False):
     _check_auth(request)
     out = []
     degraded = []   # 取清單失敗的 provider(目前只有 codex 分支會標)
@@ -19116,7 +19362,10 @@ async def v2_sessions(request: Request, provider: str = "", status: str = ""):
     # codex/openclaw 同款標 degraded,不無聲吞錯。
     if cc_sdk.enabled():
         try:
-            out.extend(cc_sdk.registry().v2_rows())
+            # `archived=true` 才出封存列(cc2 原本完全沒有這條出口 ——
+            # 封存一條就從 app 消失且找不回來)。對齊 tmux 的
+            # `GET /ccsessions?archived=true`。
+            out.extend(cc_sdk.registry().v2_rows(include_archived=archived))
         except Exception as e:  # noqa: BLE001
             _log_event("v2_cc2_list_failed", error=type(e).__name__,
                        error_message=str(e)[:200])
@@ -20415,9 +20664,23 @@ def _v2_card_source(session_id: str) -> tuple:
                            f"不支援的 provider: {prov}")
         session_id = rest
     row = next((r for r in _cc_conf_rows() if r[0] == session_id), None)
-    if not row:
-        raise http_err(404, "SESSION_NOT_FOUND", "unknown session")
-    return ("cc", row[0], row[1])
+    if row:
+        return ("cc", row[0], row[1])
+    # ── 遷移階段 2:`claude_code:{name}` 的後端解析(2026-10-30)──────────
+    #
+    # 規格 §3「卡片流的 id 解析」。階段 1 讓 cc2 session 出現在 `/ccsessions`
+    # 列表裡,但 app 點進去時送的是 **`claude_code:{name}`** —— 解析不到就 404,
+    # 使用者看到「列表上有、點進去說找不到」,比完全看不到更糟。
+    #
+    # 順序刻意是「**先 tmux,找不到才 cc2**」(不是規格 §4 建議的 cc2 優先):
+    # 階段 2 的目標是「讓 cc2 被打得到」,不是改變任何既有 session 的行為。
+    # 撞名時既有的 tmux 那條仍然勝出,與階段 1 的列表去重規則一致 ——
+    # 兩處規則必須相同,否則「列表顯示 tmux 那條、點進去開到 cc2」。
+    if CC_LIST_INCLUDES_CC2 and cc_sdk.enabled() and session_id:
+        if cc_sdk.registry().get(session_id) is not None:
+            _log_event("cc_id_resolved_to_cc2", session=session_id)
+            return ("cc2", session_id)
+    raise http_err(404, "SESSION_NOT_FOUND", "unknown session")
 
 
 # ─────────── Phase 0 S2:codex 卡片事件流（同兩端點,事件驅動無輪詢）────────
@@ -21455,12 +21718,42 @@ def _cc2_approval_db_upsert(record: dict) -> None:
                         (record["id"], record["title"], record["source"],
                          record["risk"], record["detail"], record["created_at"],
                          record["expires_at"], "pending", None, None, None,
-                         record["session_id"], "cc2", "permission",
+                         record["session_id"], "cc2",
+                         # ⚠️ 用 record 自己的 kind,**不要硬寫 "permission"**
+                         # (2026-10-29 修)。cc_sdk 那側已經正確分出
+                         # `question`(AskUserQuestion)與 `permission`,
+                         # 這裡硬寫會讓審核中心把「請選 Postgres / MySQL」
+                         # 渲染成權限確認 —— 使用者看到的是錯的問題類型。
+                         # cc_sdk 花了很長的註解去修「提問被記成 denied」,
+                         # 結果 DB 鏡像這一側又把 kind 弄錯:同一個 bug 的另一半。
+                         record.get("kind") or "permission",
                          json.dumps(record["options"], ensure_ascii=False)))
         con.commit()
         con.close()
     finally:
         con.close()
+    # **推播**(2026-10-29 補)。這支原本幾乎逐行照 `_oc_approval_upsert` 寫,
+    # **唯獨漏了這一行** —— 是抄漏,不是設計選擇。
+    # 後果:cc2 session 停在審批時手機完全沒通知,而 cc_sdk 的等待上限是
+    # 110 秒 fail-closed → 使用者沒盯著畫面,工具就在兩分鐘內被悄悄拒絕。
+    # 兩個缺陷疊起來的症狀是「工具莫名被拒,沒人知道為什麼」。
+    _cc2_approval_push(record)
+
+
+def _cc2_approval_push(record: dict) -> None:
+    """待審推播。語意與 `_oc_approval_push` 完全相同(沿用審核中心既有的
+    `_approval_push`,鎖屏動作鈕/巢形狀一致);無執行中 event loop
+    (純 sync 匯入期/測試)則跳過。"""
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    try:
+        _approval_push(record["id"], record["title"], record["detail"],
+                       record.get("session_id") or "")
+    except Exception as e:  # noqa: BLE001 — 推播失敗不該讓待審整筆掉
+        _log_event("cc2_approval_push_failed", approval_id=record.get("id"),
+                   error=type(e).__name__, error_message=str(e)[:160])
 
 
 def _cc2_approval_db_mark(aid: str, status: str) -> None:
@@ -21657,6 +21950,21 @@ async def v2_cc2_create(name: str, request: Request):
                        f"permission_mode 必須是 {list(cc_sdk.PERMISSION_MODES)} "
                        f"或 {list(cc_sdk.MODE_ALIASES)} 之一")
     pins = body.get("spawn_opts")
+    # ── 戶政 + 配額(2026-10-30 補)────────────────────────────────────────
+    #
+    # tmux 的 `POST /ccsessions` 一直有這兩件(`_registry_precheck_or_429` +
+    # `_registry_register`),cc2 的建立路徑**整個沒有** → cc2 session 不進
+    # workers/discovery/治理視圖,配額也擋不住。cc2 的目標是取代 tmux,
+    # 這一格不能少。
+    #
+    # ⚠️ 只對「**真的新建**」收配額:這支是冪等的(同名重 POST 只更新設定,
+    # 刻意不打斷進行中的 turn)。對既有 session 也 precheck 的話,配額滿了
+    # 連「改個 model」都會 429 —— 那是把設定變更當成開新 session 收費。
+    is_new = cc_sdk.registry().get(name) is None
+    reg_parent, reg_cls, reg_purpose = _registry_spawn_fields(body,
+                                                              default_cls="task")
+    if is_new:
+        _registry_precheck_or_429(reg_parent, reg_cls)
     sess = cc_sdk.registry().ensure(
         name, workdir=str(body.get("workdir") or "").strip(),
         permission_mode=mode,
@@ -21670,6 +21978,11 @@ async def v2_cc2_create(name: str, request: Request):
             name, str(pins.get("api_key") or "").strip())
     else:
         has_key = bool(cc_sdk.read_spawn_secret(name))
+    if is_new:
+        # 註冊在 ensure **之後**:註冊代表「這條真的存在了」,ensure 失敗時
+        # 不該留下戶政孤兒(對照 tmux 把 _registry_register 擺在 spawn 之後)。
+        _registry_register(f"cc2:{name}", provider="cc2", name=name,
+                           purpose=reg_purpose, cls=reg_cls, parent=reg_parent)
     out = {"ok": True, "session_id": f"cc2:{name}",
            "workdir": sess.workdir, "permission_mode": sess.permission_mode,
            "model": sess.model or None,
@@ -29501,6 +29814,18 @@ async def _registry_legacy_rows(known_ids: set) -> list:
                 out.append(_registry_legacy_row(sid, "claude_code", name))
     except Exception as _exc:  # noqa: BLE001
         _log_exc("_registry_legacy_rows#cc", _exc, expected=True)
+    # cc2(2026-10-30 補):建立路徑現在會 `_registry_register`,但**既有的**
+    # cc2 session 不會 —— 這次改動之前建的、以及走 `_resume`/adopt-by-cwd
+    # 那兩條路進來的,都沒有戶政。那正是這支「盤點旁路」要收的東西。
+    # 封存的不列(與 v2_rows 的預設一致)。
+    try:
+        if cc_sdk.enabled():
+            for row in cc_sdk.registry().v2_rows():
+                if row["id"] not in known_ids:
+                    out.append(_registry_legacy_row(
+                        row["id"], "cc2", row.get("title") or row["id"]))
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("_registry_legacy_rows#cc2", _exc, expected=True)
     for sid, sub in list(SUBSESSIONS.items()):
         if sid not in known_ids:
             out.append(_registry_legacy_row(sid, "dispatch",

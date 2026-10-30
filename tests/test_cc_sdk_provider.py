@@ -39,6 +39,14 @@ class FakeToolUseBlock:
         self.id, self.name, self.input = id, name, input
 
 
+class ToolResultBlock:
+    """類別名**必須**叫 `ToolResultBlock` —— `_collect_tool_results` 用
+    `type(block).__name__` 判型(SDK 的 block 不是我們的類)。"""
+
+    def __init__(self, tool_use_id, content, is_error=False):
+        self.tool_use_id, self.content, self.is_error = tool_use_id, content, is_error
+
+
 class FakeAssistantMessage:
     def __init__(self, content, session_id=None):
         self.content = content
@@ -153,6 +161,13 @@ class FakeRequest:
 
     async def json(self):
         return self._body
+
+
+def _async_const(value):
+    """把一個值包成 async 函式(patch `_cc_sessions` 這種 awaitable 用)。"""
+    async def _f(*a, **k):
+        return value
+    return _f
 
 
 def _events(store, *types):
@@ -281,10 +296,74 @@ class TestCardStream(CC2Base):
 
         sess = asyncio.run(run())
         store = sess.digest.store
-        texts = [store.cards[i]["body"]["text"] for i in store.order]
-        self.assertIn("🔧 Bash: ls -la", texts)
+        cards = [store.cards[i] for i in store.order]
+        # 2026-10-29 契約改變:工具呼叫出 `kind="tool_call"`(與 tmux 同形狀),
+        # body 是 `{tool, summary, patch?}` 而**不是** `text` —— app 的工具列
+        # 渲染與 diff chip 綁的是這個 kind。一律索引 `body["text"]` 會 KeyError。
+        tc = [c for c in cards if c["kind"] == "tool_call"]
+        self.assertEqual(len(tc), 1, "工具呼叫必須出 tool_call 卡")
+        self.assertEqual(tc[0]["body"]["tool"], "Bash")
+        self.assertEqual(tc[0]["body"]["summary"], "ls -la",
+                         "summary 只取第一行")
+        self.assertIn("ls -la", tc[0]["body"]["fallback_text"])
+        # 錯誤卡仍是 text(system role)
+        texts = [c["body"].get("text") or "" for c in cards]
         self.assertTrue(any(t.startswith("⚠️ boom") for t in texts))
         self.assertFalse(store.status["busy"])
+
+    def test_live_tool_cards_match_tmux_shape(self):
+        """live 工具卡的形狀必須與 tmux 路徑一致(2026-10-29)。
+
+        cc2 原本把工具呼叫/結果/圖都壓成 `kind:"text"`。app 不會壞(fallback_text
+        鐵律),但**看起來就是退步**:工具列變純文字、結果框失效、**diff chip
+        整個消失**。cc2 的目標是取代 tmux,這一格不能退。
+        守三件:tool_call 帶 patch、tool_result 是獨立卡、路徑圖補 attachment。
+        """
+        async def run():
+            sess = cc_sdk.registry().ensure("lt1", workdir=_TMP)
+            FakeClient.batches = [[
+                FakeAssistantMessage([
+                    FakeToolUseBlock("e1", "Edit", {
+                        "file_path": "/tmp/a.py",
+                        "old_string": "old line", "new_string": "new line"}),
+                    FakeToolUseBlock("r1", "Read", {"file_path": "/tmp/pic.png"}),
+                ]),
+                # 結果必須在**同一回合內**到達:`turn_end` 會清 `_tool_cards`
+                # (刻意的 —— 不跨回合累積,長 session 才不會無上限長大)。
+                FakeAssistantMessage([ToolResultBlock("e1", "patched ok")]),
+                FakeResultMessage(),
+            ]]
+            await sess.submit("go")
+            await _drain(sess)
+            return sess
+
+        sess = asyncio.run(run())
+        cards = [sess.digest.store.cards[i] for i in sess.digest.store.order]
+        # ⚠️ 用 list 而不是 dict —— 這一則有**兩張** tool_call(Edit 與 Read),
+        # 以 kind 當 key 會互相覆蓋(我自己先踩了一次)。
+        by_kind = {}
+        for c in cards:
+            by_kind.setdefault(c["kind"], []).append(c)
+
+        # ① Edit 的 tool_call 必須帶 patch —— 那是 app diff chip 的唯一來源
+        self.assertEqual(len(by_kind.get("tool_call", [])), 2,
+                         "兩個工具呼叫要各出一張 tool_call")
+        edit = next(c for c in by_kind["tool_call"] if c["body"]["tool"] == "Edit")
+        self.assertIn("patch", edit["body"],
+                      "Edit 沒有合成 patch —— 改檔案就看不到 diff")
+
+        # ② tool_result 是**獨立**卡,不是把 tool_call 蓋掉
+        self.assertEqual(len(by_kind.get("tool_result", [])), 1,
+                         "工具結果必須是獨立的 tool_result 卡")
+        self.assertEqual(by_kind["tool_result"][0]["body"]["text"], "patched ok")
+        self.assertTrue(any(c["body"]["tool"] == "Edit"
+                            for c in by_kind["tool_call"]),
+                        "tool_result 不該蓋掉對應的 tool_call")
+
+        # ③ 路徑圖(agent Read 一張 PNG)要補 attachment 卡
+        self.assertEqual(len(by_kind.get("attachment", [])), 1,
+                         "agent 看了圖,手機上卻沒有縮圖")
+        self.assertEqual(by_kind["attachment"][0]["body"]["filename"], "pic.png")
 
     def test_turn_end_idle_and_queue_drain(self):
         async def run():
@@ -518,8 +597,14 @@ class TestHistorySeed(CC2Base):
         json.dumps({"type": "assistant", "message": {
             "content": [{"type": "text", "text": "回覆一"}]},
             "timestamp": "2026-08-16T01:00:05Z"}, ensure_ascii=False),
-        # 以下四行全都不該成卡:tool_result 水管 / system-reminder / 純工具
-        # assistant / 壞 JSON。
+        # ⚠️ 2026-10-29 契約改變:seed 改走 `carddigest.cc_event_to_cards`
+        # (與 tmux 路徑同一套翻譯)之後,這四行**只有兩行**不該成卡:
+        #   · tool_result 水管  → 現在是 `tool_result` 卡(tmux 一直都有)
+        #   · 純 tool_use      → 現在是 `tool_call` 卡(diff chip 的來源)
+        #   · <system-reminder> → 仍然濾掉(carddigest.PLUMBING_TAGS)
+        #   · 壞 JSON          → 仍然跳過
+        # 原本只撈純文字,所以進場看不到工具步驟 —— 而 cc2 的目標是**取代** tmux,
+        # 進場內容不能比它少。
         json.dumps({"type": "user", "message": {
             "content": [{"type": "tool_result", "content": "ok"}]}}),
         json.dumps({"type": "user", "message": {
@@ -561,11 +646,19 @@ class TestHistorySeed(CC2Base):
         sess = self._restore("h1", "sdk-h1")
         store = sess.digest.store
         cards = [store.cards[i] for i in store.order]
-        self.assertEqual([c["role"] for c in cards],
-                         ["user", "assistant", "user", "assistant"])
-        self.assertEqual([c["body"]["text"] for c in cards],
+        # 新契約(2026-10-29):工具步驟也要進場 —— 順序照 transcript 原順序。
+        self.assertEqual([(c["kind"], c["role"]) for c in cards], [
+            ("text", "user"), ("markdown", "assistant"),
+            ("tool_result", "assistant"),   # 以前被當水管丟掉
+            ("tool_call", "assistant"),     # 以前被當水管丟掉
+            ("text", "user"), ("markdown", "assistant"),
+        ], "工具卡不見了 —— 那就是「進場歷史比 tmux 少」的那個退步")
+        # 對話那四張的文字(工具卡沒有 body.text,不能一律索引)
+        self.assertEqual([c["body"].get("text") for c in cards
+                          if c["kind"] in ("text", "markdown")],
                          ["第一句", "回覆一", "第二句", "回覆二"])
-        self.assertTrue(all(c["final"] for c in cards))
+        self.assertTrue(all(c["final"] for c in cards),
+                        "歷史一律定稿,不是草稿")
         # 原 ts(權威時間),不是 seed 當下的 now
         self.assertAlmostEqual(cards[0]["ts"],
                                carddigest._epoch("2026-08-16T01:00:00Z"),
@@ -587,6 +680,15 @@ class TestHistorySeed(CC2Base):
         with patch.dict(os.environ, {"CC_SDK_HISTORY_SEED": "0"}):
             sess = self._restore("h0", "sdk-h0")
         self.assertEqual(sess.digest.store.order, [])
+        # ⚠️ 反向斷言(2026-10-29 加):光是「空的」**無法區分**「上限生效」與
+        # 「根本沒讀到檔」。那次事故裡 `_project_key` 換了演算法而測試還自己重刻,
+        # seed 靜默讀不到任何檔 —— 這一條照樣綠,只剩另外三條紅去指認問題,
+        # 追查成本高得離譜。同一份 fixture 不設 env 時必須種得出卡,
+        # 這條才算真的在測上限,而不是在測「檔案找不到」。
+        sess2 = self._restore("h0b", "sdk-h0")
+        self.assertTrue(sess2.digest.store.order,
+                        "同一份 fixture 在沒有 CC_SDK_HISTORY_SEED=0 時必須種出卡;"
+                        "空的代表讀不到檔(路徑算錯),不是上限生效")
 
     def test_seed_cards_precede_live_events(self):
         self._write_jsonl("sdk-h3", self.FIXTURE)
@@ -602,24 +704,496 @@ class TestHistorySeed(CC2Base):
 
         asyncio.run(run())
         store = sess.digest.store
-        texts = [store.cards[i]["body"]["text"] for i in store.order]
-        self.assertEqual(texts[:4], ["第一句", "回覆一", "第二句", "回覆二"])
-        self.assertEqual(texts[4:], ["live 輸入", "live 回覆"])
+        # `body.get` 而不是 `body["text"]`:工具卡沒有 text 欄(2026-10-29 起
+        # seed 會產工具卡),一律索引會 KeyError。
+        texts = [store.cards[i]["body"].get("text") for i in store.order]
+        # 契約的重點是**順序**:歷史在前、live 在後(§7 snapshot 語意)。
+        self.assertEqual(texts[-2:], ["live 輸入", "live 回覆"],
+                         "live 事件必須在歷史之後")
+        self.assertEqual([t for t in texts[:-2] if t],
+                         ["第一句", "回覆一", "ok", "第二句", "回覆二"],
+                         "歷史(含工具結果)必須是 live 之前的前綴")
 
     def test_missing_jsonl_silent(self):
         sess = self._restore("h4", "sdk-no-file")
         self.assertEqual(sess.digest.store.order, [])
+        # 「安靜」是指不出錯誤卡、不擋 session —— 但**有 sdk_session_id 卻找不到
+        # transcript** 這件事本身要留痕(2026-10-29):它與「全新對話」不同,
+        # 而原本這條路完全無聲,正是上次零線索追查的來源。
+        with patch.object(cc_sdk, "LOG") as log:
+            self._restore("h4b", "sdk-no-file")
+        events = [c.args[0] for c in log.call_args_list if c.args]
+        self.assertIn("cc2_history_seed_missing", events)
+
+    def test_reseed_is_idempotent_not_duplicated(self):
+        """同一條對話重種不得產生第二份歷史(2026-10-29)。
+
+        原本 `seed_card` 用共用的遞增計數器產 id,重種時 `_seq` 已往前走 →
+        同樣的歷史拿到不同 card id → app 端(快取 key = session_id+card.id+rev)
+        會把整段歷史疊第二份。今天僥倖沒出事只因為兩個呼叫點互斥;任何未來的
+        「自癒後重種」都會當場重複。
+        """
+        self._write_jsonl("sdk-h6", self.FIXTURE)
+        sess = self._restore("h6", "sdk-h6")
+        first = list(sess.digest.store.order)
+        # 刻意**不綁數量** —— fixture 改了不該讓這條假性紅。要守的是「重種不增卡」。
+        self.assertTrue(first, "種子一張都沒有,這條測不到冪等")
+        before = {i: sess.digest.store.cards[i]["body"].get("text") for i in first}
+        sess._seed_history()          # 模擬自癒 / adopt-by-cwd 再次觸發
+        self.assertEqual(sess.digest.store.order, first,
+                         "重種必須是對同一批 card id 做 upsert,不得新增卡")
+        after = {i: sess.digest.store.cards[i]["body"].get("text") for i in first}
+        self.assertEqual(after, before, "重種把內容改掉了")
 
     def test_unreadable_jsonl_logged_not_fatal(self):
         # 路徑是個目錄 → open 直接炸;種子必須容忍,session 照常可用。
-        d = os.path.join(self.projects, _TMP.replace("/", "-"))
+        # ⚠️ 2026-10-29:這裡原本也寫死 `_TMP.replace("/", "-")`(`_write_jsonl`
+        # 的修正漏了這條)。後果是那個「不可讀目錄」被建在**錯的 project key**
+        # 底下,`_seed_history` 走的是 `FileNotFoundError` 分支 → 這條測試
+        # **因為另一個理由通過**,它宣稱覆蓋的「整檔讀不動必須容忍」實際零覆蓋。
+        # 直接證據:修之前跑這組,h1/h2 都有 `cc2_history_seeded` 事件,
+        # h5 連一個 seed 事件都沒有。
+        d = os.path.join(self.projects, cc_sdk._project_key(_TMP))
         os.makedirs(os.path.join(d, "sdk-h5.jsonl"), exist_ok=True)
-        sess = self._restore("h5", "sdk-h5")
+        with patch.object(cc_sdk, "LOG") as log:
+            sess = self._restore("h5", "sdk-h5")
         self.assertIsNotNone(sess)
         self.assertEqual(sess.digest.store.order, [])
+        # 「容忍」不等於「沉默」:讀不動必須留痕,否則下次又是零線索追查。
+        events = [c.args[0] for c in log.call_args_list if c.args]
+        self.assertIn("cc2_history_seed_failed", events,
+                      "整檔讀不動必須 log,不能靜默吞掉")
 
 
 # ───────────────────────── 審批第三態(gap #2)─────────────────────────
+
+class TestApprovalParity(CC2Base):
+    """審批面與 tmux 的 parity(2026-10-29/30)。cc2 的目標是取代 tmux,
+    這幾條守的是「切過去不會比現在差」。"""
+
+    ASK = {"questions": [
+        {"header": "資料庫", "question": "用哪個?", "multiSelect": True,
+         "options": [{"label": "Postgres", "description": "預設"},
+                     {"label": "MySQL", "description": "舊系統相容"}]},
+        {"header": "快取", "question": "要 Redis 嗎?",
+         "options": [{"label": "要"}, {"label": "不要"}]},
+    ]}
+
+    def test_ask_card_carries_multiselect_and_question_count(self):
+        """app 要畫得出「複選」與「第 N/M 題」—— record 原本根本沒有 meta 鍵。"""
+        async def run():
+            sess = cc_sdk.registry().ensure("ap1", workdir=_TMP)
+            with patch.dict(os.environ, {"CC_SDK_APPROVAL_TIMEOUT": "0.05"}):
+                await sess._can_use_tool("AskUserQuestion", self.ASK,
+                                         type("Ctx", (), {})())
+            return sess
+
+        sess = asyncio.run(run())
+        card = next(e["data"]["card"] for e in
+                    _events(sess.digest.store, "card.upsert")
+                    if e["data"]["card"]["kind"] == "approval")
+        b = card["body"]
+        self.assertTrue(b.get("multiselect"),
+                        "複選題沒標 multiselect → app 只能當單選畫,使用者在盲選")
+        self.assertEqual(b.get("q_total"), 2, "看不出總共幾題")
+        self.assertEqual(b.get("q_index"), 1)
+        # 選項說明必須保留(原本只取 label → 說明空白)
+        opt = next(o for o in b["options"] if o["label"] == "Postgres")
+        self.assertEqual(opt.get("detail"), "預設",
+                         "選項說明被丟掉 —— 使用者看不到每個選項是什麼意思")
+
+    def test_ask_record_kind_is_question_not_permission(self):
+        """提問與權限是不同的東西:DB 鏡像原本把 kind 硬寫成 permission,
+        審核中心於是把「請選 Postgres / MySQL」渲染成權限確認。"""
+        captured = []
+        async def run():
+            sess = cc_sdk.registry().ensure("ap2", workdir=_TMP)
+            with patch.object(cc_sdk, "APPROVAL_DB_UPSERT", captured.append), \
+                 patch.dict(os.environ, {"CC_SDK_APPROVAL_TIMEOUT": "0.05"}):
+                await sess._can_use_tool("AskUserQuestion", self.ASK,
+                                         type("Ctx", (), {})())
+        asyncio.run(run())
+        self.assertEqual(captured[0]["kind"], "question")
+        self.assertEqual(captured[0]["risk"], "low", "回答問題不是危險操作")
+
+    def test_timeout_message_distinguishes_from_user_decline(self):
+        """逾時與「使用者按了拒絕」必須分開講。
+
+        原本兩者共用「未核准(逾時或拒絕)」—— 使用者看到「拒絕執行」卻從沒按過
+        任何東西,只會以為 app 壞了。而 110s 上限不能放寬(必須早於 CLI 端 stdio
+        逾時才保證送得出明確 deny),所以解法是把原因講清楚 + 推播讓人及時知道。
+        """
+        async def run():
+            sess = cc_sdk.registry().ensure("ap3", workdir=_TMP)
+            with patch.dict(os.environ, {"CC_SDK_APPROVAL_TIMEOUT": "0.05"}):
+                return await sess._can_use_tool("Bash", {"command": "ls"},
+                                                type("Ctx", (), {})())
+
+        res = asyncio.run(run())
+        self.assertEqual(res.behavior, "deny")
+        self.assertIn("No one answered", res.message,
+                      "逾時的訊息必須說清楚是「沒人回答」,不是「使用者拒絕」")
+        # 不可以說成「使用者拒絕了」(`auto-declined` 裡也有 declined,
+        # 所以驗的是那整句主張,不是單字 —— 我自己先用單字驗,錯了一次)。
+        self.assertNotIn("The user declined", res.message)
+
+
+class TestCcListMergesCc2(CC2Base):
+    """遷移階段 1:`/ccsessions` 併入 cc2 列(2026-10-30)。
+
+    cc2 的目標是取代 tmux,但兩個 app 的 CC 分頁都只讀 `/ccsessions`
+    (tmux 專屬)→ cc2 session 在使用者眼前整個不存在。
+    守三件:旗標關時零行為改變、開了之後列得出來且形狀對、撞名不出兩條。
+    """
+
+    def _rows(self):
+        return asyncio.run(bridge.cc_list(FakeRequest()))["sessions"]
+
+    def test_flag_off_changes_nothing(self):
+        """最重要的一條:旗標預設關 → 與 2026-10-30 之前**逐字相同**。"""
+        cc_sdk.registry().ensure("merged1", workdir=_TMP)
+        with patch.object(bridge, "CC_LIST_INCLUDES_CC2", False), \
+             patch.object(bridge, "_cc_conf_rows", lambda: []):
+            self.assertEqual(self._rows(), [],
+                             "旗標關著卻把 cc2 列塞進去了 —— 那不是可回退的改動")
+
+    def test_flag_on_lists_cc2_in_cc_shape(self):
+        sess = cc_sdk.registry().ensure("merged2", workdir=_TMP)
+        sess.sdk_session_id = "sdk-m2"
+        with patch.object(bridge, "CC_LIST_INCLUDES_CC2", True), \
+             patch.object(bridge, "_cc_conf_rows", lambda: []):
+            rows = self._rows()
+        self.assertEqual([r["name"] for r in rows], ["merged2"])
+        r = rows[0]
+        # `status` 要照 tmux 的約定:status 是「這條在」,忙碌看 busy。
+        self.assertEqual(r["status"], "running")
+        self.assertFalse(r["busy"], "閒置的 session 不該標 busy")
+        self.assertEqual(r["workdir"], _TMP)
+        self.assertEqual(r["sessionId"], "sdk-m2")
+        self.assertIsNone(r["claudeTitle"],
+                          "cc2 沒有 pane title —— 不可以拿 session 名充當")
+        self.assertEqual(r["backend"], "cc2", "診斷要分得出後端")
+
+    def test_name_collision_keeps_tmux_and_logs(self):
+        """同名時保守選既有的 tmux 那條,不讓使用者看到兩個一樣的名字。
+
+        兩邊是獨立命名空間(tmux 來自 ccsess 設定檔、cc2 來自自己的 registry),
+        遷移期間真的會撞。撞名代表有歷史殘留要清,所以要 log,不能安靜吞掉。
+        """
+        cc_sdk.registry().ensure("dup", workdir=_TMP)
+        events = []
+        with patch.object(bridge, "CC_LIST_INCLUDES_CC2", True), \
+             patch.object(bridge, "_cc_conf_rows",
+                          lambda: [("dup", "/tmp/x", "1")]), \
+             patch.object(bridge, "_cc_sessions",
+                          _async_const([{"name": "dup", "workdir": "/tmp/x",
+                                         "status": "running", "busy": False}])), \
+             patch.object(bridge, "_log_event",
+                          lambda ev, **kw: events.append(ev)):
+            rows = self._rows()
+        self.assertEqual([r["name"] for r in rows], ["dup"],
+                         "撞名出了兩條 —— 使用者會看到兩個一樣的 session")
+        self.assertNotIn("backend", rows[0], "撞名時該留 tmux 那條")
+        self.assertIn("cc_name_collision", events, "撞名必須留痕")
+
+    def test_archived_query_includes_cc2(self):
+        gone = cc_sdk.registry().ensure("arch1", workdir=_TMP)
+        gone.archived = True
+        with patch.object(bridge, "CC_LIST_INCLUDES_CC2", True), \
+             patch.object(bridge, "_cc_conf_rows", lambda: []):
+            rows = asyncio.run(bridge.cc_list(FakeRequest(),
+                                              archived=True))["sessions"]
+        self.assertEqual([r["name"] for r in rows], ["arch1"])
+        self.assertEqual(rows[0]["status"], "archived")
+
+
+class TestCcIdResolvesToCc2(CC2Base):
+    """遷移階段 2:`claude_code:{name}` 解析到 cc2 後端(2026-10-30)。
+
+    階段 1 讓 cc2 出現在 `/ccsessions` 列表,但 app 點進去送的是
+    `claude_code:{name}` —— 解析不到就 404,使用者看到「列表上有、點進去說
+    找不到」,**比完全看不到更糟**。
+    """
+
+    def test_claude_code_id_falls_through_to_cc2(self):
+        cc_sdk.registry().ensure("r2a", workdir=_TMP)
+        with patch.object(bridge, "CC_LIST_INCLUDES_CC2", True), \
+             patch.object(bridge, "_cc_conf_rows", lambda: []):
+            self.assertEqual(bridge._v2_card_source("claude_code:r2a"),
+                             ("cc2", "r2a"))
+
+    def test_tmux_wins_on_collision_same_rule_as_list(self):
+        """撞名時 tmux 勝 —— **必須與階段 1 的列表去重同一條規則**。
+
+        不一致的話會變成「列表顯示 tmux 那條、點進去開到 cc2」,那是最難查的
+        一種錯:兩邊各自看起來都對。
+        """
+        cc_sdk.registry().ensure("dup2", workdir=_TMP)
+        with patch.object(bridge, "CC_LIST_INCLUDES_CC2", True), \
+             patch.object(bridge, "_cc_conf_rows",
+                          lambda: [("dup2", "/tmp/y", "1")]):
+            self.assertEqual(bridge._v2_card_source("claude_code:dup2"),
+                             ("cc", "dup2", "/tmp/y"))
+
+    def test_flag_off_keeps_404(self):
+        """旗標關 → 與今天逐字相同(不解析、照樣 404)。"""
+        cc_sdk.registry().ensure("r2b", workdir=_TMP)
+        with patch.object(bridge, "CC_LIST_INCLUDES_CC2", False), \
+             patch.object(bridge, "_cc_conf_rows", lambda: []):
+            with self.assertRaises(HTTPException) as cm:
+                bridge._v2_card_source("claude_code:r2b")
+            self.assertEqual(cm.exception.status_code, 404)
+
+    def test_unknown_name_still_404(self):
+        with patch.object(bridge, "CC_LIST_INCLUDES_CC2", True), \
+             patch.object(bridge, "_cc_conf_rows", lambda: []):
+            with self.assertRaises(HTTPException) as cm:
+                bridge._v2_card_source("claude_code:never-existed")
+            self.assertEqual(cm.exception.status_code, 404)
+
+
+class TestCcWriteEndpointsDispatch(CC2Base):
+    """遷移階段 3:`/ccsessions/{name}/*` 的寫入面 dispatch(2026-10-30)。
+
+    **這不是選配** —— 階段 1+2 讓 cc2 session 對 app 長得像 `claude_code:`,
+    於是 app 的 ⋮ 選單(改名/模型/審核模式/壓縮)會對它顯示,而那些端點原本
+    一律 404(名字不在 ccsess 設定檔裡)。不補就是把階段 1+2 留在壞的狀態。
+    """
+
+    def setUp(self):
+        super().setUp()
+        self._flag = patch.object(bridge, "CC_LIST_INCLUDES_CC2", True)
+        self._conf = patch.object(bridge, "_cc_conf_rows", lambda: [])
+        self._flag.start(); self._conf.start()
+        cc_sdk.registry().ensure("w1", workdir=_TMP)
+
+    def tearDown(self):
+        self._conf.stop(); self._flag.stop()
+        super().tearDown()
+
+    def test_backend_resolver_matches_list_and_card_rules(self):
+        """三處規則必須一致:列表去重、`_v2_card_source`、`_cc_backend`。"""
+        self.assertEqual(bridge._cc_backend("w1"), "cc2")
+        self.assertEqual(bridge._cc_backend("never"), "")
+        with patch.object(bridge, "_cc_conf_rows",
+                          lambda: [("w1", "/tmp/z", "1")]):
+            self.assertEqual(bridge._cc_backend("w1"), "cc",
+                             "撞名時 tmux 勝 —— 與列表/卡片流同一條規則")
+
+    def test_mode_and_model_go_to_cc2_settings(self):
+        hits = []
+        async def fake(name, request):
+            hits.append(name); return {"ok": True}
+        with patch.object(bridge, "v2_cc2_settings", fake):
+            asyncio.run(bridge.cc_session_mode("w1", FakeRequest({"mode": "plan"})))
+            asyncio.run(bridge.cc_session_model("w1", FakeRequest({"model": "opus"})))
+        self.assertEqual(hits, ["w1", "w1"],
+                         "⋮ 選單的模式/模型切換沒轉到 cc2 → 使用者按了 404")
+
+    def test_rename_and_archive_and_compress_dispatch(self):
+        seen = []
+        async def mk(tag):
+            async def f(name, request):
+                seen.append(tag); return {"ok": True}
+            return f
+        with patch.object(bridge, "v2_cc2_rename", asyncio.run(mk("rename"))), \
+             patch.object(bridge, "v2_cc2_archive", asyncio.run(mk("archive"))), \
+             patch.object(bridge, "v2_cc2_compact", asyncio.run(mk("compress"))):
+            asyncio.run(bridge.cc_session_rename("w1", FakeRequest({"name": "w1b"})))
+            asyncio.run(bridge.cc_session_archive("w1", FakeRequest({})))
+            asyncio.run(bridge.cc_session_compress("w1", FakeRequest({})))
+        self.assertEqual(sorted(seen), ["archive", "compress", "rename"])
+
+    def test_answer_is_honest_409_not_fake_success(self):
+        """TUI 式多選作答對 cc2 不存在。回 409 + 指路 —— 不可以回 404
+        (app 會以為 session 不存在,它明明在列表上)、更不可以假成功
+        (使用者按了以為送出,模型什麼都沒收到)。"""
+        with self.assertRaises(HTTPException) as cm:
+            asyncio.run(bridge.cc_session_answer("w1", FakeRequest({"keys": ["1"]})))
+        self.assertEqual(cm.exception.status_code, 409)
+        self.assertIn("approvals", str(cm.exception.detail),
+                      "要指路到可行的那條(結構化審批決議)")
+
+    def test_diff_shares_workdir_logic(self):
+        got = []
+        async def fake(workdir, path):
+            got.append((workdir, path)); return {"text": ""}
+        with patch.object(bridge, "_session_workdir_diff", fake):
+            asyncio.run(bridge.cc_session_diff("w1", FakeRequest(), path="a.py"))
+        self.assertEqual(got, [(_TMP, "a.py")],
+                         "diff 只需要 workdir,cc2 也有 —— 該共用同一支")
+
+    def test_history_uses_shared_formatter_shape(self):
+        """回應形狀必須是 app 已經在吃的 `{text, more}`,不是 cc2 原生的
+        `{messages,…}` —— 兩邊 transcript 同格式,給對路徑就自動同形狀。"""
+        sess = cc_sdk.registry().get("w1")
+        sess.sdk_session_id = "sdk-w1"
+        out = asyncio.run(bridge.cc_session_history("w1", FakeRequest()))
+        self.assertIn("text", out)
+        self.assertIn("more", out)
+        self.assertNotIn("messages", out)
+
+
+class TestNewSessionBackend(CC2Base):
+    """遷移階段 4:新建的 CC session 走哪個後端(2026-10-30)。
+
+    這是**真正的切換點** —— 翻成 cc2 之後新開的每一條都是 SDK 後端。
+    與階段 1-3 的本質差別:那三階段關旗標就全回原狀,這一階段已經建出來的
+    cc2 session 不會變回 tmux。
+    """
+
+    # ⚠️ workdir 必須在 home 底下 —— `/ccsessions` 有這條檢查(沒有它,
+    # 不存在的路徑會讓 ccsess 悄悄退回 $HOME 並帶 --continue,劫持家目錄那條
+    # 對話)。`_TMP` 在 /var/folders,所以這組測試要自己的 home 內目錄。
+    def setUp(self):
+        super().setUp()
+        self.wd = tempfile.mkdtemp(prefix="cc2-stage4-",
+                                   dir=os.path.expanduser("~"))
+
+    def tearDown(self):
+        try:
+            os.rmdir(self.wd)
+        except OSError:
+            pass
+        super().tearDown()
+
+    def _create(self, name, **extra):
+        return asyncio.run(bridge.cc_session_create(
+            FakeRequest({"name": name, "workdir": self.wd, **extra})))
+
+    def test_default_still_tmux(self):
+        """最重要的一條:**預設不改變任何行為**。
+
+        ⚠️ 這條原本寫成 `with patch.object(..., "tmux")` 再斷言結果是 tmux ——
+        那是**空綠**:它 patch 掉了要測的那個值,所以把模組預設改成 cc2 也照樣
+        通過(鑑別力驗證當場抓到)。要測「預設」就不能 patch 它,
+        直接讀模組常數 + 確認沒設 env 時的解析結果。
+        """
+        self.assertEqual(bridge.CC_NEW_SESSIONS_BACKEND, "tmux",
+                         "模組預設不是 tmux —— 那就不是「可選擇啟用」的遷移")
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("CC_NEW_SESSIONS_BACKEND", None)
+            self.assertEqual(
+                (os.environ.get("CC_NEW_SESSIONS_BACKEND", "")
+                 .strip().lower() or "tmux"), "tmux")
+
+    def test_bad_flag_value_falls_back_to_tmux(self):
+        """旗標寫錯不該讓「開新 session」整個壞掉。"""
+        for bad in ("", "sdk", "CC2 ", "tmux2"):
+            with patch.object(bridge, "CC_NEW_SESSIONS_BACKEND", bad):
+                self.assertEqual(bridge._cc_new_backend(), "tmux",
+                                 f"旗標 {bad!r} 應退回 tmux")
+
+    def test_cc2_requires_cc2_enabled(self):
+        with patch.object(bridge, "CC_NEW_SESSIONS_BACKEND", "cc2"), \
+             patch.dict(os.environ, {"CC_SDK_PROVIDER": ""}):
+            self.assertEqual(bridge._cc_new_backend(), "tmux",
+                             "cc2 本身沒啟用時不該把新 session 丟給它")
+
+    def test_creates_cc2_and_returns_tmux_shape(self):
+        """app 零改動是整個遷移策略的前提 —— 回傳必須是 tmux 的形狀。"""
+        with patch.object(bridge, "CC_NEW_SESSIONS_BACKEND", "cc2"), \
+             patch.object(bridge, "_cc_conf_rows", lambda: []), \
+             patch.object(bridge, "_registry_precheck_or_429", lambda *a, **k: None), \
+             patch.object(bridge, "_registry_register", lambda *a, **k: None):
+            out = self._create("n4a")
+        self.assertTrue(out["ok"])
+        sess = out["session"]
+        self.assertEqual(sess["name"], "n4a")
+        self.assertEqual(sess["workdir"], os.path.realpath(self.wd))
+        # cc2 是 lazy 連線,剛建好還沒連 SDK → 照實說 starting
+        self.assertEqual(sess["status"], "starting")
+        self.assertEqual(sess["backend"], "cc2")
+        self.assertNotIn("session_id", out, "不可以回 cc2 原生形狀")
+        # 真的建在 cc2 registry 裡
+        self.assertIsNotNone(cc_sdk.registry().get("n4a"))
+
+    def test_name_collision_across_backends_is_409(self):
+        """命名空間互斥(規格 §4 規則 1):名字存在於**任一**後端就 409。
+        從源頭擋撞名,比事後在列表/解析/寫入三處各自去重可靠。"""
+        cc_sdk.registry().ensure("taken1", workdir=self.wd)
+        with patch.object(bridge, "CC_LIST_INCLUDES_CC2", True), \
+             patch.object(bridge, "_cc_conf_rows", lambda: []):
+            with self.assertRaises(HTTPException) as cm:
+                self._create("taken1")
+        self.assertEqual(cm.exception.status_code, 409)
+
+        with patch.object(bridge, "CC_NEW_SESSIONS_BACKEND", "cc2"), \
+             patch.object(bridge, "_cc_conf_rows",
+                          lambda: [("taken2", "/tmp/q", "1")]):
+            with self.assertRaises(HTTPException) as cm:
+                self._create("taken2")
+        self.assertEqual(cm.exception.status_code, 409,
+                         "tmux 已有同名,cc2 不該硬建一條")
+
+    def test_cc2_rejects_names_tmux_would_accept(self):
+        """tmux 只擋 `/|:` 與空白,cc2 限英數/底線/連字號 —— 提前講清楚,
+        而不是讓它在 v2 端點 400 時回一個 app 沒預期的錯誤碼。"""
+        with patch.object(bridge, "CC_NEW_SESSIONS_BACKEND", "cc2"), \
+             patch.object(bridge, "_cc_conf_rows", lambda: []):
+            with self.assertRaises(HTTPException) as cm:
+                self._create("has.dot")
+        self.assertEqual(cm.exception.status_code, 400)
+
+
+class TestGovernanceRegistration(CC2Base):
+    """cc2 session 要進戶政 + 吃配額(2026-10-30)。
+
+    tmux 的 `POST /ccsessions` 一直有 `_registry_precheck_or_429` 與
+    `_registry_register`,cc2 的建立路徑整個沒有 → cc2 session 不進
+    workers/discovery/治理視圖,配額也擋不住。cc2 的目標是取代 tmux,
+    這一格不能少。
+    """
+
+    def test_create_registers_in_governance(self):
+        calls = []
+        with patch.object(bridge, "_registry_register",
+                          lambda sid, **kw: calls.append((sid, kw))):
+            asyncio.run(bridge.v2_cc2_create(
+                "gov1", FakeRequest({"workdir": _TMP})))
+        self.assertEqual(len(calls), 1, "新建的 cc2 session 沒進戶政")
+        sid, kw = calls[0]
+        self.assertEqual(sid, "cc2:gov1")
+        self.assertEqual(kw["provider"], "cc2")
+
+    def test_idempotent_repost_does_not_recharge_quota(self):
+        """重 POST 同名只更新設定(刻意冪等,不打斷進行中的 turn)——
+        那不是開新 session,不該再吃一次配額。否則配額滿了連「改個 model」
+        都會 429。"""
+        pre, reg = [], []
+        with patch.object(bridge, "_registry_precheck_or_429",
+                          lambda *a, **k: pre.append(a)), \
+             patch.object(bridge, "_registry_register",
+                          lambda sid, **kw: reg.append(sid)):
+            asyncio.run(bridge.v2_cc2_create("gov2", FakeRequest({"workdir": _TMP})))
+            asyncio.run(bridge.v2_cc2_create("gov2", FakeRequest({"model": "opus"})))
+        self.assertEqual(len(pre), 1, "冪等重 POST 又吃了一次配額")
+        self.assertEqual(len(reg), 1, "冪等重 POST 又註冊了一次")
+
+
+class TestArchivedVisibility(CC2Base):
+    def test_archived_sessions_are_queryable_not_lost(self):
+        """封存不得等於消失(2026-10-30)。
+
+        `v2_rows` 原本只是**跳過**封存的 session,而 cc2 沒有任何「列出封存」
+        的管道 → 封存一條就從 app 永久消失、使用者也無從得知要解除哪一條
+        (解除本身是有的)。tmux 一直有 `GET /ccsessions?archived=true`。
+        """
+        reg = cc_sdk.registry()
+        reg.ensure("live1", workdir=_TMP)
+        gone = reg.ensure("gone1", workdir=_TMP)
+        gone.archived = True
+
+        ids = [r["id"] for r in reg.v2_rows()]
+        self.assertIn("cc2:live1", ids)
+        self.assertNotIn("cc2:gone1", ids, "預設列表不該出封存的")
+
+        arch = reg.v2_rows(include_archived=True)
+        self.assertEqual([r["id"] for r in arch], ["cc2:gone1"],
+                         "封存列查不到 —— 那條 session 等於被刪了")
+        self.assertEqual(arch[0]["status"], "archived",
+                         "狀態字彙要與 tmux 一致")
+
 
 class TestApprovalForSession(CC2Base):
     def test_options_shape_has_for_session(self):

@@ -107,12 +107,51 @@ def context_usage_timeout() -> float:
 
 
 def history_seed_limit() -> int:
-    """歷史種子上限(0 = 關閉):session 重建時從 SDK transcript jsonl 撈
-    最後 N 則 user/assistant 文字訊息餵進卡片庫,先於一切 live 事件。"""
+    """歷史種子上限(0 = 關閉)= transcript jsonl 的**尾端原始行數**。
+
+    2026-10-29 改語意:原本是「最後 N 則過濾後的文字訊息」(預設 40)。
+    改走共用 digest 之後一行可能產 0..n 張卡(工具呼叫/結果/thinking/附件),
+    用「則數」切會把工具步驟算進對話額度 —— 同一條對話的可見輪數反而變少。
+    改成切行數,與 tmux 路徑的 `_CC_CARD_SEED_LINES = 200` 同語意、同預設,
+    這樣兩條路徑進場看到的歷史份量一致(cc2 的目標是取代,不是縮水)。
+    """
     try:
-        return int(os.environ.get("CC_SDK_HISTORY_SEED", "") or 40)
+        return int(os.environ.get("CC_SDK_HISTORY_SEED", "") or 200)
     except ValueError:
-        return 40
+        return 200
+
+
+def transcript_path(sess) -> str:
+    """這條 cc2 session 的 transcript jsonl 路徑(沒有 sdk_session_id 回 "")。
+
+    抽成公開函式是為了讓 bridge 的 `/ccsessions/{name}/history` 對 cc2 能走
+    **同一個格式化器** —— 兩條路徑的 transcript 是同一種 jsonl,給對路徑就
+    自動同形狀(`{text, more}`),不必為 cc2 另寫一套翻頁回應。
+    """
+    sid = getattr(sess, "sdk_session_id", "") or ""
+    if not sid:
+        return ""
+    return os.path.join(_claude_projects_root(),
+                        _project_key(getattr(sess, "workdir", "") or ""),
+                        f"{sid}.jsonl")
+
+
+def _seed_card_uid(d: dict, jsonl_path: str, lineno: int) -> str:
+    """種子卡的穩定 id 來源 —— 與 bridge 的 `_cc_card_uid` **同語意**。
+
+    刻意複製而不 import bridge:本模組的鐵律是不 import bridge(循環)。
+    語意必須一致,否則同一條 transcript 在兩條路徑上會產出不同 id,
+    app 的快取(key = session_id + card.id + rev)會疊兩份。
+
+    優先用 jsonl 事件自己的 `uuid`:它綁的是「那一則事件」,所以重讀/重種
+    天然冪等。沒有 uuid 才退回「檔案雜湊 + 行號」。
+    """
+    u = d.get("uuid")
+    if u:
+        return str(u)[:32]
+    import hashlib
+    fh = hashlib.md5((jsonl_path or "").encode()).hexdigest()[:6]
+    return f"{fh}-L{lineno}"
 
 
 def _short_key(value: str) -> str:
@@ -445,8 +484,11 @@ def _tool_summary(tool: str, tool_input: dict) -> str:
 # in-memory —— bridge 重啟後 app 打開會是一片空白,所以 session 重建時把最近
 # 的對話種回去。解析自包含(不 import bridge),過濾清單鏡像 _fmt_cc_event。
 
-_SEED_SKIP_TAGS = ("<task-notification>", "<system-reminder>", "[Internal",
-                   "<command-name>", "<local-command", "[Your previous response")
+# 直接用 carddigest 的那一份,**不留複本**(2026-10-29)。
+# 原本是逐字抄一遍 `carddigest.PLUMBING_TAGS`,兩份必然漂移 —— 而契約 §0/§6
+# 明寫「digest 的責任在 bridge:一份 parser、伺服器端、所有終端共享」。
+# 哪天有人在 carddigest 補一個新的水管標記,cc2 這條路會安靜地漏出來。
+_SEED_SKIP_TAGS = carddigest.PLUMBING_TAGS
 
 
 def _seed_row(d):
@@ -536,6 +578,15 @@ class CC2Digest(carddigest.ApprovalCardMixin):
             "context": ({"used": self.ctx_tokens, "size": self.ctx_max,
                          "pct": round(self.ctx_pct, 1)}
                         if self.ctx_max else None),
+            # ⚠️ **也要吐 `usage`**(2026-10-29)。tmux 路徑把上下文用量放在
+            # `status["usage"]`,而 bridge 自己的註解寫著「app 的 ContextUsage
+            # decoder 直接吃」那個鍵。cc2 只放 `context` → app 解不到 →
+            # **整個上下文儀表空白,而且全綠、沒報錯**。這是「名字對不上」那種
+            # 最難查的失效:看起來什麼都正常,就是不顯示。
+            # 兩個鍵都吐(同一份資料),等 app 兩邊都收斂到一個名字再談移除。
+            "usage": ({"used": self.ctx_tokens, "size": self.ctx_max,
+                       "pct": round(self.ctx_pct, 1)}
+                      if self.ctx_max else None),
             "prompt": self.prompt,
             # blocked:對齊 tmux 的同名欄位(2026-08-18「隱形卡住」事故之後
             # 加的)。cc2 卡住的形態只有一種 —— 有審批/提問在等人回答,
@@ -587,10 +638,18 @@ class CC2Digest(carddigest.ApprovalCardMixin):
         self.store.upsert_card(carddigest.make_card(
             self._next_id("u"), self.store.turn_id, "user", "text", body))
 
-    def seed_card(self, role: str, text: str, ts: float):
-        """歷史種子卡:final:true、帶原始 ts(權威時間)、不掛 turn。"""
+    def seed_card(self, role: str, text: str, ts: float, idx: int):
+        """歷史種子卡:final:true、帶原始 ts(權威時間)、不掛 turn。
+
+        `idx` = 這張卡在本次種子序列中的位置,**用來產穩定 id**。
+        原本用 `self._next_id("h")`(共用遞增計數器)—— 那不冪等:同一條對話
+        重種一次,`_seq` 已經往前走,於是同樣的歷史拿到**不同的** card id,
+        app 端(快取 key = session_id + card.id + rev)會把整段歷史**疊第二份**。
+        tmux 路徑是用事件 uuid 衍生 id + `store.seeded` 閂,這裡比照其精神:
+        id 由位置決定,重種就是對同一批 id 做 upsert(契約 §5:同 id → 替換渲染)。
+        """
         self.store.upsert_card(carddigest.make_card(
-            self._next_id("h"), "", role, "markdown",
+            f"card-cc2-{self.name}-h{idx}", "", role, "markdown",
             {"text": text, "fallback_text": text}, ts=ts))
 
     def text_delta(self, delta: str):
@@ -639,15 +698,40 @@ class CC2Digest(carddigest.ApprovalCardMixin):
         self.store.saw_output = True
         self.last_event_at = time.time()
 
-    def tool_card(self, tool: str, summary: str, use_id: str = ""):
-        text = f"🔧 {tool}: {summary}" if summary else f"🔧 {tool}"
-        cid = self._next_id("t")
+    def tool_card(self, tool: str, summary: str, use_id: str = "", inp=None):
+        """工具呼叫卡。**`kind="tool_call"`,與 tmux 路徑同形狀**(2026-10-29)。
+
+        原本出 `kind="text"`(一行「🔧 Bash: git status」)。app 對 `tool_call`
+        有專屬渲染(工具列 + `body.patch` → **diff chip**),壓成 text 之後那些
+        全部失效 —— 使用者看到的是「工具步驟變成一行純文字、改檔案看不到 diff」。
+        cc2 的目標是取代 tmux,不能在這一格退步。
+
+        `patch` 由 `carddigest._tool_patch` 從 tool input 合成(Edit/Write/
+        MultiEdit/NotebookEdit),與 tmux 走同一支 —— 一份 parser(契約 §0)。
+        """
+        cid = f"card-cc2-{self.name}-tc-{use_id}" if use_id else self._next_id("t")
+        cmd = (summary or "").splitlines()[0][:200] if summary else ""
+        fb = f"› 🔧 {tool}" + (f" `{cmd}`" if cmd else "")
+        body = {"tool": tool, "summary": cmd, "fallback_text": fb}
+        patch = carddigest._tool_patch(tool, inp if isinstance(inp, dict) else {})
+        if patch:
+            body["patch"] = patch
         self.store.upsert_card(carddigest.make_card(
-            cid, self.store.turn_id, "assistant", "text",
-            {"text": text, "fallback_text": text, "origin": "cc2.tool"}))
+            cid, self.store.turn_id, "assistant", "tool_call", body))
+        # agent 看圖(Read 一張 PNG 之類):補 attachment 卡,手機直接顯示縮圖。
+        # 這條 cc2 原本完全沒有 —— 只有 base64 的那一半(見 `media_card`)。
+        img = carddigest._image_path_in(inp if isinstance(inp, dict) else {})
+        if img:
+            fname = img.rsplit("/", 1)[-1]
+            ext = "." + fname.rsplit(".", 1)[-1].lower() if "." in fname else ""
+            self.store.upsert_card(carddigest.make_card(
+                f"{cid}-img", self.store.turn_id, "assistant", "attachment",
+                {"filename": fname, "path": img,
+                 "mime": carddigest._IMAGE_MIME.get(ext, "image/png"),
+                 "fallback_text": f"🖼 {fname}"}))
         if use_id:
             # 第四格 = 是否已回填過真輸出(D6:避免被後到的空結果蓋掉)
-            self._tool_cards[str(use_id)] = (cid, tool, summary, False)
+            self._tool_cards[str(use_id)] = (cid, tool, cmd, False)
         self.store.last_tool = tool
         self._status(f"執行 {tool}")
 
@@ -674,15 +758,27 @@ class CC2Digest(carddigest.ApprovalCardMixin):
         if not body:
             body = "(沒有輸出)"
         self._tool_cards[str(use_id)] = (cid, tool, summary, True)
-        limit = 800
+        # 2000 對齊 tmux 路徑的 `carddigest._TOOL_RESULT_MAX`(原本 800,
+        # 同一份編譯輸出在 cc2 上被多截掉一半)。
+        limit = 2000
         if len(body) > limit:
             body = body[:limit] + f"\n…(還有 {len(result.strip()) - limit} 字,"\
                                   "完整輸出在終端機接手時看得到)"
-        mark = "⚠️ 失敗" if is_error else "↳"
-        text = f"{head}\n{mark} {body}"
+        # **獨立的 `tool_result` 卡**,不回填進 tool_call 那張(2026-10-29)。
+        #
+        # 原本是「一張卡原地改寫」—— 刻意避免洗版,但代價是:
+        #   · kind 只能是 `text`(同一張卡不能從 tool_call 變成 tool_result)
+        #   · 於是 app 的可折疊結果框失效,而且 tool_call 的 patch/diff chip
+        #     會被結果文字蓋掉
+        # tmux 路徑一直是兩張分開的卡,app 的渲染也是照那個形狀做的。要取代
+        # 就得同形狀 —— id 用 `tr-{use_id}` 與 tool_call 的 `tc-{use_id}` 配對,
+        # 仍然冪等(同一個 tool_use_id 回來兩次是 upsert 不是新增)。
+        rid = f"card-cc2-{self.name}-tr-{use_id}" if use_id else self._next_id("tr")
+        fb = f"{head}\n{'⚠️ 失敗' if is_error else '↳'} {body}"
         self.store.upsert_card(carddigest.make_card(
-            cid, self.store.turn_id, "assistant", "text",
-            {"text": text, "fallback_text": text, "origin": "cc2.tool"}))
+            rid, self.store.turn_id, "assistant", "tool_result",
+            {"text": body, "fallback_text": fb, "tool": tool,
+             "is_error": bool(is_error), "origin": "cc2.tool"}))
         self.last_event_at = time.time()
 
     def error_card(self, text: str):
@@ -808,14 +904,15 @@ class CCSdkSession:
         return out
 
     def _seed_history(self) -> None:
-        """歷史種子:sdk_session_id 對應的 transcript jsonl 撈最後 N 則
-        (CC_SDK_HISTORY_SEED,預設 40)user/assistant 文字訊息 → final:true
-        卡(原角色/原 ts),先於一切 live 事件。jsonl 缺席 = 全新對話,安靜
-        跳過;整檔讀不動/個別行壞掉容忍,各 log 一次,絕不擋 session 起步。"""
+        """歷史種子:transcript jsonl 的尾端 N 行(CC_SDK_HISTORY_SEED,預設 200)
+        經 **`carddigest.cc_event_to_cards`** 翻成 final:true 卡(原角色/原 ts/
+        uuid 衍生 id),先於一切 live 事件 —— 與 tmux 路徑同一套翻譯、同份量。
+        jsonl 缺席 = 全新對話,安靜跳過(但有 sdk_session_id 卻找不到檔要留痕);
+        整檔讀不動/個別行壞掉容忍,各 log 一次,絕不擋 session 起步。"""
         if not self.sdk_session_id:
             return
-        limit = history_seed_limit()
-        if limit <= 0:
+        limit_lines = history_seed_limit()
+        if limit_lines <= 0:
             return
         path = os.path.join(_claude_projects_root(),
                             _project_key(self.workdir),
@@ -833,31 +930,79 @@ class CCSdkSession:
                 raw = fb.read()
             lines = raw.decode("utf-8", "replace").splitlines()
         except FileNotFoundError:
+            # ⚠️ 這條**不是**「全新對話」—— 那種情況在最上面
+            # `if not self.sdk_session_id` 就已經回去了。走到這裡代表
+            # **有 sdk_session_id 卻找不到它的 transcript**,成因通常是
+            # project key 算不對、或 transcript 被清掉。
+            #
+            # 原本這條完全無聲。後果:2026-10-29 `_project_key` 改用 SDK 官方
+            # 演算法(解 symlink、非英數全換)而測試還自己重刻,seed 去讀了另一個
+            # 目錄 → 歷史整段不見、**零線索**,花了一整輪才追到。
+            # 種子讀不到不該擋 session 起步,但**必須留痕**。
+            #
+            # `dir_exists` 是關鍵鑑別訊號,而且不洩路徑(避免家目錄進 log):
+            #   False → project key 對不上(本次事故的形狀)
+            #   True  → key 是對的,transcript 真的不在
+            _log("cc2_history_seed_missing", session=self.name,
+                 sdk_session=(self.sdk_session_id or "")[:8],
+                 dir_exists=os.path.isdir(os.path.dirname(path)))
             return
         except Exception as e:  # noqa: BLE001
             _log("cc2_history_seed_failed", session=self.name,
                  error=type(e).__name__, error_message=str(e)[:200])
             return
-        rows, bad = [], 0
-        for line in lines:
+        # ── 走共用 digest(2026-10-29)───────────────────────────────────────
+        #
+        # 原本自己用 `_seed_row` 只撈 user/assistant 的**純文字**,於是進場看到的
+        # 歷史裡:工具步驟、工具結果、thinking、截圖、**diff 全部不見**。
+        # 使用者的感受是「歷史不見了」—— 而 tmux 路徑一直都有,因為它走
+        # `carddigest.cc_event_to_cards`(見 bridge 的 `_cc_digest_lines`)。
+        #
+        # cc2 當初就是為了**取代** tmux,所以進場內容不能比它少。改走同一套翻譯:
+        #   · 一次拿到 tool_call(含 `body.patch` = app 的 diff chip 來源)、
+        #     tool_result、attachment、thinking
+        #   · card id 由 **jsonl 的 uuid** 衍生 → 天然冪等(比我原本的 idx 更對:
+        #     uuid 綁的是「那一則事件」,位置綁的是「這次讀到的第幾筆」)
+        #   · 契約 §0「digest 的責任在 bridge:一份 parser、所有終端共享」
+        #
+        # 上限也跟著改成與 tmux 同語意:切的是**原始行數**(預設 200 行)而不是
+        # 「過濾後 40 則」—— 一行可能產 0..n 張卡,用則數切會把工具步驟算進額度。
+        tail = lines[-limit_lines:] if limit_lines > 0 else lines
+        sink = None
+        if MEDIA_SINK is not None:
+            try:
+                sink = MEDIA_SINK(f"cc2:{self.name}")
+            except Exception as e:  # noqa: BLE001 — 媒體落地是加分項,不擋 seed
+                _log("cc2_history_seed_media_sink_failed", session=self.name,
+                     error=type(e).__name__)
+        cards, bad = 0, 0
+        for off, line in enumerate(tail):
             line = line.strip()
             if not line:
                 continue
             try:
-                row = _seed_row(json.loads(line))
+                d = json.loads(line)
             except Exception:  # noqa: BLE001
                 bad += 1
                 continue
-            if row is not None:
-                rows.append(row)
-        for role, text, ts in rows[-limit:]:
-            self.digest.seed_card(role, text, ts)
+            try:
+                for card in carddigest.cc_event_to_cards(
+                        d, _seed_card_uid(d, path, off),
+                        turn_id="",          # 歷史不掛回合
+                        image_sink=sink):
+                    card["final"] = True     # 歷史一律定稿(不是草稿)
+                    self.digest.store.upsert_card(card)
+                    cards += 1
+            except Exception as e:  # noqa: BLE001 — 單一事件翻譯失敗不擋整段
+                bad += 1
+                _log("cc2_history_seed_card_failed", session=self.name,
+                     error=type(e).__name__, error_message=str(e)[:160])
         if bad:
             _log("cc2_history_seed_bad_lines", session=self.name,
                  skipped=bad)
-        if rows:
-            _log("cc2_history_seeded", session=self.name,
-                 cards=min(len(rows), limit))
+        if cards:
+            _log("cc2_history_seeded", session=self.name, cards=cards,
+                 lines=len(tail))
 
     # ── 輸入 ──
 
@@ -1246,7 +1391,8 @@ class CCSdkSession:
             for block in tools:
                 self.digest.tool_card(block.name,
                                       _tool_summary(block.name, block.input),
-                                      use_id=getattr(block, "id", "") or "")
+                                      use_id=getattr(block, "id", "") or "",
+                                      inp=block.input)
             # 工具結果**也會夾在 AssistantMessage 裡**(SDK message_parser 的
             # case "assistant" 同樣收 tool_result,不只 case "user")。只在
             # UserMessage 收會漏掉一部分,而且安靜無聲 —— 只是結果看不到。
@@ -1370,11 +1516,11 @@ class CCSdkSession:
         """
         qs = tool_input.get("questions") or []
         if not isinstance(qs, list) or not qs:
-            return [], "", False
+            return [], "", False, {}
         q0 = qs[0] if isinstance(qs[0], dict) else {}
         opts = q0.get("options") or []
         if not isinstance(opts, list) or not opts:
-            return [], "", False
+            return [], "", False, {}
         out = []
         for i, o in enumerate(opts[:6]):      # 卡片按鈕上限,超過的截斷
             if not isinstance(o, dict):
@@ -1382,14 +1528,28 @@ class CCSdkSession:
             label = str(o.get("label") or "").strip()
             if not label:
                 continue
-            out.append({"key": f"ask:{i}", "label": label[:40],
-                        "style": "primary" if i == 0 else "secondary"})
+            opt = {"key": f"ask:{i}", "label": label[:40],
+                   "style": "primary" if i == 0 else "secondary"}
+            # **保留 description**(2026-10-29):CLI 的每個選項都帶說明,
+            # tmux 路徑會把它帶進卡片(`_cc_approval_payload`)。原本只取 label
+            # → 使用者在選項說明空白的情況下選,等於盲選。
+            desc = str(o.get("description") or "").strip()
+            if desc:
+                opt["detail"] = desc[:200]
+            out.append(opt)
         if not out:
-            return [], "", False
+            return [], "", False, {}
         # 一律補「略過」—— CLI 的原生 UI 也永遠有 Skip,不能讓人無路可走。
         out.append({"key": "ask:skip", "label": "略過", "style": "danger"})
         title = str(q0.get("question") or q0.get("header") or "請選擇")[:200]
-        return out, title, bool(q0.get("multiSelect"))
+        # 第四個回傳值 = 卡片 meta。app 靠它決定「畫單選還是複選」、
+        # 以及顯示「第 N/M 題」——缺了就只能當單選題盲畫(契約見
+        # carddigest.ApprovalCardMixin:multiselect/q_index/q_total/q_headers)。
+        meta = {"multiselect": bool(q0.get("multiSelect")),
+                "q_index": 1, "q_total": len(qs),
+                "q_headers": [str((q.get("header") if isinstance(q, dict) else "")
+                                  or "")[:40] for q in qs][:8]}
+        return out, title, bool(q0.get("multiSelect")), meta
 
     async def _can_use_tool(self, tool: str, tool_input: dict, _ctx):
         """SDK 的結構化審批回呼。建 pending record(卡片 + DB 鏡像)→ 等
@@ -1404,9 +1564,10 @@ class CCSdkSession:
             _log("cc2_approval_auto_allow", session=self.name, tool=tool)
             return sdk.PermissionResultAllow()
         aid = "cc2-" + uuid.uuid4().hex[:12]
-        ask_opts, ask_title, ask_multi = ([], "", False)
+        ask_opts, ask_title, ask_multi, ask_meta = ([], "", False, {})
         if tool == "AskUserQuestion":
-            ask_opts, ask_title, ask_multi = self._ask_question_options(tool_input)
+            (ask_opts, ask_title, ask_multi,
+             ask_meta) = self._ask_question_options(tool_input)
         title = ask_title or str(getattr(_ctx, "title", "") or
                                  f"Claude Code 要使用 {tool}")[:200]
         now = time.time()
@@ -1416,7 +1577,9 @@ class CCSdkSession:
             "created_at": now, "expires_at": now + approval_timeout() + 5.0,
             "status": "pending", "decided_at": None, "result": None,
             "session_id": f"cc2:{self.name}", "provider": "cc2",
-            "kind": "permission",
+            # 提問與權限是**不同的東西**:app 的渲染與 `_approval_decide_core`
+            # 的字彙都分(question→answered / permission→approved|denied)。
+            "kind": "question" if ask_opts else "permission",
             # 三態選項(鏡像 codex _handle_approval_request 的宣告形狀,app
             # 零改動):第三顆 key=approve_for_session → 舊 App(只認
             # approve/deny)安全退成一般允許,不會誤送拒絕;style=secondary
@@ -1430,6 +1593,12 @@ class CCSdkSession:
         if ask_opts:
             record["kind"] = "question"       # app 可據此換版面(不換也能用)
             record["risk"] = "low"            # 回答問題不是危險操作
+            # **卡片 meta**(2026-10-29):`ApprovalCardMixin` 會把這幾個鍵轉進
+            # 卡片 body —— `multiselect` 決定 app 畫單選還是複選,
+            # `q_index/q_total` 讓「第 N/M 題」顯示得出來。原本 cc2 的 record
+            # 根本沒有 `meta` 鍵 → app 只能把複選題當單選畫,而且看不出還有幾題。
+            if ask_meta:
+                record["meta"] = ask_meta
         waiter = {"event": asyncio.Event(), "decision": None,
                   "record": record, "session": self.name}
         self.registry.pending_approvals[aid] = waiter
@@ -1538,8 +1707,24 @@ class CCSdkSession:
             return sdk.PermissionResultDeny(message=msg_text, interrupt=False)
         if approved:
             return sdk.PermissionResultAllow()
+        # 「逾時」與「使用者按了拒絕」必須**分開講**(2026-10-29)。
+        #
+        # 原本兩者共用一句「未核准(逾時或拒絕)」。那句話對模型與對使用者都
+        # 等於沒說:使用者看到卡片寫「拒絕執行」,而他根本沒按過任何東西 ——
+        # 他會以為 app 壞了,或以為自己誤觸。配上原本**完全沒有推播**
+        # (bridge 的 `_cc2_approval_db_upsert` 抄漏了那一行),症狀就是
+        # 「工具莫名被拒,沒人知道為什麼」。
+        #
+        # 逾時的上限(110s)**不能放寬** —— 它必須早於 CLI 端 stdio 審批的
+        # 逾時,我們才保證得了送回一個明確的 deny(fail-closed)。所以解法
+        # 不是等久一點,是:推播讓人及時知道(已補)+ 這裡把原因講清楚。
+        if not decision:
+            return sdk.PermissionResultDeny(
+                message=(f"No one answered within {int(approval_timeout())}s, "
+                         "so Pocket auto-declined this tool call (fail-closed). "
+                         "The user was notified; ask again if you still need it."))
         return sdk.PermissionResultDeny(
-            message="Pocket 未核准(逾時或拒絕),fail-closed 拒絕執行")
+            message="The user declined this tool call in Pocket.")
 
 
 # ── 註冊表(name → session;name→{sdk_session_id,workdir,permission_mode}
@@ -1756,16 +1941,27 @@ class CCSdkRegistry:
 
     # ── v2 sessions 列表 ──
 
-    def v2_rows(self) -> list[dict]:
+    def v2_rows(self, include_archived: bool = False) -> list[dict]:
+        """v2 session 列。
+
+        `include_archived`(2026-10-29 加):封存的 session 原本**只是被跳過**,
+        而 cc2 沒有任何「列出封存」的管道 —— 於是封存一條等於它從 app 永久
+        消失、使用者也無從得知要解除哪一條(解除本身是有的:
+        `POST /app/v2/cc2/{name}/archive` 收 `{"archived": false}`)。
+        tmux 路徑一直有 `GET /ccsessions?archived=true`,cc2 要取代它就得有
+        對等的出口。封存列帶 `status:"archived"`(與 tmux 同字彙)。
+        """
         self.load()
         out = []
         for name in sorted(self.sessions):
             sess = self.sessions[name]
-            if getattr(sess, "archived", False):
-                continue                      # 封存的不進列表(對話仍在)
+            archived = bool(getattr(sess, "archived", False))
+            if archived != include_archived:
+                continue      # 預設只出未封存;要封存列就明確問
             pend = self.pending_for(name)
-            status = "waiting_approval" if pend else (
-                "running" if sess.busy else "idle")
+            status = "archived" if archived else (
+                "waiting_approval" if pend else (
+                    "running" if sess.busy else "idle"))
             # D12:app 列表/詳情要用的欄位原本都沒吐(workdir 連 subtitle 退路
             # 都拿不到、WorkingBar 的計時拿不到、排隊深度看不到)。
             meta = {"permission_mode": sess.permission_mode,
@@ -1788,6 +1984,11 @@ class CCSdkRegistry:
                 # 終端接手指令(app 未來可直接顯示/複製;對話裡另有同款卡)
                 meta["resume_command"] = \
                     f"claude --resume {sess.sdk_session_id}"
+                # 裸的 sdk session id(2026-10-30):tmux 列有 `sessionId` 欄,
+                # 而以它為鍵的功能(例如 `_pocket_selected_cc`)對 cc2 原本
+                # 完全無效 —— 只給一條 `claude --resume …` 字串,呼叫端得去
+                # 剖字串才拿得到 id。遷移階段 1 的 `/ccsessions` 翻譯也要用它。
+                meta["sdk_session_id"] = sess.sdk_session_id
             # last_event_at 原本硬寫 None → app 列表排序拿不到時間、永遠墊底;
             # subtitle 改用最後一則對話(拿不到才退回 workdir),與 tmux 列同語意。
             last_at = getattr(sess.digest, "last_event_at", 0.0) or None
