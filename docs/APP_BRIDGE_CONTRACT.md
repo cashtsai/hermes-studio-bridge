@@ -1422,3 +1422,90 @@ CLAUDE.md 明寫那條已過時。)
 **永遠 exit 0**(exit 2 會讓 Claude Code 擋掉工具呼叫)、stdout 一個字都不印
 (PreToolUse 的 stdout 會被當成控制 JSON 解析)。bridge 沒開、沒裝、連不上 —— 
 最壞情況就是 Pocket 上看不到工人,你的 agent 照跑。
+
+## 16. Console QR 登入(`/app/v1/console/login/*`,2026-10-30)
+
+讓人在**任意一台電腦**上開桌面控制台:那台電腦開 `/console` → 不是可信來源
+→ bridge 顯示 QR → **已配對的手機掃碼批准** → 瀏覽器才拿到憑證。
+
+完整設計與威脅模型在 `docs/CONSOLE_QR_LOGIN_SPEC.md`;這一節只釘 app 要用的
+三支端點契約。
+
+### 16.0 旗標與未啟用時的表現
+
+| 旗標 | 預設 | 關掉時 |
+|---|---|---|
+| `POCKET_CONSOLE_ENABLED` | `0` | 整個 `/console` 與本節三支都 **404** |
+| `POCKET_CONSOLE_QR_LOGIN` | `0` | 本節三支 **404**;`/console` 對遠端維持**裸 403**(現狀) |
+
+**404 而不是 403/501**:app 探不到就當這台 bridge 不支援,安靜地不顯示 ——
+舊 bridge 的使用者不該看到錯誤。這與 `/capabilities` 的降級慣例一致。
+
+### 16.1 `GET /app/v1/console/login/requests/{rid}`
+
+掃到 QR 之後先讀這支,把「誰在請求」顯示給人看。**需要 `Authorization: Bearer`**
+(一般 device token)。
+
+```json
+{ "rid": "…32 hex…", "state": "pending",
+  "ip_label": "公網 203.0.113.9", "user_agent": "Mozilla/5.0 …",
+  "created_at": 1762000000, "expires_in": 118 }
+```
+
+- `state`:`pending` | `approved` | `denied` | `consumed`。**只有 `pending`
+  能批准**,其餘按下去會拿到 409。
+- `ip_label`:只講**網路種類**(公網／區網／tailnet／本機)＋ IP 本身。
+  刻意**不做地理推測** —— 那需要外部查詢,等於把訪客 IP 送給第三方。
+- `user_agent`:**請求方自稱的原文**。app 端不要美化成「Chrome on macOS」,
+  這是攻擊者可以任意填的欄位,美化它會讓人更容易相信它。
+- `expires_in`:秒。QR 只活 **120 秒**;app 應該自己倒數而不是每秒重打這支。
+- **404 = 這個 QR 不是這台桌面的**(rid 是本機隨機值)或已過期。app 據此顯示
+  「這個 QR 不是這台桌面的」。
+
+### 16.2 `POST .../{rid}/approve`、`POST .../{rid}/deny`
+
+無 body。回 `{"ok": true, "state": "approved"|"denied"}`。
+
+| 狀態碼 | 意思 | app 該怎麼做 |
+|---|---|---|
+| 200 | 成立 | 顯示結果,收掉批准頁 |
+| 404 | 不是這台桌面的 / 已過期 | 請人在電腦上重新整理登入頁再掃 |
+| 409 | 這筆已被決定過(重放防護) | 顯示「已處理過」,**不要重試** |
+| 503 | 鑄碼被節流 | **可以重按** —— bridge 刻意沒改 state 就是為了這個 |
+
+`deny` 存在的理由不只是禮貌:讓瀏覽器**立刻**看到被拒(而不是等 120 秒過期),
+人才知道自己剛剛可能被釣,而不是以為「網路怪怪的再掃一次」。
+
+### 16.3 QR payload —— **位址不在裡面,這是安全前提**
+
+```
+pocket://console-login?rid=<32 hex>
+```
+
+**只有 rid。** app 必須用它**自己既有的連線**呼叫上面三支,絕不可以被 QR
+指去另一個主機 —— 那正好是釣魚要的。所以:
+
+- app 端的解析器**不得**「順便支援」`host=`／`scheme=`／`port=`。
+  (`ConsoleLoginPayload` 的型別裡只有 `rid` 一個欄位,是結構性保證;
+  `Pocket iOSTests/ConsoleLoginPayloadTests.swift` 有一條測試專門釘這件事。)
+- 這條連結也會走 `.onOpenURL`:桌面沒裝 `qrcode` 套件時那頁只會顯示一條
+  可複製的連結(bridge 側刻意的保底),人唯一的辦法就是傳到手機點開。
+
+### 16.4 **掃到不等於批准**
+
+批准頁必須顯示 §16.1 的請求方資訊,**並等人明示點擊**。掃到就自動批准 =
+把釣魚變成一鍵得手。這是規格 §8.1 的第一道防線,不是 UI 偏好。
+
+### 16.5 批准之後那台瀏覽器能做什麼(能力降級)
+
+它拿到的是 **scoped device token**(`scope = "console-remote"`),不是一般的
+device token:
+
+- **有有效期**(一般 device token 沒有)—— 到期即 401。
+- **路徑白名單**:只有 session／指令／核准／health／檔案那幾條走得通,
+  其餘 403。白名單而不是黑名單 —— 新增端點時黑名單會**安靜地**放行。
+- **檔案面唯讀且限定目錄**:`POCKET_CONSOLE_REMOTE_FILE_ROOTS`(`:` 分隔)。
+  **沒設就等於一個都不給。** 範圍外回 **404 而不是 403**,不讓遠端瀏覽器
+  藉錯誤碼探測檔案存不存在。
+- `/pair/devices` 上看得到(`is_remote_console: true` ＋ `scope` ＋ `expires`),
+  機主可以隨時撤銷。app 的裝置清單應該把它標成「遠端瀏覽器」而不是一台裝置。
