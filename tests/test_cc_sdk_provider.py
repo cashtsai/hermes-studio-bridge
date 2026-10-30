@@ -907,6 +907,51 @@ class TestCcListMergesCc2(CC2Base):
         self.assertEqual(rows[0]["status"], "archived")
 
 
+class TestCcIdResolvesToCc2(CC2Base):
+    """遷移階段 2:`claude_code:{name}` 解析到 cc2 後端(2026-10-30)。
+
+    階段 1 讓 cc2 出現在 `/ccsessions` 列表,但 app 點進去送的是
+    `claude_code:{name}` —— 解析不到就 404,使用者看到「列表上有、點進去說
+    找不到」,**比完全看不到更糟**。
+    """
+
+    def test_claude_code_id_falls_through_to_cc2(self):
+        cc_sdk.registry().ensure("r2a", workdir=_TMP)
+        with patch.object(bridge, "CC_LIST_INCLUDES_CC2", True), \
+             patch.object(bridge, "_cc_conf_rows", lambda: []):
+            self.assertEqual(bridge._v2_card_source("claude_code:r2a"),
+                             ("cc2", "r2a"))
+
+    def test_tmux_wins_on_collision_same_rule_as_list(self):
+        """撞名時 tmux 勝 —— **必須與階段 1 的列表去重同一條規則**。
+
+        不一致的話會變成「列表顯示 tmux 那條、點進去開到 cc2」,那是最難查的
+        一種錯:兩邊各自看起來都對。
+        """
+        cc_sdk.registry().ensure("dup2", workdir=_TMP)
+        with patch.object(bridge, "CC_LIST_INCLUDES_CC2", True), \
+             patch.object(bridge, "_cc_conf_rows",
+                          lambda: [("dup2", "/tmp/y", "1")]):
+            self.assertEqual(bridge._v2_card_source("claude_code:dup2"),
+                             ("cc", "dup2", "/tmp/y"))
+
+    def test_flag_off_keeps_404(self):
+        """旗標關 → 與今天逐字相同(不解析、照樣 404)。"""
+        cc_sdk.registry().ensure("r2b", workdir=_TMP)
+        with patch.object(bridge, "CC_LIST_INCLUDES_CC2", False), \
+             patch.object(bridge, "_cc_conf_rows", lambda: []):
+            with self.assertRaises(HTTPException) as cm:
+                bridge._v2_card_source("claude_code:r2b")
+            self.assertEqual(cm.exception.status_code, 404)
+
+    def test_unknown_name_still_404(self):
+        with patch.object(bridge, "CC_LIST_INCLUDES_CC2", True), \
+             patch.object(bridge, "_cc_conf_rows", lambda: []):
+            with self.assertRaises(HTTPException) as cm:
+                bridge._v2_card_source("claude_code:never-existed")
+            self.assertEqual(cm.exception.status_code, 404)
+
+
 class TestGovernanceRegistration(CC2Base):
     """cc2 session 要進戶政 + 吃配額(2026-10-30)。
 

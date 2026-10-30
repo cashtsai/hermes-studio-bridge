@@ -20496,9 +20496,23 @@ def _v2_card_source(session_id: str) -> tuple:
                            f"不支援的 provider: {prov}")
         session_id = rest
     row = next((r for r in _cc_conf_rows() if r[0] == session_id), None)
-    if not row:
-        raise http_err(404, "SESSION_NOT_FOUND", "unknown session")
-    return ("cc", row[0], row[1])
+    if row:
+        return ("cc", row[0], row[1])
+    # ── 遷移階段 2:`claude_code:{name}` 的後端解析(2026-10-30)──────────
+    #
+    # 規格 §3「卡片流的 id 解析」。階段 1 讓 cc2 session 出現在 `/ccsessions`
+    # 列表裡,但 app 點進去時送的是 **`claude_code:{name}`** —— 解析不到就 404,
+    # 使用者看到「列表上有、點進去說找不到」,比完全看不到更糟。
+    #
+    # 順序刻意是「**先 tmux,找不到才 cc2**」(不是規格 §4 建議的 cc2 優先):
+    # 階段 2 的目標是「讓 cc2 被打得到」,不是改變任何既有 session 的行為。
+    # 撞名時既有的 tmux 那條仍然勝出,與階段 1 的列表去重規則一致 ——
+    # 兩處規則必須相同,否則「列表顯示 tmux 那條、點進去開到 cc2」。
+    if CC_LIST_INCLUDES_CC2 and cc_sdk.enabled() and session_id:
+        if cc_sdk.registry().get(session_id) is not None:
+            _log_event("cc_id_resolved_to_cc2", session=session_id)
+            return ("cc2", session_id)
+    raise http_err(404, "SESSION_NOT_FOUND", "unknown session")
 
 
 # ─────────── Phase 0 S2:codex 卡片事件流（同兩端點,事件驅動無輪詢）────────
