@@ -31,6 +31,7 @@ import pty
 import random
 import re
 import secrets
+import select
 import shlex
 import signal
 import socket
@@ -30204,6 +30205,181 @@ async def app_codex_login_status(request: Request, login_id: str = ""):
     if done is False:
         return {"ok": True, "state": "failed"}
     return {"ok": True, "state": "pending"}
+
+
+# ══════════ 階段 3:CC setup-token(PTY + 寬終端 + OSC 8 撈 URL)══════════
+#
+# 這是三個裡最麻煩的。實機 spike 發現(claude 2.1.309):
+# · `claude setup-token` 是 **full-screen TUI**,不是簡單行輸出。
+# · 它需要 **TTY** —— 沒有偽 TTY 時印空白。
+# · URL redirect 到 `platform.claude.com/oauth/code/callback`(不是 localhost),
+#   `code=true` = 授權完 Anthropic 頁面給一個 code,使用者**貼回**。
+# · 授權用**訂閱帳號**(文字明寫 "Claude subscription required")。
+#
+# 兩個讓它可靠的關鍵(都是 spike 試出來的):
+# 1. **URL 用 OSC 8 超連結的精確邊界撈**,不在純文字裡猜。TUI 折行會把純文字
+#    URL 打散+重複(state 後黏下一段),但 OSC 8 序列 `ESC]8;id;URI ST` 的 URI
+#    有標準結束錨點(ST),撈出來乾淨。實測:346 字元、state 後無殘留。
+# 2. **設寬 PTY 視窗(cols=400)**,再加一層保險讓 URL 不折行。
+#
+# 流程:start → 回 URL;使用者授權後把 code 貼進 finish → 寫進 PTY → 等退出。
+_CC_LOGIN: dict = {}        # login_id -> {master_fd, pid, url, created, done}
+_CC_LOGIN_LOCK = threading.Lock()
+_CC_LOGIN_TTL = 900.0
+# OSC 8 hyperlink 的 URI:ESC ] 8 ; params ; <URI> (ESC\ 或 BEL)
+_OSC8_URI_RE = re.compile(r"\x1b\]8;[^;]*;([^\x1b\x07]+)(?:\x1b\\|\x07)")
+_CC_OAUTH_RE = re.compile(r"https://claude\.com/cai/oauth/authorize\S+")
+
+
+def _cc_login_reap_locked(now: float) -> None:
+    for lid in [k for k, v in _CC_LOGIN.items()
+                if now - v["created"] > _CC_LOGIN_TTL]:
+        v = _CC_LOGIN.pop(lid, None)
+        if v:
+            _cc_login_kill(v)
+
+
+def _cc_login_kill(entry: dict) -> None:
+    try:
+        os.close(entry["master_fd"])
+    except OSError:
+        pass
+    try:
+        os.kill(entry["pid"], 9)
+        os.waitpid(entry["pid"], 0)
+    except (ProcessLookupError, ChildProcessError, OSError):
+        pass
+
+
+@app.post("/app/v1/agents/claude/login/start")
+async def app_claude_login_start(request: Request):
+    """啟動 CC setup-token,回授權 URL。行程留在 PTY 裡等 code。"""
+    if not POCKET_AGENT_LOGIN_IN_APP:
+        raise HTTPException(status_code=404, detail="not found")
+    _check_auth(request)
+    if _token_scope(_request_token(request)) == CONSOLE_REMOTE_SCOPE:
+        raise http_err(403, "SCOPE_FORBIDDEN",
+                       "遠端控制台不能設定帳號憑證,請用已配對的手機")
+    if not os.path.exists(CLAUDE_BIN):
+        raise http_err(503, "CLAUDE_MISSING", "這台主機沒有安裝 Claude Code")
+
+    def _spawn_and_read() -> tuple[int, int, str | None]:
+        """在偽 TTY 裡起 setup-token,讀到 URL 為止。回 (master_fd, pid, url)。"""
+        pid, master_fd = pty.fork()
+        if pid == 0:                      # 子行程
+            try:
+                os.execv(CLAUDE_BIN, [CLAUDE_BIN, "setup-token"])
+            except Exception:
+                os._exit(127)
+        # 父行程:設寬視窗(cols=400)讓 URL 不折行
+        try:
+            fcntl.ioctl(master_fd, termios.TIOCSWINSZ,
+                        struct.pack("HHHH", 50, 400, 0, 0))
+        except (OSError, ValueError):
+            pass
+        buf = b""
+        deadline = time.time() + 20
+        url = None
+        while time.time() < deadline and url is None:
+            r, _, _ = select.select([master_fd], [], [], 2)
+            if not r:
+                continue
+            try:
+                chunk = os.read(master_fd, 4096)
+            except OSError:
+                break
+            if not chunk:
+                break
+            buf += chunk
+            text = buf.decode("utf-8", "ignore")
+            # 先試 OSC 8 精確邊界(最可靠),退而求其次用純文字 regex
+            m = _OSC8_URI_RE.search(text)
+            if m and m.group(1).startswith("https://claude.com/cai/oauth"):
+                url = m.group(1)
+            else:
+                m2 = _CC_OAUTH_RE.search(re.sub(r"\x1b\][0-9];[^\x1b\x07]*(?:\x1b\\|\x07)", "", text))
+                # 純文字退路:切到 state 值結束(base64url),去掉後面黏的重複
+                if m2:
+                    cand = m2.group(0)
+                    sm = re.match(r"(https://claude\.com/cai/oauth/authorize\?.*?&state=[A-Za-z0-9_-]{20,64})", cand)
+                    if sm:
+                        url = sm.group(1)
+        return master_fd, pid, url
+
+    try:
+        master_fd, pid, url = await asyncio.to_thread(_spawn_and_read)
+    except Exception as e:  # noqa: BLE001
+        _log_exc("claude_login_spawn", e, expected=False)
+        raise http_err(503, "CLAUDE_SPAWN_FAILED", "啟動 Claude 登入失敗")
+    if url is None:
+        _cc_login_kill({"master_fd": master_fd, "pid": pid})
+        raise http_err(502, "CLAUDE_LOGIN_NO_URL", "沒能從 Claude 取得登入連結")
+    lid = secrets.token_urlsafe(18)
+    now = time.time()
+    with _CC_LOGIN_LOCK:
+        _cc_login_reap_locked(now)
+        _CC_LOGIN[lid] = {"master_fd": master_fd, "pid": pid, "url": url,
+                          "created": now, "done": None}
+    _log_event("claude_login_started")   # 不記 url
+    return {"ok": True, "provider": "claude", "mode": "manual_code",
+            "login_id": lid, "url": url, "user_code": None}
+
+
+@app.post("/app/v1/agents/claude/login/finish")
+async def app_claude_login_finish(request: Request):
+    """把使用者從 Anthropic 頁面複製的 code 貼進 PTY,完成登入。"""
+    if not POCKET_AGENT_LOGIN_IN_APP:
+        raise HTTPException(status_code=404, detail="not found")
+    _check_auth(request)
+    body = await _json_body(request)
+    lid = str(body.get("login_id") or "")
+    code = str(body.get("code") or "").strip()
+    if not code:
+        raise http_err(400, "MISSING_CODE", "請貼上授權碼")
+    with _CC_LOGIN_LOCK:
+        _cc_login_reap_locked(time.time())
+        entry = _CC_LOGIN.get(lid)
+    if entry is None:
+        raise http_err(410, "LOGIN_EXPIRED", "這次登入已過期,請重新開始")
+
+    def _submit_and_wait() -> bool:
+        fd = entry["master_fd"]
+        try:
+            # bracketed paste 包起來(TUI 用 [?2004h 開了 bracketed paste mode)
+            os.write(fd, b"\x1b[200~" + code.encode() + b"\x1b[201~\r")
+        except OSError:
+            return False
+        # 等行程退出(授權成功會寫 token 然後結束)
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            try:
+                wpid, status = os.waitpid(entry["pid"], os.WNOHANG)
+            except (ChildProcessError, OSError):
+                return True       # 已經被收掉,視為完成
+            if wpid != 0:
+                return os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
+            # 持續排空輸出,免得 PTY buffer 塞住子行程
+            r, _, _ = select.select([fd], [], [], 0.5)
+            if r:
+                try:
+                    os.read(fd, 4096)
+                except OSError:
+                    pass
+        return False
+
+    ok = await asyncio.to_thread(_submit_and_wait)
+    with _CC_LOGIN_LOCK:
+        e = _CC_LOGIN.pop(lid, None)
+    if e:
+        try:
+            os.close(e["master_fd"])
+        except OSError:
+            pass
+    _log_event("claude_login_finished", ok=ok)
+    if not ok:
+        raise http_err(502, "CLAUDE_LOGIN_FAILED",
+                       "登入沒完成 —— 授權碼可能貼錯或已過期,請重新開始")
+    return {"ok": True, "provider": "claude", "logged_in": True}
 
 
 def _host_capabilities() -> dict:
