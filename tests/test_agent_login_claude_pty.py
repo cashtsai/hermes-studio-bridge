@@ -88,12 +88,67 @@ class ClaudeLoginPtyTest(unittest.TestCase):
         if e:
             bridge._cc_login_kill(e)
 
-    def test_finish_submits_code_and_succeeds(self):
-        r = _run(bridge.app_claude_login_start(_Req()))
-        lid = r["login_id"]
-        fin = _run(bridge.app_claude_login_finish(
-            _Req({"login_id": lid, "code": "test-auth-code-123"})))
-        self.assertTrue(fin["logged_in"], "假 claude 收到 code 後 exit 0 應該算成功")
+    def test_finish_verifies_real_login_not_exit_code(self):
+        """finish **不信 exit code**,實際探 claude 登入狀態才算數。
+
+        2026-10-31 實機:行程 exit 0、端點回 logged_in:true,但 `claude -p`
+        仍 Not logged in —— 假成功。所以 finish 現在會呼 _agent_claude_logged_in()
+        實際驗證。這裡 monkeypatch 它,測兩個方向。
+        """
+        import bridge as _b
+        orig = _b._agent_claude_logged_in
+
+        async def _yes(): return True
+        _b._agent_claude_logged_in = _yes
+        try:
+            r = _run(bridge.app_claude_login_start(_Req()))
+            fin = _run(bridge.app_claude_login_finish(
+                _Req({"login_id": r["login_id"], "code": "test-code"})))
+            self.assertTrue(fin["logged_in"])
+        finally:
+            _b._agent_claude_logged_in = orig
+
+    def test_finish_raises_when_not_really_logged_in(self):
+        """行程 exit 0 但實際沒登入 → 502,**不假成功**。"""
+        from fastapi import HTTPException
+        import bridge as _b
+        orig = _b._agent_claude_logged_in
+
+        async def _no(): return False
+        _b._agent_claude_logged_in = _no
+        try:
+            r = _run(bridge.app_claude_login_start(_Req()))
+            with self.assertRaises(HTTPException) as cm:
+                _run(bridge.app_claude_login_finish(
+                    _Req({"login_id": r["login_id"], "code": "test-code"})))
+            self.assertEqual(cm.exception.status_code, 502)
+        finally:
+            _b._agent_claude_logged_in = orig
+
+    def test_finish_strips_state_fragment_from_code(self):
+        """貼成 `code#state` 時要切掉 `#` 後面 —— OAuth code 不含 fragment。"""
+        import bridge as _b
+        captured = {}
+        orig_login = _b._agent_claude_logged_in
+        async def _yes(): return True
+        _b._agent_claude_logged_in = _yes
+        # 攔截寫進 PTY 的 code
+        orig_write = os.write
+        def _spy_write(fd, data):
+            if b"\x1b[200~" in data:
+                captured["code"] = data
+            return orig_write(fd, data)
+        try:
+            r = _run(bridge.app_claude_login_start(_Req()))
+            os.write = _spy_write
+            _run(bridge.app_claude_login_finish(
+                _Req({"login_id": r["login_id"], "code": "REALCODE#statejunk"})))
+            self.assertIn(b"REALCODE", captured.get("code", b""))
+            self.assertNotIn(b"statejunk", captured.get("code", b""),
+                             "# 後面的 state 碎片沒切掉")
+        finally:
+            os.write = orig_write
+            _b._agent_claude_logged_in = orig_login
 
     def test_console_remote_scope_forbidden(self):
         from fastapi import HTTPException

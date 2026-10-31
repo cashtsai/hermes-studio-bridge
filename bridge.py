@@ -30338,6 +30338,10 @@ async def app_claude_login_finish(request: Request):
     body = await _json_body(request)
     lid = str(body.get("login_id") or "")
     code = str(body.get("code") or "").strip()
+    # OAuth code 可能被貼成 `code#state`(網頁網址列的 fragment 一起複製)。
+    # setup-token 要的是 `#` 前面那段。保留原樣會驗證失敗。
+    if "#" in code:
+        code = code.split("#", 1)[0]
     if not code:
         raise http_err(400, "MISSING_CODE", "請貼上授權碼")
     with _CC_LOGIN_LOCK:
@@ -30379,11 +30383,32 @@ async def app_claude_login_finish(request: Request):
             os.close(e["master_fd"])
         except OSError:
             pass
-    _log_event("claude_login_finished", ok=ok)
-    if not ok:
+    # **exit 0 不等於登入成功。** 2026-10-31 實機:行程 exit 0、端點回
+    # logged_in:true,但 `claude -p` 仍 Not logged in —— 假成功。
+    # 所以行程退出後**實際探一次登入狀態**才算數,不信 exit code。
+    really = await _agent_claude_logged_in()
+    _log_event("claude_login_finished", ok=ok, logged_in=really)
+    if not really:
         raise http_err(502, "CLAUDE_LOGIN_FAILED",
-                       "登入沒完成 —— 授權碼可能貼錯或已過期,請重新開始")
+                       "登入沒完成 —— 授權碼可能貼錯、含多餘字元,或已過期,請重新開始")
+    _AGENT_AUTH_CACHE["data"] = None   # 清快取,讓下次探測立刻看到已登入
     return {"ok": True, "provider": "claude", "logged_in": True}
+
+
+async def _agent_claude_logged_in() -> bool:
+    """實際探 claude 登入狀態(非互動 `-p`)。慢但可靠,只在 finish 用一次。"""
+    claude = CLAUDE_BIN if os.path.exists(CLAUDE_BIN) else "claude"
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            claude, "-p", "ok",
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+            cwd=os.path.expanduser("~"))
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=20)
+        text = (out or b"").decode("utf-8", "ignore").lower()
+        return "not logged in" not in text and "/login" not in text
+    except (asyncio.TimeoutError, FileNotFoundError, OSError):
+        return False
 
 
 def _host_capabilities() -> dict:
