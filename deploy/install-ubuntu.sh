@@ -319,6 +319,47 @@ WantedBy=default.target
 UNIT
 fi
 
+# ── Codex managed daemon(2026-10-31)──────────────────────────────────────
+#
+# **裝了 codex 執行檔,不等於拿到持久化。**
+#
+# bridge 連 Codex 有兩條路(見 bridge.py 的 CODEX_APP_SERVER_SOCKET 註解):
+#   · **managed daemon**(主要):unix socket 上跑 WebSocket frames,
+#     「the single writer shared by Desktop and Pocket」。那顆 daemon 在 Mac 上
+#     是**桌面版 Codex 帶起來的**,獨立於 bridge —— 所以 bridge 重啟時
+#     **進行中的回合活得下來**。
+#   · `codex app-server --stdio`(退路):bridge 自己 spawn 的子行程,
+#     **隨 bridge 一起死**。
+#
+# 龍蝦沒有桌面版 → 不補這個 unit 就只剩退路 → 每次 bridge 重啟都打斷正在跑的
+# Codex 回合。而龍蝦正是最常重啟的環境(更新、OOM、換設定)。
+# 機主 2026-10-31 的目標是「cc / cx 要能持久」,這一格就是缺口之一。
+#
+# ⚠️ **這段指令是從 macOS 上執行中的 daemon 行程反推的,不是來自官方文件。**
+#    (`codex app-server --remote-control --listen unix:// --managed-daemon`)
+#    刻意不帶 `--analytics-default-enabled` —— 那是桌面版自己的選擇,
+#    我們不替使用者在他的機器上打開遙測。
+#    **沒有在 Linux 上驗過**:起不來的話 bridge 會自動退回 stdio(三態判定
+#    是「連得上嗎」而不是「socket 檔在不在」),所以最壞情況是回到現狀,
+#    不會比不裝這個 unit 更糟。
+if [ "$INSTALL_CODEX" = "1" ]; then
+cat > "$UNIT_DIR/pocket-codex-daemon.service" <<UNIT
+[Unit]
+Description=Codex managed daemon (Pocket lobster) —— 讓 Codex 回合跨得過 bridge 重啟
+After=network-online.target
+
+[Service]
+Environment=PATH=%h/.local/bin:$NODE_ROOT/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=%h/.local/bin/codex app-server --remote-control --listen unix:// --managed-daemon
+Restart=always
+RestartSec=5
+TimeoutStartSec=120
+
+[Install]
+WantedBy=default.target
+UNIT
+fi
+
 if [ "$INSTALL_TUNNEL" = "1" ]; then
 # quick tunnel URL 每次啟動都會變 → wrapper 從 stderr 撈 trycloudflare URL
 # 寫進 $TUNNEL_URL_FILE,bridge 的 /pair/qr 讀它當公網保底候選。
@@ -355,6 +396,12 @@ loginctl enable-linger "$USER" 2>/dev/null || log_step "enable-linger 失敗(無
 log_step "啟動服務"
 systemctl --user enable --now "$BRIDGE_LABEL.service"
 [ "$INSTALL_OPENCLAW" = "1" ] && systemctl --user enable --now pocket-openclaw.service
+# codex daemon:只在 codex 真的裝起來了才啟用。寫了 unit 卻啟不動,只會在
+# systemctl 裡留一條紅的,讓人以為壞了 —— 而實際上只是沒裝 codex。
+if [ "$INSTALL_CODEX" = "1" ] && [ -x "$HOME/.local/bin/codex" ]; then
+  systemctl --user enable --now pocket-codex-daemon.service \
+    || log_step "codex daemon 啟不動 —— bridge 會自動退回 stdio(回合不跨重啟,但功能正常)"
+fi
 [ "$INSTALL_TUNNEL" = "1" ] && systemctl --user enable --now pocket-tunnel.service
 
 # ── 等 bridge 起來 → 開配對頁 ────────────────────────────────────────────
