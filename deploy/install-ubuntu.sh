@@ -244,7 +244,24 @@ if [ "$INSTALL_CODEX" = "1" ] && ! command -v codex >/dev/null 2>&1; then
   # ~/.local/bin/codex → PATH,所以放進 ~/.local 就找得到。
   if PATH="$NODE_ROOT/bin:$PATH" npm install -g --silent \
        --prefix "$HOME/.local" "@openai/codex@$CODEX_VERSION"; then
-    log_step "  codex $("$HOME/.local/bin/codex" --version 2>/dev/null | head -1)"
+    # ── node 要進登入 PATH,否則 codex 跑不起來(2026-10-31 實機抓到)──────
+    #
+    # **Linux 上的 codex 和 macOS 不一樣。** macOS 裝到的是原生二進位
+    # (~/.codex/packages/standalone/…);Linux 用 npm 裝到的是 JS wrapper
+    # (`#!/usr/bin/env node` → codex.js)。所以它**執行時需要 node 在 PATH 上**。
+    #
+    # 服務面沒問題(bridge 與 codex-daemon 的 unit 都有帶 $NODE_ROOT/bin),
+    # 但**使用者面會壞**:他要在 Pocket 的內建終端機裡跑 `codex` 登入自己的
+    # 帳號,而那是一個登入 shell —— 第一台實機上就是這樣炸的:
+    #     env: 'node': No such file or directory
+    # 而 bridge 的 `cx` capability 只檢查**檔案在不在**,所以照樣回 true
+    #   → **capability 在說謊**:頁籤是亮的,一用就壞。
+    if [ ! -f "$HOME/.profile.d-pocket-node" ]; then
+      printf '\n# Pocket 龍蝦:codex 是 JS wrapper,執行時要 node 在 PATH 上\nexport PATH="%s/bin:$HOME/.local/bin:$PATH"\n' \
+        "$NODE_ROOT" >> "$HOME/.profile"
+      : > "$HOME/.profile.d-pocket-node"   # 哨兵:重跑安裝器不要重複追加
+    fi
+    log_step "  codex $(PATH="$NODE_ROOT/bin:$PATH" "$HOME/.local/bin/codex" --version 2>/dev/null | head -1)"
   else
     printf '⚠️  Codex 沒裝成 —— 這台龍蝦的 Codex 頁籤會是關的,其餘功能不受影響。\n' >&2
   fi
