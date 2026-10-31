@@ -22822,6 +22822,146 @@ async def _cc2_approval_reconcile_startup():
     _cc2_reconcile_orphan_approvals()
 
 
+# ═══ v2 統一 session 操作表(rename / archive / history)═══════════════════
+#
+# ## 為什麼是一張表,不是再加三條 per-provider 路由(2026-10-31 機主拍板)
+#
+# 「每次維護其中一組的時候,另外兩組也會跟著被優化,不希望三者之間的維護
+# 成本差異太多。」—— 對齊狀態要是**程式碼裡查得到的資料**,不是散落在
+# 幾千行外的四組路由。這張表就是對齊矩陣本身:
+#
+#   · 加一個 provider = 在表裡補一欄,缺格立刻看得見
+#   · 加一個 op       = 在表裡補一列,哪家沒跟上立刻看得見
+#   · tests/test_v2_session_ops.py 斷言這張表的覆蓋 —— 缺格要嘛補上,
+#     要嘛進 `_V2_OPS_KNOWN_GAPS` 並寫明理由。**不准安靜地缺。**
+#
+# handler 一律委派給各家既有的實作(cc 的 ccsess、cc2 的 registry、cx 的
+# app-server、gemini 的名錄)—— 表不養自己的邏輯,它只是接線盒;修了某家的
+# 核心,走舊路由跟走這裡的人同時受益。
+#
+# 舊 per-provider 路由**保留**(app 的 CC/CX 碼還在用);新 surface(Gemini、
+# 之後的第六家)一律走這裡,app 端也只需要一個解析器。
+
+def _v2_op_provider(session_id: str) -> tuple:
+    """v2 id → (provider, rest)。裸名(無冒號)= claude_code,與 _v2_card_source
+    同語意;但這裡保留**原始 provider 字串**,因為表是按它查的。"""
+    if ":" in session_id:
+        prov, _, rest = session_id.partition(":")
+        return (prov, rest)
+    return ("claude_code", session_id)
+
+
+async def _gm_op_rename(rest: str, request: Request):
+    body = await _json_body(request)
+    new = str(body.get("name") or body.get("title") or "").strip()
+    if not new:
+        raise http_err(400, "NAME_REQUIRED", "name 必填")
+    row = await asyncio.to_thread(gemini_provider.rename_session, rest, new)
+    if row is None:
+        raise http_err(404, "SESSION_NOT_FOUND", f"找不到 gemini session {rest}")
+    _log_event("gemini_renamed", session=rest[:32], title=new[:60])
+    return {"ok": True, "session_id": f"gemini:{rest}", "title": row.get("title")}
+
+
+async def _gm_op_archive(rest: str, request: Request):
+    body = await _json_body(request)
+    archived = bool(body.get("archived", True))
+    row = await asyncio.to_thread(gemini_provider.set_archived, rest, archived)
+    if row is None:
+        raise http_err(404, "SESSION_NOT_FOUND", f"找不到 gemini session {rest}")
+    _log_event("gemini_archived", session=rest[:32], archived=archived)
+    return {"ok": True, "session_id": f"gemini:{rest}", "archived": archived}
+
+
+async def _gm_op_history(rest: str, request: Request):
+    q = request.query_params
+    limit = max(1, min(int(q.get("limit") or 40), 200))
+    offset = max(0, int(q.get("offset") or 0))
+    # to_thread:讀磁碟上的 jsonl(同步 I/O),不准跑在事件圈上(同 cc2 history)。
+    return await asyncio.to_thread(gemini_provider.transcript_page,
+                                   rest, limit, offset)
+
+
+async def _cc2_op_history(rest: str, request: Request):
+    q = request.query_params
+    return await v2_cc2_history(rest, request,
+                                limit=int(q.get("limit") or 40),
+                                offset=int(q.get("offset") or 0))
+
+
+async def _cc_op_history(rest: str, request: Request):
+    q = request.query_params
+    # cc 的 tmux 名若其實是 cc2 後端,委派時各自的既有路由已處理(rename 同)。
+    return await cc_session_history(rest, request,
+                                    offset=int(q.get("offset") or 0),
+                                    limit=int(q.get("limit") or 150))
+
+
+async def _cx_op_history(rest: str, request: Request):
+    q = request.query_params
+    return await codex_session_history(rest, request,
+                                       limit=int(q.get("limit") or 40),
+                                       cursor=q.get("cursor"))
+
+
+#: 對齊矩陣。op → provider → handler(rest, request)。
+#: ⚠️ 改這張表(加 op / 加 provider / 挖格)必同步看
+#: tests/test_v2_session_ops.py 的 `_V2_OPS_KNOWN_GAPS` —— 守門會紅給你看。
+_V2_SESSION_OPS: dict = {
+    "rename": {
+        "claude_code": lambda rest, req: cc_session_rename(rest, req),
+        "cc2":         lambda rest, req: v2_cc2_rename(rest, req),
+        "gemini":      _gm_op_rename,
+        # codex:app-server 沒有 thread rename API(thread 標題由內容生成)。
+        # openclaw:session 身分在 OpenClaw 端,bridge 無權改名。
+    },
+    "archive": {
+        "claude_code": lambda rest, req: cc_session_archive(rest, req),
+        "codex":       lambda rest, req: codex_session_archive(rest, req),
+        "cc2":         lambda rest, req: v2_cc2_archive(rest, req),
+        "gemini":      _gm_op_archive,
+    },
+    "history": {
+        "claude_code": _cc_op_history,
+        "codex":       _cx_op_history,
+        "cc2":         _cc2_op_history,
+        "gemini":      _gm_op_history,
+    },
+}
+
+
+async def _v2_session_op(op: str, session_id: str, request: Request):
+    """統一入口:auth → 解析 provider → 查表 → 委派。
+
+    查不到的組合回 **404 PROVIDER_OP_UNSUPPORTED 並講清楚哪家缺什麼** ——
+    不是裸 404。cc2 seam 的教訓(2026-10-29):沒有明確分支的 id 落進別家的
+    fallback,拿 gemini 的 key 當 codex thread id 去呼,壞得安靜又離奇。
+    """
+    _check_auth(request)
+    prov, rest = _v2_op_provider(session_id)
+    table = _V2_SESSION_OPS.get(op) or {}
+    handler = table.get(prov)
+    if handler is None:
+        raise http_err(404, "PROVIDER_OP_UNSUPPORTED",
+                       f"{prov} 不支援 {op}(支援:{sorted(table)})")
+    return await handler(rest, request)
+
+
+@app.post("/app/v2/sessions/{session_id}/rename")
+async def v2_session_rename(session_id: str, request: Request):
+    return await _v2_session_op("rename", session_id, request)
+
+
+@app.post("/app/v2/sessions/{session_id}/archive")
+async def v2_session_archive(session_id: str, request: Request):
+    return await _v2_session_op("archive", session_id, request)
+
+
+@app.get("/app/v2/sessions/{session_id}/history")
+async def v2_session_history(session_id: str, request: Request):
+    return await _v2_session_op("history", session_id, request)
+
+
 # ── H-2:openclaw 事件的 sqlite 一律不准跑在 WS 事件圈上 ────────────────
 # `_oc_events_feed` 是 openclaw WS reader 的**同步** callback，跑在 FastAPI
 # 的事件圈裡。裡面 `sqlite3.connect(CANON_DB, timeout=30)` + INSERT/UPDATE

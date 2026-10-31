@@ -36,6 +36,20 @@ PROVIDER_CHOICE="${POCKET_PROVIDER:-${POCKET_INSTALL_PROVIDER:-auto}}"
 DEFAULT_PROVIDER="${POCKET_DEFAULT_PROVIDER:-openclaw}"   # 龍蝦預設 openclaw(mac 版預設 hermes)
 INSTALL_HERMES="${POCKET_INSTALL_HERMES:-0}"              # Hermes 需另行配置,Ubuntu 預設關
 INSTALL_OPENCLAW="${POCKET_INSTALL_OPENCLAW:-1}"
+# ── CC / Codex(2026-10-31 補)─────────────────────────────────────────────
+# 在這之前,這支安裝器**完全沒有裝 Claude Code 或 Codex**(grep 是 0 次)。
+# 於是一台照它裝出來的龍蝦,`_host_capabilities()` 回 cc:false / cx:false
+# —— app 上那兩個頁籤是關的。而「把你的 coding agent 裝進口袋」正是 Pocket
+# 整個產品的賣點。這是龍蝦這條線最大的功能缺口,不是 Hermes vs OpenClaw。
+#
+# **刻意不碰憑證。** 兩者都只裝執行檔;登入由使用者自己在 Pocket 的內建
+# SSH 終端機裡跑 `claude` / `codex` 完成。我們一行 token 都不經手 ——
+# 這同時也是定價文件那條原則「不把 agent credentials 放到 Pocket 或 Relay」
+# 在龍蝦上唯一站得住的做法。
+INSTALL_CLAUDE="${POCKET_INSTALL_CLAUDE:-1}"
+INSTALL_CODEX="${POCKET_INSTALL_CODEX:-1}"
+# Codex 走 npm(官方套件 @openai/codex,bin=codex);版本釘死,理由同 openclaw。
+CODEX_VERSION="${CODEX_VERSION:-0.166.0}"
 HERMES_REPO_URL="${HERMES_REPO_URL:-https://github.com/NousResearch/hermes-agent.git}"
 HERMES_INSTALL_DIR="${HERMES_INSTALL_DIR:-$HOME/apps/hermes-agent}"
 OPENCLAW_VERSION="${OPENCLAW_VERSION:-2026.7.1-2}"
@@ -87,6 +101,27 @@ fi
 grep -q '^POCKET_BRIDGE_PORT=' "$ENV_FILE" || printf 'POCKET_BRIDGE_PORT=%s\n' "$BRIDGE_PORT" >> "$ENV_FILE"
 grep -q '^POCKET_TUNNEL_URL_FILE=' "$ENV_FILE" || printf 'POCKET_TUNNEL_URL_FILE=%s\n' "$TUNNEL_URL_FILE" >> "$ENV_FILE"
 grep -q '^PAIR_BOOT_CODE_FILE=' "$ENV_FILE" || printf 'PAIR_BOOT_CODE_FILE=%s\n' "$PAIR_BOOT_CODE_FILE" >> "$ENV_FILE"
+# ── 桌面控制台(2026-10-31 補)───────────────────────────────────────────
+#
+# 在這之前安裝器**從來沒設過** POCKET_CONSOLE_ENABLED(預設 0),所以龍蝦上
+# `/console` 一律 404。但那台機器根本沒有 GUI —— 它就該用瀏覽器控制台。
+#
+# `/console` 是純 FastAPI 路由 + static/console/ 的靜態檔,**零平台相依**,
+# 而且那些檔案本來就會被 rsync 進 payload。也就是說「Ubuntu 桌面端」其實
+# 早就在了,只差沒打開。不需要為 Linux 另外寫一個 GUI app。
+#
+# QR 登入一併開:雲端龍蝦**沒有「本機」可言**,每一次存取都是遠端,
+# 而遠端走 `_pair_local_only` 一律裸 403。沒有 QR 登入 = 控制台開了也進不去。
+#   → 遠端開頁 → 顯示 QR → 已配對的手機批准 → 進去(見 CONSOLE_QR_LOGIN_SPEC)
+CONSOLE_ENABLED="${POCKET_CONSOLE_ENABLED:-1}"
+CONSOLE_QR_LOGIN="${POCKET_CONSOLE_QR_LOGIN:-1}"
+# **檔案面預設一個都不開。** 遠端控制台的能力降級規則:沒設這個變數就等於
+# 看不到任何檔案。龍蝦上使用者自己的工作目錄要不要開放,由他自己決定 ——
+# 我們不替他把家目錄掛上去。設法:POCKET_CONSOLE_REMOTE_FILE_ROOTS=/path:/path2
+CONSOLE_FILE_ROOTS="${POCKET_CONSOLE_REMOTE_FILE_ROOTS:-}"
+grep -q '^POCKET_CONSOLE_ENABLED=' "$ENV_FILE" || printf 'POCKET_CONSOLE_ENABLED=%s\n' "$CONSOLE_ENABLED" >> "$ENV_FILE"
+grep -q '^POCKET_CONSOLE_QR_LOGIN=' "$ENV_FILE" || printf 'POCKET_CONSOLE_QR_LOGIN=%s\n' "$CONSOLE_QR_LOGIN" >> "$ENV_FILE"
+grep -q '^POCKET_CONSOLE_REMOTE_FILE_ROOTS=' "$ENV_FILE" || printf 'POCKET_CONSOLE_REMOTE_FILE_ROOTS=%s\n' "$CONSOLE_FILE_ROOTS" >> "$ENV_FILE"
 chmod 600 "$ENV_FILE"
 
 # ── 配對 boot code(既有就沿用;bridge 啟動也會自產,這裡先產好以便印連結) ──
@@ -124,8 +159,13 @@ install_node() {
   rm -f "$archive"
 }
 
-if [ "$INSTALL_OPENCLAW" = "1" ]; then
+# Codex 也需要 Node —— 原本 install_node 只在 OpenClaw 區塊裡被呼叫,
+# 關掉 OpenClaw 但要 Codex 時會拿不到 node。
+if [ "$INSTALL_OPENCLAW" = "1" ] || [ "$INSTALL_CODEX" = "1" ]; then
   install_node
+fi
+
+if [ "$INSTALL_OPENCLAW" = "1" ]; then
   if [ ! -x "$OPENCLAW_INSTALL_DIR/npm/node_modules/.bin/openclaw" ]; then
     log_step "安裝 OpenClaw $OPENCLAW_VERSION"
     mkdir -p "$OPENCLAW_INSTALL_DIR/npm" "$OPENCLAW_INSTALL_DIR/home/state"
@@ -153,6 +193,71 @@ if [ "$INSTALL_HERMES" = "1" ] && [ ! -x "$HERMES_INSTALL_DIR/runtime/venv/bin/h
   python3 -m venv "$HERMES_INSTALL_DIR/runtime/venv"
   "$HERMES_INSTALL_DIR/runtime/venv/bin/pip" install -q -e "$HERMES_INSTALL_DIR"
   mkdir -p "$HERMES_HOME_ROOT"
+fi
+
+# ── Claude Code / Codex(使用者自備帳號,我們只裝執行檔)────────────────────
+#
+# 失敗一律不致命:少了它們這台機器仍然可用(OpenClaw、終端機、檔案都還在),
+# 把整支安裝器弄掛才是真的壞。但要**講清楚少了什麼**,不要安靜地少一個東西。
+#
+# Claude Code 走**官方簽章 apt repo**,不走管道式安裝腳本:
+#   · 套件與 repo 都有 GPG 簽章,apt 會自動驗 —— 伺服器上這點比方便重要
+#   · 和本腳本既有的「sudo 只用於 apt 缺件補裝」模式一致
+#   · 代價:apt 版**不會自動更新**(原生安裝器版會),要靠系統升級流程
+# 官方文件與金鑰指紋:https://code.claude.com/docs/en/setup
+CLAUDE_APT_KEY_URL="${CLAUDE_APT_KEY_URL:-https://downloads.claude.ai/keys/claude-code.asc}"
+CLAUDE_APT_REPO="${CLAUDE_APT_REPO:-https://downloads.claude.ai/claude-code/apt/stable}"
+CLAUDE_APT_FPR="31DDDE24DDFAB679F42D7BD2BAA929FF1A7ECACE"
+
+install_claude_code() {
+  command -v claude >/dev/null 2>&1 && return 0
+  command -v sudo >/dev/null 2>&1 || { echo "  (沒有 sudo,略過 Claude Code)" >&2; return 1; }
+  local key=/etc/apt/keyrings/claude-code.asc
+  sudo install -d -m 0755 /etc/apt/keyrings || return 1
+  sudo curl -fsSL "$CLAUDE_APT_KEY_URL" -o "$key" || return 1
+  # **先驗指紋再信任。** 下載到的東西沒驗就加進 apt 信任鏈,等於把套件來源
+  # 的決定權交給當下的網路。
+  if ! gpg --show-keys "$key" 2>/dev/null | tr -d ' ' | grep -q "$CLAUDE_APT_FPR"; then
+    echo "  ✗ 金鑰指紋不符預期,中止安裝 Claude Code" >&2
+    sudo rm -f "$key"; return 1
+  fi
+  echo "deb [signed-by=$key] $CLAUDE_APT_REPO stable main" \
+    | sudo tee /etc/apt/sources.list.d/claude-code.list >/dev/null || return 1
+  sudo apt-get update -qq || return 1
+  sudo apt-get install -y -qq claude-code || return 1
+}
+
+if [ "$INSTALL_CLAUDE" = "1" ] && ! command -v claude >/dev/null 2>&1; then
+  log_step "安裝 Claude Code(官方簽章 apt repo)"
+  if install_claude_code; then
+    log_step "  claude $(claude --version 2>/dev/null | head -1)"
+  else
+    printf '⚠️  Claude Code 沒裝成 —— 這台龍蝦的 CC 頁籤會是關的,其餘功能不受影響。\n' >&2
+    printf '    安裝方式見 https://code.claude.com/docs/en/setup\n' >&2
+  fi
+fi
+
+if [ "$INSTALL_CODEX" = "1" ] && ! command -v codex >/dev/null 2>&1; then
+  log_step "安裝 Codex $CODEX_VERSION"
+  # npm 裝進使用者自己的 prefix(不是 sudo npm -g)。bridge 的
+  # _resolve_codex_bin() 會依序找 CODEX_BIN → ~/.codex/packages/… →
+  # ~/.local/bin/codex → PATH,所以放進 ~/.local 就找得到。
+  if PATH="$NODE_ROOT/bin:$PATH" npm install -g --silent \
+       --prefix "$HOME/.local" "@openai/codex@$CODEX_VERSION"; then
+    log_step "  codex $("$HOME/.local/bin/codex" --version 2>/dev/null | head -1)"
+  else
+    printf '⚠️  Codex 沒裝成 —— 這台龍蝦的 Codex 頁籤會是關的,其餘功能不受影響。\n' >&2
+  fi
+fi
+
+# Claude Code 官方系統需求寫明 **4 GB+ RAM**。Starter 級的雲端龍蝦正好卡在
+# 那條線上,而 Hermes 全套靜置實測就吃 1.86 GB —— 兩個一起開會很擠。
+# 只警告不中止:夠不夠要看他實際怎麼用,我們不替他決定。
+_mem_kb=$(awk '/MemTotal/{print $2}' /proc/meminfo 2>/dev/null || echo 0)
+if [ "${_mem_kb:-0}" -gt 0 ] && [ "$_mem_kb" -lt 4000000 ]; then
+  printf '⚠️  這台機器只有約 %s GB RAM;Claude Code 官方需求是 4 GB+。\n' \
+    "$(awk -v k="$_mem_kb" 'BEGIN{printf "%.1f", k/1048576}')" >&2
+  printf '    會跑,但大一點的 session 容易被 OOM 殺掉。\n' >&2
 fi
 
 # ── cloudflared(公網保底 quick tunnel) ──────────────────────────────────
@@ -214,6 +319,47 @@ WantedBy=default.target
 UNIT
 fi
 
+# ── Codex managed daemon(2026-10-31)──────────────────────────────────────
+#
+# **裝了 codex 執行檔,不等於拿到持久化。**
+#
+# bridge 連 Codex 有兩條路(見 bridge.py 的 CODEX_APP_SERVER_SOCKET 註解):
+#   · **managed daemon**(主要):unix socket 上跑 WebSocket frames,
+#     「the single writer shared by Desktop and Pocket」。那顆 daemon 在 Mac 上
+#     是**桌面版 Codex 帶起來的**,獨立於 bridge —— 所以 bridge 重啟時
+#     **進行中的回合活得下來**。
+#   · `codex app-server --stdio`(退路):bridge 自己 spawn 的子行程,
+#     **隨 bridge 一起死**。
+#
+# 龍蝦沒有桌面版 → 不補這個 unit 就只剩退路 → 每次 bridge 重啟都打斷正在跑的
+# Codex 回合。而龍蝦正是最常重啟的環境(更新、OOM、換設定)。
+# 機主 2026-10-31 的目標是「cc / cx 要能持久」,這一格就是缺口之一。
+#
+# ⚠️ **這段指令是從 macOS 上執行中的 daemon 行程反推的,不是來自官方文件。**
+#    (`codex app-server --remote-control --listen unix:// --managed-daemon`)
+#    刻意不帶 `--analytics-default-enabled` —— 那是桌面版自己的選擇,
+#    我們不替使用者在他的機器上打開遙測。
+#    **沒有在 Linux 上驗過**:起不來的話 bridge 會自動退回 stdio(三態判定
+#    是「連得上嗎」而不是「socket 檔在不在」),所以最壞情況是回到現狀,
+#    不會比不裝這個 unit 更糟。
+if [ "$INSTALL_CODEX" = "1" ]; then
+cat > "$UNIT_DIR/pocket-codex-daemon.service" <<UNIT
+[Unit]
+Description=Codex managed daemon (Pocket lobster) —— 讓 Codex 回合跨得過 bridge 重啟
+After=network-online.target
+
+[Service]
+Environment=PATH=%h/.local/bin:$NODE_ROOT/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=%h/.local/bin/codex app-server --remote-control --listen unix:// --managed-daemon
+Restart=always
+RestartSec=5
+TimeoutStartSec=120
+
+[Install]
+WantedBy=default.target
+UNIT
+fi
+
 if [ "$INSTALL_TUNNEL" = "1" ]; then
 # quick tunnel URL 每次啟動都會變 → wrapper 從 stderr 撈 trycloudflare URL
 # 寫進 $TUNNEL_URL_FILE,bridge 的 /pair/qr 讀它當公網保底候選。
@@ -250,6 +396,12 @@ loginctl enable-linger "$USER" 2>/dev/null || log_step "enable-linger 失敗(無
 log_step "啟動服務"
 systemctl --user enable --now "$BRIDGE_LABEL.service"
 [ "$INSTALL_OPENCLAW" = "1" ] && systemctl --user enable --now pocket-openclaw.service
+# codex daemon:只在 codex 真的裝起來了才啟用。寫了 unit 卻啟不動,只會在
+# systemctl 裡留一條紅的,讓人以為壞了 —— 而實際上只是沒裝 codex。
+if [ "$INSTALL_CODEX" = "1" ] && [ -x "$HOME/.local/bin/codex" ]; then
+  systemctl --user enable --now pocket-codex-daemon.service \
+    || log_step "codex daemon 啟不動 —— bridge 會自動退回 stdio(回合不跨重啟,但功能正常)"
+fi
 [ "$INSTALL_TUNNEL" = "1" ] && systemctl --user enable --now pocket-tunnel.service
 
 # ── 等 bridge 起來 → 開配對頁 ────────────────────────────────────────────
@@ -282,10 +434,17 @@ fi
 # 雲端/headless 免掃碼:直接給配對連結(30 分鐘有效),傳到手機點開即配。
 PAIR_LINK="$(curl -fsS -m 8 "http://127.0.0.1:$BRIDGE_PORT/pair/qr.json?ttl=1800&boot=$PAIR_BOOT_CODE" 2>/dev/null \
   | python3 -c 'import json,sys;d=json.load(sys.stdin);print(d.get("payload","") if d.get("ok") else "")' 2>/dev/null || true)"
+PAIR_LINK_FILE="${POCKET_PAIR_LINK_FILE:-$HOME/pocket-pair-link.txt}"
 if [ -n "$PAIR_LINK" ]; then
   echo
   echo "📎 免掃碼(雲端主機):把下面這條配對連結傳到手機(iMessage/mail 皆可),點開即配對(30 分鐘內有效):"
   echo "   $PAIR_LINK"
+  # **也要落檔。** 這支常常在沒有人看著 stdout 的情況下跑:
+  # cloud-init／Vultr startup script／ssh 一行帶過、或單純捲掉了。
+  # 連結只印在畫面上 = 錯過就只能重跑安裝器。
+  # 連結本身即憑證(帶 boot code),所以 0600。
+  (umask 077; printf '%s\n' "$PAIR_LINK" > "$PAIR_LINK_FILE") 2>/dev/null \
+    && echo "   (也寫到 $PAIR_LINK_FILE —— 錯過上面那行就 cat 它)"
 fi
 if ! command -v tailscale >/dev/null; then
   echo

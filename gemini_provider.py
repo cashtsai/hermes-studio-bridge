@@ -141,8 +141,10 @@ def list_sessions() -> list[dict]:
     """名錄 → [{id,acp_sid,title,cwd,created,last}],last 新→舊。
     `id` 是 bridge 自己的 key(v2 id 的 rest 段);`acp_sid` 是 gemini 端
     session id —— 解耦的原因:CLI 更新/狀態清掉時 ACP session 會蒸發,
-    bridge 這邊換一顆 acp_sid 續命,歷史(逐字稿/卡)照舊。"""
-    rows = list(_load_sessions().values())
+    bridge 這邊換一顆 acp_sid 續命,歷史(逐字稿/卡)照舊。
+
+    封存的不列(對齊 cc2:封存=不列出來,對話不刪;`set_archived` 可復原)。"""
+    rows = [r for r in _load_sessions().values() if not r.get("archived")]
     rows.sort(key=lambda r: float(r.get("last") or 0), reverse=True)
     return rows
 
@@ -178,6 +180,34 @@ def touch_session(key: str, title_hint: str = "") -> None:
     _save_sessions(d)
 
 
+def rename_session(key: str, title: str) -> dict | None:
+    """改標題(gemini 的 session 身分是 key,標題只是顯示名 —— 與 cc2 的
+    「搬鍵」不同,這裡沒有身分搬移的問題,單純改欄位)。
+    回更新後的列;session 不存在回 None。"""
+    d = _load_sessions()
+    row = d.get(key)
+    if not row:
+        return None
+    row["title"] = (title or "").strip()[:60]
+    _save_sessions(d)
+    return row
+
+
+def set_archived(key: str, archived: bool) -> dict | None:
+    """封存/復原(對齊 cc2 的語意:封存只是不列出來,逐字稿與卡照留)。
+
+    ⚠️ 刻意**不用 `forget_session`** 當封存:forget 是刪名錄 —— 不可逆,
+    而 app 的滑動手勢叫「封存」。按「封存」卻永久刪除,就是文字與行為不一致。
+    回更新後的列;session 不存在回 None。"""
+    d = _load_sessions()
+    row = d.get(key)
+    if not row:
+        return None
+    row["archived"] = bool(archived)
+    _save_sessions(d)
+    return row
+
+
 def forget_session(key: str) -> None:
     d = _load_sessions()
     if key in d:
@@ -200,6 +230,32 @@ def transcript_append(sid: str, role: str, text: str) -> str:
         f.write(json.dumps({"id": mid, "role": role, "content": text,
                             "ts": time.time()}, ensure_ascii=False) + "\n")
     return mid
+
+
+def transcript_page(sid: str, limit: int = 40, offset: int = 0) -> dict:
+    """歷史分頁 —— **形狀對齊 cc2 的 `history_page`**:
+    `{messages, more, total}`,offset 從最新往回數,messages 舊→新。
+
+    同形狀是刻意的:app 的「更早歷史」讀的就是這個形狀,bridge 的統一
+    history 路由對四家回一樣的東西,app 端才不用每家寫一個解析器。
+    """
+    try:
+        with open(transcript_path(sid), "r", encoding="utf-8") as f:
+            lines = f.readlines()
+    except Exception:  # noqa: BLE001 — 新 session 沒逐字稿
+        return {"messages": [], "more": False, "total": 0}
+    rows = []
+    for line in lines:
+        try:
+            m = json.loads(line)
+            if isinstance(m, dict):
+                rows.append(m)
+        except Exception:  # noqa: BLE001 — 壞行跳過
+            continue
+    total = len(rows)
+    end = max(0, total - max(0, offset))
+    start = max(0, end - max(1, limit))
+    return {"messages": rows[start:end], "more": start > 0, "total": total}
 
 
 def transcript_read(sid: str, limit: int = 200) -> list[dict]:
