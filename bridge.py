@@ -23891,6 +23891,40 @@ def _gm_normalize_options(options: list) -> list:
     return out
 
 
+def _gm_approval_card(key: str, record: dict) -> None:
+    """把待審送進這條對話的卡片流 —— **可直接按的核准卡**。
+
+    走 `carddigest` 的 `handle_approval`(契約 §6 的 approval 卡),與 CC/CX
+    同一條路;所以 app 的 `CardStreamView onApproval` 認得它、
+    `AgentCardSessionView.approve()` 會被觸發。
+
+    digest 不在(對話還沒被打開過、或 bridge 重啟過)→ 什麼都不做。
+    那是正常狀態:卡片流是跟著「開著的對話」活的,而核准仍然在審核中心
+    (`_approval_push` 另外做)—— 不會因此丟掉。
+    """
+    d = _GM_CARD_DIGESTS.get(key)
+    if d is None:
+        return
+    try:
+        d.handle_approval(record)
+    except Exception as exc:                      # noqa: BLE001
+        # 出卡失敗不能讓權限請求整個掉 —— 退回純文字卡,至少看得見。
+        _log_exc("gm_approval_card", exc, expected=False)
+        _gm_perm_card(key, f"⏳ Gemini 請求使用「{record.get('title') or '工具'}」"
+                           "—— 請到審核中心放行。")
+
+
+def _gm_resolve_approval_card(key: str, record: dict, status: str) -> None:
+    """決定之後把那張卡收尾(避免留一張還可點的 pending 卡)。"""
+    d = _GM_CARD_DIGESTS.get(key)
+    if d is None:
+        return
+    try:
+        d.resolve_approval(record, status)
+    except Exception as exc:                      # noqa: BLE001
+        _log_exc("gm_resolve_approval_card", exc, expected=True)
+
+
 def _gm_perm_card(key: str, text: str) -> None:
     d = _GM_CARD_DIGESTS.get(key)
     if d is None:
@@ -23961,13 +23995,26 @@ async def _gm_on_request(req: dict):
     loop = asyncio.get_running_loop()
     fut: asyncio.Future = loop.create_future()
     _GM_PERM_WAITERS[aid] = fut
-    _gm_perm_card(key, f"⏳ Gemini 請求使用「{tool}」—— 等你在審核中心放行。")
+    # 對話頁要出**可直接按的核准卡**,不是一行「去審核中心放行」的純文字。
+    #
+    # CC/CX 的待審是卡片流裡的 approval 卡(`CardStreamView` 的 onApproval
+    # 接得到);Gemini 原本只 `_gm_perm_card(…)` 出一張 system/text,於是
+    # `AgentCardSessionView.approve()` 在 Gemini 上**永遠不會被觸發** ——
+    # 使用者得離開對話、切到審核中心、再回來。而這條只有 180 秒窗口。
+    #
+    # `handle_approval` 吃的就是 bridge 的統一 approval 物件(契約 §6),
+    # `record["options"]` 已經正規化過(見 `_gm_normalize_options`),
+    # 所以卡上的按鈕會有文字、按下去也對得回 optionId。
+    _gm_approval_card(key, record)
     _approval_push(aid, record["title"], record["detail"], record["session_id"])
 
     try:
         approve = await asyncio.wait_for(fut, timeout=_GM_PERM_TIMEOUT)
     except asyncio.TimeoutError:
         _gm_approval_set_status(aid, "expired")
+        # 卡片流那張也要收尾 —— 不收的話對話頁會留一張還能按的 pending 卡,
+        # 按了才吃 409(同 `_approvals_expire` 的 A3 教訓)。
+        _gm_resolve_approval_card(key, record, "expired")
         _gm_perm_card(key, f"⌛ 「{tool}」等不到放行({int(_GM_PERM_TIMEOUT)} 秒),"
                            "已自動拒絕。")
         _log_event("gemini_permission_expired", approval_id=aid, tool=tool)
@@ -23979,11 +24026,13 @@ async def _gm_on_request(req: dict):
         # allow 選項一定存在(上面已經擋過沒有的情況)。
         opt = _gm_pick_option(options, True) or ""
         _gm_approval_set_status(aid, "approved")
+        _gm_resolve_approval_card(key, record, "approved")
         _gm_perm_card(key, f"✅ 已放行「{tool}」。")
         _log_event("gemini_permission_approved", approval_id=aid, tool=tool,
                    option=opt)
         return {"outcome": {"outcome": "selected", "optionId": opt}}
     _gm_approval_set_status(aid, "denied")
+    _gm_resolve_approval_card(key, record, "denied")
     _gm_perm_card(key, f"⛔ 已駁回「{tool}」。")
     # 有 reject 選項就明確選它;沒有就回 cancelled —— ACP 的 cancelled 本身
     # 就是合法的拒絕,不必為了「看起來有選」而硬塞一個 optionId。
