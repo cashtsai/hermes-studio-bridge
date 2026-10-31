@@ -50,7 +50,16 @@ users:
     gecos: Pocket lobster
     shell: /bin/bash
     sudo: ['ALL=(ALL) NOPASSWD:ALL']   # 安裝器需要 sudo 補 apt 套件與 Claude Code 的 apt repo
-    lock_passwd: true                  # 不給密碼登入；要進去走 Vultr Console 或自己加 key
+    lock_passwd: true                  # 不給密碼登入
+    # 要 SSH 進這台就把**你自己的**公鑰填在這裡（`cat ~/.ssh/id_ed25519.pub`）。
+    # 不填也能用：Vultr 的網頁 Console 一樣進得去。
+    #
+    # ⚠️ **這個檔在公開 repo 裡，是給所有人用的模板 —— 絕對不要把任何人的
+    #    實際公鑰 commit 進來。** 寫死一把金鑰 = 每個照這份部署的使用者，
+    #    他的機器上都授權了那把鑰匙的主人。
+    #    自己用的那份請在貼進 Vultr 之前才填，不要回寫進 repo。
+    # ssh_authorized_keys:
+    #   - ssh-ed25519 AAAA...換成你自己的... you@example
 
 write_files:
   - path: /usr/local/bin/pocket-lobster-setup.sh
