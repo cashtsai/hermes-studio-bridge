@@ -453,15 +453,26 @@ systemctl --user daemon-reload \
 loginctl enable-linger "$USER" 2>/dev/null || log_step "enable-linger 失敗(無 sudo?)— 登出後服務會停,可稍後手動: sudo loginctl enable-linger $USER"
 
 log_step "啟動服務"
-systemctl --user enable --now "$BRIDGE_LABEL.service"
-[ "$INSTALL_OPENCLAW" = "1" ] && systemctl --user enable --now pocket-openclaw.service
+# ⚠️ enable **+ restart**,不是 `enable --now`(2026-10-31 實機抓到)。
+# `enable --now` 對**已經在跑**的服務是 no-op —— 於是重跑安裝器時,服務雖然
+# rsync 了新 bridge.py,卻**永遠不會被重新載入**,跑的還是舊程式。
+# 每次重跑都要手動 `systemctl --user restart` 才生效,是這個坑。
+# enable(開機自啟)只做一次、restart 保證吃到新碼。
+#
+# bridge 要先 daemon-reload 後再 restart(unit 檔可能剛改過)。
+_svc_up() {   # $1 = unit 名
+  systemctl --user enable "$1" >/dev/null 2>&1
+  systemctl --user restart "$1"
+}
+_svc_up "$BRIDGE_LABEL.service"
+[ "$INSTALL_OPENCLAW" = "1" ] && _svc_up pocket-openclaw.service
 # codex daemon:只在 codex 真的裝起來了才啟用。寫了 unit 卻啟不動,只會在
 # systemctl 裡留一條紅的,讓人以為壞了 —— 而實際上只是沒裝 codex。
 if [ "$INSTALL_CODEX" = "1" ] && [ -x "$HOME/.local/bin/codex" ]; then
-  systemctl --user enable --now pocket-codex-daemon.service \
+  _svc_up pocket-codex-daemon.service \
     || log_step "codex daemon 啟不動 —— bridge 會自動退回 stdio(回合不跨重啟,但功能正常)"
 fi
-[ "$INSTALL_TUNNEL" = "1" ] && systemctl --user enable --now pocket-tunnel.service
+[ "$INSTALL_TUNNEL" = "1" ] && _svc_up pocket-tunnel.service
 
 # ── 等 bridge 起來 → 開配對頁 ────────────────────────────────────────────
 log_step "等 bridge /health"

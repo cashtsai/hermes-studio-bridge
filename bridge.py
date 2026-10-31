@@ -30127,10 +30127,14 @@ async def app_codex_login_start(request: Request):
     if not os.path.exists(codex_bin):
         raise http_err(503, "CODEX_MISSING", "這台主機沒有安裝 Codex")
     try:
+        # cwd 用使用者家目錄,**不是 HOME_ROOT** —— HOME_ROOT 是 Hermes 家目錄
+        # (~/apps/hermes-agent/home),龍蝦沒裝 Hermes 時那目錄不存在,
+        # create_subprocess_exec(cwd=不存在) 會丟 FileNotFoundError → 503。
+        # 登入不需要特定 cwd,用保證存在的家目錄。
         proc = await asyncio.create_subprocess_exec(
             codex_bin, "login", "--device-auth",
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
-            stdin=asyncio.subprocess.DEVNULL, cwd=HOME_ROOT)
+            stdin=asyncio.subprocess.DEVNULL, cwd=os.path.expanduser("~"))
     except (FileNotFoundError, PermissionError) as e:
         _log_event("codex_login_spawn_failed", error=type(e).__name__)
         raise http_err(503, "CODEX_SPAWN_FAILED", "啟動 Codex 登入失敗")
