@@ -244,27 +244,34 @@ if [ "$INSTALL_CODEX" = "1" ] && ! command -v codex >/dev/null 2>&1; then
   # ~/.local/bin/codex → PATH,所以放進 ~/.local 就找得到。
   if PATH="$NODE_ROOT/bin:$PATH" npm install -g --silent \
        --prefix "$HOME/.local" "@openai/codex@$CODEX_VERSION"; then
-    # ── node 要進登入 PATH,否則 codex 跑不起來(2026-10-31 實機抓到)──────
-    #
-    # **Linux 上的 codex 和 macOS 不一樣。** macOS 裝到的是原生二進位
-    # (~/.codex/packages/standalone/…);Linux 用 npm 裝到的是 JS wrapper
-    # (`#!/usr/bin/env node` → codex.js)。所以它**執行時需要 node 在 PATH 上**。
-    #
-    # 服務面沒問題(bridge 與 codex-daemon 的 unit 都有帶 $NODE_ROOT/bin),
-    # 但**使用者面會壞**:他要在 Pocket 的內建終端機裡跑 `codex` 登入自己的
-    # 帳號,而那是一個登入 shell —— 第一台實機上就是這樣炸的:
-    #     env: 'node': No such file or directory
-    # 而 bridge 的 `cx` capability 只檢查**檔案在不在**,所以照樣回 true
-    #   → **capability 在說謊**:頁籤是亮的,一用就壞。
-    if [ ! -f "$HOME/.profile.d-pocket-node" ]; then
-      printf '\n# Pocket 龍蝦:codex 是 JS wrapper,執行時要 node 在 PATH 上\nexport PATH="%s/bin:$HOME/.local/bin:$PATH"\n' \
-        "$NODE_ROOT" >> "$HOME/.profile"
-      : > "$HOME/.profile.d-pocket-node"   # 哨兵:重跑安裝器不要重複追加
-    fi
     log_step "  codex $(PATH="$NODE_ROOT/bin:$PATH" "$HOME/.local/bin/codex" --version 2>/dev/null | head -1)"
   else
     printf '⚠️  Codex 沒裝成 —— 這台龍蝦的 Codex 頁籤會是關的,其餘功能不受影響。\n' >&2
   fi
+fi
+
+# ── node 要進登入 PATH(2026-10-31 實機抓到,修正版)─────────────────────
+#
+# **Linux 上的 codex 和 macOS 不一樣。** macOS 裝到的是原生二進位
+# (~/.codex/packages/standalone/…);Linux 用 npm 裝到的是 JS wrapper
+# (`#!/usr/bin/env node` → codex.js)—— **執行時需要 node 在 PATH 上**。
+#
+# 服務面沒事(bridge 與 codex-daemon 的 unit 都帶了 $NODE_ROOT/bin),
+# 壞的是**使用者面**:他要在 Pocket 的內建終端機裡跑 `codex` 登入自己的帳號,
+# 而那是登入 shell。第一台實機就是這樣炸的:
+#     env: 'node': No such file or directory
+# 而 bridge 的 `cx` capability 只檢查檔案在不在 → 照樣回 true
+#   → **capability 在說謊**:頁籤亮著,一用就壞。
+#
+# ⚠️ **這段刻意放在安裝區塊外面。** 第一版我寫在
+# `! command -v codex` 的判斷式**裡面** —— 於是在「codex 已經裝好、只是
+# PATH 沒設」的機器上重跑安裝器,整段被跳過,修正永遠套不上去。
+# 實機重跑時就是這樣:日誌裡連「安裝 Codex」都沒出現,問題原封不動。
+# **修的是既有狀態,就不能掛在「第一次安裝」的條件下。**
+if [ -x "$NODE_ROOT/bin/node" ] && ! grep -q 'pocket-lobster-node-path' "$HOME/.profile" 2>/dev/null; then
+  printf '\n# pocket-lobster-node-path:codex 是 JS wrapper,執行時要 node 在 PATH 上\nexport PATH="%s/bin:$HOME/.local/bin:$PATH"\n' \
+    "$NODE_ROOT" >> "$HOME/.profile"
+  log_step "已把 node 加進 ~/.profile 的 PATH"
 fi
 
 # Claude Code 官方系統需求寫明 **4 GB+ RAM**。Starter 級的雲端龍蝦正好卡在
@@ -407,7 +414,25 @@ WantedBy=default.target
 UNIT
 fi
 
-systemctl --user daemon-reload
+# ── systemctl --user 需要 XDG_RUNTIME_DIR(2026-10-31 實機抓到)─────────
+#
+# 首次 cloud-init 時這個變數是有的,所以第一次裝沒事。但**重跑**時常常是
+# `ssh root@box 'sudo -u pocket -i …'` —— 那條路徑沒有 user session bus,
+# 於是每一個 systemctl --user 都失敗:
+#     Failed to connect to user scope bus via local transport:
+#     $DBUS_SESSION_BUS_ADDRESS and $XDG_RUNTIME_DIR not defined
+# 而安裝器照樣往下跑、印出「結果」—— 看起來成功,**實際上服務根本沒重啟,
+# 跑的還是舊程式**。這是「離開碼不等於成功」的又一個版本。
+#
+# linger 開著時 /run/user/<uid> 一定在,補上變數就能用。
+if [ -z "${XDG_RUNTIME_DIR:-}" ] && [ -d "/run/user/$(id -u)" ]; then
+  export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+  log_step "補上 XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR(重跑時 ssh 環境沒有它)"
+fi
+
+systemctl --user daemon-reload \
+  || die "systemctl --user 不可用(XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-未設})。
+  若是從 ssh 重跑,改用:  sudo machinectl shell pocket@  然後在裡面跑本腳本"
 loginctl enable-linger "$USER" 2>/dev/null || log_step "enable-linger 失敗(無 sudo?)— 登出後服務會停,可稍後手動: sudo loginctl enable-linger $USER"
 
 log_step "啟動服務"
