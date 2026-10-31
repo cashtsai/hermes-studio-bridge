@@ -30037,6 +30037,48 @@ async def app_agents_auth(request: Request):
     return await _agent_auth_status()
 
 
+# ══════════ App 內 agent 登入(AGENT_LOGIN_IN_APP_SPEC)階段 1:Gemini ══════════
+#
+# 龍蝦上三個 agent 原本都要使用者自己 ssh 進去設定。這組端點把登入搬進 app
+# 頁籤。Gemini 最簡單(API key,不是 OAuth),先打通這條管線。
+#
+# 旗標 `POCKET_AGENT_LOGIN_IN_APP` 預設關 → 合併進 main 不改變現行行為。
+POCKET_AGENT_LOGIN_IN_APP = os.environ.get("POCKET_AGENT_LOGIN_IN_APP", "0") != "0"
+
+
+@app.put("/app/v1/agents/gemini/key")
+async def app_gemini_set_key(request: Request):
+    """把使用者貼的 Gemini API key 寫進 ~/.pocket/gemini.json(0600)。
+
+    刻意設計:
+      · **只接受一般 device token,不接受 console-remote scope**(規格 §3 安全):
+        設定 API key 等同把帳號綁上這台機器,是機主級動作,不下放給遠端瀏覽器。
+      · **key 絕不進 log** —— 連長度、前綴都不記;只 log「設了/清了」這個事實。
+      · env `GEMINI_API_KEY` 存在時仍優先(save_config 的既有語意),但這條
+        路是給「沒設 env、想從手機貼」的龍蝦使用者。
+    """
+    if not POCKET_AGENT_LOGIN_IN_APP:
+        raise HTTPException(status_code=404, detail="not found")
+    _check_auth(request)
+    # console-remote 的遠端瀏覽器不准碰登入(等同機主權限)。
+    if _token_scope(_request_token(request)) == CONSOLE_REMOTE_SCOPE:
+        raise http_err(403, "SCOPE_FORBIDDEN",
+                       "遠端控制台不能設定帳號憑證,請用已配對的手機")
+    body = await _json_body(request)
+    key = str(body.get("api_key") or "").strip()
+    if not key:
+        raise http_err(400, "MISSING_KEY", "api_key 不可為空")
+    try:
+        gemini_provider.save_config(api_key=key)
+    except Exception as e:  # noqa: BLE001
+        _log_exc("gemini_set_key", e, expected=False)
+        raise http_err(500, "SAVE_FAILED", "寫入 Gemini 設定失敗")
+    _log_event("gemini_key_set")   # 不記 key 本身
+    # `configured()` 每次直接 load_config() 讀檔、不快取,所以寫完立刻為 True,
+    # 不需要另外清快取。
+    return {"ok": True, "provider": "gemini", "configured": GEMINI.configured()}
+
+
 def _host_capabilities() -> dict:
     """這台龍蝦主機支援哪些 provider — 給 app 依能力顯示/隱藏功能,而不是
     讓不支援的功能看起來像壞掉(Windows/精簡安裝沒有 tmux/CC 時尤其重要)。
