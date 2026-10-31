@@ -23704,6 +23704,56 @@ _GM_TURNS: dict = {}     # acp_sid -> {"cid","text","key"}(進行中 turn 的路
 _GM_PERM_WAITERS: dict = {}
 _GM_PERM_TIMEOUT = float(os.environ.get("POCKET_GEMINI_APPROVAL_SEC", "180"))
 
+#: 回合失敗的分類 → 人看得懂的說法 + 下一步。
+#:
+#: 為什麼需要這個(2026-10-31):Gemini 的失敗原本一律呈現成
+#: 「Gemini 回合失敗:<原始例外前 160 字>」。那對**額度用完**特別糟 ——
+#: 使用者看到一串技術字串,不知道是自己沒配額、還是我們壞了,也不知道要等多久。
+#: 這正是 2026-10-11 把 Gemini 入口藏起來時點名的「quota 失敗」。
+#:
+#: ⚠️ **刻意不報百分比。** CC/CX 的 `/app/v1/usage` 能給剩餘額度,是因為
+#: Codex 寫 `~/.codex/sessions/**/*.jsonl` 的 `payload.rate_limits`、Claude 有
+#: statusLine hook 的 json。**Gemini 沒有任何本機用量來源**(2026-10-31 查過
+#: `~/.gemini/`:state/settings/logs 都沒有額度欄位)。沒有來源就不猜 ——
+#: 同 usage 段的信任邊界:不能推算一個看起來像官方的數字。
+_GM_FAILURE_RULES = (
+    # (分類, 關鍵字, 給使用者的話)
+    ("quota", ("quota", "resource_exhausted", "429", "rate limit",
+               "too many requests"),
+     "Gemini 的用量額度目前用完了。這是 Google 帳號層級的限制,不是連線問題 —— "
+     "等額度重置後再試,或改用 CC / CX 繼續這件事。"),
+    ("auth", ("unauthenticated", "401", "invalid credentials", "login",
+              "re-authenticate"),
+     "Gemini 需要重新登入。在桌面端終端機跑一次 `gemini` 完成登入後再回來。"),
+    ("timeout", ("timeout", "timed out", "deadline"),
+     "Gemini 這一回合等太久被中斷了。內容多的話可以拆小一點再試。"),
+    ("unavailable", ("unavailable", "503", "502", "connection refused"),
+     "Gemini 服務暫時連不上。這通常是上游的事,過一下再試。"),
+)
+
+
+def _gemini_failure_kind(exc: BaseException) -> str:
+    """失敗分類(給日誌用的短標籤)。認不出回 `other`。"""
+    blob = f"{type(exc).__name__} {exc}".lower()
+    for kind, needles, _ in _GM_FAILURE_RULES:
+        if any(n in blob for n in needles):
+            return kind
+    return "other"
+
+
+def _gemini_failure_text(exc: BaseException) -> str:
+    """給使用者看的失敗說明。
+
+    認得出的分類 → 人話 + 下一步;認不出 → **照舊附原始訊息**,
+    不要用一句含糊的「發生錯誤」把唯一的線索吃掉(那比技術字串更糟)。
+    """
+    raw = str(exc)[:160]
+    for kind, needles, msg in _GM_FAILURE_RULES:
+        blob = f"{type(exc).__name__} {exc}".lower()
+        if any(n in blob for n in needles):
+            return msg
+    return f"Gemini 回合失敗：{raw}"
+
 
 def _gemini_key_from_session_id(session_id: str) -> str | None:
     sid = str(session_id or "")
@@ -23802,6 +23852,45 @@ def _gm_pick_option(options: list, approve: bool) -> str | None:
     return None
 
 
+def _gm_normalize_options(options: list) -> list:
+    """ACP 的 `{optionId,name,kind}` → 契約的 `{key,label,style}`。
+
+    ## 為什麼需要這支(2026-10-31)
+
+    原本是 `record["options"] = options`,把 ACP 原形直接塞進 canonical
+    approvals 表。其他四家(cc/cx/cc2/persona)存的都是 `{key,label,style}`,
+    而 app 的 `TerminalApprovalOption` 只認那個形狀。於是 Gemini 的核准卡:
+
+      · `key` 與 `label` 都解成空字串 → **畫出沒有文字的空白按鈕**
+      · 按下去送 `{"key": ""}`
+      · `_gm_approval_decide` 原本只讀 `b["approve"]` → `bool(None)` = False
+      · **一律駁回**
+
+    也就是說 2026-10-11 把 Gemini 入口藏起來時點名的「權限請求只能自動拒」
+    **一直都還在**,只是從「明講自動拒」變成「使用者按了空白鈕然後被拒」——
+    那更糟,因為它看起來是能用的。
+
+    `style` 的對位:allow* → primary,reject* → deny。其餘(ACP 之後若加新
+    kind)保守給 secondary —— 不猜它是放行還是駁回,讓它可見但不搶眼。
+    """
+    out = []
+    for o in options or []:
+        if not isinstance(o, dict):
+            continue
+        oid = str(o.get("optionId") or "").strip()
+        if not oid:
+            continue           # 沒有 id 的選項送回去也沒用,不要畫出來
+        kind = str(o.get("kind") or "")
+        style = ("primary" if kind.startswith("allow")
+                 else "deny" if kind.startswith("reject") else "secondary")
+        # label 用 ACP 給的 name;真的沒有才退回 kind,**絕不留空字串** ——
+        # 空 label 就是那顆空白按鈕的來源。
+        out.append({"key": oid,
+                    "label": str(o.get("name") or kind or "選項")[:60],
+                    "style": style})
+    return out
+
+
 def _gm_perm_card(key: str, text: str) -> None:
     d = _GM_CARD_DIGESTS.get(key)
     if d is None:
@@ -23863,7 +23952,8 @@ async def _gm_on_request(req: dict):
         "created_at": now,
         "expires_at": now + int(_GM_PERM_TIMEOUT),
         "session_id": f"gemini:{key}",
-        "options": options,
+        # 正規化成契約形狀 —— 直接塞 ACP 原形會讓 app 畫出空白按鈕(見該函式)。
+        "options": _gm_normalize_options(options),
     }
     if not _gm_approval_insert(record):
         return {"outcome": {"outcome": "cancelled"}}
@@ -23919,6 +24009,62 @@ def _gm_approval_set_status(aid: str, status: str) -> None:
         con.close()
 
 
+def _gm_decision_is_approve(aid: str, b: dict) -> bool:
+    """決議 body → 放行或駁回。**三種形狀都要收。**
+
+    ⚠️ 原本只讀 `b["approve"]`。但 app 的核准卡送的是 `{"key": "<optionId>"}`
+    (`StudioBridge.swift` 的 decide 一律送 key)—— 於是 `b.get("approve")` 是
+    None、`bool(None)` 是 False,**使用者按「允許」照樣被駁回**,而且沒有任何
+    錯誤:卡片消失、agent 收到 cancelled。這是 2026-10-31 端到端盤點抓到的。
+
+    收下的三種:
+      1. `{"approve": true|false}` —— 舊路徑(審核中心的二元鈕),保留。
+      2. `{"key": "<optionId>"}` —— app 核准卡的實際形狀。對回那筆 approval 的
+         選項,看它的 style 是 primary(放行)還是 deny(駁回)。
+      3. `{"key": "approve"|"deny"}` —— 其他 provider 的通用字面值。
+
+    **認不出來一律駁回**(fail-closed)。這是權限決定:猜錯的方向只能是
+    「少給權限」,不能是「多給」。
+    """
+    if "approve" in b:
+        return bool(b.get("approve"))
+    key = str(b.get("key") or "").strip()
+    if not key:
+        return False
+    if key in ("approve", "allow", "primary"):
+        return True
+    if key in ("deny", "reject", "cancel"):
+        return False
+    # optionId → 查那筆 approval 存下來的正規化選項。
+    for o in _gm_approval_options(aid):
+        if str(o.get("key") or "") == key:
+            return str(o.get("style") or "") == "primary"
+    _log_event("gemini_approval_key_unmatched", approval_id=aid, key=key[:40])
+    return False
+
+
+def _gm_approval_options(aid: str) -> list:
+    """那筆 approval 的正規化選項(查不到回空 list,呼叫端 fail-closed)。"""
+    try:
+        row = _approval_get_row(aid)
+    except Exception as exc:                      # noqa: BLE001
+        _log_exc("gm_approval_options", exc, expected=True)
+        return []
+    if not row:
+        return []
+    opts = row.get("options")
+    if isinstance(opts, str):
+        try:
+            opts = json.loads(opts)
+        except Exception as exc:                  # noqa: BLE001
+            # 留痕:選項解不出來 = 那張核准卡的按鈕對不回 optionId,
+            # 使用者按「允許」會被 fail-closed 駁回。安靜吞掉的話,
+            # 回報就只有「我按了允許卻被拒」而沒有任何線索。
+            _log_exc("gm_approval_options_json", exc, expected=False)
+            return []
+    return [o for o in (opts or []) if isinstance(o, dict)]
+
+
 def _gm_approval_decide(aid: str, b: dict) -> dict:
     """決定端點的 gemini 分支 —— **只叫醒等待者**,收尾由等待者協程做。
 
@@ -23929,7 +24075,7 @@ def _gm_approval_decide(aid: str, b: dict) -> dict:
     if fut is None or fut.done():
         raise HTTPException(status_code=409,
                             detail="already decided or expired")
-    approve = bool(b.get("approve"))
+    approve = _gm_decision_is_approve(aid, b)
     fut.set_result(approve)
     _log_event("gemini_approval_decision", approval_id=aid, approve=approve)
     return {"id": aid, "status": "approved" if approve else "denied",
@@ -23969,11 +24115,12 @@ async def _gm_run_turn(key: str, content: str,
     except Exception as e:  # noqa: BLE001
         partial = _GM_TURNS.get(acp_sid, {}).get("text", "") if acp_sid else ""
         try:
-            d.turn_end(cid, partial, error=f"Gemini 回合失敗：{str(e)[:160]}")
+            d.turn_end(cid, partial, error=_gemini_failure_text(e))
         except Exception as e2:  # noqa: BLE001
             _log_exc("gm_turn_end_error", e2, expected=True)
         _log_event("gemini_turn_failed", session=key[:32],
-                   error=type(e).__name__, error_message=str(e)[:160])
+                   error=type(e).__name__, error_message=str(e)[:160],
+                   kind=_gemini_failure_kind(e))
     finally:
         if acp_sid:
             _GM_TURNS.pop(acp_sid, None)
