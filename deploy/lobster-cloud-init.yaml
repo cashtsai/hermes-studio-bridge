@@ -75,8 +75,11 @@ write_files:
       # `git clone` 拿的是預設分支 main —— 而 CC/Codex/console 那批改動還在
       # `feat/lobster-agent-runtimes` 上沒合併。結果整台裝出來 `cc/cx` 全 false、
       # `/console` 404，而我們差點以為是安裝器壞了。
-      # **合併進 main 之後，把這行改回 `main`。**
-      REF="${POCKET_BRIDGE_REF:-feat/lobster-agent-runtimes}"
+      # 2026-10-31 稍晚：那批改動（含 CC 登入存 token、人格 Pocket、安裝器預設
+      # 免費模型）已全部合併進 main，所以釘回 `main`。**要裝特定分支就帶
+      # POCKET_BRIDGE_REF，不要再把預設值改成分支名** —— 分支會被合併或刪掉，
+      # 留在這裡的過期釘子會讓新機安靜地裝到舊碼（正是上面那次事故）。
+      REF="${POCKET_BRIDGE_REF:-main}"
       SRC="$HOME/pocket-bridge"
       log() { printf '\n==> %s\n' "$*"; }
 

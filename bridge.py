@@ -29967,7 +29967,11 @@ async def _dashboard_sessions():
             # 還沒開口說過話 → sessions.list 空 → 不要畫成 0/0。預設人格(Pocket /
             # main agent)本來就在,算一條閒置,跟人格分頁「有一條 Pocket」對齊,
             # 也跟 gemini 的 `or 1` 作法一致(免得「分頁有、儀表板說 0」)。
-            if oc_w == 0 and oc_i == 0:
+            #
+            # **只在 openclaw 是主 provider 時補。** Mac(hermes 主場)也可能配置了
+            # openclaw,那裡的人格分頁顯示的是 Hermes 人格、沒有對應的 Pocket 列,
+            # 補 1 會變成「儀表板多一條、分頁找不到」—— 正好是這行想消滅的那種不一致。
+            if oc_w == 0 and oc_i == 0 and _dashboard_active_provider() == "openclaw":
                 oc_i = 1
             out["openclaw"] = {"working": oc_w, "idle": oc_i}
         except Exception as e:  # noqa: BLE001
