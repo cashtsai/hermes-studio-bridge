@@ -24137,7 +24137,58 @@ async def _gemini_v2_rows() -> list:
         # 送到 gemini:default 時才真正開 ACP session。
         out = [gemini_provider.session_v2_row({"id": "default",
                                                "title": "Gemini"})]
-    return out
+    return [_gm_row_align(r) for r in out]
+
+
+def _gm_row_align(row: dict) -> dict:
+    """把 gemini 的列對齊 v2 契約。兩件事,都是 app 端看得見的落差。
+
+    ## 1. `last_event_at` 要 ISO8601 UTC 字串,不是 float epoch
+
+    `gemini_provider.session_v2_row` 送的是 `float(row["last"])`,但契約
+    (§4.1)與 app 的 `AgentSession.lastEventAt` 都只解 ISO 字串 →
+    **「最後活動時間」永遠空白**。codex 一模一樣的坑已經用 `_v2_iso_utc` 修過
+    (見該函式 docstring);gemini 沒跟上。
+    ⚠️ `GeminiSessionListView.swift:111-114` 有一段註解寫「2026-10-10 更正:
+    實測 gemini 列也有值」—— 那是**誤判**:值有,但解不出來。
+
+    ## 2. 待審要在列表上看得出來
+
+    cc / hermes / codex / openclaw 都會把 pending approval 疊成
+    `status:"waiting_approval"` + `meta.approval`;gemini 只有 busy→running,
+    於是「它在等你」在清單上完全看不出來 —— 而 Gemini 的核准有 180 秒窗口,
+    看不到就等於逾時被拒。`statusTint`/`statusLabel` 的「等待核准」分支因此
+    一直是死碼。
+    """
+    row = dict(row)
+    # `or None`:epoch 0 代表「沒有活動」,不是 1970-01-01。共用的 `_v2_iso_utc`
+    # 只把 None/"" 當空值(codex 依賴那個語意,不動它),所以在這一側擋掉。
+    row["last_event_at"] = _v2_iso_utc(row.get("last_event_at") or None)
+    pend = _gm_pending_approval_for(str(row.get("id") or ""))
+    if pend:
+        row["status"] = "waiting_approval"
+        meta = dict(row.get("meta") or {})
+        meta["approval"] = pend
+        row["meta"] = meta
+    return row
+
+
+def _gm_pending_approval_for(v2_id: str) -> dict | None:
+    """這條 gemini 會話的待審(沒有回 None)。
+
+    只讀 canonical 表 —— 核准卡已經寫在那裡(`_gm_approval_insert`),
+    不另建一份狀態,免得「卡片說在等、列表說 idle」那種自相矛盾。
+    """
+    if not v2_id:
+        return None
+    try:
+        pend = _gemini_pending_by_session()
+    except Exception as exc:                      # noqa: BLE001
+        # 查不到就當沒有待審(列表照舊顯示 running/idle)—— 寧可少一個提示,
+        # 不要因為這裡爆掉讓整個 session 列表掛掉。
+        _log_exc("gm_pending_for_row", exc, expected=True)
+        return None
+    return pend.get(v2_id)
 
 
 async def _gm_input_core(key: str, session_id: str, body: dict) -> dict:
@@ -24145,6 +24196,46 @@ async def _gm_input_core(key: str, session_id: str, body: dict) -> dict:
     事件流(同 hermes fire-and-forget 語意)。附件 v1 不支援 —— 明說,不默吞。"""
     if not GEMINI.configured():
         raise http_err(404, "SESSION_NOT_FOUND", "gemini not configured")
+    # client_id 去重 —— persona(`_APP_TURN_INFLIGHT`)、CX、CC 三家都有,
+    # **gemini 一直沒有**。而 app 的重試刻意沿用同一個 client_id
+    # (`AgentCardSessionView.swift` 註解明寫「bridge 端沒有 client_id 去重時
+    # 就是兩次執行」),所以每一條重試路徑在 Gemini 上都是**保證跑第二輪**:
+    #   · app 端 client timeout 後重送
+    #   · OfflineOutbox 自動補送
+    #   · 手動重試(可連點)
+    # 對 Gemini 特別嚴重:它的額度是 Google 帳號層級的,重跑一輪就是真的多扣
+    # 一次,而使用者根本不知道自己送了兩次。
+    dedup, prior = await _gm_input_claim(key, body.get("client_id"))
+    if prior is not None:
+        return await _gm_input_wait_prior(prior)
+    try:
+        return await _gm_input_run(key, session_id, body, dedup)
+    except BaseException:
+        _cc_input_release(dedup)   # 失敗不留佔位,否則重試會被當成重複而卡住
+        raise
+
+
+async def _gm_input_claim(key: str, client_id):
+    """同 `_cc_input_claim` 的語意,共用那套 TTL/鎖(同一個去重機制不該有兩套實作)。"""
+    return await _cc_input_claim(f"gemini:{key}", client_id)
+
+
+async def _gm_input_wait_prior(prior) -> dict:
+    """重複請求:等前一次的結果,回**同一份** —— 不要再跑一輪。"""
+    try:
+        await asyncio.wait_for(prior["event"].wait(), _CX_INPUT_INFLIGHT_WAIT)
+    except asyncio.TimeoutError:
+        # 前一次還在跑。回 202 式的 ack 而不是再送一輪 —— 寧可讓使用者看到
+        # 「已收下」,也不要重複扣額度。
+        _log_event("gemini_input_dedup_wait_timeout")
+        return {"ok": True, "accepted": True, "deduplicated": True}
+    _log_event("gemini_input_deduplicated")
+    return dict(prior.get("result") or
+                {"ok": True, "accepted": True, "deduplicated": True})
+
+
+async def _gm_input_run(key: str, session_id: str, body: dict,
+                        dedup) -> dict:
     content = (body.get("content") or body.get("text") or "").strip()
     attachments = body.get("attachments") or []
     # 2026-10-10:Gemini 從「附件一律不收」改成真的收。ACP 的 prompt 本來就是
@@ -24204,8 +24295,10 @@ async def _gm_input_core(key: str, session_id: str, body: dict) -> dict:
     task.add_done_callback(_BG_TASKS.discard)
     out = {"ok": True, "session_id": session_id, "accepted": True,
            "message_id": mid}
-    if attachments:
-        out["attachments_dropped"] = len(attachments)
+    # ⚠️ 不再回 `attachments_dropped` —— 附件從 2026-10-10 起是**真的收下**的
+    # (影像進 prompt block、其他存檔後附路徑)。繼續回這個欄位是誤導:
+    # 它的字面意思是「丟掉了幾個」,而我們一個都沒丟。
+    _cc_input_settle(dedup, out)
     return out
 
 
@@ -29041,6 +29134,32 @@ def _hermes_pending_by_session() -> dict:
             con.close()
     except Exception as e:  # noqa: BLE001
         _log_event("hermes_pending_scan_failed", error=str(e)[:160])
+    return out
+
+
+def _gemini_pending_by_session() -> dict:
+    """gemini 的 pending 待審(session_id='gemini:{key}')→ 統一物件,
+    每 session 取最早一筆。v2 sessions 補 waiting_approval 用(同 openclaw 線)。
+
+    為什麼需要:Gemini 的核准只有 180 秒窗口,列表看不出「它在等你」就等於
+    逾時被拒。其他四家都有這層,gemini 之前沒有。"""
+    import sqlite3
+    out = {}
+    try:
+        con = sqlite3.connect(CANON_DB, timeout=30)
+        try:
+            _approvals_expire(con)
+            con.commit()
+            rows = con.execute(
+                f"SELECT {_APPROVAL_COLS} FROM approvals WHERE status='pending'"
+                " AND session_id LIKE 'gemini:%' ORDER BY created_at ASC").fetchall()
+            for r in rows:
+                d = _approval_row(r)
+                out.setdefault(d["session_id"], d)
+        finally:
+            con.close()
+    except Exception as e:  # noqa: BLE001
+        _log_event("gemini_pending_scan_failed", error=str(e)[:160])
     return out
 
 
