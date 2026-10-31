@@ -50,7 +50,16 @@ users:
     gecos: Pocket lobster
     shell: /bin/bash
     sudo: ['ALL=(ALL) NOPASSWD:ALL']   # 安裝器需要 sudo 補 apt 套件與 Claude Code 的 apt repo
-    lock_passwd: true                  # 不給密碼登入；要進去走 Vultr Console 或自己加 key
+    lock_passwd: true                  # 不給密碼登入
+    # 要 SSH 進這台就把**你自己的**公鑰填在這裡（`cat ~/.ssh/id_ed25519.pub`）。
+    # 不填也能用：Vultr 的網頁 Console 一樣進得去。
+    #
+    # ⚠️ **這個檔在公開 repo 裡，是給所有人用的模板 —— 絕對不要把任何人的
+    #    實際公鑰 commit 進來。** 寫死一把金鑰 = 每個照這份部署的使用者，
+    #    他的機器上都授權了那把鑰匙的主人。
+    #    自己用的那份請在貼進 Vultr 之前才填，不要回寫進 repo。
+    # ssh_authorized_keys:
+    #   - ssh-ed25519 AAAA...換成你自己的... you@example
 
 write_files:
   - path: /usr/local/bin/pocket-lobster-setup.sh
@@ -62,15 +71,26 @@ write_files:
       # 失敗時好重跑，不必重建整台機器。
       set -uo pipefail
       REPO="${POCKET_BRIDGE_REPO:-https://github.com/cashtsai/hermes-studio-bridge.git}"
+      # **要抓哪個 ref。** 2026-10-31 第一次實機測試踩到：這裡原本沒指定，
+      # `git clone` 拿的是預設分支 main —— 而 CC/Codex/console 那批改動還在
+      # `feat/lobster-agent-runtimes` 上沒合併。結果整台裝出來 `cc/cx` 全 false、
+      # `/console` 404，而我們差點以為是安裝器壞了。
+      # 2026-10-31 稍晚：那批改動（含 CC 登入存 token、人格 Pocket、安裝器預設
+      # 免費模型）已全部合併進 main，所以釘回 `main`。**要裝特定分支就帶
+      # POCKET_BRIDGE_REF，不要再把預設值改成分支名** —— 分支會被合併或刪掉，
+      # 留在這裡的過期釘子會讓新機安靜地裝到舊碼（正是上面那次事故）。
+      REF="${POCKET_BRIDGE_REF:-main}"
       SRC="$HOME/pocket-bridge"
       log() { printf '\n==> %s\n' "$*"; }
 
-      log "取得 bridge 原始碼"
-      if [ -d "$SRC/.git" ]; then
-        git -C "$SRC" pull --ff-only || true
-      else
-        git clone --depth 1 "$REPO" "$SRC" || { echo "✗ clone 失敗"; exit 1; }
-      fi
+      log "取得 bridge 原始碼（ref=$REF）"
+      # 一律用 fetch + checkout FETCH_HEAD，不用 clone/pull —— 這樣「第一次裝」
+      # 與「重跑」走同一條路徑，而且換 ref 不必砍掉重來。
+      [ -d "$SRC/.git" ] || { mkdir -p "$SRC"; git -C "$SRC" init -q; \
+        git -C "$SRC" remote add origin "$REPO"; }
+      git -C "$SRC" fetch --depth 1 origin "$REF" || { echo "✗ fetch 失敗（ref=$REF）"; exit 1; }
+      git -C "$SRC" checkout -q --force FETCH_HEAD || { echo "✗ checkout 失敗"; exit 1; }
+      echo "    $(git -C "$SRC" log -1 --format='%h %s' | cut -c1-70)"
 
       log "跑官方安裝器"
       # 旗標全部走安裝器自己的預設（CC/Codex/OpenClaw/console/QR 登入都開，

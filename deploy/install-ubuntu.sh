@@ -101,6 +101,31 @@ fi
 grep -q '^POCKET_BRIDGE_PORT=' "$ENV_FILE" || printf 'POCKET_BRIDGE_PORT=%s\n' "$BRIDGE_PORT" >> "$ENV_FILE"
 grep -q '^POCKET_TUNNEL_URL_FILE=' "$ENV_FILE" || printf 'POCKET_TUNNEL_URL_FILE=%s\n' "$TUNNEL_URL_FILE" >> "$ENV_FILE"
 grep -q '^PAIR_BOOT_CODE_FILE=' "$ENV_FILE" || printf 'PAIR_BOOT_CODE_FILE=%s\n' "$PAIR_BOOT_CODE_FILE" >> "$ENV_FILE"
+# ── Codex:龍蝦上關家目錄隔離,改用 managed daemon(2026-10-31)──────────
+#
+# **為什麼**:機主的目標是「cc / cx 要能持久」。Codex 的持久性(回合跨得過
+# bridge 重啟)來自 managed daemon —— 它獨立於 bridge 行程。但 bridge 有一條
+# 鐵則:**隔離開啟 ⇒ 一定自己 spawn stdio、不碰 daemon**(見 bridge.py 的
+# `_codex_isolated` 區塊)。而 `codex_home.isolation_enabled()` 在**非 macOS
+# 預設開隔離**,理由寫著「龍蝦那台無頭 Ubuntu 根本沒有 daemon」。
+#
+# 那個前提被本安裝器推翻了 —— 我們**裝了** pocket-codex-daemon。於是隔離預設
+# 把 daemon 永遠排除掉,Codex 退回 stdio、隨 bridge 死,持久性拿不到。
+# (2026-10-31 第一台實機就是這樣:codex session 一律 `codex binary
+#  unavailable`,追到底是隔離規則強制 stdio。)
+#
+# 關隔離的代價在龍蝦上是**零**:隔離防的是「桌面版與 Pocket 搶同一個
+# ~/.codex 的 writer lock」,而龍蝦是單使用者、沒有桌面版 —— 沒有東西可搶。
+# 換來的正是機主要的持久性。
+grep -q '^POCKET_CODEX_ISOLATED=' "$ENV_FILE" || printf 'POCKET_CODEX_ISOLATED=%s\n' "${POCKET_CODEX_ISOLATED:-0}" >> "$ENV_FILE"
+# ── 選定 provider(2026-10-31 補:0/0 空人格的根因)─────────────────────────
+#
+# `DEFAULT_PROVIDER` 一直被算出來(龍蝦=openclaw)卻**從沒寫進 bridge.env**,
+# 所以 bridge 的 `_dashboard_active_provider()` 讀不到 POCKET_ACTIVE_PROVIDER →
+# 回 "auto"。後果:`/app/v1/personas`(設定頁人格管理)不走 OpenClaw 分支,掉回
+# Hermes 內建清單 —— 龍蝦上那是空的 → 人格管理一個都沒有。寫上它,人格分頁才會
+# 顯示 OpenClaw 的主 session(對外名「Pocket」)。
+grep -q '^POCKET_ACTIVE_PROVIDER=' "$ENV_FILE" || printf 'POCKET_ACTIVE_PROVIDER=%s\n' "$DEFAULT_PROVIDER" >> "$ENV_FILE"
 # ── 桌面控制台(2026-10-31 補)───────────────────────────────────────────
 #
 # 在這之前安裝器**從來沒設過** POCKET_CONSOLE_ENABLED(預設 0),所以龍蝦上
@@ -122,6 +147,11 @@ CONSOLE_FILE_ROOTS="${POCKET_CONSOLE_REMOTE_FILE_ROOTS:-}"
 grep -q '^POCKET_CONSOLE_ENABLED=' "$ENV_FILE" || printf 'POCKET_CONSOLE_ENABLED=%s\n' "$CONSOLE_ENABLED" >> "$ENV_FILE"
 grep -q '^POCKET_CONSOLE_QR_LOGIN=' "$ENV_FILE" || printf 'POCKET_CONSOLE_QR_LOGIN=%s\n' "$CONSOLE_QR_LOGIN" >> "$ENV_FILE"
 grep -q '^POCKET_CONSOLE_REMOTE_FILE_ROOTS=' "$ENV_FILE" || printf 'POCKET_CONSOLE_REMOTE_FILE_ROOTS=%s\n' "$CONSOLE_FILE_ROOTS" >> "$ENV_FILE"
+# ── App 內 agent 登入(2026-10-31:龍蝦沒有「你的 Mac」可去桌面控制台登入)──
+# 預設**開**:雲端龍蝦上 CC/Codex/Gemini 的登入只能在手機 App 裡按鈕完成
+# (CC setup-token / Codex device-auth / Gemini 貼 key)。旗標在 bridge.py 預設
+# 關(404),mac 版維持關(走桌面控制台);龍蝦這台一定要開,否則三個引擎都登不了。
+grep -q '^POCKET_AGENT_LOGIN_IN_APP=' "$ENV_FILE" || printf 'POCKET_AGENT_LOGIN_IN_APP=%s\n' "${POCKET_AGENT_LOGIN_IN_APP:-1}" >> "$ENV_FILE"
 chmod 600 "$ENV_FILE"
 
 # ── 配對 boot code(既有就沿用;bridge 啟動也會自產,這裡先產好以便印連結) ──
@@ -184,6 +214,47 @@ if [ "$INSTALL_OPENCLAW" = "1" ]; then
     printf '{"base_url":"ws://127.0.0.1:19801","token":"%s"}\n' "$OPENCLAW_GATEWAY_TOKEN" > "$OPENCLAW_CONFIG_FILE"
     chmod 600 "$OPENCLAW_CONFIG_FILE"
   fi
+  # ── gateway 預設模型(2026-10-31:開箱就有一個免費線上模型可用)────────────
+  #
+  # OpenClaw 的 gateway 設定(models.providers / agents.defaults)在
+  # $OPENCLAW_INSTALL_DIR/home/openclaw.json。原本安裝器完全不寫它 → 新機
+  # gateway 跑得起來(--allow-unconfigured)但沒有任何模型,機主得自己手接。
+  # 這裡預設接上 OpenRouter 的免費模型(:free 不需信用卡),讓「預設 Pocket
+  # 人格」一裝好就能回話。api 明確寫 openai-completions(補掉 gateway 日誌那句
+  # `no "api" specified` 警告;實機已證模型回覆正常,這只是清掉雜訊)。
+  #
+  # **API key 絕不寫死在這支腳本(它在公開 repo)。** 由安裝時的環境變數
+  # POCKET_OPENROUTER_KEY 帶進來;沒給就留空字串 —— gateway 照跑,免費模型要
+  # 等機主把 key 填進去(app 設定頁或重跑安裝器帶 key)才會真的呼叫。
+  OPENCLAW_GATEWAY_CONFIG="$OPENCLAW_INSTALL_DIR/home/openclaw.json"
+  OPENROUTER_FREE_MODEL="${POCKET_OPENROUTER_MODEL:-nvidia/nemotron-3.5-super-vl:free}"
+  if [ ! -s "$OPENCLAW_GATEWAY_CONFIG" ]; then
+    mkdir -p "$(dirname "$OPENCLAW_GATEWAY_CONFIG")"
+    OPENROUTER_KEY="${POCKET_OPENROUTER_KEY:-}" OPENROUTER_MODEL="$OPENROUTER_FREE_MODEL" \
+      python3 - "$OPENCLAW_GATEWAY_CONFIG" <<'PY'
+import json, os, sys
+path = sys.argv[1]
+model = os.environ["OPENROUTER_MODEL"]
+cfg = {
+    "models": {"providers": {"openrouter": {
+        "baseUrl": "https://openrouter.ai/api/v1",
+        "apiKey": os.environ.get("OPENROUTER_KEY", ""),
+        "api": "openai-completions",
+        "models": [{"id": model, "name": model}],
+    }}},
+    "agents": {"defaults": {"model": "openrouter/" + model}},
+}
+with open(path, "w", encoding="utf-8") as f:
+    json.dump(cfg, f, ensure_ascii=False, indent=2)
+os.chmod(path, 0o600)
+PY
+    if [ -n "${POCKET_OPENROUTER_KEY:-}" ]; then
+      log_step "  gateway 預設模型:openrouter/$OPENROUTER_FREE_MODEL(已帶 key)"
+    else
+      printf '⚠️  gateway 預設模型已設 openrouter/%s,但**沒帶 API key** —— 免費模型要填 key 才會回話。\n' "$OPENROUTER_FREE_MODEL" >&2
+      printf '    取得免費 key:https://openrouter.ai/keys(:free 模型不需信用卡)。填法:app 設定頁,或帶 POCKET_OPENROUTER_KEY=... 重跑安裝器。\n' >&2
+    fi
+  fi
 fi
 
 # ── Hermes provider(選配) ────────────────────────────────────────────────
@@ -244,10 +315,34 @@ if [ "$INSTALL_CODEX" = "1" ] && ! command -v codex >/dev/null 2>&1; then
   # ~/.local/bin/codex → PATH,所以放進 ~/.local 就找得到。
   if PATH="$NODE_ROOT/bin:$PATH" npm install -g --silent \
        --prefix "$HOME/.local" "@openai/codex@$CODEX_VERSION"; then
-    log_step "  codex $("$HOME/.local/bin/codex" --version 2>/dev/null | head -1)"
+    log_step "  codex $(PATH="$NODE_ROOT/bin:$PATH" "$HOME/.local/bin/codex" --version 2>/dev/null | head -1)"
   else
     printf '⚠️  Codex 沒裝成 —— 這台龍蝦的 Codex 頁籤會是關的,其餘功能不受影響。\n' >&2
   fi
+fi
+
+# ── node 要進登入 PATH(2026-10-31 實機抓到,修正版)─────────────────────
+#
+# **Linux 上的 codex 和 macOS 不一樣。** macOS 裝到的是原生二進位
+# (~/.codex/packages/standalone/…);Linux 用 npm 裝到的是 JS wrapper
+# (`#!/usr/bin/env node` → codex.js)—— **執行時需要 node 在 PATH 上**。
+#
+# 服務面沒事(bridge 與 codex-daemon 的 unit 都帶了 $NODE_ROOT/bin),
+# 壞的是**使用者面**:他要在 Pocket 的內建終端機裡跑 `codex` 登入自己的帳號,
+# 而那是登入 shell。第一台實機就是這樣炸的:
+#     env: 'node': No such file or directory
+# 而 bridge 的 `cx` capability 只檢查檔案在不在 → 照樣回 true
+#   → **capability 在說謊**:頁籤亮著,一用就壞。
+#
+# ⚠️ **這段刻意放在安裝區塊外面。** 第一版我寫在
+# `! command -v codex` 的判斷式**裡面** —— 於是在「codex 已經裝好、只是
+# PATH 沒設」的機器上重跑安裝器,整段被跳過,修正永遠套不上去。
+# 實機重跑時就是這樣:日誌裡連「安裝 Codex」都沒出現,問題原封不動。
+# **修的是既有狀態,就不能掛在「第一次安裝」的條件下。**
+if [ -x "$NODE_ROOT/bin/node" ] && ! grep -q 'pocket-lobster-node-path' "$HOME/.profile" 2>/dev/null; then
+  printf '\n# pocket-lobster-node-path:codex 是 JS wrapper,執行時要 node 在 PATH 上\nexport PATH="%s/bin:$HOME/.local/bin:$PATH"\n' \
+    "$NODE_ROOT" >> "$HOME/.profile"
+  log_step "已把 node 加進 ~/.profile 的 PATH"
 fi
 
 # Claude Code 官方系統需求寫明 **4 GB+ RAM**。Starter 級的雲端龍蝦正好卡在
@@ -390,19 +485,48 @@ WantedBy=default.target
 UNIT
 fi
 
-systemctl --user daemon-reload
+# ── systemctl --user 需要 XDG_RUNTIME_DIR(2026-10-31 實機抓到)─────────
+#
+# 首次 cloud-init 時這個變數是有的,所以第一次裝沒事。但**重跑**時常常是
+# `ssh root@box 'sudo -u pocket -i …'` —— 那條路徑沒有 user session bus,
+# 於是每一個 systemctl --user 都失敗:
+#     Failed to connect to user scope bus via local transport:
+#     $DBUS_SESSION_BUS_ADDRESS and $XDG_RUNTIME_DIR not defined
+# 而安裝器照樣往下跑、印出「結果」—— 看起來成功,**實際上服務根本沒重啟,
+# 跑的還是舊程式**。這是「離開碼不等於成功」的又一個版本。
+#
+# linger 開著時 /run/user/<uid> 一定在,補上變數就能用。
+if [ -z "${XDG_RUNTIME_DIR:-}" ] && [ -d "/run/user/$(id -u)" ]; then
+  export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+  log_step "補上 XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR(重跑時 ssh 環境沒有它)"
+fi
+
+systemctl --user daemon-reload \
+  || die "systemctl --user 不可用(XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-未設})。
+  若是從 ssh 重跑,改用:  sudo machinectl shell pocket@  然後在裡面跑本腳本"
 loginctl enable-linger "$USER" 2>/dev/null || log_step "enable-linger 失敗(無 sudo?)— 登出後服務會停,可稍後手動: sudo loginctl enable-linger $USER"
 
 log_step "啟動服務"
-systemctl --user enable --now "$BRIDGE_LABEL.service"
-[ "$INSTALL_OPENCLAW" = "1" ] && systemctl --user enable --now pocket-openclaw.service
+# ⚠️ enable **+ restart**,不是 `enable --now`(2026-10-31 實機抓到)。
+# `enable --now` 對**已經在跑**的服務是 no-op —— 於是重跑安裝器時,服務雖然
+# rsync 了新 bridge.py,卻**永遠不會被重新載入**,跑的還是舊程式。
+# 每次重跑都要手動 `systemctl --user restart` 才生效,是這個坑。
+# enable(開機自啟)只做一次、restart 保證吃到新碼。
+#
+# bridge 要先 daemon-reload 後再 restart(unit 檔可能剛改過)。
+_svc_up() {   # $1 = unit 名
+  systemctl --user enable "$1" >/dev/null 2>&1
+  systemctl --user restart "$1"
+}
+_svc_up "$BRIDGE_LABEL.service"
+[ "$INSTALL_OPENCLAW" = "1" ] && _svc_up pocket-openclaw.service
 # codex daemon:只在 codex 真的裝起來了才啟用。寫了 unit 卻啟不動,只會在
 # systemctl 裡留一條紅的,讓人以為壞了 —— 而實際上只是沒裝 codex。
 if [ "$INSTALL_CODEX" = "1" ] && [ -x "$HOME/.local/bin/codex" ]; then
-  systemctl --user enable --now pocket-codex-daemon.service \
+  _svc_up pocket-codex-daemon.service \
     || log_step "codex daemon 啟不動 —— bridge 會自動退回 stdio(回合不跨重啟,但功能正常)"
 fi
-[ "$INSTALL_TUNNEL" = "1" ] && systemctl --user enable --now pocket-tunnel.service
+[ "$INSTALL_TUNNEL" = "1" ] && _svc_up pocket-tunnel.service
 
 # ── 等 bridge 起來 → 開配對頁 ────────────────────────────────────────────
 log_step "等 bridge /health"

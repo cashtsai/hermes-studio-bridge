@@ -31,6 +31,7 @@ import pty
 import random
 import re
 import secrets
+import select
 import shlex
 import signal
 import socket
@@ -23685,9 +23686,12 @@ async def _openclaw_v1_personas() -> list:
     sessions = await _openclaw_v1_sessions()
     preview = (sessions[0].get("preview") if sessions else None) or "OpenClaw gateway"
     status = (sessions[0].get("status") if sessions else None) or "idle"
+    # 對外顯示名「Pocket」:龍蝦上這就是機主初次啟動預設有的那個人格(main agent)。
+    # avatar_rev=0 → app 畫預設人像圓盤(紅圈),不另掛自訂頭像。id/session_id 不動,
+    # 路由仍指向 `openclaw:agent:main:main`。
     return [{
         "id": "openclaw",
-        "name": "OpenClaw",
+        "name": "Pocket",
         "profile": "main",
         "home": "",
         "enabled": True,
@@ -30415,6 +30419,15 @@ async def _dashboard_sessions():
                     oc_w += 1
                 else:
                     oc_i += 1
+            # 還沒開口說過話 → sessions.list 空 → 不要畫成 0/0。預設人格(Pocket /
+            # main agent)本來就在,算一條閒置,跟人格分頁「有一條 Pocket」對齊,
+            # 也跟 gemini 的 `or 1` 作法一致(免得「分頁有、儀表板說 0」)。
+            #
+            # **只在 openclaw 是主 provider 時補。** Mac(hermes 主場)也可能配置了
+            # openclaw,那裡的人格分頁顯示的是 Hermes 人格、沒有對應的 Pocket 列,
+            # 補 1 會變成「儀表板多一條、分頁找不到」—— 正好是這行想消滅的那種不一致。
+            if oc_w == 0 and oc_i == 0 and _dashboard_active_provider() == "openclaw":
+                oc_i = 1
             out["openclaw"] = {"working": oc_w, "idle": oc_i}
         except Exception as e:  # noqa: BLE001
             _log_event("dashboard_openclaw_failed", error=type(e).__name__,
@@ -30490,6 +30503,463 @@ async def app_agents_auth(request: Request):
     TTL 60s 快取;純唯讀查狀態,不碰憑證。"""
     _check_auth(request)
     return await _agent_auth_status()
+
+
+# ══════════ App 內 agent 登入(AGENT_LOGIN_IN_APP_SPEC)階段 1:Gemini ══════════
+#
+# 龍蝦上三個 agent 原本都要使用者自己 ssh 進去設定。這組端點把登入搬進 app
+# 頁籤。Gemini 最簡單(API key,不是 OAuth),先打通這條管線。
+#
+# 旗標 `POCKET_AGENT_LOGIN_IN_APP` 預設關 → 合併進 main 不改變現行行為。
+POCKET_AGENT_LOGIN_IN_APP = os.environ.get("POCKET_AGENT_LOGIN_IN_APP", "0") != "0"
+
+
+@app.put("/app/v1/agents/gemini/key")
+async def app_gemini_set_key(request: Request):
+    """把使用者貼的 Gemini API key 寫進 ~/.pocket/gemini.json(0600)。
+
+    刻意設計:
+      · **只接受一般 device token,不接受 console-remote scope**(規格 §3 安全):
+        設定 API key 等同把帳號綁上這台機器,是機主級動作,不下放給遠端瀏覽器。
+      · **key 絕不進 log** —— 連長度、前綴都不記;只 log「設了/清了」這個事實。
+      · env `GEMINI_API_KEY` 存在時仍優先(save_config 的既有語意),但這條
+        路是給「沒設 env、想從手機貼」的龍蝦使用者。
+    """
+    if not POCKET_AGENT_LOGIN_IN_APP:
+        raise HTTPException(status_code=404, detail="not found")
+    _check_auth(request)
+    # console-remote 的遠端瀏覽器不准碰登入(等同機主權限)。
+    if _token_scope(_request_token(request)) == CONSOLE_REMOTE_SCOPE:
+        raise http_err(403, "SCOPE_FORBIDDEN",
+                       "遠端控制台不能設定帳號憑證,請用已配對的手機")
+    body = await _json_body(request)
+    key = str(body.get("api_key") or "").strip()
+    if not key:
+        raise http_err(400, "MISSING_KEY", "api_key 不可為空")
+    try:
+        gemini_provider.save_config(api_key=key)
+    except Exception as e:  # noqa: BLE001
+        _log_exc("gemini_set_key", e, expected=False)
+        raise http_err(500, "SAVE_FAILED", "寫入 Gemini 設定失敗")
+    _log_event("gemini_key_set")   # 不記 key 本身
+    # `configured()` 每次直接 load_config() 讀檔、不快取,所以寫完立刻為 True,
+    # 不需要另外清快取。
+    return {"ok": True, "provider": "gemini", "configured": GEMINI.configured()}
+
+
+# ══════════ 階段 2:Codex device-auth(不靠 localhost callback)══════════
+#
+# 實機實測(codex 0.166.0)`codex login --device-auth` 的輸出:
+#   1. Open this link: https://auth.openai.com/codex/device
+#   2. Enter this one-time code (expires in 15 minutes): RIUQ-KPYAN
+# 行程會**等**到使用者在網頁授權完成才退出,然後 auth.json 落檔。
+#
+# 所以設計比規格原稿更簡單:**不需要使用者「貼 code 回來」** —— 授權在
+# OpenAI 那邊完成。bridge 只要:spawn 背景行程、撈 URL+code 給 app 顯示、
+# **讓行程繼續跑**,再提供一支 status 端點讓 app 輪詢「登入好了沒」。
+#
+# login_id → 那顆背景行程。短 TTL(device code 15 分鐘)。
+_CODEX_LOGIN: dict = {}            # login_id -> {proc, url, user_code, created, done}
+_CODEX_LOGIN_LOCK = threading.Lock()
+_CODEX_LOGIN_TTL = 900.0           # 15 分鐘,對齊 OpenAI device code 的有效期
+_CODEX_DEVICE_URL_RE = re.compile(r"https://auth\.openai\.com/\S+")
+_CODEX_DEVICE_CODE_RE = re.compile(r"\b([A-Z0-9]{4}-[A-Z0-9]{4,6})\b")
+
+
+def _codex_login_gc_locked(now: float) -> None:
+    for lid in [k for k, v in _CODEX_LOGIN.items()
+                if now - v["created"] > _CODEX_LOGIN_TTL]:
+        v = _CODEX_LOGIN.pop(lid, None)
+        if v and v.get("proc") and v["proc"].returncode is None:
+            try:
+                v["proc"].kill()
+            except ProcessLookupError:
+                pass
+
+
+@app.post("/app/v1/agents/codex/login/start")
+async def app_codex_login_start(request: Request):
+    """啟動 Codex device-auth,回 app 要顯示的 URL + 一次性 code。
+
+    行程留在背景跑(等使用者授權),用 login_id 追蹤;app 之後輪詢
+    `/app/v1/agents/codex/login/status?login_id=…`。
+    """
+    if not POCKET_AGENT_LOGIN_IN_APP:
+        raise HTTPException(status_code=404, detail="not found")
+    _check_auth(request)
+    if _token_scope(_request_token(request)) == CONSOLE_REMOTE_SCOPE:
+        raise http_err(403, "SCOPE_FORBIDDEN",
+                       "遠端控制台不能設定帳號憑證,請用已配對的手機")
+    codex_bin = _resolve_codex_bin()
+    if not os.path.exists(codex_bin):
+        raise http_err(503, "CODEX_MISSING", "這台主機沒有安裝 Codex")
+    try:
+        # cwd 用使用者家目錄,**不是 HOME_ROOT** —— HOME_ROOT 是 Hermes 家目錄
+        # (~/apps/hermes-agent/home),龍蝦沒裝 Hermes 時那目錄不存在,
+        # create_subprocess_exec(cwd=不存在) 會丟 FileNotFoundError → 503。
+        # 登入不需要特定 cwd,用保證存在的家目錄。
+        proc = await asyncio.create_subprocess_exec(
+            codex_bin, "login", "--device-auth",
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+            stdin=asyncio.subprocess.DEVNULL, cwd=os.path.expanduser("~"))
+    except (FileNotFoundError, PermissionError) as e:
+        _log_event("codex_login_spawn_failed", error=type(e).__name__)
+        raise http_err(503, "CODEX_SPAWN_FAILED", "啟動 Codex 登入失敗")
+    # 讀開頭幾行把 URL + code 撈出來(ANSI 色碼要剝掉)。
+    url = user_code = None
+    deadline = time.time() + 20
+    buf = b""
+    while time.time() < deadline and (url is None or user_code is None):
+        try:
+            chunk = await asyncio.wait_for(proc.stdout.read(512), timeout=3)
+        except asyncio.TimeoutError:
+            continue
+        if not chunk:
+            break
+        buf += chunk
+        text = re.sub(r"\x1b\[[0-9;]*m", "", buf.decode("utf-8", "ignore"))
+        if url is None:
+            m = _CODEX_DEVICE_URL_RE.search(text)
+            if m:
+                url = m.group(0)
+        if user_code is None:
+            m = _CODEX_DEVICE_CODE_RE.search(text)
+            if m:
+                user_code = m.group(1)
+    if url is None:
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+        raise http_err(502, "CODEX_LOGIN_NO_URL", "沒能從 Codex 取得登入連結")
+    lid = secrets.token_urlsafe(18)
+    now = time.time()
+    with _CODEX_LOGIN_LOCK:
+        _codex_login_gc_locked(now)
+        _CODEX_LOGIN[lid] = {"proc": proc, "url": url, "user_code": user_code,
+                             "created": now, "done": None}
+    # 背景等行程結束 → 標記完成(auth.json 落檔與否由 returncode 判斷)。
+    async def _wait():
+        rc = await proc.wait()
+        with _CODEX_LOGIN_LOCK:
+            e = _CODEX_LOGIN.get(lid)
+            if e is not None:
+                e["done"] = (rc == 0)
+        _log_event("codex_login_finished", ok=(rc == 0))
+    t = asyncio.create_task(_wait())
+    _BG_TASKS.add(t)
+    t.add_done_callback(_BG_TASKS.discard)
+    _log_event("codex_login_started")   # 不記 url/code
+    return {"ok": True, "provider": "codex", "mode": "device_code",
+            "login_id": lid, "url": url, "user_code": user_code}
+
+
+@app.get("/app/v1/agents/codex/login/status")
+async def app_codex_login_status(request: Request, login_id: str = ""):
+    """app 輪詢:這次 device-auth 完成了沒。
+
+    `state`:`pending`(還在等授權)| `done`(登入成功)| `failed`(行程非 0 退出)
+    | `expired`(login_id 不存在/已過期)。
+    """
+    if not POCKET_AGENT_LOGIN_IN_APP:
+        raise HTTPException(status_code=404, detail="not found")
+    _check_auth(request)
+    now = time.time()
+    with _CODEX_LOGIN_LOCK:
+        _codex_login_gc_locked(now)
+        e = _CODEX_LOGIN.get(login_id)
+        if e is None:
+            return {"ok": True, "state": "expired"}
+        done = e["done"]
+    if done is True:
+        return {"ok": True, "state": "done"}
+    if done is False:
+        return {"ok": True, "state": "failed"}
+    return {"ok": True, "state": "pending"}
+
+
+# ══════════ 階段 3:CC setup-token(PTY + 寬終端 + OSC 8 撈 URL)══════════
+#
+# 這是三個裡最麻煩的。實機 spike 發現(claude 2.1.309):
+# · `claude setup-token` 是 **full-screen TUI**,不是簡單行輸出。
+# · 它需要 **TTY** —— 沒有偽 TTY 時印空白。
+# · URL redirect 到 `platform.claude.com/oauth/code/callback`(不是 localhost),
+#   `code=true` = 授權完 Anthropic 頁面給一個 code,使用者**貼回**。
+# · 授權用**訂閱帳號**(文字明寫 "Claude subscription required")。
+#
+# 兩個讓它可靠的關鍵(都是 spike 試出來的):
+# 1. **URL 用 OSC 8 超連結的精確邊界撈**,不在純文字裡猜。TUI 折行會把純文字
+#    URL 打散+重複(state 後黏下一段),但 OSC 8 序列 `ESC]8;id;URI ST` 的 URI
+#    有標準結束錨點(ST),撈出來乾淨。實測:346 字元、state 後無殘留。
+# 2. **設寬 PTY 視窗(cols=400)**,再加一層保險讓 URL 不折行。
+#
+# 流程:start → 回 URL;使用者授權後把 code 貼進 finish → 寫進 PTY → 等退出。
+_CC_LOGIN: dict = {}        # login_id -> {master_fd, pid, url, created, done}
+_CC_LOGIN_LOCK = threading.Lock()
+_CC_LOGIN_TTL = 900.0
+# OSC 8 hyperlink 的 URI:ESC ] 8 ; params ; <URI> (ESC\ 或 BEL)
+_OSC8_URI_RE = re.compile(r"\x1b\]8;[^;]*;([^\x1b\x07]+)(?:\x1b\\|\x07)")
+_CC_OAUTH_RE = re.compile(r"https://claude\.com/cai/oauth/authorize\S+")
+# `claude setup-token` **印** token 到終端機、**不存檔**(官方 auth 文件明寫:
+# "It does not save the token anywhere; copy it and set it as the
+# CLAUDE_CODE_OAUTH_TOKEN environment variable")。所以 finish 貼完 code 後必須
+# 從 PTY 輸出把這把 token 撈出來自己存,否則 `claude -p` 永遠 Not logged in
+# —— 這正是 2026-10-31「exit 0 卻沒登入」的根因。token 形狀 `sk-ant-oat01-…`。
+_CC_OAUTH_TOKEN_RE = re.compile(r"sk-ant-oat[0-9A-Za-z]{0,4}-[A-Za-z0-9_-]{20,}")
+_CC_OAUTH_TOKEN_FALLBACK_RE = re.compile(r"sk-ant-[A-Za-z0-9_-]{30,}")
+
+
+def _cc_login_reap_locked(now: float) -> None:
+    for lid in [k for k, v in _CC_LOGIN.items()
+                if now - v["created"] > _CC_LOGIN_TTL]:
+        v = _CC_LOGIN.pop(lid, None)
+        if v:
+            _cc_login_kill(v)
+
+
+def _cc_login_kill(entry: dict) -> None:
+    try:
+        os.close(entry["master_fd"])
+    except OSError:
+        pass
+    try:
+        os.kill(entry["pid"], 9)
+        os.waitpid(entry["pid"], 0)
+    except (ProcessLookupError, ChildProcessError, OSError):
+        pass
+
+
+@app.post("/app/v1/agents/claude/login/start")
+async def app_claude_login_start(request: Request):
+    """啟動 CC setup-token,回授權 URL。行程留在 PTY 裡等 code。"""
+    if not POCKET_AGENT_LOGIN_IN_APP:
+        raise HTTPException(status_code=404, detail="not found")
+    _check_auth(request)
+    if _token_scope(_request_token(request)) == CONSOLE_REMOTE_SCOPE:
+        raise http_err(403, "SCOPE_FORBIDDEN",
+                       "遠端控制台不能設定帳號憑證,請用已配對的手機")
+    if not os.path.exists(CLAUDE_BIN):
+        raise http_err(503, "CLAUDE_MISSING", "這台主機沒有安裝 Claude Code")
+
+    def _spawn_and_read() -> tuple[int, int, str | None]:
+        """在偽 TTY 裡起 setup-token,讀到 URL 為止。回 (master_fd, pid, url)。"""
+        pid, master_fd = pty.fork()
+        if pid == 0:                      # 子行程
+            try:
+                os.execv(CLAUDE_BIN, [CLAUDE_BIN, "setup-token"])
+            except Exception:
+                os._exit(127)
+        # 父行程:設寬視窗(cols=400)讓 URL 不折行
+        try:
+            fcntl.ioctl(master_fd, termios.TIOCSWINSZ,
+                        struct.pack("HHHH", 50, 400, 0, 0))
+        except (OSError, ValueError):
+            pass
+        buf = b""
+        deadline = time.time() + 20
+        url = None
+        while time.time() < deadline and url is None:
+            r, _, _ = select.select([master_fd], [], [], 2)
+            if not r:
+                continue
+            try:
+                chunk = os.read(master_fd, 4096)
+            except OSError:
+                break
+            if not chunk:
+                break
+            buf += chunk
+            text = buf.decode("utf-8", "ignore")
+            # 先試 OSC 8 精確邊界(最可靠),退而求其次用純文字 regex
+            m = _OSC8_URI_RE.search(text)
+            if m and m.group(1).startswith("https://claude.com/cai/oauth"):
+                url = m.group(1)
+            else:
+                m2 = _CC_OAUTH_RE.search(re.sub(r"\x1b\][0-9];[^\x1b\x07]*(?:\x1b\\|\x07)", "", text))
+                # 純文字退路:切到 state 值結束(base64url),去掉後面黏的重複
+                if m2:
+                    cand = m2.group(0)
+                    sm = re.match(r"(https://claude\.com/cai/oauth/authorize\?.*?&state=[A-Za-z0-9_-]{20,64})", cand)
+                    if sm:
+                        url = sm.group(1)
+        return master_fd, pid, url
+
+    try:
+        master_fd, pid, url = await asyncio.to_thread(_spawn_and_read)
+    except Exception as e:  # noqa: BLE001
+        _log_exc("claude_login_spawn", e, expected=False)
+        raise http_err(503, "CLAUDE_SPAWN_FAILED", "啟動 Claude 登入失敗")
+    if url is None:
+        _cc_login_kill({"master_fd": master_fd, "pid": pid})
+        raise http_err(502, "CLAUDE_LOGIN_NO_URL", "沒能從 Claude 取得登入連結")
+    lid = secrets.token_urlsafe(18)
+    now = time.time()
+    with _CC_LOGIN_LOCK:
+        _cc_login_reap_locked(now)
+        _CC_LOGIN[lid] = {"master_fd": master_fd, "pid": pid, "url": url,
+                          "created": now, "done": None}
+    _log_event("claude_login_started")   # 不記 url
+    return {"ok": True, "provider": "claude", "mode": "manual_code",
+            "login_id": lid, "url": url, "user_code": None}
+
+
+def _claude_settings_path() -> str:
+    """Claude Code 的使用者 settings.json。尊重 CLAUDE_CONFIG_DIR(多帳號),
+    否則 ~/.claude/settings.json。"""
+    cfg = os.environ.get("CLAUDE_CONFIG_DIR")
+    base = cfg if cfg else os.path.join(os.path.expanduser("~"), ".claude")
+    return os.path.join(base, "settings.json")
+
+
+def _claude_persist_oauth_token(token: str) -> None:
+    """把 setup-token 印出來的 CLAUDE_CODE_OAUTH_TOKEN 寫進 settings.json 的 env
+    區塊。這是官方支援的來源(文件:env block of a settings file),每個 claude
+    行程開場自己重讀 → 與 bridge 怎麼 spawn(tmux / -p / SDK)無關都吃得到。
+    0600 寫入,與 claude 在 Linux 存 .credentials.json 的權限一致。**不記 log。**"""
+    path = _claude_settings_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    data = {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f) or {}
+    except (FileNotFoundError, ValueError, OSError):
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    env = data.get("env")
+    if not isinstance(env, dict):
+        env = {}
+    env["CLAUDE_CODE_OAUTH_TOKEN"] = token
+    data["env"] = env
+    blob = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
+    tmp = path + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.write(fd, blob)
+    finally:
+        os.close(fd)
+    os.replace(tmp, path)
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+
+
+@app.post("/app/v1/agents/claude/login/finish")
+async def app_claude_login_finish(request: Request):
+    """把使用者從 Anthropic 頁面複製的 code 貼進 PTY,完成登入。"""
+    if not POCKET_AGENT_LOGIN_IN_APP:
+        raise HTTPException(status_code=404, detail="not found")
+    _check_auth(request)
+    body = await _json_body(request)
+    lid = str(body.get("login_id") or "")
+    code = str(body.get("code") or "").strip()
+    # OAuth code 可能被貼成 `code#state`(網頁網址列的 fragment 一起複製)。
+    # setup-token 要的是 `#` 前面那段。保留原樣會驗證失敗。
+    if "#" in code:
+        code = code.split("#", 1)[0]
+    if not code:
+        raise http_err(400, "MISSING_CODE", "請貼上授權碼")
+    with _CC_LOGIN_LOCK:
+        _cc_login_reap_locked(time.time())
+        entry = _CC_LOGIN.get(lid)
+    if entry is None:
+        raise http_err(410, "LOGIN_EXPIRED", "這次登入已過期,請重新開始")
+
+    def _submit_and_wait() -> tuple[bool, str | None]:
+        """回 (exit_ok, token)。token = 從 PTY 輸出撈到的 CLAUDE_CODE_OAUTH_TOKEN
+        (setup-token 貼完 code 後**印**出來的那把),撈不到回 None。"""
+        fd = entry["master_fd"]
+        try:
+            # bracketed paste 包起來(TUI 用 [?2004h 開了 bracketed paste mode)
+            os.write(fd, b"\x1b[200~" + code.encode() + b"\x1b[201~\r")
+        except OSError:
+            return False, None
+        # 等行程退出(授權成功會**印** token 然後結束)。全程累積輸出,退出後
+        # 撈 token —— 不能丟,丟了就等於沒登入(見 _CC_OAUTH_TOKEN_RE 的註解)。
+        buf = b""
+        deadline = time.time() + 30
+        exit_ok = False
+        while time.time() < deadline:
+            # 先排空輸出(免得 PTY buffer 塞住子行程),再判退出 —— 順序要緊:
+            # 子行程印完 token 才 exit,先讀才不會漏掉最後那段。
+            r, _, _ = select.select([fd], [], [], 0.5)
+            if r:
+                try:
+                    chunk = os.read(fd, 4096)
+                    if chunk:
+                        buf += chunk[:1 << 20] if len(buf) < (1 << 20) else b""
+                except OSError:
+                    pass
+            try:
+                wpid, status = os.waitpid(entry["pid"], os.WNOHANG)
+            except (ChildProcessError, OSError):
+                exit_ok = True        # 已被收掉,視為完成
+                break
+            if wpid != 0:
+                exit_ok = os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
+                # 行程退出後再把殘餘輸出排乾(token 常在最後一口)
+                for _ in range(8):
+                    r2, _, _ = select.select([fd], [], [], 0.2)
+                    if not r2:
+                        break
+                    try:
+                        c2 = os.read(fd, 4096)
+                    except OSError:
+                        break
+                    if not c2:
+                        break
+                    buf += c2
+                break
+        text = buf.decode("utf-8", "ignore")
+        m = _CC_OAUTH_TOKEN_RE.search(text) or _CC_OAUTH_TOKEN_FALLBACK_RE.search(text)
+        return exit_ok, (m.group(0) if m else None)
+
+    ok, token = await asyncio.to_thread(_submit_and_wait)
+    with _CC_LOGIN_LOCK:
+        e = _CC_LOGIN.pop(lid, None)
+    if e:
+        try:
+            os.close(e["master_fd"])
+        except OSError:
+            pass
+    # 撈到 token 就**自己存**(setup-token 不存),否則 `claude -p` 認不得這把。
+    # 存進 ~/.claude/settings.json 的 env 區塊(官方認證來源 #5,每個 claude 行程
+    # 開場自己重讀,與 bridge 怎麼 spawn 無關)+ 當場塞進 os.environ 讓即時探測
+    # 也看得到。**token 絕不進 log。**
+    if token:
+        try:
+            await asyncio.to_thread(_claude_persist_oauth_token, token)
+            os.environ["CLAUDE_CODE_OAUTH_TOKEN"] = token
+        except Exception as _e:  # noqa: BLE001
+            _log_exc("claude_token_persist", _e, expected=False)
+    # **exit 0 不等於登入成功。** 2026-10-31 實機:行程 exit 0、端點回
+    # logged_in:true,但 `claude -p` 仍 Not logged in —— 假成功(當時正是沒存
+    # token)。所以行程退出後**實際探一次登入狀態**才算數,不信 exit code。
+    really = await _agent_claude_logged_in()
+    _log_event("claude_login_finished", ok=ok, token_captured=bool(token),
+               logged_in=really)
+    if not really:
+        raise http_err(502, "CLAUDE_LOGIN_FAILED",
+                       "登入沒完成 —— 授權碼可能貼錯、含多餘字元,或已過期,請重新開始")
+    _AGENT_AUTH_CACHE["data"] = None   # 清快取,讓下次探測立刻看到已登入
+    return {"ok": True, "provider": "claude", "logged_in": True}
+
+
+async def _agent_claude_logged_in() -> bool:
+    """實際探 claude 登入狀態(非互動 `-p`)。慢但可靠,只在 finish 用一次。"""
+    claude = CLAUDE_BIN if os.path.exists(CLAUDE_BIN) else "claude"
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            claude, "-p", "ok",
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+            cwd=os.path.expanduser("~"))
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=20)
+        text = (out or b"").decode("utf-8", "ignore").lower()
+        return "not logged in" not in text and "/login" not in text
+    except (asyncio.TimeoutError, FileNotFoundError, OSError):
+        return False
 
 
 def _host_capabilities() -> dict:
