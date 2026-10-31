@@ -293,8 +293,12 @@ class CC2AskUserQuestionTest(unittest.TestCase):
             "options": [{"label": "PostgreSQL", "description": "關聯式"},
                         {"label": "SQLite", "description": "輕量"}]}]}
 
+    # ⚠️ 一律用 `*_` 吸收尾端 —— `_ask_question_options` 2026-10-29(3eb278e)
+    # 從回傳 3 個變成 4 個(多了 meta),這整組測試就全炸在
+    # `ValueError: too many values to unpack`。寫死元組長度等於把測試綁在
+    # 實作的欄位數上:下次再加一個欄位,壞的又是測試而不是產品。
     def test_options_become_card_buttons(self):
-        opts, title, multi = cc_sdk.CCSdkSession._ask_question_options(self.inp)
+        opts, title, multi, *_ = cc_sdk.CCSdkSession._ask_question_options(self.inp)
         labels = [o["label"] for o in opts]
         self.assertIn("PostgreSQL", labels)
         self.assertIn("SQLite", labels)
@@ -303,18 +307,18 @@ class CC2AskUserQuestionTest(unittest.TestCase):
 
     def test_skip_button_always_present(self):
         """CLI 原生 UI 永遠有 Skip —— 不能讓人無路可走。"""
-        opts, _, _ = cc_sdk.CCSdkSession._ask_question_options(self.inp)
+        opts, *_ = cc_sdk.CCSdkSession._ask_question_options(self.inp)
         self.assertEqual(opts[-1]["key"], "ask:skip")
 
     def test_multiselect_flag_detected(self):
         inp = {"questions": [{"question": "選多個", "multiSelect": True,
                               "options": [{"label": "A"}, {"label": "B"}]}]}
-        _, _, multi = cc_sdk.CCSdkSession._ask_question_options(inp)
+        _, _, multi, *_ = cc_sdk.CCSdkSession._ask_question_options(inp)
         self.assertTrue(multi)
 
     def test_non_question_tool_unaffected(self):
         """一般工具不受影響,仍走允許/拒絕。"""
-        opts, title, _ = cc_sdk.CCSdkSession._ask_question_options(
+        opts, title, *_ = cc_sdk.CCSdkSession._ask_question_options(
             {"command": "ls -la"})
         self.assertEqual(opts, [])
         self.assertEqual(title, "")
@@ -324,7 +328,7 @@ class CC2AskUserQuestionTest(unittest.TestCase):
         for bad in ({}, {"questions": []}, {"questions": [{}]},
                     {"questions": "not-a-list"},
                     {"questions": [{"options": []}]}):
-            opts, _, _ = cc_sdk.CCSdkSession._ask_question_options(bad)
+            opts, *_ = cc_sdk.CCSdkSession._ask_question_options(bad)
             self.assertEqual(opts, [], f"壞輸入要安全退回一般審批: {bad}")
 
     def test_decide_accepts_ask_keys(self):
@@ -340,7 +344,7 @@ class CC2AskUserQuestionTest(unittest.TestCase):
         """選項太多時截斷,卡片不會爆版。"""
         inp = {"questions": [{"question": "多", "options":
                               [{"label": f"opt{i}"} for i in range(20)]}]}
-        opts, _, _ = cc_sdk.CCSdkSession._ask_question_options(inp)
+        opts, *_ = cc_sdk.CCSdkSession._ask_question_options(inp)
         self.assertLessEqual(len(opts), 7, "含略過最多 7 顆")
 
 
@@ -471,7 +475,7 @@ class CC2AnswerDeliveryTest(unittest.TestCase):
         """壞資料不准炸掉審批流程(炸掉才是真的卡住整個回合)。"""
         for bad in ({}, {"questions": []}, {"questions": [{"options": []}]},
                     {"questions": "nope"}, {"questions": [None]}):
-            opts, title, multi = cc_sdk.CCSdkSession._ask_question_options(bad)
+            opts, title, multi, *_ = cc_sdk.CCSdkSession._ask_question_options(bad)
             self.assertEqual(opts, [], f"{bad} 應退回一般審批")
 
 
@@ -657,22 +661,44 @@ class CC2ToolResultTest(unittest.TestCase):
         m.content = [b]
         return m
 
-    def _card_text(self, cid_fragment="t"):
+    def _result_card(self) -> dict:
+        """那張 `tool_result` 卡(origin=cc2.tool)。找不到回空 dict。"""
         for c in self.s.digest.store.cards.values():
             if (c.get("body") or {}).get("origin") == "cc2.tool":
-                return str((c.get("body") or {}).get("text") or "")
-        return ""
+                return c
+        return {}
 
-    def test_result_backfills_same_card(self):
+    def _card_text(self, cid_fragment="t"):
+        return str((self._result_card().get("body") or {}).get("text") or "")
+
+    def test_result_is_a_paired_card_and_is_idempotent(self):
+        """結果是**獨立一張** `tr-` 卡,與 `tc-` 配對;重複回來是 upsert。
+
+        ⚠️ 2026-10-29 刻意從「一張卡原地改寫」改成兩張(見 cc_sdk.tool_result
+        的註解):原地改寫的 kind 只能是 `text`,於是 app 的可折疊結果框失效、
+        tool_call 的 patch/diff chip 被結果文字蓋掉。tmux 路徑一直是兩張,
+        app 的渲染就是照那個形狀做的。
+
+        本測試原本斷言「不得另開新卡」—— 那釘的是舊設計,改版後必紅
+        (2026-10-31 發現時已紅了兩天)。真正要守的不是「卡數不變」,是
+        **同一個 tool_use_id 回來幾次都只有一張結果卡** —— 那才是防洗版的性質。
+        """
         self.s.digest.tool_card("Bash", "git status", use_id="tu_1")
-        before = len(self.s.digest.store.cards)
+        after_call = len(self.s.digest.store.cards)
         self.s._collect_tool_results(
             self._result_msg("tu_1", "On branch main\nnothing to commit"))
-        self.assertEqual(len(self.s.digest.store.cards), before,
-                         "要回填同一張卡,不得另開新卡(手機上會洗版)")
+        self.assertEqual(len(self.s.digest.store.cards), after_call + 1,
+                         "結果應該是獨立一張卡(與 tool_call 配對)")
         txt = self._card_text()
-        self.assertIn("git status", txt, "呼叫摘要要留著")
         self.assertIn("nothing to commit", txt, "結果要看得到")
+
+        # 同一個 use_id 再回一次 → 卡數不得增加(upsert,不是 append)。
+        # 這條是真正擋洗版的:SDK 對同一個 tool_use_id 可能送兩則
+        # (先文字、再純圖),每則都新增就會在手機上長出一串重複卡。
+        self.s._collect_tool_results(
+            self._result_msg("tu_1", "On branch main\nnothing to commit"))
+        self.assertEqual(len(self.s.digest.store.cards), after_call + 1,
+                         "同一個 tool_use_id 重複回來必須 upsert,不得再開一張")
 
     def test_list_content_text_parts_collected(self):
         self.s.digest.tool_card("Read", "foo.py", use_id="tu_2")
@@ -682,17 +708,32 @@ class CC2ToolResultTest(unittest.TestCase):
         self.assertIn("def main():", self._card_text())
 
     def test_error_result_marked(self):
+        """失敗要標出來。
+
+        ⚠️ 標記在 **`is_error` 欄位與 `fallback_text`**,不在 `text` ——
+        `text` 是工具的原始輸出,混進我們的標記會讓 app 沒辦法分開渲染。
+        本測試原本查 `text`,改版後必紅。
+        """
         self.s.digest.tool_card("Bash", "false", use_id="tu_3")
         self.s._collect_tool_results(
             self._result_msg("tu_3", "command failed", is_error=True))
-        self.assertIn("⚠️ 失敗", self._card_text())
+        card = self._result_card()
+        self.assertTrue((card.get("body") or {}).get("is_error"),
+                        "is_error 要標起來(app 據此渲染)")
+        self.assertIn("⚠️ 失敗", str((card.get("body") or {}).get("fallback_text") or ""))
 
     def test_long_result_truncated_and_says_so(self):
-        """編譯輸出動輒上萬字:截斷並明說,不要把卡片流撐爆。"""
+        """編譯輸出動輒上萬字:截斷並明說,不要把卡片流撐爆。
+
+        ⚠️ 上限 **2000**,不是原本的 800 —— 2026-10-29 對齊 tmux 路徑的
+        `carddigest._TOOL_RESULT_MAX`(註解:「同一份編譯輸出在 cc2 上被多截掉
+        一半」)。本測試原本斷言 `< 1200`,改版後必紅。
+        """
         self.s.digest.tool_card("Bash", "xcodebuild", use_id="tu_4")
         self.s._collect_tool_results(self._result_msg("tu_4", "x" * 5000))
         txt = self._card_text()
-        self.assertLess(len(txt), 1200, "不得塞全文")
+        self.assertLess(len(txt), 2300, "不得塞全文(2000 + 截斷說明)")
+        self.assertGreater(len(txt), 1900, "也不該截得比 tmux 路徑短")
         self.assertIn("還有", txt, "要明說截斷了多少")
 
     def test_empty_result_says_no_output(self):
