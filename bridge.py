@@ -30079,6 +30079,133 @@ async def app_gemini_set_key(request: Request):
     return {"ok": True, "provider": "gemini", "configured": GEMINI.configured()}
 
 
+# ══════════ 階段 2:Codex device-auth(不靠 localhost callback)══════════
+#
+# 實機實測(codex 0.166.0)`codex login --device-auth` 的輸出:
+#   1. Open this link: https://auth.openai.com/codex/device
+#   2. Enter this one-time code (expires in 15 minutes): RIUQ-KPYAN
+# 行程會**等**到使用者在網頁授權完成才退出,然後 auth.json 落檔。
+#
+# 所以設計比規格原稿更簡單:**不需要使用者「貼 code 回來」** —— 授權在
+# OpenAI 那邊完成。bridge 只要:spawn 背景行程、撈 URL+code 給 app 顯示、
+# **讓行程繼續跑**,再提供一支 status 端點讓 app 輪詢「登入好了沒」。
+#
+# login_id → 那顆背景行程。短 TTL(device code 15 分鐘)。
+_CODEX_LOGIN: dict = {}            # login_id -> {proc, url, user_code, created, done}
+_CODEX_LOGIN_LOCK = threading.Lock()
+_CODEX_LOGIN_TTL = 900.0           # 15 分鐘,對齊 OpenAI device code 的有效期
+_CODEX_DEVICE_URL_RE = re.compile(r"https://auth\.openai\.com/\S+")
+_CODEX_DEVICE_CODE_RE = re.compile(r"\b([A-Z0-9]{4}-[A-Z0-9]{4,6})\b")
+
+
+def _codex_login_gc_locked(now: float) -> None:
+    for lid in [k for k, v in _CODEX_LOGIN.items()
+                if now - v["created"] > _CODEX_LOGIN_TTL]:
+        v = _CODEX_LOGIN.pop(lid, None)
+        if v and v.get("proc") and v["proc"].returncode is None:
+            try:
+                v["proc"].kill()
+            except ProcessLookupError:
+                pass
+
+
+@app.post("/app/v1/agents/codex/login/start")
+async def app_codex_login_start(request: Request):
+    """啟動 Codex device-auth,回 app 要顯示的 URL + 一次性 code。
+
+    行程留在背景跑(等使用者授權),用 login_id 追蹤;app 之後輪詢
+    `/app/v1/agents/codex/login/status?login_id=…`。
+    """
+    if not POCKET_AGENT_LOGIN_IN_APP:
+        raise HTTPException(status_code=404, detail="not found")
+    _check_auth(request)
+    if _token_scope(_request_token(request)) == CONSOLE_REMOTE_SCOPE:
+        raise http_err(403, "SCOPE_FORBIDDEN",
+                       "遠端控制台不能設定帳號憑證,請用已配對的手機")
+    codex_bin = _resolve_codex_bin()
+    if not os.path.exists(codex_bin):
+        raise http_err(503, "CODEX_MISSING", "這台主機沒有安裝 Codex")
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            codex_bin, "login", "--device-auth",
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+            stdin=asyncio.subprocess.DEVNULL, cwd=HOME_ROOT)
+    except (FileNotFoundError, PermissionError) as e:
+        _log_event("codex_login_spawn_failed", error=type(e).__name__)
+        raise http_err(503, "CODEX_SPAWN_FAILED", "啟動 Codex 登入失敗")
+    # 讀開頭幾行把 URL + code 撈出來(ANSI 色碼要剝掉)。
+    url = user_code = None
+    deadline = time.time() + 20
+    buf = b""
+    while time.time() < deadline and (url is None or user_code is None):
+        try:
+            chunk = await asyncio.wait_for(proc.stdout.read(512), timeout=3)
+        except asyncio.TimeoutError:
+            continue
+        if not chunk:
+            break
+        buf += chunk
+        text = re.sub(r"\x1b\[[0-9;]*m", "", buf.decode("utf-8", "ignore"))
+        if url is None:
+            m = _CODEX_DEVICE_URL_RE.search(text)
+            if m:
+                url = m.group(0)
+        if user_code is None:
+            m = _CODEX_DEVICE_CODE_RE.search(text)
+            if m:
+                user_code = m.group(1)
+    if url is None:
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+        raise http_err(502, "CODEX_LOGIN_NO_URL", "沒能從 Codex 取得登入連結")
+    lid = secrets.token_urlsafe(18)
+    now = time.time()
+    with _CODEX_LOGIN_LOCK:
+        _codex_login_gc_locked(now)
+        _CODEX_LOGIN[lid] = {"proc": proc, "url": url, "user_code": user_code,
+                             "created": now, "done": None}
+    # 背景等行程結束 → 標記完成(auth.json 落檔與否由 returncode 判斷)。
+    async def _wait():
+        rc = await proc.wait()
+        with _CODEX_LOGIN_LOCK:
+            e = _CODEX_LOGIN.get(lid)
+            if e is not None:
+                e["done"] = (rc == 0)
+        _log_event("codex_login_finished", ok=(rc == 0))
+    t = asyncio.create_task(_wait())
+    _BG_TASKS.add(t)
+    t.add_done_callback(_BG_TASKS.discard)
+    _log_event("codex_login_started")   # 不記 url/code
+    return {"ok": True, "provider": "codex", "mode": "device_code",
+            "login_id": lid, "url": url, "user_code": user_code}
+
+
+@app.get("/app/v1/agents/codex/login/status")
+async def app_codex_login_status(request: Request, login_id: str = ""):
+    """app 輪詢:這次 device-auth 完成了沒。
+
+    `state`:`pending`(還在等授權)| `done`(登入成功)| `failed`(行程非 0 退出)
+    | `expired`(login_id 不存在/已過期)。
+    """
+    if not POCKET_AGENT_LOGIN_IN_APP:
+        raise HTTPException(status_code=404, detail="not found")
+    _check_auth(request)
+    now = time.time()
+    with _CODEX_LOGIN_LOCK:
+        _codex_login_gc_locked(now)
+        e = _CODEX_LOGIN.get(login_id)
+        if e is None:
+            return {"ok": True, "state": "expired"}
+        done = e["done"]
+    if done is True:
+        return {"ok": True, "state": "done"}
+    if done is False:
+        return {"ok": True, "state": "failed"}
+    return {"ok": True, "state": "pending"}
+
+
 def _host_capabilities() -> dict:
     """這台龍蝦主機支援哪些 provider — 給 app 依能力顯示/隱藏功能,而不是
     讓不支援的功能看起來像壞掉(Windows/精簡安裝沒有 tmux/CC 時尤其重要)。
