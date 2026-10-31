@@ -45,6 +45,10 @@ with open(_FAKE_CLAUDE, "w") as f:
         # OSC 8: ESC ] 8 ; id=x ; URI ESC \  TEXT ESC ] 8 ; ; ESC \
         "printf '\\033]8;id=t;%s\\033\\\\click\\033]8;;\\033\\\\\\n' '" + _FAKE_URL + "'\n"
         "read -r line\n"                                # 等 code 貼回
+        # 實機 setup-token 貼完 code 後**印** token 再退出。照抄這一步,驗 finish
+        # 撈得到並存起來(撈不到 = 真機上就是 Not logged in 的根因)。
+        "printf 'Success! Your token is below.\\n'\n"
+        "printf '%s\\n' 'sk-ant-oat01-FAKEtok3n_abcdefghijklmnopqrstuvwxyz0123456789-_'\n"
         "exit 0\n")
 os.chmod(_FAKE_CLAUDE, os.stat(_FAKE_CLAUDE).st_mode | stat.S_IEXEC)
 
@@ -149,6 +153,56 @@ class ClaudeLoginPtyTest(unittest.TestCase):
         finally:
             os.write = orig_write
             _b._agent_claude_logged_in = orig_login
+
+    def test_finish_captures_and_persists_oauth_token(self):
+        """setup-token 印出的 token 要被撈到、寫進 settings.json 的 env 區塊。
+
+        2026-10-31 根因:finish 把 PTY 輸出全丟了,token 跟著丟 → `claude -p`
+        永遠 Not logged in。這裡用假 claude 印一把 token,驗 finish:
+          · 撈到 token(_submit_and_wait 回傳)
+          · 寫進 CLAUDE_CONFIG_DIR/settings.json 的 env.CLAUDE_CODE_OAUTH_TOKEN
+          · 設進 os.environ
+          · token **不進 log**
+        _agent_claude_logged_in 仍 monkeypatch(真探測要真帳號),但這裡要的是
+        「token 真的被存下來」這件事,不是探測結果。
+        """
+        import json as _json
+        import bridge as _b
+        cfgdir = tempfile.mkdtemp(prefix="cc-cfg-")
+        orig_login = _b._agent_claude_logged_in
+        orig_env = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")
+        os.environ.pop("CLAUDE_CODE_OAUTH_TOKEN", None)
+        os.environ["CLAUDE_CONFIG_DIR"] = cfgdir
+        seen = []
+        orig_log = _b._log_event
+        _b._log_event = lambda event=None, **k: seen.append((event, dict(k)))
+        async def _yes(): return True
+        _b._agent_claude_logged_in = _yes
+        try:
+            r = _run(bridge.app_claude_login_start(_Req()))
+            fin = _run(bridge.app_claude_login_finish(
+                _Req({"login_id": r["login_id"], "code": "test-code"})))
+            self.assertTrue(fin["logged_in"])
+            # 寫進 settings.json 的 env 區塊
+            with open(os.path.join(cfgdir, "settings.json"), encoding="utf-8") as f:
+                saved = _json.load(f)
+            tok = saved.get("env", {}).get("CLAUDE_CODE_OAUTH_TOKEN", "")
+            self.assertTrue(tok.startswith("sk-ant-oat01-FAKEtok3n"),
+                            f"token 沒寫進 settings.json:{tok!r}")
+            # 設進 os.environ
+            self.assertEqual(os.environ.get("CLAUDE_CODE_OAUTH_TOKEN"), tok)
+            # token 不進 log —— 只記 token_captured 布林
+            blob = repr(seen)
+            self.assertNotIn("sk-ant-oat", blob, "token 不該進 log")
+            self.assertIn("token_captured", blob)
+        finally:
+            _b._agent_claude_logged_in = orig_login
+            _b._log_event = orig_log
+            os.environ.pop("CLAUDE_CONFIG_DIR", None)
+            if orig_env is None:
+                os.environ.pop("CLAUDE_CODE_OAUTH_TOKEN", None)
+            else:
+                os.environ["CLAUDE_CODE_OAUTH_TOKEN"] = orig_env
 
     def test_console_remote_scope_forbidden(self):
         from fastapi import HTTPException

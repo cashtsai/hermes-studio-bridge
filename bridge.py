@@ -23546,9 +23546,12 @@ async def _openclaw_v1_personas() -> list:
     sessions = await _openclaw_v1_sessions()
     preview = (sessions[0].get("preview") if sessions else None) or "OpenClaw gateway"
     status = (sessions[0].get("status") if sessions else None) or "idle"
+    # 對外顯示名「Pocket」:龍蝦上這就是機主初次啟動預設有的那個人格(main agent)。
+    # avatar_rev=0 → app 畫預設人像圓盤(紅圈),不另掛自訂頭像。id/session_id 不動,
+    # 路由仍指向 `openclaw:agent:main:main`。
     return [{
         "id": "openclaw",
-        "name": "OpenClaw",
+        "name": "Pocket",
         "profile": "main",
         "home": "",
         "enabled": True,
@@ -29961,6 +29964,11 @@ async def _dashboard_sessions():
                     oc_w += 1
                 else:
                     oc_i += 1
+            # 還沒開口說過話 → sessions.list 空 → 不要畫成 0/0。預設人格(Pocket /
+            # main agent)本來就在,算一條閒置,跟人格分頁「有一條 Pocket」對齊,
+            # 也跟 gemini 的 `or 1` 作法一致(免得「分頁有、儀表板說 0」)。
+            if oc_w == 0 and oc_i == 0:
+                oc_i = 1
             out["openclaw"] = {"working": oc_w, "idle": oc_i}
         except Exception as e:  # noqa: BLE001
             _log_event("dashboard_openclaw_failed", error=type(e).__name__,
@@ -30233,6 +30241,13 @@ _CC_LOGIN_TTL = 900.0
 # OSC 8 hyperlink 的 URI:ESC ] 8 ; params ; <URI> (ESC\ 或 BEL)
 _OSC8_URI_RE = re.compile(r"\x1b\]8;[^;]*;([^\x1b\x07]+)(?:\x1b\\|\x07)")
 _CC_OAUTH_RE = re.compile(r"https://claude\.com/cai/oauth/authorize\S+")
+# `claude setup-token` **印** token 到終端機、**不存檔**(官方 auth 文件明寫:
+# "It does not save the token anywhere; copy it and set it as the
+# CLAUDE_CODE_OAUTH_TOKEN environment variable")。所以 finish 貼完 code 後必須
+# 從 PTY 輸出把這把 token 撈出來自己存,否則 `claude -p` 永遠 Not logged in
+# —— 這正是 2026-10-31「exit 0 卻沒登入」的根因。token 形狀 `sk-ant-oat01-…`。
+_CC_OAUTH_TOKEN_RE = re.compile(r"sk-ant-oat[0-9A-Za-z]{0,4}-[A-Za-z0-9_-]{20,}")
+_CC_OAUTH_TOKEN_FALLBACK_RE = re.compile(r"sk-ant-[A-Za-z0-9_-]{30,}")
 
 
 def _cc_login_reap_locked(now: float) -> None:
@@ -30329,6 +30344,48 @@ async def app_claude_login_start(request: Request):
             "login_id": lid, "url": url, "user_code": None}
 
 
+def _claude_settings_path() -> str:
+    """Claude Code 的使用者 settings.json。尊重 CLAUDE_CONFIG_DIR(多帳號),
+    否則 ~/.claude/settings.json。"""
+    cfg = os.environ.get("CLAUDE_CONFIG_DIR")
+    base = cfg if cfg else os.path.join(os.path.expanduser("~"), ".claude")
+    return os.path.join(base, "settings.json")
+
+
+def _claude_persist_oauth_token(token: str) -> None:
+    """把 setup-token 印出來的 CLAUDE_CODE_OAUTH_TOKEN 寫進 settings.json 的 env
+    區塊。這是官方支援的來源(文件:env block of a settings file),每個 claude
+    行程開場自己重讀 → 與 bridge 怎麼 spawn(tmux / -p / SDK)無關都吃得到。
+    0600 寫入,與 claude 在 Linux 存 .credentials.json 的權限一致。**不記 log。**"""
+    path = _claude_settings_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    data = {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f) or {}
+    except (FileNotFoundError, ValueError, OSError):
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    env = data.get("env")
+    if not isinstance(env, dict):
+        env = {}
+    env["CLAUDE_CODE_OAUTH_TOKEN"] = token
+    data["env"] = env
+    blob = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
+    tmp = path + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.write(fd, blob)
+    finally:
+        os.close(fd)
+    os.replace(tmp, path)
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+
+
 @app.post("/app/v1/agents/claude/login/finish")
 async def app_claude_login_finish(request: Request):
     """把使用者從 Anthropic 頁面複製的 code 貼進 PTY,完成登入。"""
@@ -30350,32 +30407,56 @@ async def app_claude_login_finish(request: Request):
     if entry is None:
         raise http_err(410, "LOGIN_EXPIRED", "這次登入已過期,請重新開始")
 
-    def _submit_and_wait() -> bool:
+    def _submit_and_wait() -> tuple[bool, str | None]:
+        """回 (exit_ok, token)。token = 從 PTY 輸出撈到的 CLAUDE_CODE_OAUTH_TOKEN
+        (setup-token 貼完 code 後**印**出來的那把),撈不到回 None。"""
         fd = entry["master_fd"]
         try:
             # bracketed paste 包起來(TUI 用 [?2004h 開了 bracketed paste mode)
             os.write(fd, b"\x1b[200~" + code.encode() + b"\x1b[201~\r")
         except OSError:
-            return False
-        # 等行程退出(授權成功會寫 token 然後結束)
+            return False, None
+        # 等行程退出(授權成功會**印** token 然後結束)。全程累積輸出,退出後
+        # 撈 token —— 不能丟,丟了就等於沒登入(見 _CC_OAUTH_TOKEN_RE 的註解)。
+        buf = b""
         deadline = time.time() + 30
+        exit_ok = False
         while time.time() < deadline:
-            try:
-                wpid, status = os.waitpid(entry["pid"], os.WNOHANG)
-            except (ChildProcessError, OSError):
-                return True       # 已經被收掉,視為完成
-            if wpid != 0:
-                return os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
-            # 持續排空輸出,免得 PTY buffer 塞住子行程
+            # 先排空輸出(免得 PTY buffer 塞住子行程),再判退出 —— 順序要緊:
+            # 子行程印完 token 才 exit,先讀才不會漏掉最後那段。
             r, _, _ = select.select([fd], [], [], 0.5)
             if r:
                 try:
-                    os.read(fd, 4096)
+                    chunk = os.read(fd, 4096)
+                    if chunk:
+                        buf += chunk[:1 << 20] if len(buf) < (1 << 20) else b""
                 except OSError:
                     pass
-        return False
+            try:
+                wpid, status = os.waitpid(entry["pid"], os.WNOHANG)
+            except (ChildProcessError, OSError):
+                exit_ok = True        # 已被收掉,視為完成
+                break
+            if wpid != 0:
+                exit_ok = os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
+                # 行程退出後再把殘餘輸出排乾(token 常在最後一口)
+                for _ in range(8):
+                    r2, _, _ = select.select([fd], [], [], 0.2)
+                    if not r2:
+                        break
+                    try:
+                        c2 = os.read(fd, 4096)
+                    except OSError:
+                        break
+                    if not c2:
+                        break
+                    buf += c2
+                break
+        text = buf.decode("utf-8", "ignore")
+        m = _CC_OAUTH_TOKEN_RE.search(text) or _CC_OAUTH_TOKEN_FALLBACK_RE.search(text)
+        return exit_ok, (m.group(0) if m else None)
 
-    ok = await asyncio.to_thread(_submit_and_wait)
+    ok, token = await asyncio.to_thread(_submit_and_wait)
     with _CC_LOGIN_LOCK:
         e = _CC_LOGIN.pop(lid, None)
     if e:
@@ -30383,11 +30464,22 @@ async def app_claude_login_finish(request: Request):
             os.close(e["master_fd"])
         except OSError:
             pass
+    # 撈到 token 就**自己存**(setup-token 不存),否則 `claude -p` 認不得這把。
+    # 存進 ~/.claude/settings.json 的 env 區塊(官方認證來源 #5,每個 claude 行程
+    # 開場自己重讀,與 bridge 怎麼 spawn 無關)+ 當場塞進 os.environ 讓即時探測
+    # 也看得到。**token 絕不進 log。**
+    if token:
+        try:
+            await asyncio.to_thread(_claude_persist_oauth_token, token)
+            os.environ["CLAUDE_CODE_OAUTH_TOKEN"] = token
+        except Exception as _e:  # noqa: BLE001
+            _log_exc("claude_token_persist", _e, expected=False)
     # **exit 0 不等於登入成功。** 2026-10-31 實機:行程 exit 0、端點回
-    # logged_in:true,但 `claude -p` 仍 Not logged in —— 假成功。
-    # 所以行程退出後**實際探一次登入狀態**才算數,不信 exit code。
+    # logged_in:true,但 `claude -p` 仍 Not logged in —— 假成功(當時正是沒存
+    # token)。所以行程退出後**實際探一次登入狀態**才算數,不信 exit code。
     really = await _agent_claude_logged_in()
-    _log_event("claude_login_finished", ok=ok, logged_in=really)
+    _log_event("claude_login_finished", ok=ok, token_captured=bool(token),
+               logged_in=really)
     if not really:
         raise http_err(502, "CLAUDE_LOGIN_FAILED",
                        "登入沒完成 —— 授權碼可能貼錯、含多餘字元,或已過期,請重新開始")

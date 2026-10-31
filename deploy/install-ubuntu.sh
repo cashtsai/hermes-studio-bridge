@@ -118,6 +118,14 @@ grep -q '^PAIR_BOOT_CODE_FILE=' "$ENV_FILE" || printf 'PAIR_BOOT_CODE_FILE=%s\n'
 # ~/.codex 的 writer lock」,而龍蝦是單使用者、沒有桌面版 —— 沒有東西可搶。
 # 換來的正是機主要的持久性。
 grep -q '^POCKET_CODEX_ISOLATED=' "$ENV_FILE" || printf 'POCKET_CODEX_ISOLATED=%s\n' "${POCKET_CODEX_ISOLATED:-0}" >> "$ENV_FILE"
+# ── 選定 provider(2026-10-31 補:0/0 空人格的根因)─────────────────────────
+#
+# `DEFAULT_PROVIDER` 一直被算出來(龍蝦=openclaw)卻**從沒寫進 bridge.env**,
+# 所以 bridge 的 `_dashboard_active_provider()` 讀不到 POCKET_ACTIVE_PROVIDER →
+# 回 "auto"。後果:`/app/v1/personas`(設定頁人格管理)不走 OpenClaw 分支,掉回
+# Hermes 內建清單 —— 龍蝦上那是空的 → 人格管理一個都沒有。寫上它,人格分頁才會
+# 顯示 OpenClaw 的主 session(對外名「Pocket」)。
+grep -q '^POCKET_ACTIVE_PROVIDER=' "$ENV_FILE" || printf 'POCKET_ACTIVE_PROVIDER=%s\n' "$DEFAULT_PROVIDER" >> "$ENV_FILE"
 # ── 桌面控制台(2026-10-31 補)───────────────────────────────────────────
 #
 # 在這之前安裝器**從來沒設過** POCKET_CONSOLE_ENABLED(預設 0),所以龍蝦上
