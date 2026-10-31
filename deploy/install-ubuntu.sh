@@ -147,6 +147,11 @@ CONSOLE_FILE_ROOTS="${POCKET_CONSOLE_REMOTE_FILE_ROOTS:-}"
 grep -q '^POCKET_CONSOLE_ENABLED=' "$ENV_FILE" || printf 'POCKET_CONSOLE_ENABLED=%s\n' "$CONSOLE_ENABLED" >> "$ENV_FILE"
 grep -q '^POCKET_CONSOLE_QR_LOGIN=' "$ENV_FILE" || printf 'POCKET_CONSOLE_QR_LOGIN=%s\n' "$CONSOLE_QR_LOGIN" >> "$ENV_FILE"
 grep -q '^POCKET_CONSOLE_REMOTE_FILE_ROOTS=' "$ENV_FILE" || printf 'POCKET_CONSOLE_REMOTE_FILE_ROOTS=%s\n' "$CONSOLE_FILE_ROOTS" >> "$ENV_FILE"
+# ── App 內 agent 登入(2026-10-31:龍蝦沒有「你的 Mac」可去桌面控制台登入)──
+# 預設**開**:雲端龍蝦上 CC/Codex/Gemini 的登入只能在手機 App 裡按鈕完成
+# (CC setup-token / Codex device-auth / Gemini 貼 key)。旗標在 bridge.py 預設
+# 關(404),mac 版維持關(走桌面控制台);龍蝦這台一定要開,否則三個引擎都登不了。
+grep -q '^POCKET_AGENT_LOGIN_IN_APP=' "$ENV_FILE" || printf 'POCKET_AGENT_LOGIN_IN_APP=%s\n' "${POCKET_AGENT_LOGIN_IN_APP:-1}" >> "$ENV_FILE"
 chmod 600 "$ENV_FILE"
 
 # ── 配對 boot code(既有就沿用;bridge 啟動也會自產,這裡先產好以便印連結) ──
@@ -208,6 +213,47 @@ if [ "$INSTALL_OPENCLAW" = "1" ]; then
   if [ ! -s "$OPENCLAW_CONFIG_FILE" ]; then
     printf '{"base_url":"ws://127.0.0.1:19801","token":"%s"}\n' "$OPENCLAW_GATEWAY_TOKEN" > "$OPENCLAW_CONFIG_FILE"
     chmod 600 "$OPENCLAW_CONFIG_FILE"
+  fi
+  # ── gateway 預設模型(2026-10-31:開箱就有一個免費線上模型可用)────────────
+  #
+  # OpenClaw 的 gateway 設定(models.providers / agents.defaults)在
+  # $OPENCLAW_INSTALL_DIR/home/openclaw.json。原本安裝器完全不寫它 → 新機
+  # gateway 跑得起來(--allow-unconfigured)但沒有任何模型,機主得自己手接。
+  # 這裡預設接上 OpenRouter 的免費模型(:free 不需信用卡),讓「預設 Pocket
+  # 人格」一裝好就能回話。api 明確寫 openai-completions(補掉 gateway 日誌那句
+  # `no "api" specified` 警告;實機已證模型回覆正常,這只是清掉雜訊)。
+  #
+  # **API key 絕不寫死在這支腳本(它在公開 repo)。** 由安裝時的環境變數
+  # POCKET_OPENROUTER_KEY 帶進來;沒給就留空字串 —— gateway 照跑,免費模型要
+  # 等機主把 key 填進去(app 設定頁或重跑安裝器帶 key)才會真的呼叫。
+  OPENCLAW_GATEWAY_CONFIG="$OPENCLAW_INSTALL_DIR/home/openclaw.json"
+  OPENROUTER_FREE_MODEL="${POCKET_OPENROUTER_MODEL:-nvidia/nemotron-3.5-super-vl:free}"
+  if [ ! -s "$OPENCLAW_GATEWAY_CONFIG" ]; then
+    mkdir -p "$(dirname "$OPENCLAW_GATEWAY_CONFIG")"
+    OPENROUTER_KEY="${POCKET_OPENROUTER_KEY:-}" OPENROUTER_MODEL="$OPENROUTER_FREE_MODEL" \
+      python3 - "$OPENCLAW_GATEWAY_CONFIG" <<'PY'
+import json, os, sys
+path = sys.argv[1]
+model = os.environ["OPENROUTER_MODEL"]
+cfg = {
+    "models": {"providers": {"openrouter": {
+        "baseUrl": "https://openrouter.ai/api/v1",
+        "apiKey": os.environ.get("OPENROUTER_KEY", ""),
+        "api": "openai-completions",
+        "models": [{"id": model, "name": model}],
+    }}},
+    "agents": {"defaults": {"model": "openrouter/" + model}},
+}
+with open(path, "w", encoding="utf-8") as f:
+    json.dump(cfg, f, ensure_ascii=False, indent=2)
+os.chmod(path, 0o600)
+PY
+    if [ -n "${POCKET_OPENROUTER_KEY:-}" ]; then
+      log_step "  gateway 預設模型:openrouter/$OPENROUTER_FREE_MODEL(已帶 key)"
+    else
+      printf '⚠️  gateway 預設模型已設 openrouter/%s,但**沒帶 API key** —— 免費模型要填 key 才會回話。\n' "$OPENROUTER_FREE_MODEL" >&2
+      printf '    取得免費 key:https://openrouter.ai/keys(:free 模型不需信用卡)。填法:app 設定頁,或帶 POCKET_OPENROUTER_KEY=... 重跑安裝器。\n' >&2
+    fi
   fi
 fi
 
