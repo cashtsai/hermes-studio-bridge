@@ -101,6 +101,23 @@ fi
 grep -q '^POCKET_BRIDGE_PORT=' "$ENV_FILE" || printf 'POCKET_BRIDGE_PORT=%s\n' "$BRIDGE_PORT" >> "$ENV_FILE"
 grep -q '^POCKET_TUNNEL_URL_FILE=' "$ENV_FILE" || printf 'POCKET_TUNNEL_URL_FILE=%s\n' "$TUNNEL_URL_FILE" >> "$ENV_FILE"
 grep -q '^PAIR_BOOT_CODE_FILE=' "$ENV_FILE" || printf 'PAIR_BOOT_CODE_FILE=%s\n' "$PAIR_BOOT_CODE_FILE" >> "$ENV_FILE"
+# ── Codex:龍蝦上關家目錄隔離,改用 managed daemon(2026-10-31)──────────
+#
+# **為什麼**:機主的目標是「cc / cx 要能持久」。Codex 的持久性(回合跨得過
+# bridge 重啟)來自 managed daemon —— 它獨立於 bridge 行程。但 bridge 有一條
+# 鐵則:**隔離開啟 ⇒ 一定自己 spawn stdio、不碰 daemon**(見 bridge.py 的
+# `_codex_isolated` 區塊)。而 `codex_home.isolation_enabled()` 在**非 macOS
+# 預設開隔離**,理由寫著「龍蝦那台無頭 Ubuntu 根本沒有 daemon」。
+#
+# 那個前提被本安裝器推翻了 —— 我們**裝了** pocket-codex-daemon。於是隔離預設
+# 把 daemon 永遠排除掉,Codex 退回 stdio、隨 bridge 死,持久性拿不到。
+# (2026-10-31 第一台實機就是這樣:codex session 一律 `codex binary
+#  unavailable`,追到底是隔離規則強制 stdio。)
+#
+# 關隔離的代價在龍蝦上是**零**:隔離防的是「桌面版與 Pocket 搶同一個
+# ~/.codex 的 writer lock」,而龍蝦是單使用者、沒有桌面版 —— 沒有東西可搶。
+# 換來的正是機主要的持久性。
+grep -q '^POCKET_CODEX_ISOLATED=' "$ENV_FILE" || printf 'POCKET_CODEX_ISOLATED=%s\n' "${POCKET_CODEX_ISOLATED:-0}" >> "$ENV_FILE"
 # ── 桌面控制台(2026-10-31 補)───────────────────────────────────────────
 #
 # 在這之前安裝器**從來沒設過** POCKET_CONSOLE_ENABLED(預設 0),所以龍蝦上

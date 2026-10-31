@@ -72,7 +72,9 @@ thread-store = `<home>/state_5.sqlite` 的 `threads` 資料列 +
 # 環境變數
 
   POCKET_CODEX_ISOLATED   1/0/true/false/on/off/auto（預設 auto）
-                          auto = macOS 關、其他平台（龍蝦無頭 Ubuntu）開
+                          auto = macOS 關、其他平台開
+                          ⚠️ 龍蝦安裝器顯式設 0（要 managed daemon 的持久性,
+                             見 isolation_enabled() 的 2026-10-31 更正）
   POCKET_CODEX_HOME       隔離家目錄路徑（預設 ~/.pocket/codex-home）
   POCKET_CODEX_CONFIG_MODE  copy（預設）/ symlink / none
   CODEX_HOME              「共用家目錄」在哪（預設 ~/.codex）；隔離關閉時
@@ -120,8 +122,16 @@ def isolation_enabled() -> bool:
     """要不要用隔離家目錄。
 
     預設 `auto`：**macOS 關**（善彰的機器上這次合併要零風險，開關由 plist 掌握）、
-    **非 macOS 開**（龍蝦那台無頭 Ubuntu 根本沒有桌面 app 的 managed daemon，
-    隔離是嚴格更好且沒有代價的預設）。
+    **非 macOS 開**。
+
+    ⚠️ 2026-10-31 更正那個「非 macOS 開」的理由：原文寫「龍蝦那台無頭 Ubuntu
+    根本沒有桌面 app 的 managed daemon」。**那個前提已經不成立** —— 龍蝦安裝器
+    (`deploy/install-ubuntu.sh`)現在會裝 `pocket-codex-daemon.service`,就是為了
+    讓 Codex 回合跨得過 bridge 重啟(機主要的「持久」)。而隔離開啟會強制走
+    stdio、永遠不碰 daemon,兩者直接打架。
+    **所以龍蝦安裝器顯式寫 `POCKET_CODEX_ISOLATED=0` 覆蓋這個 auto 預設。**
+    這裡的 auto 預設**刻意不改**:改它會動到其他非 macOS 場景(風險大),而龍蝦
+    那條路已經用顯式 env 蓋過去了。auto 只是「沒人明講時的退路」。
     """
     raw = (os.environ.get("POCKET_CODEX_ISOLATED") or "auto").strip().lower()
     if raw in _TRUE:
