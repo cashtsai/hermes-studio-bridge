@@ -30399,10 +30399,13 @@ async def app_claude_login_finish(request: Request):
     body = await _json_body(request)
     lid = str(body.get("login_id") or "")
     code = str(body.get("code") or "").strip()
-    # OAuth code 可能被貼成 `code#state`(網頁網址列的 fragment 一起複製)。
-    # setup-token 要的是 `#` 前面那段。保留原樣會驗證失敗。
-    if "#" in code:
-        code = code.split("#", 1)[0]
+    # **整串 `code#state` 原樣送回,不要切掉 `#`。** 2026-10-31 實機(claude
+    # 2.1.309,tmux 直接觀察 setup-token):只送 `#` 前段 → "OAuth error:
+    # Invalid code. Please make sure the full code was copied";送完整
+    # `code#state` 才過。`#` 後面是 OAuth state,setup-token 要靠它比對(CSRF),
+    # 不是可丟的網址 fragment。
+    # 之前這裡反過來切掉 `#`(理由寫「保留原樣會驗證失敗」)—— 那是沒在真機
+    # 上驗過的錯誤推論,正是它讓每一次 app 內 CC 登入都失敗(紅線第 5 條)。
     if not code:
         raise http_err(400, "MISSING_CODE", "請貼上授權碼")
     with _CC_LOGIN_LOCK:

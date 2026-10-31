@@ -129,8 +129,14 @@ class ClaudeLoginPtyTest(unittest.TestCase):
         finally:
             _b._agent_claude_logged_in = orig
 
-    def test_finish_strips_state_fragment_from_code(self):
-        """貼成 `code#state` 時要切掉 `#` 後面 —— OAuth code 不含 fragment。"""
+    def test_finish_sends_full_code_including_state(self):
+        """貼成 `code#state` 時要**整串原樣**送進 PTY,不准切掉 `#` 後面。
+
+        2026-10-31 實機(claude 2.1.309,tmux 直接觀察):只送 `#` 前段 →
+        "OAuth error: Invalid code. Please make sure the full code was copied";
+        完整 `code#state` 才過。`#` 後面是 OAuth state(CSRF 比對用),不是可丟
+        的網址 fragment。之前這裡反過來切掉,害每一次 app 內 CC 登入都失敗。
+        """
         import bridge as _b
         captured = {}
         orig_login = _b._agent_claude_logged_in
@@ -146,10 +152,12 @@ class ClaudeLoginPtyTest(unittest.TestCase):
             r = _run(bridge.app_claude_login_start(_Req()))
             os.write = _spy_write
             _run(bridge.app_claude_login_finish(
-                _Req({"login_id": r["login_id"], "code": "REALCODE#statejunk"})))
+                _Req({"login_id": r["login_id"], "code": "REALCODE#stateABC"})))
             self.assertIn(b"REALCODE", captured.get("code", b""))
-            self.assertNotIn(b"statejunk", captured.get("code", b""),
-                             "# 後面的 state 碎片沒切掉")
+            self.assertIn(b"stateABC", captured.get("code", b""),
+                          "# 後面的 state 一起送才是完整 code,不准切掉")
+            self.assertIn(b"REALCODE#stateABC", captured.get("code", b""),
+                          "必須整串 code#state 原樣送回")
         finally:
             os.write = orig_write
             _b._agent_claude_logged_in = orig_login
