@@ -434,10 +434,17 @@ fi
 # 雲端/headless 免掃碼:直接給配對連結(30 分鐘有效),傳到手機點開即配。
 PAIR_LINK="$(curl -fsS -m 8 "http://127.0.0.1:$BRIDGE_PORT/pair/qr.json?ttl=1800&boot=$PAIR_BOOT_CODE" 2>/dev/null \
   | python3 -c 'import json,sys;d=json.load(sys.stdin);print(d.get("payload","") if d.get("ok") else "")' 2>/dev/null || true)"
+PAIR_LINK_FILE="${POCKET_PAIR_LINK_FILE:-$HOME/pocket-pair-link.txt}"
 if [ -n "$PAIR_LINK" ]; then
   echo
   echo "📎 免掃碼(雲端主機):把下面這條配對連結傳到手機(iMessage/mail 皆可),點開即配對(30 分鐘內有效):"
   echo "   $PAIR_LINK"
+  # **也要落檔。** 這支常常在沒有人看著 stdout 的情況下跑:
+  # cloud-init／Vultr startup script／ssh 一行帶過、或單純捲掉了。
+  # 連結只印在畫面上 = 錯過就只能重跑安裝器。
+  # 連結本身即憑證(帶 boot code),所以 0600。
+  (umask 077; printf '%s\n' "$PAIR_LINK" > "$PAIR_LINK_FILE") 2>/dev/null \
+    && echo "   (也寫到 $PAIR_LINK_FILE —— 錯過上面那行就 cat 它)"
 fi
 if ! command -v tailscale >/dev/null; then
   echo
