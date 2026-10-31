@@ -268,12 +268,27 @@ class BridgeGlueTests(unittest.TestCase):
         self.assertTrue(finals and finals[0]["body"]["text"] == "PONG")
         self.assertFalse(bridge._GM_TURNS)
 
-    def test_v1_post_message_busy_409(self):
+    def test_v1_post_message_busy_queues_not_409(self):
+        """忙碌 → **排隊,不是 409**(C11,2026-10-31 對齊 cc2/CX 的 submit)。
+
+        本測試原本斷言 409 —— 那釘的是舊契約。409 的實害:app 只靠本地
+        ledger 擋,兩台裝置或語音+打字連發時,第二則直接「送出失敗」,
+        使用者的訊息就丟了。新契約:收下、上牆、回 queued,上一輪收尾
+        自動接著跑。**訊息比額度珍貴,收下再說。**
+        """
         bridge._GM_TURNS["acp-z"] = {"cid": "c", "text": "", "key": "kbusy"}
-        r = client.post("/app/v1/messages", headers=AUTH,
-                        json={"session": "gemini:kbusy", "content": "x"})
-        self.assertEqual(r.status_code, 409)
-        bridge._GM_TURNS.clear()
+        try:
+            r = client.post("/app/v1/messages", headers=AUTH,
+                            json={"session": "gemini:kbusy", "content": "x"})
+            # v1 是 OpenAI 相容的 SSE 串流 —— 驗狀態碼與串流形狀,
+            # 佇列的真相直接看 _GM_INPUT_QUEUE(那才是「收下了」的證據)。
+            self.assertEqual(r.status_code, 200, r.text[:200])
+            self.assertIn("data:", r.text[:100], "v1 回的是 SSE 串流")
+            self.assertEqual(len(bridge._GM_INPUT_QUEUE.get("kbusy") or []), 1,
+                             "佇列要真的有那一則,不是只回 200")
+        finally:
+            bridge._GM_TURNS.clear()
+            bridge._GM_INPUT_QUEUE.clear()
 
     def test_v1_interrupt_dispatch(self):
         with patch.object(bridge.GEMINI, "cancel",

@@ -36,6 +36,22 @@ _V2_OPS_KNOWN_GAPS = {
     ("archive", "hermes"): "persona 對話無封存概念(TG 式常駐)",
     ("history", "openclaw"): "事件表就是歷史(/app/v2/…/events 已涵蓋),無另一份逐字稿",
     ("history", "hermes"): "persona 走 canonical store 的訊息分頁,不在這張表",
+    # ── config(C6 收尾,2026-10-31):缺格全是架構理由,不是沒接線 ──
+    ("config_read", "claude_code"):
+        "CC 的模型/權限走 live TUI(/ccsessions/{name}/model|mode),"
+        "第二套入口只會多一條會漂移的真相(config 端點 docstring 原話)",
+    ("config_write", "claude_code"): "同 config_read:live TUI 是唯一寫入面",
+    ("config_read", "cc2"):
+        "settings 是寫入面;現值由 cc2 列的 meta 回報,沒有獨立讀端點",
+    ("config_read", "gemini"):
+        "模型是單一常駐 ACP 子程序的 spawn 參數(gemini --acp -m),"
+        "per-session 模型 = 每會話一顆行程,是架構題不是接線題;"
+        "全域設定走 /app/v1/gemini/config",
+    ("config_write", "gemini"): "同 config_read:spawn 參數改不了跑著的行程",
+    ("config_read", "openclaw"): "session 設定住在 OpenClaw gateway 端,bridge 只讀",
+    ("config_write", "openclaw"): "同上",
+    ("config_read", "hermes"): "persona 的設定就是人格定義,不是 session 屬性",
+    ("config_write", "hermes"): "同上",
 }
 
 #: 表上該出現的 provider 全集 —— 新 provider 上線時加進來,守門會逼每個 op

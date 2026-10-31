@@ -20557,8 +20557,14 @@ async def v2_session_config_read(session_id: str, request: Request):
     """
     _check_auth(request)
     provider, ident = _v2_config_split(session_id)
-    if provider != "codex" or not ident:
+    if not ident:
         raise HTTPException(status_code=404, detail="not found")
+    if provider != "codex":
+        # 非 codex → 走統一操作表(_V2_SESSION_OPS 的 config_read)。
+        # 表上沒有的家回 PROVIDER_OP_UNSUPPORTED 404 —— 與原本的裸 404 同
+        # 狀態碼(app 的 graceful absence 原樣保留),但**指名哪家缺什麼**,
+        # 而且缺格在對齊守門測試裡必須有理由。codex 的 inline 路徑零改動。
+        return await _v2_session_op("config_read", session_id, request)
     if ident not in CODEX_APP.thread_settings:
         try:
             await CODEX_APP.ensure_thread_loaded(ident)
@@ -20598,8 +20604,11 @@ async def v2_session_config_write(session_id: str, request: Request):
     """
     _check_auth(request)
     provider, ident = _v2_config_split(session_id)
-    if provider != "codex" or not ident:
+    if not ident:
         raise HTTPException(status_code=404, detail="not found")
+    if provider != "codex":
+        # 同 config_read:非 codex 走對齊表(cc2 由此接上 settings 寫入)。
+        return await _v2_session_op("config_write", session_id, request)
     body = await request.json()
     params: dict = {"threadId": ident}
     model = str(body.get("model") or "").strip()
@@ -22928,6 +22937,18 @@ _V2_SESSION_OPS: dict = {
         "cc2":         _cc2_op_history,
         "gemini":      _gm_op_history,
     },
+    # config:統一控制面(SessionControlSheet)的讀/寫。codex 的實作在
+    # `/app/v2/sessions/{id}/config` 的 inline 路徑(出貨已久,一個位元不動),
+    # 這裡的 codex 項只是讓矩陣完整 —— 直呼 _v2_session_op 時繞回同一條。
+    # 其他家的缺格**都有架構理由**(見 tests 的 _V2_OPS_KNOWN_GAPS):
+    # 不是沒接線,是那一家的設定根本不住在 per-session 層。
+    "config_read": {
+        "codex": lambda rest, req: v2_session_config_read(f"codex:{rest}", req),
+    },
+    "config_write": {
+        "codex": lambda rest, req: v2_session_config_write(f"codex:{rest}", req),
+        "cc2":   lambda rest, req: v2_cc2_settings(rest, req),
+    },
 }
 
 
@@ -23839,6 +23860,10 @@ async def _openclaw_v1_post_message(body: dict, request: Request):
 GEMINI = gemini_provider.GeminiClient(log=_log_event)
 _GM_CARD_DIGESTS: dict = {}
 _GM_TURNS: dict = {}     # acp_sid -> {"cid","text","key"}(進行中 turn 的路由表)
+#: C11:忙碌時排隊的輸入(key -> [(content, blocks)])。上一輪收尾時 drain。
+#: 刻意不設上限計數器 —— _att_guard/body 上限已擋單則大小,而「排了 30 則」
+#: 是使用者自己的選擇;比照 cc2 的 queue(它也不設上限)。
+_GM_INPUT_QUEUE: dict = {}
 
 # 權限請求等待者:approval id -> Future。語意照 cc2 seam —— **真相在等待者
 # 手上**,決定端點只負責叫醒,DB mark 與卡片收尾由等待者協程統一做(決議與
@@ -24342,6 +24367,19 @@ async def _gm_run_turn(key: str, content: str,
     finally:
         if acp_sid:
             _GM_TURNS.pop(acp_sid, None)
+        # C11 drain:上一輪收尾(成功或失敗都算)→ 接著跑佇列裡最舊的一則。
+        # 放 finally 是刻意的:失敗不 drain 的話,排在後面的訊息會永遠卡著,
+        # 而使用者看到的只是「我後來送的那幾則全部沒反應」。
+        pending = _GM_INPUT_QUEUE.get(key)
+        if pending:
+            nxt_content, nxt_blocks = pending.pop(0)
+            if not pending:
+                _GM_INPUT_QUEUE.pop(key, None)
+            _log_event("gemini_queue_drain", session=key[:32],
+                       remaining=len(pending))
+            t2 = asyncio.create_task(_gm_run_turn(key, nxt_content, nxt_blocks))
+            _BG_TASKS.add(t2)
+            t2.add_done_callback(_BG_TASKS.discard)
 
 
 async def _gemini_v2_rows() -> list:
@@ -24510,8 +24548,6 @@ async def _gm_input_run(key: str, session_id: str, body: dict,
                    voice=len(voice_lines))
     if not content and not blocks:
         raise http_err(400, "EMPTY_CONTENT", "content required")
-    if _gm_busy(key):
-        raise http_err(409, "TURN_IN_PROGRESS", "上一輪還在回覆中，稍候或先中斷。")
     d = await _gm_card_digest(key)
     mid = await asyncio.to_thread(
         gemini_provider.transcript_append, key, "user", content)
@@ -24526,6 +24562,20 @@ async def _gm_input_run(key: str, session_id: str, body: dict,
                                 {"content": content, "attachments": att_meta})
     d.message_card({"id": mid, "role": "user", "content": content,
                     "attachments": att_meta, "ts": time.time()})
+    # 忙碌 → **排隊,不回 409**(C11,對齊 cc2/CX 的 submit 語意)。
+    #
+    # 409 的實害:app 只靠本地 ledger 擋,搶線(兩台裝置、或語音+打字連發)
+    # 時第二則直接「送出失敗」—— 使用者的訊息就丟了。排隊的話:訊息卡已經
+    # 上牆(上面 message_card),佇列深度回給 app 畫「已排入」,上一輪收尾
+    # 自動接著跑。訊息比額度珍貴:**收下再說**。
+    if _gm_busy(key):
+        _GM_INPUT_QUEUE.setdefault(key, []).append((content, blocks))
+        depth = len(_GM_INPUT_QUEUE[key])
+        _log_event("gemini_input_queued", session=key[:32], depth=depth)
+        out = {"ok": True, "session_id": session_id, "accepted": True,
+               "queued": True, "queue_depth": depth, "message_id": mid}
+        _cc_input_settle(dedup, out)
+        return out
     task = asyncio.create_task(_gm_run_turn(key, content, blocks))
     _BG_TASKS.add(task)
     task.add_done_callback(_BG_TASKS.discard)
