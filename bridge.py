@@ -30242,41 +30242,40 @@ async def app_codex_login_status(request: Request, login_id: str = ""):
 _CC_LOGIN: dict = {}        # login_id -> {master_fd, pid, url, created, done}
 _CC_LOGIN_LOCK = threading.Lock()
 _CC_LOGIN_TTL = 900.0
-# OSC 8 hyperlink 的 URI:ESC ] 8 ; params ; <URI> (ESC\ 或 BEL)
-_OSC8_URI_RE = re.compile(r"\x1b\]8;[^;]*;([^\x1b\x07]+)(?:\x1b\\|\x07)")
-_CC_OAUTH_RE = re.compile(r"https://claude\.com/cai/oauth/authorize\S+")
-# `claude setup-token` **印** token 到終端機、**不存檔**(官方 auth 文件明寫:
-# "It does not save the token anywhere; copy it and set it as the
-# CLAUDE_CODE_OAUTH_TOKEN environment variable")。所以 finish 貼完 code 後必須
-# 從 PTY 輸出把這把 token 撈出來自己存,否則 `claude -p` 永遠 Not logged in
-# —— 這正是 2026-10-31「exit 0 卻沒登入」的根因。token 形狀 `sk-ant-oat01-…`。
-_CC_OAUTH_TOKEN_RE = re.compile(r"sk-ant-oat[0-9A-Za-z]{0,4}-[A-Za-z0-9_-]{20,}")
-_CC_OAUTH_TOKEN_FALLBACK_RE = re.compile(r"sk-ant-[A-Za-z0-9_-]{30,}")
+# 註:2026-10-31 改用 OAuth PKCE 直連後,原本刮 setup-token TUI 的那整套
+# (OSC8/OAuth-URL/token regex + pyte/OSC52/ANSI 還原 _cc_token_from_pty_bytes)
+# 全數移除 —— 那條路被 Ink 重繪打散、撈到的 token API 一律 401,試遍 ANSI/pyte/
+# OSC52 都不行。正解是 bridge 自己做 PKCE 交換(見下方 start/finish)。
 
 
 def _cc_login_reap_locked(now: float) -> None:
+    # OAuth 直連後 entry 只是記憶體裡的 {verifier,state,created},過期直接丟,
+    # 沒有 PTY/行程要收(舊版的 _cc_login_kill 已拿掉)。
     for lid in [k for k, v in _CC_LOGIN.items()
                 if now - v["created"] > _CC_LOGIN_TTL]:
-        v = _CC_LOGIN.pop(lid, None)
-        if v:
-            _cc_login_kill(v)
+        _CC_LOGIN.pop(lid, None)
 
 
-def _cc_login_kill(entry: dict) -> None:
-    try:
-        os.close(entry["master_fd"])
-    except OSError:
-        pass
-    try:
-        os.kill(entry["pid"], 9)
-        os.waitpid(entry["pid"], 0)
-    except (ProcessLookupError, ChildProcessError, OSError):
-        pass
+# ── OAuth PKCE 直連(2026-10-31 改寫)──────────────────────────────────────
+#
+# **不再刮 setup-token 的 TUI。** setup-token 內部做的就是標準 OAuth PKCE:
+# 拿授權 code 去 token 端點換 token。所以 bridge **自己**做這件事 —— 自己產
+# code_verifier/challenge、自己組授權 URL、拿 code 直接 POST 換,token 以乾淨
+# JSON 回來。消滅 PTY/pyte/ANSI/OSC52/tmux 整堆脆弱環節(全被 TUI 重繪打散 →
+# API 401 的那一堆嘗試)。UX 不變:開網頁授權、把 code 貼回。
+# 端點與格式來源:社群逆向(platform.claude.com/v1/oauth/token,form-urlencoded)
+# + 實機觀察 setup-token 產的授權 URL(claude.com/cai/oauth/authorize,
+# scope=user:inference → 一年期 access token,prefix sk-ant-oat01-)。
+_CC_OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+_CC_OAUTH_AUTHORIZE = "https://claude.com/cai/oauth/authorize"
+_CC_OAUTH_TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
+_CC_OAUTH_REDIRECT = "https://platform.claude.com/oauth/code/callback"
+_CC_OAUTH_SCOPE = "user:inference"
 
 
 @app.post("/app/v1/agents/claude/login/start")
 async def app_claude_login_start(request: Request):
-    """啟動 CC setup-token,回授權 URL。行程留在 PTY 裡等 code。"""
+    """產 PKCE + 組授權 URL 回去。verifier/state 留在記憶體等 finish 換 token。"""
     if not POCKET_AGENT_LOGIN_IN_APP:
         raise HTTPException(status_code=404, detail="not found")
     _check_auth(request)
@@ -30285,65 +30284,22 @@ async def app_claude_login_start(request: Request):
                        "遠端控制台不能設定帳號憑證,請用已配對的手機")
     if not os.path.exists(CLAUDE_BIN):
         raise http_err(503, "CLAUDE_MISSING", "這台主機沒有安裝 Claude Code")
-
-    def _spawn_and_read() -> tuple[int, int, str | None]:
-        """在偽 TTY 裡起 setup-token,讀到 URL 為止。回 (master_fd, pid, url)。"""
-        pid, master_fd = pty.fork()
-        if pid == 0:                      # 子行程
-            try:
-                os.execv(CLAUDE_BIN, [CLAUDE_BIN, "setup-token"])
-            except Exception:
-                os._exit(127)
-        # 父行程:設寬視窗(cols=400)讓 URL 不折行
-        try:
-            fcntl.ioctl(master_fd, termios.TIOCSWINSZ,
-                        struct.pack("HHHH", 50, 400, 0, 0))
-        except (OSError, ValueError):
-            pass
-        buf = b""
-        deadline = time.time() + 20
-        url = None
-        while time.time() < deadline and url is None:
-            r, _, _ = select.select([master_fd], [], [], 2)
-            if not r:
-                continue
-            try:
-                chunk = os.read(master_fd, 4096)
-            except OSError:
-                break
-            if not chunk:
-                break
-            buf += chunk
-            text = buf.decode("utf-8", "ignore")
-            # 先試 OSC 8 精確邊界(最可靠),退而求其次用純文字 regex
-            m = _OSC8_URI_RE.search(text)
-            if m and m.group(1).startswith("https://claude.com/cai/oauth"):
-                url = m.group(1)
-            else:
-                m2 = _CC_OAUTH_RE.search(re.sub(r"\x1b\][0-9];[^\x1b\x07]*(?:\x1b\\|\x07)", "", text))
-                # 純文字退路:切到 state 值結束(base64url),去掉後面黏的重複
-                if m2:
-                    cand = m2.group(0)
-                    sm = re.match(r"(https://claude\.com/cai/oauth/authorize\?.*?&state=[A-Za-z0-9_-]{20,64})", cand)
-                    if sm:
-                        url = sm.group(1)
-        return master_fd, pid, url
-
-    try:
-        master_fd, pid, url = await asyncio.to_thread(_spawn_and_read)
-    except Exception as e:  # noqa: BLE001
-        _log_exc("claude_login_spawn", e, expected=False)
-        raise http_err(503, "CLAUDE_SPAWN_FAILED", "啟動 Claude 登入失敗")
-    if url is None:
-        _cc_login_kill({"master_fd": master_fd, "pid": pid})
-        raise http_err(502, "CLAUDE_LOGIN_NO_URL", "沒能從 Claude 取得登入連結")
+    # PKCE S256
+    verifier = secrets.token_urlsafe(48)
+    challenge = base64.urlsafe_b64encode(
+        hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
+    state = secrets.token_urlsafe(24)
+    url = _CC_OAUTH_AUTHORIZE + "?" + urllib.parse.urlencode({
+        "code": "true", "client_id": _CC_OAUTH_CLIENT_ID,
+        "response_type": "code", "redirect_uri": _CC_OAUTH_REDIRECT,
+        "scope": _CC_OAUTH_SCOPE, "code_challenge": challenge,
+        "code_challenge_method": "S256", "state": state})
     lid = secrets.token_urlsafe(18)
     now = time.time()
     with _CC_LOGIN_LOCK:
         _cc_login_reap_locked(now)
-        _CC_LOGIN[lid] = {"master_fd": master_fd, "pid": pid, "url": url,
-                          "created": now, "done": None}
-    _log_event("claude_login_started")   # 不記 url
+        _CC_LOGIN[lid] = {"verifier": verifier, "state": state, "created": now}
+    _log_event("claude_login_started")   # 不記 url/verifier/state
     return {"ok": True, "provider": "claude", "mode": "manual_code",
             "login_id": lid, "url": url, "user_code": None}
 
@@ -30392,104 +30348,69 @@ def _claude_persist_oauth_token(token: str) -> None:
 
 @app.post("/app/v1/agents/claude/login/finish")
 async def app_claude_login_finish(request: Request):
-    """把使用者從 Anthropic 頁面複製的 code 貼進 PTY,完成登入。"""
+    """拿使用者貼回的 code 直接 POST token 端點換 token,存起來。"""
     if not POCKET_AGENT_LOGIN_IN_APP:
         raise HTTPException(status_code=404, detail="not found")
     _check_auth(request)
     body = await _json_body(request)
     lid = str(body.get("login_id") or "")
-    code = str(body.get("code") or "").strip()
-    # **整串 `code#state` 原樣送回,不要切掉 `#`。** 2026-10-31 實機(claude
-    # 2.1.309,tmux 直接觀察 setup-token):只送 `#` 前段 → "OAuth error:
-    # Invalid code. Please make sure the full code was copied";送完整
-    # `code#state` 才過。`#` 後面是 OAuth state,setup-token 要靠它比對(CSRF),
-    # 不是可丟的網址 fragment。
-    # 之前這裡反過來切掉 `#`(理由寫「保留原樣會驗證失敗」)—— 那是沒在真機
-    # 上驗過的錯誤推論,正是它讓每一次 app 內 CC 登入都失敗(紅線第 5 條)。
-    if not code:
+    raw = str(body.get("code") or "").strip()
+    if not raw:
         raise http_err(400, "MISSING_CODE", "請貼上授權碼")
+    # 使用者多半把整串 `code#state` 貼回(Anthropic 回呼頁就是這樣給的)。
+    # 直連交換要的是 `#` 前的 code;`#` 後的 state 拿來跟我方產的比對(CSRF)。
+    code, _, pasted_state = raw.partition("#")
+    code = code.strip()
     with _CC_LOGIN_LOCK:
         _cc_login_reap_locked(time.time())
-        entry = _CC_LOGIN.get(lid)
+        entry = _CC_LOGIN.pop(lid, None)   # 單次:換過就作廢
     if entry is None:
         raise http_err(410, "LOGIN_EXPIRED", "這次登入已過期,請重新開始")
+    if pasted_state and pasted_state.strip() != entry["state"]:
+        raise http_err(400, "STATE_MISMATCH", "授權碼的識別碼對不上,請重新開始")
 
-    def _submit_and_wait() -> tuple[bool, str | None]:
-        """回 (exit_ok, token)。token = 從 PTY 輸出撈到的 CLAUDE_CODE_OAUTH_TOKEN
-        (setup-token 貼完 code 後**印**出來的那把),撈不到回 None。"""
-        fd = entry["master_fd"]
-        try:
-            # bracketed paste 包起來(TUI 用 [?2004h 開了 bracketed paste mode)
-            os.write(fd, b"\x1b[200~" + code.encode() + b"\x1b[201~\r")
-        except OSError:
-            return False, None
-        # 等行程退出(授權成功會**印** token 然後結束)。全程累積輸出,退出後
-        # 撈 token —— 不能丟,丟了就等於沒登入(見 _CC_OAUTH_TOKEN_RE 的註解)。
-        buf = b""
-        deadline = time.time() + 30
-        exit_ok = False
-        while time.time() < deadline:
-            # 先排空輸出(免得 PTY buffer 塞住子行程),再判退出 —— 順序要緊:
-            # 子行程印完 token 才 exit,先讀才不會漏掉最後那段。
-            r, _, _ = select.select([fd], [], [], 0.5)
-            if r:
-                try:
-                    chunk = os.read(fd, 4096)
-                    if chunk:
-                        buf += chunk[:1 << 20] if len(buf) < (1 << 20) else b""
-                except OSError:
-                    pass
-            try:
-                wpid, status = os.waitpid(entry["pid"], os.WNOHANG)
-            except (ChildProcessError, OSError):
-                exit_ok = True        # 已被收掉,視為完成
-                break
-            if wpid != 0:
-                exit_ok = os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
-                # 行程退出後再把殘餘輸出排乾(token 常在最後一口)
-                for _ in range(8):
-                    r2, _, _ = select.select([fd], [], [], 0.2)
-                    if not r2:
-                        break
-                    try:
-                        c2 = os.read(fd, 4096)
-                    except OSError:
-                        break
-                    if not c2:
-                        break
-                    buf += c2
-                break
-        text = buf.decode("utf-8", "ignore")
-        m = _CC_OAUTH_TOKEN_RE.search(text) or _CC_OAUTH_TOKEN_FALLBACK_RE.search(text)
-        return exit_ok, (m.group(0) if m else None)
-
-    ok, token = await asyncio.to_thread(_submit_and_wait)
-    with _CC_LOGIN_LOCK:
-        e = _CC_LOGIN.pop(lid, None)
-    if e:
-        try:
-            os.close(e["master_fd"])
-        except OSError:
-            pass
-    # 撈到 token 就**自己存**(setup-token 不存),否則 `claude -p` 認不得這把。
-    # 存進 ~/.claude/settings.json 的 env 區塊(官方認證來源 #5,每個 claude 行程
-    # 開場自己重讀,與 bridge 怎麼 spawn 無關)+ 當場塞進 os.environ 讓即時探測
-    # 也看得到。**token 絕不進 log。**
-    if token:
-        try:
-            await asyncio.to_thread(_claude_persist_oauth_token, token)
-            os.environ["CLAUDE_CODE_OAUTH_TOKEN"] = token
-        except Exception as _e:  # noqa: BLE001
-            _log_exc("claude_token_persist", _e, expected=False)
-    # **exit 0 不等於登入成功。** 2026-10-31 實機:行程 exit 0、端點回
-    # logged_in:true,但 `claude -p` 仍 Not logged in —— 假成功(當時正是沒存
-    # token)。所以行程退出後**實際探一次登入狀態**才算數,不信 exit code。
+    # 直接 POST token 端點(form-urlencoded)。token 以乾淨 JSON 回來,
+    # 不經任何 TUI。**token/refresh 絕不進 log。**
+    import httpx   # lazy,同 bridge 其他地方的慣例
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(
+                _CC_OAUTH_TOKEN_URL,
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+                content=urllib.parse.urlencode({
+                    "grant_type": "authorization_code",
+                    "code": code,
+                    "redirect_uri": _CC_OAUTH_REDIRECT,
+                    "client_id": _CC_OAUTH_CLIENT_ID,
+                    "code_verifier": entry["verifier"],
+                    "state": entry["state"],
+                }))
+    except Exception as _e:  # noqa: BLE001
+        _log_exc("claude_oauth_exchange", _e, expected=False)
+        raise http_err(502, "CLAUDE_LOGIN_FAILED", "連 Anthropic 換 token 失敗,請重試")
+    if resp.status_code != 200:
+        _log_event("claude_login_exchange_failed", status=resp.status_code)
+        raise http_err(502, "CLAUDE_LOGIN_FAILED",
+                       "授權碼無效或已過期,請重新開始(換 token 被拒)")
+    try:
+        token = str((resp.json() or {}).get("access_token") or "")
+    except Exception:  # noqa: BLE001
+        token = ""
+    if not token:
+        _log_event("claude_login_no_access_token")
+        raise http_err(502, "CLAUDE_LOGIN_FAILED", "換回來的回應沒有 token,請重試")
+    try:
+        await asyncio.to_thread(_claude_persist_oauth_token, token)
+        os.environ["CLAUDE_CODE_OAUTH_TOKEN"] = token
+    except Exception as _e:  # noqa: BLE001
+        _log_exc("claude_token_persist", _e, expected=False)
+        raise http_err(500, "CLAUDE_LOGIN_FAILED", "token 存檔失敗")
+    # 仍實際探一次(不信「存了就等於好」—— 紅線第 5 條)。
     really = await _agent_claude_logged_in()
-    _log_event("claude_login_finished", ok=ok, token_captured=bool(token),
-               logged_in=really)
+    _log_event("claude_login_finished", token_saved=True, logged_in=really)
     if not really:
         raise http_err(502, "CLAUDE_LOGIN_FAILED",
-                       "登入沒完成 —— 授權碼可能貼錯、含多餘字元,或已過期,請重新開始")
+                       "token 換到了但 claude 仍未登入,請重試或回報")
     _AGENT_AUTH_CACHE["data"] = None   # 清快取,讓下次探測立刻看到已登入
     return {"ok": True, "provider": "claude", "logged_in": True}
 
