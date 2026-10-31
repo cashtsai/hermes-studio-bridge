@@ -1,0 +1,117 @@
+#cloud-config
+# Pocket 龍蝦 —— Vultr cloud-init 自助佈建（2026-10-31）
+#
+# ## 怎麼用
+#
+# 在 Vultr Console 建機時，「Additional Features」勾 **Enable Cloud-Init
+# User-Data**，把這整份貼進去。開機後它自己裝完。
+#
+# 建議規格：**2 vCPU / 4 GB**（Claude Code 官方需求是 4 GB+ RAM）。
+# 1 GB 的 $5 方案裝得起來，但跑 CC 會 OOM —— 那台只適合驗安裝流程。
+#
+# ## 為什麼是 cloud-init，不是「給我們 SSH」
+#
+# BYO 方案的整個重點是**那台機器是使用者的**。要他交出 SSH key，我們就又
+# 變成他機器的保管人 —— 那正是 BYO 想避開的事。cloud-init 讓他**什麼都不用
+# 交給我們**：貼一段文字，開機自己裝完，我們連他的 IP 都不需要知道。
+#
+# ## 裝完怎麼配對
+#
+# 安裝器會把配對連結寫進 `/home/pocket/pocket-pair-link.txt`（0600）。
+# 用 **Vultr 的網頁 Console**（不需要 SSH key）跑：
+#
+#     sudo cat /home/pocket/pocket-pair-link.txt
+#
+# 把那條連結傳到手機點開即配對（30 分鐘有效）。過期就重跑：
+#
+#     sudo -u pocket -i bash -lc 'cd ~/pocket-bridge && deploy/install-ubuntu.sh'
+#
+# ## 它裝了什麼
+#
+# bridge + tmux + Claude Code + Codex(+daemon) + OpenClaw + cloudflared 通道
+# + 桌面控制台（含 QR 登入）。**沒有碰任何憑證** —— agent 的登入要你自己
+# 在 Pocket 的內建終端機裡跑 `claude` / `codex` 完成。
+
+package_update: true
+packages:
+  - git
+  - curl
+  - tmux
+  - python3
+  - python3-venv
+  - rsync
+  - gnupg
+
+users:
+  # 刻意**不以 root 跑服務**。install-ubuntu.sh 是 per-user 設計
+  # （`systemctl --user` + `loginctl enable-linger`），那在 root 底下語意不對：
+  # root 沒有 user session，linger 對它沒有意義。所以建一個一般使用者。
+  - name: pocket
+    gecos: Pocket lobster
+    shell: /bin/bash
+    sudo: ['ALL=(ALL) NOPASSWD:ALL']   # 安裝器需要 sudo 補 apt 套件與 Claude Code 的 apt repo
+    lock_passwd: true                  # 不給密碼登入；要進去走 Vultr Console 或自己加 key
+
+write_files:
+  - path: /usr/local/bin/pocket-lobster-setup.sh
+    permissions: '0755'
+    owner: root:root
+    content: |
+      #!/usr/bin/env bash
+      # 以 pocket 身分跑官方安裝器。cloud-init 只呼叫這支，邏輯都在這裡 ——
+      # 失敗時好重跑，不必重建整台機器。
+      set -uo pipefail
+      REPO="${POCKET_BRIDGE_REPO:-https://github.com/cashtsai/hermes-studio-bridge.git}"
+      SRC="$HOME/pocket-bridge"
+      log() { printf '\n==> %s\n' "$*"; }
+
+      log "取得 bridge 原始碼"
+      if [ -d "$SRC/.git" ]; then
+        git -C "$SRC" pull --ff-only || true
+      else
+        git clone --depth 1 "$REPO" "$SRC" || { echo "✗ clone 失敗"; exit 1; }
+      fi
+
+      log "跑官方安裝器"
+      # 旗標全部走安裝器自己的預設（CC/Codex/OpenClaw/console/QR 登入都開，
+      # Hermes 關）。要改就在這裡加 env，不要去改安裝器。
+      #
+      # 刻意**不設** POCKET_CONSOLE_REMOTE_FILE_ROOTS：遠端控制台的檔案面
+      # 預設一個都不開。要開放哪個工作目錄，是這台機器的主人自己的決定。
+      cd "$SRC" || exit 1
+      chmod +x deploy/install-ubuntu.sh
+      deploy/install-ubuntu.sh
+      rc=$?
+
+      log "結果"
+      if [ -s "$HOME/pocket-pair-link.txt" ]; then
+        echo "✅ 配對連結已寫入 $HOME/pocket-pair-link.txt"
+      else
+        echo "⚠️ 沒有產生配對連結 —— 安裝可能沒跑完，看上面的輸出。"
+      fi
+      exit "$rc"
+
+runcmd:
+  # 以 pocket 身分跑（`-i` = login shell，讓 XDG / systemd --user 的環境正確）。
+  - [ bash, -lc, "sudo -u pocket -i /usr/local/bin/pocket-lobster-setup.sh" ]
+  # linger：沒有它，pocket 一登出 systemd --user 的服務就全停。
+  # 安裝器自己會試一次（可能因為權限失敗），這裡以 root 再補一次，確保成立。
+  - [ bash, -lc, "loginctl enable-linger pocket" ]
+  # 把配對連結也抄一份到 root 看得到的地方 —— Vultr 網頁 Console 預設是 root，
+  # 少一次 sudo 就少一個卡住使用者的地方。
+  - [ bash, -lc, "install -m 0600 /home/pocket/pocket-pair-link.txt /root/pocket-pair-link.txt 2>/dev/null || true" ]
+
+final_message: |
+  Pocket 龍蝦安裝完成（耗時 $UPTIME 秒）。
+
+  配對：在這台機器上執行
+      cat /root/pocket-pair-link.txt
+  把那條連結傳到手機點開（30 分鐘有效）。
+
+  沒有連結或安裝失敗，看：
+      cat /var/log/cloud-init-output.log
+  重跑：
+      sudo -u pocket -i /usr/local/bin/pocket-lobster-setup.sh
+
+  配對完成後，在 Pocket 的終端機頁籤裡跑 `claude` / `codex` 登入你自己的帳號。
+  我們不經手任何憑證。
