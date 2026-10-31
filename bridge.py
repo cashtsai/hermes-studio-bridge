@@ -24279,6 +24279,27 @@ GEMINI.on_update = _gm_on_update
 GEMINI.on_request = _gm_on_request
 
 
+def _gm_turn_end_push(key: str, digest, summary: str, ok: bool) -> None:
+    """Gemini 回合收尾 → 沒人在看就推播(對齊 cc/cx/cc2;C12 缺口)。
+
+    「沒人在看」= 這條對話的卡片流**沒有活著的 SSE 訂閱者**(store._wakers
+    空)。開著對話的人本來就看得到結果,再推一則只是吵;背景跑完不推,
+    那個回合就安靜蒸發 —— cc 的 `_cc_turn_end_push` 同一個判準,只是它的
+    訂閱數由 follower 迴圈傳入,這裡直接看 wakers。
+
+    失敗也推(ok=False → ⚠️):背景掛掉而使用者不知道,比成功不通知更糟。
+    整段 fail-safe —— 推播壞了不准影響回合收尾。
+    """
+    try:
+        if getattr(digest.store, "_wakers", None):
+            return                      # 有人開著對話在看,不吵
+        row = gemini_provider.get_session(key) or {}
+        display = (row.get("title") or "").strip() or f"Gemini {key[:8]}"
+        _turn_end_push(f"gemini:{key}", display, summary, ok=ok)
+    except Exception as exc:            # noqa: BLE001
+        _log_exc("gm_turn_end_push", exc, expected=True)
+
+
 async def _gm_run_turn(key: str, content: str,
                        blocks: list | None = None) -> None:
     d = await _gm_card_digest(key)
@@ -24305,6 +24326,7 @@ async def _gm_run_turn(key: str, content: str,
         _log_event("gemini_turn_end", session=key[:32],
                    stop=str((res or {}).get("stopReason") or ""),
                    chars=len(full))
+        _gm_turn_end_push(key, d, full, ok=True)
     except Exception as e:  # noqa: BLE001
         partial = _GM_TURNS.get(acp_sid, {}).get("text", "") if acp_sid else ""
         try:
@@ -24314,6 +24336,9 @@ async def _gm_run_turn(key: str, content: str,
         _log_event("gemini_turn_failed", session=key[:32],
                    error=type(e).__name__, error_message=str(e)[:160],
                    kind=_gemini_failure_kind(e))
+        # 失敗也要推(ok=False → ⚠️ 標題):背景跑掛掉而使用者不知道,
+        # 等於那個回合安靜蒸發 —— 比成功不通知更糟。
+        _gm_turn_end_push(key, d, _gemini_failure_text(e), ok=False)
     finally:
         if acp_sid:
             _GM_TURNS.pop(acp_sid, None)
@@ -24438,9 +24463,15 @@ async def _gm_input_run(key: str, session_id: str, body: dict,
     #     這比丟掉有用得多(與 codex 的 note_paths 同精神)
     blocks: list = []
     note_paths: list = []
+    voice_lines: list = []
     att_meta: list = []          # 給卡片流用(與 hermes 的 att_meta 同形狀)
     if attachments:
         _att_guard(attachments)
+        # C10(2026-10-31 盤點):app 對 Gemini 一樣送 stt_lang,但這個分支
+        # 原本不讀 —— 語音附件只會變成一行「[附件:/path/to.m4a]」。CC/cc2/CX
+        # 都會 _transcribe;gemini CLI 又不吃音檔,所以**不轉寫等於語音輸入
+        # 在 Gemini 上整個沒用**。照 cc2 分支同一套。
+        stt_lang = str(body.get("stt_lang") or "").strip()
         for a in attachments:
             path = _save_attachment(a, (a or {}).get("filename") or "file")
             if not path:
@@ -24449,7 +24480,15 @@ async def _gm_input_run(key: str, session_id: str, body: dict,
                              "filename": (a or {}).get("filename"),
                              "mime": (a or {}).get("mime"),
                              "path": path})
-            if (a or {}).get("kind") == "image":
+            if (a or {}).get("kind") == "audio":
+                t = await asyncio.to_thread(_transcribe, path, "", stt_lang)
+                if t:
+                    voice_lines.append(t)
+                else:
+                    # 轉寫失敗退回路徑 —— 至少看得出「有一個音檔沒被聽懂」,
+                    # 不要安靜吃掉。
+                    note_paths.append(path)
+            elif (a or {}).get("kind") == "image":
                 mime = (a.get("mime") or mimetypes.guess_type(path)[0]
                         or "image/png")
                 try:
@@ -24461,10 +24500,14 @@ async def _gm_input_run(key: str, session_id: str, body: dict,
                     note_paths.append(path)
             else:
                 note_paths.append(path)
+        if voice_lines:
+            # 語音在前、打字在後(與 cc2 同序:說的話是主體,文字框常是補充)。
+            content = "\n".join(voice_lines + ([content] if content else [])).strip()
         if note_paths:
             content = (content + "\n\n[附件:" + " ".join(note_paths) + "]").strip()
         _log_event("gemini_attachments", session=key[:32],
-                   images=len(blocks), paths=len(note_paths))
+                   images=len(blocks), paths=len(note_paths),
+                   voice=len(voice_lines))
     if not content and not blocks:
         raise http_err(400, "EMPTY_CONTENT", "content required")
     if _gm_busy(key):
@@ -30747,7 +30790,11 @@ async def app_claude_login_start(request: Request):
         if pid == 0:                      # 子行程
             try:
                 os.execv(CLAUDE_BIN, [CLAUDE_BIN, "setup-token"])
-            except Exception:
+            except OSError:
+                # fork 出來的子行程**不能**呼叫 _log_exc —— 會把父行程的日誌
+                # 緩衝再 flush 一次(同一行出現兩遍)。exit code 127 就是留痕:
+                # 父行程讀到 127 = exec 失敗(慣例同 shell)。收窄成 OSError
+                # 讓健壯性護欄知道這裡是刻意的,不是吞錯。
                 os._exit(127)
         # 父行程:設寬視窗(cols=400)讓 URL 不折行
         try:
