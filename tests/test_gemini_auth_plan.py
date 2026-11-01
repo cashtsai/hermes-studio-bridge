@@ -94,5 +94,41 @@ class AuthPlanTest(unittest.TestCase):
             self.assertEqual(gp.load_config()["auth"], "auto")
 
 
+class BackendSwitchTest(unittest.TestCase):
+    """ACP 後端切換(gemini→antigravity)—— gemini CLI 個人 OAuth 被 Google 封,
+    Antigravity 接手免費/訂閱。結構接縫:預設不變,env 切後端。"""
+
+    def test_default_backend_is_gemini(self):
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("POCKET_GEMINI_BACKEND", None)
+            self.assertEqual(gp.acp_backend(), "gemini")
+
+    def test_unknown_backend_falls_back_to_gemini(self):
+        """亂填的後端名不得讓 provider 用一個不存在的表 → 退回 gemini。"""
+        with patch.dict(os.environ, {"POCKET_GEMINI_BACKEND": "typo"}):
+            self.assertEqual(gp.acp_backend(), "gemini")
+
+    def test_switch_to_antigravity(self):
+        with patch.dict(os.environ, {"POCKET_GEMINI_BACKEND": "antigravity"}):
+            self.assertEqual(gp.acp_backend(), "antigravity")
+
+    def test_auth_plan_uses_backend_specific_ids(self):
+        """切後端後,auth_plan 回的 methodId 要是**那個後端的**字串。
+        寫死 gemini 的 'oauth-personal' 會讓 antigravity 握手拿錯 id。"""
+        with patch.dict(os.environ, {"POCKET_GEMINI_BACKEND": "antigravity"}):
+            plan = gp.auth_plan(_cfg(key="k"), oauth=True)
+            # 目前是 PLACEHOLDER(待 SG 龍蝦實測填),但一定**不是** gemini 的字串。
+            self.assertNotIn("oauth-personal", plan)
+            self.assertNotIn("gemini-api-key", plan)
+            self.assertEqual(len(plan), 2, "oauth + key 兩條都在,只是 id 換了")
+
+    def test_gemini_backend_ids_unchanged(self):
+        """預設後端的 id 一字不變 —— 現狀零回歸。"""
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("POCKET_GEMINI_BACKEND", None)
+            self.assertEqual(gp.auth_plan(_cfg(key="k"), oauth=True),
+                             ["oauth-personal", "gemini-api-key"])
+
+
 if __name__ == "__main__":
     unittest.main()

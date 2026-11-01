@@ -122,17 +122,22 @@ def auth_plan(cfg: dict, oauth: bool) -> list[str]:
 
     回傳空清單 = 什麼都沒有,呼叫端回 NOT_CONFIGURED。
     """
+    # method id 由**當前後端**決定(gemini vs antigravity 的字串不同)——
+    # auth_plan 回的是「要依序試的 methodId」,所以要用後端表的對照,
+    # 不能寫死 gemini 的字串(否則切 antigravity 後握手會拿錯 id)。
+    ids = backend_spec()["auth_ids"]
     mode = str(cfg.get("auth") or "auto")
     has_key = bool(cfg.get("api_key"))
+    oauth_id, key_id = ids["oauth"], ids["api-key"]
     if mode == "oauth":
-        return ["oauth-personal"] if oauth else []
+        return [oauth_id] if oauth else []
     if mode == "api-key":
-        return ["gemini-api-key"] if has_key else []
+        return [key_id] if has_key else []
     plan = []
     if oauth:
-        plan.append("oauth-personal")
+        plan.append(oauth_id)
     if has_key:
-        plan.append("gemini-api-key")
+        plan.append(key_id)
     return plan
 
 
@@ -165,6 +170,48 @@ def save_config(api_key: str | None = None, model: str | None = None,
 
 def gemini_bin() -> str:
     return os.environ.get("GEMINI_BIN", "gemini")
+
+
+# ── ACP 後端選擇(2026-11-01:gemini CLI 個人 OAuth 被 Google 封,Antigravity
+#    接手免費/訂閱額度;見 docs/GEMINI_AUTH_DECISION_20261101.md)────────────
+#
+# 兩個後端握手形狀相同(都是 initialize→authenticate→session/new→session/prompt
+# 的 ACP),差別只在:啟動指令、authMethods 的 id 字串、模型參數旗標。所以用
+# **資料驅動的 backend 表**,不 fork provider —— 龍蝦實測後把 Antigravity 的
+# 細節填進表即可,client 邏輯(on_update/核准/排隊/逐字稿)一行不改。
+#
+# ⚠️ Antigravity 那欄的 authMethods id 與 model 旗標目前是**待實測佔位**
+# (標 PLACEHOLDER)—— SG 龍蝦上錄下 ACP initialize 的實際 authMethods 後填。
+# 預設後端仍是 gemini(現狀零變化);POCKET_GEMINI_BACKEND=antigravity 才切。
+_ACP_BACKENDS = {
+    "gemini": {
+        "argv": lambda: [gemini_bin(), "--acp"],
+        "model_flag": "-m",                      # gemini --acp -m <model>
+        # CLI 0.63 實測的 authMethods id。
+        "auth_ids": {"oauth": "oauth-personal", "api-key": "gemini-api-key"},
+        "env_key": "GEMINI_API_KEY",
+    },
+    "antigravity": {
+        # agy-agent-acp 是 npm 轉接器,內部 spawn 已登入的 `agy`
+        # (前提:agy 已 `agy auth login`)。可用 POCKET_ANTIGRAVITY_ACP_CMD 覆寫。
+        "argv": lambda: (os.environ.get("POCKET_ANTIGRAVITY_ACP_CMD",
+                                        "agy-agent-acp").split()),
+        "model_flag": None,                      # PLACEHOLDER:待實測
+        "auth_ids": {"oauth": "PLACEHOLDER_personal_google",   # 待龍蝦實測填
+                     "api-key": "PLACEHOLDER_api_key"},
+        "env_key": "GEMINI_API_KEY",
+    },
+}
+
+
+def acp_backend() -> str:
+    """當前 ACP 後端。預設 gemini(現狀);env 切 antigravity。"""
+    b = os.environ.get("POCKET_GEMINI_BACKEND", "gemini").strip()
+    return b if b in _ACP_BACKENDS else "gemini"
+
+
+def backend_spec() -> dict:
+    return _ACP_BACKENDS[acp_backend()]
 
 
 # ── session 名錄(ACP 沒有 list,自己記)──────────────────────────────────
@@ -371,11 +418,14 @@ class GeminiClient:
             if not plan:
                 raise GeminiError("gemini not configured", code="NOT_CONFIGURED")
             self._auth_plan = plan
+            spec = backend_spec()
+            key_id = spec["auth_ids"]["api-key"]
             env = dict(os.environ)
             # 只有計畫裡真的會用到 API key 才塞 env —— OAuth-only 的行程不帶
             # key(帶了沒壞處但會讓「到底用哪個身分」更難查)。
-            if "gemini-api-key" in plan and cfg["api_key"]:
-                env["GEMINI_API_KEY"] = cfg["api_key"]
+            # env_key 由後端決定(兩家目前都用 GEMINI_API_KEY,但不寫死)。
+            if key_id in plan and cfg["api_key"]:
+                env[spec["env_key"]] = cfg["api_key"]
             env.setdefault("GEMINI_CLI_TRUST_WORKSPACE", "true")
             # CLI 會自我重啟一次(再 spawn 一個 node 並配「實體記憶體一半」的
             # old-space;本機 128GB → 64GB)。實測 gemini --version:原樣 ~4.2s、
@@ -397,12 +447,14 @@ class GeminiClient:
                     stderr_to = open(errlog, "ab")
                 except OSError:
                     stderr_to = asyncio.subprocess.DEVNULL
-            argv = [gemini_bin(), "--acp"]
+            spec = backend_spec()
+            argv = list(spec["argv"]())
             # 每次 spawn 重讀 —— 設定面板改完會 _drop_proc(),下一次握手就要
             # 吃到新模型。讀 module 常數的舊寫法改了也不會生效。
+            # model_flag=None 的後端(例:Antigravity 待實測)先不帶模型旗標。
             model = cfg.get("model") or ""
-            if model:
-                argv += ["-m", model]
+            if model and spec.get("model_flag"):
+                argv += [spec["model_flag"], model]
             try:
                 self.proc = await asyncio.create_subprocess_exec(
                     *argv,
