@@ -86,6 +86,10 @@ def load_config() -> dict:
     out = {"model": model,
            "model_source": ("env" if _MODEL_ENV
                             else "file" if file_model else "none")}
+    # auth 模式(2026-11-01 機主拍板「改成訂閱的」):
+    #   auto(預設)= 有 Google 登入就用它(訂閱/免費額度),沒有才退 API key
+    #   oauth / api-key = 強制指定(除錯或刻意分流用)
+    out["auth"] = str(d.get("auth") or "auto").strip() or "auto"
     key = (os.environ.get("GEMINI_API_KEY") or "").strip()
     if key:
         return {**out, "api_key": key, "source": "env"}
@@ -94,7 +98,46 @@ def load_config() -> dict:
             "source": "file" if d else "none"}
 
 
-def save_config(api_key: str | None = None, model: str | None = None) -> dict:
+#: gemini CLI 的 OAuth 憑證快取(`gemini` 互動模式「Log in with Google」後落檔)。
+_OAUTH_CREDS = os.path.expanduser("~/.gemini/oauth_creds.json")
+
+
+def oauth_available() -> bool:
+    """Mac 上有沒有可用的 Google 登入快取。
+
+    只看檔案存在 —— token 過期與否交給 CLI 自己 refresh(它本來就會),
+    這裡搶著判斷只會做出第二份會漂移的真相。"""
+    return os.path.isfile(_OAUTH_CREDS)
+
+
+def auth_plan(cfg: dict, oauth: bool) -> list[str]:
+    """這次握手要依序嘗試的 ACP methodId(實測自 CLI 0.63.0 的 authMethods:
+    oauth-personal / gemini-api-key / vertex-ai / gateway)。
+
+    ## 為什麼訂閱(OAuth)優先(2026-11-01 機主拍板)
+
+    「哪有那麼多人有 API key。」Google 登入**馬上就有免費額度**,訂閱
+    (AI Pro/Ultra)的額度也掛在這 —— 跟 CC/CX 的訂閱仔同一個模式。
+    API key 降為退路:有 key 沒登入的人照舊能用,一個都不踢。
+
+    回傳空清單 = 什麼都沒有,呼叫端回 NOT_CONFIGURED。
+    """
+    mode = str(cfg.get("auth") or "auto")
+    has_key = bool(cfg.get("api_key"))
+    if mode == "oauth":
+        return ["oauth-personal"] if oauth else []
+    if mode == "api-key":
+        return ["gemini-api-key"] if has_key else []
+    plan = []
+    if oauth:
+        plan.append("oauth-personal")
+    if has_key:
+        plan.append("gemini-api-key")
+    return plan
+
+
+def save_config(api_key: str | None = None, model: str | None = None,
+                auth: str | None = None) -> dict:
     """App「進階」頁/設定面板的手動配置落檔(0600)。env 有值時 env 仍優先。
 
     **合併寫入**:只帶 model 的呼叫不可以把 api_key 清掉,反之亦然。原本這支
@@ -105,6 +148,12 @@ def save_config(api_key: str | None = None, model: str | None = None) -> dict:
         d["api_key"] = api_key.strip()
     if model is not None:
         d["model"] = model.strip()
+    if auth is not None:
+        # 只收認得的值 —— 寫進去一個錯字會讓 auth_plan 回空清單,
+        # 整個 provider 安靜變成未配置。
+        v = auth.strip()
+        if v in ("auto", "oauth", "api-key"):
+            d["auth"] = v
     os.makedirs(os.path.dirname(_CONFIG_FILE), exist_ok=True)
     tmp = _CONFIG_FILE + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
@@ -297,10 +346,17 @@ class GeminiClient:
         self._loaded: set[str] = set()   # 本程序已 new/load 過的 ACP session
         self.on_update = None
         self.on_request = None
+        #: 這顆行程實際用的身分(oauth-personal / gemini-api-key;未連線="")。
+        #: /app/v1/gemini/config 回給 app 顯示「目前用 Google 帳號(訂閱)」用。
+        self.auth_used = ""
+        self._auth_plan: list = []
         self.server_info: dict = {}
 
     def configured(self) -> bool:
-        return bool(load_config()["api_key"])
+        # 「配置好了」= 至少一條認證路走得通(Google 登入或 API key)。
+        # 原本只認 api_key —— 那會讓「只登入了 Google」的使用者看到
+        # 「未配置」,而他明明已經有免費額度了。
+        return bool(auth_plan(load_config(), oauth_available()))
 
     # ── 子程序/握手 ──
 
@@ -311,10 +367,15 @@ class GeminiClient:
             if self.proc is not None and self.proc.returncode is None:
                 return
             cfg = load_config()
-            if not cfg["api_key"]:
+            plan = auth_plan(cfg, oauth_available())
+            if not plan:
                 raise GeminiError("gemini not configured", code="NOT_CONFIGURED")
+            self._auth_plan = plan
             env = dict(os.environ)
-            env["GEMINI_API_KEY"] = cfg["api_key"]
+            # 只有計畫裡真的會用到 API key 才塞 env —— OAuth-only 的行程不帶
+            # key(帶了沒壞處但會讓「到底用哪個身分」更難查)。
+            if "gemini-api-key" in plan and cfg["api_key"]:
+                env["GEMINI_API_KEY"] = cfg["api_key"]
             env.setdefault("GEMINI_CLI_TRUST_WORKSPACE", "true")
             # CLI 會自我重啟一次(再 spawn 一個 node 並配「實體記憶體一半」的
             # old-space;本機 128GB → 64GB)。實測 gemini --version:原樣 ~4.2s、
@@ -362,17 +423,36 @@ class GeminiClient:
                                                    "writeTextFile": False}}},
                     timeout=_SPAWN_TIMEOUT)
                 self.server_info = init or {}
-                await self._call_locked("authenticate",
-                                        {"methodId": "gemini-api-key"},
-                                        timeout=_SPAWN_TIMEOUT)
+                # 依 auth_plan 順序試(訂閱/免費額度的 oauth-personal 在前,
+                # API key 退路在後)。第一個成功的就是這顆行程的身分;
+                # 全部失敗才丟 —— 丟的是**最後一個**錯誤,但每次失敗都留痕,
+                # 查「為什麼走到 API key」時日誌說得出 OAuth 當時怎麼了。
+                auth_used = ""
+                last_exc: Exception | None = None
+                for method in self._auth_plan:
+                    try:
+                        await self._call_locked("authenticate",
+                                                {"methodId": method},
+                                                timeout=_SPAWN_TIMEOUT)
+                        auth_used = method
+                        break
+                    except Exception as exc:        # noqa: BLE001
+                        last_exc = exc
+                        self._log("gemini_auth_method_failed", method=method,
+                                  error=str(exc)[:160])
+                if not auth_used:
+                    raise last_exc or GeminiError("authenticate failed",
+                                                  code="AUTH_FAILED")
+                self.auth_used = auth_used
             except Exception:
                 await self._drop_proc()
                 raise
             self._log("gemini_connected",
                       protocol=(self.server_info or {}).get("protocolVersion"),
-                      # 用了哪個模型要留痕:查「很慢」時第一個要問的就是這個,
-                      # 而原本日誌完全看不出來(空=沿用 CLI 預設)。
-                      model=model or "(cli-default)")
+                      # 用了哪個模型/哪個身分要留痕:查「很慢」「額度怎麼算的」
+                      # 時第一個要問的就是這兩個。
+                      model=model or "(cli-default)",
+                      auth=auth_used)
 
     async def _drop_proc(self):
         proc, self.proc = self.proc, None

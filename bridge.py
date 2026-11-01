@@ -24680,6 +24680,14 @@ async def gemini_config_get(request: Request):
     cfg = gemini_provider.load_config()
     return {"configured": GEMINI.configured(), "source": cfg["source"],
             "key_set": bool(cfg["api_key"]),
+            # 認證(2026-11-01 訂閱優先):auth=模式(auto/oauth/api-key)、
+            # oauth_available=Mac 上有沒有 Google 登入快取、
+            # auth_used=跑著的行程實際用的身分(""=還沒連線)。
+            # app 據此顯示「已用 Google 帳號(訂閱/免費額度)」或引導登入,
+            # 不要再預設推人去生 API key —— 哪有那麼多人有 API key(機主原話)。
+            "auth": cfg["auth"],
+            "oauth_available": gemini_provider.oauth_available(),
+            "auth_used": GEMINI.auth_used,
             # 模型:空字串 = 沿用 CLI 預設。**全域**(是 CLI 的 spawn 參數,整個
             # provider 共用一個 ACP 行程)—— app 要照這個語意標示,不可做成
             # per-session 的樣子。`model_source == "env"` 時選擇器要唯讀:env
@@ -24699,11 +24707,13 @@ async def gemini_config_put(request: Request):
     body = await request.json()
     has_key = "api_key" in body
     has_model = "model" in body
-    if not has_key and not has_model:
-        raise http_err(400, "EMPTY", "api_key 與 model 至少要帶一個")
+    has_auth = "auth" in body
+    if not has_key and not has_model and not has_auth:
+        raise http_err(400, "EMPTY", "api_key / model / auth 至少要帶一個")
     cfg = gemini_provider.save_config(
         str(body.get("api_key") or "") if has_key else None,
-        str(body.get("model") or "") if has_model else None)
+        str(body.get("model") or "") if has_model else None,
+        str(body.get("auth") or "") if has_auth else None)
     # 模型是 spawn 參數,改了一定要重新握手才生效(同改 key 的路徑)。
     await GEMINI._drop_proc()
     _log_event("gemini_config_updated", configured=GEMINI.configured(),
