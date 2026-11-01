@@ -152,6 +152,14 @@ grep -q '^POCKET_CONSOLE_REMOTE_FILE_ROOTS=' "$ENV_FILE" || printf 'POCKET_CONSO
 # (CC setup-token / Codex device-auth / Gemini 貼 key)。旗標在 bridge.py 預設
 # 關(404),mac 版維持關(走桌面控制台);龍蝦這台一定要開,否則三個引擎都登不了。
 grep -q '^POCKET_AGENT_LOGIN_IN_APP=' "$ENV_FILE" || printf 'POCKET_AGENT_LOGIN_IN_APP=%s\n' "${POCKET_AGENT_LOGIN_IN_APP:-1}" >> "$ENV_FILE"
+# ── Pocket ID relay 自動報到(Pairing V3;2026-11-01 Pocket Cloud 代管用)──────
+# 代管流程:provisioner 開機時把這兩個值塞進 user_data → 這裡寫進 bridge.env →
+# bridge(`bridge.py` Pocket ID 段,env 閘 POCKET_ID_URL)開機就自動向 relay 報到,
+# App 從 /v1/hosts 看到新盒子自動連 —— 不用 console cat 配對連結。
+# **兩個都空 = 維持現行本地配對(pocket://pair + tunnel),零行為改變**(BYO/手動仍可用)。
+# 見 docs/POCKET_CLOUD_MANAGED_SPEC.md。
+grep -q '^POCKET_ID_URL=' "$ENV_FILE" || printf 'POCKET_ID_URL=%s\n' "${POCKET_ID_URL:-}" >> "$ENV_FILE"
+grep -q '^POCKET_ID_ENROLL_TOKEN=' "$ENV_FILE" || printf 'POCKET_ID_ENROLL_TOKEN=%s\n' "${POCKET_ID_ENROLL_TOKEN:-}" >> "$ENV_FILE"
 chmod 600 "$ENV_FILE"
 
 # ── 配對 boot code(既有就沿用;bridge 啟動也會自產,這裡先產好以便印連結) ──
