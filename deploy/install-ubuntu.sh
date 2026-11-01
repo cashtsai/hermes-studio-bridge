@@ -170,6 +170,14 @@ grep -q '^POCKET_AGENT_LOGIN_IN_APP=' "$ENV_FILE" || printf 'POCKET_AGENT_LOGIN_
 grep -q '^POCKET_GEMINI_BACKEND=' "$ENV_FILE" || printf 'POCKET_GEMINI_BACKEND=%s\n' "${POCKET_GEMINI_BACKEND:-antigravity}" >> "$ENV_FILE"
 # 中繼掛哪個區(SG=產品預設區;claim 時伺服器不認得的值會 400)。
 grep -q '^POCKET_RELAY_REGION=' "$ENV_FILE" || printf 'POCKET_RELAY_REGION=%s\n' "${POCKET_RELAY_REGION:-sg}" >> "$ENV_FILE"
+# ── Pocket ID relay 自動報到(Pairing V3;2026-11-01 Pocket Cloud 代管用)──────
+# 代管流程:provisioner 開機時把這兩個值塞進 user_data → 這裡寫進 bridge.env →
+# bridge(`bridge.py` Pocket ID 段,env 閘 POCKET_ID_URL)開機就自動向 relay 報到,
+# App 從 /v1/hosts 看到新盒子自動連 —— 不用 console cat 配對連結。
+# **兩個都空 = 維持現行本地配對(pocket://pair + tunnel),零行為改變**(BYO/手動仍可用)。
+# 見 docs/POCKET_CLOUD_MANAGED_SPEC.md。
+grep -q '^POCKET_ID_URL=' "$ENV_FILE" || printf 'POCKET_ID_URL=%s\n' "${POCKET_ID_URL:-}" >> "$ENV_FILE"
+grep -q '^POCKET_ID_ENROLL_TOKEN=' "$ENV_FILE" || printf 'POCKET_ID_ENROLL_TOKEN=%s\n' "${POCKET_ID_ENROLL_TOKEN:-}" >> "$ENV_FILE"
 chmod 600 "$ENV_FILE"
 
 # ── 配對 boot code(既有就沿用;bridge 啟動也會自產,這裡先產好以便印連結) ──
