@@ -23,6 +23,7 @@ carddigest.GeminiDigest,v2 路由/送訊接線在 bridge.py(S5 區)。
 import asyncio
 import json
 import os
+import shutil
 import time
 import uuid
 
@@ -172,17 +173,31 @@ def gemini_bin() -> str:
     return os.environ.get("GEMINI_BIN", "gemini")
 
 
-# ── ACP 後端選擇(2026-11-01:gemini CLI 個人 OAuth 被 Google 封,Antigravity
-#    接手免費/訂閱額度;見 docs/GEMINI_AUTH_DECISION_20261101.md)────────────
+def agy_bin() -> str:
+    """Antigravity CLI 執行檔;找不到回空字串(= antigravity 後端未配置)。
+
+    官方 installer 裝到 ~/.local/bin/agy —— launchd/systemd 服務的 PATH
+    常常沒有這段,所以 which 之外要明確摸這個預設位置。"""
+    env = (os.environ.get("POCKET_AGY_BIN") or "").strip()
+    if env:
+        return env if os.path.exists(os.path.expanduser(env)) else ""
+    found = shutil.which("agy")
+    if found:
+        return found
+    default = os.path.expanduser("~/.local/bin/agy")
+    return default if os.path.exists(default) else ""
+
+
+# ── 引擎後端選擇(2026-11-01:gemini CLI 個人 OAuth 被 Google 封,Antigravity
+#    接手免費/訂閱額度;決策與實測見 docs/GEMINI_AUTH_DECISION_20261101.md)────
 #
-# 兩個後端握手形狀相同(都是 initialize→authenticate→session/new→session/prompt
-# 的 ACP),差別只在:啟動指令、authMethods 的 id 字串、模型參數旗標。所以用
-# **資料驅動的 backend 表**,不 fork provider —— 龍蝦實測後把 Antigravity 的
-# 細節填進表即可,client 邏輯(on_update/核准/排隊/逐字稿)一行不改。
-#
-# ⚠️ Antigravity 那欄的 authMethods id 與 model 旗標目前是**待實測佔位**
-# (標 PLACEHOLDER)—— SG 龍蝦上錄下 ACP initialize 的實際 authMethods 後填。
-# 預設後端仍是 gemini(現狀零變化);POCKET_GEMINI_BACKEND=antigravity 才切。
+# 兩個引擎的**協定不同**(SG 龍蝦 2026-11-01 實測,agy 1.4.12):
+#   gemini      → ACP(initialize→authenticate→session/new→session/prompt)
+#   antigravity → **stream-json**(沒有 ACP、沒有 authenticate;認證=機器上
+#                  `agy` 已登入的狀態;session 概念是 conversation_id)
+# 所以 antigravity 不是 _ACP_BACKENDS 的一欄(第一版那個 PLACEHOLDER 設計
+# 作廢)—— 它是**另一個 client 類別**(AntigravityClient),由 make_client()
+# 依 POCKET_GEMINI_BACKEND 選。兩個 client 門面相同,bridge 零改動。
 _ACP_BACKENDS = {
     "gemini": {
         "argv": lambda: [gemini_bin(), "--acp"],
@@ -191,27 +206,18 @@ _ACP_BACKENDS = {
         "auth_ids": {"oauth": "oauth-personal", "api-key": "gemini-api-key"},
         "env_key": "GEMINI_API_KEY",
     },
-    "antigravity": {
-        # agy-agent-acp 是 npm 轉接器,內部 spawn 已登入的 `agy`
-        # (前提:agy 已 `agy auth login`)。可用 POCKET_ANTIGRAVITY_ACP_CMD 覆寫。
-        "argv": lambda: (os.environ.get("POCKET_ANTIGRAVITY_ACP_CMD",
-                                        "agy-agent-acp").split()),
-        "model_flag": None,                      # PLACEHOLDER:待實測
-        "auth_ids": {"oauth": "PLACEHOLDER_personal_google",   # 待龍蝦實測填
-                     "api-key": "PLACEHOLDER_api_key"},
-        "env_key": "GEMINI_API_KEY",
-    },
 }
 
 
-def acp_backend() -> str:
-    """當前 ACP 後端。預設 gemini(現狀);env 切 antigravity。"""
+def provider_backend() -> str:
+    """當前引擎。預設 gemini(現狀);POCKET_GEMINI_BACKEND=antigravity 切。"""
     b = os.environ.get("POCKET_GEMINI_BACKEND", "gemini").strip()
-    return b if b in _ACP_BACKENDS else "gemini"
+    return b if b in ("gemini", "antigravity") else "gemini"
 
 
 def backend_spec() -> dict:
-    return _ACP_BACKENDS[acp_backend()]
+    # ACP spawn 細節表 —— 只有 ACP 引擎(gemini)用;antigravity 走自己的類別。
+    return _ACP_BACKENDS["gemini"]
 
 
 # ── session 名錄(ACP 沒有 list,自己記)──────────────────────────────────
@@ -697,6 +703,303 @@ class GeminiClient:
             if str(row.get("acp_sid") or "") == acp_sid:
                 return k
         return None
+
+
+# ── Antigravity(agy)stream-json 引擎 ────────────────────────────────────────
+#
+# SG 龍蝦 2026-11-01 實測錄下的 wire 形狀(agy 1.4.12):
+#   spawn : agy --input-format stream-json --output-format stream-json
+#           --dangerously-skip-permissions [--conversation <id>]
+#   stdin : {"event":"user","message":{"role":"user",
+#            "content":[{"type":"text","text":"…"}]}}\n(Claude 式
+#            {"type":"user"} 會被拒:missing event field)
+#   stdout: {"event":"init","conversation_id":…,"init":{cwd,tools}} →
+#           {"event":"step_update",…}* →
+#           {"event":"result","result":{conversation_id,status,response,usage}}
+#   同一行程可連發、context 延續;跨行程續接用 --conversation(對話落在
+#   ~/.gemini/antigravity-cli/,跨重啟持久)。
+#
+# 與 ACP 的差異與取捨:
+# - 沒有 authenticate:認證=機器上 agy 已 Google 登入的狀態。登入壞掉時
+#   turn 直接 ERROR,由 _GM_FAILURE_RULES 翻人話,不在 spawn 期猜。
+# - 沒有逐字流:result 才有全文 → 整段一次 emit agent_message_chunk。
+#   體感=人格模式(等完整回覆),不是 CC 的逐字 —— 誠實的協定限制。
+# - --dangerously-skip-permissions:stream-json 是單向協定,沒有 mid-turn
+#   權限往返可走;cwd 釘在 _DEFAULT_CWD 工作區當爆炸半徑。
+# - 行程模型:**每回合 spawn 一支**,靠 --conversation 續 context。常駐可省
+#   spawn 成本但要管 N 條對話 N 支常駐行程的生命週期;v1 選簡單正確的。
+
+def _agy_user_event(blocks: list) -> tuple[dict, int]:
+    """ACP content blocks → agy user 事件。回 (事件, 被略過的非文字塊數)。
+
+    agy stream-json 的 content 實測只收 {type:"text"} —— 影像等附件先略過
+    並回報數量,由呼叫端在文字裡註記(不默吞,使用者看得到)。"""
+    texts = [str(b.get("text") or "") for b in blocks
+             if isinstance(b, dict) and b.get("type") == "text"]
+    skipped = sum(1 for b in blocks
+                  if not (isinstance(b, dict) and b.get("type") == "text"))
+    text = "\n".join(t for t in texts if t)
+    if skipped:
+        text = (text + f"\n(另有 {skipped} 個附件,Antigravity 後端暫不支援,"
+                       f"已略過)").strip()
+    return ({"event": "user",
+             "message": {"role": "user",
+                         "content": [{"type": "text", "text": text}]}},
+            skipped)
+
+
+def _agy_should_reopen(err_text: str) -> bool:
+    """帶 --conversation 失敗時,哪些錯誤值得「丟掉舊對話、開新局重試一次」。
+
+    只認「對話不存在」類(gemini 後端 session/load 失敗開新局的同一精神);
+    額度/認證錯誤**不准**重試 —— 那會重複燒 quota 還把真錯蓋掉。"""
+    t = (err_text or "").lower()
+    return any(n in t for n in
+               ("conversation", "not found", "no such", "unknown id"))
+
+
+class AntigravityClient:
+    """Antigravity(agy)引擎 —— 與 GeminiClient **完全同門面**,bridge 零改動。
+
+    門面契約(bridge 實際用到的全部):configured() / auth_used /
+    ensure_session(key)→sid / call("session/prompt",{sessionId,prompt})→
+    {stopReason} / cancel(key) / acp_to_key(sid) / _drop_proc() /
+    on_update、on_request 掛點。sid 沿用名錄的 acp_sid 欄位存
+    conversation_id;首回合前還沒有 id,先用 "agy-pending:<key>" 佔位,
+    init 事件回真 id 後落檔替換。"""
+
+    def __init__(self, log=None):
+        self._log = log or (lambda *_a, **_k: None)
+        self.on_update = None
+        self.on_request = None   # 相容掛點;stream-json 單向,永遠不會被叫
+        self.auth_used = ""      # 首次 SUCCESS 後 = "google-antigravity"
+        self.server_info: dict = {}
+        self._inflight: dict[str, asyncio.subprocess.Process] = {}
+        self._cancelled: set[str] = set()
+
+    def configured(self) -> bool:
+        # 認證=agy 的登入狀態,本機只能驗「binary 在不在」;登入壞掉會在
+        # turn 失敗時以人話浮現,不在這裡發網路呼叫探活(configured() 在
+        # 列表/health 熱路徑上)。
+        return bool(agy_bin())
+
+    # ── session ──
+
+    async def ensure_session(self, key: str) -> str:
+        if not self.configured():
+            raise GeminiError("agy 不在(官方 installer 裝到 ~/.local/bin,"
+                              "或設 POCKET_AGY_BIN)", code="NO_BINARY")
+        row = get_session(key)
+        if row is None:
+            row = remember_session(key, f"agy-pending:{key}")
+        return str(row["acp_sid"])
+
+    def acp_to_key(self, acp_sid: str) -> str | None:
+        for k, row in _load_sessions().items():
+            if str(row.get("acp_sid") or "") == acp_sid:
+                return k
+        return None
+
+    # ── 呼叫 ──
+
+    async def call(self, method: str, params: dict | None = None,
+                   timeout: float = _CALL_TIMEOUT):
+        if method != "session/prompt":
+            # 門面只承諾 bridge 實際會呼叫的 —— 其他 method 大聲拒絕,
+            # 不假裝 ACP 全集都在。
+            raise GeminiError(f"antigravity 後端不支援 {method}",
+                              code="UNSUPPORTED")
+        p = params or {}
+        return await self._prompt(str(p.get("sessionId") or ""),
+                                  list(p.get("prompt") or []), timeout)
+
+    def _argv(self, conv: str) -> list[str]:
+        argv = [agy_bin(), "--input-format", "stream-json",
+                "--output-format", "stream-json",
+                "--dangerously-skip-permissions"]
+        if conv:
+            argv += ["--conversation", conv]
+        return argv
+
+    async def _prompt(self, sid: str, blocks: list, timeout: float) -> dict:
+        if not sid:
+            raise GeminiError("missing sessionId", code="BAD_REQUEST")
+        event, skipped = _agy_user_event(blocks)
+        if skipped:
+            self._log("antigravity_blocks_skipped", session=sid[:40],
+                      skipped=skipped)
+        conv = "" if sid.startswith("agy-pending:") else sid
+        # 中斷/在途簿記用 **bridge key** 當鍵:sid 在 turn 中途可能被
+        # _record_conv 換名(pending→真 id、舊局→新局),key 不會。
+        okey = self.acp_to_key(sid) or (sid.split(":", 1)[1]
+                                        if sid.startswith("agy-pending:")
+                                        else sid)
+        cfg = load_config()
+        if cfg.get("model"):
+            # agy 的模型旗標未實測(models 列得出 id,帶法未知)——
+            # 不帶假旗標,但留痕讓「設了模型沒生效」查得到原因。
+            self._log("antigravity_model_ignored", model=cfg["model"])
+        try:
+            return await self._run_once(sid, okey, conv, event, timeout)
+        except GeminiError as e:
+            # 舊 conversation 載不回(agy 更新/狀態清掉/從 gemini 後端切來的
+            # ACP sid)→ 開新局重試一次;其他錯誤原樣丟。
+            if conv and _agy_should_reopen(str(e)):
+                self._log("antigravity_conv_reopen", session=sid[:40],
+                          error=str(e)[:120])
+                return await self._run_once(sid, okey, "", event, timeout)
+            raise
+
+    async def _run_once(self, sid: str, okey: str, conv: str, event: dict,
+                        timeout: float) -> dict:
+        os.makedirs(_DEFAULT_CWD, exist_ok=True)
+        errlog = os.environ.get("GEMINI_STDERR_LOG",
+                                os.path.join(_STATE_DIR, "cli-stderr.log"))
+        if errlog.lower() in ("off", "none", "devnull", ""):
+            stderr_to = asyncio.subprocess.DEVNULL
+        else:
+            try:
+                os.makedirs(os.path.dirname(errlog) or ".", exist_ok=True)
+                stderr_to = open(errlog, "ab")
+            except OSError:
+                stderr_to = asyncio.subprocess.DEVNULL
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *self._argv(conv),
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=stderr_to, cwd=_DEFAULT_CWD)
+        except FileNotFoundError:
+            raise GeminiError("agy 不在(官方 installer 裝到 ~/.local/bin,"
+                              "或設 POCKET_AGY_BIN)", code="NO_BINARY")
+        self._inflight[okey] = proc
+        self._cancelled.discard(okey)
+        try:
+            proc.stdin.write((json.dumps(event, ensure_ascii=False) + "\n")
+                             .encode())
+            await proc.stdin.drain()
+            proc.stdin.close()          # EOF → agy 跑完這回合就退出
+            return await asyncio.wait_for(self._read_turn(sid, okey, proc),
+                                          timeout=timeout)
+        except asyncio.TimeoutError:
+            raise GeminiError("agy turn timeout", code="TIMEOUT",
+                              retryable=True)
+        finally:
+            if self._inflight.get(okey) is proc:
+                self._inflight.pop(okey, None)
+            if proc.returncode is None:
+                try:
+                    proc.kill()
+                except Exception:  # noqa: BLE001
+                    pass
+
+    async def _read_turn(self, sid: str, okey: str, proc) -> dict:
+        """讀事件到 result 為止;把全文以 agent_message_chunk 形狀 emit,
+        讓 bridge 的 on_update/_GM_TURNS 累積邏輯原樣工作。"""
+        while True:
+            raw = await proc.stdout.readline()
+            if not raw:
+                if okey in self._cancelled:
+                    self._cancelled.discard(okey)
+                    return {"stopReason": "cancelled"}
+                raise GeminiError("agy 行程在 result 前結束",
+                                  code="PROCESS_LOST", retryable=True)
+            if os.environ.get("GEMINI_DEBUG"):
+                self._log("agy_rx", frame=raw.decode("utf-8", "replace")[:200])
+            try:
+                f = json.loads(raw.decode("utf-8", "replace"))
+            except Exception:  # noqa: BLE001 — 非 JSON 行跳過
+                continue
+            ev = f.get("event") or ""
+            if ev == "init":
+                conv_id = str(f.get("conversation_id") or
+                              (f.get("init") or {}).get("conversation_id") or "")
+                self.server_info = f.get("init") or {}
+                if conv_id:
+                    self._record_conv(sid, conv_id)
+                continue
+            if ev == "step_update":
+                # 進度 metadata(沒有 token 增量)。translate 成 thought 種別
+                # 讓 app 顯示「工作中」,文字留空不瞎編。
+                if self.on_update:
+                    try:
+                        self.on_update(sid, {"sessionUpdate":
+                                             "agent_thought_chunk",
+                                             "content": {"type": "text",
+                                                         "text": ""}})
+                    except Exception:  # noqa: BLE001
+                        pass
+                continue
+            if ev == "result":
+                r = f.get("result") or {}
+                status = str(r.get("status") or "")
+                if status != "SUCCESS":
+                    raise GeminiError(str(r.get("error") or
+                                          f"agy status={status or '?'}"),
+                                      code=status or "ERROR")
+                text = str(r.get("response") or "")
+                if text and self.on_update:
+                    try:
+                        self.on_update(sid, {"sessionUpdate":
+                                             "agent_message_chunk",
+                                             "content": {"type": "text",
+                                                         "text": text}})
+                    except Exception:  # noqa: BLE001
+                        pass
+                self.auth_used = "google-antigravity"
+                conv_id = str(r.get("conversation_id") or "")
+                if conv_id:
+                    self._record_conv(sid, conv_id)
+                self._log("antigravity_turn_result", session=sid[:40],
+                          chars=len(text),
+                          tokens_in=(r.get("usage") or {}).get("input_tokens"))
+                return {"stopReason": "end_turn", "usage": r.get("usage") or {}}
+
+    def _record_conv(self, sid: str, conv_id: str) -> None:
+        """init/result 給的 conversation_id 落回名錄(pending 佔位 → 真 id;
+        舊局載不回開新局 → 換 id)。本回合的 emit 仍用呼叫端的 sid ——
+        bridge 的 _GM_TURNS 是用它註冊的,turn 中途換名會把全文弄丟。"""
+        if conv_id == sid:
+            return
+        key = self.acp_to_key(sid) or (sid.split(":", 1)[1]
+                                       if sid.startswith("agy-pending:") else "")
+        if not key:
+            return
+        row = get_session(key) or {}
+        remember_session(key, conv_id, title=str(row.get("title") or ""),
+                         cwd=str(row.get("cwd") or ""))
+        self._log("antigravity_conv_bound", key=key[:32], conv=conv_id[:12])
+
+    # ── 中斷/清理 ──
+
+    async def cancel(self, key: str):
+        proc = self._inflight.get(key)
+        if proc is not None and proc.returncode is None:
+            self._cancelled.add(key)
+            try:
+                proc.kill()
+            except Exception:  # noqa: BLE001
+                pass
+
+    async def _drop_proc(self):
+        """設定變更時的全清(與 GeminiClient 同名同義)。"""
+        procs, self._inflight = dict(self._inflight), {}
+        for okey, proc in procs.items():
+            self._cancelled.add(okey)
+            if proc.returncode is None:
+                try:
+                    proc.kill()
+                except Exception:  # noqa: BLE001
+                    pass
+        self._log("antigravity_dropped", count=len(procs))
+
+
+def make_client(log=None):
+    """依 POCKET_GEMINI_BACKEND 選引擎 —— 兩個 client 門面相同,bridge 只認
+    這個工廠,不認具體類別。"""
+    if provider_backend() == "antigravity":
+        return AntigravityClient(log=log)
+    return GeminiClient(log=log)
 
 
 # ── v2 session 形狀助手(bridge 對映用,不碰網路)─────────────────────────────

@@ -36,12 +36,28 @@ id、headless flag。這幾乎是 drop-in。
 **這條直接實現機主的願景**:個人 Google 登入 = 免費額度 + 訂閱額度,跟 CC/CX
 的訂閱仔同一個模式。
 
-⚠️ **未驗證(實作前必做,別重蹈「管線存在≠端到端通」)**:
-1. `agy` 的安裝(binary 哪來、龍蝦上怎麼裝)
-2. ACP server 的確切啟動指令與 authMethods id 的字面值
-3. **無頭龍蝦上首次 Google 登入怎麼完成**(登入持久,但第一次仍要瀏覽器?
-   官方說有 ACP server 的 authenticate,要實測是不是能走 NO_BROWSER 式 URL+碼)
-4. 官方 ACP server vs 社群 agy-acp 哪個穩
+#### ✅ 2026-11-01 SG 龍蝦(207.148.69.149,agy 1.4.12)實測 —— 四點全釘
+
+1. **安裝**:官方 installer → `~/.local/bin/agy`(服務 PATH 常沒這段,
+   provider 的 `agy_bin()` 明確摸這個位置)。
+2. **wire 形狀:不是 ACP,是 stream-json**(上表「握手完全相同」來自外部
+   文章,實測推翻 —— agy 1.4.12 沒有 ACP server):
+   - spawn:`agy --input-format stream-json --output-format stream-json
+     --dangerously-skip-permissions [--conversation <id>]`
+   - stdin:`{"event":"user","message":{"role":"user","content":[{"type":
+     "text","text":"…"}]}}`(Claude 式 `{"type":"user"}` 被拒)
+   - stdout:`init`(conversation_id、tools)→ `step_update`* →
+     `result`(status/response/usage)。**沒有逐字流**,全文在 result。
+   - 同行程連發 context 延續(1+2=3 → 再加10=13);跨行程用
+     `--conversation`,對話落 `~/.gemini/antigravity-cli/` 跨重啟持久。
+3. **無頭登入**:bare `agy` TUI → OAuth URL + 貼回授權碼。⚠️ URL 會被
+   TUI 框折行咬壞(機主實踩 400 invalid_request)—— 程式整合時要從
+   輸出撈完整 URL,不能叫人從終端機複製。登入跨 session 持久。
+4. **個人帳號被服務**:✅ 兩回合真跑 SUCCESS。**而且 models 不只 Gemini**:
+   gemini-3.8-flash(high/med/low)、claude-sonnet-4-6、
+   claude-opus-4-6-thinking、gpt-oss-120b —— 一個 Google 登入全有。
+   註:trivial prompt 的 usage.input_tokens ≈ 6.7k(agent harness 前導),
+   額度估算要算這筆。
 
 ### B. gemini CLI + 付費 API key(現狀能動)
 
@@ -80,15 +96,24 @@ auto 模式退到付費 API key,但那把 key 免費額度爆了 → Gemini 實�
 **為什麼不是 B 當主線**:機主的核心訴求是「哪有那麼多人有 API key」。
 A 正面解決它,B 繞過它。B 只保留給「已經有付費 key 且不想登入」的少數。
 
-## 3. 下一步(待機主拍板走 A)
+## 3. 下一步(機主已拍板走 A,2026-11-01「直接開做」)
 
-1. 在**一台龍蝦**上裝 `agy`,實測上面四個未驗證點(同 Codex device-auth 的
-   實機驗證路徑 —— 不在桌面推論)
-2. `gemini_provider.py` 加 `ANTIGRAVITY` 後端(或參數化 binary/authMethods),
-   auto 模式優先序:Antigravity OAuth → OpenRouter → API key
-3. app 的 Gemini 登入頁:「用 Google 登入」改指向 agy 的流程
+1. ~~龍蝦實測四個未驗證點~~ ✅ 全釘(見上)
+2. ~~provider 加 Antigravity 後端~~ ✅ **已實作**:`AntigravityClient`
+   (stream-json 引擎,與 `GeminiClient` 完全同門面,`make_client()` 依
+   `POCKET_GEMINI_BACKEND=antigravity` 選;bridge 只改一行接工廠)。
+   測試:tests/test_antigravity_client.py(wire 契約)+
+   test_gemini_auth_plan.py 的門面同形測試。
+   已知限制(誠實記):無逐字流(全文一次到)、附件未支援(明說略過)、
+   模型旗標未實測(設了模型會 log `antigravity_model_ignored`)、
+   `--dangerously-skip-permissions`(stream-json 單向,無 mid-turn 權限
+   往返;cwd 釘在工作區)。
+3. app 的 Gemini 登入頁:「用 Google 登入」改指向 agy 的流程(待做;
+   URL 要由 bridge 撈完整字串回 app,見上面折行坑)
 4. 規格 `GEMINI_SUBSCRIPTION_AUTH_20261101.md` 的 gemini CLI 前提作廢,
-   指向本文件
+   指向本文件 ✅(該文件已加頂註)
+5. 龍蝦(B 軌)啟用:bridge 服務 env 設 `POCKET_GEMINI_BACKEND=antigravity`
+   + 機上 agy 已登入 → 端到端驗一輪(管線存在≠端到端通)
 
 ## 4. 不變的教訓
 

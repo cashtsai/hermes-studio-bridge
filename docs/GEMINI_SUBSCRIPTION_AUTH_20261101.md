@@ -3,7 +3,10 @@
 > 「讓 gemini 跟 cc cx 的訂閱仔一樣,哪有那麼多人有 API key。Google 登入
 > 馬上就有免費的。OpenClaw 綁去訂閱的 Gemini,下一個 fallback OpenRouter。」
 >
-> 本文件是規格與現況。**改實作先改這裡。**
+> ⚠️ **2026-11-01 前提生變**:gemini CLI 的個人 OAuth 當天實測被 Google 封
+> (migrate to Antigravity)。**訂閱/免費額度的載體換成 Antigravity(agy)**,
+> 決策與龍蝦實測見 `GEMINI_AUTH_DECISION_20261101.md` —— 本文件的願景不變,
+> §1/§3.2 裡涉及 gemini CLI OAuth 的鏈路作廢。**改實作先看決策文件。**
 
 ## 0. 一句話
 

@@ -23857,7 +23857,8 @@ async def _openclaw_v1_post_message(body: dict, request: Request):
 # 解耦讓 CLI 端 session 蒸發時可換 acp_sid 續命(bridge 端歷史不動)。
 # 未配置(無 GEMINI_API_KEY)→ 全部靜默缺席,照 APNs 金鑰缺席模式。
 
-GEMINI = gemini_provider.GeminiClient(log=_log_event)
+# 工廠選引擎(gemini ACP / antigravity stream-json)—— 門面相同,下游不分家。
+GEMINI = gemini_provider.make_client(log=_log_event)
 _GM_CARD_DIGESTS: dict = {}
 _GM_TURNS: dict = {}     # acp_sid -> {"cid","text","key"}(進行中 turn 的路由表)
 #: C11:忙碌時排隊的輸入(key -> [(content, blocks)])。上一輪收尾時 drain。
@@ -23892,8 +23893,10 @@ _GM_FAILURE_RULES = (
      "Gemini 的用量額度目前用完了。這是 Google 帳號層級的限制,不是連線問題 —— "
      "等額度重置後再試,或改用 CC / CX 繼續這件事。"),
     ("auth", ("unauthenticated", "401", "invalid credentials", "login",
-              "re-authenticate"),
-     "Gemini 需要重新登入。在桌面端終端機跑一次 `gemini` 完成登入後再回來。"),
+              "re-authenticate", "sign in", "not signed in"),
+     # 兩個引擎共用這條:gemini CLI 跑 `gemini`,Antigravity 跑 `agy`。
+     "Gemini 需要重新登入。在主機終端機跑一次 `gemini`(或 Antigravity 引擎"
+     "跑 `agy`)完成 Google 登入後再回來。"),
     ("timeout", ("timeout", "timed out", "deadline"),
      "Gemini 這一回合等太久被中斷了。內容多的話可以拆小一點再試。"),
     ("unavailable", ("unavailable", "503", "502", "connection refused"),
