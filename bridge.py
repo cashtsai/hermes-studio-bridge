@@ -11893,6 +11893,34 @@ def _relay_set_status(state: str, **fields) -> None:
                    detail=str(fields.get("detail") or "")[:200])
 
 
+def _relay_kill_stale_frpc() -> int:
+    """殺掉**用同一份設定檔**跑著的殘兵 frpc。
+
+    bridge 被 SIGKILL(kickstart -k / launchd 換版)時 finally 跑不到,
+    frpc 被晾成孤兒(PPID 1)繼續佔著子網域 —— 新 frpc 註冊永遠
+    「already exists / router config conflict」,狀態卡 rejected 而隧道
+    其實是孤兒在撐(2026-11-02 實踩,一晚量產三條)。開工前清場。
+    只認「命令列含我們設定檔路徑」的行程,不碰別人的 frpc。"""
+    killed = 0
+    try:
+        out = subprocess.run(["pgrep", "-f", _relay_conf_path()],
+                             capture_output=True, text=True, timeout=5).stdout
+        for pid_s in out.split():
+            pid = int(pid_s)
+            if pid == os.getpid():
+                continue
+            try:
+                os.kill(pid, signal.SIGKILL)
+                killed += 1
+            except (ProcessLookupError, PermissionError):
+                pass
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("relay_stale_scan", _exc, expected=True)
+    if killed:
+        _log_event("relay_stale_frpc_killed", count=killed)
+    return killed
+
+
 async def _relay_run_frpc(binary: str) -> str:
     """跑 frpc 直到它結束,回傳輸出尾巴(用來判斷是不是授權問題)。
 
@@ -11907,6 +11935,7 @@ async def _relay_run_frpc(binary: str) -> str:
     邊讀邊更新狀態:隧道是**中途**才真的通的,等這個函式返回就太晚了
     (它返回的時候隧道已經斷了)。
     """
+    _relay_kill_stale_frpc()
     proc = await asyncio.create_subprocess_exec(
         binary, "-c", _relay_conf_path(),
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
