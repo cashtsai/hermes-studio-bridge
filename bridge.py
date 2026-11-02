@@ -11047,23 +11047,10 @@ async def app_v1_console_boot(request: Request):
 
 
 # ═════════ console QR 登入(2026-10-29)═══════════════════════════════════════
-# 規格:docs/CONSOLE_QR_LOGIN_SPEC.md ——**改實作先改那份**。
-#
-# 問題:`/console` 只能從 loopback 或 tailnet 直連開(`_pair_local_only`),
-# 機主要的是「在一台完全沒有 tailnet 的電腦上也能開」。
-#
-# 為什麼不是「放寬六碼」:節流是 per-IP 6 次/60s、碼活 300s,單一 IP 命中率
-# 0.003%,但 1000 個 IP 並行就 3%、10000 個就 30%(per-IP 節流擋不住殭屍網路),
-# 而命中的代價是那台機器的檔案瀏覽權限。六碼今天可以接受,正因為它躲在 tailnet
-# 那道門後面當第二層;拆掉第一道門它就變成唯一的鎖 —— 那是質變,不做。
-#
-# 這條路把門換成「**已配對的手機明示批准**」:熵從 10⁶ 變 2¹²⁸,而且秘密不再
-# 需要經過不可信的瀏覽器(瀏覽器什麼都不用證明)。業界先例 = WhatsApp Web /
-# Discord 掃碼登入。實作上就是**既有配對流程倒著跑**。
-#
-# 主威脅是 **QR 釣魚**(攻擊者在自己機器開登入頁、把 QR 截圖傳給機主騙他掃),
-# 不是暴力破解。三道防線見 `_console_login_create` / `console_login_status` /
-# `app_v1_console_login_approve` 各自的註解。
+# 完整設計與威脅模型已移至非公開筆記(商業化考量,不在此公開 repo 列出攻擊面
+# 細節)。這裡只留工程上的 why:讓「在沒有 tailnet 的電腦上也能開 /console」
+# 這件事成立,門從「網路層信任」換成「已配對的手機明示批准」——業界先例
+# WhatsApp Web / Discord 掃碼登入同款,實作上是既有配對流程倒著跑。
 POCKET_CONSOLE_QR_LOGIN = os.environ.get("POCKET_CONSOLE_QR_LOGIN", "0") != "0"
 
 _CONSOLE_LOGIN_TTL = 120.0            # 秒;QR 的壽命(短到釣魚來不及轉手)

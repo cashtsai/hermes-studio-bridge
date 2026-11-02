@@ -1,4 +1,4 @@
-"""`GET /console` 的入口分流(規格 CONSOLE_QR_LOGIN_SPEC §6.1)。
+"""`GET /console` 的入口分流(QR 登入設計文件已移至非公開筆記)。
 
 QR 登入的狀態機、token scope、手機端三支端點在 10c2aa4 就都寫好了,但
 **沒有任何地方會導向它們** —— 遠端來的請求一律被 `_pair_local_only` 裸 403
