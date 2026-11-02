@@ -10033,12 +10033,35 @@ def _pair_tunnel_urls() -> list:
     """
     out = []
     for raw in (os.environ.get("POCKET_TUNNEL_URL") or "",
+                _relay_public_url(),
                 _tunnel_url_from_file(),
                 _quick_tunnel_url() or ""):
         u = (raw or "").strip().rstrip("/")
         if u and u not in out:
             out.append(u)
     return out
+
+
+def _relay_public_url() -> str:
+    """中繼隧道的公網 URL(開關開著且有 grant 才回)。
+
+    2026-11-02 商品化缺口:B 軌龍蝦接上 relay 後,配對 QR 的公網候選裡
+    卻只有「每次重啟就換網址」的 quick tunnel —— 穩定網域明明在手上。
+    列進候選;**能不能用仍由 _sort_public_by_sse 實測加權**,這裡只表達
+    「它存在」。"""
+    try:
+        if not os.path.exists(os.path.join(_relay_dir(), "enabled")):
+            return ""
+        with open(os.path.join(_relay_dir(), "grant.json"),
+                  encoding="utf-8") as f:
+            g = json.load(f)
+        h = str(g.get("hostname") or "").strip()
+        return f"https://{h}" if h else ""
+    except FileNotFoundError:
+        return ""
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("relay_public_url", _exc, expected=True)
+        return ""
 
 
 def _tunnel_url_from_file() -> str:
