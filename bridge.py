@@ -11805,9 +11805,14 @@ async def _relay_claim() -> dict:
     """
     import httpx
     st = _pocket_id_state()
+    body = {"host_id": st.get("host_id"), "host_secret": st.get("host_secret")}
+    # 這台主機掛哪個區的 relay(龍蝦設 sg;空=預設區)。值不認得伺服器會 400,
+    # 不默退 —— 配錯區要當場知道,不是悄悄跑去別區。
+    region = (os.environ.get("POCKET_RELAY_REGION") or "").strip()
+    if region:
+        body["region"] = region
     async with httpx.AsyncClient(timeout=30) as client:
-        r = await client.post(POCKET_ID_URL + "/v1/relay/claim", json={
-            "host_id": st.get("host_id"), "host_secret": st.get("host_secret")})
+        r = await client.post(POCKET_ID_URL + "/v1/relay/claim", json=body)
     if r.status_code == 402:
         raise _RelayUnentitled()
     r.raise_for_status()
@@ -11828,7 +11833,7 @@ def _relay_write_conf(grant: dict) -> None:
             "[metadatas]\n"
             f'token = "{grant["frp_token"]}"\n\n'
             "[[proxies]]\n"
-            'name = "bridge"\n'
+            f'name = "bridge-{grant["subdomain"]}"\n'
             'type = "http"\n'
             'localIP = "127.0.0.1"\n'
             f"localPort = {_relay_local_port()}\n"
