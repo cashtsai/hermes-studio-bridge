@@ -15922,6 +15922,22 @@ def _cc_pin_name(name: str) -> str:
     return re.sub(r"[^A-Za-z0-9._-]", "_", name or "")
 
 
+def _cc_write_model_pin(name: str, model: str) -> None:
+    """落 model pin(= 現用/下次 spawn 要帶的模型)。
+
+    live `/model` 切換成功後要更新它,否則 status 讀到的還是 spawn 時的舊值
+    (2026-11-02:app 設定面板模型 picker 不亮的另一半)—— 而且順帶讓
+    session 重啟後沿用使用者選的模型,不彈回 spawn 預設。寫失敗留痕不炸:
+    pin 只是個優化,掉了下次切換會補回。"""
+    try:
+        os.makedirs(_CC_MODEL_PIN_DIR, exist_ok=True)
+        with open(os.path.join(_CC_MODEL_PIN_DIR, _cc_pin_name(name)),
+                  "w", encoding="utf-8") as f:
+            f.write((model or "").strip() + "\n")
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("cc_write_model_pin", _exc, expected=True)
+
+
 def _cc_read_pin(directory: str, name: str) -> str:
     """讀一個 pin 檔;沒設定就回空字串。
 
@@ -16153,10 +16169,7 @@ async def _cc_native(verb: str, *rest) -> str:
         _cc_conf_backup()
         _cc_conf_upsert(name, workdir, "1")
         if len(rest) > 2 and rest[2]:
-            os.makedirs(_CC_MODEL_PIN_DIR, exist_ok=True)
-            with open(os.path.join(_CC_MODEL_PIN_DIR, _cc_pin_name(name)),
-                      "w", encoding="utf-8") as f:
-                f.write(str(rest[2]).strip() + "\n")
+            _cc_write_model_pin(name, str(rest[2]))
         if verb == "new":
             await _cc_native_launch(name, workdir)
         return ""
@@ -18467,6 +18480,14 @@ async def _cc_status_core(name: str) -> dict:
             prompt = ask
     await _cc_refine_q_index(name, prompt)
     st = {"busy": busy, "running": True, "mode": mode, "prompt": prompt}
+    # `model`:現用模型(新增欄,舊 app 不讀不受影響)。app 的設定面板模型
+    # picker 原本只在「切換成功回讀後」才有值 → 首次開面板三個選項全不亮、
+    # 看起來像點了沒反應(2026-11-02 機主回報)。model pin 是 session spawn 時
+    # 實際帶上 `--model` 的那個值(見 _cc_native_claude_cmd),就是權威來源;
+    # 沒 pin(跟隨 CLI 預設)時省略欄位,app 自己退回「未知」不亂標。
+    model = _cc_read_pin(_CC_MODEL_PIN_DIR, name)
+    if model:
+        st["model"] = model
     # ── 兩個新增欄,舊 app 不讀不受影響 ────────────────────────────────
     # `busy_since`:回合起算時間(epoch 秒)。app 的 WorkingBar 原本只有一顆
     # 脈動點,在 2 秒與 20 分鐘看起來一模一樣 —— 遠端遙控最怕的就是這個:
@@ -19850,6 +19871,9 @@ async def cc_session_model(name: str, request: Request):
             raise http_err(502, "MODEL_CONFIRM_UNRESOLVED",
                            "sent /model but a prompt is still on screen — not switched",
                            tail[-200:])
+        # 切成功 → 落 pin。status 下次回讀即反映現用模型(picker 會亮),
+        # 且 session 重啟沿用。
+        _cc_write_model_pin(name, model)
         return {"ok": True, "model": model, "confirmed": True,
                 "answered_dialog": answered}
 

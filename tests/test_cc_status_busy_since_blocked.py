@@ -246,6 +246,53 @@ class WiringTest(unittest.TestCase):
                                 "定義 + 至少一個呼叫點")
 
 
+class ModelFieldTest(_Harness):
+    """status 要帶 `model`(現用模型)。沒有它,app 設定面板的模型 picker
+    只在「切換成功回讀後」才有值 → 首次開面板三選項全不亮,看起來像點了
+    沒反應(2026-11-02 機主回報)。來源是 model pin = spawn 實際帶的 --model
+    / live 切換後寫回的值。"""
+
+    def setUp(self):
+        super().setUp()
+        self._saved_pin = bridge._cc_read_pin
+        self._model = ""
+        bridge._cc_read_pin = lambda d, n: (
+            self._model if d == bridge._CC_MODEL_PIN_DIR else "")
+
+    def tearDown(self):
+        bridge._cc_read_pin = self._saved_pin
+        super().tearDown()
+
+    def test_model_pin_surfaces_in_status(self):
+        self._model = "opus"
+        self.hook = {"busy": False, "updated_at": time.time()}
+        self.assertEqual(self.status().get("model"), "opus")
+
+    def test_no_pin_omits_model_not_empty(self):
+        """沒 pin(跟隨 CLI 預設)→ **省略**欄位,不回空字串 —— app 自己退回
+        「未知」不亂標一個選項。"""
+        self._model = ""
+        self.hook = {"busy": False, "updated_at": time.time()}
+        self.assertNotIn("model", self.status())
+
+    def test_custom_model_passes_through(self):
+        self._model = "claude-sonnet-4-6"
+        self.hook = {"busy": False, "updated_at": time.time()}
+        self.assertEqual(self.status().get("model"), "claude-sonnet-4-6")
+
+
+class ModelPinWriteOnSwitchTest(unittest.TestCase):
+    """live /model 切換成功後要**寫回 pin** —— 否則 status 永遠讀到 spawn 時
+    的舊值(修的另一半),而且 session 重啟會彈回 spawn 預設模型。"""
+
+    def test_set_model_endpoint_writes_pin(self):
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(root, "bridge.py"), encoding="utf-8") as f:
+            src = f.read()
+        # 成功回傳前有落 pin 的呼叫(別讓它變成只回 ok 卻不持久)。
+        self.assertIn("_cc_write_model_pin(name, model)", src)
+
+
 class CodexTurnStartedAtTest(unittest.TestCase):
     """CX 也要有回合計時 —— 不然 CC 有、CX 沒有,同一支 App 兩套體驗。
 
