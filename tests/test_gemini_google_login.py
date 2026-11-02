@@ -21,7 +21,9 @@ os.environ.setdefault("BRIDGE_TOKEN", "test-token")
 import bridge  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
-AUTH = {"Authorization": "Bearer test-token"}
+# 不能寫死 token 值:整包測試同進程共用一個 bridge module,誰先 import 誰的
+# setdefault 生效(2026-11-03 與 test_agent_login_claude_pty 互踩實錄)。
+AUTH = {"Authorization": f"Bearer {bridge.BRIDGE_TOKEN}"}
 
 # agy 1.4.12 真實輸出(2026-11-02 Mac 實錄,僅截 URL 行前後)。
 REAL_AGY_OUTPUT = (
