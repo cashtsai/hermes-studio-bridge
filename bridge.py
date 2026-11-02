@@ -31096,6 +31096,210 @@ async def _agent_claude_logged_in() -> bool:
         return False
 
 
+# ══════════ 階段 4:Gemini「用 Google 登入」(Antigravity/agy,PTY)══════════
+#
+# gemini CLI 的個人 OAuth 2026-06 被 Google 封(docs/GEMINI_AUTH_DECISION
+# _20261101.md);另一版「bridge 自組 PKCE、寫 ~/.gemini/oauth_creds.json」的
+# 實作(SG 快照上)前提同樣作廢 —— 那份 creds 餵的是被封的 client。
+# 本版:登入=讓機器上的 `agy` 跑完它自己的流程,bridge 只當 TTY 代理人
+# (同 CC setup-token 的 PTY 模式)。實測 agy 1.4.12:
+#  · stdin 是管道 → 直接拒絕登入(「Run 'agy' to log in」);**必須 PTY**。
+#  · PTY 下印乾淨單行 URL(寬視窗防折行)→「貼授權碼或等瀏覽器回跳」,
+#    等待視窗 60 秒;成功後 -p 的 prompt 會跑完、exit 0。
+#  · 已登入的機器:-p 直接回答、exit 0、不印 auth URL → start 回 already。
+_GM_AGY_LOGIN: dict = {}        # login_id -> {master_fd, pid, created, done}
+_GM_AGY_LOGIN_LOCK = threading.Lock()
+_GM_AGY_LOGIN_TTL = 300.0       # agy 自己的授權窗 60s,給足重試餘裕
+_AGY_AUTH_URL_RE = re.compile(r"https://accounts\.google\.com/o/oauth2/auth\?\S+")
+
+
+def _gm_agy_login_reap_locked(now: float) -> None:
+    for lid in [k for k, v in _GM_AGY_LOGIN.items()
+                if now - v["created"] > _GM_AGY_LOGIN_TTL]:
+        v = _GM_AGY_LOGIN.pop(lid, None)
+        if v:
+            _cc_login_kill(v)           # 同形 entry(master_fd/pid),直接重用
+
+
+def _agy_login_env() -> dict:
+    """子行程環境。POCKET_AGY_LOGIN_HOME 是**測試鉤**:端到端驗登入流程時
+    指到 scratch HOME,不碰機器上真的 agy 登入狀態。"""
+    env = dict(os.environ)
+    override = os.environ.get("POCKET_AGY_LOGIN_HOME", "").strip()
+    if override:
+        env["HOME"] = override
+    return env
+
+
+@app.post("/app/v1/agents/gemini/login/start")
+async def app_gemini_google_login_start(request: Request):
+    """啟動 agy 的 Google 登入,回授權 URL。行程留在 PTY 裡等授權碼。"""
+    if not POCKET_AGENT_LOGIN_IN_APP:
+        raise HTTPException(status_code=404, detail="not found")
+    _check_auth(request)
+    if _token_scope(_request_token(request)) == CONSOLE_REMOTE_SCOPE:
+        raise http_err(403, "SCOPE_FORBIDDEN",
+                       "遠端控制台不能設定帳號憑證,請用已配對的手機")
+    agy = gemini_provider.agy_bin()
+    if not agy:
+        raise http_err(503, "AGY_MISSING",
+                       "這台主機沒有安裝 Antigravity CLI(agy)")
+
+    def _spawn_and_read() -> tuple[int, int, str | None, bool]:
+        """回 (master_fd, pid, url, already_logged_in)。"""
+        env = _agy_login_env()
+        pid, master_fd = pty.fork()
+        if pid == 0:                      # 子行程(同 CC:不可呼叫 _log_exc)
+            try:
+                # -p 一個最小 prompt:未登入 → 觸發 URL+貼碼流程;已登入 →
+                # 直接回答退出(= already)。print-timeout 給足貼碼時間。
+                os.execve(agy, [agy, "-p", "只回答數字:1+1=",
+                                "--print-timeout", "240s"], env)
+            except OSError:
+                os._exit(127)
+        try:
+            fcntl.ioctl(master_fd, termios.TIOCSWINSZ,
+                        struct.pack("HHHH", 50, 400, 0, 0))
+        except (OSError, ValueError):
+            pass
+        buf = b""
+        deadline = time.time() + 25
+        url = None
+        while time.time() < deadline and url is None:
+            r, _, _ = select.select([master_fd], [], [], 2)
+            if not r:
+                # 沒輸出但行程退了 = 已登入(回答完)或掛了,交給下面判斷。
+                try:
+                    wpid, status = os.waitpid(pid, os.WNOHANG)
+                except (ChildProcessError, OSError):
+                    break
+                if wpid != 0:
+                    ok = os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
+                    return master_fd, pid, None, ok
+                continue
+            try:
+                chunk = os.read(master_fd, 4096)
+            except OSError:
+                break
+            if not chunk:
+                break
+            buf += chunk
+            text = re.sub(r"\x1b\[[0-9;]*m", "", buf.decode("utf-8", "ignore"))
+            m = _AGY_AUTH_URL_RE.search(text)
+            if m:
+                url = m.group(0).rstrip(".,)")
+        if url is None:
+            # 行程可能已自己答完(已登入)。exit 0 且沒印 auth URL = already。
+            try:
+                wpid, status = os.waitpid(pid, os.WNOHANG)
+                if wpid != 0 and os.WIFEXITED(status) \
+                        and os.WEXITSTATUS(status) == 0:
+                    return master_fd, pid, None, True
+            except (ChildProcessError, OSError):
+                pass
+        return master_fd, pid, url, False
+
+    try:
+        master_fd, pid, url, already = await asyncio.to_thread(_spawn_and_read)
+    except Exception as e:  # noqa: BLE001
+        _log_exc("gemini_google_login_spawn", e, expected=False)
+        raise http_err(503, "AGY_SPAWN_FAILED", "啟動 Google 登入失敗")
+    if already:
+        _cc_login_kill({"master_fd": master_fd, "pid": pid})
+        _log_event("gemini_google_login_already")
+        return {"ok": True, "provider": "gemini", "mode": "already",
+                "login_id": "", "url": "", "user_code": None}
+    if url is None:
+        _cc_login_kill({"master_fd": master_fd, "pid": pid})
+        raise http_err(502, "AGY_LOGIN_NO_URL", "沒能從 agy 取得登入連結")
+    lid = secrets.token_urlsafe(18)
+    now = time.time()
+    with _GM_AGY_LOGIN_LOCK:
+        _gm_agy_login_reap_locked(now)
+        _GM_AGY_LOGIN[lid] = {"master_fd": master_fd, "pid": pid,
+                              "created": now, "done": None}
+    _log_event("gemini_google_login_started")   # 不記 url
+    return {"ok": True, "provider": "gemini", "mode": "manual_code",
+            "login_id": lid, "url": url, "user_code": None}
+
+
+@app.post("/app/v1/agents/gemini/login/finish")
+async def app_gemini_google_login_finish(request: Request):
+    """把授權碼貼進 agy 的 PTY,完成登入。**實探才算數**(exit 0 ≠ 登入,
+    CC 2026-10-31 的假成功教訓):fresh `agy -p` 答得出來才回 ok。"""
+    if not POCKET_AGENT_LOGIN_IN_APP:
+        raise HTTPException(status_code=404, detail="not found")
+    _check_auth(request)
+    body = await _json_body(request)
+    lid = str(body.get("login_id") or "")
+    code = str(body.get("code") or "").strip().split("#", 1)[0].strip()
+    if not code:
+        raise http_err(400, "MISSING_CODE", "請貼上授權碼")
+    with _GM_AGY_LOGIN_LOCK:
+        _gm_agy_login_reap_locked(time.time())
+        entry = _GM_AGY_LOGIN.get(lid)
+    if entry is None:
+        raise http_err(410, "LOGIN_EXPIRED", "這次登入已過期,請重新開始")
+
+    def _submit_and_wait() -> bool:
+        fd = entry["master_fd"]
+        try:
+            os.write(fd, code.encode() + b"\r")
+        except OSError:
+            return False
+        deadline = time.time() + 60
+        while time.time() < deadline:
+            r, _, _ = select.select([fd], [], [], 0.5)
+            if r:
+                try:
+                    if not os.read(fd, 4096):
+                        pass
+                except OSError:
+                    pass
+            try:
+                wpid, status = os.waitpid(entry["pid"], os.WNOHANG)
+            except (ChildProcessError, OSError):
+                return True
+            if wpid != 0:
+                return os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
+        return False
+
+    exit_ok = await asyncio.to_thread(_submit_and_wait)
+    with _GM_AGY_LOGIN_LOCK:
+        e = _GM_AGY_LOGIN.pop(lid, None)
+    if e:
+        try:
+            os.close(e["master_fd"])
+        except OSError:
+            pass
+    really = await _agent_agy_logged_in()
+    _log_event("gemini_google_login_finished", exit_ok=exit_ok,
+               logged_in=really)
+    if not really:
+        raise http_err(502, "AGY_LOGIN_FAILED",
+                       "登入沒完成 —— 授權碼可能貼錯、過期(60 秒窗),"
+                       "請重新開始")
+    return {"ok": True, "provider": "gemini", "logged_in": True}
+
+
+async def _agent_agy_logged_in() -> bool:
+    """實探 agy 登入(非互動 -p,stdin=/dev/null 不會卡在貼碼)。"""
+    agy = gemini_provider.agy_bin()
+    if not agy:
+        return False
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            agy, "-p", "只回答數字:1+1=", "--print-timeout", "45s",
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+            env=_agy_login_env(), cwd=os.path.expanduser("~"))
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=60)
+        text = (out or b"").decode("utf-8", "ignore").lower()
+        return proc.returncode == 0 and "authentication" not in text
+    except (asyncio.TimeoutError, FileNotFoundError, OSError):
+        return False
+
+
 def _host_capabilities() -> dict:
     """這台龍蝦主機支援哪些 provider — 給 app 依能力顯示/隱藏功能,而不是
     讓不支援的功能看起來像壞掉(Windows/精簡安裝沒有 tmux/CC 時尤其重要)。
