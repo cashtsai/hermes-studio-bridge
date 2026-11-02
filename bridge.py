@@ -31399,6 +31399,9 @@ def _host_capabilities() -> dict:
         # claude_agent_sdk 套件 + 旗標。原本整個沒有這個鍵 → app 無從判斷
         # 這台支不支援,只能試了才知道。
         "cc2": cc_sdk.enabled() and os.path.exists(CLAUDE_BIN),
+        # 釘版 release(艦隊面板用):跟著 heartbeat 的 capabilities 流進
+        # pocket-id 的 hosts.capabilities_json → /v1/admin/* 可讀「誰跑哪版」。
+        "release": _lobster_release(),
     }
 
 
