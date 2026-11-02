@@ -26,6 +26,10 @@ die() { printf '✗ %s\n' "$*" >&2; exit 1; }
 BRIDGE_LABEL="${POCKET_BRIDGE_LABEL:-pocket-bridge}"
 INSTALL_ROOT="${POCKET_BRIDGE_INSTALL_ROOT:-$HOME/.local/share/pocket-lobster/bridge/current}"
 BRIDGE_VENV="${POCKET_BRIDGE_VENV:-$INSTALL_ROOT/venv}"
+# unit 的 ExecStart/WorkingDirectory 指向哪(更新器藍綠切換時傳 current
+# symlink,安裝目錄則是 releases/<tag> —— 兩者分離 symlink 才有意義)。
+RUN_ROOT="${POCKET_BRIDGE_RUN_ROOT:-$INSTALL_ROOT}"
+RUN_VENV="${POCKET_BRIDGE_RUN_VENV:-$RUN_ROOT/venv}"
 BRIDGE_PORT="${POCKET_BRIDGE_PORT:-8081}"
 ENV_DIR="${POCKET_ENV_DIR:-$HOME/.config/pocket-lobster}"
 ENV_FILE="$ENV_DIR/bridge.env"
@@ -418,12 +422,12 @@ Description=Pocket bridge (lobster host)
 After=network-online.target
 
 [Service]
-WorkingDirectory=$INSTALL_ROOT
+WorkingDirectory=$RUN_ROOT
 EnvironmentFile=$ENV_FILE
 Environment=PATH=$NODE_ROOT/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
 # 預設只綁 loopback:對外唯一入口是 cloudflared tunnel(或自建 Tailscale)。
 # 要開 LAN 直連請以 POCKET_BRIDGE_BIND=0.0.0.0 重跑安裝器(明確選擇,不是預設)。
-ExecStart=$BRIDGE_VENV/bin/python -m uvicorn bridge:app --host $BRIDGE_BIND --port $BRIDGE_PORT --timeout-graceful-shutdown 3
+ExecStart=$RUN_VENV/bin/python -m uvicorn bridge:app --host $BRIDGE_BIND --port $BRIDGE_PORT --timeout-graceful-shutdown 3
 Restart=always
 RestartSec=3
 
@@ -544,6 +548,34 @@ fi
 systemctl --user daemon-reload \
   || die "systemctl --user 不可用(XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-未設})。
   若是從 ssh 重跑,改用:  sudo machinectl shell pocket@  然後在裡面跑本腳本"
+# ── 自動更新器(2026-11-02,艦隊規模化)──────────────────────────────────
+# 每天問一次 lobster-v* tag;沒有 tag = 無事退場,所以預設開著零風險。
+# 發版=打 tag(有意識的動作),main 是開發線艦隊不追。
+if [ -f "$SOURCE_ROOT/deploy/lobster-update.sh" ]; then
+  install -m 0755 "$SOURCE_ROOT/deploy/lobster-update.sh" "$HOME/.local/bin/lobster-update.sh"
+  cat > "$UNIT_DIR/pocket-bridge-update.service" <<UNIT
+[Unit]
+Description=Pocket lobster bridge auto-update (oneshot)
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/lobster-update.sh
+UNIT
+  cat > "$UNIT_DIR/pocket-bridge-update.timer" <<UNIT
+[Unit]
+Description=Pocket lobster bridge auto-update (daily)
+[Timer]
+OnBootSec=15min
+OnUnitActiveSec=24h
+RandomizedDelaySec=3600
+[Install]
+WantedBy=timers.target
+UNIT
+  systemctl --user daemon-reload 2>/dev/null || true
+  systemctl --user enable --now pocket-bridge-update.timer 2>/dev/null \
+    || log_step "update timer 啟用失敗(重登後 systemctl --user enable --now pocket-bridge-update.timer)"
+  log_step "自動更新器已就位(每日檢查 lobster-v* tag)"
+fi
+
 loginctl enable-linger "$USER" 2>/dev/null || log_step "enable-linger 失敗(無 sudo?)— 登出後服務會停,可稍後手動: sudo loginctl enable-linger $USER"
 
 log_step "啟動服務"

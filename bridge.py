@@ -31385,6 +31385,17 @@ async def _agent_agy_logged_in() -> bool:
         return False
 
 
+def _lobster_release() -> str:
+    """這份部署的 release tag(lobster-update.sh 寫的 .lobster-release)。
+    非釘版(開發機/舊佈局)回空字串 —— 誠實說「沒釘」,不編版本號。"""
+    try:
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               ".lobster-release"), encoding="utf-8") as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
 def _host_capabilities() -> dict:
     """這台龍蝦主機支援哪些 provider — 給 app 依能力顯示/隱藏功能,而不是
     讓不支援的功能看起來像壞掉(Windows/精簡安裝沒有 tmux/CC 時尤其重要)。
@@ -31416,7 +31427,10 @@ async def health(agents: int = 0):
            "subsessions": len(SUBSESSIONS),
            "bg_tasks": len(_BG_TASKS),
            "turns_in_flight": inflight,
-           "capabilities": _host_capabilities()}
+           "capabilities": _host_capabilities(),
+           # 釘版 release(lobster-update.sh 落的戳;非釘版部署=無此欄)。
+           # 艦隊面板(Appsmith)靠它看「哪台跑哪版、誰落後」。
+           "release": _lobster_release()}
     # `?agents=1`:**CC / CX 也在忙嗎**(2026-10-10 實害)。
     #
     # turns_in_flight 只數人格回合,對 CC/CX 完全沒有概念。機主 08:28 還在跑
