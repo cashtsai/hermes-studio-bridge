@@ -31113,12 +31113,27 @@ _GM_AGY_LOGIN_TTL = 300.0       # agy 自己的授權窗 60s,給足重試餘裕
 _AGY_AUTH_URL_RE = re.compile(r"https://accounts\.google\.com/o/oauth2/auth\?\S+")
 
 
+def _gm_agy_login_kill(entry: dict) -> None:
+    """收掉 PTY + 子行程。**自帶、不借用 CC 的版本** —— 龍蝦快照上 CC login
+    被改寫成無 PTY、_cc_login_kill 不存在,借用會 NameError(2026-11-02 實踩,
+    SG 部署當場 500)。"""
+    try:
+        os.close(entry["master_fd"])
+    except OSError:
+        pass
+    try:
+        os.kill(entry["pid"], 9)
+        os.waitpid(entry["pid"], 0)
+    except (ProcessLookupError, ChildProcessError, OSError):
+        pass
+
+
 def _gm_agy_login_reap_locked(now: float) -> None:
     for lid in [k for k, v in _GM_AGY_LOGIN.items()
                 if now - v["created"] > _GM_AGY_LOGIN_TTL]:
         v = _GM_AGY_LOGIN.pop(lid, None)
         if v:
-            _cc_login_kill(v)           # 同形 entry(master_fd/pid),直接重用
+            _gm_agy_login_kill(v)
 
 
 def _agy_login_env() -> dict:
@@ -31205,12 +31220,12 @@ async def app_gemini_google_login_start(request: Request):
         _log_exc("gemini_google_login_spawn", e, expected=False)
         raise http_err(503, "AGY_SPAWN_FAILED", "啟動 Google 登入失敗")
     if already:
-        _cc_login_kill({"master_fd": master_fd, "pid": pid})
+        _gm_agy_login_kill({"master_fd": master_fd, "pid": pid})
         _log_event("gemini_google_login_already")
         return {"ok": True, "provider": "gemini", "mode": "already",
                 "login_id": "", "url": "", "user_code": None}
     if url is None:
-        _cc_login_kill({"master_fd": master_fd, "pid": pid})
+        _gm_agy_login_kill({"master_fd": master_fd, "pid": pid})
         raise http_err(502, "AGY_LOGIN_NO_URL", "沒能從 agy 取得登入連結")
     lid = secrets.token_urlsafe(18)
     now = time.time()
