@@ -10179,6 +10179,15 @@ def _sort_public_by_sse(urls: list) -> list:
     return sorted(urls, key=rank)
 
 
+def _pair_self_reachable(ip: str) -> bool:
+    """bridge 在這個 IP 上真的聽得到嗎(綁 loopback 時答案是否)。"""
+    try:
+        with socket.create_connection((ip, _BRIDGE_PORT), timeout=0.4):
+            return True
+    except OSError:
+        return False
+
+
 def _pair_host_candidates(force: bool = False):
     """依優先序的連線候選(同 pocket-pair.py 的 QR payload v2 語意):
     1) 私網直連 2) tailnet 3) 公網 tunnel。快取 30s,tailscale 探測不便宜。
@@ -10189,7 +10198,11 @@ def _pair_host_candidates(force: bool = False):
         return list(_PAIR_HOSTS_CACHE["hosts"]), _PAIR_HOSTS_CACHE["tailscale"]
     hosts = []
     lan = _pair_lan_ip()
-    if lan:
+    # 直連候選要**先驗自己真的在那裡聽**:bridge 綁 127.0.0.1(龍蝦安全
+    # 預設)時,報 LAN/公網 IP 出去就是一個死候選 —— 手機排它最前面,
+    # 每次連線都先白試一輪再換道(2026-11-02 全新機驗收抓到)。
+    # 用行為判定(真連一次),不猜設定:unit 的 --host 不在 env 裡。
+    if lan and _pair_self_reachable(lan):
         hosts.append("http://%s:%d" % (lan, _BRIDGE_PORT))
     ts = _pair_tailscale_host()
     if ts:
