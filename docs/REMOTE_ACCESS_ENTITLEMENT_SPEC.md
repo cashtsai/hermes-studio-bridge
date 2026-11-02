@@ -4,8 +4,8 @@
 > （收據綁裝置）、**遠端維持擋檔案面**（其餘全開）。
 > 本文件是實作依據 —— **改實作先改這裡**。狀態：**規格，未實作**。
 >
-> 相關：`CONSOLE_QR_LOGIN_SPEC.md`（認證機制）、
-> `POCKET_SERVICE_PRICING_HANDOFF.md`（拓撲現況與產品化目標、Dedicated Lobster）。
+> 相關：QR 登入認證機制設計(威脅模型已移至非公開筆記,不在此 repo)、
+> `POCKET_SERVICE_PRICING_HANDOFF.md`(拓撲現況與產品化目標、Dedicated Lobster)。
 
 ## 0. 一句話
 
@@ -186,8 +186,9 @@ relay 轉送的是終端機/卡片流/檔案上傳，成本隨用量走。第一
 ## 10. 實作順序（依「沒有就不能賣」排序）
 
 ### 第 0 階段：先把 QR 登入做完（前置）
-見 `CONSOLE_QR_LOGIN_SPEC.md` §16：入口分流 + token scope（擋 `/file`、
-`/filediff`）+ iOS/Android 批准頁。**這一階段完全不碰收費**，而且就算收費
+見 `APP_BRIDGE_CONTRACT.md` §16(端點契約;完整威脅模型已移至非公開筆記):
+入口分流 + token scope(擋 `/file`、`/filediff`)+ iOS/Android 批准頁。
+**這一階段完全不碰收費**，而且就算收費
 永遠不做，它本身也有價值（tailnet/LAN 的 QR 登入比六碼好用）。
 
 ### 第 1 階段：多租戶 relay（G1，最大的工程）
@@ -222,8 +223,7 @@ Play Billing + 批准頁，照 `IOS_PARITY.md` 流程追。
 
 - 不承諾「Mac 睡著也能用」（§7 第 3 點是研究項，不是功能）。
 - 不承諾跨平台一次購買（§5，無帳號的直接後果）。
-- 不承諾遠端檔案瀏覽（機主拍板擋檔案面；見
-  `CONSOLE_QR_LOGIN_SPEC.md` §9）。
+- 不承諾遠端檔案瀏覽（機主拍板擋檔案面；見 `APP_BRIDGE_CONTRACT.md` §16.5）。
 - 不承諾按量計費或無限流量（§9）。
 
 **銷售文案不得超出這個清單。** 賣超過能力範圍的東西，退款與負評的成本遠高於
