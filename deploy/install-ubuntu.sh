@@ -48,6 +48,14 @@ INSTALL_OPENCLAW="${POCKET_INSTALL_OPENCLAW:-1}"
 # 在龍蝦上唯一站得住的做法。
 INSTALL_CLAUDE="${POCKET_INSTALL_CLAUDE:-1}"
 INSTALL_CODEX="${POCKET_INSTALL_CODEX:-1}"
+# Antigravity(agy):Gemini 訂閱引擎(gemini CLI 個人 OAuth 已死,見
+# docs/GEMINI_AUTH_DECISION_20261101.md)。使用者在 App 按「用 Google 登入」
+# 要有 agy 在機上等著 —— 不裝的話 Gemini 頁籤開箱即壞。
+INSTALL_AGY="${POCKET_INSTALL_AGY:-1}"
+# frpc:付費中繼的客戶端。訂閱者按「開啟中繼」時 bridge 要 spawn 它 ——
+# 不裝的話 relay/status 永遠 no_binary(2026-11-02 SG 龍蝦實踩,手動補裝)。
+INSTALL_FRPC="${POCKET_INSTALL_FRPC:-1}"
+FRPC_VERSION="${POCKET_FRPC_VERSION:-0.61.1}"   # 與 frps 同版釘死
 # Codex 走 npm(官方套件 @openai/codex,bin=codex);版本釘死,理由同 openclaw。
 CODEX_VERSION="${CODEX_VERSION:-0.166.0}"
 HERMES_REPO_URL="${HERMES_REPO_URL:-https://github.com/NousResearch/hermes-agent.git}"
@@ -152,6 +160,12 @@ grep -q '^POCKET_CONSOLE_REMOTE_FILE_ROOTS=' "$ENV_FILE" || printf 'POCKET_CONSO
 # (CC setup-token / Codex device-auth / Gemini 貼 key)。旗標在 bridge.py 預設
 # 關(404),mac 版維持關(走桌面控制台);龍蝦這台一定要開,否則三個引擎都登不了。
 grep -q '^POCKET_AGENT_LOGIN_IN_APP=' "$ENV_FILE" || printf 'POCKET_AGENT_LOGIN_IN_APP=%s\n' "${POCKET_AGENT_LOGIN_IN_APP:-1}" >> "$ENV_FILE"
+# ── 新架構預設(2026-11-02)──────────────────────────────────────────────
+# Gemini 引擎:antigravity(Google 登入=免費/訂閱額度)。gemini CLI 的個人
+# OAuth 被 Google 封了,留在預設 gemini 等於「開箱 Gemini 只能貼付費 key」。
+grep -q '^POCKET_GEMINI_BACKEND=' "$ENV_FILE" || printf 'POCKET_GEMINI_BACKEND=%s\n' "${POCKET_GEMINI_BACKEND:-antigravity}" >> "$ENV_FILE"
+# 中繼掛哪個區(SG=產品預設區;claim 時伺服器不認得的值會 400)。
+grep -q '^POCKET_RELAY_REGION=' "$ENV_FILE" || printf 'POCKET_RELAY_REGION=%s\n' "${POCKET_RELAY_REGION:-sg}" >> "$ENV_FILE"
 chmod 600 "$ENV_FILE"
 
 # ── 配對 boot code(既有就沿用;bridge 啟動也會自產,這裡先產好以便印連結) ──
@@ -319,6 +333,32 @@ if [ "$INSTALL_CODEX" = "1" ] && ! command -v codex >/dev/null 2>&1; then
   else
     printf '⚠️  Codex 沒裝成 —— 這台龍蝦的 Codex 頁籤會是關的,其餘功能不受影響。\n' >&2
   fi
+fi
+
+if [ "$INSTALL_AGY" = "1" ] && ! command -v agy >/dev/null 2>&1 \
+     && [ ! -x "$HOME/.local/bin/agy" ]; then
+  log_step "安裝 Antigravity CLI(agy)"
+  # 官方 installer 裝到 ~/.local/bin/agy;它自帶背景自更新,不提供版本釘選。
+  if curl -fsSL https://antigravity.google/cli/install.sh | bash >/dev/null 2>&1 \
+       && [ -x "$HOME/.local/bin/agy" ]; then
+    log_step "  agy $("$HOME/.local/bin/agy" --version 2>/dev/null | head -1)"
+  else
+    printf '⚠️  agy 沒裝成 —— Gemini「用 Google 登入」會不可用(可改貼 API key)。\n' >&2
+  fi
+fi
+
+if [ "$INSTALL_FRPC" = "1" ] && [ ! -x "$HOME/.local/bin/frpc" ]; then
+  log_step "安裝 frpc $FRPC_VERSION(付費中繼客戶端)"
+  FRP_ARCH="$(uname -m)"; case "$FRP_ARCH" in x86_64) FRP_A=amd64;; aarch64) FRP_A=arm64;; *) FRP_A="$FRP_ARCH";; esac
+  FRP_TMP="$(mktemp -d)"
+  if curl -fsSL "https://github.com/fatedier/frp/releases/download/v${FRPC_VERSION}/frp_${FRPC_VERSION}_linux_${FRP_A}.tar.gz" \
+       | tar -xz -C "$FRP_TMP" --strip-components=1 \
+       && install -m 0755 "$FRP_TMP/frpc" "$HOME/.local/bin/frpc"; then
+    log_step "  frpc $("$HOME/.local/bin/frpc" --version 2>/dev/null)"
+  else
+    printf '⚠️  frpc 沒裝成 —— 中繼開關會回 no_binary,其餘功能不受影響。\n' >&2
+  fi
+  rm -rf "$FRP_TMP"
 fi
 
 # ── node 要進登入 PATH(2026-10-31 實機抓到,修正版)─────────────────────
