@@ -31182,13 +31182,18 @@ async def app_gemini_google_login_start(request: Request):
                 url = m.group(0).rstrip(".,)")
         if url is None:
             # 行程可能已自己答完(已登入)。exit 0 且沒印 auth URL = already。
-            try:
-                wpid, status = os.waitpid(pid, os.WNOHANG)
-                if wpid != 0 and os.WIFEXITED(status) \
-                        and os.WEXITSTATUS(status) == 0:
-                    return master_fd, pid, None, True
-            except (ChildProcessError, OSError):
-                pass
+            # ⚠️ EOF 會比行程退出早半拍 —— 單發 WNOHANG 常撲空,把「已登入」
+            # 誤判成 AGY_LOGIN_NO_URL(2026-11-03 Mac 實踩)。給 3 秒等待窗。
+            wait_until = time.time() + 3
+            while time.time() < wait_until:
+                try:
+                    wpid, status = os.waitpid(pid, os.WNOHANG)
+                except (ChildProcessError, OSError):
+                    return master_fd, pid, None, True   # 已被收屍 = 已結束
+                if wpid != 0:
+                    ok = os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
+                    return master_fd, pid, None, ok
+                time.sleep(0.2)
         return master_fd, pid, url, False
 
     try:
