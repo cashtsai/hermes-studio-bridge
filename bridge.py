@@ -2629,12 +2629,32 @@ async def _event_wait(session: str, seen_ver: int) -> None:
 
 
 def _event_append(session: str, etype: str, payload: dict,
-                  external_id: str | None = None) -> int:
+                  external_id: str | None = None,
+                  con=None) -> int:
     """Append 一筆事件,回傳全域 seq(=event_log.id);0 表示去重略過或寫入
     失敗。絕不 raise — 鏡射寫入掛在既有熱路徑上(_canon_add/_report_upsert/
-    合併掃描),event_log 故障只能降級成「新路徑落後」,不准拖垮舊路徑。"""
+    合併掃描),event_log 故障只能降級成「新路徑落後」,不准拖垮舊路徑。
+
+    `con`(2026-11-03,照 t3code 的「事件+投影同一交易」):呼叫端把**自己
+    已開的 CANON_DB connection** 傳進來 → 事件與呼叫端的正典寫入落在
+    **同一個交易**,一起 commit 或一起消失 —— 「canonical 有、event_log
+    沒有」的副本落後窗從結構上關閉。此模式下:
+      · 不 commit/不 close(交易歸呼叫端);
+      · 不碰 _EVENT_SEEN 快取(交易可能被 rollback,快取會毒化冪等;
+        DB 的 external_id UNIQUE 照樣守住);
+      · **不 notify** —— 通知必須等 commit 之後(WAL 下其他連線看不到
+        未提交列,先叫醒訂閱者只會讓它白查一輪),呼叫端 commit 後自己
+        呼 _event_notify(session)。
+    """
     import sqlite3
     try:
+        if con is not None:
+            cur = con.execute(
+                "INSERT OR IGNORE INTO event_log(session,type,external_id,payload,created_at) "
+                "VALUES(?,?,?,?,?)",
+                (session, etype, external_id,
+                 json.dumps(payload, ensure_ascii=False), time.time()))
+            return int(cur.lastrowid or 0) if cur.rowcount else 0
         if external_id and external_id in _EVENT_SEEN.get(session, ()):
             return 0
         con = sqlite3.connect(CANON_DB, timeout=30)
@@ -2769,9 +2789,11 @@ def _event_msg_key(m: dict) -> str:
     return f"{m.get('source') or 'app'}:{m.get('id')}:{h}"
 
 
-def _event_mirror_messages(session: str, msgs: list) -> int:
+def _event_mirror_messages(session: str, msgs: list, con=None) -> int:
     """把一批 app-shape 訊息 dict 鏡射進 event_log(冪等,靠 external_id
-    去重)。回傳真正新寫入的筆數。絕不 raise。"""
+    去重)。回傳真正新寫入的筆數。絕不 raise。
+    `con` 有值 = 併進呼叫端交易(見 _event_append),呼叫端 commit 後
+    記得自己 _event_notify(session)。"""
     n = 0
     for m in msgs or []:
         try:
@@ -2780,7 +2802,7 @@ def _event_mirror_messages(session: str, msgs: list) -> int:
             _log_exc("_event_mirror_messages", _exc, expected=True)
             continue
         if _event_append(session, "message.upsert", {"message": m},
-                         external_id=key):
+                         external_id=key, con=con):
             n += 1
     return n
 
@@ -2932,15 +2954,19 @@ def _canon_add(session: str, role: str, content: str, attachments=None,
                         "VALUES(?,?,?,?,?,?,?,?)",
                         (mid, session, role, content, json.dumps(attachments or [], ensure_ascii=False),
                          now, status, client_id))
+            # Sync engine P1→P1.5(2026-11-03,抄 t3code):鏡射**併進同一個
+            # 交易** —— 原本 commit 完才另開連線鏡射,中間斷掉就是「canonical
+            # 有、event_log 沒有」,正是列表預覽/未讀落後的病灶之一。現在
+            # messages 與 message.upsert 事件一起 commit、一起消失。
+            mirrored = _event_mirror_messages(session, [{
+                "id": mid, "role": role, "content": content,
+                "attachments": attachments or [], "ts": now, "status": status,
+                "client_id": client_id, "source": "app"}], con=con)
             con.commit()
             con.close()
             _canon_notify(session)
-            # Sync engine P1:App 訊息寫入點順便鏡射進 event_log(雙寫過渡)。
-            # payload 形狀對齊 _canon_messages 的輸出,client 兩邊看到同一種訊息。
-            _event_mirror_messages(session, [{
-                "id": mid, "role": role, "content": content,
-                "attachments": attachments or [], "ts": now, "status": status,
-                "client_id": client_id, "source": "app"}])
+            if mirrored:
+                _event_notify(session)
             # P1-3:人格完成一則回覆 → 推播把你叫回 app(前景由 app willPresent 抑制)。
             if push and role == "assistant" and status == "done":
                 _push_persona_reply(session, content)
@@ -3900,16 +3926,17 @@ def _report_upsert(session: str, report: dict) -> str:
             "ingested_at,actions) VALUES(?,?,?,?,?,?,?,?,?,?)",
             (rid, session, label, name, content, ts,
              external_source, external_id, time.time(), actions_json))
+        # 2026-11-03(抄 t3code):鏡射併進同一交易,報告與事件一起 commit。
+        mirrored = 0
+        if not is_diagnostic:
+            mirrored = _event_mirror_messages(session, [_report_msg_shape({
+                "id": rid, "label": label, "content": content, "ts": ts,
+            })], con=con)
         con.commit()
         con.close()
-        # Sync engine P1:cron 晨報寫入點鏡射進 event_log(雙寫過渡)。形狀走
-        # _report_msg_shape = app 在 /app/v1/messages 看到的同一種報告訊息;
-        # 改稿(同 rid 新內容)→ 新鍵 → 追加新事件,同 message id 覆蓋。
-        if not is_diagnostic:
-            _event_mirror_messages(session, [_report_msg_shape({
-                "id": rid, "label": label, "content": content, "ts": ts,
-            })])
-        else:
+        if mirrored:
+            _event_notify(session)
+        if is_diagnostic:
             _log_event("report_event_diagnostic",
                        session=session, label=label, name=name,
                        external_source=external_source)
