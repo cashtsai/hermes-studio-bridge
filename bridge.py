@@ -23157,6 +23157,175 @@ def _provider_caps_payload() -> dict:
     return out
 
 
+# ── Guest links(2026-11-04,抄 t3code:HMAC、零存儲、撤銷即全滅)──────
+#
+# token = base64url(json{sid,exp}) + "." + HMAC(secret, payload)。伺服器
+# **不存任何東西** —— 驗證只需要密鑰;撤銷全部連結 = 刪密鑰檔(下次發
+# 連結自動生新鑰)。密鑰獨立檔案,不用 BRIDGE_TOKEN(那把是全功率 API
+# 鑰,guest 面一旦出事不能陪葬)。
+
+_GUEST_SECRET_PATH = Path(os.path.expanduser("~/.pocket/guest-link-secret"))
+
+
+def _guest_secret() -> bytes:
+    try:
+        b = _GUEST_SECRET_PATH.read_bytes().strip()
+        if len(b) >= 32:
+            return b
+    except FileNotFoundError:
+        pass
+    _GUEST_SECRET_PATH.parent.mkdir(parents=True, exist_ok=True)
+    b = secrets.token_bytes(32)
+    _GUEST_SECRET_PATH.write_bytes(b)
+    try:
+        _GUEST_SECRET_PATH.chmod(0o600)
+    except OSError:
+        pass
+    return b
+
+
+def _guest_sign(payload: bytes) -> str:
+    import hmac as _hmac
+    return base64.urlsafe_b64encode(
+        _hmac.new(_guest_secret(), payload, hashlib.sha256).digest()
+    ).decode().rstrip("=")
+
+
+def _guest_token_make(session_id: str, ttl_secs: int) -> tuple[str, float]:
+    exp = time.time() + ttl_secs
+    payload = json.dumps({"sid": session_id, "exp": exp},
+                         separators=(",", ":")).encode()
+    body = base64.urlsafe_b64encode(payload).decode().rstrip("=")
+    return f"{body}.{_guest_sign(payload)}", exp
+
+
+def _guest_token_verify(token: str) -> str | None:
+    """回 session_id;簽章/格式/過期任一不對 → None。"""
+    import hmac as _hmac
+    try:
+        body, sig = token.split(".", 1)
+        payload = base64.urlsafe_b64decode(body + "=" * (-len(body) % 4))
+        if not _hmac.compare_digest(sig, _guest_sign(payload)):
+            return None
+        obj = json.loads(payload)
+        if float(obj.get("exp") or 0) < time.time():
+            return None
+        sid = str(obj.get("sid") or "")
+        return sid or None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _guest_public_base() -> str:
+    """對外可達的網址底:中繼網址優先(POCKET_TUNNEL_URL)。沒有公網
+    就只好回空 —— 端點會 409,分享功能在純 LAN 配置下本來就不成立。"""
+    return (os.environ.get("POCKET_TUNNEL_URL") or "").rstrip("/")
+
+
+@app.post("/app/v1/guest-links")
+async def guest_link_create(request: Request):
+    _check_auth(request)
+    b = await request.json()
+    sid = str(b.get("session_id") or "").strip()
+    if not sid:
+        raise http_err(400, "BAD_REQUEST", "缺 session_id")
+    ttl = int(b.get("ttl_secs") or 86400)
+    ttl = max(300, min(ttl, 7 * 86400))
+    # 先驗 session 存在(解析失敗這裡就炸,不發死連結)。
+    await _v2_card_store(sid)
+    base = _guest_public_base()
+    if not base:
+        raise http_err(409, "NO_PUBLIC_URL",
+                       "沒有公網位址(未啟用中繼),無法產生可分享連結")
+    token, exp = _guest_token_make(sid, ttl)
+    _log_event("guest_link_created", session=sid, ttl=ttl)
+    return {"url": f"{base}/guest/{token}", "expires_at": exp}
+
+
+def _guest_html(session_id: str, cards: list) -> str:
+    import html as _html
+    rows = []
+    for c in cards:
+        body = c.get("body") or {}
+        text = str(body.get("text") or body.get("fallback_text") or "").strip()
+        if not text:
+            continue
+        role = "you" if c.get("role") == "user" else "agent"
+        rows.append(
+            f'<div class="m {role}"><pre>{_html.escape(text)}</pre></div>')
+    title = _html.escape(session_id)
+    return ("<!doctype html><meta charset='utf-8'>"
+            "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+            "<meta name='robots' content='noindex'>"
+            f"<title>Pocket · {title}</title>"
+            "<style>body{font:15px/1.6 -apple-system,sans-serif;max-width:720px;"
+            "margin:24px auto;padding:0 16px;background:#faf8f5;color:#222}"
+            ".m{margin:10px 0;padding:10px 14px;border-radius:12px}"
+            ".m pre{margin:0;white-space:pre-wrap;word-break:break-word;font:inherit}"
+            ".you{background:#e8e2d8}.agent{background:#fff;border:1px solid #e5e0d8}"
+            "h1{font-size:17px}footer{color:#999;font-size:12px;margin:24px 0}"
+            "</style>"
+            f"<h1>Pocket 對話(唯讀)</h1>{''.join(rows) or '<p>(沒有內容)</p>'}"
+            "<footer>由 Pocket 分享的唯讀快照;連結到期自動失效。</footer>")
+
+
+@app.get("/guest/{token}")
+async def guest_view(token: str):
+    """**無 auth,刻意的** —— 認證就是 token 本身(HMAC+exp)。只讀、只
+    渲染文字、HTML 轉義、noindex;壞/過期一律 410 不區分(不給探測面)。"""
+    sid = _guest_token_verify(token)
+    if not sid:
+        raise HTTPException(status_code=410, detail="連結已失效")
+    try:
+        store = await _v2_card_store(sid)
+    except Exception:  # noqa: BLE001
+        raise HTTPException(status_code=410, detail="連結已失效")
+    snap = store.snapshot(limit=300)
+    return HTMLResponse(_guest_html(sid, snap.get("cards") or []))
+
+
+# ── Usage summary(2026-11-04,抄 t3code usage 面板的資料面)────────────
+
+
+@app.get("/app/v1/usage/summary")
+async def usage_summary(request: Request, window: str = "7d"):
+    """按 provider 匯總的用量。v1 資料源是 event_log(turn/訊息里程碑),
+    **tokens 誠實回 null** —— bridge 目前不持久化 token 計數,顯示假數
+    比沒有更糟;等 provider usage 落 event_log 後同一個端點自然長出來。"""
+    _check_auth(request)
+    days = {"1d": 1, "7d": 7, "30d": 30}.get(window, 7)
+    cutoff = time.time() - days * 86400
+    import sqlite3
+    per: dict = {}
+    try:
+        con = sqlite3.connect(CANON_DB, timeout=30)
+        try:
+            rows = con.execute(
+                "SELECT session, type, COUNT(*) FROM event_log"
+                " WHERE created_at > ? AND type IN"
+                " ('turn','card.milestone','message.upsert')"
+                " GROUP BY session, type", (cutoff,)).fetchall()
+        finally:
+            con.close()
+    except Exception:  # noqa: BLE001
+        rows = []
+    for session, etype, n in rows:
+        prov = str(session).split(":", 1)[0] if ":" in str(session) else "hermes"
+        d = per.setdefault(prov, {"provider": prov, "turns": 0, "messages": 0,
+                                  "tokens_in": None, "tokens_out": None,
+                                  "est_cost_usd": None})
+        if etype == "turn":
+            # begin/end 成對,一回合算一次。
+            d["turns"] += n // 2 if n >= 2 else n
+        else:
+            d["messages"] += n
+    providers = sorted(per.values(), key=lambda x: -(x["turns"] + x["messages"]))
+    total = {"turns": sum(p["turns"] for p in providers),
+             "messages": sum(p["messages"] for p in providers),
+             "tokens_in": None, "tokens_out": None, "est_cost_usd": None}
+    return {"window": f"{days}d", "providers": providers, "total": total}
+
+
 @app.get("/app/v2/providers/capabilities")
 async def v2_provider_capabilities(request: Request):
     """App 的「按能力渲染」資料源:不支援=不顯示,而不是按了才壞。"""
