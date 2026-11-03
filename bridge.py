@@ -9024,6 +9024,22 @@ async def _codex_thread_set_archived(thread_id: str, archived: bool = True) -> s
     raise last or Exception("archive failed")
 
 
+def _default_session_cwd() -> str:
+    """新 session 沒帶 cwd 時的預設工作目錄。
+
+    原本直接用 HOME_ROOT(~/apps/hermes-agent/home)—— 在機主的 Mac 上合理,
+    但那是 persona gateway 的內部目錄:(1) app 列表會把這個目錄的 thread
+    當 gateway 內部 thread 藏掉,使用者「開了對話卻看不到」(2026-11-03
+    雲端龍蝦實測);(2) 代管龍蝦沒裝 Hermes,該目錄根本不存在。
+    改成:HOME_ROOT 存在(= 有 Hermes 的機器)照舊;否則給 ~/work。
+    """
+    if os.path.isdir(HOME_ROOT):
+        return HOME_ROOT
+    d = os.path.expanduser("~/work")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
 @app.post("/codexsessions")
 async def codex_session_create(request: Request):
     _check_auth(request)
@@ -9034,7 +9050,7 @@ async def codex_session_create(request: Request):
                                            str(body.get("stt_lang") or ""))
     if not input_items:
         raise HTTPException(status_code=400, detail="text or attachment required")
-    cwd = body.get("cwd") or HOME_ROOT
+    cwd = body.get("cwd") or _default_session_cwd()
     params = {
         "cwd": cwd,
         "ephemeral": False,
