@@ -14,6 +14,7 @@ Run:  uvicorn bridge:app --host 0.0.0.0 --port 8081
 import asyncio
 import base64
 import carddigest
+import codecs
 import collections
 import contextlib
 import contextvars
@@ -12547,6 +12548,19 @@ async def app_v1_terminal(websocket: WebSocket):
                mode="tmux" if tmux_bin else "shell")  # no keystrokes/output
 
     loop = asyncio.get_running_loop()
+    # **每個連線自己的解碼器狀態**,不能是模組層全域 —— 多個終端機分頁/多個
+    # 使用者同時連線時,共用一個 incremental decoder 會讓彼此的半個 UTF-8
+    # 位元組序列互相污染,比沒有緩衝還糟。
+    #
+    # 為什麼需要這個:os.read() 一次讀 65536 bytes,CJK 字元是 3-byte UTF-8
+    # 序列,65536 不是 3 的倍數,長時間輸出中文(機主自己的 CLI 工具滿滿中文
+    # 介面)遲早會剛好讀到切一半的字元中間。原本 `data.decode("utf-8",
+    # "replace")` 對每次讀取獨立解碼,切一半的那個字元連同緊接在後面、本來
+    # 完整的下一個字元**一起**變成亂碼(U+FFFD 或錯位字元),使用越久、
+    # 中文輸出越多,撞到的機率越高 —— 正是「常常使用的時候排版跑掉」的形狀。
+    # IncrementalDecoder 會把不完整的尾巴留著,等下一次讀取的位元組接上去
+    # 才解碼,EOF 時才用 final=True 強制吐出(可能真的壞掉的)剩餘部分。
+    utf8_decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
 
     def _read_master() -> bytes:
         try:
@@ -12559,10 +12573,16 @@ async def app_v1_terminal(websocket: WebSocket):
         while True:
             data = await loop.run_in_executor(None, _read_master)
             if not data:
+                tail = utf8_decoder.decode(b"", final=True)
+                if tail:
+                    try:
+                        await websocket.send_text(json.dumps({"type": "output", "data": tail}))
+                    except Exception as _exc:  # noqa: BLE001
+                        _log_exc("app_v1_terminal.pump_output_final", _exc, expected=True)
                 return
             try:
                 await websocket.send_text(json.dumps(
-                    {"type": "output", "data": data.decode("utf-8", "replace")}))
+                    {"type": "output", "data": utf8_decoder.decode(data)}))
             except Exception as _exc:  # noqa: BLE001 — socket went away mid-send
                 _log_exc("app_v1_terminal.pump_output", _exc, expected=True)
                 return
