@@ -29511,6 +29511,39 @@ def _approval_provider_of(source: str) -> str:
     return "hermes"
 
 
+def _approval_response_capability(aid: str, provider: str, src: str,
+                                  status: str) -> str:
+    """這筆審批現在**答得動嗎**(2026-11-04,抄 t3code responseCapability)。
+
+    pending 不等於可答:等待者是記憶體的(CC 的 pane 對位、cc2/codex 的
+    waiter dict、gemini 的 future),bridge 重啟/逾時後 DB 列還掛著
+    pending,app 讓人按下去只會收 409 —— 「答了沒人收」的靜默失敗家族。
+    回 "live"(等待者在)/"not_resumable"(死了,UI 該灰掉按鈕)/
+    "none"(已決,沒有回答這回事)。判不出來回 live —— 寧可讓人按、
+    409 守底,也不要把活的請求誤標成死的。openclaw 真相在 gateway,
+    bridge 鏡像判不了死活,一律 live。
+    """
+    if status != "pending":
+        return "none"
+    try:
+        if src.startswith("claude_code:"):
+            name = src.split(":", 1)[1]
+            a = _CC_APPROVAL_ACTIVE.get(name)
+            return "live" if a and a.get("aid") == aid else "not_resumable"
+        if src.startswith("cc2:"):
+            w = cc_sdk.registry().pending_approvals.get(aid)
+            return "live" if w and w.get("decision") is None else "not_resumable"
+        if src.startswith("codex"):
+            return ("live" if aid in getattr(CODEX_APP, "pending_approvals", {})
+                    else "not_resumable")
+        if src.startswith("gemini:"):
+            fut = _GM_PERM_WAITERS.get(aid)
+            return "live" if fut is not None and not fut.done() else "not_resumable"
+    except Exception:  # noqa: BLE001
+        pass
+    return "live"
+
+
 def _approval_row(r):
     """DB tuple(_APPROVAL_COLS 序)→ 統一 approval 物件(spec §1)。
     舊欄位全保留(相容期);新欄位缺值時由 source 推導 — 遷移前的舊列與
@@ -29537,6 +29570,8 @@ def _approval_row(r):
            "provider": r[11] or _approval_provider_of(src),
            "kind": kind,
            "options": options or _approval_default_options(kind)}
+    out["response_capability"] = _approval_response_capability(
+        out["id"], out["provider"], src, str(out["status"] or ""))
     if isinstance(meta, dict) and meta:
         out["meta"] = meta
     return out
@@ -29960,6 +29995,18 @@ async def _approval_decide_core(aid: str, b: dict) -> dict:
             b.get("decision") or b.get("status") or b.get("action") or "").strip():
         b = {**b, "approve": _approval_bool_from_body(b)}
     d = _approval_get_row(aid)
+    # 冪等收據(2026-11-04,抄 t3code「重送只回收據」):已決的審批再被
+    # POST 一次 —— 推播點一次、app 裡又點一次、兩台裝置同時按 —— 第二下
+    # 原本會掉進各 provider 分支換來 409「already decided」,使用者看到的
+    # 是「我批准了然後它報錯」。已決就回實際結果收據,不嚇人也不重送;
+    # 409 保留給「還 pending 但等待者已死」的真失效。
+    _terminal = {"approved", "denied", "rejected", "answered",
+                 "acknowledged", "expired"}
+    if d and str(d.get("status") or "") in _terminal:
+        out = {"id": aid, "status": d.get("status"), "idempotent": True}
+        if d.get("result"):
+            out["result"] = d.get("result")
+        return out
     src = str((d or {}).get("source") or "")
     if d and src.startswith("claude_code:"):
         # 批次 3 斷點③:CC 審核決議 → 回流 TUI 鍵。以「當下 pane 的 prompt」

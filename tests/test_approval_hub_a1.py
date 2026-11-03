@@ -101,13 +101,21 @@ class TestDecideCore(unittest.TestCase):
         con.commit()
         con.close()
 
-    def test_permission_key_and_409(self):
+    def test_permission_key_then_idempotent_receipt(self):
+        """重答已決的審批 → 冪等收據(2026-11-04,抄 t3code)。
+
+        原本斷言 409 —— 但「推播點一次、app 又點一次」的第二下看到
+        409 等於「我批准了然後它報錯」。已決回實際結果收據;409 保留
+        給 pending-but-waiter-dead 的真失效。"""
         self._mk("p1", "permission")
         r = self._decide("p1", {"key": "approve"})
         self.assertEqual(r["status"], "approved")
-        with self.assertRaises(HTTPException) as cm:
-            self._decide("p1", {"key": "approve"})
-        self.assertEqual(cm.exception.status_code, 409)
+        r2 = self._decide("p1", {"key": "approve"})
+        self.assertEqual(r2["status"], "approved")
+        self.assertTrue(r2.get("idempotent"))
+        # 反向重答也回收據(告知實況),不騙使用者「已拒絕」。
+        r3 = self._decide("p1", {"key": "deny"})
+        self.assertEqual(r3["status"], "approved")
 
     def test_permission_deny_writes_denied(self):
         self._mk("p2", "permission")
