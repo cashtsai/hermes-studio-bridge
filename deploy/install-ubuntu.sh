@@ -347,6 +347,14 @@ if [ "$INSTALL_CODEX" = "1" ] && ! command -v codex >/dev/null 2>&1; then
   fi
 fi
 
+# CC 首啟 onboarding(主題選單+安全須知)會把 composer 卡死 —— 全新機第一句
+# 話直接 CC_INPUT_NOT_ACCEPTED(composer_stuck),app 端還 blocked:false 無從
+# 引導(2026-11-03 驗收機實踩)。預埋完成旗標,開箱即可對話。
+if [ ! -f "$HOME/.claude.json" ]; then
+  printf '{"hasCompletedOnboarding": true, "theme": "dark"}\n' > "$HOME/.claude.json"
+  log_step "預埋 CC onboarding 完成旗標(~/.claude.json)"
+fi
+
 if [ "$INSTALL_AGY" = "1" ] && ! command -v agy >/dev/null 2>&1 \
      && [ ! -x "$HOME/.local/bin/agy" ]; then
   log_step "安裝 Antigravity CLI(agy)"
