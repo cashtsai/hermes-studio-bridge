@@ -23095,6 +23095,75 @@ _V2_SESSION_OPS: dict = {
 }
 
 
+#: Provider 能力宣告(2026-11-04,抄 t3code provider-capability-system)。
+#: 原則:**orchestration 與 app 讀 capability,不讀 provider 名字** ——
+#: app 之前每家各寫一套 if provider ==,bridge 加了能力 app 不知道、
+#: bridge 沒有的能力 app 畫了按鈕按下去 404(「管線存在≠端到端通」的
+#: 客戶端版)。這張表是**宣告**:錯報有害(UI 藏掉活功能/畫出死按鈕),
+#: 不確定的旗標寧可保守並附判準註解。ops 不在這裡宣告 —— 直接從
+#: _V2_SESSION_OPS 推導,單一真相不會漂移。
+#:
+#: 欄位判準:
+#:   interrupt        能不能中斷進行中的回合(CC=tmux Esc、cc2=SDK、
+#:                    codex=turn interrupt;gemini 的 agy ACP 沒有中斷面)
+#:   queued_messages  忙碌時送訊息會排隊而不是被吃掉
+#:   streaming        live=逐字串流;poll=輪詢快照
+#:   terminal_status_quality  strong=協定有明確回合終態;weak=靠啟發式
+#:                    (CC pane 判讀就是 weak —— composer_stuck 病史)
+#:   approvals        有審批面
+#:   approval_callbacks_live_only  等待者是記憶體的,bridge 重啟即不可答
+#:                    (對應 approvals 列的 response_capability 判定)
+#:   native_id_strength  strong=provider 原生穩定 id;weak=名字/路徑類
+_PROVIDER_CAPS: dict = {
+    "claude_code": {
+        "interrupt": True, "queued_messages": True, "streaming": "live",
+        "terminal_status_quality": "weak", "approvals": True,
+        "approval_callbacks_live_only": True, "native_id_strength": "weak",
+    },
+    "cc2": {
+        "interrupt": True, "queued_messages": True, "streaming": "live",
+        "terminal_status_quality": "strong", "approvals": True,
+        "approval_callbacks_live_only": True, "native_id_strength": "strong",
+    },
+    "codex": {
+        "interrupt": True, "queued_messages": True, "streaming": "live",
+        "terminal_status_quality": "strong", "approvals": True,
+        "approval_callbacks_live_only": True, "native_id_strength": "strong",
+    },
+    "gemini": {
+        "interrupt": False, "queued_messages": True, "streaming": "live",
+        "terminal_status_quality": "strong", "approvals": True,
+        "approval_callbacks_live_only": True, "native_id_strength": "weak",
+    },
+    "openclaw": {
+        "interrupt": False, "queued_messages": True, "streaming": "live",
+        "terminal_status_quality": "strong", "approvals": True,
+        # 審批真相在 gateway(durable),bridge 重啟不滅 —— 不是 live-only。
+        "approval_callbacks_live_only": False, "native_id_strength": "strong",
+    },
+    "hermes": {
+        "interrupt": False, "queued_messages": True, "streaming": "live",
+        "terminal_status_quality": "strong", "approvals": True,
+        "approval_callbacks_live_only": False, "native_id_strength": "strong",
+    },
+}
+
+
+def _provider_caps_payload() -> dict:
+    out = {}
+    for prov, caps in _PROVIDER_CAPS.items():
+        ops = sorted(op for op, tbl in _V2_SESSION_OPS.items() if prov in tbl)
+        out[prov] = {**caps, "ops": ops}
+    return out
+
+
+@app.get("/app/v2/providers/capabilities")
+async def v2_provider_capabilities(request: Request):
+    """App 的「按能力渲染」資料源:不支援=不顯示,而不是按了才壞。"""
+    _check_auth(request)
+    return {"providers": _provider_caps_payload()}
+
+
 async def _v2_session_op(op: str, session_id: str, request: Request):
     """統一入口:auth → 解析 provider → 查表 → 委派。
 
