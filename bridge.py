@@ -2683,6 +2683,19 @@ def _event_append(session: str, etype: str, payload: dict,
         return 0
 
 
+def _milestone_sink(session_id: str, etype: str, payload: dict,
+                    external_id: str | None) -> None:
+    """carddigest 里程碑 → event_log(P3-lite)。吞錯:鏡射是加分項,
+    不准影響卡片熱路徑;_event_append 本身已絕不 raise。"""
+    try:
+        _event_append(session_id, etype, payload, external_id=external_id)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+carddigest.MILESTONE_SINK = _milestone_sink
+
+
 def _event_since(session: str, since_seq: int = 0, limit: int = 500) -> list[dict]:
     """撈 id > since_seq 的事件(即時 + 補洞共用同一條查詢)。信封對齊
     /app/v2/sessions/{id}/events 的 {seq,ts,type,data} 形狀。"""
@@ -21628,6 +21641,7 @@ def _cx_feed_thread_locked(thread_id: str, create_if_missing: bool = False) -> N
         if not create_if_missing:
             return
         d = _CX_CARD_DIGESTS[thread_id] = carddigest.CodexThreadDigest()
+    d.store.media_session_id = f"codex:{thread_id}"
     try:
         info = CODEX_APP.thread_lock_info(thread_id)
         if not info:
@@ -21977,6 +21991,7 @@ def _cx_feed_input_accepted(thread_id: str, client_id: str | None, text: str,
         if not create_if_missing:
             return
         d = _CX_CARD_DIGESTS[thread_id] = carddigest.CodexThreadDigest()
+    d.store.media_session_id = f"codex:{thread_id}"
     card = carddigest.make_input_accepted_card(
         "codex", client_id, text, attachments=_input_attachment_summary(attachments),
         typed_text=typed_text)
@@ -22087,6 +22102,7 @@ async def _cx_card_digest(thread_id: str):
     d = _CX_CARD_DIGESTS.get(thread_id)
     if d is None:
         d = _CX_CARD_DIGESTS[thread_id] = carddigest.CodexThreadDigest()
+    d.store.media_session_id = f"codex:{thread_id}"
     await _cx_seed_card_digest(thread_id, d, required=not d.seeded)
     # The provider may already be running before this phone stream is opened.
     # Seed/cold-load must therefore reconcile against app-server state instead
@@ -22248,6 +22264,9 @@ async def _hp_card_digest(session: str):
     d = _HP_CARD_DIGESTS.get(session)
     if d is None:
         d = _HP_CARD_DIGESTS[session] = carddigest.PersonaDigest()
+        # 刻意**不設** media_session_id:人格訊息已由 _canon_add 走
+        # message.upsert 進 event_log,卡片再鏡射就是雙份(P3-lite 只收
+        # CC/CX/Gemini/OpenClaw 這些沒有 canonical 的 provider)。
     if not d.seeded:
         d.seeded = True
         try:
