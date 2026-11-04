@@ -30875,6 +30875,14 @@ async def app_codex_login_status(request: Request, login_id: str = ""):
             return {"ok": True, "state": "expired"}
         done = e["done"]
     if done is True:
+        # **一定要清 auth 快取。** `_agent_auth_status()` 有 60s TTL,而 app
+        # 一看到 state=done 就立刻回頭打 `/app/v1/agents/auth` —— 不清的話那
+        # 一趟拿到的還是快取裡「未登入」那份:頁籤維持蓋版、session 讀不出來,
+        # 得等 TTL 自己過期才會好。2026-11-04 機主回報「Codex 登入認證完
+        # session 也不會自己讀出來,app 要關掉重開才有」就是這個 —— 重開那段
+        # 時間剛好夠 60s 過期,所以看起來像「非得重開不可」。
+        # CC 的 finish 早就有這一行,Codex 與 Gemini 當時漏掉了。
+        _AGENT_AUTH_CACHE["data"] = None
         return {"ok": True, "state": "done"}
     if done is False:
         return {"ok": True, "state": "failed"}
@@ -31292,6 +31300,9 @@ async def app_gemini_google_login_finish(request: Request):
         raise http_err(502, "AGY_LOGIN_FAILED",
                        "登入沒完成 —— 授權碼可能貼錯、過期(60 秒窗),"
                        "請重新開始")
+    # 同 Codex login/status 的理由:不清這份 60s 快取,app 收到 ok 之後立刻
+    # 回頭問的那趟 auth 仍會拿到「未登入」,頁籤維持蓋版直到 TTL 過期。
+    _AGENT_AUTH_CACHE["data"] = None
     return {"ok": True, "provider": "gemini", "logged_in": True}
 
 
