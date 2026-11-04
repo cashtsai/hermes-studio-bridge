@@ -31074,7 +31074,8 @@ async def app_claude_login_finish(request: Request):
                        "授權碼無效或已過期,請重新開始(換 token 被拒)")
     try:
         token = str((resp.json() or {}).get("access_token") or "")
-    except Exception:  # noqa: BLE001
+    except Exception as _e:  # noqa: BLE001
+        _log_exc("claude_login_token_response_parse", _e, expected=False)
         token = ""
     if not token:
         _log_event("claude_login_no_access_token")
