@@ -42,7 +42,8 @@ def load_fixture(name: str) -> list[dict]:
                 frame = json.loads(line)
             except ValueError as exc:
                 raise AssertionError(f"invalid JSON in {name}:{line_no}") from exc
-            if not isinstance(frame, dict) or not frame.get("method"):
+            if (not isinstance(frame, dict)
+                    or not (frame.get("method") or frame.get("event"))):
                 raise AssertionError(f"invalid frame in {name}:{line_no}")
             frames.append(frame)
     return frames
@@ -53,6 +54,42 @@ def replay(frames: list) -> "carddigest.CodexThreadDigest":
     for f in frames:
         d.handle(f["method"], f.get("params") or {})
     return d
+
+
+def replay_persona(frames: list, digest):
+    """Replay the normalized turn contract used by Persona/Gemini digests."""
+    for f in frames:
+        method = f["method"]
+        params = f.get("params") or {}
+        if method == "seed_messages":
+            digest.seed_messages(params.get("messages") or [])
+        elif method == "turn_begin":
+            digest.turn_begin(str(params.get("cid") or ""),
+                              str(params.get("label") or ""))
+        elif method == "turn_delta":
+            digest.turn_delta(str(params.get("cid") or ""),
+                              str(params.get("delta") or ""))
+        elif method == "turn_status":
+            digest.turn_status(str(params.get("label") or ""))
+        elif method == "turn_end":
+            digest.turn_end(str(params.get("cid") or ""),
+                            str(params.get("full_text") or ""),
+                            reply_mid=str(params.get("reply_mid") or ""),
+                            error=str(params.get("error") or ""))
+        else:
+            raise AssertionError(f"unsupported persona fixture method: {method}")
+    return digest
+
+
+def replay_openclaw(frames: list) -> "carddigest.OpenClawDigest":
+    """Replay gateway event frames without opening a live WebSocket."""
+    digest = carddigest.OpenClawDigest()
+    for f in frames:
+        event = f.get("event")
+        if event not in {"chat", "agent"}:
+            raise AssertionError(f"unsupported OpenClaw fixture event: {event}")
+        digest.handle(event, f.get("payload") or {})
+    return digest
 
 
 def _cards(d):
@@ -110,6 +147,33 @@ class TestCxApproval(unittest.TestCase):
         done = [c for c in _cards(d) if c.get("kind") == "approval"]
         self.assertEqual(len(done), 1, "決議是原卡收尾,不是第二張")
         self.assertNotEqual(done[0].get("rev"), pend[0].get("rev"))
+
+
+class TestGeminiSimpleTurn(unittest.TestCase):
+    def test_seed_stream_and_terminal_card(self):
+        d = replay_persona(load_fixture("gemini-simple.jsonl"),
+                           carddigest.GeminiDigest())
+        cards = _cards(d)
+        self.assertEqual(len([c for c in cards if c["id"] == "card-gm-gm-user"]), 1)
+        reply = [c for c in cards if c["id"] == "card-gm-turn-g-1"]
+        self.assertEqual(len(reply), 1)
+        self.assertEqual(reply[0]["body"]["text"], "GEMINI_OK")
+        self.assertTrue(reply[0].get("final"))
+        self.assertFalse(d.busy)
+
+
+class TestOpenClawSimpleTurn(unittest.TestCase):
+    def test_gateway_lifecycle_and_chat_projection(self):
+        d = replay_openclaw(load_fixture("openclaw-simple.jsonl"))
+        cards = _cards(d)
+        reply = [c for c in cards if c["id"] == "card-oc-run-1"]
+        self.assertEqual(len(reply), 1)
+        self.assertEqual(reply[0]["body"]["text"], "OPENCLAW_OK")
+        self.assertTrue(reply[0].get("final"))
+        self.assertFalse(d.busy)
+        turns = [e["data"]["state"] for e in d.store.events
+                 if e["type"] == "turn"]
+        self.assertEqual(turns, ["begin", "end"])
 
 
 if __name__ == "__main__":
