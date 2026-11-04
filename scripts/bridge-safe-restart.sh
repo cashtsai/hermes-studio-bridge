@@ -7,6 +7,20 @@
 set -u
 MAX=${1:-600}
 T0=$(date +%s)
+# PocketConnect installs `com.pocketconnect.bridge`; older Studio installs use
+# `ai.studio.hermes-bridge`. Prefer an explicit label, otherwise detect the
+# plist that exists so this guard cannot restart the wrong service.
+LABEL="${POCKET_BRIDGE_LABEL:-}"
+if [ -z "$LABEL" ]; then
+  if [ -f "$HOME/Library/LaunchAgents/com.pocketconnect.bridge.plist" ]; then
+    LABEL="com.pocketconnect.bridge"
+  elif [ -f "$HOME/Library/LaunchAgents/ai.studio.hermes-bridge.plist" ]; then
+    LABEL="ai.studio.hermes-bridge"
+  else
+    LABEL="com.pocketconnect.bridge"
+  fi
+fi
+PLIST="${POCKET_BRIDGE_PLIST:-$HOME/Library/LaunchAgents/$LABEL.plist}"
 # 等的不只是人格回合 —— **CC / CX 也在跑就不准重啟**(2026-10-10 實害)。
 #
 # 舊版只看 turns_in_flight(人格)。機主當時正在跑一個 CX 任務(rollout 顯示
@@ -44,7 +58,7 @@ except Exception: print('-1 health讀不到')")
   sleep 10
 done
 rm -f /tmp/hermes-bridge-watchdog.fails
-launchctl kickstart -k "gui/$(id -u)/ai.studio.hermes-bridge" || exit 1
+launchctl kickstart -k "gui/$(id -u)/$LABEL" || exit 1
 sleep 6
 curl -s -m 8 http://127.0.0.1:8081/health | head -c 160; echo
 echo "✓ 安全重啟完成"
@@ -57,8 +71,9 @@ echo "✓ 安全重啟完成"
 SMOKE="$(dirname "$0")/post-deploy-smoke.py"
 if [ -f "$SMOKE" ]; then
   TOKEN=$(/usr/libexec/PlistBuddy -c 'Print :EnvironmentVariables:BRIDGE_TOKEN' \
-    "$HOME/Library/LaunchAgents/ai.studio.hermes-bridge.plist" 2>/dev/null || true)
-  if BRIDGE_TOKEN="$TOKEN" /usr/bin/env python3 "$SMOKE"; then
+    "$PLIST" 2>/dev/null || true)
+  if POCKET_BRIDGE_PLIST="$PLIST" BRIDGE_TOKEN="$TOKEN" \
+      /usr/bin/env python3 "$SMOKE"; then
     echo "✓ 部署後煙測全過"
   else
     echo "✗ 部署後煙測有紅 — bridge 已重啟但顯示層不變式壞了,立刻查" >&2

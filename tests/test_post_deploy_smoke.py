@@ -8,6 +8,8 @@
 import _isolation  # noqa: F401  # 測試隔離閂:必須是第一個 import(2026-08-15 事故防線,見 tests/_isolation.py)
 import importlib.util
 import os
+import plistlib
+import tempfile
 import unittest
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -44,6 +46,24 @@ class ResultShapeTests(unittest.TestCase):
         r.add("警告項", False, "有點怪", warn=True)
         self.assertEqual(r.failed, [])
         self.assertEqual(len(r.warned), 1)
+
+
+class PlistDiscoveryTests(unittest.TestCase):
+    def test_explicit_plist_override_is_used(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "bridge.plist")
+            with open(path, "wb") as fh:
+                plistlib.dump({"EnvironmentVariables": {"BRIDGE_TOKEN": "t"}}, fh)
+            old = os.environ.get("POCKET_BRIDGE_PLIST")
+            os.environ["POCKET_BRIDGE_PLIST"] = path
+            try:
+                self.assertEqual(smoke.bridge_plist_path(), path)
+                self.assertEqual(smoke.read_token(), "t")
+            finally:
+                if old is None:
+                    os.environ.pop("POCKET_BRIDGE_PLIST", None)
+                else:
+                    os.environ["POCKET_BRIDGE_PLIST"] = old
 
 
 class InvariantTests(unittest.TestCase):
