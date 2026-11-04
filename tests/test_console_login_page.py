@@ -543,12 +543,18 @@ class TestNoCodeInLogs(_LoginBase):
         events = {ev for ev, _ in seen}
         self.assertIn("console_auth_failed", events, "失敗要留痕(但不留碼)")
         self.assertIn("console_auth_ok", events)
-        # 事件只准帶來源與一個 bool,不准帶任何碼的衍生物
+        # 事件只准帶來源與 bool,不准帶任何碼的衍生物。
+        # web-first(2026-11-04)新增兩個欄位,都與碼無關:
+        #   · `web`(bool)—— 這次登入是否走公網中繼面,稽核用。
+        #   · `forwarded_for` —— XFF 最左(訪客 IP;碼只走 POST body,
+        #     永遠不會流進任何標頭)。
         for ev, kw in seen:
             if ev.startswith("console_auth"):
-                self.assertLessEqual(set(kw), {"client", "claim"},
+                self.assertLessEqual(set(kw),
+                                     {"client", "claim", "web", "forwarded_for"},
                                      f"{ev} 的欄位太多:{kw}")
                 self.assertIsInstance(kw.get("claim", False), bool)
+                self.assertIsInstance(kw.get("web", False), bool)
 
     def test_claim_code_never_logged(self):
         """交棒給前端的那枚一次性碼也不准進日誌(延伸上一條)。"""

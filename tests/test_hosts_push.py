@@ -111,6 +111,7 @@ class WatchLoopStateTest(unittest.TestCase):
         self.pushes = []
         self._orig_push = bridge.push_notify
         self._orig_devices = bridge._devices
+        self._orig_pocket_id_state = bridge._pocket_id_state
 
         async def fake_push(*a, **kw):
             self.pushes.append(kw)
@@ -121,6 +122,7 @@ class WatchLoopStateTest(unittest.TestCase):
     def tearDown(self):
         bridge.push_notify = self._orig_push
         bridge._devices = self._orig_devices
+        bridge._pocket_id_state = self._orig_pocket_id_state
 
     def _tick(self, hosts, devices=("tok",)):
         """跑迴圈的一輪 —— 把 sleep 短路掉,第二圈丟 CancelledError 收工。"""
@@ -155,8 +157,21 @@ class WatchLoopStateTest(unittest.TestCase):
         kw = self.pushes[0]
         self.assertTrue(kw["silent"], "必須是靜默推播")
         self.assertEqual(kw["data"], {"kind": "hosts",
-                                      "hosts": ["https://new.example"]})
+                                      "hosts": ["https://new.example"],
+                                      "host_id": ""})
         self.assertEqual(_read_state(), ["https://new.example"])
+
+    def test_change_after_seed_includes_source_host_id(self):
+        """多台 bridge 同時推播時,手機必須能辨認候選清單的來源。"""
+        bridge._pocket_id_state = lambda: {"host_id": "host-cloud-001"}
+        bridge._hosts_push_save(["https://old.example"])
+        self._tick(["https://new.example"])
+        self.assertEqual(len(self.pushes), 1)
+        self.assertEqual(self.pushes[0]["data"], {
+            "kind": "hosts",
+            "hosts": ["https://new.example"],
+            "host_id": "host-cloud-001",
+        })
 
     def test_unchanged_does_not_push(self):
         bridge._hosts_push_save(["https://same.example"])

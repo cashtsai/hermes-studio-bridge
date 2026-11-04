@@ -5,7 +5,7 @@
 > 那是劝退點。而遠端機(龍蝦)的 localhost callback 流程會斷,一般使用者
 > 走不了。
 >
-> **全部機制都在測試主機上實測過(203.0.113.10, codex 0.166.0 / claude 2.1.309)。**
+> **全部機制都在龍蝦實機上實測過（版本資訊見測試紀錄；公開文件不記錄實機位址）。**
 
 ## 0. 目標
 
@@ -170,7 +170,7 @@ Gemini 是退化版:**沒有按鈕,只有一個貼 API key 的輸入框**。
 
 ## 附:這份規格的事實來源
 
-全部 2026-10-31 在測試主機(Vultr SG, 203.0.113.10)跑過:
+全部 2026-10-31 在龍蝦實機（Vultr SG；實機位址不寫入公開文件）跑過:
 - `codex login --device-auth` → `auth.openai.com/codex/device` + device code
 - `claude setup-token` → redirect_uri = `platform.claude.com/oauth/code/callback`
   (不是 localhost)+ `code=true`(manual code)+ "subscription required"
