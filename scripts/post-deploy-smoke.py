@@ -36,8 +36,23 @@ import urllib.error
 import urllib.request
 
 DEFAULT_BASE = os.environ.get("POCKET_BRIDGE_URL", "http://127.0.0.1:8081")
-PLIST = os.path.expanduser(
-    "~/Library/LaunchAgents/ai.studio.hermes-bridge.plist")
+def bridge_plist_path() -> str:
+    """Find the current Pocket label, while keeping legacy installs usable."""
+    override = os.environ.get("POCKET_BRIDGE_PLIST")
+    if override:
+        return os.path.expanduser(override)
+    candidates = [
+        "~/Library/LaunchAgents/com.pocketconnect.bridge.plist",
+        "~/Library/LaunchAgents/ai.studio.hermes-bridge.plist",
+    ]
+    for candidate in candidates:
+        path = os.path.expanduser(candidate)
+        if os.path.exists(path):
+            return path
+    return os.path.expanduser(candidates[0])
+
+
+PLIST = bridge_plist_path()
 
 
 # ── 基礎設施 ──────────────────────────────────────────────────────────────
@@ -66,8 +81,9 @@ class Result:
 def read_token() -> str:
     if os.environ.get("BRIDGE_TOKEN"):
         return os.environ["BRIDGE_TOKEN"]
+    plist = bridge_plist_path()
     try:
-        with open(PLIST, "rb") as f:
+        with open(plist, "rb") as f:
             return (plistlib.load(f).get("EnvironmentVariables") or {}
                     ).get("BRIDGE_TOKEN", "")
     except OSError:
