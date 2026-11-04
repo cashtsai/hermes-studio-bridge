@@ -10301,8 +10301,22 @@ async def _hosts_watch_loop() -> None:
             if not _devices():
                 _hosts_push_save(hosts)       # 沒裝置可推,但基準要跟上
                 continue
+            # **一定要帶 host_id。** 這條推播會扇出給**所有**註冊過的裝置
+            # (`push_notify` → `_devices()` 沒有任何帳號/主機過濾),而手機
+            # 可能同時配對過好幾台 bridge(自己的 Mac + 雲端龍蝦)。不帶身分
+            # 的話,app 收到只能無條件套用 → 誰最後推、手機就被指到誰身上。
+            #
+            # 2026-11-04 機主實況:同時有自己的 Mac 與雲端龍蝦,Mac 這台的
+            # 候選清單一變動就推一次,把手機的候選整份換成 Mac 的,位址被
+            # 重新指向 Mac 的 Funnel、雲端那台的位址從 app 裡整個消失,而
+            # token 還是雲端那台的 → 401,「連不到雲端那台」。
+            #
+            # 空字串 = 這台沒在 pocket-id 註冊過(純自架)。app 端的規矩是
+            # 「兩邊都有 id 且不同才拒絕」,所以空值會退回舊行為,不會讓既有
+            # 的單機使用者變砖。
             res = await push_notify(
-                "", "", data={"kind": "hosts", "hosts": hosts},
+                "", "", data={"kind": "hosts", "hosts": hosts,
+                              "host_id": str(_pocket_id_state().get("host_id") or "")},
                 content_available=True, silent=True)
             _hosts_push_save(hosts)
             _log_event("hosts_push_sent", sent=res.get("sent"),
