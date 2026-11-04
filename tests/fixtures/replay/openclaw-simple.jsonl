@@ -1,0 +1,4 @@
+{"event":"agent","payload":{"runId":"run-1","stream":"lifecycle","data":{"phase":"start"}}}
+{"event":"chat","payload":{"runId":"run-1","state":"delta","message":{"content":[{"type":"text","text":"OPENCLAW_"}]}}}
+{"event":"chat","payload":{"runId":"run-1","state":"final","message":{"content":[{"type":"text","text":"OPENCLAW_OK"}],"timestamp":1783200001000}}}
+{"event":"agent","payload":{"runId":"run-1","stream":"lifecycle","data":{"phase":"end"}}}

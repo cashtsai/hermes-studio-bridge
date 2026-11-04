@@ -1223,6 +1223,12 @@ class CodexThreadDigest(ApprovalCardMixin):
     # handle_approval / resolve_approval：見 ApprovalCardMixin（A3，三 provider 共用）。
 
 
+#: 里程碑鏡射 sink:bridge 啟動時設成
+#: lambda session, etype, payload, ext: _event_append(session, etype, payload, external_id=ext)
+#: 保持 None = 不鏡射(測試/獨立使用 carddigest 時零副作用)。
+MILESTONE_SINK = None
+
+
 class SessionCardStore(ApprovalCardMixin):
     """契約 §1/§3 的 per-session 卡片庫 + 事件 ring buffer。
 
@@ -1296,7 +1302,39 @@ class SessionCardStore(ApprovalCardMixin):
             del self.events[:len(self.events) - self.ring_max]
         for w in self._wakers:      # 事件落地即刻喚醒所有 SSE 訂閱者
             w.set()
+        self._mirror_milestone(etype, data)
         return ev
+
+    def _mirror_milestone(self, etype: str, data: dict) -> None:
+        """里程碑事件鏡射進持久 event_log(2026-11-04,t3code P3-lite)。
+
+        ring 是記憶體,bridge 重啟即歸零 → 410 冷載;持久化里程碑給重啟後
+        的「這個 session 發生過什麼」一條可重放的脊椎。**刻意不鏡射串流
+        delta** —— card.upsert 在 started→delta 階段 final=False、每個
+        delta 都來一次,全鏡射會把 sqlite 灌爆;只收 final=True 的終態卡、
+        session.status 變更(set_status 本來就 change-gated)與 turn 轉換。
+        sink 由 bridge 啟動時注入(MILESTONE_SINK);沒注入、或 store 沒有
+        media_session_id(不知道自己是誰)就安靜跳過 —— 鏡射永遠是加分項,
+        不准拖垮熱路徑(sink 端自己吞錯)。
+        """
+        sink = MILESTONE_SINK
+        sid = getattr(self, "media_session_id", "") or ""
+        if sink is None or not sid:
+            return
+        if etype == "card.upsert":
+            card = (data or {}).get("card") or {}
+            if not card.get("final"):
+                return
+            body = card.get("body") or {}
+            basis = f"{card.get('id')}|{body.get('text') or body.get('fallback_text') or ''}"
+            ext = "card:" + hashlib.sha1(basis.encode("utf-8", "replace")).hexdigest()[:20]
+            sink(sid, "card.milestone", {"card": card}, ext)
+        elif etype == "session.status":
+            sink(sid, "session.status", data, None)
+        elif etype == "turn":
+            tid = (data or {}).get("turn_id") or ""
+            st = (data or {}).get("state") or ""
+            sink(sid, "turn", data, f"turn:{tid}:{st}" if tid else None)
 
     def attach_waker(self) -> "asyncio.Event":
         """SSE 訂閱者註冊喚醒器;斷線務必 detach_waker(不然洩漏)。"""

@@ -1,0 +1,4 @@
+{"method":"turn/started","params":{"turn":{"id":"t-1"}}}
+{"method":"item/agentMessage/delta","params":{"itemId":"i-1","delta":"你好"}}
+{"method":"item/agentMessage/delta","params":{"itemId":"i-1","delta":",世界"}}
+{"method":"turn/completed","params":{"turn":{"id":"t-1"}}}

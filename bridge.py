@@ -92,6 +92,48 @@ _BG_TASKS: set = set()
 # startup 時由 _start_housekeeping 填入。
 _MAIN_LOOP = None
 
+# T3Code #3: opt-in Codex wire fixture recorder. It is deliberately disabled
+# by default because app-server frames can contain prompts, paths, and tool
+# output. When a maintainer sets POCKET_RECORD_FIXTURE, each inbound server
+# request/notification is appended as one JSONL frame for local replay tests.
+_FIXTURE_RECORD_LOCK = threading.Lock()
+
+
+def _record_fixture_frame(msg: dict) -> None:
+    """Append one inbound Codex app-server frame to an explicit local path.
+
+    This is a debugging/replay aid, not an audit log. The caller opts in with
+    ``POCKET_RECORD_FIXTURE=/private/tmp/codex.jsonl``; the file is created with
+    owner-only permissions and failures never affect the live bridge.
+    """
+    path = os.path.expanduser(os.environ.get("POCKET_RECORD_FIXTURE", "").strip())
+    if not path or not isinstance(msg, dict) or not msg.get("method"):
+        return
+    frame = {"method": str(msg["method"]),
+             "params": msg.get("params") if isinstance(msg.get("params"), dict)
+             else {}}
+    # Server-request ids are useful when diagnosing an approval transcript,
+    # but the replay digest intentionally ignores this optional field.
+    if "id" in msg:
+        frame["request_id"] = msg["id"]
+    raw = (json.dumps(frame, ensure_ascii=False, separators=(",", ":"),
+                      default=str) + "\n").encode("utf-8")
+    try:
+        parent = os.path.dirname(os.path.abspath(path))
+        os.makedirs(parent, mode=0o700, exist_ok=True)
+        with _FIXTURE_RECORD_LOCK:
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+            try:
+                os.fchmod(fd, 0o600)
+                view = memoryview(raw)
+                while view:
+                    view = view[os.write(fd, view):]
+            finally:
+                os.close(fd)
+    except Exception as exc:  # noqa: BLE001
+        # Recording must never turn a healthy provider stream into an error.
+        _log_event("codex_fixture_record_failed", error=type(exc).__name__)
+
 # Durable media index.  Construction is lazy so importing bridge.py in tests
 # does not create production state under ~/.pocket.
 _MEDIA_ARTIFACT_STORE = None
@@ -2629,12 +2671,32 @@ async def _event_wait(session: str, seen_ver: int) -> None:
 
 
 def _event_append(session: str, etype: str, payload: dict,
-                  external_id: str | None = None) -> int:
+                  external_id: str | None = None,
+                  con=None) -> int:
     """Append 一筆事件,回傳全域 seq(=event_log.id);0 表示去重略過或寫入
     失敗。絕不 raise — 鏡射寫入掛在既有熱路徑上(_canon_add/_report_upsert/
-    合併掃描),event_log 故障只能降級成「新路徑落後」,不准拖垮舊路徑。"""
+    合併掃描),event_log 故障只能降級成「新路徑落後」,不准拖垮舊路徑。
+
+    `con`(2026-11-03,照 t3code 的「事件+投影同一交易」):呼叫端把**自己
+    已開的 CANON_DB connection** 傳進來 → 事件與呼叫端的正典寫入落在
+    **同一個交易**,一起 commit 或一起消失 —— 「canonical 有、event_log
+    沒有」的副本落後窗從結構上關閉。此模式下:
+      · 不 commit/不 close(交易歸呼叫端);
+      · 不碰 _EVENT_SEEN 快取(交易可能被 rollback,快取會毒化冪等;
+        DB 的 external_id UNIQUE 照樣守住);
+      · **不 notify** —— 通知必須等 commit 之後(WAL 下其他連線看不到
+        未提交列,先叫醒訂閱者只會讓它白查一輪),呼叫端 commit 後自己
+        呼 _event_notify(session)。
+    """
     import sqlite3
     try:
+        if con is not None:
+            cur = con.execute(
+                "INSERT OR IGNORE INTO event_log(session,type,external_id,payload,created_at) "
+                "VALUES(?,?,?,?,?)",
+                (session, etype, external_id,
+                 json.dumps(payload, ensure_ascii=False), time.time()))
+            return int(cur.lastrowid or 0) if cur.rowcount else 0
         if external_id and external_id in _EVENT_SEEN.get(session, ()):
             return 0
         con = sqlite3.connect(CANON_DB, timeout=30)
@@ -2661,6 +2723,20 @@ def _event_append(session: str, etype: str, payload: dict,
         _log_event("event_append_failed", session=session, type=etype,
                    error=type(e).__name__, error_message=str(e)[:160])
         return 0
+
+
+def _milestone_sink(session_id: str, etype: str, payload: dict,
+                    external_id: str | None) -> None:
+    """carddigest 里程碑 → event_log(P3-lite)。吞錯:鏡射是加分項,
+    不准影響卡片熱路徑;_event_append 本身已絕不 raise。"""
+    try:
+        _event_append(session_id, etype, payload, external_id=external_id)
+    except Exception as exc:  # noqa: BLE001
+        _log_event("milestone_sink_failed", session=session_id, type=etype,
+                   error=type(exc).__name__, expected=True)
+
+
+carddigest.MILESTONE_SINK = _milestone_sink
 
 
 def _event_since(session: str, since_seq: int = 0, limit: int = 500) -> list[dict]:
@@ -2769,9 +2845,11 @@ def _event_msg_key(m: dict) -> str:
     return f"{m.get('source') or 'app'}:{m.get('id')}:{h}"
 
 
-def _event_mirror_messages(session: str, msgs: list) -> int:
+def _event_mirror_messages(session: str, msgs: list, con=None) -> int:
     """把一批 app-shape 訊息 dict 鏡射進 event_log(冪等,靠 external_id
-    去重)。回傳真正新寫入的筆數。絕不 raise。"""
+    去重)。回傳真正新寫入的筆數。絕不 raise。
+    `con` 有值 = 併進呼叫端交易(見 _event_append),呼叫端 commit 後
+    記得自己 _event_notify(session)。"""
     n = 0
     for m in msgs or []:
         try:
@@ -2780,7 +2858,7 @@ def _event_mirror_messages(session: str, msgs: list) -> int:
             _log_exc("_event_mirror_messages", _exc, expected=True)
             continue
         if _event_append(session, "message.upsert", {"message": m},
-                         external_id=key):
+                         external_id=key, con=con):
             n += 1
     return n
 
@@ -2932,15 +3010,19 @@ def _canon_add(session: str, role: str, content: str, attachments=None,
                         "VALUES(?,?,?,?,?,?,?,?)",
                         (mid, session, role, content, json.dumps(attachments or [], ensure_ascii=False),
                          now, status, client_id))
+            # Sync engine P1→P1.5(2026-11-03,抄 t3code):鏡射**併進同一個
+            # 交易** —— 原本 commit 完才另開連線鏡射,中間斷掉就是「canonical
+            # 有、event_log 沒有」,正是列表預覽/未讀落後的病灶之一。現在
+            # messages 與 message.upsert 事件一起 commit、一起消失。
+            mirrored = _event_mirror_messages(session, [{
+                "id": mid, "role": role, "content": content,
+                "attachments": attachments or [], "ts": now, "status": status,
+                "client_id": client_id, "source": "app"}], con=con)
             con.commit()
             con.close()
             _canon_notify(session)
-            # Sync engine P1:App 訊息寫入點順便鏡射進 event_log(雙寫過渡)。
-            # payload 形狀對齊 _canon_messages 的輸出,client 兩邊看到同一種訊息。
-            _event_mirror_messages(session, [{
-                "id": mid, "role": role, "content": content,
-                "attachments": attachments or [], "ts": now, "status": status,
-                "client_id": client_id, "source": "app"}])
+            if mirrored:
+                _event_notify(session)
             # P1-3:人格完成一則回覆 → 推播把你叫回 app(前景由 app willPresent 抑制)。
             if push and role == "assistant" and status == "done":
                 _push_persona_reply(session, content)
@@ -3900,16 +3982,17 @@ def _report_upsert(session: str, report: dict) -> str:
             "ingested_at,actions) VALUES(?,?,?,?,?,?,?,?,?,?)",
             (rid, session, label, name, content, ts,
              external_source, external_id, time.time(), actions_json))
+        # 2026-11-03(抄 t3code):鏡射併進同一交易,報告與事件一起 commit。
+        mirrored = 0
+        if not is_diagnostic:
+            mirrored = _event_mirror_messages(session, [_report_msg_shape({
+                "id": rid, "label": label, "content": content, "ts": ts,
+            })], con=con)
         con.commit()
         con.close()
-        # Sync engine P1:cron 晨報寫入點鏡射進 event_log(雙寫過渡)。形狀走
-        # _report_msg_shape = app 在 /app/v1/messages 看到的同一種報告訊息;
-        # 改稿(同 rid 新內容)→ 新鍵 → 追加新事件,同 message id 覆蓋。
-        if not is_diagnostic:
-            _event_mirror_messages(session, [_report_msg_shape({
-                "id": rid, "label": label, "content": content, "ts": ts,
-            })])
-        else:
+        if mirrored:
+            _event_notify(session)
+        if is_diagnostic:
             _log_event("report_event_diagnostic",
                        session=session, label=label, name=name,
                        external_source=external_source)
@@ -6232,6 +6315,7 @@ class CodexAppServerClient:
             _log_event("codex_app_server_bad_json", error=type(e).__name__,
                        line=str(raw)[:160])
             return
+        _record_fixture_frame(msg)
         if msg.get("method"):
             await self._handle_server_message(msg)
         elif "id" in msg:
@@ -21735,6 +21819,7 @@ def _cx_feed_thread_locked(thread_id: str, create_if_missing: bool = False) -> N
         if not create_if_missing:
             return
         d = _CX_CARD_DIGESTS[thread_id] = carddigest.CodexThreadDigest()
+    d.store.media_session_id = f"codex:{thread_id}"
     try:
         info = CODEX_APP.thread_lock_info(thread_id)
         if not info:
@@ -22084,6 +22169,7 @@ def _cx_feed_input_accepted(thread_id: str, client_id: str | None, text: str,
         if not create_if_missing:
             return
         d = _CX_CARD_DIGESTS[thread_id] = carddigest.CodexThreadDigest()
+    d.store.media_session_id = f"codex:{thread_id}"
     card = carddigest.make_input_accepted_card(
         "codex", client_id, text, attachments=_input_attachment_summary(attachments),
         typed_text=typed_text)
@@ -22194,6 +22280,7 @@ async def _cx_card_digest(thread_id: str):
     d = _CX_CARD_DIGESTS.get(thread_id)
     if d is None:
         d = _CX_CARD_DIGESTS[thread_id] = carddigest.CodexThreadDigest()
+    d.store.media_session_id = f"codex:{thread_id}"
     await _cx_seed_card_digest(thread_id, d, required=not d.seeded)
     # The provider may already be running before this phone stream is opened.
     # Seed/cold-load must therefore reconcile against app-server state instead
@@ -22355,6 +22442,9 @@ async def _hp_card_digest(session: str):
     d = _HP_CARD_DIGESTS.get(session)
     if d is None:
         d = _HP_CARD_DIGESTS[session] = carddigest.PersonaDigest()
+        # 刻意**不設** media_session_id:人格訊息已由 _canon_add 走
+        # message.upsert 進 event_log,卡片再鏡射就是雙份(P3-lite 只收
+        # CC/CX/Gemini/OpenClaw 這些沒有 canonical 的 provider)。
     if not d.seeded:
         d.seeded = True
         try:
@@ -23181,6 +23271,246 @@ _V2_SESSION_OPS: dict = {
         "cc2":   lambda rest, req: v2_cc2_settings(rest, req),
     },
 }
+
+
+#: Provider 能力宣告(2026-11-04,抄 t3code provider-capability-system)。
+#: 原則:**orchestration 與 app 讀 capability,不讀 provider 名字** ——
+#: app 之前每家各寫一套 if provider ==,bridge 加了能力 app 不知道、
+#: bridge 沒有的能力 app 畫了按鈕按下去 404(「管線存在≠端到端通」的
+#: 客戶端版)。這張表是**宣告**:錯報有害(UI 藏掉活功能/畫出死按鈕),
+#: 不確定的旗標寧可保守並附判準註解。ops 不在這裡宣告 —— 直接從
+#: _V2_SESSION_OPS 推導,單一真相不會漂移。
+#:
+#: 欄位判準:
+#:   interrupt        能不能中斷進行中的回合(CC=tmux Esc、cc2=SDK、
+#:                    codex=turn interrupt;gemini 的 agy ACP 沒有中斷面)
+#:   queued_messages  忙碌時送訊息會排隊而不是被吃掉
+#:   streaming        live=逐字串流;poll=輪詢快照
+#:   terminal_status_quality  strong=協定有明確回合終態;weak=靠啟發式
+#:                    (CC pane 判讀就是 weak —— composer_stuck 病史)
+#:   approvals        有審批面
+#:   approval_callbacks_live_only  等待者是記憶體的,bridge 重啟即不可答
+#:                    (對應 approvals 列的 response_capability 判定)
+#:   native_id_strength  strong=provider 原生穩定 id;weak=名字/路徑類
+_PROVIDER_CAPS: dict = {
+    "claude_code": {
+        "interrupt": True, "queued_messages": True, "streaming": "live",
+        "terminal_status_quality": "weak", "approvals": True,
+        "approval_callbacks_live_only": True, "native_id_strength": "weak",
+    },
+    "cc2": {
+        "interrupt": True, "queued_messages": True, "streaming": "live",
+        "terminal_status_quality": "strong", "approvals": True,
+        "approval_callbacks_live_only": True, "native_id_strength": "strong",
+    },
+    "codex": {
+        "interrupt": True, "queued_messages": True, "streaming": "live",
+        "terminal_status_quality": "strong", "approvals": True,
+        "approval_callbacks_live_only": True, "native_id_strength": "strong",
+    },
+    "gemini": {
+        "interrupt": False, "queued_messages": True, "streaming": "live",
+        "terminal_status_quality": "strong", "approvals": True,
+        "approval_callbacks_live_only": True, "native_id_strength": "weak",
+    },
+    "openclaw": {
+        "interrupt": False, "queued_messages": True, "streaming": "live",
+        "terminal_status_quality": "strong", "approvals": True,
+        # 審批真相在 gateway(durable),bridge 重啟不滅 —— 不是 live-only。
+        "approval_callbacks_live_only": False, "native_id_strength": "strong",
+    },
+    "hermes": {
+        "interrupt": False, "queued_messages": True, "streaming": "live",
+        "terminal_status_quality": "strong", "approvals": True,
+        "approval_callbacks_live_only": False, "native_id_strength": "strong",
+    },
+}
+
+
+def _provider_caps_payload() -> dict:
+    out = {}
+    for prov, caps in _PROVIDER_CAPS.items():
+        ops = sorted(op for op, tbl in _V2_SESSION_OPS.items() if prov in tbl)
+        out[prov] = {**caps, "ops": ops}
+    return out
+
+
+# ── Guest links(2026-11-04,抄 t3code:HMAC、零存儲、撤銷即全滅)──────
+#
+# token = base64url(json{sid,exp}) + "." + HMAC(secret, payload)。伺服器
+# **不存任何東西** —— 驗證只需要密鑰;撤銷全部連結 = 刪密鑰檔(下次發
+# 連結自動生新鑰)。密鑰獨立檔案,不用 BRIDGE_TOKEN(那把是全功率 API
+# 鑰,guest 面一旦出事不能陪葬)。
+
+_GUEST_SECRET_PATH = Path(os.path.expanduser("~/.pocket/guest-link-secret"))
+
+
+def _guest_secret() -> bytes:
+    try:
+        b = _GUEST_SECRET_PATH.read_bytes().strip()
+        if len(b) >= 32:
+            return b
+    except FileNotFoundError:
+        pass
+    _GUEST_SECRET_PATH.parent.mkdir(parents=True, exist_ok=True)
+    b = secrets.token_bytes(32)
+    _GUEST_SECRET_PATH.write_bytes(b)
+    try:
+        _GUEST_SECRET_PATH.chmod(0o600)
+    except OSError:
+        pass
+    return b
+
+
+def _guest_sign(payload: bytes) -> str:
+    import hmac as _hmac
+    return base64.urlsafe_b64encode(
+        _hmac.new(_guest_secret(), payload, hashlib.sha256).digest()
+    ).decode().rstrip("=")
+
+
+def _guest_token_make(session_id: str, ttl_secs: int) -> tuple[str, float]:
+    exp = time.time() + ttl_secs
+    payload = json.dumps({"sid": session_id, "exp": exp},
+                         separators=(",", ":")).encode()
+    body = base64.urlsafe_b64encode(payload).decode().rstrip("=")
+    return f"{body}.{_guest_sign(payload)}", exp
+
+
+def _guest_token_verify(token: str) -> str | None:
+    """回 session_id;簽章/格式/過期任一不對 → None。"""
+    import hmac as _hmac
+    try:
+        body, sig = token.split(".", 1)
+        payload = base64.urlsafe_b64decode(body + "=" * (-len(body) % 4))
+        if not _hmac.compare_digest(sig, _guest_sign(payload)):
+            return None
+        obj = json.loads(payload)
+        if float(obj.get("exp") or 0) < time.time():
+            return None
+        sid = str(obj.get("sid") or "")
+        return sid or None
+    except Exception as exc:  # noqa: BLE001
+        _log_event("guest_token_invalid", error=type(exc).__name__, expected=True)
+        return None
+
+
+def _guest_public_base() -> str:
+    """對外可達的網址底:中繼網址優先(POCKET_TUNNEL_URL)。沒有公網
+    就只好回空 —— 端點會 409,分享功能在純 LAN 配置下本來就不成立。"""
+    return (os.environ.get("POCKET_TUNNEL_URL") or "").rstrip("/")
+
+
+@app.post("/app/v1/guest-links")
+async def guest_link_create(request: Request):
+    _check_auth(request)
+    b = await request.json()
+    sid = str(b.get("session_id") or "").strip()
+    if not sid:
+        raise http_err(400, "BAD_REQUEST", "缺 session_id")
+    ttl = int(b.get("ttl_secs") or 86400)
+    ttl = max(300, min(ttl, 7 * 86400))
+    # 先驗 session 存在(解析失敗這裡就炸,不發死連結)。
+    await _v2_card_store(sid)
+    base = _guest_public_base()
+    if not base:
+        raise http_err(409, "NO_PUBLIC_URL",
+                       "沒有公網位址(未啟用中繼),無法產生可分享連結")
+    token, exp = _guest_token_make(sid, ttl)
+    _log_event("guest_link_created", session=sid, ttl=ttl)
+    return {"url": f"{base}/guest/{token}", "expires_at": exp}
+
+
+def _guest_html(session_id: str, cards: list) -> str:
+    import html as _html
+    rows = []
+    for c in cards:
+        body = c.get("body") or {}
+        text = str(body.get("text") or body.get("fallback_text") or "").strip()
+        if not text:
+            continue
+        role = "you" if c.get("role") == "user" else "agent"
+        rows.append(
+            f'<div class="m {role}"><pre>{_html.escape(text)}</pre></div>')
+    title = _html.escape(session_id)
+    return ("<!doctype html><meta charset='utf-8'>"
+            "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+            "<meta name='robots' content='noindex'>"
+            f"<title>Pocket · {title}</title>"
+            "<style>body{font:15px/1.6 -apple-system,sans-serif;max-width:720px;"
+            "margin:24px auto;padding:0 16px;background:#faf8f5;color:#222}"
+            ".m{margin:10px 0;padding:10px 14px;border-radius:12px}"
+            ".m pre{margin:0;white-space:pre-wrap;word-break:break-word;font:inherit}"
+            ".you{background:#e8e2d8}.agent{background:#fff;border:1px solid #e5e0d8}"
+            "h1{font-size:17px}footer{color:#999;font-size:12px;margin:24px 0}"
+            "</style>"
+            f"<h1>Pocket 對話(唯讀)</h1>{''.join(rows) or '<p>(沒有內容)</p>'}"
+            "<footer>由 Pocket 分享的唯讀快照;連結到期自動失效。</footer>")
+
+
+@app.get("/guest/{token}")
+async def guest_view(token: str):
+    """**無 auth,刻意的** —— 認證就是 token 本身(HMAC+exp)。只讀、只
+    渲染文字、HTML 轉義、noindex;壞/過期一律 410 不區分(不給探測面)。"""
+    sid = _guest_token_verify(token)
+    if not sid:
+        raise HTTPException(status_code=410, detail="連結已失效")
+    try:
+        store = await _v2_card_store(sid)
+    except Exception:  # noqa: BLE001
+        raise HTTPException(status_code=410, detail="連結已失效")
+    snap = store.snapshot(limit=300)
+    return HTMLResponse(_guest_html(sid, snap.get("cards") or []))
+
+
+# ── Usage summary(2026-11-04,抄 t3code usage 面板的資料面)────────────
+
+
+@app.get("/app/v1/usage/summary")
+async def usage_summary(request: Request, window: str = "7d"):
+    """按 provider 匯總的用量。v1 資料源是 event_log(turn/訊息里程碑),
+    **tokens 誠實回 null** —— bridge 目前不持久化 token 計數,顯示假數
+    比沒有更糟;等 provider usage 落 event_log 後同一個端點自然長出來。"""
+    _check_auth(request)
+    days = {"1d": 1, "7d": 7, "30d": 30}.get(window, 7)
+    cutoff = time.time() - days * 86400
+    import sqlite3
+    per: dict = {}
+    try:
+        con = sqlite3.connect(CANON_DB, timeout=30)
+        try:
+            rows = con.execute(
+                "SELECT session, type, COUNT(*) FROM event_log"
+                " WHERE created_at > ? AND type IN"
+                " ('turn','card.milestone','message.upsert')"
+                " GROUP BY session, type", (cutoff,)).fetchall()
+        finally:
+            con.close()
+    except Exception as exc:  # noqa: BLE001
+        _log_event("usage_summary_read_failed", error=type(exc).__name__)
+        rows = []
+    for session, etype, n in rows:
+        prov = str(session).split(":", 1)[0] if ":" in str(session) else "hermes"
+        d = per.setdefault(prov, {"provider": prov, "turns": 0, "messages": 0,
+                                  "tokens_in": None, "tokens_out": None,
+                                  "est_cost_usd": None})
+        if etype == "turn":
+            # begin/end 成對,一回合算一次。
+            d["turns"] += n // 2 if n >= 2 else n
+        else:
+            d["messages"] += n
+    providers = sorted(per.values(), key=lambda x: -(x["turns"] + x["messages"]))
+    total = {"turns": sum(p["turns"] for p in providers),
+             "messages": sum(p["messages"] for p in providers),
+             "tokens_in": None, "tokens_out": None, "est_cost_usd": None}
+    return {"window": f"{days}d", "providers": providers, "total": total}
+
+
+@app.get("/app/v2/providers/capabilities")
+async def v2_provider_capabilities(request: Request):
+    """App 的「按能力渲染」資料源:不支援=不顯示,而不是按了才壞。"""
+    _check_auth(request)
+    return {"providers": _provider_caps_payload()}
 
 
 async def _v2_session_op(op: str, session_id: str, request: Request):
@@ -29599,6 +29929,41 @@ def _approval_provider_of(source: str) -> str:
     return "hermes"
 
 
+def _approval_response_capability(aid: str, provider: str, src: str,
+                                  status: str) -> str:
+    """這筆審批現在**答得動嗎**(2026-11-04,抄 t3code responseCapability)。
+
+    pending 不等於可答:等待者是記憶體的(CC 的 pane 對位、cc2/codex 的
+    waiter dict、gemini 的 future),bridge 重啟/逾時後 DB 列還掛著
+    pending,app 讓人按下去只會收 409 —— 「答了沒人收」的靜默失敗家族。
+    回 "live"(等待者在)/"not_resumable"(死了,UI 該灰掉按鈕)/
+    "none"(已決,沒有回答這回事)。判不出來回 live —— 寧可讓人按、
+    409 守底,也不要把活的請求誤標成死的。openclaw 真相在 gateway,
+    bridge 鏡像判不了死活,一律 live。
+    """
+    if status != "pending":
+        return "none"
+    try:
+        if src.startswith("claude_code:"):
+            name = src.split(":", 1)[1]
+            a = _CC_APPROVAL_ACTIVE.get(name)
+            return "live" if a and a.get("aid") == aid else "not_resumable"
+        if src.startswith("cc2:"):
+            w = cc_sdk.registry().pending_approvals.get(aid)
+            return "live" if w and w.get("decision") is None else "not_resumable"
+        if src.startswith("codex"):
+            return ("live" if aid in getattr(CODEX_APP, "pending_approvals", {})
+                    else "not_resumable")
+        if src.startswith("gemini:"):
+            fut = _GM_PERM_WAITERS.get(aid)
+            return "live" if fut is not None and not fut.done() else "not_resumable"
+    except Exception as exc:  # noqa: BLE001
+        _log_event("approval_response_capability_probe_failed",
+                   approval_id_hash=_short_hash(aid),
+                   error=type(exc).__name__, expected=True)
+    return "live"
+
+
 def _approval_row(r):
     """DB tuple(_APPROVAL_COLS 序)→ 統一 approval 物件(spec §1)。
     舊欄位全保留(相容期);新欄位缺值時由 source 推導 — 遷移前的舊列與
@@ -29625,6 +29990,8 @@ def _approval_row(r):
            "provider": r[11] or _approval_provider_of(src),
            "kind": kind,
            "options": options or _approval_default_options(kind)}
+    out["response_capability"] = _approval_response_capability(
+        out["id"], out["provider"], src, str(out["status"] or ""))
     if isinstance(meta, dict) and meta:
         out["meta"] = meta
     return out
@@ -30048,6 +30415,18 @@ async def _approval_decide_core(aid: str, b: dict) -> dict:
             b.get("decision") or b.get("status") or b.get("action") or "").strip():
         b = {**b, "approve": _approval_bool_from_body(b)}
     d = _approval_get_row(aid)
+    # 冪等收據(2026-11-04,抄 t3code「重送只回收據」):已決的審批再被
+    # POST 一次 —— 推播點一次、app 裡又點一次、兩台裝置同時按 —— 第二下
+    # 原本會掉進各 provider 分支換來 409「already decided」,使用者看到的
+    # 是「我批准了然後它報錯」。已決就回實際結果收據,不嚇人也不重送;
+    # 409 保留給「還 pending 但等待者已死」的真失效。
+    _terminal = {"approved", "denied", "rejected", "answered",
+                 "acknowledged", "expired"}
+    if d and str(d.get("status") or "") in _terminal:
+        out = {"id": aid, "status": d.get("status"), "idempotent": True}
+        if d.get("result"):
+            out["result"] = d.get("result")
+        return out
     src = str((d or {}).get("source") or "")
     if d and src.startswith("claude_code:"):
         # 批次 3 斷點③:CC 審核決議 → 回流 TUI 鍵。以「當下 pane 的 prompt」

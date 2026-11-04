@@ -1,6 +1,7 @@
 # 統一待審核中心(Approval Hub)規範
 
-> 狀態:**A1 已實作上線(2026-07-10);A2-A4 待做**。拍板後依 APP_BRIDGE_CONTRACT.md §0 鐵律
+> 狀態:**A1 bridge、A2 app、A3 bridge 已實作上線(2026-11-04);A4 相容期收尾待做**。
+> A2 的 app 實作在 `pocketagent`，A1/A3 的 bridge 實作在本 repo。拍板後依 APP_BRIDGE_CONTRACT.md §0 鐵律
 > 「任何 app 要消費的形狀,先寫進契約再上線」——本文件內容併入契約新 §12,
 > 實作切片進 §9 遷移表。
 >
@@ -126,10 +127,11 @@ body {title, session_id, kind, risk?, detail?, options?, ttl_seconds?, callback_
 ## 4. 卡片流:approval 卡三 provider 補齊
 
 - 契約 §6 的 `approval` 卡(`{approval_id, title, options, source,
-  fallback_text}`)目前**只有 codex 會發**。統一後:三 provider 的 pending
-  在其 session 卡片流都 emit approval 卡、決定後 upsert 為 resolved
-  (carddigest 現成 `handle_approval/resolve_approval` 模式套用到 cc watcher
-  與 hermes create)。
+  fallback_text}`)已由 Codex、CC watcher 與 Hermes approval/notice 流共同發出。
+  三者的 pending 都在其 session 卡片流 emit approval 卡、決定後 upsert 為
+  resolved（共用 carddigest `handle_approval/resolve_approval`）；冷載與 TTL
+  過期也有對應測試。新的 provider 若要接入，必須補同一組 pending/resolve/
+  cold-seed fixture，而不是只補中心清單。
 - 卡上的 `options` 與 §1 同物;卡片內一鍵決定與中心決定等價
   (都打 3.2)。
 
@@ -152,9 +154,9 @@ body {title, session_id, kind, risk?, detail?, options?, ttl_seconds?, callback_
 | 切片 | 內容 | 依賴 |
 |---|---|---|
 | ✅A1 | bridge:approvals 表加 `session_id/provider/kind/options` 欄(migration+回填),v1 list/decision 曝露新欄位;`{key}` 決定;v2 meta.approval 統一(含 hermes 補 waiting_approval) | 無 |
-| A2 | app:中心單清單+單決定路徑;角標改同源 | A1 |
-| A3 | bridge:cc/hermes 補 approval 卡片流;hermes `kind=notice` 通知接入(挑 1–2 個 cron 報告先行) | A1 |
-| A4 | 相容期收尾:刪三種舊 v2 approve body、刪 `meta.prompt`、刪 app 舊三路輪詢 | A2+A3 全上線一版後 |
+| ✅A2 | app:中心單清單+單決定路徑;角標改同源 | A1 |
+| ✅A3 | bridge:Codex/CC/Hermes 補 approval 卡片流;Hermes `kind=notice` 通知接入與 TTL/cold-seed 收尾 | A1 |
+| A4 | 相容期收尾:刪三種舊 v2 approve body、刪 `meta.prompt`、刪 app 舊三路輪詢；必須在新版 app 已普及後執行 | A2+A3 全上線一版後 |
 
 ## 7. 驗收基準
 

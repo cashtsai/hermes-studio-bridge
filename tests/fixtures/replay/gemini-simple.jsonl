@@ -1,0 +1,5 @@
+{"method":"seed_messages","params":{"messages":[{"id":"gm-user","role":"user","content":"Say hello","ts":1783200000.0}]}}
+{"method":"turn_begin","params":{"cid":"g-1","label":"已送達 Gemini，等待回覆。"}}
+{"method":"turn_delta","params":{"cid":"g-1","delta":"GEMINI_"}}
+{"method":"turn_delta","params":{"cid":"g-1","delta":"OK"}}
+{"method":"turn_end","params":{"cid":"g-1","full_text":"GEMINI_OK","reply_mid":"gm-assistant"}}
