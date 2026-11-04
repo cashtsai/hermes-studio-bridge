@@ -13,10 +13,12 @@ runner 直接吃。合成幀先頂著:形狀照 carddigest.handle 的實際分�
 分支改了這裡會紅,就是要的效果。
 """
 import _isolation  # noqa: F401
+import json
 import os
 import sys
 import tempfile
 import unittest
+from pathlib import Path
 
 _TMP = tempfile.mkdtemp(prefix="replay-")
 os.environ.setdefault("POCKET_CANON_DB", os.path.join(_TMP, "canonical.db"))
@@ -24,6 +26,26 @@ os.environ.setdefault("BRIDGE_TOKEN", "test-unit-token")
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import carddigest  # noqa: E402
+
+
+FIXTURE_DIR = Path(__file__).parent / "fixtures" / "replay"
+
+
+def load_fixture(name: str) -> list[dict]:
+    """Load one reviewed provider transcript fixture from JSONL."""
+    frames = []
+    with (FIXTURE_DIR / name).open(encoding="utf-8") as fh:
+        for line_no, line in enumerate(fh, 1):
+            if not line.strip():
+                continue
+            try:
+                frame = json.loads(line)
+            except ValueError as exc:
+                raise AssertionError(f"invalid JSON in {name}:{line_no}") from exc
+            if not isinstance(frame, dict) or not frame.get("method"):
+                raise AssertionError(f"invalid frame in {name}:{line_no}")
+            frames.append(frame)
+    return frames
 
 
 def replay(frames: list) -> "carddigest.CodexThreadDigest":
@@ -37,25 +59,9 @@ def _cards(d):
     return d.store.snapshot()["cards"]
 
 
-CX_SIMPLE = [
-    {"method": "turn/started", "params": {"turn": {"id": "t-1"}}},
-    {"method": "item/agentMessage/delta",
-     "params": {"itemId": "i-1", "delta": "你好"}},
-    {"method": "item/agentMessage/delta",
-     "params": {"itemId": "i-1", "delta": ",世界"}},
-    {"method": "turn/completed", "params": {"turn": {"id": "t-1"}}},
-]
-
-CX_TURN_ERROR = [
-    {"method": "turn/started", "params": {"turn": {"id": "t-2"}}},
-    {"method": "turn/completed",
-     "params": {"turn": {"id": "t-2", "error": {"message": "boom"}}}},
-]
-
-
 class TestCxSimpleTurn(unittest.TestCase):
     def test_delta_accumulates_into_one_card(self):
-        d = replay(CX_SIMPLE)
+        d = replay(load_fixture("cx-simple.jsonl"))
         cards = _cards(d)
         msg = [c for c in cards if c["id"] == "card-cx-i-1"]
         self.assertEqual(len(msg), 1, "同 itemId 的 delta 要累積同一張卡")
@@ -63,10 +69,11 @@ class TestCxSimpleTurn(unittest.TestCase):
 
     def test_turn_lifecycle_and_busy(self):
         d = carddigest.CodexThreadDigest()
-        d.handle("turn/started", {"turn": {"id": "t-1"}})
+        frames = load_fixture("cx-simple.jsonl")
+        d.handle(frames[0]["method"], frames[0]["params"])
         self.assertTrue(d.busy)
         self.assertEqual(d.runtime_status, "running")
-        d.handle("turn/completed", {"turn": {"id": "t-1"}})
+        d.handle(frames[-1]["method"], frames[-1]["params"])
         self.assertFalse(d.busy)
         self.assertEqual(d.runtime_status, "done")
         kinds = [e["type"] for e in d.store.events]
@@ -78,7 +85,7 @@ class TestCxSimpleTurn(unittest.TestCase):
 
 class TestCxTurnError(unittest.TestCase):
     def test_error_turn_emits_error_card(self):
-        d = replay(CX_TURN_ERROR)
+        d = replay(load_fixture("cx-error.jsonl"))
         errs = [c for c in _cards(d) if "boom" in
                 (c["body"].get("text") or "")]
         self.assertEqual(len(errs), 1)

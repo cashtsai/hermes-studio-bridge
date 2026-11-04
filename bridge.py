@@ -92,6 +92,48 @@ _BG_TASKS: set = set()
 # startup 時由 _start_housekeeping 填入。
 _MAIN_LOOP = None
 
+# T3Code #3: opt-in Codex wire fixture recorder. It is deliberately disabled
+# by default because app-server frames can contain prompts, paths, and tool
+# output. When a maintainer sets POCKET_RECORD_FIXTURE, each inbound server
+# request/notification is appended as one JSONL frame for local replay tests.
+_FIXTURE_RECORD_LOCK = threading.Lock()
+
+
+def _record_fixture_frame(msg: dict) -> None:
+    """Append one inbound Codex app-server frame to an explicit local path.
+
+    This is a debugging/replay aid, not an audit log. The caller opts in with
+    ``POCKET_RECORD_FIXTURE=/private/tmp/codex.jsonl``; the file is created with
+    owner-only permissions and failures never affect the live bridge.
+    """
+    path = os.path.expanduser(os.environ.get("POCKET_RECORD_FIXTURE", "").strip())
+    if not path or not isinstance(msg, dict) or not msg.get("method"):
+        return
+    frame = {"method": str(msg["method"]),
+             "params": msg.get("params") if isinstance(msg.get("params"), dict)
+             else {}}
+    # Server-request ids are useful when diagnosing an approval transcript,
+    # but the replay digest intentionally ignores this optional field.
+    if "id" in msg:
+        frame["request_id"] = msg["id"]
+    raw = (json.dumps(frame, ensure_ascii=False, separators=(",", ":"),
+                      default=str) + "\n").encode("utf-8")
+    try:
+        parent = os.path.dirname(os.path.abspath(path))
+        os.makedirs(parent, mode=0o700, exist_ok=True)
+        with _FIXTURE_RECORD_LOCK:
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+            try:
+                os.fchmod(fd, 0o600)
+                view = memoryview(raw)
+                while view:
+                    view = view[os.write(fd, view):]
+            finally:
+                os.close(fd)
+    except Exception as exc:  # noqa: BLE001
+        # Recording must never turn a healthy provider stream into an error.
+        _log_event("codex_fixture_record_failed", error=type(exc).__name__)
+
 # Durable media index.  Construction is lazy so importing bridge.py in tests
 # does not create production state under ~/.pocket.
 _MEDIA_ARTIFACT_STORE = None
@@ -2689,8 +2731,9 @@ def _milestone_sink(session_id: str, etype: str, payload: dict,
     不准影響卡片熱路徑;_event_append 本身已絕不 raise。"""
     try:
         _event_append(session_id, etype, payload, external_id=external_id)
-    except Exception:  # noqa: BLE001
-        pass
+    except Exception as exc:  # noqa: BLE001
+        _log_event("milestone_sink_failed", session=session_id, type=etype,
+                   error=type(exc).__name__, expected=True)
 
 
 carddigest.MILESTONE_SINK = _milestone_sink
@@ -6272,6 +6315,7 @@ class CodexAppServerClient:
             _log_event("codex_app_server_bad_json", error=type(e).__name__,
                        line=str(raw)[:160])
             return
+        _record_fixture_frame(msg)
         if msg.get("method"):
             await self._handle_server_message(msg)
         elif "id" in msg:
@@ -23212,7 +23256,8 @@ def _guest_token_verify(token: str) -> str | None:
             return None
         sid = str(obj.get("sid") or "")
         return sid or None
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
+        _log_event("guest_token_invalid", error=type(exc).__name__, expected=True)
         return None
 
 
@@ -23307,7 +23352,8 @@ async def usage_summary(request: Request, window: str = "7d"):
                 " GROUP BY session, type", (cutoff,)).fetchall()
         finally:
             con.close()
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
+        _log_event("usage_summary_read_failed", error=type(exc).__name__)
         rows = []
     for session, etype, n in rows:
         prov = str(session).split(":", 1)[0] if ":" in str(session) else "hermes"
@@ -29777,8 +29823,10 @@ def _approval_response_capability(aid: str, provider: str, src: str,
         if src.startswith("gemini:"):
             fut = _GM_PERM_WAITERS.get(aid)
             return "live" if fut is not None and not fut.done() else "not_resumable"
-    except Exception:  # noqa: BLE001
-        pass
+    except Exception as exc:  # noqa: BLE001
+        _log_event("approval_response_capability_probe_failed",
+                   approval_id_hash=_short_hash(aid),
+                   error=type(exc).__name__, expected=True)
     return "live"
 
 
@@ -31383,7 +31431,8 @@ async def app_claude_login_finish(request: Request):
                        "授權碼無效或已過期,請重新開始(換 token 被拒)")
     try:
         token = str((resp.json() or {}).get("access_token") or "")
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
+        _log_event("claude_login_invalid_response", error=type(exc).__name__)
         token = ""
     if not token:
         _log_event("claude_login_no_access_token")
