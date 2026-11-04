@@ -1529,6 +1529,7 @@ CLAUDE.md 明寫那條已過時。)
 |---|---|---|
 | `POCKET_CONSOLE_ENABLED` | `0` | 整個 `/console` 與本節三支都 **404** |
 | `POCKET_CONSOLE_QR_LOGIN` | `0` | 本節三支 **404**;`/console` 對遠端維持**裸 403**(現狀) |
+| `POCKET_CONSOLE_WEB` | `0` | `/console` 對**本機中繼 vhost**(付費 relay 的 hostname)維持 403。開了之後,只有 Host 等於本機 relay grant 的 hostname 的請求能進到 **401 配對碼輸入頁**(其餘門禁與率限照舊;公網面的 cookie 一律 session-only)。與 QR 旗標各自獨立;同一個請求兩者都適用時走輸入頁。手機端三支端點不受本旗標影響 |
 
 **404 而不是 403/501**:app 探不到就當這台 bridge 不支援,安靜地不顯示 ——
 舊 bridge 的使用者不該看到錯誤。這與 `/capabilities` 的降級慣例一致。

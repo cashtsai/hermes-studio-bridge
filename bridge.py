@@ -10501,9 +10501,19 @@ def _console_cookie_secure(request: Request) -> bool:
     走 http(tailnet 直連 8081)時若硬加 `Secure`,瀏覽器會直接丟掉 cookie,
     PWA 照樣壞。抽成一支是因為 QR 登入的 sid cookie 也要同一條規則 ——
     規則只能有一份,否則兩邊會慢慢漂開。
+
+    2026-11-04(web-first)補看 `X-Forwarded-Proto`:走 https 中繼時,TLS 在
+    relay 端終止,到 uvicorn 這裡的 scheme 是 http —— 只認 scheme 會讓公網面
+    的 cookie 少掉 `Secure`。信這個標頭是安全的:謊報 https 只會讓**自己的**
+    cookie 被標 Secure(之後走 http 送不回來,自傷);真 https 時 scheme 或
+    標頭至少一個成立,Secure 不會掉。
     """
     scheme = (getattr(getattr(request, "url", None), "scheme", "") or "").lower()
-    return scheme == "https"
+    if scheme == "https":
+        return True
+    headers = getattr(request, "headers", None)
+    xfp = ((headers.get("x-forwarded-proto") or "") if headers else "")
+    return xfp.split(",")[0].strip().lower() == "https"
 
 
 def _console_set_cookie(request: Request, resp: Response, *,
@@ -10583,11 +10593,13 @@ def _console_set_claim_cookie(request: Request, resp: Response, code: str) -> No
     `document.cookie` 讀它(見本節開頭的安全論證)。"""
     if not code:
         return
-    scheme = (getattr(getattr(request, "url", None), "scheme", "") or "").lower()
     resp.set_cookie(
         _CONSOLE_CLAIM_COOKIE_NAME, code,
         max_age=_CONSOLE_CLAIM_COOKIE_TTL, path=_CONSOLE_COOKIE_PATH,
-        httponly=False, samesite="strict", secure=(scheme == "https"),
+        httponly=False, samesite="strict",
+        # 與 pocket_console 同一條 Secure 規則(單一來源;原本這裡 inline 複製
+        # 了一份 scheme 判斷,web-first 補 X-Forwarded-Proto 時一併收攏)。
+        secure=_console_cookie_secure(request),
     )
 
 
@@ -10608,7 +10620,7 @@ _CONSOLE_LOGIN_ERR = "bad-code"       # 哨兵:只是「要不要顯示錯誤列
 # 刻意只有一種 —— 錯誤原因(空的/太短/前綴對)一律同一句,見下方 role="alert"。
 
 
-def _console_login_html(error: str = "") -> str:
+def _console_login_html(error: str = "", *, persistent: bool = True) -> str:
     """輸入頁 HTML。自包含(inline CSS、零外部資源、零 JS),繁中+英文並陳。
 
     刻意不引 /console/static/* —— 這頁在「還沒認證」的狀態下送出,不該讓未認證
@@ -10696,17 +10708,28 @@ __ERR__<form method="post" action="/console/auth">
 <span class="en">Find the code in Pocket on your iPhone:
 <b>Settings → Desktop Console</b>.</span></p>
 </div>
-<p class="note">驗證成功後,這個瀏覽器會記住 14 天。<br>
-<span class="en">This browser stays signed in for 14 days.</span></p>
-</main></body></html>""".replace("__ERR__", err)
+<p class="note">__NOTE__</p>
+</main></body></html>""".replace("__ERR__", err).replace("__NOTE__", (
+        "驗證成功後,這個瀏覽器會記住 14 天。<br>"
+        "<span class=\"en\">This browser stays signed in for 14 days.</span>"
+        if persistent else
+        # web-first 中繼面發的是 session cookie(關瀏覽器即失效),頁面上的
+        # 承諾要跟實際發的憑證一致,不能沿用 14 天那句。
+        "驗證成功後,登入維持到關閉瀏覽器為止。<br>"
+        "<span class=\"en\">You stay signed in until this browser is closed."
+        "</span>"))
 
 
-def _console_login_response(request: Request, *, error: str = "") -> HTMLResponse:
+def _console_login_response(request: Request, *, error: str = "",
+                            persistent: bool = True) -> HTMLResponse:
     """401 + 輸入頁。401 而不是 200:語意是「還沒認證」,而且不會被誤當成
     console 本體快取(`_CONSOLE_SECURITY_HEADERS` 已帶 `Cache-Control: no-store`)。
-    瀏覽器對 401 + HTML body 照樣正常渲染。"""
-    return HTMLResponse(_console_login_html(error), status_code=401,
-                        headers=_CONSOLE_SECURITY_HEADERS)
+    瀏覽器對 401 + HTML body 照樣正常渲染。
+
+    `persistent=False`(web-first 中繼面)只影響頁尾那句登入壽命的說明 ——
+    表單、錯誤訊息、節流行為完全同一套。"""
+    return HTMLResponse(_console_login_html(error, persistent=persistent),
+                        status_code=401, headers=_CONSOLE_SECURITY_HEADERS)
 
 
 # 輸入頁的嘗試節流:**沿用** token 閘那張 per-client 有界表
@@ -10798,10 +10821,22 @@ def _console_auth_retry_after(request: Request) -> float:
 
 
 def _console_auth_note_failure(request: Request) -> None:
-    """記一次輸入頁失敗(進同一張 per-client 桶)。**不記碼**,只記來源。"""
+    """記一次輸入頁失敗(進同一張 per-client 桶)。**不記碼**,只記來源。
+
+    web-first(2026-11-04)補 `forwarded_for`:走中繼時 TLS/代理在前面,
+    `request.client` 在沒開 proxy-headers 的部署下只會是 loopback ——
+    公網面的失敗必須記得到**訪客**的 IP,事後才查得了帳。取 XFF 最左,
+    與 `_console_login_client_key` 同一個取法;值可偽造,但這裡只是日誌
+    (率限桶照用 `_client_host`,不受影響)。
+    """
     with _AUTH_LOCK:
         _auth_fail_bump_locked(request, time.monotonic())
-    _log_event("console_auth_failed", client=_client_host(request))
+    xff = (request.headers.get("x-forwarded-for") or "").split(",")[0].strip()
+    if xff:
+        _log_event("console_auth_failed", client=_client_host(request),
+                   forwarded_for=xff)
+    else:
+        _log_event("console_auth_failed", client=_client_host(request))
 
 
 def _console_login_cross_site(request: Request) -> bool:
@@ -10854,10 +10889,31 @@ async def console_page(request: Request):
     # 這道門整個拆掉。六碼的熵只有 10⁶(規格 §3 有算術),它只配在可信網路
     # 裡當第二層,不能當公網的唯一鎖。cookie 不同:它是
     # `HMAC(boot_code, …)`,偽造不了,而且是**批准流程發出去的**。
+    #
+    # web-first(2026-11-04):第 1 條多一種「可信來源」—— 本機中繼 vhost +
+    # `POCKET_CONSOLE_WEB=1`(見 `_console_web_ok` 上方的安全論證)。放行的
+    # 只有來源這層;接下來照走同一條 boot/cookie 真閘 → 401 輸入頁。
+    # 差別只有兩個,都把公網面收得更緊而不是更鬆:
+    #   · `?boot=` 供錯碼要照咬同一張失敗退避表(handoff 的教訓:每個
+    #     `_pair_boot_ok` 呼叫點都要有退避,否則公網面多一條無限猜的 oracle)。
+    #     只在「真的供了碼」時計失敗 —— 裸開輸入頁不是嘗試,不該把 PWA
+    #     每次啟動都記成一次攻擊。
+    #   · cookie 續命走 session-only(見下方 `session_only=not local`)。
     local = _pair_local_ok(request)
-    if local:
+    web = (not local) and _console_web_ok(request)
+    if local or web:
+        boot_supplied = bool((request.query_params.get("boot") or "").strip())
+        if web and boot_supplied:
+            wait = _console_auth_retry_after(request)
+            if wait > 0:
+                raise HTTPException(status_code=429,
+                                    detail="too many attempts; slow down",
+                                    headers={"Retry-After": str(int(wait) + 1)})
         if not _pair_boot_ok(request, allow_cookie=True):
-            return _console_login_response(request)  # 沒碼/碼錯/cookie 過期 → 輸入頁
+            if web and boot_supplied:
+                _console_auth_note_failure(request)
+            # 沒碼/碼錯/cookie 過期 → 輸入頁(web 面的頁尾說明對齊 session cookie)
+            return _console_login_response(request, persistent=local)
     elif not _console_cookie_ok(request):
         if not POCKET_CONSOLE_QR_LOGIN:
             # 維持裸 403 —— **連輸入框都不給**,見 _console_login_html 的規矩 1。
@@ -10876,7 +10932,17 @@ async def console_page(request: Request):
     # 若照本機那樣換發 14 天的,掃碼登入的人每開一次頁就把「關瀏覽器即失效」
     # (規格 §10)換成一張 14 天通行證,等於這條路徑的安全前提被無聲抵銷。
     # QR 登入的前提正是「人不一定在可信的電腦前」。
-    _console_set_cookie(request, resp, session_only=not local)
+    # web-first 的中繼面(`web=True` → `local=False`)**同樣只續 session
+    # cookie**:機主對這條路的原始要求就是「關掉瀏覽器就重新用碼登入」,
+    # 而且 QR 批准發的 session cookie 不該因為多開了 web 旗標就被升級成
+    # 14 天(兩種 cookie 在值上無從分辨,一視同仁收緊)。
+    #
+    # 續命失敗只影響「這一次的續命」,不毀掉本次請求:頁面照送,舊 cookie
+    # 活到它原本的 TTL,下次再續(t3code「憑證續期不斷線」原則)。
+    try:
+        _console_set_cookie(request, resp, session_only=not local)
+    except Exception as _exc:  # noqa: BLE001 — 續不了命 ≠ 開不了頁
+        _log_exc("console_cookie_renew", _exc, expected=True)
     return resp
 
 
@@ -10918,7 +10984,12 @@ async def console_auth(request: Request):
     """
     if not POCKET_CONSOLE_ENABLED:
         raise HTTPException(status_code=404, detail="not found")
-    _pair_local_only(request)       # 與 GET 同一條線:非直連連表單都不該看到
+    # 與 GET 同一條線:直連(loopback/tailnet)或本機中繼 vhost(web-first,
+    # 旗標開才算)以外,連表單都不該看到。403 的內容與日誌維持單一來源
+    # (`_pair_local_only` 剛回報過 False,必定會丟)。
+    local = _pair_local_ok(request)
+    if not (local or _console_web_ok(request)):
+        _pair_local_only(request)
     if _console_login_cross_site(request):
         raise HTTPException(status_code=403, detail="cross-site form post")
     wait = _console_auth_retry_after(request)
@@ -10936,16 +11007,22 @@ async def console_auth(request: Request):
                                _pair_boot_code().encode("utf-8")))
     if not ok:
         _console_auth_note_failure(request)
-        return _console_login_response(request, error=_CONSOLE_LOGIN_ERR)
+        return _console_login_response(request, error=_CONSOLE_LOGIN_ERR,
+                                       persistent=local)
     resp = RedirectResponse("/console", status_code=303,
                             headers=dict(_CONSOLE_SECURITY_HEADERS))
-    _console_set_cookie(request, resp)
+    # 本機直連:14 天滑動視窗照舊。web-first 中繼面:session cookie ——
+    # 機主對這條路的原始要求是「關掉瀏覽器或 timeout 就重新六碼登入」,
+    # 公網面的憑證不活過那個分頁(與 GET 的續命規則一致,不然 GET 下一次
+    # 續命也會把它收斂成 session cookie,發 14 天只是自欺)。
+    _console_set_cookie(request, resp, session_only=not local)
     # 交棒給前端:只有「這一次驗過碼」才鑄碼,長命 cookie 永遠換不到(見
     # _CONSOLE_CLAIM_COOKIE_NAME 上方的安全邊界)。碼放 cookie 不放 query。
     claim = _console_mint_claim_code()
     _console_set_claim_cookie(request, resp, claim)
     _log_event("console_auth_ok", client=_client_host(request),
-               claim=bool(claim))      # 只記「有沒有鑄」,不記碼
+               claim=bool(claim),      # 只記「有沒有鑄」,不記碼
+               web=not local)          # 公網中繼面成功登入要留痕,可稽核
     return resp
 
 
@@ -11107,6 +11184,49 @@ def _pair_local_ok(request: Request) -> bool:
         return True
     except HTTPException:
         return False
+
+
+# ═════════ console web-first(2026-11-04)════════════════════════════════════
+# 讓 `GET /console` 能從**這台機器自己的中繼 vhost**(付費 relay 的
+# https://<hostname>)用任意瀏覽器打開 —— 不再只限 loopback/tailnet 直連。
+#
+# 放行的只有「來源」這一層,而且窄到不能再窄:
+#   · 旗標 `POCKET_CONSOLE_WEB`(預設 0)沒開 → 行為與今天一字不差。
+#   · 開了,也只認 Host == 本機 relay grant 的 hostname(開關檔 + grant.json
+#     都在 `_relay_dir()` 下,只有這台機器的主人放得進去)。別的公網入口
+#     (quick tunnel、cloudflared 具名 tunnel)不在放行名單 —— 要哪個 vhost
+#     對外開門,是部署形態的宣告,不是「有轉送標頭就算」。
+#   · 其餘兩層(`POCKET_CONSOLE_ENABLED`、boot 碼/cookie 真閘)一毫米不動:
+#     放行之後等著的仍是 401 輸入頁 + 6 位一次性短碼 + 失敗退避。
+#
+# Host 標頭是客戶端可控的,所以這**不是**認證 —— 它跟 `_pair_local_only`
+# 一樣只是「決定給哪種登入門面」的分流:冒充 Host 的人得到的只是一頁
+# 輸入框,真閘(短碼/boot 碼/簽過名的 cookie)在後面照站。
+# `_pair_local_only` 本身與它守著的 `/pair/qr*` 完全不碰。
+POCKET_CONSOLE_WEB = os.environ.get("POCKET_CONSOLE_WEB", "0") != "0"
+
+
+def _console_web_vhost() -> str:
+    """本機中繼 vhost 的主機名;relay 沒開/沒 grant 就是空字串。
+
+    每次求值(走 `_relay_public_url()` → `_relay_dir()`),不做模組常數 ——
+    這個 repo 被「import 當下綁死」咬過太多次(見 `_relay_dir` 的 docstring)。
+    """
+    url = _relay_public_url()
+    if not url.startswith("https://"):
+        return ""
+    return url[len("https://"):].strip().lower()
+
+
+def _console_web_ok(request: Request) -> bool:
+    """web-first 入口述詞:旗標開,且請求的 Host 正是本機的中繼 vhost。"""
+    if not POCKET_CONSOLE_WEB:
+        return False
+    vhost = _console_web_vhost()
+    if not vhost:
+        return False
+    host = (request.headers.get("host") or "").split(":", 1)[0].strip().lower()
+    return host == vhost
 
 
 def _console_login_client_key(request: Request) -> str:
