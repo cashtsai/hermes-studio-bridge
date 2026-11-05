@@ -4296,6 +4296,28 @@ APNS_HOST = os.environ.get(
 _apns_jwt_cache: list = [None, 0.0]        # [token, issued_at]
 _apns_disabled_logged: list = [False]      # 只記一次,避免每則推播都刷 log
 
+# ActivityKit updates are a low-priority background channel.  A provider can
+# emit several phase events in one second; forwarding all of them wastes APNs
+# budget and makes the lock screen visibly jumpy.  Final updates are never
+# throttled, so completion/interruption cannot be hidden behind this guard.
+LIVE_ACTIVITY_MIN_UPDATE_SECS = float(os.environ.get(
+    "APNS_LIVE_ACTIVITY_MIN_UPDATE_SECS", "8"))
+_LIVE_ACTIVITY_LAST_SENT: dict[str, float] = {}
+
+
+def _live_activity_update_throttled(session_id: str, busy: bool,
+                                    now: float | None = None) -> bool:
+    """Return whether a non-terminal ActivityKit update is inside the window."""
+    if not busy or LIVE_ACTIVITY_MIN_UPDATE_SECS <= 0:
+        return False
+    current = time.monotonic() if now is None else now
+    last = _LIVE_ACTIVITY_LAST_SENT.get(session_id)
+    return last is not None and current - last < LIVE_ACTIVITY_MIN_UPDATE_SECS
+
+
+def _live_activity_forget(session_id: str) -> None:
+    _LIVE_ACTIVITY_LAST_SENT.pop(session_id, None)
+
 
 def apns_configured() -> bool:
     """金鑰三件套(路徑上的 .p8 檔 + KEY_ID + TEAM_ID)齊備才算配置完成。
@@ -4522,6 +4544,8 @@ async def _apns_send_live_activity(session_id: str, busy: bool,
     problem = _push_http2_problem()
     if problem:
         return {"sent": False, "reason": "dependency_missing"}
+    if _live_activity_update_throttled(session_id, busy):
+        return {"sent": False, "reason": "throttled"}
     event = "update" if busy else "end"
     content_state = {"busy": bool(busy), "phaseLabel": phase_label,
                      "endedLabel": ended_label}
@@ -4541,8 +4565,13 @@ async def _apns_send_live_activity(session_id: str, busy: bool,
             response = await client.post(
                 f"{APNS_HOST}/3/device/{rec['token']}",
                 headers=headers, json={"aps": aps})
+        if response.status_code == 200 and busy:
+            _LIVE_ACTIVITY_LAST_SENT[session_id] = time.monotonic()
         if response.status_code == 410:
             t3code_runtime.remove_live_activity(CANON_DB, session_id)
+            _live_activity_forget(session_id)
+        elif not busy and response.status_code in {200, 410}:
+            _live_activity_forget(session_id)
         if response.status_code != 200:
             _log_event("live_activity_push_failed", session=session_id,
                        status=response.status_code,
@@ -24058,8 +24087,9 @@ async def t3_live_activity_register(session_id: str, request: Request):
 @app.delete("/app/v2/sessions/{session_id}/live-activity")
 async def t3_live_activity_remove(session_id: str, request: Request):
     _check_auth(request)
-    return {"ok": True, "removed": t3code_runtime.remove_live_activity(
-        CANON_DB, session_id)}
+    removed = t3code_runtime.remove_live_activity(CANON_DB, session_id)
+    _live_activity_forget(session_id)
+    return {"ok": True, "removed": removed}
 
 
 @app.get("/app/v2/providers/capabilities")
