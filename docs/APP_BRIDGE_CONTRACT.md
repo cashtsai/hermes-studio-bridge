@@ -475,6 +475,22 @@ Rules:
   them for delivery/working UI and must not persist them as assistant text.
 - The stream ends with `data: [DONE]`.
 
+### Guest links（唯讀、短效、無帳號）
+
+`POST /app/v1/guest-links` requires the normal owner/device bearer token and
+accepts `{session_id, ttl_secs?}`. `ttl_secs` is clamped to 5 minutes through
+7 days. The response is `{url, expires_at}`. The URL itself is the only guest
+credential: it is an HMAC-signed token containing the session id and expiry.
+The bridge stores neither the raw URL nor a token row, renders text-only
+HTML with escaping and `noindex`, and returns `410` for invalid, expired or
+unknown links without distinguishing those cases.
+
+`POST /app/v1/guest-links/revoke-all` requires owner authentication and rotates
+the host-local guest signing secret. It returns `{revoked: true}` and
+invalidates all previously issued guest links. This is intentionally
+all-links revocation; per-link revocation would require a token-hash denylist
+and a retention policy.
+
 ### `POST /app/v1/uploads/file`
 
 Uploads one composer attachment as a bearer-authenticated multipart request.
@@ -893,6 +909,8 @@ client 對接要知道的最小集合（2026-08-01 補：Android 端曾因本節
 | `GET  /app/v2/sessions/{id}/events?since_seq=&profile=` | SSE 卡片事件流（§5） | ✅ 上線（S1：cc；同上） |
 | `GET  /app/v2/sessions/{id}/media?limit=&cursor=` | session 媒體永久索引（§7） | ✅ 上線（cc/cx/persona） |
 | `GET  /app/v2/artifacts/{media_id}` | 已封存 artifact 位元組 | ✅ 上線 |
+| `POST /app/v1/guest-links` | 建立短效、唯讀、無帳號分享連結 | ✅ 上線 |
+| `POST /app/v1/guest-links/revoke-all` | owner 驗證後輪替 guest signing secret，使既有連結全部失效 | ✅ 上線 |
 | `POST /app/v2/sessions/{id}/approve` | 核准/拒絕（body: `{approve: bool}` 或 `{decision}`；`for_session` 可記住） | ✅ 上線（現路由僅 cx；cc/persona 併入待批次 2 統一路由） |
 | `POST /app/v2/sessions/{id}/input` | 送訊息/指令(可帶 attachments) | ⏳ 批次 2（統一路由；現走 v1 `/app/v1/delegations/{…}/input` 與 `/app/v1/messages`） |
 

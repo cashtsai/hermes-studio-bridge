@@ -21,6 +21,8 @@
   壞版本目錄與 snapshot 都保留。
 - `scripts/restore-sqlite-snapshot.sh`：資料庫復原是明確人工操作，必須提供
   `CONFIRM_RESTORE=1`。這避免自動回滾把更新期間已寫入的新訊息覆蓋掉。
+- Guest link 撤銷：`POST /app/v1/guest-links/revoke-all` 只輪替獨立 guest
+  signing secret，所有既有分享連結立即失效；不保存 token denylist。
 
 ## 操作
 
@@ -51,6 +53,8 @@ CC、CX 各一條 session。不要直接刪除 `releases/` 或 `snapshots/`，�
 
 - 這套保護尚未在 Vultr 實機觸發壞版演練；目前以腳本測試與靜態 unit contract
   驗證為主。
+- Guest link 目前是「全數撤銷」語意，不是單條撤銷；若未來要 per-link revoke，
+  必須另設只存 token hash/expiry 的 denylist 與清理策略，不能把原始 URL 存回資料庫。
 - 自動回滾只回退程式碼。資料庫 snapshot 的復原保留給明確人工決策。
 - macOS 的舊版 standalone watchdog 仍可存在；它只處理 health timeout，不能
   取代 supervisor 的 crash-loop hold。
