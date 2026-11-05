@@ -23801,6 +23801,15 @@ def _guest_token_verify(token: str) -> str | None:
         return None
 
 
+def _guest_revoke_all() -> None:
+    """Rotate the signing secret; existing stateless links all die at once."""
+    try:
+        _GUEST_SECRET_PATH.unlink()
+    except FileNotFoundError:
+        pass
+    _log_event("guest_links_revoked_all")
+
+
 def _guest_public_base() -> str:
     """對外可達的網址底:中繼網址優先(POCKET_TUNNEL_URL)。沒有公網
     就只好回空 —— 端點會 409,分享功能在純 LAN 配置下本來就不成立。"""
@@ -23825,6 +23834,14 @@ async def guest_link_create(request: Request):
     token, exp = _guest_token_make(sid, ttl)
     _log_event("guest_link_created", session=sid, ttl=ttl)
     return {"url": f"{base}/guest/{token}", "expires_at": exp}
+
+
+@app.post("/app/v1/guest-links/revoke-all")
+async def guest_link_revoke_all(request: Request):
+    """Revoke every stateless guest link without storing token denylist rows."""
+    _check_auth(request)
+    _guest_revoke_all()
+    return {"revoked": True}
 
 
 def _guest_html(session_id: str, cards: list) -> str:
