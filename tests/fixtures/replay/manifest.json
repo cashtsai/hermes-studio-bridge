@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "minimum_scenarios": [
+    "simple_turn",
+    "error_terminal",
+    "approval_pending_and_resolved"
+  ],
+  "release_scenarios": [
+    "simple_turn",
+    "stream_resume",
+    "interrupt_or_unsupported",
+    "approval_pending_and_resolved",
+    "queued_message",
+    "error_terminal"
+  ],
+  "providers": {
+    "codex": {
+      "simple_turn": "cx-simple.jsonl",
+      "error_terminal": "cx-error.jsonl"
+    },
+    "gemini": {
+      "simple_turn": "gemini-simple.jsonl"
+    },
+    "openclaw": {
+      "simple_turn": "openclaw-simple.jsonl"
+    }
+  }
+}

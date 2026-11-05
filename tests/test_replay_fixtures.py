@@ -29,6 +29,16 @@ import carddigest  # noqa: E402
 
 
 FIXTURE_DIR = Path(__file__).parent / "fixtures" / "replay"
+MANIFEST_PATH = FIXTURE_DIR / "manifest.json"
+
+
+def load_manifest() -> dict:
+    """Load the reviewed provider/scenario coverage manifest."""
+    with MANIFEST_PATH.open(encoding="utf-8") as fh:
+        manifest = json.load(fh)
+    if manifest.get("schema_version") != 1:
+        raise AssertionError("unsupported replay fixture manifest schema")
+    return manifest
 
 
 def load_fixture(name: str) -> list[dict]:
@@ -118,6 +128,33 @@ class TestCxSimpleTurn(unittest.TestCase):
         turns = [e["data"]["state"] for e in d.store.events
                  if e["type"] == "turn"]
         self.assertEqual(turns, ["begin", "end"])
+
+
+class TestReplayManifest(unittest.TestCase):
+    def test_manifest_references_existing_fixture_scenarios(self):
+        manifest = load_manifest()
+        fixture_names = {p.stem for p in FIXTURE_DIR.glob("*.jsonl")}
+        for provider, scenarios in manifest["providers"].items():
+            for scenario, filename in scenarios.items():
+                self.assertIn(
+                    Path(filename).stem,
+                    fixture_names,
+                    f"{provider} fixture 不存在: {scenario} -> {filename}",
+                )
+
+    def test_release_gate_has_explicit_six_scenario_contract(self):
+        manifest = load_manifest()
+        self.assertEqual(
+            set(manifest["release_scenarios"]),
+            {
+                "simple_turn",
+                "stream_resume",
+                "interrupt_or_unsupported",
+                "approval_pending_and_resolved",
+                "queued_message",
+                "error_terminal",
+            },
+        )
 
 
 class TestCxTurnError(unittest.TestCase):
