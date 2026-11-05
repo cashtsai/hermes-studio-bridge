@@ -140,6 +140,73 @@ TOOLS = [
     {"name": "agent_context_list",
      "description": "列出本 agent 讀得到的 session,以及各自允許的讀取模式。",
      "inputSchema": {"type": "object", "properties": {}}},
+    {"name": "t3_provider_capabilities",
+     "description": "讀取 T3Code provider 能力；只回傳能力，不回傳任何憑證。",
+     "inputSchema": {"type": "object", "properties": {}}},
+    {"name": "t3_create_delegation",
+     "description": "建立可追蹤的 T3Code delegation work order。",
+     "inputSchema": {"type": "object", "properties": {
+         "parent_persona": {"type": "string"},
+         "provider": {"type": "string", "enum": ["codex", "claude_code", "gemini"]},
+         "objective": {"type": "string"},
+         "cwd": {"type": "string"},
+         "task_code": {"type": "string"},
+         "subtask_code": {"type": "string"},
+         "title": {"type": "string"},
+         "model": {"type": "string"}},
+         "required": ["parent_persona", "provider", "objective", "cwd",
+                       "task_code", "subtask_code"]}},
+    {"name": "t3_get_delegation",
+     "description": "讀取 T3Code delegation 的持久化狀態與 runtime 狀態。",
+     "inputSchema": {"type": "object", "properties": {
+         "delegation_id": {"type": "string"}},
+         "required": ["delegation_id"]}},
+    {"name": "t3_await_delegation",
+     "description": "在有界時間內等待 delegation 狀態收斂，不會無限阻塞。",
+     "inputSchema": {"type": "object", "properties": {
+         "delegation_id": {"type": "string"},
+         "timeout_seconds": {"type": "number"}},
+         "required": ["delegation_id"]}},
+    {"name": "t3_create_context_transfer",
+     "description": "建立不含 secrets 的 ContextTransfer dry-run envelope。",
+     "inputSchema": {"type": "object", "properties": {
+         "app_thread_id": {"type": "string"},
+         "source_provider_thread_id": {"type": "string"},
+         "target_provider": {"type": "string"},
+         "summary": {"type": "string"},
+         "decisions": {"type": "array"},
+         "artifacts": {"type": "array"},
+         "pending": {"type": "array"}},
+         "required": ["app_thread_id", "source_provider_thread_id",
+                       "target_provider", "summary"]}},
+    {"name": "t3_transition_context_transfer",
+     "description": "推進 ContextTransfer 狀態；approved 必須帶 approval_id。",
+     "inputSchema": {"type": "object", "properties": {
+         "transfer_id": {"type": "string"},
+         "status": {"type": "string",
+                    "enum": ["approved", "target_created", "applied",
+                              "failed", "expired"]},
+         "approval_id": {"type": "string"},
+         "target_provider_thread_id": {"type": "string"},
+         "error": {"type": "string"}},
+         "required": ["transfer_id", "status"]}},
+    {"name": "t3_create_checkpoint",
+     "description": "建立唯讀 checkpoint；只有明確 approval 才能寫入 git ref。",
+     "inputSchema": {"type": "object", "properties": {
+         "app_thread_id": {"type": "string"},
+         "provider_thread_id": {"type": "string"},
+         "cwd": {"type": "string"},
+         "artifact_paths": {"type": "array", "items": {"type": "string"}},
+         "write_ref": {"type": "boolean"},
+         "approval_id": {"type": "string"}},
+         "required": ["app_thread_id", "cwd"]}},
+    {"name": "t3_restore_checkpoint",
+     "description": "在 approval、confirm=true、乾淨 worktree 下復原 checkpoint。",
+     "inputSchema": {"type": "object", "properties": {
+         "checkpoint_id": {"type": "string"},
+         "approval_id": {"type": "string"},
+         "confirm": {"type": "boolean"}},
+         "required": ["checkpoint_id", "approval_id", "confirm"]}},
     {"name": "propose_calendar_event",
      "description": ("提議一個行事曆事件 —— **不會寫入**,只會在使用者手機上"
                      "出現一張確認卡,他按下去才由 app 寫進行事曆。"
@@ -205,6 +272,11 @@ def _proposal_body(target: str, args: dict) -> dict:
     return body
 
 
+def _t3_body(args: dict, keys: tuple[str, ...]) -> dict:
+    """Pass only the typed T3Code fields; credentials are never accepted."""
+    return {key: args[key] for key in keys if args.get(key) is not None}
+
+
 def _http(method: str, path: str, body: dict | None = None,
           timeout: float = 630.0) -> dict:
     req = urllib.request.Request(
@@ -260,6 +332,38 @@ def _tool_call(name: str, args: dict) -> dict:
         res = _http("POST", "/app/v2/agent_context", body, timeout=120.0)
     elif name == "agent_context_list":
         res = _http("GET", f"/app/v2/agent_context_targets?caller={SELF_ID}")
+    elif name == "t3_provider_capabilities":
+        res = _http("GET", "/app/v3/orchestrator/providers/capabilities")
+    elif name == "t3_create_delegation":
+        res = _http("POST", "/app/v3/orchestrator/delegations", _t3_body(
+            args, ("parent_persona", "provider", "objective", "cwd",
+                   "task_code", "subtask_code", "title", "model")))
+    elif name == "t3_get_delegation":
+        did = urllib.parse.quote(str(args.get("delegation_id") or ""), safe="")
+        res = _http("GET", f"/app/v3/orchestrator/delegations/{did}")
+    elif name == "t3_await_delegation":
+        did = urllib.parse.quote(str(args.get("delegation_id") or ""), safe="")
+        res = _http("POST", f"/app/v3/orchestrator/delegations/{did}/await",
+                    _t3_body(args, ("timeout_seconds",)), timeout=45.0)
+    elif name == "t3_create_context_transfer":
+        tid = urllib.parse.quote(str(args.get("app_thread_id") or ""), safe="")
+        res = _http("POST", f"/app/v3/threads/{tid}/context-transfers",
+                    _t3_body(args, ("source_provider_thread_id", "target_provider",
+                                    "summary", "decisions", "artifacts", "pending")))
+    elif name == "t3_transition_context_transfer":
+        tid = urllib.parse.quote(str(args.get("transfer_id") or ""), safe="")
+        res = _http("POST", f"/app/v3/context-transfers/{tid}/transition",
+                    _t3_body(args, ("status", "approval_id",
+                                    "target_provider_thread_id", "error")))
+    elif name == "t3_create_checkpoint":
+        tid = urllib.parse.quote(str(args.get("app_thread_id") or ""), safe="")
+        res = _http("POST", f"/app/v3/threads/{tid}/checkpoints",
+                    _t3_body(args, ("provider_thread_id", "cwd", "artifact_paths",
+                                    "write_ref", "approval_id")))
+    elif name == "t3_restore_checkpoint":
+        cid = urllib.parse.quote(str(args.get("checkpoint_id") or ""), safe="")
+        res = _http("POST", f"/app/v3/checkpoints/{cid}/restore",
+                    _t3_body(args, ("approval_id", "confirm")))
     elif name in ("propose_calendar_event", "propose_reminder"):
         target = "reminder" if name == "propose_reminder" else "calendar"
         sid = str(args.get("session") or "").strip() or SELF_ID
