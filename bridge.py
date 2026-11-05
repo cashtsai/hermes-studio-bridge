@@ -5802,6 +5802,26 @@ def _codex_build_elicitation_response(record: dict, key: str) -> dict:
     return {"action": "accept", "content": None, "_meta": None}
 
 
+def _prepare_cx_byok_home(home: str) -> None:
+    """Prepare a private Codex home for one interactive BYOK session.
+
+    BYOK sessions must not inherit the host's subscription auth.json: the
+    process is authenticated by OPENAI_API_KEY instead. Copy only the shared
+    non-secret config, and keep the per-session home private.
+    """
+    os.makedirs(home, mode=0o700, exist_ok=True)
+    with contextlib.suppress(OSError):
+        os.chmod(home, 0o700)
+    source = os.path.join(codex_home.shared_home(), "config.toml")
+    target = os.path.join(home, "config.toml")
+    if os.path.isfile(source) and not os.path.exists(target):
+        try:
+            shutil.copyfile(source, target)
+            os.chmod(target, 0o600)
+        except OSError as exc:
+            _log_exc("codex_byok_home_config", exc, expected=True)
+
+
 class CodexAppServerClient:
     """Small JSON-RPC client for `codex app-server --stdio`.
 
@@ -5810,11 +5830,17 @@ class CodexAppServerClient:
     Codex App/CLI threads; `codex exec` remains only a fallback path.
     """
 
-    def __init__(self):
+    def __init__(self, *, spawn_env: dict | None = None,
+                 spawn_home: str | None = None):
         self.proc = None
         self.ws = None
         self.transport = ""
         self.spawned_bin = ""
+        # Non-empty only for an isolated interactive BYOK session. The key is
+        # held in memory and injected into that child process only; it is never
+        # part of JSON-RPC, argv, or bridge logging.
+        self._spawn_env = dict(spawn_env or {})
+        self._spawn_home = str(spawn_home or "")
         # 這一次連線實際用的 codex 家目錄(隔離時 = ~/.pocket/codex-home)。
         self.codex_home = ""
         # 上一次「印出來」的傳輸種類,用來做 once-per-transition 的日誌節流。
@@ -5951,9 +5977,20 @@ class CodexAppServerClient:
         self.spawned_bin = codex_bin
         # 隔離關閉時 env 是 None,連 `env=` 參數都不會傳,spawn 呼叫與今天
         # 逐字相同。
-        env = _codex_prepare_home()
+        if self._spawn_home:
+            _prepare_cx_byok_home(self._spawn_home)
+            env = dict(os.environ)
+            env["CODEX_HOME"] = self._spawn_home
+            # A damaged/missing BYOK secret must not accidentally inherit a
+            # host-level key; a private session should fail closed.
+            env.pop("OPENAI_API_KEY", None)
+            env.update(self._spawn_env)
+        else:
+            env = _codex_prepare_home()
         self.codex_home = (codex_home.isolated_home() if env is not None
                            else codex_home.shared_home())
+        if self._spawn_home:
+            self.codex_home = self._spawn_home
         try:
             self.proc = await asyncio.create_subprocess_exec(
                 codex_bin, "app-server", "--stdio",
@@ -5975,6 +6012,21 @@ class CodexAppServerClient:
         self.transport = "stdio"
         self._reader_task = asyncio.create_task(self._read_stdout())
         self._stderr_task = asyncio.create_task(self._read_stderr())
+
+    async def close(self) -> None:
+        """Stop a private app-server without touching the shared daemon."""
+        proc = self.proc
+        if proc is None or proc.returncode is not None:
+            return
+        with contextlib.suppress(ProcessLookupError):
+            proc.terminate()
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=3.0)
+        except asyncio.TimeoutError:
+            with contextlib.suppress(ProcessLookupError):
+                proc.kill()
+            with contextlib.suppress(Exception):
+                await proc.wait()
 
     def _note_transport(self, transport: str, **fields):
         """只在「傳輸換人做」的時候印一行,不要每次重試都洗版。"""
@@ -7907,6 +7959,147 @@ class CodexAppServerClient:
 CODEX_APP = CodexAppServerClient()
 
 
+# ── CX per-session BYOK ──────────────────────────────────────────────────────
+# The normal CX lane deliberately uses one managed app-server shared with the
+# desktop Codex app. An API key is process-scoped, so putting it in that daemon
+# would silently change authentication for every CX thread. BYOK threads get a
+# private app-server and private CODEX_HOME instead.
+CX_BYOK_ROOT = os.path.expanduser("~/.config/pocket/cx-byok")
+CX_BYOK_INDEX = os.path.join(CX_BYOK_ROOT, "index.json")
+_CX_BYOK_CLIENTS: dict[str, CodexAppServerClient] = {}
+_CX_BYOK_META: dict[str, dict] = {}
+
+
+def _cx_byok_load_index() -> None:
+    try:
+        with open(CX_BYOK_INDEX, encoding="utf-8") as fh:
+            rows = json.load(fh)
+        if isinstance(rows, dict):
+            for tid, meta in rows.items():
+                if isinstance(tid, str) and isinstance(meta, dict):
+                    _CX_BYOK_META[tid] = dict(meta)
+    except FileNotFoundError:
+        return
+    except Exception as exc:  # noqa: BLE001 — broken optional index must not stop bridge
+        _log_exc("cx_byok_index_load", exc, expected=True)
+
+
+def _cx_byok_save_index() -> None:
+    os.makedirs(CX_BYOK_ROOT, mode=0o700, exist_ok=True)
+    with contextlib.suppress(OSError):
+        os.chmod(CX_BYOK_ROOT, 0o700)
+    tmp = CX_BYOK_INDEX + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(_CX_BYOK_META, fh, ensure_ascii=False, sort_keys=True)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, CX_BYOK_INDEX)
+    with contextlib.suppress(OSError):
+        os.chmod(CX_BYOK_INDEX, 0o600)
+
+
+def _cx_byok_register(thread_id: str, api_key: str, text: str,
+                      cwd: str, client: CodexAppServerClient) -> None:
+    """Persist only host-local metadata + a 0600 key file for restart resume."""
+    slot = os.path.basename(str(getattr(client, "_spawn_home", "") or ""))
+    if not slot:
+        slot = uuid.uuid4().hex
+    root = os.path.join(CX_BYOK_ROOT, "sessions")
+    homes = os.path.join(root, "homes")
+    keys = os.path.join(root, "keys")
+    os.makedirs(homes, mode=0o700, exist_ok=True)
+    os.makedirs(keys, mode=0o700, exist_ok=True)
+    home = str(getattr(client, "_spawn_home", "") or os.path.join(homes, slot))
+    secret = os.path.join(keys, slot)
+    _prepare_cx_byok_home(home)
+    fd = os.open(secret, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.write(fd, api_key.encode("utf-8"))
+    finally:
+        os.close(fd)
+    with contextlib.suppress(OSError):
+        os.chmod(secret, 0o600)
+    meta = {
+        "slot": slot,
+        "home": home,
+        "secret": secret,
+        "name": (text or thread_id)[:80],
+        "preview": (text or "")[:180],
+        "workdir": cwd,
+        "createdAt": time.time(),
+        "updatedAt": time.time(),
+        "archived": False,
+    }
+    _CX_BYOK_META[thread_id] = meta
+    _CX_BYOK_CLIENTS[thread_id] = client
+    _cx_byok_save_index()
+
+
+def _cx_byok_client_for_thread(thread_id: str) -> CodexAppServerClient | None:
+    """Return an existing or lazily reconstructed private client."""
+    client = _CX_BYOK_CLIENTS.get(thread_id)
+    if client is not None:
+        return client
+    meta = _CX_BYOK_META.get(thread_id)
+    if not meta:
+        return None
+    try:
+        with open(str(meta.get("secret") or ""), encoding="utf-8") as fh:
+            key = fh.read().strip()
+        home = str(meta.get("home") or "")
+        if not key or not home:
+            raise ValueError("BYOK metadata is incomplete")
+        client = CodexAppServerClient(
+            spawn_env={"OPENAI_API_KEY": key}, spawn_home=home)
+        _CX_BYOK_CLIENTS[thread_id] = client
+        return client
+    except Exception as exc:  # noqa: BLE001 — surface an honest session error later
+        _log_exc("cx_byok_client_restore", exc, expected=True,
+                 thread=thread_id[:16])
+        return None
+
+
+def _cx_client_for_thread(thread_id: str) -> CodexAppServerClient:
+    if thread_id in _CX_BYOK_META:
+        client = _cx_byok_client_for_thread(thread_id)
+        if client is not None:
+            return client
+        # Never fall back to the managed app-server: doing so would silently
+        # run a BYOK thread under another account. Keep the failure isolated to
+        # this session; the next request will surface the provider error.
+        meta = _CX_BYOK_META[thread_id]
+        home = str(meta.get("home") or "")
+        client = CodexAppServerClient(spawn_home=home or None)
+        _CX_BYOK_CLIENTS[thread_id] = client
+        return client
+    return CODEX_APP
+
+
+def _cx_byok_stub(thread_id: str, meta: dict) -> dict:
+    """A listable session row without starting a private provider process."""
+    return {
+        "id": thread_id,
+        "name": meta.get("name") or thread_id[:12] or "codex",
+        "thread_id": thread_id,
+        "session_id": "",
+        "workdir": meta.get("workdir") or "",
+        "preview": meta.get("preview") or "",
+        "status": "idle",
+        "source": "appServer",
+        "updatedAt": meta.get("updatedAt") or meta.get("createdAt"),
+        "modelProvider": "",
+        "byok": True,
+        "has_api_key": bool(meta.get("secret")),
+    }
+
+
+def _cx_byok_thread_stubs(archived: bool = False) -> list[dict]:
+    return [_cx_byok_stub(tid, meta) for tid, meta in _CX_BYOK_META.items()
+            if bool(meta.get("archived")) == bool(archived)]
+
+
+_cx_byok_load_index()
+
+
 def _codex_context_used(inner: dict, prev_inner: dict | None):
     """從累計 tokenUsage 推「當前上下文佔用」。
 
@@ -8018,7 +8211,7 @@ def _codex_thread_model(tid: str, fallback: dict | None = None):
     """這條 CX thread 目前的 model:thread_settings 快取(唯一可信來源,見
     CodexAppServerClient 註解)優先,退回 summary/thread dict 的 model 欄。"""
     try:
-        m = (CODEX_APP.thread_settings.get(tid) or {}).get("model")
+        m = (_cx_client_for_thread(tid).thread_settings.get(tid) or {}).get("model")
     except Exception as _exc:  # noqa: BLE001
         _log_exc("_cx_model_hint", _exc, expected=True)
         m = None
@@ -8291,15 +8484,17 @@ def _cx_list_preview_text(thread_id: str) -> str:
 _CX_UPDATED_AT_SEEN: dict = {}
 
 
-def _codex_enrich_summary(summary: dict) -> dict:
+def _codex_enrich_summary(summary: dict,
+                          client: CodexAppServerClient | None = None) -> dict:
     tid = summary.get("thread_id") or summary.get("id") or ""
-    summary["appServerAlive"] = CODEX_APP.is_server_alive()
-    summary["runtimeStatus"] = CODEX_APP.runtime_status(
+    client = client or _cx_client_for_thread(tid)
+    summary["appServerAlive"] = client.is_server_alive()
+    summary["runtimeStatus"] = client.runtime_status(
         tid, summary.get("status") or "")
     # `activeTurn` 的語意就是「這條現在有沒有回合在跑」。只讀 active_turns 的話
     # 它只認得 Pocket 自己發起的回合;provider 說 active 也算數,否則 app 的
     # v1 codexsessions 面(用 activeTurn 推 lifecycle)還是會顯示待機。
-    summary["activeTurn"] = (CODEX_APP.is_active(tid)
+    summary["activeTurn"] = (client.is_active(tid)
                              or summary["runtimeStatus"] in ("running", "stalled"))
     summary["status"] = summary["runtimeStatus"]
     # 回合起算時間 —— 與 CC 的 `busy_since` 同一件事、同一個理由:app 的
@@ -8309,25 +8504,25 @@ def _codex_enrich_summary(summary: dict) -> dict:
     # 只在真的有回合時給,且不知道就不給 —— 不拿「我第一次看到它在忙」充當
     # 起算點(那個數字會對跑了半小時的回合說「已 2 秒」)。provider 自己起的
     # 回合(桌面版/VS Code/CLI)我們沒有 turn/started,所以這裡會是缺欄。
-    if CODEX_APP.is_active(tid):
+    if client.is_active(tid):
         # 刻意用 `is_active` 而不是上面那個放寬過的 `activeTurn`:後者在
         # provider 說 running 時也為真,而那種回合我們沒有 turn/started,
         # 給出去的會是上一輪的殘值。
-        started = getattr(CODEX_APP, "turn_started_at", {}).get(tid)
+        started = getattr(client, "turn_started_at", {}).get(tid)
         if started:
             summary["turnStartedAt"] = started
-    usage = _codex_usage_map(CODEX_APP.token_usage.get(tid),
+    usage = _codex_usage_map(client.token_usage.get(tid),
                              model=_codex_thread_model(tid, summary),
                              # getattr:這條路徑在測試裡會被各種 stub 取代,
                              # 直接取屬性會讓不相干的測試炸掉。
-                             prev=getattr(CODEX_APP, "token_usage_prev", {}).get(tid))
+                             prev=getattr(client, "token_usage_prev", {}).get(tid))
     if usage:
         summary["usage"] = usage
-    approval = CODEX_APP.pending_approval_for_thread(tid)
+    approval = client.pending_approval_for_thread(tid)
     if approval:
         summary["awaitingApproval"] = True
         summary["status"] = "waiting_approval"
-        summary["approval"] = CODEX_APP._approval_public(approval)
+        summary["approval"] = client._approval_public(approval)
     # codex 的 `preview` 語意是**開場白**(實測:state DB 裡 preview 與
     # first_user_message 一字不差),不是「最新訊息」。bridge 原封轉給 app 當
     # 對話預覽 → 那條 thread 不管後來聊了什麼,列表永遠顯示第一句話。
@@ -8337,18 +8532,18 @@ def _codex_enrich_summary(summary: dict) -> dict:
     latest = _cx_list_preview_text(tid)
     if latest:
         summary["preview"] = latest
-    if tid in CODEX_APP.last_event_at:
-        summary["lastEventAt"] = CODEX_APP.last_event_at[tid]
+    if tid in client.last_event_at:
+        summary["lastEventAt"] = client.last_event_at[tid]
         # updatedAt 取較新者。thread/list 回的 updatedAt 會落後很多(2026-08-15
         # 實機:bridge 報 07-07,codex 自己的 state DB 卻是 08-15,差 39 天)——
         # managed daemon 啟動時把 thread 索引載進記憶體,之後 DB 被別的行程
         # (桌面 app / bridge 自己的 turn)更新,daemon 的視圖沒跟上。我們手上
         # 的 last_event_at 是即時的,拿它補齊,對話列表才不會排在錯的位置。
         try:
-            if float(summary.get("updatedAt") or 0) < CODEX_APP.last_event_at[tid]:
-                summary["updatedAt"] = CODEX_APP.last_event_at[tid]
+            if float(summary.get("updatedAt") or 0) < client.last_event_at[tid]:
+                summary["updatedAt"] = client.last_event_at[tid]
         except (TypeError, ValueError):
-            summary["updatedAt"] = CODEX_APP.last_event_at[tid]
+            summary["updatedAt"] = client.last_event_at[tid]
     # 2026-08-21:上面那段只在 last_event_at 有記錄時才補,而它是純記憶體、重啟後
     # 是空的 —— 於是 `/status`(走 thread/read,拿 daemon 陳舊索引)會report 出比
     # 列表舊幾十天的時間。實測同一條 thread:list=08-19、status=07-07,差 43 天,
@@ -8365,13 +8560,13 @@ def _codex_enrich_summary(summary: dict) -> dict:
             _CX_UPDATED_AT_SEEN[tid] = cur
         elif seen > cur:
             summary["updatedAt"] = seen
-    if tid in CODEX_APP.thread_errors:
-        summary["error"] = CODEX_APP.thread_errors[tid]
+    if tid in client.thread_errors:
+        summary["error"] = client.thread_errors[tid]
     # thread-store 寫入鎖:`locked` **恆存在**(bool),app 才能無條件拿它決定
     # banner 與輸入框的啟用狀態,不必分辨「沒有這個欄位」與「沒被鎖」。
     # 刻意不動 `status` —— 那是既有 enum(idle/running/waiting_approval/…),
     # 塞新值會讓舊 app 顯示成未知狀態;鎖是正交的旗標。
-    lock = CODEX_APP.thread_lock_info(tid)
+    lock = client.thread_lock_info(tid)
     summary["locked"] = bool(lock)
     if lock:
         summary["lockReason"] = lock["reason"]
@@ -8451,7 +8646,9 @@ async def _codex_v2_visible_threads(wanted: int = 20) -> list[dict]:
     # 5s 內直接回上次的新鮮結果,daemon 每 TTL 至多掃一次。
     if (_CODEX_V2_VISIBLE_CACHE and not _CODEX_V2_STALE
             and time.time() - _CODEX_V2_VISIBLE_FRESH_AT < _CODEX_V2_LIST_TTL):
-        return _CODEX_V2_VISIBLE_CACHE[:wanted]
+        rows = list(_CODEX_V2_VISIBLE_CACHE) + _cx_byok_thread_stubs()
+        rows.sort(key=lambda row: float(row.get("updatedAt") or 0), reverse=True)
+        return rows[:wanted]
     visible: list[dict] = []
     cursor = None
     try:
@@ -8477,16 +8674,22 @@ async def _codex_v2_visible_threads(wanted: int = 20) -> list[dict]:
             # 被吞、degraded_providers 永遠回空 —— CX 半死一整天看板卻說健康。
             # 這裡標起來,v2_sessions 據此把 codex 列進 degraded。
             _CODEX_V2_STALE = True
-            return _CODEX_V2_VISIBLE_CACHE[:wanted]
+            rows = list(_CODEX_V2_VISIBLE_CACHE) + _cx_byok_thread_stubs()
+            rows.sort(key=lambda row: float(row.get("updatedAt") or 0), reverse=True)
+            return rows[:wanted]
         raise
     _CODEX_V2_VISIBLE_CACHE = [dict(t) for t in visible]
     _CODEX_V2_VISIBLE_FRESH_AT = time.time()
     _CODEX_V2_STALE = False
+    visible.extend(_cx_byok_thread_stubs())
+    visible.sort(key=lambda row: float(row.get("updatedAt") or 0), reverse=True)
     return visible[:wanted]
 
 
-def _codex_session_summary(thread: dict) -> dict:
+def _codex_session_summary(thread: dict,
+                           client: CodexAppServerClient | None = None) -> dict:
     tid = thread.get("id") or ""
+    client = client or _cx_client_for_thread(tid)
     name = (thread.get("name") or "").strip()
     preview = (thread.get("preview") or "").strip()
     provider_status = _codex_status_type(thread.get("status"))
@@ -8494,7 +8697,7 @@ def _codex_session_summary(thread: dict) -> dict:
     # 廣播之外的第二條保險:錯過通知、或 bridge 比 app-server 晚啟動時,
     # 清單一拉就補回來。notLoaded 也記,note_provider_status 會照實存,
     # runtime_status 自己知道要忽略它。
-    CODEX_APP.note_provider_status(tid, thread.get("status"))
+    client.note_provider_status(tid, thread.get("status"))
     out = {
         "name": name or preview[:180] or (tid[:12] or "codex"),
         "thread_id": tid,
@@ -8993,9 +9196,25 @@ async def codex_sessions(request: Request, limit: int = 40, cwd: str | None = No
                 task = asyncio.create_task(_codex_warm_threads(warm_ids))
                 _BG_TASKS.add(task)
                 task.add_done_callback(_BG_TASKS.discard)
+        sessions = [_codex_enrich_summary(_codex_session_summary(t))
+                    for t in data]
+        # Private BYOK app-servers have their own state DB, so they cannot
+        # appear in the shared daemon's thread/list. Keep their host-local
+        # metadata listable without cold-starting one provider process per poll.
+        if cursor is None:
+            for tid, meta in _CX_BYOK_META.items():
+                if bool(meta.get("archived")) != bool(archived):
+                    continue
+                client = _cx_byok_client_for_thread(tid)
+                row = _codex_enrich_summary(_cx_byok_stub(tid, meta), client)
+                row["byok"] = True
+                row["has_api_key"] = True
+                sessions.append(row)
+            sessions.sort(key=lambda row: float(row.get("updatedAt") or 0),
+                          reverse=True)
+            sessions = sessions[:wanted]
         return {
-            "sessions": [_codex_enrich_summary(_codex_session_summary(t))
-                         for t in data],
+            "sessions": sessions,
             "nextCursor": next_cursor,
             "includeChildren": include_children,
             "hiddenChildren": hidden_children,
@@ -9019,8 +9238,9 @@ async def codex_sessions(request: Request, limit: int = 40, cwd: str | None = No
 @app.get("/codexsessions/{thread_id}/status")
 async def codex_session_status(thread_id: str, request: Request):
     _check_auth(request)
+    client = _cx_client_for_thread(thread_id)
     try:
-        res = await CODEX_APP.call("thread/read", {
+        res = await client.call("thread/read", {
             "threadId": thread_id,
             "includeTurns": False,
         }, timeout=20.0)
@@ -9029,7 +9249,7 @@ async def codex_session_status(thread_id: str, request: Request):
         # 會對到空字串 thread → 狀態欄永遠是「一切正常」。請求本身就知道 id。
         if not thread.get("id"):
             thread = {**thread, "id": thread_id}
-        summary = _codex_enrich_summary(_codex_session_summary(thread))
+        summary = _codex_enrich_summary(_codex_session_summary(thread, client), client)
         # 使用者停在被鎖的 session 上盯著 banner 時,這是唯一還會定期跑的請求
         # → 借它當復原探針(抑制窗保證不會變成 retry storm)。
         _codex_lock_recheck(thread_id)
@@ -9045,17 +9265,22 @@ async def codex_session_set_name(thread_id: str, request: Request):
     name = (body.get("name") or "").strip()
     if not name:
         raise HTTPException(status_code=400, detail="name required")
+    client = _cx_client_for_thread(thread_id)
     try:
-        await CODEX_APP.call("thread/name/set", {
+        await client.call("thread/name/set", {
             "threadId": thread_id,
             "name": name,
         }, timeout=15.0)
-        res = await CODEX_APP.call("thread/read", {
+        res = await client.call("thread/read", {
             "threadId": thread_id,
             "includeTurns": False,
         }, timeout=20.0)
         thread = (res or {}).get("thread") or {}
-        summary = _codex_enrich_summary(_codex_session_summary(thread))
+        summary = _codex_enrich_summary(_codex_session_summary(thread, client), client)
+        if thread_id in _CX_BYOK_META:
+            _CX_BYOK_META[thread_id]["name"] = name
+            _CX_BYOK_META[thread_id]["updatedAt"] = time.time()
+            _cx_byok_save_index()
         return {"ok": True, "session": summary}
     except Exception as e:  # noqa: BLE001
         _codex_http_error(e)
@@ -9072,19 +9297,27 @@ async def codex_session_archive(thread_id: str, request: Request):
         pass
     _check_auth(request)
     archived = body.get("archived", True)
+    client = _cx_client_for_thread(thread_id)
     try:
-        method = await _codex_thread_set_archived(thread_id, bool(archived))
+        method = await _codex_thread_set_archived(thread_id, bool(archived), client)
+        if thread_id in _CX_BYOK_META:
+            _CX_BYOK_META[thread_id]["archived"] = bool(archived)
+            _CX_BYOK_META[thread_id]["updatedAt"] = time.time()
+            _cx_byok_save_index()
     except Exception as e:  # noqa: BLE001
         _codex_http_error(e)
     return {"ok": True, "method": method}
 
 
-async def _codex_thread_set_archived(thread_id: str, archived: bool = True) -> str:
+async def _codex_thread_set_archived(
+        thread_id: str, archived: bool = True,
+        client: CodexAppServerClient | None = None) -> str:
     """Archive/unarchive a Codex thread via the app server, trying the known
     method names in order (the app server build varies). Shared by the archive
     endpoint and the registry reaper. Returns the method that worked; raises
     the last error when every variant fails."""
     last = None
+    client = client or _cx_client_for_thread(thread_id)
     methods = (
         (
             ("thread/archive/set", {"threadId": thread_id, "archived": True}),
@@ -9100,7 +9333,7 @@ async def _codex_thread_set_archived(thread_id: str, archived: bool = True) -> s
     )
     for method, params in methods:
         try:
-            await CODEX_APP.call(method, params, timeout=15.0)
+            await client.call(method, params, timeout=15.0)
             return method
         except Exception as e:  # noqa: BLE001
             _log_exc("codex_session_archive#2", e, expected=True)
@@ -9143,8 +9376,8 @@ async def codex_session_create(request: Request):
     # spawn config(設計 §2.1):cx thread 走共用 app-server,thread/start 能設的是
     # model/approvalPolicy/**sandbox**(欄名以 ThreadStartParams schema 為準);
     # effort 不在 thread 層,起好之後補送 thread/settings/update(見下)。
-    # api_key/profile 無法逐 thread 注入
-    # (共用 app-server 一份 auth)→ 要 BYO key 請走 /dispatch 的 codex exec 子程序。
+    # api_key 會切到此 thread 專用的 app-server；profile 仍是 shared
+    # app-server 不支援的 launch-only 選項。
     try:
         spawn_cfg = _spawn_config_validate(body.get("config"), "cx")
     except SpawnConfigError as e:
@@ -9152,50 +9385,66 @@ async def codex_session_create(request: Request):
     if body.get("model") and not spawn_cfg.get("model"):
         spawn_cfg = {**spawn_cfg, "model": body.get("model")}
     params.update(_spawn_cx_thread_params(spawn_cfg))
-    cx_unsupported = [k for k in ("api_key", "profile") if spawn_cfg.get(k)]
+    cx_unsupported = [k for k in ("profile",) if spawn_cfg.get(k)]
     redacted = _spawn_config_redacted(spawn_cfg)
     if redacted:
         _log_event("codex_spawn_config", **redacted)
+    api_key = str(spawn_cfg.get("api_key") or "").strip()
+    client = CODEX_APP
+    byok = bool(api_key)
+    if byok:
+        slot = uuid.uuid4().hex
+        home = os.path.join(CX_BYOK_ROOT, "sessions", "homes", slot)
+        client = CodexAppServerClient(
+            spawn_env={"OPENAI_API_KEY": api_key}, spawn_home=home)
     # 戶政(藍圖 §3.1):thread/start 之前先過配額——超額 429,不生孤兒 thread。
     reg_parent, reg_cls, reg_purpose = _registry_spawn_fields(body, default_cls="task")
     _registry_precheck_or_429(reg_parent, reg_cls)
+    thread_id = ""
+    byok_registered = False
     try:
-        res = await CODEX_APP.call("thread/start", params, timeout=30.0)
+        res = await client.call("thread/start", params, timeout=30.0)
         thread = (res or {}).get("thread") or {}
         thread_id = thread.get("id")
         if not thread_id:
             raise CodexAppServerError("thread/start returned no thread id")
-        CODEX_APP.loaded_threads.add(thread_id)
-        CODEX_APP.note_thread_settings(thread_id, res or {})
+        client.loaded_threads.add(thread_id)
+        client.note_thread_settings(thread_id, res or {})
+        if byok:
+            _cx_byok_register(thread_id, api_key, text, cwd, client)
+            byok_registered = True
         # effort 在 thread 層沒有欄位(schema:`effort` 只在 TurnStartParams)——
         # thread/start 帶 reasoningEffort 會被靜默丟掉。thread 起好之後補送一次
         # settings/update 才會生效;失敗不擋開場,但要記進 unsupported 讓 app 知道
         # 「沒套上」,不可以照抄回去謊稱已套用(2026-08-21 安全性修正的一部分)。
         if spawn_cfg.get("effort"):
             try:
-                await CODEX_APP.call("thread/settings/update",
-                                     {"threadId": thread_id,
-                                      "effort": spawn_cfg["effort"]}, timeout=15.0)
+                await client.call("thread/settings/update",
+                                  {"threadId": thread_id,
+                                   "effort": spawn_cfg["effort"]}, timeout=15.0)
             except Exception as _eff_exc:   # noqa: BLE001
                 _log_exc("cx_spawn_effort_apply", _eff_exc, expected=True)
                 cx_unsupported.append("effort")
         _registry_register(f"codex:{thread_id}", provider="codex",
                            name=text[:40] or thread_id, purpose=reg_purpose,
                            cls=reg_cls, parent=reg_parent)
-        await CODEX_APP.start_turn(thread_id, input_items,
-                                   client_id=body.get("client_id"), cwd=cwd)
+        await client.start_turn(thread_id, input_items,
+                                client_id=body.get("client_id"), cwd=cwd)
         _cx_feed_input_accepted(
             thread_id, body.get("client_id"), _codex_user_input_text(input_items),
             attachments, typed_text=_codex_user_input_text(input_items),
             create_if_missing=True)
         resp = {"ok": True, "thread_id": thread_id,
-                "session": _codex_enrich_summary(_codex_session_summary(thread)),
+                "session": _codex_enrich_summary(
+                    _codex_session_summary(thread, client), client),
                 "spawn_config": _spawn_config_public(spawn_cfg)}
         if cx_unsupported:
             # 明說哪些欄位共用 app-server 吃不下,app 可提示改走 dispatch。
             resp["spawn_config_unsupported"] = cx_unsupported
         return resp
     except Exception as e:  # noqa: BLE001
+        if byok and not byok_registered:
+            await client.close()
         _codex_http_error(e)
 
 
@@ -13110,6 +13359,7 @@ async def codex_session_input(thread_id: str, request: Request):
     # 固有衝突,防呆方式是 UI 層提示/衝突偵測,不是在這裡跳過 resume(跳過
     # 就送不出訊息了)。
     _check_auth(request)
+    client = _cx_client_for_thread(thread_id)
     body = await _json_body(request)
     _registry_call_safe("touch", f"codex:{thread_id}")   # 戶政:活動記帳
     input_items = await _codex_input_items((body.get("text") or "").strip(),
@@ -13133,9 +13383,9 @@ async def codex_session_input(thread_id: str, request: Request):
         # 實測,使用者只能乾等)。CC 早有 queued 語意;鎖住入佇列後,解鎖偵測
         # (ensure_thread_loaded 成功)會自動 drain,使用者什麼都不用做。
         def _accept_queued() -> dict:
-            depth = CODEX_APP.enqueue_input(thread_id, input_items,
-                                            client_id=client_id,
-                                            cwd=body.get("cwd"), text=text)
+            depth = client.enqueue_input(thread_id, input_items,
+                                         client_id=client_id,
+                                         cwd=body.get("cwd"), text=text)
             _cx_feed_input_accepted(
                 thread_id, client_id, text,
                 body.get("attachments") or [], typed_text=text,
@@ -13148,16 +13398,16 @@ async def codex_session_input(thread_id: str, request: Request):
             # 鎖住而入佇列的話,要把「為什麼在排隊」的鎖卡也推進卡片流 ——
             # 舊 409 路徑由 _codex_http_error 推(create_if_missing=True),
             # 新路徑不走它,不補的話使用者只看到泡泡排著、不知道在等什麼。
-            if CODEX_APP.is_thread_locked(thread_id):
+            if client.is_thread_locked(thread_id):
                 _cx_feed_thread_locked(thread_id, create_if_missing=True)
             return {"ok": True, "thread_id": thread_id, **res}
 
-        if CODEX_APP.is_active(thread_id) or CODEX_APP.is_thread_locked(thread_id):
+        if client.is_active(thread_id) or client.is_thread_locked(thread_id):
             return _accept_queued()
         try:
-            started = await CODEX_APP.start_turn(thread_id, input_items,
-                                                 client_id=client_id,
-                                                 cwd=body.get("cwd"))
+            started = await client.start_turn(thread_id, input_items,
+                                              client_id=client_id,
+                                              cwd=body.get("cwd"))
             _cx_feed_input_accepted(
                 thread_id, client_id, text,
                 body.get("attachments") or [], typed_text=text,
@@ -13205,7 +13455,8 @@ _CODEX_COLLAB_MODES = ("plan", "default")
 _CX_MODELS_CACHE: dict = {"at": 0.0, "ids": set()}
 
 
-async def _codex_known_models() -> set:
+async def _codex_known_models(
+        client: CodexAppServerClient | None = None) -> set:
     """codex 認得的 model id 集合(`model/list`,快取 10 分鐘)。
 
     拿不到就回空集合 = 呼叫端放行不擋:這是護欄,不該因為 codex 暫時不回應就把
@@ -13214,7 +13465,7 @@ async def _codex_known_models() -> set:
     if _CX_MODELS_CACHE["ids"] and now - _CX_MODELS_CACHE["at"] < 600:
         return _CX_MODELS_CACHE["ids"]
     try:
-        res = await CODEX_APP.call("model/list", {}, timeout=10.0)
+        res = await (client or CODEX_APP).call("model/list", {}, timeout=10.0)
     except Exception as e:  # noqa: BLE001
         _log_exc("cx_model_list", e, expected=True)
         return set()
@@ -13248,12 +13499,13 @@ async def codex_session_settings_read(thread_id: str, request: Request):
     spawn-only。
     """
     _check_auth(request)
-    if thread_id not in CODEX_APP.thread_settings:
+    client = _cx_client_for_thread(thread_id)
+    if thread_id not in client.thread_settings:
         try:
-            await CODEX_APP.ensure_thread_loaded(thread_id)
+            await client.ensure_thread_loaded(thread_id)
         except Exception as e:  # noqa: BLE001
             _codex_http_error(e)
-    cached = dict(CODEX_APP.thread_settings.get(thread_id) or {})
+    cached = dict(client.thread_settings.get(thread_id) or {})
     cached.pop("at", None)
     settings = {k: v for k, v in cached.items() if v}
     return {"thread_id": thread_id, "settings": settings,
@@ -13279,6 +13531,7 @@ async def codex_session_settings(thread_id: str, request: Request):
     這是 CC 有、CX 沒有的最大功能落差。
     """
     _check_auth(request)
+    client = _cx_client_for_thread(thread_id)
     body = await request.json()
     params = {"threadId": thread_id}
     model = str(body.get("model") or "").strip()
@@ -13289,7 +13542,7 @@ async def codex_session_settings(thread_id: str, request: Request):
         # 字串(實測 `totally-bogus-model-xyz` 回 200、讀回來也是它),要等下一輪
         # 真的跑起來才炸,而且錯誤跟「你設過一個不存在的模型」看不出關聯。
         # model/list 拿不到(舊版/暫時失敗)就放行 —— 驗證是護欄,不該變成新的故障點。
-        known = await _codex_known_models()
+        known = await _codex_known_models(client=client)
         if known and model not in known:
             raise http_err(400, "CX_UNKNOWN_MODEL",
                            f"codex 不認得這個模型:{model}",
@@ -13308,7 +13561,7 @@ async def codex_session_settings(thread_id: str, request: Request):
                                        + "|".join(_CODEX_COLLAB_MODES))
         # schema:CollaborationMode = {mode, settings};`settings` 少了會被拒
         # (實測 `missing field settings`),模型沿用該 thread 現有的那顆。
-        cur_model = model or str((CODEX_APP.thread_settings.get(thread_id)
+        cur_model = model or str((_cx_client_for_thread(thread_id).thread_settings.get(thread_id)
                                   or {}).get("model") or "").strip()
         params["collaborationMode"] = {"mode": mode,
                                        "settings": ({"model": cur_model}
@@ -13318,15 +13571,15 @@ async def codex_session_settings(thread_id: str, request: Request):
             status_code=400,
             detail="model, approvalPolicy or collaborationMode required")
     try:
-        await CODEX_APP.ensure_thread_loaded(thread_id)
-        await CODEX_APP.call("thread/settings/update", params, timeout=15.0)
+        await client.ensure_thread_loaded(thread_id)
+        await client.call("thread/settings/update", params, timeout=15.0)
     except Exception as e:  # noqa: BLE001
         _codex_http_error(e)
     applied = {k: v for k, v in params.items() if k != "threadId"}
     # 廣播(thread/settings/updated)會帶全量,但它是非同步到的 —— 面板寫完
     # 立刻讀回時可能還沒進來。這裡先就地併一份,避免「存檔後面板還顯示舊值」
     # 被再次誤判成沒生效。
-    CODEX_APP.note_thread_settings(thread_id, applied)
+    client.note_thread_settings(thread_id, applied)
     _log_event("codex_settings_update", thread=thread_id[:16], **applied)
     return {"ok": True, "thread_id": thread_id, "applied": applied}
 
@@ -13334,8 +13587,9 @@ async def codex_session_settings(thread_id: str, request: Request):
 @app.post("/codexsessions/{thread_id}/interrupt")
 async def codex_session_interrupt(thread_id: str, request: Request):
     _check_auth(request)
+    client = _cx_client_for_thread(thread_id)
     try:
-        await CODEX_APP.interrupt_turn(thread_id)
+        await client.interrupt_turn(thread_id)
         # 中斷成功才留痕 —— 失敗路徑不能推卡,否則卡片會宣稱「已中斷」而其實沒有。
         _cx_feed_interrupted(thread_id)
         return {"ok": True, "thread_id": thread_id}
@@ -13354,6 +13608,7 @@ async def codex_session_answer(thread_id: str, request: Request):
     沒有 pending question → 409。
     """
     _check_auth(request)
+    client = _cx_client_for_thread(thread_id)
     try:
         b = await request.json()
     except Exception as _exc:  # noqa: BLE001
@@ -13367,7 +13622,7 @@ async def codex_session_answer(thread_id: str, request: Request):
     else:
         key = str(b.get("key") or "")
     text = str(b.get("text") or b.get("answer") or "")
-    record = CODEX_APP.pending_question_for_thread(thread_id)
+    record = client.pending_question_for_thread(thread_id)
     if not record:
         raise http_err(409, "QUESTION_NOT_PENDING",
                        "no pending Codex question for thread")
@@ -13377,7 +13632,7 @@ async def codex_session_answer(thread_id: str, request: Request):
     if not key and not text:
         raise http_err(400, "MISSING_ANSWER", "需要 keys 或 text 其中之一")
     try:
-        result = await CODEX_APP.answer_question(record["id"], key=key, text=text)
+        result = await client.answer_question(record["id"], key=key, text=text)
     except CodexAppServerError as e:
         if e.code == 404:
             raise http_err(409, "QUESTION_NOT_PENDING",
@@ -13397,6 +13652,7 @@ async def codex_session_answer(thread_id: str, request: Request):
 async def codex_session_history(thread_id: str, request: Request, limit: int = 40,
                                 cursor: str | None = None):
     _check_auth(request)
+    client = _cx_client_for_thread(thread_id)
     lim = max(1, min(limit, 100))
     key = (thread_id, lim, cursor or "")
     hit = _CODEX_HISTORY_CACHE.get(key)
@@ -13413,7 +13669,7 @@ async def codex_session_history(thread_id: str, request: Request, limit: int = 4
         }
         if cursor:
             params["cursor"] = cursor
-        res = await CODEX_APP.call("thread/turns/list", params, timeout=45.0)
+        res = await client.call("thread/turns/list", params, timeout=45.0)
         turns = list((res or {}).get("data", []))
         turns.reverse()
         text = _codex_format_turns(turns)
@@ -13438,6 +13694,7 @@ async def codex_session_history(thread_id: str, request: Request, limit: int = 4
 async def codex_session_stream(thread_id: str, request: Request, replay: int = 20,
                                follow: bool = False):
     _check_auth(request)
+    client = _cx_client_for_thread(thread_id)
     cid = "codexsess-" + uuid.uuid4().hex[:16]
 
     def chunk(delta, finish=None):
@@ -13458,7 +13715,7 @@ async def codex_session_stream(thread_id: str, request: Request, replay: int = 2
         # resume(那是必要的,因為要在這條 app-server 上真的接管+送 turn)。
         if replay > 0:
             try:
-                res = await CODEX_APP.call("thread/turns/list", {
+                res = await client.call("thread/turns/list", {
                     "threadId": thread_id,
                     "limit": max(1, min(replay, 50)),
                     "itemsView": "full",
@@ -13473,17 +13730,17 @@ async def codex_session_stream(thread_id: str, request: Request, replay: int = 2
                 _log_exc("codex_session_stream.gen", e, expected=True)
                 yield chunk({"content": f"\n⚠️ history failed: {e}\n"})
         idx = 0
-        if replay <= 0 and not CODEX_APP.is_active(thread_id):
-            idx = len(CODEX_APP.events_for(thread_id))
-        event_generation = CODEX_APP.thread_event_generations[thread_id]
-        seen_turn_activity = CODEX_APP.is_active(thread_id)
+        if replay <= 0 and not client.is_active(thread_id):
+            idx = len(client.events_for(thread_id))
+        event_generation = client.thread_event_generations[thread_id]
+        seen_turn_activity = client.is_active(thread_id)
         idle = 0
         idle_limit = 120 if follow else 0
         while True:
             if await request.is_disconnected():
                 break
-            events = CODEX_APP.events_for(thread_id)
-            current_generation = CODEX_APP.thread_event_generations[thread_id]
+            events = client.events_for(thread_id)
+            current_generation = client.thread_event_generations[thread_id]
             if current_generation != event_generation:
                 event_generation = current_generation
                 idx = 0
@@ -13499,7 +13756,7 @@ async def codex_session_stream(thread_id: str, request: Request, replay: int = 2
                 c = _fmt_item(kind, val)
                 if c:
                     yield chunk({"content": c})
-            active = CODEX_APP.is_active(thread_id)
+            active = client.is_active(thread_id)
             if active:
                 seen_turn_activity = True
             if _codex_stream_turn_finished(seen_turn_activity, active,
@@ -20293,7 +20550,8 @@ async def v2_sessions(request: Request, provider: str = "", status: str = "",
             if (s.get("thread_id") or s.get("id")) in delegated_codex_ids:
                 continue
             thread_id = s.get("thread_id") or s.get("id")
-            approval = CODEX_APP.pending_approval_for_thread(thread_id)
+            client = _cx_client_for_thread(thread_id)
+            approval = client.pending_approval_for_thread(thread_id)
             # runtimeStatus 已經是 _codex_enrich_summary 算好的單一真相
             # (優先序見 CodexAppServerClient.runtime_status)。這裡**不再自己
             # 重算**:舊碼把它壓成 waiting_approval/running/idle 三選一,等於把
@@ -20302,7 +20560,7 @@ async def v2_sessions(request: Request, provider: str = "", status: str = "",
             caps = ["input", "interrupt", "attachments", "replay", "follow"]
             if approval:
                 caps.append("approve")
-            pub = CODEX_APP._approval_public(approval) if approval else None
+            pub = client._approval_public(approval) if approval else None
             if pub:
                 # A1:疊上統一欄位(session_id/provider/kind/status…)。options
                 # 相容期保留記憶體版 — 現行 app 以 style=="deny" 判拒絕鍵;
@@ -20314,7 +20572,7 @@ async def v2_sessions(request: Request, provider: str = "", status: str = "",
                            "options": pub.get("options") or drow.get("options")}
             # thread-store 寫入鎖:清單這一層也要看得出來,不然 app 只能在
             # 使用者按下送出、吃到 409 之後才知道這條進不去。
-            lock = CODEX_APP.thread_lock_info(thread_id)
+            lock = client.thread_lock_info(thread_id)
             meta = {"approval": pub, "locked": bool(lock)}
             if lock:
                 meta["lock"] = lock
@@ -20487,9 +20745,10 @@ async def v2_session_approve(session_id: str, request: Request):
     for_session = bool(body.get("for_session") or body.get("approve_for_session") or
                        body.get("remember"))
     thread_id = src[1]
+    client = _cx_client_for_thread(thread_id)
     try:
-        result = await CODEX_APP.decide_thread_approval(thread_id, approved,
-                                                        for_session=for_session)
+        result = await client.decide_thread_approval(thread_id, approved,
+                                                     for_session=for_session)
         return {"ok": True, "session_id": session_id, "thread_id": thread_id, **result}
     except CodexAppServerError as e:
         if e.code == 404:
@@ -20578,6 +20837,7 @@ async def v2_session_input(session_id: str, request: Request):
         _cc_input_settle(entry, out)
         return out
     if src[0] == "cx":
+        client = _cx_client_for_thread(src[1])
         content = (body.get("content") or body.get("text") or "").strip()
         attachments = body.get("attachments") or []
         if not content and not attachments:
@@ -20593,8 +20853,8 @@ async def v2_session_input(session_id: str, request: Request):
                     "duplicate": True, **await _cx_input_replay(prior)}
         try:
             def _accept_queued_v2() -> dict:
-                depth = CODEX_APP.enqueue_input(src[1], items, client_id=client_id,
-                                                text=text)
+                depth = client.enqueue_input(src[1], items, client_id=client_id,
+                                             text=text)
                 _cx_feed_input_accepted(src[1], client_id, text, attachments,
                                         typed_text=text, create_if_missing=True,
                                         queued=True)
@@ -20603,16 +20863,16 @@ async def v2_session_input(session_id: str, request: Request):
                 res = {"delivery": "queued", "queued": True, "queue_depth": depth}
                 _cx_input_settle(entry, res)
                 # 同 v1:鎖住入佇列要補推鎖卡(舊 409 路徑由 _codex_http_error 推)。
-                if CODEX_APP.is_thread_locked(src[1]):
+                if client.is_thread_locked(src[1]):
                     _cx_feed_thread_locked(src[1], create_if_missing=True)
                 return {"ok": True, "session_id": session_id, "accepted": True, **res}
 
             # 忙碌/鎖住 → 入佇列(同 v1,不回 4xx)。鎖住入佇列 = 2026-09-19
             # 契約改版:解鎖偵測會自動 drain,使用者不再看到「被桌面佔用」紅字。
-            if CODEX_APP.is_active(src[1]) or CODEX_APP.is_thread_locked(src[1]):
+            if client.is_active(src[1]) or client.is_thread_locked(src[1]):
                 return _accept_queued_v2()
             try:
-                await CODEX_APP.start_turn(src[1], items, client_id=client_id)
+                await client.start_turn(src[1], items, client_id=client_id)
             except CodexAppServerError as e:
                 # 直送當下才第一次撞鎖 → 一樣入佇列(鎖已由 start_turn 記進
                 # 狀態機 + 推卡,這裡只補收訊息)。
@@ -20728,14 +20988,15 @@ async def v2_session_compact(session_id: str, request: Request):
     now = time.time()
     if src[0] == "cx":
         tid = src[1]
+        client = _cx_client_for_thread(tid)
         started = _CX_COMPACT_RUNNING.get(tid, 0)
         if started and now - started < 900:
             raise http_err(409, "COMPACT_RUNNING",
                            f"壓縮已在進行({int(now - started)}s 前啟動)")
         _CX_COMPACT_RUNNING[tid] = now
         try:
-            await CODEX_APP.call("thread/compact/start", {"threadId": tid},
-                                 timeout=30.0)
+            await client.call("thread/compact/start", {"threadId": tid},
+                              timeout=30.0)
         except CodexAppServerError as e:
             _CX_COMPACT_RUNNING.pop(tid, None)
             _log_event("cx_compact_failed", thread=tid[:16], error=str(e)[:200])
@@ -20833,8 +21094,9 @@ async def v2_session_interrupt(session_id: str, request: Request):
         except openclaw_provider.OpenClawError as e:
             _oc_http_error(e)
         return {"ok": True, "session_id": session_id, "interrupted": True}
+    client = _cx_client_for_thread(src[1])
     try:
-        await CODEX_APP.interrupt_turn(src[1])
+        await client.interrupt_turn(src[1])
     except CodexAppServerError as e:
         if "no active" in str(e).lower():
             raise http_err(409, "NO_ACTIVE_TURN", "no active Codex turn")
@@ -20880,12 +21142,13 @@ async def v2_session_config_read(session_id: str, request: Request):
         # 狀態碼(app 的 graceful absence 原樣保留),但**指名哪家缺什麼**,
         # 而且缺格在對齊守門測試裡必須有理由。codex 的 inline 路徑零改動。
         return await _v2_session_op("config_read", session_id, request)
-    if ident not in CODEX_APP.thread_settings:
+    client = _cx_client_for_thread(ident)
+    if ident not in client.thread_settings:
         try:
-            await CODEX_APP.ensure_thread_loaded(ident)
+            await client.ensure_thread_loaded(ident)
         except Exception as e:  # noqa: BLE001
             _codex_http_error(e)
-    cached = dict(CODEX_APP.thread_settings.get(ident) or {})
+    cached = dict(client.thread_settings.get(ident) or {})
     cached.pop("at", None)
     out: dict = {}
     if cached.get("model"):
@@ -20925,11 +21188,12 @@ async def v2_session_config_write(session_id: str, request: Request):
         # 同 config_read:非 codex 走對齊表(cc2 由此接上 settings 寫入)。
         return await _v2_session_op("config_write", session_id, request)
     body = await request.json()
+    client = _cx_client_for_thread(ident)
     params: dict = {"threadId": ident}
     model = str(body.get("model") or "").strip()
     policy = str(body.get("approval_policy") or "").strip()
     if model:
-        known = await _codex_known_models()
+        known = await _codex_known_models(client=client)
         if known and model not in known:
             raise http_err(400, "CX_UNKNOWN_MODEL",
                            f"codex 不認得這個模型:{model}",
@@ -20945,12 +21209,12 @@ async def v2_session_config_write(session_id: str, request: Request):
         raise HTTPException(status_code=400,
                             detail="model or approval_policy required")
     try:
-        await CODEX_APP.ensure_thread_loaded(ident)
-        await CODEX_APP.call("thread/settings/update", params, timeout=15.0)
+        await client.ensure_thread_loaded(ident)
+        await client.call("thread/settings/update", params, timeout=15.0)
     except Exception as e:  # noqa: BLE001
         _codex_http_error(e)
     applied = {k: v for k, v in params.items() if k != "threadId"}
-    CODEX_APP.note_thread_settings(ident, applied)
+    client.note_thread_settings(ident, applied)
     ignored = [k for k in ("effort", "sandbox", "max_budget_usd",
                            "fallback_model", "append_system_prompt", "profile")
                if body.get(k) not in (None, "")]
@@ -21713,7 +21977,8 @@ def _cx_sync_digest_runtime(thread_id: str) -> None:
     if digest is None:
         return
     try:
-        digest.sync_runtime_status(CODEX_APP.runtime_status(thread_id, ""))
+        client = _cx_client_for_thread(thread_id)
+        digest.sync_runtime_status(client.runtime_status(thread_id, ""))
     except Exception as exc:  # noqa: BLE001
         _log_exc("_cx_sync_digest_runtime", exc, expected=True)
 
@@ -21772,7 +22037,7 @@ def _cx_sync_queue_depth(thread_id: str) -> None:
     if d is None:
         return
     try:
-        d.queue_depth = CODEX_APP.pending_count(thread_id)
+        d.queue_depth = _cx_client_for_thread(thread_id).pending_count(thread_id)
         d._status()
     except Exception as _exc:  # noqa: BLE001
         _log_exc("_cx_sync_queue_depth", _exc, expected=True)
@@ -21787,7 +22052,7 @@ def _cx_sync_thread_lock(thread_id: str) -> None:
     if d is None:
         return
     try:
-        info = CODEX_APP.thread_lock_info(thread_id)
+        info = _cx_client_for_thread(thread_id).thread_lock_info(thread_id)
         d.locked = bool(info)
         d.lock_reason = (info or {}).get("reason") or ""
         d.lock_message = (info or {}).get("message") or ""
@@ -21821,7 +22086,7 @@ def _cx_feed_thread_locked(thread_id: str, create_if_missing: bool = False) -> N
         d = _CX_CARD_DIGESTS[thread_id] = carddigest.CodexThreadDigest()
     d.store.media_session_id = f"codex:{thread_id}"
     try:
-        info = CODEX_APP.thread_lock_info(thread_id)
+        info = _cx_client_for_thread(thread_id).thread_lock_info(thread_id)
         if not info:
             return
         if getattr(d, "lock_card_since", None) != info["since"]:
@@ -22090,12 +22355,13 @@ def _codex_lock_recheck(thread_id: str) -> None:
     """
     if not thread_id or thread_id in _CX_LOCK_PROBES:
         return
-    if not CODEX_APP.thread_lock_retry_due(thread_id):
+    client = _cx_client_for_thread(thread_id)
+    if not client.thread_lock_retry_due(thread_id):
         return
 
     async def _probe():
         try:
-            await CODEX_APP.ensure_thread_loaded(thread_id)
+            await client.ensure_thread_loaded(thread_id)
         except Exception as _exc:  # noqa: BLE001
             _log_exc("_codex_lock_recheck", _exc, expected=True)
         finally:
@@ -22200,12 +22466,13 @@ async def _cx_seed_card_digest(thread_id: str, d, required: bool = False) -> Non
         return
     d.seeding = True
     try:
+        client = _cx_client_for_thread(thread_id)
         # 只讀 seed 不做 thread/resume:resume 會「接管」該 thread,若它正被
         # 別的 codex app-server(如 VS Code,thread source=vscode)持有就會卡死
         # 整條 stdio → 之後所有 codex 呼叫一起 hang(XCash 就是這樣空白+送不出)。
         # thread/turns/list 本來就不需 resume 也讀得到(/codexsessions/{id}/history
         # 就是這樣讀的),所以這裡直接列 turns。
-        res = await CODEX_APP.call("thread/turns/list", {
+        res = await client.call("thread/turns/list", {
             "threadId": thread_id, "limit": _CX_CARD_SEED_TURNS,
             "itemsView": "full", "sortDirection": "desc"}, timeout=45.0)
         turns = list((res or {}).get("data", []))
@@ -22228,7 +22495,7 @@ async def _cx_seed_card_digest(thread_id: str, d, required: bool = False) -> Non
         # Seed 期間先收到的 live notification 必須在 canonical 舊→新卡片
         # 落地後重播，否則 live 卡會先佔住 order 尾端，舊歷史反而接在今天後面。
         d.finish_seed()
-        rec = CODEX_APP.pending_approval_for_thread(thread_id)
+        rec = client.pending_approval_for_thread(thread_id)
         if rec:
             d.handle_approval(rec)
         d.seeded = True
@@ -22290,7 +22557,7 @@ async def _cx_card_digest(thread_id: str):
     # 個 snapshot 就帶著 locked,不必等下一次事件。若鎖是背景(warm loop /
     # stderr)先偵測到的,那時沒有 digest 可推卡 —— 在這裡補上,使用者一進來
     # 就看得到原因,而不是一個沒反應的輸入框。
-    if CODEX_APP.is_thread_locked(thread_id):
+    if _cx_client_for_thread(thread_id).is_thread_locked(thread_id):
         _cx_feed_thread_locked(thread_id)
     else:
         _cx_sync_thread_lock(thread_id)

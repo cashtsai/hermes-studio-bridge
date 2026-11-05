@@ -236,6 +236,62 @@ def test_claude_argv_merge():
        "no config → default bypassPermissions")
 
 
+# ── 10. CX interactive BYOK 隔離(app-server / CODEX_HOME / secret)─────────
+def test_cx_interactive_byok_isolation():
+    import stat
+    from unittest import mock
+
+    with tempfile.TemporaryDirectory(prefix="cx-byok-test-") as root:
+        shared = os.path.join(root, "shared")
+        private = os.path.join(root, "private")
+        os.makedirs(shared, mode=0o700)
+        with open(os.path.join(shared, "config.toml"), "w", encoding="utf-8") as fh:
+            fh.write('model_reasoning_effort = "xhigh"\n')
+        with open(os.path.join(shared, "auth.json"), "w", encoding="utf-8") as fh:
+            fh.write('{"access_token":"SHARED-SUBSCRIPTION"}')
+        with mock.patch.object(bridge.codex_home, "shared_home", return_value=shared):
+            bridge._prepare_cx_byok_home(private)
+        ok(os.path.exists(os.path.join(private, "config.toml")),
+           "BYOK home copies non-secret config")
+        ok(not os.path.exists(os.path.join(private, "auth.json")),
+           "BYOK home never copies shared auth.json")
+        ok((os.stat(private).st_mode & 0o777) == 0o700,
+           "BYOK home is 0700")
+        ok((os.stat(os.path.join(private, "config.toml")).st_mode & 0o777) == 0o600,
+           "BYOK config is 0600")
+
+        client = bridge.CodexAppServerClient(
+            spawn_env={"OPENAI_API_KEY": OPENAI_KEY}, spawn_home=private)
+        ok(client._spawn_home == private, "BYOK client has private CODEX_HOME")
+        ok(client._spawn_env.get("OPENAI_API_KEY") == OPENAI_KEY,
+           "BYOK key is held for the private child only")
+        ok(client is not bridge.CODEX_APP, "BYOK client is not the shared daemon")
+
+        tid = "cx-byok-test-thread"
+        saved_meta = dict(bridge._CX_BYOK_META)
+        saved_clients = dict(bridge._CX_BYOK_CLIENTS)
+        try:
+            bridge._CX_BYOK_META.clear()
+            bridge._CX_BYOK_CLIENTS.clear()
+            bridge._CX_BYOK_META[tid] = {
+                "secret": os.path.join(root, "missing-key"),
+                "home": private,
+                "name": "private",
+            }
+            restored = bridge._cx_client_for_thread(tid)
+            ok(restored is not bridge.CODEX_APP,
+               "broken BYOK metadata never falls back to shared daemon")
+            public = bridge._cx_byok_stub(tid, bridge._CX_BYOK_META[tid])
+            encoded = json.dumps(public, ensure_ascii=False)
+            ok(OPENAI_KEY not in encoded and "api_key" not in public,
+               "BYOK public session row contains no key")
+        finally:
+            bridge._CX_BYOK_META.clear()
+            bridge._CX_BYOK_META.update(saved_meta)
+            bridge._CX_BYOK_CLIENTS.clear()
+            bridge._CX_BYOK_CLIENTS.update(saved_clients)
+
+
 if __name__ == "__main__":
     test_cc_flags()
     test_cx_flags()
@@ -246,4 +302,5 @@ if __name__ == "__main__":
     test_cc_pin_roundtrip()
     test_graceful_old_shape()
     test_claude_argv_merge()
+    test_cx_interactive_byok_isolation()
     print(f"OK — {_passed} assertions passed")
