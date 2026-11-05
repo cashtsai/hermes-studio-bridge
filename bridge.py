@@ -61,6 +61,7 @@ import media_artifacts
 import hermes_media
 import openclaw_provider
 import gemini_provider
+import t3code_runtime
 import cc_detect            # CC TUI 狀態偵測(manifest 引擎;herdr 設計移植)
 import cc_sdk               # CC provider v2(Agent SDK;模組內 lazy-import SDK)
 import tg_outbound
@@ -1706,6 +1707,10 @@ def _canon_init():
             last_at REAL, output_json TEXT)""")
         con.commit()
         con.close()
+        # T3Code additive tables live in their own module so the new contracts
+        # can be tested without importing the whole FastAPI bridge.  The call is
+        # idempotent and deliberately happens after legacy migrations succeed.
+        t3code_runtime.ensure_schema(CANON_DB)
     finally:
         con.close()
 
@@ -4487,6 +4492,70 @@ async def _apns_send(token: str, title: str, body: str, data: dict | None = None
         return r.status_code, r.text
 
 
+async def _apns_send_live_activity(session_id: str, busy: bool,
+                                   phase_label: str | None = None,
+                                   ended_label: str | None = None) -> dict:
+    """Send one ActivityKit update for a registered session token.
+
+    Registration is opt-in and the normal alert push path remains untouched.
+    A missing key or h2 dependency is reported as a disabled result, never as
+    a bridge startup failure.
+    """
+    rec = t3code_runtime.get_live_activity(CANON_DB, session_id)
+    if not rec:
+        return {"sent": False, "reason": "not_registered"}
+    if not apns_configured():
+        return {"sent": False, "reason": "apns_disabled"}
+    problem = _push_http2_problem()
+    if problem:
+        return {"sent": False, "reason": "dependency_missing"}
+    event = "update" if busy else "end"
+    content_state = {"busy": bool(busy), "phaseLabel": phase_label,
+                     "endedLabel": ended_label}
+    aps = {"timestamp": int(time.time()), "event": event,
+           "content-state": content_state}
+    if not busy:
+        aps["dismissal-date"] = int(time.time()) + 120
+    headers = {
+        "authorization": f"bearer {_apns_jwt()}",
+        "apns-topic": f"{rec['bundle_id']}.push-type.liveactivity",
+        "apns-push-type": "liveactivity",
+        "apns-priority": "10" if not busy else "5",
+    }
+    try:
+        import httpx
+        async with httpx.AsyncClient(http2=True, timeout=10) as client:
+            response = await client.post(
+                f"{APNS_HOST}/3/device/{rec['token']}",
+                headers=headers, json={"aps": aps})
+        if response.status_code == 410:
+            t3code_runtime.remove_live_activity(CANON_DB, session_id)
+        if response.status_code != 200:
+            _log_event("live_activity_push_failed", session=session_id,
+                       status=response.status_code,
+                       detail=(response.text or "")[:160])
+        return {"sent": response.status_code == 200,
+                "status": response.status_code}
+    except Exception as exc:  # noqa: BLE001
+        _log_event("live_activity_push_failed", session=session_id,
+                   error=type(exc).__name__)
+        return {"sent": False, "reason": "exception"}
+
+
+def _live_activity_update(session_id: str, busy: bool,
+                          phase_label: str | None = None,
+                          ended_label: str | None = None) -> None:
+    """Fire-and-forget ActivityKit update; the live stream stays independent."""
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    task = loop.create_task(_apns_send_live_activity(
+        session_id, busy, phase_label, ended_label))
+    _BG_TASKS.add(task)
+    task.add_done_callback(_BG_TASKS.discard)
+
+
 async def push_notify(title: str, body: str, data: dict | None = None,
                       category: str | None = None,
                       thread_id: str | None = None,
@@ -4754,6 +4823,10 @@ def _turn_end_push(sid: str, display: str, summary: str, ok: bool = True) -> Non
     except RuntimeError:
         return
     _TURNEND_PUSH_LAST[sid] = now
+    # If the iOS app requested an ActivityKit push token, keep the lock-screen
+    # state truthful even after the app process is suspended.  The ordinary
+    # alert push remains the fallback for older builds.
+    _live_activity_update(sid, False, ended_label=("已完成" if ok else "已中斷"))
     t = loop.create_task(push_notify(title, body, data,
                                      thread_id=sid, content_available=True,
                                      no_preview_body="回合已完成"))
@@ -7243,7 +7316,12 @@ class CodexAppServerClient:
             prev = self.token_usage.get(tid)
             if isinstance(prev, dict):
                 self.token_usage_prev[tid] = prev
-            self.token_usage[tid] = params.get("tokenUsage") or params
+            raw_usage = params.get("tokenUsage") or params
+            self.token_usage[tid] = raw_usage
+            _persist_provider_usage(
+                f"codex:{tid}", "codex", raw_usage,
+                model=(self.thread_settings.get(tid) or {}).get("model"),
+                source="codex.tokenUsage")
             return
         if method == "thread/settings/updated" and tid:
             # 全連線廣播(同 thread/status/changed)→ 桌面版/VS Code 改的設定
@@ -7259,6 +7337,7 @@ class CodexAppServerClient:
             self.thread_errors.pop(tid, None)
             self.retry_escalations.pop(tid, None)   # 新回合 → 重試計數歸零
             self._start_turn_watchdog(tid)
+            _live_activity_update(f"codex:{tid}", True, phase_label="工作中…")
             _codex_history_invalidate(tid)   # cached /history page is now stale
             return
         if method == "turn/completed" and tid:
@@ -8205,6 +8284,24 @@ def _codex_usage_map(tu, model=None, prev=None) -> dict | None:
             usage["cost_usd"] = round(cost, 4)
             usage["cost_is_estimate"] = True
     return usage
+
+
+def _persist_provider_usage(session: str, provider: str, raw: dict,
+                            model: str | None = None,
+                            source: str = "provider") -> None:
+    """Persist an honest provider usage sample without affecting the hot path."""
+    try:
+        inner = raw.get("tokenUsage") if isinstance(raw, dict) else None
+        inner = inner if isinstance(inner, dict) else (raw if isinstance(raw, dict) else {})
+        dedupe = hashlib.sha256(json.dumps(
+            [session, provider, model, inner], sort_keys=True,
+            ensure_ascii=False, default=str).encode()).hexdigest()
+        t3code_runtime.record_usage_sample(
+            CANON_DB, session, provider, raw, model=model, source=source,
+            dedupe_key=dedupe)
+    except Exception as exc:  # noqa: BLE001
+        _log_event("usage_sample_write_failed", session=session,
+                   provider=provider, error=type(exc).__name__)
 
 
 def _codex_thread_model(tid: str, fallback: dict | None = None):
@@ -23767,10 +23864,148 @@ async def usage_summary(request: Request, window: str = "7d"):
         else:
             d["messages"] += n
     providers = sorted(per.values(), key=lambda x: -(x["turns"] + x["messages"]))
+    # T3Code usage samples are written only when a provider emits an honest
+    # tokenUsage/usage payload.  Merge them without changing the old shape;
+    # providers that have no token source remain explicitly null.
+    try:
+        stored = t3code_runtime.usage_summary(CANON_DB, cutoff)
+    except Exception as exc:  # noqa: BLE001
+        _log_event("usage_sample_summary_failed", error=type(exc).__name__)
+        stored = {}
+    for provider, sample in stored.items():
+        row = next((item for item in providers if item["provider"] == provider), None)
+        if row is None:
+            row = {"provider": provider, "turns": 0, "messages": 0,
+                   "tokens_in": None, "tokens_out": None,
+                   "est_cost_usd": None}
+            providers.append(row)
+        row["tokens_in"] = sample["tokens_in"]
+        row["tokens_out"] = sample["tokens_out"]
+        row["cache_read_tokens"] = sample["cache_read_tokens"]
+        row["cache_write_tokens"] = sample["cache_write_tokens"]
+        row["total_tokens"] = sample["total_tokens"]
+        row["est_cost_usd"] = sample["est_cost_usd"] or None
     total = {"turns": sum(p["turns"] for p in providers),
              "messages": sum(p["messages"] for p in providers),
-             "tokens_in": None, "tokens_out": None, "est_cost_usd": None}
+             "tokens_in": sum((p.get("tokens_in") or 0) for p in providers) or None,
+             "tokens_out": sum((p.get("tokens_out") or 0) for p in providers) or None,
+             "total_tokens": sum((p.get("total_tokens") or 0) for p in providers) or None,
+             "est_cost_usd": sum((p.get("est_cost_usd") or 0) for p in providers) or None}
     return {"window": f"{days}d", "providers": providers, "total": total}
+
+
+# ─────────────── T3Code durable thread/control contract ────────────────
+# These endpoints are additive.  Existing `/app/v1` session wire shapes stay
+# unchanged while the new model can be exercised by replay tests and a future
+# client without pretending that provider-native ids are Pocket ids.
+
+
+def _t3_bad(exc: Exception):
+    raise http_err(400, "T3CODE_BAD_REQUEST", str(exc))
+
+
+@app.post("/app/v3/threads")
+async def t3_thread_create(request: Request):
+    _check_auth(request)
+    body = await _json_body(request)
+    try:
+        return {"ok": True, "thread": t3code_runtime.create_app_thread(
+            CANON_DB, str(body.get("owner") or "xcash"),
+            str(body.get("title") or "Pocket thread"),
+            str(body.get("id") or "").strip() or None)}
+    except t3code_runtime.T3CodeError as exc:
+        _t3_bad(exc)
+
+
+@app.get("/app/v3/threads/{thread_id}")
+async def t3_thread_get(thread_id: str, request: Request):
+    _check_auth(request)
+    thread = t3code_runtime.get_app_thread(CANON_DB, thread_id)
+    if thread is None:
+        raise http_err(404, "T3CODE_THREAD_NOT_FOUND", "unknown app thread")
+    return {"ok": True, "thread": thread}
+
+
+@app.post("/app/v3/threads/{thread_id}/providers")
+async def t3_provider_link(thread_id: str, request: Request):
+    _check_auth(request)
+    body = await _json_body(request)
+    try:
+        item = t3code_runtime.link_provider_thread(
+            CANON_DB, thread_id, body.get("provider"), body.get("native_id"),
+            body.get("capabilities"), body.get("id"))
+        return {"ok": True, "provider_thread": item}
+    except t3code_runtime.T3CodeError as exc:
+        _t3_bad(exc)
+
+
+@app.post("/app/v3/threads/{thread_id}/context-transfers")
+async def t3_context_transfer(thread_id: str, request: Request):
+    _check_auth(request)
+    body = await _json_body(request)
+    try:
+        item = t3code_runtime.create_context_transfer(
+            CANON_DB, thread_id,
+            str(body.get("source_provider_thread_id") or ""),
+            body.get("target_provider"), body.get("summary"),
+            body.get("decisions"), body.get("artifacts"), body.get("pending"),
+            body.get("transfer_id"), body.get("expires_at"))
+        return {"ok": True, "transfer": item}
+    except t3code_runtime.T3CodeError as exc:
+        _t3_bad(exc)
+
+
+@app.post("/app/v3/threads/{thread_id}/checkpoints")
+async def t3_checkpoint(thread_id: str, request: Request):
+    _check_auth(request)
+    if t3code_runtime.get_app_thread(CANON_DB, thread_id) is None:
+        raise http_err(404, "T3CODE_THREAD_NOT_FOUND", "unknown app thread")
+    body = await _json_body(request)
+    try:
+        cwd = _normalise_workdir(body.get("cwd"), create=False)
+        manifest = t3code_runtime.build_checkpoint_manifest(
+            cwd, thread_id, body.get("provider_thread_id"),
+            body.get("artifact_paths") or [])
+        return {"ok": True, "checkpoint": t3code_runtime.create_checkpoint(
+            CANON_DB, manifest, body.get("checkpoint_id"))}
+    except t3code_runtime.T3CodeError as exc:
+        _t3_bad(exc)
+
+
+@app.get("/app/v3/sessions/{session_id}/snapshot")
+async def t3_session_snapshot(session_id: str, request: Request, limit: int = 100):
+    _check_auth(request)
+    return {"ok": True, "snapshot": t3code_runtime.event_snapshot(
+        CANON_DB, session_id, limit)}
+
+
+@app.get("/app/v3/sessions/{session_id}/events")
+async def t3_session_events(session_id: str, request: Request,
+                             after_seq: int = 0, limit: int = 500):
+    _check_auth(request)
+    events = t3code_runtime.events_after(CANON_DB, session_id, after_seq, limit)
+    return {"ok": True, "session": session_id, "after_seq": int(after_seq),
+            "events": events,
+            "latest_seq": events[-1]["seq"] if events else int(after_seq)}
+
+
+@app.post("/app/v2/sessions/{session_id}/live-activity")
+async def t3_live_activity_register(session_id: str, request: Request):
+    _check_auth(request)
+    body = await _json_body(request)
+    try:
+        return {"ok": True, "live_activity": t3code_runtime.register_live_activity(
+            CANON_DB, session_id, body.get("token"),
+            body.get("bundle_id") or APNS_BUNDLE_ID)}
+    except t3code_runtime.T3CodeError as exc:
+        _t3_bad(exc)
+
+
+@app.delete("/app/v2/sessions/{session_id}/live-activity")
+async def t3_live_activity_remove(session_id: str, request: Request):
+    _check_auth(request)
+    return {"ok": True, "removed": t3code_runtime.remove_live_activity(
+        CANON_DB, session_id)}
 
 
 @app.get("/app/v2/providers/capabilities")
@@ -23778,6 +24013,52 @@ async def v2_provider_capabilities(request: Request):
     """App 的「按能力渲染」資料源:不支援=不顯示,而不是按了才壞。"""
     _check_auth(request)
     return {"providers": _provider_caps_payload()}
+
+
+@app.get("/app/v3/orchestrator/providers/capabilities")
+async def t3_orchestrator_capabilities(request: Request):
+    """Typed orchestrator capability view; no provider credentials are exposed."""
+    _check_auth(request)
+    return {"version": 1, "providers": _provider_caps_payload()}
+
+
+@app.post("/app/v3/orchestrator/delegations")
+async def t3_orchestrator_create(request: Request):
+    """MCP-facing create facade over the existing durable delegation registry."""
+    return await app_delegation_create(request)
+
+
+@app.get("/app/v3/orchestrator/delegations/{delegation_id}")
+async def t3_orchestrator_get(delegation_id: str, request: Request):
+    _check_auth(request)
+    row = _delegation_get(delegation_id)
+    if not row:
+        raise http_err(404, "DELEGATION_NOT_FOUND", "unknown delegation")
+    return {"ok": True, "delegation": _delegation_public(
+        row, await _delegation_runtime_status(row))}
+
+
+@app.post("/app/v3/orchestrator/delegations/{delegation_id}/await")
+async def t3_orchestrator_await(delegation_id: str, request: Request):
+    """Bounded status wait; it never executes shell or transfers credentials."""
+    _check_auth(request)
+    body = await _json_body(request)
+    try:
+        timeout = min(30.0, max(0.0, float(body.get("timeout_seconds") or 0)))
+    except (TypeError, ValueError):
+        raise http_err(400, "T3CODE_BAD_REQUEST", "timeout_seconds must be numeric")
+    deadline = time.monotonic() + timeout
+    terminal = {"idle", "done", "failed", "archived", "cancelled", "denied", "expired"}
+    while True:
+        row = _delegation_get(delegation_id)
+        if not row:
+            raise http_err(404, "DELEGATION_NOT_FOUND", "unknown delegation")
+        runtime = await _delegation_runtime_status(row)
+        public = _delegation_public(row, runtime)
+        if runtime in terminal or time.monotonic() >= deadline:
+            return {"ok": True, "timed_out": runtime not in terminal,
+                    "delegation": public}
+        await asyncio.sleep(min(0.25, max(0.0, deadline - time.monotonic())))
 
 
 async def _v2_session_op(op: str, session_id: str, request: Request):
