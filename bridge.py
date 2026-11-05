@@ -24021,6 +24021,47 @@ async def t3_context_transfer_transition(transfer_id: str, request: Request):
         _t3_bad(exc)
 
 
+@app.post("/app/v3/credentials/handoffs")
+async def t3_credential_handoff_create(request: Request):
+    """Issue metadata-only handoff ticket; no credential value is accepted."""
+    _check_auth(request)
+    body = await _json_body(request)
+    try:
+        clean = t3code_runtime.validate_credential_handoff_payload(body)
+        item = t3code_runtime.create_credential_handoff(
+            CANON_DB, clean.get("source_host_id"), clean.get("target_host_id"),
+            clean.get("provider"), clean.get("audience"),
+            clean.get("ttl_secs", 300), clean.get("handoff_id"))
+        return {"ok": True, "handoff": item}
+    except t3code_runtime.T3CodeError as exc:
+        _t3_bad(exc)
+
+
+@app.get("/app/v3/credentials/handoffs/{handoff_id}")
+async def t3_credential_handoff_get(handoff_id: str, request: Request):
+    _check_auth(request)
+    item = t3code_runtime.get_credential_handoff(CANON_DB, handoff_id)
+    if item is None:
+        raise http_err(404, "T3CODE_HANDOFF_NOT_FOUND", "unknown credential handoff")
+    return {"ok": True, "handoff": item}
+
+
+@app.post("/app/v3/credentials/handoffs/{handoff_id}/consume")
+async def t3_credential_handoff_consume(handoff_id: str, request: Request):
+    """Consume a one-time ticket; storing the provider secret is a later Keychain step."""
+    _check_auth(request)
+    body = await _json_body(request)
+    try:
+        clean = t3code_runtime.validate_credential_handoff_payload(body)
+        item = t3code_runtime.consume_credential_handoff(
+            CANON_DB, handoff_id, clean.get("nonce"),
+            clean.get("target_host_id"), clean.get("provider"),
+            clean.get("audience"))
+        return {"ok": True, "handoff": item}
+    except t3code_runtime.T3CodeError as exc:
+        _t3_bad(exc)
+
+
 @app.post("/app/v3/threads/{thread_id}/checkpoints")
 async def t3_checkpoint(thread_id: str, request: Request):
     _check_auth(request)
