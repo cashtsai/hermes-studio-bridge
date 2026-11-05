@@ -22,6 +22,19 @@ SCHEMA_VERSION = 1
 DIGEST_ALGORITHM = "sha256-canonical-jsonl-v1"
 RECORDER_VERSION = "t3code-replay-1"
 MAX_FRAME_BYTES = 512 * 1024
+MINIMUM_SCENARIOS = (
+    "simple_turn",
+    "error_terminal",
+    "approval_pending_and_resolved",
+)
+RELEASE_SCENARIOS = (
+    "simple_turn",
+    "stream_resume",
+    "interrupt_or_unsupported",
+    "approval_pending_and_resolved",
+    "queued_message",
+    "error_terminal",
+)
 
 _SENSITIVE_KEY = re.compile(
     r"(?:token|secret|password|passwd|api[_-]?key|private[_-]?key|"
@@ -39,6 +52,77 @@ _SECRET_VALUE = re.compile(
 
 class ReplayFixtureError(ValueError):
     """A fixture is malformed or contains data that must not be recorded."""
+
+
+def validate_manifest(manifest: Any, fixture_dir: str | os.PathLike[str], *,
+                      release: bool = False) -> dict[str, Any]:
+    """Validate provider/scenario coverage without opening a provider.
+
+    Development manifests may describe partial coverage so a new provider can
+    land incrementally.  ``release=True`` is the hard gate: every declared
+    provider must map all six release scenarios to existing, safe JSONL files.
+    The returned summary is intentionally metadata-only and safe to print in
+    CI logs.
+    """
+    if not isinstance(manifest, dict):
+        raise ReplayFixtureError("manifest must be an object")
+    if manifest.get("schema_version") != SCHEMA_VERSION:
+        raise ReplayFixtureError("unsupported replay fixture manifest schema")
+    if manifest.get("recorder_version") != RECORDER_VERSION:
+        raise ReplayFixtureError("unsupported replay fixture recorder version")
+    if manifest.get("digest_algorithm") != DIGEST_ALGORITHM:
+        raise ReplayFixtureError("unsupported replay fixture digest algorithm")
+
+    policy = manifest.get("recording_policy")
+    if not isinstance(policy, dict) or not all(
+        policy.get(key) is True for key in ("sanitize_before_write",
+                                             "owner_only_output")
+    ) or policy.get("raw_transcript_committed") is not False:
+        raise ReplayFixtureError("manifest recording policy is unsafe")
+
+    providers = manifest.get("providers")
+    if not isinstance(providers, dict) or not providers:
+        raise ReplayFixtureError("manifest providers must be a non-empty object")
+
+    required = RELEASE_SCENARIOS if release else ()
+    root = Path(fixture_dir).expanduser().resolve()
+    coverage: dict[str, dict[str, Any]] = {}
+    for provider, scenarios in providers.items():
+        if not isinstance(provider, str) or not provider.strip():
+            raise ReplayFixtureError("provider name must be a non-empty string")
+        if not isinstance(scenarios, dict) or not scenarios:
+            raise ReplayFixtureError(f"{provider}: scenarios must be non-empty")
+        missing = sorted(set(required) - set(scenarios))
+        if missing:
+            raise ReplayFixtureError(
+                f"{provider}: release fixture scenarios missing: {', '.join(missing)}"
+            )
+        files: dict[str, str] = {}
+        for scenario, filename in scenarios.items():
+            if not isinstance(scenario, str) or not scenario.strip():
+                raise ReplayFixtureError(f"{provider}: scenario name is invalid")
+            if not isinstance(filename, str) or not filename.strip():
+                raise ReplayFixtureError(
+                    f"{provider}/{scenario}: fixture filename is invalid"
+                )
+            candidate = (root / filename).resolve()
+            try:
+                candidate.relative_to(root)
+            except ValueError as exc:
+                raise ReplayFixtureError(
+                    f"{provider}/{scenario}: fixture escapes manifest directory"
+                ) from exc
+            if not candidate.is_file():
+                raise ReplayFixtureError(
+                    f"{provider}/{scenario}: fixture does not exist"
+                )
+            load_jsonl(candidate)
+            files[scenario] = candidate.name
+        coverage[provider] = {
+            "scenarios": sorted(files),
+            "release_ready": set(RELEASE_SCENARIOS).issubset(files),
+        }
+    return {"release": release, "providers": coverage}
 
 
 def _check_safe(value: Any, path: str = "frame") -> None:

@@ -64,6 +64,22 @@ fallback；後者驗證 duplicate、out-of-order 與 terminal 後遲到事件。
 
 ## CI gate
 
+共用 validator 可用以下命令執行 development gate：
+
+```bash
+python scripts/validate-replay-fixtures.py
+```
+
+升版或 staging promotion 時改用：
+
+```bash
+python scripts/validate-replay-fixtures.py --release
+```
+
+`--release` 會要求 manifest 裡的每個 provider 都有六個 release scenario，並
+重新以同一個 sanitized loader 驗證檔案；development gate 允許 provider 先以
+部分 fixture 增量接入。兩種模式都拒絕路徑穿越與不安全 recording policy。
+
 新 provider 進入 `_V2_SESSION_OPS` 時，CI 必須同時檢查：
 
 1. 有 capability manifest。

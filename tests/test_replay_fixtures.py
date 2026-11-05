@@ -27,7 +27,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import carddigest  # noqa: E402
 from live_update_event import LiveUpdateCursor  # noqa: E402
-from replay_fixture import load_jsonl  # noqa: E402
+from replay_fixture import (ReplayFixtureError, load_jsonl,
+                            validate_manifest)  # noqa: E402
 
 
 FIXTURE_DIR = Path(__file__).parent / "fixtures" / "replay"
@@ -40,6 +41,7 @@ def load_manifest() -> dict:
         manifest = json.load(fh)
     if manifest.get("schema_version") != 1:
         raise AssertionError("unsupported replay fixture manifest schema")
+    validate_manifest(manifest, FIXTURE_DIR)
     return manifest
 
 
@@ -155,6 +157,18 @@ class TestReplayManifest(unittest.TestCase):
                 "error_terminal",
             },
         )
+
+    def test_release_validator_rejects_partial_provider(self):
+        manifest = load_manifest()
+        with self.assertRaisesRegex(ReplayFixtureError,
+                                    "release fixture scenarios missing"):
+            validate_manifest(manifest, FIXTURE_DIR, release=True)
+
+    def test_manifest_rejects_fixture_path_escape(self):
+        manifest = load_manifest()
+        manifest["providers"] = {"codex": {"simple_turn": "../outside.jsonl"}}
+        with self.assertRaisesRegex(ReplayFixtureError, "escapes manifest"):
+            validate_manifest(manifest, FIXTURE_DIR)
 
     def test_capability_fixtures_are_explicit_and_present(self):
         manifest = load_manifest()
