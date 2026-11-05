@@ -37,6 +37,12 @@
 
 `ops` 必須由 `_V2_SESSION_OPS` 推導，不接受手寫第二份。能力不足時要明確回傳 unavailable/unsupported，而不是畫出不可用的控制項。
 
+`GET /app/v2/providers/capabilities` 與 typed v3 capability view 會額外帶出
+`replay`：`source`、已通過的 `scenarios`、`schema_version`、
+`digest_algorithm` 與 `release_ready`。這是 additive metadata；runtime bundle 沒有
+manifest 時回 `source=unavailable`、空情境與 `release_ready=false`，App 不得把
+缺資料當成 provider 已具備完整能力。
+
 目前 bridge 已有 per-approval 的 `response_capability`（`live`、`not_resumable`、`none`）。這個欄位比 provider 級的靜態布林值更可靠；Phase 2 只會把它納入 capability contract 的明確文件，不會用一個 provider 級旗標取代每筆審批的即時判定。
 
 ## Fixture 規則

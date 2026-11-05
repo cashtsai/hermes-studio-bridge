@@ -25,6 +25,7 @@ import ipaddress
 import json
 import math
 import difflib
+import functools
 import mimetypes
 import os
 import pty
@@ -23749,11 +23750,59 @@ _PROVIDER_CAPS: dict = {
 }
 
 
+@functools.lru_cache(maxsize=1)
+def _replay_capability_payload() -> dict:
+    """Return reviewed replay readiness without ever guessing capability.
+
+    The manifest is optional at runtime because some deployed bridge bundles do
+    not ship test fixtures.  Missing or malformed metadata is therefore an
+    explicit unavailable result, not a reason to advertise a release-ready
+    provider.  The cache keeps a capability request from rereading fixture
+    files; tests can call ``cache_clear`` when they replace the manifest path.
+    """
+    configured = os.environ.get("T3CODE_REPLAY_MANIFEST", "").strip()
+    manifest_path = Path(configured).expanduser() if configured else (
+        Path(__file__).resolve().parent / "tests" / "fixtures" / "replay" /
+        "manifest.json"
+    )
+    unknown = {
+        "source": "unavailable",
+        "schema_version": None,
+        "digest_algorithm": None,
+        "scenarios": [],
+        "release_ready": False,
+    }
+    try:
+        with manifest_path.open(encoding="utf-8") as handle:
+            manifest = json.load(handle)
+        summary = replay_fixture.validate_manifest(
+            manifest, manifest_path.parent, release=False)
+    except (OSError, ValueError, replay_fixture.ReplayFixtureError):
+        return {provider: dict(unknown) for provider in _PROVIDER_CAPS}
+
+    out = {}
+    for provider in _PROVIDER_CAPS:
+        coverage = (summary.get("providers") or {}).get(provider)
+        if not isinstance(coverage, dict):
+            out[provider] = dict(unknown)
+            continue
+        out[provider] = {
+            "source": "manifest",
+            "schema_version": manifest.get("schema_version"),
+            "digest_algorithm": manifest.get("digest_algorithm"),
+            "scenarios": list(coverage.get("scenarios") or []),
+            "release_ready": bool(coverage.get("release_ready")),
+        }
+    return out
+
+
 def _provider_caps_payload() -> dict:
     out = {}
+    replay = _replay_capability_payload()
     for prov, caps in _PROVIDER_CAPS.items():
         ops = sorted(op for op, tbl in _V2_SESSION_OPS.items() if prov in tbl)
-        out[prov] = {**caps, "ops": ops}
+        out[prov] = {**caps, "ops": ops,
+                     "replay": dict(replay.get(prov) or {})}
     return out
 
 
