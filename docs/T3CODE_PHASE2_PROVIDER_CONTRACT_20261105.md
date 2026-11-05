@@ -37,6 +37,8 @@
 
 `ops` 必須由 `_V2_SESSION_OPS` 推導，不接受手寫第二份。能力不足時要明確回傳 unavailable/unsupported，而不是畫出不可用的控制項。
 
+目前 bridge 已有 per-approval 的 `response_capability`（`live`、`not_resumable`、`none`）。這個欄位比 provider 級的靜態布林值更可靠；Phase 2 只會把它納入 capability contract 的明確文件，不會用一個 provider 級旗標取代每筆審批的即時判定。
+
 ## Fixture 規則
 
 Fixture 放在 `tests/fixtures/replay/`，每行一個脫敏 frame。每份 fixture 需要：
