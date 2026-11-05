@@ -83,6 +83,9 @@ def validate_manifest(manifest: Any, fixture_dir: str | os.PathLike[str], *,
     providers = manifest.get("providers")
     if not isinstance(providers, dict) or not providers:
         raise ReplayFixtureError("manifest providers must be a non-empty object")
+    digests = manifest.get("fixture_digests")
+    if not isinstance(digests, dict):
+        raise ReplayFixtureError("manifest fixture_digests must be an object")
 
     required = RELEASE_SCENARIOS if release else ()
     root = Path(fixture_dir).expanduser().resolve()
@@ -116,7 +119,18 @@ def validate_manifest(manifest: Any, fixture_dir: str | os.PathLike[str], *,
                 raise ReplayFixtureError(
                     f"{provider}/{scenario}: fixture does not exist"
                 )
-            load_jsonl(candidate)
+            frames = load_jsonl(candidate)
+            expected_digest = digests.get(candidate.name)
+            if not isinstance(expected_digest, str) or not re.fullmatch(
+                    r"[0-9a-f]{64}", expected_digest):
+                raise ReplayFixtureError(
+                    f"{provider}/{scenario}: fixture digest is missing or invalid"
+                )
+            actual_digest = fixture_digest(frames)
+            if actual_digest != expected_digest:
+                raise ReplayFixtureError(
+                    f"{provider}/{scenario}: fixture digest mismatch"
+                )
             files[scenario] = candidate.name
         coverage[provider] = {
             "scenarios": sorted(files),

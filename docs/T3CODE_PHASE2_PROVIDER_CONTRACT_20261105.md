@@ -77,8 +77,9 @@ python scripts/validate-replay-fixtures.py --release
 ```
 
 `--release` 會要求 manifest 裡的每個 provider 都有六個 release scenario，並
-重新以同一個 sanitized loader 驗證檔案；development gate 允許 provider 先以
-部分 fixture 增量接入。兩種模式都拒絕路徑穿越與不安全 recording policy。
+重新以同一個 sanitized loader 驗證檔案與 manifest pin 的 SHA-256 digest；development
+gate 允許 provider 先以部分 fixture 增量接入。兩種模式都拒絕路徑穿越、不安全
+recording policy 與 fixture digest drift。
 
 新 provider 進入 `_V2_SESSION_OPS` 時，CI 必須同時檢查：
 

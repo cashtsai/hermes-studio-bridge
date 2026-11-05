@@ -170,6 +170,12 @@ class TestReplayManifest(unittest.TestCase):
         with self.assertRaisesRegex(ReplayFixtureError, "escapes manifest"):
             validate_manifest(manifest, FIXTURE_DIR)
 
+    def test_manifest_rejects_digest_drift(self):
+        manifest = load_manifest()
+        manifest["fixture_digests"]["cx-simple.jsonl"] = "0" * 64
+        with self.assertRaisesRegex(ReplayFixtureError, "digest mismatch"):
+            validate_manifest(manifest, FIXTURE_DIR)
+
     def test_capability_fixtures_are_explicit_and_present(self):
         manifest = load_manifest()
         capabilities = manifest.get("capability_scenarios") or {}

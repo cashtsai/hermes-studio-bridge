@@ -7,6 +7,14 @@
     "owner_only_output": true,
     "raw_transcript_committed": false
   },
+  "fixture_digests": {
+    "cx-error.jsonl": "c365893bea610b50f3123de379a7d52d465770f291ab7bb66bc73b2b1afd7994",
+    "cx-simple.jsonl": "e3b132cc181426ce10eb8d90026e2f05a19ab15e92d4e759cbabbb66beccd9aa",
+    "gemini-simple.jsonl": "60352c56f036bd556a0c455880acc2ca1cfd6aef20c2a1970eca19bec2a23500",
+    "live-update.jsonl": "e7f60110b80fcc48c8b214ed3568be060ac0adf75b69a6c44616845d9fb391f2",
+    "openclaw-simple.jsonl": "08eb9476e10938bb09e2ebf03fb582eb039fe7b0020433ca310859b0ebcfadd7",
+    "visual-reply.jsonl": "b80db3af93f71394dbd7798d189cf38421e6e0336a681eef362d449a4738e805"
+  },
   "minimum_scenarios": [
     "simple_turn",
     "error_terminal",
