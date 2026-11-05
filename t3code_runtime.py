@@ -1,0 +1,538 @@
+"""Small, durable primitives for the T3Code follow-up contract.
+
+The bridge remains the compatibility surface.  This module owns only the new
+tables and pure-ish operations so migrations, redaction, and idempotency can be
+tested without importing the full FastAPI application.
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import re
+import sqlite3
+import subprocess
+import time
+import uuid
+from pathlib import Path
+from typing import Any
+
+
+SECRET_KEYS = frozenset({
+    "api_key", "apikey", "authorization", "cookie", "password", "secret",
+    "token", "access_token", "refresh_token", "private_key", "credential",
+})
+_SECRET_WORD = re.compile(
+    r"(?:api[_-]?key|authorization|cookie|password|secret|access[_-]?token|"
+    r"refresh[_-]?token|private[_-]?key|credential)\s*[:=]",
+    re.IGNORECASE,
+)
+
+
+class T3CodeError(ValueError):
+    """A client-correctable T3Code contract error."""
+
+
+def _now() -> float:
+    return time.time()
+
+
+def _id(prefix: str) -> str:
+    return f"{prefix}_{uuid.uuid4().hex}"
+
+
+def _json(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True,
+                      separators=(",", ":"))
+
+
+def _row(row: sqlite3.Row | None) -> dict | None:
+    return dict(row) if row is not None else None
+
+
+def ensure_schema(db_path: str) -> None:
+    """Create the additive T3Code schema without touching legacy tables."""
+    parent = os.path.dirname(os.path.abspath(db_path))
+    os.makedirs(parent, exist_ok=True)
+    con = sqlite3.connect(db_path, timeout=30)
+    try:
+        con.execute("PRAGMA journal_mode=WAL")
+        con.execute("PRAGMA busy_timeout=30000")
+        con.execute("""CREATE TABLE IF NOT EXISTS app_threads(
+            id TEXT PRIMARY KEY,
+            owner TEXT NOT NULL,
+            title TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'active',
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL,
+            version INTEGER NOT NULL DEFAULT 1)""")
+        con.execute("""CREATE TABLE IF NOT EXISTS provider_threads(
+            id TEXT PRIMARY KEY,
+            app_thread_id TEXT NOT NULL,
+            provider TEXT NOT NULL,
+            native_id TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'active',
+            capabilities TEXT NOT NULL DEFAULT '{}',
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL,
+            UNIQUE(provider, native_id),
+            FOREIGN KEY(app_thread_id) REFERENCES app_threads(id))""")
+        con.execute("CREATE INDEX IF NOT EXISTS idx_provider_thread_app "
+                    "ON provider_threads(app_thread_id, updated_at)")
+        con.execute("""CREATE TABLE IF NOT EXISTS context_transfers(
+            id TEXT PRIMARY KEY,
+            app_thread_id TEXT NOT NULL,
+            source_provider_thread_id TEXT NOT NULL,
+            target_provider TEXT NOT NULL,
+            target_provider_thread_id TEXT,
+            envelope TEXT NOT NULL,
+            envelope_hash TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'dry_run',
+            created_at REAL NOT NULL,
+            expires_at REAL,
+            FOREIGN KEY(app_thread_id) REFERENCES app_threads(id))""")
+        con.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_transfer_hash "
+                    "ON context_transfers(id, envelope_hash)")
+        con.execute("""CREATE TABLE IF NOT EXISTS checkpoints(
+            id TEXT PRIMARY KEY,
+            app_thread_id TEXT NOT NULL,
+            provider_thread_id TEXT,
+            cwd TEXT NOT NULL,
+            head TEXT,
+            dirty_summary TEXT NOT NULL DEFAULT '',
+            artifact_manifest_hash TEXT NOT NULL,
+            manifest TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'dry_run',
+            created_at REAL NOT NULL,
+            FOREIGN KEY(app_thread_id) REFERENCES app_threads(id))""")
+        con.execute("""CREATE TABLE IF NOT EXISTS usage_samples(
+            id TEXT PRIMARY KEY,
+            session TEXT NOT NULL,
+            provider TEXT NOT NULL,
+            model TEXT,
+            input_tokens INTEGER,
+            output_tokens INTEGER,
+            cache_read_tokens INTEGER,
+            cache_write_tokens INTEGER,
+            total_tokens INTEGER,
+            estimated_cost_usd REAL,
+            source TEXT NOT NULL,
+            dedupe_key TEXT UNIQUE,
+            recorded_at REAL NOT NULL)""")
+        con.execute("CREATE INDEX IF NOT EXISTS idx_usage_session_time "
+                    "ON usage_samples(session, recorded_at)")
+        con.execute("""CREATE TABLE IF NOT EXISTS live_activity_tokens(
+            session_id TEXT PRIMARY KEY,
+            token TEXT NOT NULL,
+            bundle_id TEXT NOT NULL,
+            updated_at REAL NOT NULL)""")
+        con.commit()
+    finally:
+        con.close()
+
+
+def _connect(db_path: str) -> sqlite3.Connection:
+    con = sqlite3.connect(db_path, timeout=30)
+    con.row_factory = sqlite3.Row
+    con.execute("PRAGMA busy_timeout=30000")
+    return con
+
+
+def create_app_thread(db_path: str, owner: str, title: str,
+                      thread_id: str | None = None) -> dict:
+    ensure_schema(db_path)
+    owner = str(owner or "").strip()
+    title = str(title or "").strip()[:200]
+    if not owner or not title:
+        raise T3CodeError("owner and title are required")
+    tid = thread_id or _id("app")
+    now = _now()
+    con = _connect(db_path)
+    try:
+        con.execute("INSERT INTO app_threads(id,owner,title,status,created_at,updated_at) "
+                    "VALUES(?,?,?,?,?,?)",
+                    (tid, owner, title, "active", now, now))
+        con.commit()
+        return {"id": tid, "owner": owner, "title": title, "status": "active",
+                "created_at": now, "updated_at": now, "version": 1,
+                "provider_threads": []}
+    finally:
+        con.close()
+
+
+def link_provider_thread(db_path: str, app_thread_id: str, provider: str,
+                         native_id: str, capabilities: dict | None = None,
+                         provider_thread_id: str | None = None) -> dict:
+    ensure_schema(db_path)
+    provider = str(provider or "").strip().lower()
+    native_id = str(native_id or "").strip()
+    if not provider or not native_id:
+        raise T3CodeError("provider and native_id are required")
+    now = _now()
+    pid = provider_thread_id or _id("provider")
+    caps = capabilities if isinstance(capabilities, dict) else {}
+    con = _connect(db_path)
+    try:
+        if not con.execute("SELECT 1 FROM app_threads WHERE id=?",
+                           (app_thread_id,)).fetchone():
+            raise T3CodeError("unknown app_thread")
+        existing = con.execute(
+            "SELECT * FROM provider_threads WHERE provider=? AND native_id=?",
+            (provider, native_id)).fetchone()
+        if existing:
+            if existing["app_thread_id"] != app_thread_id:
+                raise T3CodeError("native provider thread already belongs to another app_thread")
+            pid = existing["id"]
+            con.execute("UPDATE provider_threads SET status='active', capabilities=?, "
+                        "updated_at=? WHERE id=?", (_json(caps), now, pid))
+        else:
+            con.execute("""INSERT INTO provider_threads
+                (id,app_thread_id,provider,native_id,status,capabilities,created_at,updated_at)
+                VALUES(?,?,?,?,?,?,?,?)""",
+                        (pid, app_thread_id, provider, native_id, "active",
+                         _json(caps), now, now))
+        con.commit()
+        row = con.execute("SELECT * FROM provider_threads WHERE id=?", (pid,)).fetchone()
+        out = _row(row) or {}
+        out["capabilities"] = json.loads(out.get("capabilities") or "{}")
+        return out
+    finally:
+        con.close()
+
+
+def get_app_thread(db_path: str, thread_id: str) -> dict | None:
+    ensure_schema(db_path)
+    con = _connect(db_path)
+    try:
+        row = con.execute("SELECT * FROM app_threads WHERE id=?", (thread_id,)).fetchone()
+        if row is None:
+            return None
+        out = _row(row) or {}
+        children = con.execute(
+            "SELECT * FROM provider_threads WHERE app_thread_id=? ORDER BY created_at",
+            (thread_id,)).fetchall()
+        out["provider_threads"] = []
+        for child in children:
+            item = _row(child) or {}
+            item["capabilities"] = json.loads(item.get("capabilities") or "{}")
+            out["provider_threads"].append(item)
+        return out
+    finally:
+        con.close()
+
+
+def _contains_secret(value: Any, path: str = "") -> str | None:
+    if isinstance(value, dict):
+        for key, child in value.items():
+            key_text = str(key).strip().lower().replace("-", "_")
+            if key_text in SECRET_KEYS or _SECRET_WORD.search(key_text + ":"):
+                return f"{path}.{key}".strip(".")
+            found = _contains_secret(child, f"{path}.{key}".strip("."))
+            if found:
+                return found
+    elif isinstance(value, list):
+        for index, child in enumerate(value):
+            found = _contains_secret(child, f"{path}[{index}]")
+            if found:
+                return found
+    elif isinstance(value, str) and _SECRET_WORD.search(value):
+        return path or "value"
+    return None
+
+
+def _normalise_transfer(value: Any, name: str) -> Any:
+    if value is None:
+        return [] if name in {"decisions", "artifacts", "pending"} else ""
+    if name == "summary":
+        return str(value).strip()[:12000]
+    if not isinstance(value, list):
+        raise T3CodeError(f"{name} must be a list")
+    return value[:100]
+
+
+def create_context_transfer(db_path: str, app_thread_id: str,
+                            source_provider_thread_id: str,
+                            target_provider: str, summary: str,
+                            decisions: list | None = None,
+                            artifacts: list | None = None,
+                            pending: list | None = None,
+                            transfer_id: str | None = None,
+                            expires_at: float | None = None) -> dict:
+    ensure_schema(db_path)
+    payload = {
+        "version": 1,
+        "source_provider_thread_id": source_provider_thread_id,
+        "target_provider": str(target_provider or "").strip().lower(),
+        "summary": _normalise_transfer(summary, "summary"),
+        "decisions": _normalise_transfer(decisions, "decisions"),
+        "artifacts": _normalise_transfer(artifacts, "artifacts"),
+        "pending": _normalise_transfer(pending, "pending"),
+    }
+    if not payload["source_provider_thread_id"] or not payload["target_provider"]:
+        raise T3CodeError("source_provider_thread_id and target_provider are required")
+    secret_path = _contains_secret(payload)
+    if secret_path:
+        raise T3CodeError(f"context transfer contains secret material at {secret_path}")
+    envelope = _json(payload)
+    digest = hashlib.sha256(envelope.encode()).hexdigest()
+    transfer_id = transfer_id or _id("ctx")
+    now = _now()
+    con = _connect(db_path)
+    try:
+        if not con.execute("SELECT 1 FROM app_threads WHERE id=?", (app_thread_id,)).fetchone():
+            raise T3CodeError("unknown app_thread")
+        if not con.execute("SELECT 1 FROM provider_threads WHERE id=? AND app_thread_id=?",
+                           (source_provider_thread_id, app_thread_id)).fetchone():
+            raise T3CodeError("source provider thread is not attached to app_thread")
+        existing = con.execute("SELECT * FROM context_transfers WHERE id=?",
+                               (transfer_id,)).fetchone()
+        if existing:
+            if existing["envelope_hash"] != digest:
+                raise T3CodeError("transfer_id already exists with different content")
+            out = _row(existing) or {}
+            out["envelope"] = json.loads(out["envelope"])
+            return out
+        con.execute("""INSERT INTO context_transfers
+            (id,app_thread_id,source_provider_thread_id,target_provider,envelope,
+             envelope_hash,status,created_at,expires_at)
+            VALUES(?,?,?,?,?,?,?,?,?)""",
+                    (transfer_id, app_thread_id, source_provider_thread_id,
+                     payload["target_provider"], envelope, digest, "dry_run",
+                     now, expires_at))
+        con.commit()
+        return {"id": transfer_id, "app_thread_id": app_thread_id,
+                "source_provider_thread_id": source_provider_thread_id,
+                "target_provider": payload["target_provider"],
+                "envelope": payload, "envelope_hash": digest,
+                "status": "dry_run", "created_at": now, "expires_at": expires_at}
+    finally:
+        con.close()
+
+
+def _git(cwd: str, *args: str) -> str:
+    try:
+        result = subprocess.run(["git", "-C", cwd, *args], capture_output=True,
+                                text=True, timeout=5, check=False)
+        return result.stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def build_checkpoint_manifest(cwd: str, app_thread_id: str,
+                              provider_thread_id: str | None = None,
+                              artifact_paths: list[str] | None = None) -> dict:
+    path = os.path.realpath(os.path.expanduser(cwd))
+    if not os.path.isdir(path):
+        raise T3CodeError("cwd must be an existing directory")
+    status = _git(path, "status", "--short")
+    head = _git(path, "rev-parse", "HEAD") or None
+    artifacts = []
+    for raw in (artifact_paths or [])[:100]:
+        item = os.path.realpath(os.path.join(path, str(raw)))
+        if not item.startswith(path + os.sep) and item != path:
+            raise T3CodeError("artifact path must stay inside cwd")
+        if os.path.isfile(item):
+            data = Path(item).read_bytes()
+            artifacts.append({"path": os.path.relpath(item, path),
+                              "size": len(data),
+                              "sha256": hashlib.sha256(data).hexdigest()})
+    manifest = {"version": 1, "app_thread_id": app_thread_id,
+                "provider_thread_id": provider_thread_id, "cwd": path,
+                "head": head, "dirty": bool(status),
+                "dirty_summary": status[:8000], "artifacts": artifacts,
+                "read_only": True, "created_at": _now()}
+    encoded = _json(manifest)
+    manifest["artifact_manifest_hash"] = hashlib.sha256(encoded.encode()).hexdigest()
+    return manifest
+
+
+def create_checkpoint(db_path: str, manifest: dict,
+                      checkpoint_id: str | None = None) -> dict:
+    ensure_schema(db_path)
+    if manifest.get("read_only") is not True:
+        raise T3CodeError("checkpoint manifest must be read-only")
+    cid = checkpoint_id or _id("checkpoint")
+    now = _now()
+    encoded = _json(manifest)
+    digest = hashlib.sha256(encoded.encode()).hexdigest()
+    con = _connect(db_path)
+    try:
+        existing = con.execute("SELECT * FROM checkpoints WHERE id=?", (cid,)).fetchone()
+        if existing:
+            existing_manifest = existing["manifest"] or ""
+            if existing_manifest != encoded:
+                raise T3CodeError("checkpoint_id already exists with different content")
+            out = _row(existing) or {}
+            out["manifest"] = json.loads(out["manifest"] or "{}")
+            out["status"] = out.get("status") or "dry_run"
+            out["manifest_hash"] = digest
+            return out
+        con.execute("""INSERT INTO checkpoints
+            (id,app_thread_id,provider_thread_id,cwd,head,dirty_summary,
+             artifact_manifest_hash,manifest,status,created_at)
+            VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                    (cid, manifest["app_thread_id"], manifest.get("provider_thread_id"),
+                     manifest["cwd"], manifest.get("head"),
+                     manifest.get("dirty_summary") or "",
+                     manifest.get("artifact_manifest_hash") or digest,
+                     encoded, "dry_run", now))
+        con.commit()
+        return {"id": cid, "status": "dry_run", "manifest": manifest,
+                "manifest_hash": digest, "created_at": now}
+    finally:
+        con.close()
+
+
+def record_usage_sample(db_path: str, session: str, provider: str,
+                        usage: dict, model: str | None = None,
+                        source: str = "provider", dedupe_key: str | None = None) -> dict | None:
+    ensure_schema(db_path)
+    if not isinstance(usage, dict):
+        return None
+    inner = usage.get("tokenUsage") if isinstance(usage.get("tokenUsage"), dict) else usage
+    if isinstance(inner.get("total"), dict):
+        inner = inner["total"]
+
+    def integer(*keys: str) -> int | None:
+        for key in keys:
+            if inner.get(key) is not None:
+                try:
+                    return max(0, int(inner[key]))
+                except (TypeError, ValueError):
+                    return None
+        return None
+    inp = integer("input_tokens", "inputTokens")
+    out = integer("output_tokens", "outputTokens")
+    cache_read = integer("cache_read_tokens", "cachedInputTokens") or 0
+    cache_write = integer("cache_creation_input_tokens", "cacheWriteInputTokens") or 0
+    total = integer("total_tokens", "totalTokens")
+    if total is None:
+        total = sum(v or 0 for v in (inp, out, cache_read, cache_write)) or None
+    if total is None:
+        return None
+    key = dedupe_key or hashlib.sha256(
+        _json([session, provider, model, inp, out, cache_read, cache_write, total]).encode()
+    ).hexdigest()
+    now = _now()
+    con = _connect(db_path)
+    try:
+        con.execute("""INSERT OR IGNORE INTO usage_samples
+            (id,session,provider,model,input_tokens,output_tokens,cache_read_tokens,
+             cache_write_tokens,total_tokens,estimated_cost_usd,source,dedupe_key,recorded_at)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (_id("usage"), str(session), str(provider), model, inp, out,
+                     cache_read, cache_write, total,
+                     usage.get("cost_usd") or inner.get("cost_usd"),
+                     source, key, now))
+        con.commit()
+        row = con.execute("SELECT * FROM usage_samples WHERE dedupe_key=?", (key,)).fetchone()
+        return _row(row)
+    finally:
+        con.close()
+
+
+def usage_summary(db_path: str, cutoff: float) -> dict:
+    ensure_schema(db_path)
+    con = _connect(db_path)
+    try:
+        rows = con.execute("""SELECT provider, COUNT(*),
+            COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0),
+            COALESCE(SUM(cache_read_tokens),0), COALESCE(SUM(cache_write_tokens),0),
+            COALESCE(SUM(total_tokens),0), COALESCE(SUM(estimated_cost_usd),0)
+            FROM usage_samples WHERE recorded_at>? GROUP BY provider""", (cutoff,)).fetchall()
+        return {str(row[0]): {"provider": str(row[0]), "samples": int(row[1]),
+                              "tokens_in": int(row[2]), "tokens_out": int(row[3]),
+                              "cache_read_tokens": int(row[4]),
+                              "cache_write_tokens": int(row[5]),
+                              "total_tokens": int(row[6]),
+                              "est_cost_usd": float(row[7])}
+                for row in rows}
+    finally:
+        con.close()
+
+
+def register_live_activity(db_path: str, session_id: str, token: str,
+                           bundle_id: str) -> dict:
+    ensure_schema(db_path)
+    session_id, token, bundle_id = (str(session_id or "").strip(),
+                                    str(token or "").strip(),
+                                    str(bundle_id or "").strip())
+    if not session_id or not token or not bundle_id:
+        raise T3CodeError("session_id, token and bundle_id are required")
+    now = _now()
+    con = _connect(db_path)
+    try:
+        con.execute("INSERT OR REPLACE INTO live_activity_tokens(session_id,token,bundle_id,updated_at) "
+                    "VALUES(?,?,?,?)", (session_id, token, bundle_id, now))
+        con.commit()
+        return {"session_id": session_id, "bundle_id": bundle_id,
+                "token_set": True, "updated_at": now}
+    finally:
+        con.close()
+
+
+def get_live_activity(db_path: str, session_id: str) -> dict | None:
+    ensure_schema(db_path)
+    con = _connect(db_path)
+    try:
+        return _row(con.execute("SELECT * FROM live_activity_tokens WHERE session_id=?",
+                               (session_id,)).fetchone())
+    finally:
+        con.close()
+
+
+def remove_live_activity(db_path: str, session_id: str) -> bool:
+    ensure_schema(db_path)
+    con = _connect(db_path)
+    try:
+        cur = con.execute("DELETE FROM live_activity_tokens WHERE session_id=?", (session_id,))
+        con.commit()
+        return bool(cur.rowcount)
+    finally:
+        con.close()
+
+
+def event_snapshot(db_path: str, session: str, limit: int = 100) -> dict:
+    """Return a durable message snapshot plus the event cursor it represents."""
+    con = _connect(db_path)
+    try:
+        rows = con.execute(
+            "SELECT id,role,content,attachments,created_at,status,client_id "
+            "FROM messages WHERE session=? ORDER BY created_at DESC LIMIT ?",
+            (session, max(1, min(int(limit), 500)))).fetchall()
+        messages = []
+        for row in reversed(rows):
+            item = _row(row) or {}
+            try:
+                item["attachments"] = json.loads(item.get("attachments") or "[]")
+            except (TypeError, ValueError):
+                item["attachments"] = []
+            messages.append(item)
+        seq = con.execute("SELECT COALESCE(MAX(id),0) FROM event_log WHERE session=?",
+                          (session,)).fetchone()[0]
+        return {"session": session, "messages": messages,
+                "snapshot_seq": int(seq or 0), "generated_at": _now()}
+    finally:
+        con.close()
+
+
+def events_after(db_path: str, session: str, after_seq: int = 0,
+                 limit: int = 500) -> list[dict]:
+    """Read durable events strictly after a client cursor."""
+    con = _connect(db_path)
+    try:
+        rows = con.execute(
+            "SELECT id,type,payload,created_at FROM event_log "
+            "WHERE session=? AND id>? ORDER BY id LIMIT ?",
+            (session, max(0, int(after_seq)), max(1, min(int(limit), 500)))).fetchall()
+        out = []
+        for row in rows:
+            try:
+                payload = json.loads(row[2] or "{}")
+            except (TypeError, ValueError):
+                payload = {}
+            out.append({"seq": int(row[0]), "type": row[1], "data": payload,
+                        "ts": row[3]})
+        return out
+    finally:
+        con.close()
