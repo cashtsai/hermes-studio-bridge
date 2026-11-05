@@ -5,7 +5,7 @@ import _isolation  # noqa: F401
 import unittest
 
 from live_update_event import (LiveUpdateEventError, apns_content_state,
-                               make_event, next_seq)
+                               LiveUpdateCursor, make_event, next_seq)
 
 
 class LiveUpdateEventTest(unittest.TestCase):
@@ -44,6 +44,38 @@ class LiveUpdateEventTest(unittest.TestCase):
         first = next_seq("session-test", floor=100)
         second = next_seq("session-test", floor=100)
         self.assertGreater(second, first)
+
+    def test_cursor_ignores_duplicate_and_out_of_order_events(self):
+        cursor = LiveUpdateCursor("codex:t1")
+        self.assertTrue(cursor.accept(make_event(
+            "codex:t1", 2, "streaming", phase="回覆中", updated_at=1783291200)))
+        self.assertFalse(cursor.accept(make_event(
+            "codex:t1", 2, "running", phase="舊事件", updated_at=1783291201)))
+        self.assertFalse(cursor.accept(make_event(
+            "codex:t1", 1, "running", phase="更舊", updated_at=1783291202)))
+        self.assertEqual(cursor.snapshot()["state"], "streaming")
+        self.assertEqual(cursor.snapshot()["seq"], 2)
+
+    def test_cursor_keeps_terminal_state(self):
+        cursor = LiveUpdateCursor("codex:t2")
+        self.assertTrue(cursor.accept(make_event(
+            "codex:t2", 1, "completed", phase="完成", updated_at=1783291200)))
+        self.assertFalse(cursor.accept(make_event(
+            "codex:t2", 2, "running", phase="遲到", updated_at=1783291201)))
+        self.assertTrue(cursor.snapshot()["terminal"])
+
+    def test_cursor_rejects_other_session(self):
+        cursor = LiveUpdateCursor("codex:t3")
+        with self.assertRaises(LiveUpdateEventError):
+            cursor.accept(make_event("codex:other", 1, "running",
+                                     updated_at=1783291200))
+
+    def test_cursor_rejects_unknown_version(self):
+        cursor = LiveUpdateCursor("codex:t4")
+        event = make_event("codex:t4", 1, "running", updated_at=1783291200)
+        event["version"] = 2
+        with self.assertRaises(LiveUpdateEventError):
+            cursor.accept(event)
 
 
 if __name__ == "__main__":

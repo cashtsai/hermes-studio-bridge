@@ -1,0 +1,2 @@
+{"method":"turn_begin","params":{"cid":"visual-1","label":"回覆中"}}
+{"method":"turn_end","params":{"cid":"visual-1","full_text":"```studio-card\n{\"kind\":\"visual\",\"fallback_text\":\"看圖與原文\",\"blocks\":[{\"type\":\"image\",\"url\":\"https://cdn.example/preview.png\",\"alt\":\"預覽\"},{\"type\":\"link\",\"url\":\"https://example.com/source\",\"label\":\"原文\"}]}\n```"}}

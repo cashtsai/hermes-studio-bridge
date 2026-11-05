@@ -49,6 +49,12 @@ Fixture 放在 `tests/fixtures/replay/`，每行一個脫敏 frame。每份 fixt
 - 能以純本機 replay runner 執行，不啟動 tmux、網路或 provider process。
 - 對 card projection、busy 狀態、terminal outcome、重連 cursor 做斷言。
 
+除了 provider 六場景外，`manifest.json` 的 `capability_scenarios` 會登記
+`visual_replies` 與 `live_updates` 的獨立 fixture。前者驗證 typed block 與舊版
+fallback；後者驗證 duplicate、out-of-order 與 terminal 後遲到事件。共用
+`LiveUpdateCursor` 只接受同 session 且 seq 較新的事件，終態一旦收尾不再被後續
+事件覆寫。
+
 ## CI gate
 
 新 provider 進入 `_V2_SESSION_OPS` 時，CI 必須同時檢查：

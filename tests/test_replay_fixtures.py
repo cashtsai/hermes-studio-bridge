@@ -26,6 +26,7 @@ os.environ.setdefault("BRIDGE_TOKEN", "test-unit-token")
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import carddigest  # noqa: E402
+from live_update_event import LiveUpdateCursor  # noqa: E402
 
 
 FIXTURE_DIR = Path(__file__).parent / "fixtures" / "replay"
@@ -156,6 +157,18 @@ class TestReplayManifest(unittest.TestCase):
             },
         )
 
+    def test_capability_fixtures_are_explicit_and_present(self):
+        manifest = load_manifest()
+        capabilities = manifest.get("capability_scenarios") or {}
+        self.assertEqual(set(capabilities), {"visual_replies", "live_updates"})
+        for capability, scenarios in capabilities.items():
+            self.assertTrue(scenarios, f"{capability} must have a scenario")
+            for scenario, filename in scenarios.items():
+                self.assertTrue(
+                    (FIXTURE_DIR / filename).is_file(),
+                    f"{capability}/{scenario} fixture missing: {filename}",
+                )
+
 
 class TestCxTurnError(unittest.TestCase):
     def test_error_turn_emits_error_card(self):
@@ -211,6 +224,34 @@ class TestOpenClawSimpleTurn(unittest.TestCase):
         turns = [e["data"]["state"] for e in d.store.events
                  if e["type"] == "turn"]
         self.assertEqual(turns, ["begin", "end"])
+
+
+class TestCapabilityReplay(unittest.TestCase):
+    def test_visual_fixture_projects_typed_blocks_and_fallback(self):
+        digest = replay_persona(load_fixture("visual-reply.jsonl"),
+                                carddigest.PersonaDigest())
+        visual_cards = [c for c in _cards(digest)
+                        if c.get("body", {}).get("visual")]
+        self.assertEqual(len(visual_cards), 1)
+        visual = visual_cards[0]["body"]["visual"]
+        self.assertEqual(visual["fallback_text"], "看圖與原文")
+        self.assertEqual([b["type"] for b in visual["blocks"]],
+                         ["image", "link"])
+
+    def test_live_update_fixture_rejects_stale_and_post_terminal_events(self):
+        cursor = LiveUpdateCursor("codex:fixture-1")
+        applied = []
+        for frame in load_fixture("live-update.jsonl"):
+            self.assertEqual(frame["event"], "live_update")
+            applied.append(cursor.accept(frame["payload"]))
+        self.assertEqual(applied, [True, True, False, True, False])
+        self.assertEqual(cursor.snapshot(), {
+            "session_id": "codex:fixture-1",
+            "seq": 13,
+            "state": "completed",
+            "phase": "完成",
+            "terminal": True,
+        })
 
 
 if __name__ == "__main__":

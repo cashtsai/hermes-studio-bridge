@@ -24,5 +24,13 @@
     "openclaw": {
       "simple_turn": "openclaw-simple.jsonl"
     }
+  },
+  "capability_scenarios": {
+    "visual_replies": {
+      "visual_text_image_link_fallback": "visual-reply.jsonl"
+    },
+    "live_updates": {
+      "duplicate_out_of_order_terminal": "live-update.jsonl"
+    }
   }
 }

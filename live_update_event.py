@@ -9,6 +9,7 @@ network state, or provider-specific objects.
 from __future__ import annotations
 
 import time
+from dataclasses import dataclass
 from typing import Any
 
 
@@ -94,6 +95,64 @@ def next_seq(session_id: str, floor: int = 0) -> int:
 
 
 _LAST_SEQ: dict[str, int] = {}
+
+
+def validate_event(event: dict) -> dict:
+    """Validate an event received from a transport or replay fixture.
+
+    Rebuilding the envelope drops provider-specific fields and makes the
+    consumer boundary deterministic.  The caller can then safely apply the
+    sequence rules without trusting a remote payload.
+    """
+    if not isinstance(event, dict):
+        raise LiveUpdateEventError("event must be an object")
+    try:
+        version = int(event.get("version", VERSION))
+    except (TypeError, ValueError) as exc:
+        raise LiveUpdateEventError("unsupported event version") from exc
+    if version != VERSION:
+        raise LiveUpdateEventError("unsupported event version")
+    return make_event(
+        event.get("session_id") or event.get("sessionID"),
+        event.get("seq"),
+        event.get("state"),
+        phase=event.get("phase"),
+        updated_at=event.get("updated_at", event.get("updatedAt")),
+        terminal=event.get("terminal"),
+    )
+
+
+@dataclass
+class LiveUpdateCursor:
+    """Small provider-neutral consumer for duplicate/out-of-order events."""
+
+    session_id: str
+    seq: int = 0
+    state: str = "connecting"
+    phase: str | None = None
+    terminal: bool = False
+
+    def accept(self, event: dict) -> bool:
+        """Apply only a newer event for this session; return whether applied."""
+        normalized = validate_event(event)
+        if normalized["session_id"] != self.session_id:
+            raise LiveUpdateEventError("event session does not match cursor")
+        if self.terminal or normalized["seq"] <= self.seq:
+            return False
+        self.seq = normalized["seq"]
+        self.state = normalized["state"]
+        self.phase = normalized.get("phase")
+        self.terminal = normalized["terminal"]
+        return True
+
+    def snapshot(self) -> dict:
+        return {
+            "session_id": self.session_id,
+            "seq": self.seq,
+            "state": self.state,
+            "phase": self.phase,
+            "terminal": self.terminal,
+        }
 
 
 def apns_content_state(event: dict, *, busy: bool,
