@@ -1464,14 +1464,16 @@ class SessionCardStore(ApprovalCardMixin):
 #   {"kind": "table", "title": "持倉", "columns": [...], "rows": [[...]],
 #    "fallback_text": "..."}
 #   ```
-# kind ∈ {table, kv, text, markdown};fallback_text 缺了由 digest 代生。
+# kind ∈ {table, kv, text, markdown, choices, visual};fallback_text 缺了由
+# digest 代生。visual 的 blocks 仍會經過 visual_envelope 正規化,不把 provider
+# 私有欄位或未清理 HTML 直接交給 app。
 # 壞 JSON / 不認得的 kind → 圍欄原文保留(不吞內容,fallback 鐵律)。
 
 _SC_FENCE_RE = re.compile(r"```studio-card[ \t]*\n(.*?)\n?```", re.DOTALL)
 # choices = 選擇閘道公版(docs/CHOICE_GATEWAY_CONTRACT.md):agent 吐一個
 # ```studio-card {kind:"choices", options:[…]}``` → App 渲染成原生按鈕。
 # body(含 options/rows)原樣過(extract 用 dict(payload)),不需另寫欄位。
-_SC_KINDS = ("table", "kv", "text", "markdown", "choices")
+_SC_KINDS = ("table", "kv", "text", "markdown", "choices", "visual")
 
 
 def _studio_card_fallback(payload: dict) -> str:
@@ -1519,6 +1521,20 @@ def _studio_card_fallback(payload: dict) -> str:
                 lines.append(f"- {label}(送「{send}」)")
             else:
                 lines.append(f"- {label}")
+        return "\n".join(lines).strip() or "studio-card"
+    if kind == "visual":
+        lines = [title] if title else []
+        for block in payload.get("blocks") or []:
+            if not isinstance(block, dict):
+                continue
+            block_type = str(block.get("type") or "").strip().lower()
+            if block_type in {"text", "markdown"} and block.get("text"):
+                lines.append(str(block["text"]))
+            elif block_type == "image":
+                lines.append(f"🖼 {block.get('alt') or block.get('url') or '圖片'}")
+            elif block_type in {"link", "file"}:
+                lines.append(str(block.get("label") or block.get("filename")
+                                 or block.get("url") or "連結"))
         return "\n".join(lines).strip() or "studio-card"
     text = str(payload.get("text") or "")
     return (f"{title}\n{text}" if title else text).strip() or "studio-card"
@@ -1595,6 +1611,16 @@ class PersonaDigest(ApprovalCardMixin):
         for i, body in enumerate(bodies):
             body = dict(body)
             kind = body.pop("kind")
+            if kind == "visual":
+                # TerminalCardKind remains v2-compatible; visual is an
+                # additive body capability on a normal markdown card.
+                blocks = body.pop("blocks", None)
+                body["visual"] = {
+                    "version": body.pop("version", 1),
+                    "blocks": blocks,
+                    "fallback_text": body.get("fallback_text") or "",
+                }
+                kind = "markdown"
             self.store.upsert_card(make_card(f"{base_cid}-sc{i}", self.store.turn_id,
                                              "assistant", kind, body, ts=ts))
 

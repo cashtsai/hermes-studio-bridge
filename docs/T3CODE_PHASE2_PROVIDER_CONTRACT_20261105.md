@@ -73,6 +73,11 @@ Fixture 放在 `tests/fixtures/replay/`，每行一個脫敏 frame。每份 fixt
 `applied:false`，不會搬移 session 或傳遞 credential。active/streaming session
 維持 host affinity；只有 explicit failover + durable checkpoint 才可進入下一台。
 
+Persona/provider 若要產生 visual reply，可在 `studio-card` fence 使用
+`{"kind":"visual","blocks":[...]}`；digest 會投影成普通 markdown card 的
+`body.visual`，同時把 fallback 文字留在母卡與 visual card。非法 block 會被丟棄，
+不會阻斷串流或破壞 v2 client。
+
 ### Live Update 共用事件
 
 Bridge 的 ActivityKit APNs sender 現在在既有 iOS `content-state` 欄位外，附帶
