@@ -53,9 +53,12 @@ metadata，不帶明文 secret：
 
 1. 已完成：上述 envelope、secret rejection、target binding、expiry、nonce replay
    guard 與一次性 server-side state；資料庫只保留 nonce hash。
-2. 下一步：接 macOS Keychain / iOS Keychain，加入 target binding、過期、重放與 audit
-   redaction 的實機驗收。
-3. 最後：讓 provider secret provider 以 credential reference 交付，target 寫入
+2. 已補上：Bridge repo 的 `credential_store.py` 提供 target-side macOS
+   Keychain adapter；寫入走 `security` stdin，不把 secret 放進 argv、log 或
+   SQLite。它是本機 adapter，不代表跨主機交接已經自動完成。
+3. 下一步：把 adapter 接到明確 approval 的 target installer，加入 target binding、
+   過期、重放與 audit redaction 的實機驗收。
+4. 最後：讓 provider secret provider 以 credential reference 交付，target 寫入
    Keychain 後只回傳 `accepted` 與 reference。
 
 在這三步完成前，產品 UI 應該只提供「在目標主機重新登入/貼上 API key」的流程，
