@@ -23,6 +23,9 @@
   `CONFIRM_RESTORE=1`。這避免自動回滾把更新期間已寫入的新訊息覆蓋掉。
 - Guest link 撤銷：已驗證的 owner/device 可呼叫 `POST /app/v1/guest-links/revoke-all`，只輪替獨立 guest
   signing secret，所有既有分享連結立即失效；不保存 token denylist。
+- APNs 金鑰來源：預設仍相容既有 `.p8` 檔案；可用 `APNS_KEY_SOURCE=keychain` 從
+  macOS Keychain 讀取，或以 `APNS_KEY_REQUIRE_PRIVATE=1` 強制檔案 owner-only。
+  provider 只回傳是否可讀與 key material 給 JWT signer，不把內容寫入 log、DB 或事件。
 
 ## 操作
 
@@ -53,6 +56,7 @@ CC、CX 各一條 session。不要直接刪除 `releases/` 或 `snapshots/`，�
 
 - 這套保護尚未在 Vultr 實機觸發壞版演練；目前以腳本測試與靜態 unit contract
   驗證為主。
+- APNs Keychain provider 已有單元測試；TestFlight 背景/鎖屏矩陣仍需真機與實際 key。
 - Guest link 目前是「全數撤銷」語意，不是單條撤銷；若未來要 per-link revoke，
   必須另設只存 token hash/expiry 的 denylist 與清理策略，不能把原始 URL 存回資料庫。
 - 自動回滾只回退程式碼。資料庫 snapshot 的復原保留給明確人工決策。

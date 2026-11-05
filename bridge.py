@@ -51,6 +51,7 @@ from pathlib import Path
 import agent_call as agent_call_policy
 import agent_context as agent_context_policy
 import agent_registry
+import apns_key_provider
 import codex_home
 import host_discovery
 from harness import distill as harness_distill
@@ -61,6 +62,7 @@ import media_artifacts
 import hermes_media
 import openclaw_provider
 import gemini_provider
+import orchestrator
 import t3code_runtime
 import cc_detect            # CC TUI 狀態偵測(manifest 引擎;herdr 設計移植)
 import cc_sdk               # CC provider v2(Agent SDK;模組內 lazy-import SDK)
@@ -4325,7 +4327,12 @@ def apns_configured() -> bool:
     未配置 → 推播模組整體靜默停用:push_notify 短路回 disabled,不打 APNs、
     不讀金鑰、不炸例外。第一次偵測到未配置時 _log_event 一筆(此後安靜),
     讓「推播沒動靜」可以在 event log 裡查到原因而不是無聲消失。"""
-    ok = bool(APNS_KEY_ID) and bool(APNS_TEAM_ID) and os.path.isfile(APNS_KEY_PATH)
+    ok = bool(APNS_KEY_ID) and bool(APNS_TEAM_ID) and apns_key_provider.available(
+        source=os.environ.get("APNS_KEY_SOURCE", "file"),
+        path=APNS_KEY_PATH,
+        service=os.environ.get("APNS_KEYCHAIN_SERVICE"),
+        account=os.environ.get("APNS_KEYCHAIN_ACCOUNT"),
+    )
     if not ok and not _apns_disabled_logged[0]:
         _apns_disabled_logged[0] = True
         _log_event("apns_disabled",
@@ -4362,8 +4369,12 @@ def _apns_jwt() -> str:
     now = time.time()
     if _apns_jwt_cache[0] and now - _apns_jwt_cache[1] < 3000:
         return _apns_jwt_cache[0]
-    with open(APNS_KEY_PATH) as f:
-        key = f.read()
+    key = apns_key_provider.read_apns_key(
+        source=os.environ.get("APNS_KEY_SOURCE", "file"),
+        path=APNS_KEY_PATH,
+        service=os.environ.get("APNS_KEYCHAIN_SERVICE"),
+        account=os.environ.get("APNS_KEYCHAIN_ACCOUNT"),
+    )
     tok = pyjwt.encode({"iss": APNS_TEAM_ID, "iat": int(now)}, key,
                        algorithm="ES256", headers={"kid": APNS_KEY_ID})
     _apns_jwt_cache[0], _apns_jwt_cache[1] = tok, now
@@ -24162,6 +24173,26 @@ async def t3_orchestrator_capabilities(request: Request):
     """Typed orchestrator capability view; no provider credentials are exposed."""
     _check_auth(request)
     return {"version": 1, "providers": _provider_caps_payload()}
+
+
+@app.post("/app/v3/orchestrator/placement/preview")
+async def t3_orchestrator_placement_preview(request: Request):
+    """Plan placement without moving a session or touching credentials."""
+    _check_auth(request)
+    body = await _json_body(request)
+    try:
+        result = orchestrator.plan_placement(
+            body.get("hosts") or [],
+            required=body.get("required_capabilities") or [],
+            current_host_id=body.get("current_host_id"),
+            session_state=str(body.get("session_state") or "idle"),
+            checkpointed=bool(body.get("checkpointed")),
+            allow_failover=bool(body.get("allow_failover")),
+        )
+    except (TypeError, ValueError) as exc:
+        raise http_err(400, "T3CODE_BAD_REQUEST", str(exc))
+    return {"version": 1, "placement": result.as_dict(),
+            "applied": False}
 
 
 @app.post("/app/v3/orchestrator/delegations")

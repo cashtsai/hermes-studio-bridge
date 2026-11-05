@@ -32,6 +32,33 @@ internals.
   commit real tokens to git.
 - `/health` may be used as a lightweight reachability check.
 
+## 1.1 Typed visual reply envelope (additive)
+
+Cards may include an optional `body.visual` envelope. It is versioned and must
+always be accompanied by the existing `fallback_text`; older clients ignore
+the envelope and render the fallback.
+
+```json
+{
+  "version": 1,
+  "fallback_text": "摘要",
+  "blocks": [
+    {"type": "text", "text": "摘要"},
+    {"type": "image", "url": "https://example.invalid/a.png",
+     "mime": "image/png", "alt": "預覽"},
+    {"type": "link", "url": "https://example.invalid", "label": "原文"},
+    {"type": "html", "html": "<p>已清理內容</p>", "sanitized": true}
+  ]
+}
+```
+
+Allowed block types are `text`, `markdown`, `image`, `file`, `link`, and
+`html`. `html` requires server-side sanitization and is rejected if common
+active-content markers are present. Provider-specific fields and secret-like
+fields are dropped or rejected. Raw HTML is never placed into the normal text
+field. The envelope is a capability-gated extension; it does not change the
+v2 fallback path.
+
 ## 2. Stable v1 Endpoints
 
 ### `GET /health`

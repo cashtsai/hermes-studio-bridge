@@ -20,6 +20,8 @@ import hashlib
 import re
 import time
 
+from visual_envelope import VisualEnvelopeError, normalize_visual_envelope
+
 
 def _epoch(ts) -> float:
     """CC jsonl timestamp（ISO8601 或 epoch）→ epoch float；解不動就當下。"""
@@ -102,6 +104,14 @@ def make_card(cid: str, turn_id: str, role: str, kind: str, body: dict,
               ts: float | None = None, rev: int = 1, final: bool = True) -> dict:
     body = dict(body or {})
     body.setdefault("fallback_text", body.get("text") or "")
+    # Typed visual replies are additive.  A malformed envelope must never
+    # break the card stream; older clients still receive fallback_text.
+    if "visual" in body:
+        try:
+            body["visual"] = normalize_visual_envelope(
+                body["visual"], body.get("fallback_text") or body.get("text") or "")
+        except VisualEnvelopeError:
+            body.pop("visual", None)
     explicit_ts = ts is not None
     card = {"id": cid, "turn_id": turn_id, "role": role, "kind": kind,
             "rev": rev, "final": final, "ts": ts if explicit_ts else time.time(),

@@ -64,3 +64,11 @@ Fixture 放在 `tests/fixtures/replay/`，每行一個脫敏 frame。每份 fixt
 ## 建議
 
 先把現有 CC/CX/Gemini/OpenClaw fixture 補上 manifest，再錄 Claude Code 與 Hermes 的脫敏真實 transcript。不要先把 `TerminalCardStore` 切成 v3；provider contract 綠、真機 replay 綠、舊 bridge fallback 綠，才有資格翻主路徑 feature flag。
+
+## Typed visual replies 與 placement preview
+
+`body.visual` 是 additive capability，規格在 `APP_BRIDGE_CONTRACT.md` §1.1；
+不符合 envelope 的 provider output 必須退回 `fallback_text`。多機排程先使用
+`POST /app/v3/orchestrator/placement/preview` 取得純計畫，該端點永遠回
+`applied:false`，不會搬移 session 或傳遞 credential。active/streaming session
+維持 host affinity；只有 explicit failover + durable checkpoint 才可進入下一台。
