@@ -55,9 +55,10 @@ metadata，不帶明文 secret：
    guard 與一次性 server-side state；資料庫只保留 nonce hash。
 2. 已補上：Bridge repo 的 `credential_store.py` 提供 target-side macOS
    Keychain adapter；寫入走 `security` stdin，不把 secret 放進 argv、log 或
-   SQLite。它是本機 adapter，不代表跨主機交接已經自動完成。
-3. 下一步：把 adapter 接到明確 approval 的 target installer，加入 target binding、
-   過期、重放與 audit redaction 的實機驗收。
+   SQLite。`credential_handoff_installer.py` 也要求 handoff 已 consumed、
+   approval_id、target/provider/audience 完全匹配後才寫入。
+3. 下一步：把 source secret provider 與已驗證的 host-to-host channel 接上，加入
+   target binding、過期、重放與 audit redaction 的真機驗收。
 4. 最後：讓 provider secret provider 以 credential reference 交付，target 寫入
    Keychain 後只回傳 `accepted` 與 reference。
 
