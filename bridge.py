@@ -63,6 +63,7 @@ import hermes_media
 import openclaw_provider
 import gemini_provider
 import orchestrator
+import live_update_event
 import t3code_runtime
 import cc_detect            # CC TUI 狀態偵測(manifest 引擎;herdr 設計移植)
 import cc_sdk               # CC provider v2(Agent SDK;模組內 lazy-import SDK)
@@ -4540,7 +4541,8 @@ async def _apns_send(token: str, title: str, body: str, data: dict | None = None
 
 async def _apns_send_live_activity(session_id: str, busy: bool,
                                    phase_label: str | None = None,
-                                   ended_label: str | None = None) -> dict:
+                                   ended_label: str | None = None,
+                                   terminal_state: str | None = None) -> dict:
     """Send one ActivityKit update for a registered session token.
 
     Registration is opt-in and the normal alert push path remains untouched.
@@ -4557,9 +4559,14 @@ async def _apns_send_live_activity(session_id: str, busy: bool,
         return {"sent": False, "reason": "dependency_missing"}
     if _live_activity_update_throttled(session_id, busy):
         return {"sent": False, "reason": "throttled"}
+    state = "running" if busy else (terminal_state or "completed")
+    seq = live_update_event.next_seq(session_id, _event_latest_seq(session_id))
+    shared_event = live_update_event.make_event(
+        session_id, seq, state, phase=phase_label or ended_label)
+    content_state = live_update_event.apns_content_state(
+        shared_event, busy=busy, phase_label=phase_label,
+        ended_label=ended_label)
     event = "update" if busy else "end"
-    content_state = {"busy": bool(busy), "phaseLabel": phase_label,
-                     "endedLabel": ended_label}
     aps = {"timestamp": int(time.time()), "event": event,
            "content-state": content_state}
     if not busy:
@@ -4597,14 +4604,15 @@ async def _apns_send_live_activity(session_id: str, busy: bool,
 
 def _live_activity_update(session_id: str, busy: bool,
                           phase_label: str | None = None,
-                          ended_label: str | None = None) -> None:
+                          ended_label: str | None = None,
+                          terminal_state: str | None = None) -> None:
     """Fire-and-forget ActivityKit update; the live stream stays independent."""
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
         return
     task = loop.create_task(_apns_send_live_activity(
-        session_id, busy, phase_label, ended_label))
+        session_id, busy, phase_label, ended_label, terminal_state))
     _BG_TASKS.add(task)
     task.add_done_callback(_BG_TASKS.discard)
 
@@ -4879,7 +4887,8 @@ def _turn_end_push(sid: str, display: str, summary: str, ok: bool = True) -> Non
     # If the iOS app requested an ActivityKit push token, keep the lock-screen
     # state truthful even after the app process is suspended.  The ordinary
     # alert push remains the fallback for older builds.
-    _live_activity_update(sid, False, ended_label=("已完成" if ok else "已中斷"))
+    _live_activity_update(sid, False, ended_label=("已完成" if ok else "已中斷"),
+                          terminal_state=("completed" if ok else "failed"))
     t = loop.create_task(push_notify(title, body, data,
                                      thread_id=sid, content_available=True,
                                      no_preview_body="回合已完成"))

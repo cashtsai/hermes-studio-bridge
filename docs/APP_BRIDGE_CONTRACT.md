@@ -59,6 +59,20 @@ fields are dropped or rejected. Raw HTML is never placed into the normal text
 field. The envelope is a capability-gated extension; it does not change the
 v2 fallback path.
 
+## 1.2 Live update event envelope (iOS and Android)
+
+ActivityKit payloads keep the existing iOS `busy`, `phaseLabel`, and
+`endedLabel` fields, and also carry the shared event fields:
+`version`, `sessionID`, `seq`, `state`, and `terminal`. The allowed states are
+`connecting`, `queued`, `running`, `waiting_user`, `streaming`, `completed`,
+`failed`, `disconnected`, and `idle`.
+
+`completed` and `failed` are the only terminal states. Clients must discard an
+event whose sequence is older than the last accepted event, must not turn a
+transport `disconnected` state into `idle`, and must always apply a terminal
+event even when non-terminal updates are throttled. Android Live Updates use
+the same envelope; only the platform presentation differs.
+
 ## 2. Stable v1 Endpoints
 
 ### `GET /health`

@@ -93,6 +93,10 @@ class LiveActivityPushTest(unittest.TestCase):
         self.assertEqual(_FakeClient.calls[0]["headers"]["apns-push-type"],
                          "liveactivity")
         self.assertEqual(_FakeClient.calls[1]["json"]["aps"]["event"], "end")
+        shared = _FakeClient.calls[1]["json"]["aps"]["content-state"]
+        self.assertEqual(shared["version"], 1)
+        self.assertEqual(shared["state"], "completed")
+        self.assertTrue(shared["terminal"])
 
     def test_410_removes_stale_activity_registration(self):
         _FakeClient.responses.append(_Response(410, "Unregistered"))

@@ -72,3 +72,11 @@ Fixture 放在 `tests/fixtures/replay/`，每行一個脫敏 frame。每份 fixt
 `POST /app/v3/orchestrator/placement/preview` 取得純計畫，該端點永遠回
 `applied:false`，不會搬移 session 或傳遞 credential。active/streaming session
 維持 host affinity；只有 explicit failover + durable checkpoint 才可進入下一台。
+
+### Live Update 共用事件
+
+Bridge 的 ActivityKit APNs sender 現在在既有 iOS `content-state` 欄位外，附帶
+`version/sessionID/seq/state/terminal` 共用事件 envelope。Android Live Updates
+可直接沿用同一組狀態與序號規則；非終態更新仍可節流，`completed`/`failed` 不可被
+節流吞掉。這一輪只完成 bridge-side event contract，Android client 與背景 quota
+仍需另外驗收。
