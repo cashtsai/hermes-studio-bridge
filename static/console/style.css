@@ -116,6 +116,14 @@ body{background:var(--bg);color:var(--text);font-family:var(--sans);
 .card.streaming{opacity:.78;}
 .card.streaming::after{content:"▍";animation:blink 1s steps(2) infinite;}
 @keyframes blink{50%{opacity:0;}}
+.visual-reply{display:flex;flex-direction:column;gap:8px;}
+.visual-image{display:block;max-width:min(520px,100%);max-height:360px;object-fit:contain;
+  border-radius:8px;background:var(--panel-2);}
+.visual-link{display:inline-flex;align-items:center;max-width:100%;width:max-content;
+  color:var(--accent-2);text-decoration:underline;overflow-wrap:anywhere;}
+.visual-text,.visual-fallback,.visual-plain{white-space:normal;overflow-wrap:anywhere;}
+.visual-fallback{font-size:12px;color:var(--dim);}
+.visual-plain{margin-top:2px;}
 
 /* composer */
 .composer{display:flex;gap:8px;padding:12px 16px;border-top:1px solid var(--line);background:var(--panel);}
