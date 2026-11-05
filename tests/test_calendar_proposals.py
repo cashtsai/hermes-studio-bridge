@@ -475,6 +475,9 @@ class TestMcpTools(unittest.TestCase):
         names = {t["name"] for t in self.mcp.TOOLS}
         self.assertIn("propose_calendar_event", names)
         self.assertIn("propose_reminder", names)
+        self.assertIn("t3_create_delegation", names)
+        self.assertIn("t3_transition_context_transfer", names)
+        self.assertIn("t3_restore_checkpoint", names)
         for t in self.mcp.TOOLS:
             if t["name"] == "propose_calendar_event":
                 self.assertEqual(set(t["inputSchema"]["required"]),
@@ -515,6 +518,30 @@ class TestMcpTools(unittest.TestCase):
         self.assertEqual(seen["body"]["target"], "reminder")
         self.assertNotIn("start", seen["body"])
         self.assertNotIn("end", seen["body"])
+
+    def test_t3_delegation_payload_is_typed(self):
+        seen, out = self._capture("t3_create_delegation", {
+            "parent_persona": "xcash", "provider": "codex",
+            "objective": "finish the release", "cwd": "/tmp/project",
+            "task_code": "T3CODE", "subtask_code": "RELEASE",
+            "api_key": "must-never-pass"})
+        self.assertEqual(seen["method"], "POST")
+        self.assertEqual(seen["path"], "/app/v3/orchestrator/delegations")
+        self.assertNotIn("api_key", seen["body"])
+        self.assertEqual(seen["body"]["task_code"], "T3CODE")
+        self.assertFalse(out["isError"])
+
+    def test_t3_transfer_and_checkpoint_routes(self):
+        seen, _ = self._capture("t3_transition_context_transfer", {
+            "transfer_id": "ctx/a", "status": "approved",
+            "approval_id": "approval-1", "token": "must-never-pass"})
+        self.assertEqual(seen["path"], "/app/v3/context-transfers/ctx%2Fa/transition")
+        self.assertNotIn("token", seen["body"])
+        seen, _ = self._capture("t3_restore_checkpoint", {
+            "checkpoint_id": "checkpoint-1", "approval_id": "approval-1",
+            "confirm": True})
+        self.assertEqual(seen["path"], "/app/v3/checkpoints/checkpoint-1/restore")
+        self.assertEqual(seen["body"], {"approval_id": "approval-1", "confirm": True})
 
     def test_empty_fields_are_not_sent(self):
         """空值不上送 —— 讓 bridge 的預設值生效,不要送 '' 去撞驗證。"""

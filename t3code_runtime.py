@@ -33,6 +33,16 @@ class T3CodeError(ValueError):
     """A client-correctable T3Code contract error."""
 
 
+CONTEXT_TRANSITIONS = {
+    "dry_run": {"approved", "expired"},
+    "approved": {"target_created", "failed", "expired"},
+    "target_created": {"applied", "failed", "expired"},
+    "applied": set(),
+    "failed": set(),
+    "expired": set(),
+}
+
+
 def _now() -> float:
     return time.time()
 
@@ -126,9 +136,28 @@ def ensure_schema(db_path: str) -> None:
             token TEXT NOT NULL,
             bundle_id TEXT NOT NULL,
             updated_at REAL NOT NULL)""")
+        con.execute("""CREATE TABLE IF NOT EXISTS t3code_meta(
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL,
+            updated_at REAL NOT NULL)""")
+        _ensure_columns(con, "context_transfers", {
+            "approval_id": "TEXT", "last_error": "TEXT", "updated_at": "REAL",
+        })
+        _ensure_columns(con, "checkpoints", {
+            "ref_name": "TEXT", "approval_id": "TEXT", "restore_status": "TEXT",
+            "restored_at": "REAL", "last_error": "TEXT",
+        })
         con.commit()
     finally:
         con.close()
+
+
+def _ensure_columns(con: sqlite3.Connection, table: str,
+                    columns: dict[str, str]) -> None:
+    present = {row[1] for row in con.execute(f"PRAGMA table_info({table})")}
+    for name, ddl in columns.items():
+        if name not in present:
+            con.execute(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}")
 
 
 def _connect(db_path: str) -> sqlite3.Connection:
@@ -221,6 +250,75 @@ def get_app_thread(db_path: str, thread_id: str) -> dict | None:
         con.close()
 
 
+def project_legacy_delegations(db_path: str, rows: list[dict]) -> dict:
+    """Project legacy delegation handles into stable v3 ids.
+
+    This is deliberately additive.  The v1 delegation registry remains the
+    source of operational truth until the client cutover; rerunning the
+    projection is deterministic and never deletes an AppThread.
+    """
+    ensure_schema(db_path)
+    projected = skipped = 0
+    now = _now()
+    con = _connect(db_path)
+    try:
+        for raw in rows or []:
+            row = dict(raw or {})
+            provider = str(row.get("provider") or "").strip().lower()
+            native = str(row.get("provider_session_id") or
+                         row.get("codex_thread_id") or
+                         row.get("cc_session_name") or "").strip()
+            if not provider or not native:
+                skipped += 1
+                continue
+            owner = str(row.get("parent_session") or
+                        row.get("parent_persona") or "unknown").strip()
+            work_order = str(row.get("work_order") or row.get("id") or "").strip()
+            app_key = f"{owner}:{work_order}"
+            app_id = "app_legacy_" + hashlib.sha256(app_key.encode()).hexdigest()[:24]
+            title = str(row.get("title") or row.get("objective") or work_order
+                        or "Legacy thread").strip()[:200]
+            if not con.execute("SELECT 1 FROM app_threads WHERE id=?", (app_id,)).fetchone():
+                con.execute("""INSERT INTO app_threads
+                    (id,owner,title,status,created_at,updated_at)
+                    VALUES(?,?,?,?,?,?)""",
+                            (app_id, owner, title, "active", now, now))
+            else:
+                con.execute("UPDATE app_threads SET title=?,updated_at=? WHERE id=?",
+                            (title, now, app_id))
+            existing = con.execute(
+                "SELECT id,app_thread_id FROM provider_threads WHERE provider=? AND native_id=?",
+                (provider, native)).fetchone()
+            if existing and existing["app_thread_id"] != app_id:
+                skipped += 1
+                continue
+            child_status = "detached" if str(row.get("status") or "").lower() in {
+                "done", "failed", "archived", "cancelled", "expired"
+            } else "active"
+            pid = existing["id"] if existing else (
+                "provider_legacy_" + hashlib.sha256(
+                    f"{provider}:{native}".encode()).hexdigest()[:24])
+            if existing:
+                con.execute("UPDATE provider_threads SET status=?,updated_at=? WHERE id=?",
+                            (child_status, now, pid))
+            else:
+                con.execute("""INSERT INTO provider_threads
+                    (id,app_thread_id,provider,native_id,status,capabilities,created_at,updated_at)
+                    VALUES(?,?,?,?,?,?,?,?)""",
+                            (pid, app_id, provider, native, child_status,
+                             _json({"projected_from": "delegation",
+                                    "delegation_id": row.get("id")}), now, now))
+            projected += 1
+        con.execute("""INSERT INTO t3code_meta(key,value,updated_at)
+            VALUES('legacy_projection_version','1',?)
+            ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at""",
+                    (now,))
+        con.commit()
+        return {"projected": projected, "skipped": skipped, "version": 1}
+    finally:
+        con.close()
+
+
 def _contains_secret(value: Any, path: str = "") -> str | None:
     if isinstance(value, dict):
         for key, child in value.items():
@@ -294,17 +392,66 @@ def create_context_transfer(db_path: str, app_thread_id: str,
             return out
         con.execute("""INSERT INTO context_transfers
             (id,app_thread_id,source_provider_thread_id,target_provider,envelope,
-             envelope_hash,status,created_at,expires_at)
-            VALUES(?,?,?,?,?,?,?,?,?)""",
+             envelope_hash,status,created_at,expires_at,updated_at)
+            VALUES(?,?,?,?,?,?,?,?,?,?)""",
                     (transfer_id, app_thread_id, source_provider_thread_id,
                      payload["target_provider"], envelope, digest, "dry_run",
-                     now, expires_at))
+                     now, expires_at, now))
         con.commit()
         return {"id": transfer_id, "app_thread_id": app_thread_id,
                 "source_provider_thread_id": source_provider_thread_id,
                 "target_provider": payload["target_provider"],
                 "envelope": payload, "envelope_hash": digest,
                 "status": "dry_run", "created_at": now, "expires_at": expires_at}
+    finally:
+        con.close()
+
+
+def get_context_transfer(db_path: str, transfer_id: str) -> dict | None:
+    ensure_schema(db_path)
+    con = _connect(db_path)
+    try:
+        row = _row(con.execute("SELECT * FROM context_transfers WHERE id=?",
+                              (transfer_id,)).fetchone())
+        if not row:
+            return None
+        row["envelope"] = json.loads(row.get("envelope") or "{}")
+        return row
+    finally:
+        con.close()
+
+
+def transition_context_transfer(db_path: str, transfer_id: str,
+                                next_status: str, approval_id: str | None = None,
+                                target_provider_thread_id: str | None = None,
+                                error: str | None = None) -> dict:
+    ensure_schema(db_path)
+    next_status = str(next_status or "").strip().lower()
+    if next_status not in CONTEXT_TRANSITIONS:
+        raise T3CodeError("unsupported context transfer status")
+    now = _now()
+    con = _connect(db_path)
+    try:
+        current = con.execute("SELECT * FROM context_transfers WHERE id=?",
+                              (transfer_id,)).fetchone()
+        if current is None:
+            raise T3CodeError("unknown context transfer")
+        old_status = str(current["status"] or "dry_run")
+        if next_status not in CONTEXT_TRANSITIONS.get(old_status, set()):
+            if old_status == next_status:
+                return get_context_transfer(db_path, transfer_id) or {}
+            raise T3CodeError(f"invalid context transfer transition: {old_status}->{next_status}")
+        if next_status == "approved" and not str(approval_id or "").strip():
+            raise T3CodeError("approval_id is required before applying a transfer")
+        if next_status in {"target_created", "applied"} and not str(target_provider_thread_id or "").strip():
+            raise T3CodeError("target_provider_thread_id is required")
+        con.execute("""UPDATE context_transfers SET status=?,approval_id=?,
+            target_provider_thread_id=COALESCE(?,target_provider_thread_id),
+            last_error=?,updated_at=? WHERE id=?""",
+                    (next_status, approval_id, target_provider_thread_id,
+                     error, now, transfer_id))
+        con.commit()
+        return get_context_transfer(db_path, transfer_id) or {}
     finally:
         con.close()
 
@@ -379,6 +526,95 @@ def create_checkpoint(db_path: str, manifest: dict,
         con.commit()
         return {"id": cid, "status": "dry_run", "manifest": manifest,
                 "manifest_hash": digest, "created_at": now}
+    finally:
+        con.close()
+
+
+def _checkpoint_ref(checkpoint_id: str) -> str:
+    clean = re.sub(r"[^A-Za-z0-9_.-]", "-", str(checkpoint_id or ""))[:80]
+    if not clean:
+        raise T3CodeError("checkpoint id is required")
+    return f"refs/pocket/checkpoints/{clean}"
+
+
+def _git_run(cwd: str, *args: str, check: bool = False) -> subprocess.CompletedProcess:
+    try:
+        return subprocess.run(["git", "-C", cwd, *args], capture_output=True,
+                              text=True, timeout=10, check=check)
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise T3CodeError(f"git operation failed: {type(exc).__name__}") from exc
+
+
+def _approval_is_ready(con: sqlite3.Connection, approval_id: str | None) -> bool:
+    if not str(approval_id or "").strip():
+        return False
+    tables = {r[0] for r in con.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'")}
+    if "approvals" not in tables:
+        return True
+    row = con.execute("SELECT status FROM approvals WHERE id=?", (approval_id,)).fetchone()
+    return bool(row and str(row[0]).lower() in {"approved", "approved_for_session"})
+
+
+def materialize_checkpoint_ref(db_path: str, checkpoint_id: str,
+                               approval_id: str) -> dict:
+    """Create a hidden git ref only after an explicit approved action."""
+    ensure_schema(db_path)
+    con = _connect(db_path)
+    try:
+        row = con.execute("SELECT * FROM checkpoints WHERE id=?", (checkpoint_id,)).fetchone()
+        if row is None:
+            raise T3CodeError("unknown checkpoint")
+        if not _approval_is_ready(con, approval_id):
+            raise T3CodeError("checkpoint ref requires an approved approval")
+        cwd = str(row["cwd"])
+        head = _git_run(cwd, "rev-parse", "HEAD").stdout.strip()
+        if not head:
+            raise T3CodeError("checkpoint cwd has no git HEAD")
+        ref = _checkpoint_ref(checkpoint_id)
+        _git_run(cwd, "update-ref", ref, head, check=True)
+        now = _now()
+        con.execute("""UPDATE checkpoints SET ref_name=?,approval_id=?,
+            restore_status='available',status='materialized',last_error=NULL WHERE id=?""",
+                    (ref, approval_id, checkpoint_id))
+        con.commit()
+        out = _row(con.execute("SELECT * FROM checkpoints WHERE id=?",
+                               (checkpoint_id,)).fetchone()) or {}
+        out["manifest"] = json.loads(out.get("manifest") or "{}")
+        out["materialized_at"] = now
+        return out
+    finally:
+        con.close()
+
+
+def restore_checkpoint(db_path: str, checkpoint_id: str, approval_id: str,
+                       confirm: bool) -> dict:
+    """Restore a clean worktree from a materialized ref after confirmation."""
+    if not confirm:
+        raise T3CodeError("restore requires confirm=true")
+    ensure_schema(db_path)
+    con = _connect(db_path)
+    try:
+        row = con.execute("SELECT * FROM checkpoints WHERE id=?", (checkpoint_id,)).fetchone()
+        if row is None:
+            raise T3CodeError("unknown checkpoint")
+        if not row["ref_name"]:
+            raise T3CodeError("checkpoint ref is not materialized")
+        if not _approval_is_ready(con, approval_id):
+            raise T3CodeError("restore requires an approved approval")
+        cwd = str(row["cwd"])
+        if _git_run(cwd, "status", "--porcelain").stdout.strip():
+            raise T3CodeError("refusing restore on a dirty worktree")
+        _git_run(cwd, "read-tree", "--reset", "-u", str(row["ref_name"]), check=True)
+        now = _now()
+        con.execute("""UPDATE checkpoints SET restore_status='restored',
+            approval_id=?,restored_at=?,status='restored',last_error=NULL WHERE id=?""",
+                    (approval_id, now, checkpoint_id))
+        con.commit()
+        out = _row(con.execute("SELECT * FROM checkpoints WHERE id=?",
+                               (checkpoint_id,)).fetchone()) or {}
+        out["manifest"] = json.loads(out.get("manifest") or "{}")
+        return out
     finally:
         con.close()
 

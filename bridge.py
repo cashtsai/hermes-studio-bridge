@@ -3617,6 +3617,19 @@ def _delegation_get(delegation_id: str):
         con.close()
 
 
+@app.on_event("startup")
+async def _t3_legacy_projection_startup():
+    """Seed the additive v3 projection without making startup fragile."""
+    try:
+        rows = [dict(row) for row in _delegation_rows(limit=1000)]
+        result = t3code_runtime.project_legacy_delegations(CANON_DB, rows)
+        _log_event("t3code_legacy_projection", **result)
+    except Exception as _exc:  # noqa: BLE001
+        # The legacy registry remains authoritative; a projection failure must
+        # be visible in logs but cannot take the bridge offline.
+        _log_exc("t3code_legacy_projection", _exc, expected=True)
+
+
 def _delegation_insert(row: dict) -> None:
     import sqlite3
     con = sqlite3.connect(CANON_DB, timeout=30)
@@ -23832,9 +23845,11 @@ async def guest_view(token: str):
 
 @app.get("/app/v1/usage/summary")
 async def usage_summary(request: Request, window: str = "7d"):
-    """按 provider 匯總的用量。v1 資料源是 event_log(turn/訊息里程碑),
-    **tokens 誠實回 null** —— bridge 目前不持久化 token 計數,顯示假數
-    比沒有更糟;等 provider usage 落 event_log 後同一個端點自然長出來。"""
+    """按 provider 匯總回合、訊息與已知的 provider token samples。
+
+    token 欄位只接受 Codex wire usage 或 Claude 本機 transcript 的已知數字；
+    沒有可靠來源的 provider 仍回 null，不用估算值冒充真實用量。
+    """
     _check_auth(request)
     days = {"1d": 1, "7d": 7, "30d": 30}.get(window, 7)
     cutoff = time.time() - days * 86400
@@ -23955,6 +23970,28 @@ async def t3_context_transfer(thread_id: str, request: Request):
         _t3_bad(exc)
 
 
+@app.get("/app/v3/context-transfers/{transfer_id}")
+async def t3_context_transfer_get(transfer_id: str, request: Request):
+    _check_auth(request)
+    item = t3code_runtime.get_context_transfer(CANON_DB, transfer_id)
+    if item is None:
+        raise http_err(404, "T3CODE_TRANSFER_NOT_FOUND", "unknown context transfer")
+    return {"ok": True, "transfer": item}
+
+
+@app.post("/app/v3/context-transfers/{transfer_id}/transition")
+async def t3_context_transfer_transition(transfer_id: str, request: Request):
+    _check_auth(request)
+    body = await _json_body(request)
+    try:
+        item = t3code_runtime.transition_context_transfer(
+            CANON_DB, transfer_id, body.get("status"), body.get("approval_id"),
+            body.get("target_provider_thread_id"), body.get("error"))
+        return {"ok": True, "transfer": item}
+    except t3code_runtime.T3CodeError as exc:
+        _t3_bad(exc)
+
+
 @app.post("/app/v3/threads/{thread_id}/checkpoints")
 async def t3_checkpoint(thread_id: str, request: Request):
     _check_auth(request)
@@ -23966,8 +24003,25 @@ async def t3_checkpoint(thread_id: str, request: Request):
         manifest = t3code_runtime.build_checkpoint_manifest(
             cwd, thread_id, body.get("provider_thread_id"),
             body.get("artifact_paths") or [])
-        return {"ok": True, "checkpoint": t3code_runtime.create_checkpoint(
-            CANON_DB, manifest, body.get("checkpoint_id"))}
+        checkpoint = t3code_runtime.create_checkpoint(
+            CANON_DB, manifest, body.get("checkpoint_id"))
+        if body.get("write_ref"):
+            checkpoint = t3code_runtime.materialize_checkpoint_ref(
+                CANON_DB, checkpoint["id"], str(body.get("approval_id") or ""))
+        return {"ok": True, "checkpoint": checkpoint}
+    except t3code_runtime.T3CodeError as exc:
+        _t3_bad(exc)
+
+
+@app.post("/app/v3/checkpoints/{checkpoint_id}/restore")
+async def t3_checkpoint_restore(checkpoint_id: str, request: Request):
+    _check_auth(request)
+    body = await _json_body(request)
+    try:
+        checkpoint = t3code_runtime.restore_checkpoint(
+            CANON_DB, checkpoint_id, str(body.get("approval_id") or ""),
+            bool(body.get("confirm")))
+        return {"ok": True, "checkpoint": checkpoint}
     except t3code_runtime.T3CodeError as exc:
         _t3_bad(exc)
 
