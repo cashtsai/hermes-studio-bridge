@@ -58,6 +58,10 @@ except Exception: print('-1 health讀不到')")
   sleep 10
 done
 rm -f /tmp/hermes-bridge-watchdog.fails
+# A safe restart is an explicit operator action; release a supervisor hold so
+# the service can be tried once with the current code.
+CRASH_STATE_DIR="${POCKET_BRIDGE_CRASH_STATE_DIR:-$HOME/Library/Application Support/PocketConnect/bridge-state}"
+rm -f "$CRASH_STATE_DIR/crash-loop.hold" "$CRASH_STATE_DIR/failures"
 launchctl kickstart -k "gui/$(id -u)/$LABEL" || exit 1
 sleep 6
 curl -s -m 8 http://127.0.0.1:8081/health | head -c 160; echo

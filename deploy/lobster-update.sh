@@ -25,12 +25,63 @@ REPO="${POCKET_BRIDGE_REPO:-https://github.com/cashtsai/hermes-studio-bridge.git
 BASE="${POCKET_LOBSTER_BASE:-$HOME/.local/share/pocket-lobster/bridge}"
 CURRENT="$BASE/current"
 RELEASES="$BASE/releases"
+SNAPSHOTS="$BASE/snapshots"
 SRC="$HOME/pocket-bridge"                 # 與 cloud-init 的 setup 腳本共用
 UNIT="${POCKET_BRIDGE_LABEL:-pocket-bridge}"
 ENV_FILE="${POCKET_ENV_DIR:-$HOME/.config/pocket-lobster}/bridge.env"
+CRASH_STATE_DIR="${POCKET_BRIDGE_CRASH_STATE_DIR:-$HOME/.local/state/pocket-lobster/bridge}"
+PYTHON="${POCKET_PYTHON:-python3}"
 
 log() { printf '[lobster-update] %s\n' "$*"; }
 die() { printf '[lobster-update] ✗ %s\n' "$*" >&2; exit 1; }
+
+if [ -f "$ENV_FILE" ]; then
+  # The installer keeps the database paths and port in this 0600 file. Never
+  # print its contents; only the named variables are consumed below.
+  . "$ENV_FILE"
+  UNIT="${POCKET_BRIDGE_LABEL:-$UNIT}"
+  CRASH_STATE_DIR="${POCKET_BRIDGE_CRASH_STATE_DIR:-$CRASH_STATE_DIR}"
+  PYTHON="${POCKET_PYTHON:-$PYTHON}"
+fi
+
+reset_crash_loop() {
+  rm -f "$CRASH_STATE_DIR/crash-loop.hold" "$CRASH_STATE_DIR/failures"
+}
+
+snapshot_sqlite() {
+  local source="$1" destination="$2"
+  [ -f "$source" ] || return 0
+  mkdir -p "$(dirname "$destination")"
+  "$PYTHON" - "$source" "$destination" <<'PY'
+import sqlite3
+import sys
+
+source, destination = sys.argv[1:]
+src = sqlite3.connect(source, timeout=30)
+dst = sqlite3.connect(destination, timeout=30)
+try:
+    src.backup(dst)
+    dst.commit()
+finally:
+    dst.close()
+    src.close()
+PY
+  chmod 600 "$destination" 2>/dev/null || true
+  log "SQLite snapshot: $source → $destination"
+}
+
+snapshot_databases() {
+  local stamp="$1"
+  local canon="${POCKET_CANON_DB:-$HOME/.local/share/pocket-agent/canonical.db}"
+  local accounts="${POCKET_ACCOUNTS_DB:-$HOME/.local/share/pocket-agent/accounts.db}"
+  mkdir -p "$SNAPSHOTS"
+  if command -v "$PYTHON" >/dev/null 2>&1; then
+    snapshot_sqlite "$canon" "$SNAPSHOTS/$stamp-canonical.db"
+    snapshot_sqlite "$accounts" "$SNAPSHOTS/$stamp-accounts.db"
+  else
+    log "⚠️ 找不到 $PYTHON，略過 SQLite snapshot(程式碼回滾仍會執行)"
+  fi
+}
 
 # ── 1. 最新 release tag ─────────────────────────────────────────────────
 latest="$(git ls-remote --tags --refs "$REPO" 'lobster-v*' 2>/dev/null \
@@ -57,6 +108,13 @@ if [ -d "$CURRENT" ] && [ ! -L "$CURRENT" ]; then
 fi
 prev_target="$(readlink "$CURRENT" 2>/dev/null || true)"
 
+# SQLite online backup is safe while the service is live. Do not stop the
+# existing release before fetch/install succeeds; a failed download must leave
+# the known-good version serving traffic.
+SNAPSHOT_STAMP="$(date +%Y%m%d%H%M%S)-${current_tag:-legacy}"
+snapshot_databases "$SNAPSHOT_STAMP"
+reset_crash_loop
+
 # ── 3. 取碼 + 以官方安裝器建新版目錄 ───────────────────────────────────
 [ -d "$SRC/.git" ] || { mkdir -p "$SRC"; git -C "$SRC" init -q; \
   git -C "$SRC" remote add origin "$REPO" 2>/dev/null || true; }
@@ -74,7 +132,9 @@ fi
 printf '%s\n' "$latest" > "$NEW/.lobster-release"
 
 # ── 4. 原子切換 + 重啟 ─────────────────────────────────────────────────
+systemctl --user stop "$UNIT" 2>/dev/null || true
 ln -sfn "$NEW" "$CURRENT"
+reset_crash_loop
 systemctl --user restart "$UNIT"
 
 # ── 5. 行為探活(不信 is-active —— 驗收探行為不探存活)────────────────
@@ -96,7 +156,9 @@ fi
 # ── 6. 回滾 ─────────────────────────────────────────────────────────────
 log "✗ 新版探活失敗 —— 回滾到 ${prev_target:-<無>}"
 if [ -n "$prev_target" ] && [ -d "$prev_target" ]; then
+  systemctl --user stop "$UNIT" 2>/dev/null || true
   ln -sfn "$prev_target" "$CURRENT"
+  reset_crash_loop
   systemctl --user restart "$UNIT"
   log "已回滾並重啟;壞版本留在 $NEW 供驗屍"
 else

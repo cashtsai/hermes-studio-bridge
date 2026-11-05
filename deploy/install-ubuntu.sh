@@ -730,6 +730,8 @@ cat > "$UNIT_DIR/$BRIDGE_LABEL.service" <<UNIT
 [Unit]
 Description=Pocket bridge (lobster host)
 After=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 WorkingDirectory=$RUN_ROOT
@@ -737,7 +739,9 @@ EnvironmentFile=$ENV_FILE
 Environment=PATH=$NODE_ROOT/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
 # 預設只綁 loopback:對外唯一入口是 cloudflared tunnel(或自建 Tailscale)。
 # 要開 LAN 直連請以 POCKET_BRIDGE_BIND=0.0.0.0 重跑安裝器(明確選擇,不是預設)。
-ExecStart=$RUN_VENV/bin/python -m uvicorn bridge:app --host $BRIDGE_BIND --port $BRIDGE_PORT --timeout-graceful-shutdown 3
+ExecStart=/bin/bash $RUN_ROOT/deploy/bridge-supervisor.sh $RUN_VENV/bin/python -m uvicorn bridge:app --host $BRIDGE_BIND --port $BRIDGE_PORT --timeout-graceful-shutdown 3
+Environment=POCKET_BRIDGE_CRASH_STATE_DIR=%h/.local/state/pocket-lobster/bridge
+Environment=POCKET_BRIDGE_CRASH_LOG=%h/.local/state/pocket-lobster/bridge/crash-loop.log
 Restart=always
 RestartSec=3
 

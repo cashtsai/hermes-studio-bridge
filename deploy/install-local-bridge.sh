@@ -323,6 +323,11 @@ if [ -z "$BRIDGE_TOKEN" ]; then
 fi
 
 mkdir -p "$INSTALL_ROOT" "$(dirname "$LAUNCH_AGENT")" "$HERMES_HOME_ROOT" "$(dirname "$OPENCLAW_CONFIG_FILE")"
+CRASH_STATE_DIR="${POCKET_BRIDGE_CRASH_STATE_DIR:-$HOME/Library/Application Support/PocketConnect/bridge-state}"
+mkdir -p "$CRASH_STATE_DIR"
+# An explicit installer run is an operator-approved retry after a failed
+# deployment. Clear only the supervisor circuit, never the bridge databases.
+rm -f "$CRASH_STATE_DIR/crash-loop.hold" "$CRASH_STATE_DIR/failures"
 log_step "Copying Pocket bridge"
 rsync -a --delete \
   --exclude ".git" \
@@ -346,6 +351,8 @@ cat > "$LAUNCH_AGENT" <<PLIST
 
     <key>ProgramArguments</key>
     <array>
+        <string>/bin/bash</string>
+        <string>$INSTALL_ROOT/deploy/bridge-supervisor.sh</string>
         <string>$BRIDGE_PYTHON</string>
         <string>-m</string>
         <string>uvicorn</string>
@@ -381,12 +388,18 @@ cat > "$LAUNCH_AGENT" <<PLIST
               2026-10-28 掃未合併分支時才挖出來。) -->
         <key>POCKET_ACTIVE_PROVIDER</key>
         <string>${REQUESTED_PROVIDER:-auto}</string>
+        <key>POCKET_BRIDGE_CRASH_STATE_DIR</key>
+        <string>$CRASH_STATE_DIR</string>
+        <key>POCKET_BRIDGE_CRASH_LOG</key>
+        <string>$CRASH_STATE_DIR/crash-loop.log</string>
     </dict>
 
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
     <true/>
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
 
     <key>StandardOutPath</key>
     <string>$INSTALL_ROOT/bridge.out.log</string>
