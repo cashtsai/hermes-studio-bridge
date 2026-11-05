@@ -103,6 +103,12 @@ recording policy 與 fixture digest drift。
 `applied:false`，不會搬移 session 或傳遞 credential。active/streaming session
 維持 host affinity；只有 explicit failover + durable checkpoint 才可進入下一台。
 
+多機 capacity 的下一層現在有獨立的 `capacity_lease.py` 純 contract：lease 有
+固定 TTL、host/session binding、同 session 冪等、容量滿時拒絕超賣，並可用注入時間
+測試 expiry/release。它刻意是單程序記憶體元件，不宣稱已提供 durable queue、跨程序
+鎖或 failover；正式接線前仍必須把 lease 放進持久化 queue/worker supervisor，並以
+checkpoint + explicit approval 守住 active turn 不任意搬機。
+
 Persona/provider 若要產生 visual reply，可在 `studio-card` fence 使用
 `{"kind":"visual","blocks":[...]}`；digest 會投影成普通 markdown card 的
 `body.visual`，同時把 fallback 文字留在母卡與 visual card。非法 block 會被丟棄，
