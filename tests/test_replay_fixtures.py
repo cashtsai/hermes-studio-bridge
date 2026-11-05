@@ -27,6 +27,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import carddigest  # noqa: E402
 from live_update_event import LiveUpdateCursor  # noqa: E402
+from replay_fixture import load_jsonl  # noqa: E402
 
 
 FIXTURE_DIR = Path(__file__).parent / "fixtures" / "replay"
@@ -44,20 +45,10 @@ def load_manifest() -> dict:
 
 def load_fixture(name: str) -> list[dict]:
     """Load one reviewed provider transcript fixture from JSONL."""
-    frames = []
-    with (FIXTURE_DIR / name).open(encoding="utf-8") as fh:
-        for line_no, line in enumerate(fh, 1):
-            if not line.strip():
-                continue
-            try:
-                frame = json.loads(line)
-            except ValueError as exc:
-                raise AssertionError(f"invalid JSON in {name}:{line_no}") from exc
-            if (not isinstance(frame, dict)
-                    or not (frame.get("method") or frame.get("event"))):
-                raise AssertionError(f"invalid frame in {name}:{line_no}")
-            frames.append(frame)
-    return frames
+    try:
+        return load_jsonl(FIXTURE_DIR / name)
+    except ValueError as exc:
+        raise AssertionError(f"invalid replay fixture: {name}") from exc
 
 
 def replay(frames: list) -> "carddigest.CodexThreadDigest":
@@ -145,6 +136,14 @@ class TestReplayManifest(unittest.TestCase):
 
     def test_release_gate_has_explicit_six_scenario_contract(self):
         manifest = load_manifest()
+        self.assertEqual(manifest["recorder_version"], "t3code-replay-1")
+        self.assertEqual(
+            manifest["digest_algorithm"],
+            "sha256-canonical-jsonl-v1",
+        )
+        self.assertTrue(manifest["recording_policy"]["sanitize_before_write"])
+        self.assertTrue(manifest["recording_policy"]["owner_only_output"])
+        self.assertFalse(manifest["recording_policy"]["raw_transcript_committed"])
         self.assertEqual(
             set(manifest["release_scenarios"]),
             {

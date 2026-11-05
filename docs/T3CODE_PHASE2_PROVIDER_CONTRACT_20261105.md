@@ -49,6 +49,13 @@ Fixture 放在 `tests/fixtures/replay/`，每行一個脫敏 frame。每份 fixt
 - 能以純本機 replay runner 執行，不啟動 tmux、網路或 provider process。
 - 對 card projection、busy 狀態、terminal outcome、重連 cursor 做斷言。
 
+目前 Bridge 的 `replay_fixture.py` 已把錄製與 CI 載入收斂到同一個邊界：寫入前會
+驗證 frame、拒絕敏感欄位/常見 secret pattern、排序 JSON object key，並以 owner-only
+權限寫入；`load_jsonl()` 會在 CI 再驗證一次。digest 使用
+`sha256-canonical-jsonl-v1`，保留 frame 順序但不受 object key 順序影響。被拒絕的
+frame 只留下錯誤類型，不把內容寫進 event log；raw transcript 仍只允許留在隔離的
+本機暫存路徑，不進 repo 或 PR artifact。
+
 除了 provider 六場景外，`manifest.json` 的 `capability_scenarios` 會登記
 `visual_replies` 與 `live_updates` 的獨立 fixture。前者驗證 typed block 與舊版
 fallback；後者驗證 duplicate、out-of-order 與 terminal 後遲到事件。共用

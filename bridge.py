@@ -64,6 +64,7 @@ import openclaw_provider
 import gemini_provider
 import orchestrator
 import live_update_event
+import replay_fixture
 import t3code_runtime
 import cc_detect            # CC TUI 狀態偵測(manifest 引擎;herdr 設計移植)
 import cc_sdk               # CC provider v2(Agent SDK;模組內 lazy-import SDK)
@@ -99,16 +100,18 @@ _MAIN_LOOP = None
 # T3Code #3: opt-in Codex wire fixture recorder. It is deliberately disabled
 # by default because app-server frames can contain prompts, paths, and tool
 # output. When a maintainer sets POCKET_RECORD_FIXTURE, each inbound server
-# request/notification is appended as one JSONL frame for local replay tests.
+# request/notification is validated, sanitized, and appended as canonical JSONL
+# for local replay tests; rejected secret-like frames never land on disk.
 _FIXTURE_RECORD_LOCK = threading.Lock()
 
 
 def _record_fixture_frame(msg: dict) -> None:
-    """Append one inbound Codex app-server frame to an explicit local path.
+    """Append one validated inbound Codex frame to an explicit local path.
 
     This is a debugging/replay aid, not an audit log. The caller opts in with
-    ``POCKET_RECORD_FIXTURE=/private/tmp/codex.jsonl``; the file is created with
-    owner-only permissions and failures never affect the live bridge.
+    ``POCKET_RECORD_FIXTURE=/private/tmp/codex.jsonl``; the recorder rejects
+    secret-like fields/values, writes canonical JSONL with owner-only
+    permissions, and failures never affect the live bridge.
     """
     path = os.path.expanduser(os.environ.get("POCKET_RECORD_FIXTURE", "").strip())
     if not path or not isinstance(msg, dict) or not msg.get("method"):
@@ -120,20 +123,13 @@ def _record_fixture_frame(msg: dict) -> None:
     # but the replay digest intentionally ignores this optional field.
     if "id" in msg:
         frame["request_id"] = msg["id"]
-    raw = (json.dumps(frame, ensure_ascii=False, separators=(",", ":"),
-                      default=str) + "\n").encode("utf-8")
     try:
-        parent = os.path.dirname(os.path.abspath(path))
-        os.makedirs(parent, mode=0o700, exist_ok=True)
         with _FIXTURE_RECORD_LOCK:
-            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
-            try:
-                os.fchmod(fd, 0o600)
-                view = memoryview(raw)
-                while view:
-                    view = view[os.write(fd, view):]
-            finally:
-                os.close(fd)
+            replay_fixture.append_frame(path, frame)
+    except replay_fixture.ReplayFixtureError as exc:
+        # A rejected frame must never affect the live provider stream, but it
+        # is useful to leave a type-only diagnostic for the recorder owner.
+        _log_event("codex_fixture_frame_rejected", reason=type(exc).__name__)
     except Exception as exc:  # noqa: BLE001
         # Recording must never turn a healthy provider stream into an error.
         _log_event("codex_fixture_record_failed", error=type(exc).__name__)

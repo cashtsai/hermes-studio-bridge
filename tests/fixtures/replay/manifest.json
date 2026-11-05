@@ -1,5 +1,12 @@
 {
   "schema_version": 1,
+  "recorder_version": "t3code-replay-1",
+  "digest_algorithm": "sha256-canonical-jsonl-v1",
+  "recording_policy": {
+    "sanitize_before_write": true,
+    "owner_only_output": true,
+    "raw_transcript_committed": false
+  },
   "minimum_scenarios": [
     "simple_turn",
     "error_terminal",
