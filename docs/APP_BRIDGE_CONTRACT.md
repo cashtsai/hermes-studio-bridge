@@ -485,8 +485,9 @@ The bridge stores neither the raw URL nor a token row, renders text-only
 HTML with escaping and `noindex`, and returns `410` for invalid, expired or
 unknown links without distinguishing those cases.
 
-`POST /app/v1/guest-links/revoke-all` requires owner authentication and rotates
-the host-local guest signing secret. It returns `{revoked: true}` and
+`POST /app/v1/guest-links/revoke-all` requires the same authenticated
+owner/device bearer as the create endpoint and rotates the host-local guest
+signing secret. It returns `{revoked: true}` and
 invalidates all previously issued guest links. This is intentionally
 all-links revocation; per-link revocation would require a token-hash denylist
 and a retention policy.
@@ -910,7 +911,7 @@ client 對接要知道的最小集合（2026-08-01 補：Android 端曾因本節
 | `GET  /app/v2/sessions/{id}/media?limit=&cursor=` | session 媒體永久索引（§7） | ✅ 上線（cc/cx/persona） |
 | `GET  /app/v2/artifacts/{media_id}` | 已封存 artifact 位元組 | ✅ 上線 |
 | `POST /app/v1/guest-links` | 建立短效、唯讀、無帳號分享連結 | ✅ 上線 |
-| `POST /app/v1/guest-links/revoke-all` | owner 驗證後輪替 guest signing secret，使既有連結全部失效 | ✅ 上線 |
+| `POST /app/v1/guest-links/revoke-all` | authenticated owner/device 輪替 guest signing secret，使既有連結全部失效 | ✅ 上線 |
 | `POST /app/v2/sessions/{id}/approve` | 核准/拒絕（body: `{approve: bool}` 或 `{decision}`；`for_session` 可記住） | ✅ 上線（現路由僅 cx；cc/persona 併入待批次 2 統一路由） |
 | `POST /app/v2/sessions/{id}/input` | 送訊息/指令(可帶 attachments) | ⏳ 批次 2（統一路由；現走 v1 `/app/v1/delegations/{…}/input` 與 `/app/v1/messages`） |
 

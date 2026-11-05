@@ -21,7 +21,7 @@
   壞版本目錄與 snapshot 都保留。
 - `scripts/restore-sqlite-snapshot.sh`：資料庫復原是明確人工操作，必須提供
   `CONFIRM_RESTORE=1`。這避免自動回滾把更新期間已寫入的新訊息覆蓋掉。
-- Guest link 撤銷：`POST /app/v1/guest-links/revoke-all` 只輪替獨立 guest
+- Guest link 撤銷：已驗證的 owner/device 可呼叫 `POST /app/v1/guest-links/revoke-all`，只輪替獨立 guest
   signing secret，所有既有分享連結立即失效；不保存 token denylist。
 
 ## 操作
