@@ -124,10 +124,27 @@ git -C "$SRC" checkout -q --force "refs/tags/$latest" || die "checkout 失敗"
 
 NEW="$RELEASES/$latest"
 log "安裝 $latest → $NEW(官方安裝器,同一條路徑)"
+# ── systemd unit 快照(2026-11-06 真機事故)────────────────────────────
+# 安裝器會**改寫 user unit**(ExecStart 指到新版才有的 bridge-supervisor.sh
+# 之類)再啟動服務 —— 但 current 還指舊版,新 ExecStart 在舊目錄裡不存在
+# → crash loop → 安裝器探活失敗退出 → 本腳本「舊版不動」只保了 symlink,
+# **unit 已經被改走了**,服務就此卡死(v0.4.1→v0.5.0 在 70.14 實踩)。
+# 回滾必須連 unit 一起滾。
+UNIT_DIR="$HOME/.config/systemd/user"
+UNIT_SNAP="$(mktemp -d)"
+cp -a "$UNIT_DIR"/pocket-*.service "$UNIT_DIR"/pocket-*.timer "$UNIT_SNAP"/ 2>/dev/null || true
+restore_units() {
+  cp -a "$UNIT_SNAP"/. "$UNIT_DIR"/ 2>/dev/null || true
+  systemctl --user daemon-reload
+  systemctl --user reset-failed "$UNIT" 2>/dev/null || true
+  systemctl --user restart "$UNIT" 2>/dev/null || true
+}
 if ! POCKET_BRIDGE_INSTALL_ROOT="$NEW" POCKET_BRIDGE_VENV="$NEW/venv" \
      POCKET_BRIDGE_RUN_ROOT="$CURRENT" POCKET_BRIDGE_RUN_VENV="$CURRENT/venv" \
      bash "$SRC/deploy/install-ubuntu.sh" >"$BASE/update-$latest.log" 2>&1; then
-  log "✗ 安裝器失敗,舊版不動(log:$BASE/update-$latest.log)"; exit 1
+  log "✗ 安裝器失敗 —— 回復 unit 快照並重啟舊版(log:$BASE/update-$latest.log)"
+  restore_units
+  exit 1
 fi
 printf '%s\n' "$latest" > "$NEW/.lobster-release"
 
@@ -154,7 +171,8 @@ if [ "$ok" = "1" ]; then
 fi
 
 # ── 6. 回滾 ─────────────────────────────────────────────────────────────
-log "✗ 新版探活失敗 —— 回滾到 ${prev_target:-<無>}"
+log "✗ 新版探活失敗 —— 回滾到 ${prev_target:-<無>}(含 unit 快照)"
+restore_units
 if [ -n "$prev_target" ] && [ -d "$prev_target" ]; then
   systemctl --user stop "$UNIT" 2>/dev/null || true
   ln -sfn "$prev_target" "$CURRENT"
