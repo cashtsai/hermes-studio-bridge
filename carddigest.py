@@ -815,6 +815,137 @@ def _codex_item_to_cards_raw(item: dict, turn_id: str = "",
     return []
 
 
+# ── usage_limit 錯誤分類(2026-11-06,t3code 坑清單:「quota 錯誤要分類為
+# usage_limit + reset 時間」)─────────────────────────────────────────────
+#
+# 三家 provider 的限額錯誤長相(實盤樣本):
+#   CC(Claude Code SDK ResultMessage.result):
+#     "Claude AI usage limit reached|1762387200"(豎線後直接帶 reset epoch)
+#     TUI 文案:"5-hour limit reached ∙ resets 3pm" /
+#     "Claude usage limit reached. Your limit will reset at 7pm (Asia/Taipei)."
+#   CX(codex app-server turn error / CLI):
+#     "You've hit your usage limit. Try again in 4 days 2 hours." /
+#     "Rate limit reached. Please try again later."(429 家族)
+#   agy/Gemini(ACP error 文案):
+#     "RESOURCE_EXHAUSTED: Quota exceeded for quota metric '…'" /
+#     "429 … Please retry in 32.5s."(RetryInfo retryDelay)
+#
+# 分類是**保守白名單**:只認限額/速率/配額字樣;「context window exceeded」
+# 「file too large」之類的 limit 不得誤判 —— 所以不收裸的 "limit reached",
+# 只收「limit reached … reset」連體(CC TUI 的形狀)。reset 時間解析不到就
+# 誠實 null,不猜。
+USAGE_LIMIT_KIND = "usage_limit"
+
+_USAGE_LIMIT_RE = re.compile(
+    r"(usage[ _-]?limit"
+    r"|rate[ _-]?limit"
+    r"|too many requests"
+    r"|resource[ _-]?exhausted"
+    r"|quota"
+    r"|hit your[^.\n]{0,40}\blimit"
+    r"|limit reached[^.\n]{0,80}\breset)",
+    re.IGNORECASE)
+
+_RESET_EPOCH_RE = re.compile(r"limit reached\|(\d{10,13})", re.IGNORECASE)
+_RESET_SECONDS_RE = re.compile(
+    r"(?:resets?_in_seconds|retry[_ ]?delay)[\"']?\s*[:=]\s*[\"']?(\d+(?:\.\d+)?)",
+    re.IGNORECASE)
+_RESET_REL_RE = re.compile(
+    # 不能用句點斷句 —— "retry in 32.5s" 的小數點會把 32.5 截成 32。
+    r"(?:try again|retry|resets?|available)\s*(?:in|after)\s+([^\n]{1,60})",
+    re.IGNORECASE)
+_RESET_REL_TOKEN_RE = re.compile(
+    r"(\d+(?:\.\d+)?)\s*(d(?:ays?)?|h(?:ours?|rs?)?|m(?:in(?:utes?)?)?|s(?:ec(?:onds?)?)?)\b",
+    re.IGNORECASE)
+_RESET_CLOCK_RE = re.compile(
+    r"(?:resets?|try again)\s*(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b",
+    re.IGNORECASE)
+
+_REL_UNIT_SECS = {"d": 86400.0, "h": 3600.0, "m": 60.0, "s": 1.0}
+
+
+def parse_usage_reset_at(text: str, now: float | None = None) -> float | None:
+    """限額錯誤文案 → reset 的 unix 時間;解析不到回 None(誠實 null)。"""
+    t = str(text or "")
+    now = time.time() if now is None else now
+    m = _RESET_EPOCH_RE.search(t)
+    if m:
+        epoch = float(m.group(1))
+        if len(m.group(1)) == 13:          # 毫秒 → 秒
+            epoch /= 1000.0
+        return epoch
+    m = _RESET_SECONDS_RE.search(t)
+    if m:
+        return now + float(m.group(1))
+    m = _RESET_REL_RE.search(t)
+    if m:
+        total = 0.0
+        for num, unit in _RESET_REL_TOKEN_RE.findall(m.group(1)):
+            total += float(num) * _REL_UNIT_SECS[unit[0].lower()]
+        if total > 0:
+            return now + total
+    m = _RESET_CLOCK_RE.search(t)
+    if m:
+        hour = int(m.group(1)) % 12
+        if m.group(3).lower() == "pm":
+            hour += 12
+        minute = int(m.group(2) or 0)
+        lt = time.localtime(now)
+        candidate = time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday,
+                                 hour, minute, 0, -1, -1, -1))
+        if candidate <= now:
+            candidate += 86400.0           # 已過 → 明天同時刻
+        return candidate
+    return None
+
+
+def classify_error(text: str, now: float | None = None) -> dict | None:
+    """錯誤文案 → 分類 meta;非限額類回 None(普通錯誤不誤判)。
+    回傳形狀即卡片 body.meta 的契約:{"error_kind","reset_at"}。"""
+    t = str(text or "")
+    if not t or not _USAGE_LIMIT_RE.search(t):
+        return None
+    return {"error_kind": USAGE_LIMIT_KIND,
+            "reset_at": parse_usage_reset_at(t, now)}
+
+
+def error_card_body(text: str) -> tuple[dict, dict | None]:
+    """error 卡 body 統一產生點:⚠️ 文案 + (命中時)分類 meta。
+    回 (body, meta) —— 宿主 digest 拿 meta 去記 usage_limited 狀態。"""
+    msg = str(text or "")
+    body = {"text": f"⚠️ {msg}", "fallback_text": f"⚠️ {msg}"}
+    meta = classify_error(msg)
+    if meta:
+        body["meta"] = dict(meta)
+    return body, meta
+
+
+def apply_usage_limited(status: dict, meta: dict | None) -> dict:
+    """session.status 疊加 usage_limited phase(app Resume-at-reset 的依據)。
+
+    只在「回合已停、也沒有在等核准」時蓋 idle/error —— busy/waiting/queued
+    一律不碰(那些 phase 各自有 UI 行為,不能被蓋掉)。reset 時間已過 =
+    限額大概率已解除,不再謊稱 usage_limited。"""
+    if not meta:
+        return status
+    reset = meta.get("reset_at")
+    if isinstance(reset, (int, float)) and reset < time.time():
+        return status
+    if status.get("busy") or status.get("prompt"):
+        return status
+    if status.get("phase") not in ("idle", "error"):
+        return status
+    status = dict(status)
+    status["phase"] = "usage_limited"
+    status["usage_limit_reset_at"] = reset if isinstance(reset, (int, float)) else None
+    if isinstance(reset, (int, float)):
+        status["label"] = "額度已達上限,約 " + time.strftime(
+            "%m/%d %H:%M", time.localtime(reset)) + " 重置"
+    else:
+        status["label"] = "額度已達上限,重置後自動恢復"
+    return status
+
+
 class ApprovalCardMixin:
     """approval pending/resolved → 卡片（契約 §6），CC(tmux watcher) /
     codex(app-server) / hermes(create 流程) 三 provider 共用同一套
@@ -922,6 +1053,9 @@ class CodexThreadDigest(ApprovalCardMixin):
         self.runtime_status = ""
         self.turn_started_at = 0.0   # turn/started 的時間(見該處註解)
         self.prompt = None                     # pending approval title（label 素材）
+        # 最近一次限額類錯誤的分類 meta({"error_kind","reset_at"});
+        # None = 沒有。turn/started 清掉(新回合能跑 = 限額已解)。
+        self.usage_limit: dict | None = None
         self.seeded = False
         self.seeding = False
         # 冷載 seed 會 await app-server 的 turns/list。期間仍可能收到 live
@@ -1017,7 +1151,8 @@ class CodexThreadDigest(ApprovalCardMixin):
             # A provider-level wait can exist before an approval card is
             # available.  Keep it distinguishable from an idle session.
             status["blocked"] = True
-        self.store.set_status(status)
+        self.store.set_status(
+            apply_usage_limited(status, getattr(self, "usage_limit", None)))
 
     def sync_runtime_status(self, runtime_status: str) -> None:
         """Project Codex app-server status into this digest.
@@ -1128,6 +1263,7 @@ class CodexThreadDigest(ApprovalCardMixin):
             self.store.turn_id = str(turn.get("id") or "")
             self.busy = True
             self.runtime_status = "running"
+            self.usage_limit = None   # 新回合開得起來 = 限額已解
             # 回合起算時間 —— 與 CC 的 `busy_since` 同一件事、同一個理由:app 的
             # WorkingBar 只有一顆脈動點,2 秒與 20 分鐘看起來一模一樣,而遠端
             # 遙控最怕分不出「在跑」和「死了」。這是 `turn/started` **事件**
@@ -1148,9 +1284,12 @@ class CodexThreadDigest(ApprovalCardMixin):
             self.store.push_turn("end", self.store.turn_id or str(turn.get("id") or ""))
             if err:
                 msg = str(err.get("message", err))
+                body, ul_meta = error_card_body(msg)
+                if ul_meta:
+                    self.usage_limit = ul_meta
                 self.store.upsert_card(make_card(
                     f"card-cx-err-{self.store.seq}", self.store.turn_id, "system",
-                    "text", {"text": f"⚠️ {msg}", "fallback_text": f"⚠️ {msg}"}))
+                    "text", body))
             self.store.turn_id = ""
             self.store.last_tool = ""
             self._status()
@@ -1609,15 +1748,16 @@ class PersonaDigest(ApprovalCardMixin):
         self.turn_text: dict[str, str] = {}   # 進行中 turn cid → 累積文字
         self.busy = False
         self.prompt = None                    # pending approval title(A3)
+        self.usage_limit: dict | None = None  # 限額錯誤分類(turn_begin 清)
         self.seeded = False
 
     def _status(self, label: str = ""):
-        self.store.set_status({
+        self.store.set_status(apply_usage_limited({
             "busy": self.busy, "mode": None, "prompt": self.prompt,
             "phase": "run" if self.busy else "idle",
             "label": label or ("等待核准" if self.prompt else
                                ("回覆中" if self.busy else "待命")),
-        })
+        }, getattr(self, "usage_limit", None)))
 
     def _emit_studio_cards(self, base_cid: str, bodies: list, ts=None):
         """B3:抽出的 studio-card bodies → 結構化卡(id 錨在母卡上,重放穩定)。"""
@@ -1680,6 +1820,7 @@ class PersonaDigest(ApprovalCardMixin):
 
     def turn_begin(self, cid: str, label: str = ""):
         self.busy = True
+        self.usage_limit = None   # 新回合開得起來 = 限額已解
         self.turn_text[cid] = ""
         self.store.turn_id = f"turn-{cid}"
         self.store.push_turn("begin", self.store.turn_id)
@@ -1714,9 +1855,12 @@ class PersonaDigest(ApprovalCardMixin):
                 "markdown", {"text": clean, "fallback_text": clean}))
             self._emit_studio_cards(f"{self._card_prefix}turn-{cid}", sc_bodies)
         if error:
+            body, ul_meta = error_card_body(str(error))
+            if ul_meta:
+                self.usage_limit = ul_meta
             self.store.upsert_card(make_card(
                 f"{self._card_prefix}turn-{cid}-err", self.store.turn_id, "system", "text",
-                {"text": f"⚠️ {error}", "fallback_text": f"⚠️ {error}"}))
+                body))
         self.store.push_turn("end", self.store.turn_id)
         self.store.turn_id = ""
         self._status()

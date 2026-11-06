@@ -580,6 +580,30 @@ invalidates all previously issued guest links. This is intentionally
 all-links revocation; per-link revocation would require a token-hash denylist
 and a retention policy.
 
+#### Guest 互動版(2026-11-06,E3,t3code 旁觀者範式)
+
+guest 頁升級為「能看、能擬稿,**送出權在 owner**」:
+
+- **看**:頁內 5 秒輪詢(重抓同一頁 HTML、換 `#cards`/`#mine` 的
+  innerHTML)。刻意不開 SSE / JSON API —— 無 auth 面保持極簡。
+- **擬稿**:`POST /guest/{token}/suggest`,body `{text}`。無 auth(認證即
+  token 本身,同 guest 頁);率限 **6 則/分/令牌**(429)、長度上限
+  **2000 字**(413)、空文字 400;壞/過期/已撤銷 token 一律 **410**
+  (revoke-all 轉密鑰後 suggest 跟著全滅)。文字落 canonical.db
+  `guest_suggestions`(status `pending → sent|ignored|failed`),**絕不直接
+  進 session**;渲染端(guest 頁)一律 HTML 轉義。
+- **owner 面**:每則擬稿開一張審批(kind=`guest_message`、
+  session_id=目標 session、detail=全文、meta `{suggestion_id, origin:
+  "guest"}`、options `[{key:"send",label:"送出",style:"primary"},
+  {key:"ignore",label:"忽略",style:"danger"}]`),進既有審批中心 + 審核
+  推播;決議走既有 `POST /app/v1/approvals/{id}/decision`(或 v2 統一
+  approve 路由):`{key:"send"}` = 把全文走該 session **既有** input 路徑
+  (v2 統一路由,狀態落 `approved`);`{key:"ignore"}` = 不送(`denied`)。
+  相容糖 `{approve: bool}` 照舊(true→send、false→ignore)。轉發失敗回
+  `502 GUEST_FORWARD_FAILED`(審批已落終態不重送,suggestion 標 `failed`)。
+  guest_message 審批是 DB-backed:pending 的 `response_capability` 恆為
+  `live`(不走 provider 等待者探活)。
+
 ### `POST /app/v1/uploads/file`
 
 Uploads one composer attachment as a bearer-authenticated multipart request.
@@ -1075,6 +1099,17 @@ GET /app/v2/sessions/{session_id}/events?since_seq=N&profile=phone&after_durable
     同一件事的其他出口：input 兩條路由回 `409 / CX_THREAD_LOCKED`；
     `GET /codexsessions/{id}/status` 的 `session.locked` / `lockReason` /
     `lockMessage`；`GET /app/v2/sessions` 每列的 `locked` 與 `meta.lock`。
+
+    **`phase: "usage_limited"`(2026-11-06,t3code usage_limit 分類)**：
+    回合因**限額/配額/速率上限**失敗、且 session 已停下時,phase 不是
+    `idle` 而是 `usage_limited`,並附 `usage_limit_reset_at: epoch|null`
+    (限額文案解析得到 reset 時間就帶,解析不到誠實 null,**app 不要自己
+    猜**)。這是 app「Resume-at-reset」的依據:有 `usage_limit_reset_at`
+    就可以排程在該時刻自動重送/提醒;null 則只顯示「額度已達上限」。
+    解除條件:新回合真的開跑(`turn begin`)或 reset 時刻已過(bridge 下
+    一次發 status 時自動不再蓋)。覆蓋面:cc2(Claude Agent SDK)、codex
+    (app-server turn error)、gemini/agy 與 hermes persona(turn_end
+    error);tmux CC 沒有結構化錯誤出口,此 phase 不會出現在該後端。
   - `turn` — `{state: "begin"|"end"|"interrupted", turn_id}`。
   - `ping` — keepalive，統一 `SSE_KEEPALIVE_SECS`。
   - `resync` — **只出現在 §5.1 持久補洞段的結尾**：
@@ -1150,6 +1185,16 @@ GET /app/v2/sessions/{session_id}/events?since_seq=N&profile=phone&after_durable
   變更，replay 重放產出相同 patch。`text` 為 `-`/`+` 前綴行、hunk 以 `@@`
   分隔（**無行號**——事件裡沒有整檔上下文，digest 不回讀檔案以保 replay
   穩定）；上限 20k 截斷。app 不認得就忽略（fallback 原則）。
+- **error 卡的 `body.meta`(2026-11-06,usage_limit 分類)**:回合錯誤卡
+  (system/text,`⚠️ …`)在錯誤被分類為限額類時附
+  `meta: {"error_kind": "usage_limit", "reset_at": epoch|null}`。
+  `reset_at` 從 provider 文案解析(CC 的 `usage limit reached|<epoch>`、
+  CX 的 `Try again in 4 days 2 hours`、Gemini 的 `retry in 32.5s` /
+  RetryInfo…),解析不到 = null。與 `session.status` 的
+  `phase:"usage_limited"` / `usage_limit_reset_at` 同源 —— app 的
+  Resume-at-reset 讀這兩處任一即可;不認得 `meta` 的舊 client 照舊只渲染
+  文字(fallback 原則)。普通錯誤(context 超長、exit code、認證失敗…)
+  **不會**帶此 meta,分類器是保守白名單。
 - **fallback 原則**：不認得的 kind 一律渲染 `fallback_text`——舊 client 永不壞。
 - **digest 責任在 bridge**：CC jsonl、codex app-server 事件、persona stream →
   統一 parser（`carddigest.py`）產卡片。**一份 parser，伺服器端，所有終端共享**。

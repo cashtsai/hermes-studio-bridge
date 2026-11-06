@@ -44,10 +44,12 @@ class TestGuestToken(unittest.TestCase):
         self.assertEqual(bridge._guest_token_verify(new), "codex:new")
 
     def test_html_escapes(self):
+        # E3 互動版後頁面自帶輪詢 <script>,斷言鎖定「使用者內容」本身
+        # 不得以原始 HTML 出現(轉義鐵律不變)。
         html = bridge._guest_html("s", [
             {"role": "assistant", "body": {"text": "<script>alert(1)</script>"}}])
-        self.assertNotIn("<script>", html)
-        self.assertIn("&lt;script&gt;", html)
+        self.assertNotIn("<script>alert(1)</script>", html)
+        self.assertIn("&lt;script&gt;alert(1)&lt;/script&gt;", html)
 
 
 class TestUsageSummary(unittest.TestCase):

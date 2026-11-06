@@ -550,6 +550,7 @@ class CC2Digest(carddigest.ApprovalCardMixin):
         self.store.media_session_id = f"cc2:{name}"
         self.busy = False
         self.prompt = None          # pending approval title(mixin 會讀寫)
+        self.usage_limit: dict | None = None  # 限額錯誤分類(turn_begin 清)
         self.queue_depth = 0
         self._seq = 0               # 卡 id 序號(單調遞增,replay 不撞號)
         self._draft_id = ""         # 進行中 assistant draft 卡 id
@@ -563,7 +564,7 @@ class CC2Digest(carddigest.ApprovalCardMixin):
         return f"card-cc2-{self.name}-{tag}{self._seq}"
 
     def _status(self, label: str = ""):
-        self.store.set_status({
+        self.store.set_status(carddigest.apply_usage_limited({
             # busy_since:app 的 WorkingBar 靠它顯示「已 N 秒」—— 沒有的話
             # 2 秒與 30 分鐘長得一模一樣(tmux 那邊早就有,cc2 漏了)。
             # mode:權限模式,app 的模式選擇器讀這個;原本硬寫 None → 畫面空白。
@@ -596,10 +597,11 @@ class CC2Digest(carddigest.ApprovalCardMixin):
             "queue_depth": self.queue_depth,
             "label": label or ("等待核准" if self.prompt else
                                ("回覆中" if self.busy else "待命")),
-        })
+        }, getattr(self, "usage_limit", None)))
 
     def turn_begin(self, turn_id: str):
         self.busy = True
+        self.usage_limit = None   # 新回合開得起來 = 限額已解
         self.busy_since = time.time()
         self.last_event_at = self.busy_since
         self.store.turn_id = turn_id
@@ -781,17 +783,26 @@ class CC2Digest(carddigest.ApprovalCardMixin):
              "is_error": bool(is_error), "origin": "cc2.tool"}))
         self.last_event_at = time.time()
 
-    def error_card(self, text: str):
+    def error_card(self, text: str, meta: dict | None = None):
+        # usage_limit 分類(t3code):CC SDK 的限額文案長
+        # "Claude AI usage limit reached|<reset epoch>" —— error_card_body
+        # 命中時 body 附 meta {error_kind, reset_at},status 蓋 usage_limited。
+        # `meta` 參數:呼叫端已從**原始**例外分類好時直接帶入(人話 hint
+        # 會讓文字分類對不上,見 _run_turn_safe)。
+        body, ul_meta = carddigest.error_card_body(str(text))
+        ul_meta = ul_meta or (dict(meta) if meta else None)
+        if ul_meta:
+            self.usage_limit = ul_meta
+            body["meta"] = dict(ul_meta)
         self.store.upsert_card(carddigest.make_card(
-            self._next_id("e"), self.store.turn_id, "system", "text",
-            {"text": f"⚠️ {text}", "fallback_text": f"⚠️ {text}"}))
+            self._next_id("e"), self.store.turn_id, "system", "text", body))
 
     def turn_end(self, error: str = ""):
         self.busy = False
         self.busy_since = 0.0            # 回合結束 → 計時器收掉,不跨回合累加
         self.last_event_at = time.time()
         if error:
-            self.error_card(error)
+            self.error_card(error, meta=self.usage_limit)
         self.store.push_turn("end", self.store.turn_id)
         self.store.turn_id = ""
         self.store.last_tool = ""
@@ -1041,6 +1052,12 @@ class CCSdkSession:
             await self._teardown_client()
             # 認證/額度類錯誤給人看得懂的指路,不要丟 SDK 例外字串。
             hint = self._auth_hint(e)
+            # usage_limit 分類要吃**原始**例外文案 —— hint 是中文人話,
+            # 分類器的英文樣式對不上;先記到 digest,turn_end 的 _status
+            # 就會蓋 phase=usage_limited。
+            ul_meta = carddigest.classify_error(str(e))
+            if ul_meta:
+                self.digest.usage_limit = ul_meta
             self.digest.turn_end(
                 error=hint or f"{type(e).__name__}: {str(e)[:200]}")
         finally:
