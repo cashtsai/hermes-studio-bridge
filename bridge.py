@@ -24374,6 +24374,138 @@ async def v2_app_thread_rebind(thread_id: str, request: Request):
     return {"ok": True, "thread_id": thread_id, **result}
 
 
+# ───────── CC↔CX 接力 v1(ContextTransfer,POST /app/v2/threads/{id}/transfer)──
+# 把一條 app 對話的工作上下文從當前 provider 會話轉交給**另一個 provider 的
+# 新會話**:萃取來源 session 的持久里程碑(event_log card.milestone)組繁中
+# 交接 prompt(t3code_runtime.build_transfer_prompt,v1 原文拼接不呼叫 LLM)
+# → 在目標 provider 開新會話、首訊=交接 prompt → rebind(reason="transfer",
+# 舊綁定標 detached:來源原生會話還在,是刻意交棒不是死亡)→ 落
+# `thread.transferred` 事件。失敗面:目標建立失敗 → 502、原 binding 原封不動;
+# rebind 撞 active 綁定 → 409(detail 指明新會話已建、未綁)。
+# 對照 t3code ContextHandoff:這是 strategy=full_thread_summary 的 v1 簡化;
+# delta_since_target_last_seen / LLM 總結 / 檔案與 worktree 交接列 v2。
+
+_TRANSFER_TARGETS = ("codex", "cc2")
+
+
+async def _transfer_spawn_codex(request: Request, prompt: str, cwd: str) -> str:
+    """codex 方向:走既有 thread/start 建立路徑(codex_session_create),
+    首訊=交接 prompt。回傳 bridge session id(codex:xxx)。"""
+    body: dict = {"text": prompt}
+    if cwd:
+        body["cwd"] = cwd
+    res = await codex_session_create(_BodyShim(request, body))
+    new_thread = str((res or {}).get("thread_id") or "").strip()
+    if not new_thread:
+        raise http_err(502, "TRANSFER_TARGET_FAILED",
+                       "codex thread/start 回應缺 thread_id")
+    return f"codex:{new_thread}"
+
+
+async def _transfer_spawn_cc2(request: Request, prompt: str, workdir: str,
+                              name: str) -> str:
+    """cc2 方向:走既有 cc_sdk 建立路徑(v2_cc2_create,含戶政/配額),
+    建好後以 submit 送首訊=交接 prompt(lazy 連線,第一則才真的連 SDK)。"""
+    body: dict = {}
+    if workdir:
+        body["workdir"] = workdir
+    await v2_cc2_create(name, _BodyShim(request, body))
+    sess = cc_sdk.registry().get(name)
+    if sess is None:
+        raise http_err(502, "TRANSFER_TARGET_FAILED",
+                       f"cc2 session {name} 建立後不存在")
+    await sess.submit(prompt)
+    return f"cc2:{name}"
+
+
+@app.post("/app/v2/threads/{thread_id}/transfer")
+async def v2_app_thread_transfer(thread_id: str, request: Request):
+    """CC↔CX 接力 v1:body {to_provider: "codex"|"cc2", mode: "summary",
+    cwd?/workdir?, name?(cc2), max_turns?}。回 {new_session_id, binding, …}。
+    無 binding → 404(無來源可交接);來源無里程碑 → prompt 註明無歷史照樣轉。"""
+    _check_auth(request)
+    body = await _json_body(request)
+    to_provider = str(body.get("to_provider") or "").strip().lower()
+    mode = str(body.get("mode") or "summary").strip().lower()
+    if to_provider not in _TRANSFER_TARGETS:
+        raise http_err(400, "TRANSFER_BAD_PROVIDER",
+                       f"to_provider 必須是 {list(_TRANSFER_TARGETS)} 之一")
+    if mode != "summary":
+        raise http_err(400, "TRANSFER_BAD_MODE",
+                       "v1 只支援 mode='summary'(LLM 總結/檔案交接列 v2)")
+    if t3code_runtime.get_app_thread(CANON_DB, thread_id) is None:
+        raise http_err(404, "APP_THREAD_NOT_FOUND", "unknown app thread")
+    binding = t3code_runtime.current_binding(CANON_DB, thread_id)
+    if binding is None:
+        raise http_err(404, "APP_THREAD_NO_BINDING",
+                       "app thread 沒有 active binding,無來源可交接")
+    source_provider = binding["provider"]
+    source_session = binding["provider_thread_id"]
+    try:
+        max_turns = int(body.get("max_turns") or t3code_runtime.TRANSFER_MAX_TURNS)
+    except (TypeError, ValueError):
+        max_turns = t3code_runtime.TRANSFER_MAX_TURNS
+    max_turns = max(1, min(max_turns, 20))
+    handoff = t3code_runtime.build_transfer_prompt(
+        CANON_DB, source_session, source_provider, max_turns=max_turns)
+    cwd = str(body.get("cwd") or body.get("workdir") or "").strip()
+    # 目標建立:任何失敗(含上游 4xx/429/逾時)都收斂成 502 + detail,
+    # **原 binding 原封不動** —— 來源會話照常可用,使用者重試零成本。
+    try:
+        if to_provider == "codex":
+            new_session_id = await _transfer_spawn_codex(
+                request, handoff["prompt"], cwd)
+        else:
+            name = str(body.get("name") or "").strip()
+            if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", name or ""):
+                name = f"transfer-{uuid.uuid4().hex[:8]}"
+            new_session_id = await _transfer_spawn_cc2(
+                request, handoff["prompt"], cwd, name)
+    except HTTPException as exc:
+        _log_event("transfer_target_failed", session=thread_id,
+                   to_provider=to_provider, status=exc.status_code,
+                   detail=str(exc.detail)[:200])
+        raise http_err(502, "TRANSFER_TARGET_FAILED",
+                       f"{to_provider} 目標會話建立失敗",
+                       f"upstream {exc.status_code}: {exc.detail}")
+    except Exception as exc:  # noqa: BLE001
+        _log_event("transfer_target_failed", session=thread_id,
+                   to_provider=to_provider, error=type(exc).__name__,
+                   detail=str(exc)[:200])
+        raise http_err(502, "TRANSFER_TARGET_FAILED",
+                       f"{to_provider} 目標會話建立失敗",
+                       f"{type(exc).__name__}: {str(exc)[:300]}")
+    # rebind:舊綁定標 detached(交棒,原生會話仍在)。撞 active 綁定 → 409,
+    # detail 指明新會話已建立但未綁,讓操作者自行收尾,不能靜默吞掉。
+    try:
+        result = t3code_runtime.rebind_app_thread(
+            CANON_DB, thread_id, to_provider, new_session_id,
+            reason="transfer", prior_state="detached")
+    except t3code_runtime.T3CodeError as exc:
+        raise http_err(409, "TRANSFER_REBIND_CONFLICT",
+                       f"目標會話 {new_session_id} 已建立,但 rebind 失敗:{exc}")
+    new_binding = result["binding"]
+    transfer_meta = {
+        "mode": mode,
+        "from": {"provider": source_provider,
+                 "provider_thread_id": source_session},
+        "to": {"provider": to_provider, "provider_thread_id": new_session_id},
+        "turns": handoff["turns"],
+        "truncated": handoff["truncated"],
+        "prompt_chars": handoff["prompt_chars"],
+    }
+    if result.get("changed"):
+        _event_append(thread_id, "thread.transferred", {
+            "app_thread_id": thread_id, "reason": "transfer", **transfer_meta,
+        }, external_id=f"thread.transferred:{new_binding['id']}")
+    _log_event("thread_transferred", session=thread_id,
+               from_session=source_session, to_session=new_session_id,
+               turns=handoff["turns"], truncated=handoff["truncated"])
+    return {"ok": True, "thread_id": thread_id,
+            "new_session_id": new_session_id, "binding": new_binding,
+            "previous": result.get("previous"), "transfer": transfer_meta}
+
+
 @app.post("/app/v3/threads/{thread_id}/context-transfers")
 async def t3_context_transfer(thread_id: str, request: Request):
     _check_auth(request)

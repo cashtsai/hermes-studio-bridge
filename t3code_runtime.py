@@ -833,6 +833,122 @@ def transition_context_transfer(db_path: str, transfer_id: str,
         con.close()
 
 
+# ── CC↔CX 接力 v1:交接摘要萃取(2026-11-06)────────────────────────────────
+# 來源真相是 event_log 的持久里程碑(card.milestone,carddigest P3-lite 只落
+# final=True 的終態卡)。v1 刻意**不呼叫 LLM 總結** —— 原文拼接,省一跳、零
+# 幻覺;LLM 總結列 v2。這層只讀 DB、純函式,bridge 端點只負責 spawn + rebind。
+
+TRANSFER_PROMPT_MAX_CHARS = 8000
+TRANSFER_TURN_TEXT_MAX = 2000
+TRANSFER_MAX_TURNS = 6
+
+
+def extract_transfer_turns(db_path: str, session: str, max_turns: int = TRANSFER_MAX_TURNS,
+                           scan_limit: int = 400) -> list[dict]:
+    """把 session 的持久里程碑整理成「回合」:使用者請求 + 最終回覆。
+
+    一個 user 卡開新回合;回合內最後一張 assistant 終態卡就是「最終回覆」
+    (中途的工具摘要卡會被後到的覆蓋,正是契約要的語意)。同文字的連續
+    user 卡(input.accepted 回聲 + transcript 合併可能各落一筆)去重。
+    event_log 不存在(純 t3 schema 的新庫)→ 無歷史,回空list,不炸。
+    """
+    con = _connect(db_path)
+    try:
+        try:
+            rows = con.execute(
+                "SELECT id,payload FROM event_log "
+                "WHERE session=? AND type='card.milestone' "
+                "ORDER BY id DESC LIMIT ?",
+                (str(session), max(1, min(int(scan_limit), 2000)))).fetchall()
+        except sqlite3.OperationalError:
+            return []
+    finally:
+        con.close()
+    turns: list[dict] = []
+    for row in reversed(rows):          # 回到時間序
+        try:
+            card = (json.loads(row["payload"] or "{}") or {}).get("card") or {}
+        except (TypeError, ValueError):
+            continue
+        role = card.get("role")
+        body = card.get("body") or {}
+        text = str(body.get("text") or body.get("fallback_text") or "").strip()
+        if role not in ("user", "assistant") or not text:
+            continue
+        if role == "user":
+            if turns and turns[-1]["user"] == text and not turns[-1]["reply"]:
+                continue                # 同文字回聲卡,不開假回合
+            turns.append({"user": text, "reply": ""})
+        else:
+            if not turns:
+                turns.append({"user": "", "reply": text})
+            else:
+                turns[-1]["reply"] = text
+    return turns[-max(1, int(max_turns)):]
+
+
+def build_transfer_prompt(db_path: str, session: str, source_provider: str,
+                          max_turns: int = TRANSFER_MAX_TURNS,
+                          max_chars: int = TRANSFER_PROMPT_MAX_CHARS) -> dict:
+    """組繁中交接 prompt(目標會話的首訊)。
+
+    長度上限 ~max_chars:先掐單段(每段 TRANSFER_TURN_TEXT_MAX),再從最舊
+    的回合開始丟;任何截斷都在 prompt 本文留痕(「…[截斷]」/「較早內容已
+    截斷」)並以 truncated=True 回報,呼叫端落進 thread.transferred 事件。
+    無里程碑 → 註明「無歷史脈絡」照樣轉(graceful,契約拍板)。
+    """
+    max_chars = max(1000, min(int(max_chars), 16000))
+    turns = extract_transfer_turns(db_path, session, max_turns=max_turns)
+    header = (f"以下是先前與另一個 agent 的工作脈絡交接(來源 provider:"
+              f"{str(source_provider or '').strip() or '未知'},session:{session})。"
+              "你是接手的新會話,請先消化以下脈絡,接續執行未完成的工作,"
+              "不要重做已完成的部分。")
+    footer = "── 交接脈絡結束 ──\n請接續以上工作;若脈絡不足,先向使用者確認再動手。"
+    if not turns:
+        prompt = (header + "\n\n(無歷史脈絡:來源會話沒有可萃取的持久里程碑,"
+                  "請等待使用者的下一步指示。)\n\n" + footer)
+        return {"prompt": prompt, "turns": 0, "truncated": False,
+                "source_session": session, "prompt_chars": len(prompt)}
+    truncated = False
+
+    def _clip(text: str) -> str:
+        nonlocal truncated
+        if len(text) > TRANSFER_TURN_TEXT_MAX:
+            truncated = True
+            return text[:TRANSFER_TURN_TEXT_MAX] + "…[截斷]"
+        return text
+
+    blocks = []
+    for turn in turns:
+        lines = []
+        if turn["user"]:
+            lines.append("使用者:" + _clip(turn["user"]))
+        if turn["reply"]:
+            lines.append("回覆:" + _clip(turn["reply"]))
+        blocks.append("\n".join(lines))
+    # 從最新的回合往回填預算 —— 交接價值越新越高,擠不下就犧牲最舊的。
+    overhead = len(header) + len(footer) + 120
+    kept: list[str] = []
+    used = overhead
+    for block in reversed(blocks):
+        cost = len(block) + 24          # 回合標頭 + 空行
+        if kept and used + cost > max_chars:
+            truncated = True            # 較舊回合整段被丟,留痕
+            break
+        if not kept and used + cost > max_chars:
+            block = block[:max(200, max_chars - used - 24)] + "…[截斷]"
+            truncated = True
+        kept.append(block)
+        used += len(block) + 24
+    kept.reverse()
+    numbered = [f"【回合 {i + 1}】\n{b}" for i, b in enumerate(kept)]
+    note = ",較早內容已截斷" if truncated else ""
+    prompt = (header + f"\n\n── 工作脈絡(最近 {len(kept)} 回合{note})──\n\n"
+              + "\n\n".join(numbered) + "\n\n" + footer)
+    return {"prompt": prompt, "turns": len(kept), "truncated": truncated,
+            "source_session": session, "prompt_chars": len(prompt)}
+
+
 def _git(cwd: str, *args: str) -> str:
     try:
         result = subprocess.run(["git", "-C", cwd, *args], capture_output=True,
