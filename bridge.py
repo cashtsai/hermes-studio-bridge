@@ -1656,6 +1656,18 @@ def _canon_init():
         con.execute("UPDATE approvals SET session_id=source WHERE session_id IS NULL"
                     " AND (source LIKE 'claude_code:%' OR source LIKE 'codex:%')")
         con.execute("UPDATE approvals SET kind='permission' WHERE kind IS NULL")
+        # E3 guest 互動版(2026-11-06,t3code 旁觀者範式):訪客擬稿落這張表,
+        # **絕不直接進 session** —— 送出權在 owner(審批卡 kind=guest_message
+        # 核准後才走該 session 既有 input 路徑)。token_hash = 令牌的 sha256
+        # 前綴(不存原始 token,撤銷/到期後這些列只剩審計用途)。
+        # status: pending → sent | ignored | failed。
+        con.execute("""CREATE TABLE IF NOT EXISTS guest_suggestions(
+            id TEXT PRIMARY KEY, token_hash TEXT NOT NULL, session TEXT NOT NULL,
+            text TEXT NOT NULL, ts REAL NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            approval_id TEXT, decided_at REAL)""")
+        con.execute("CREATE INDEX IF NOT EXISTS idx_guest_sugg_token"
+                    " ON guest_suggestions(token_hash, ts)")
         con.execute("""CREATE TABLE IF NOT EXISTS devices(
             token TEXT PRIMARY KEY, platform TEXT, created_at REAL)""")
         con.execute("""CREATE TABLE IF NOT EXISTS report_events(
@@ -24261,7 +24273,100 @@ async def guest_link_revoke_all(request: Request):
     return {"revoked": True}
 
 
-def _guest_html(session_id: str, cards: list) -> str:
+# ── Guest 互動版(2026-11-06,E3,t3code 旁觀者範式)──────────────────────
+# guest 能**看**(5s 輪詢新卡片)、能**擬稿**(POST suggest),但送出權在
+# owner:擬稿落 canonical.db guest_suggestions(pending),同時開一張
+# kind=guest_message 的審批卡進審批中心;owner 按「送出」才走該 session 既有
+# input 路徑(_approval_decide_core 的 guest_message 分支)。**絕不直接進
+# session**。無 auth 面保持極簡:不開 SSE、不開 JSON API —— 輪詢就是重抓同
+# 一頁 HTML 換 innerHTML。
+
+_GUEST_SUGGEST_TEXT_MAX = 2000
+_GUEST_SUGGEST_RL_MAX = 6          # 6 則/分/令牌
+_GUEST_SUGGEST_RL_WINDOW = 60.0
+_GUEST_SUGGEST_RL: dict = {}       # token_hash -> [ts, ...]
+
+
+def _guest_token_hash(token: str) -> str:
+    """令牌 → 落表/率限鍵。不存原始 token(撤銷=換密鑰,hash 查不回)。"""
+    return hashlib.sha256(token.encode("utf-8", "replace")).hexdigest()[:24]
+
+
+def _guest_rate_ok(token_hash: str, now: float | None = None) -> bool:
+    now = time.time() if now is None else now
+    hits = [t for t in _GUEST_SUGGEST_RL.get(token_hash, [])
+            if now - t < _GUEST_SUGGEST_RL_WINDOW]
+    if len(hits) >= _GUEST_SUGGEST_RL_MAX:
+        _GUEST_SUGGEST_RL[token_hash] = hits
+        return False
+    hits.append(now)
+    _GUEST_SUGGEST_RL[token_hash] = hits
+    # 表不無限長大:掃描者輪換 token 也撐不大(窗外即棄)。
+    if len(_GUEST_SUGGEST_RL) > 512:
+        for k in [k for k, v in list(_GUEST_SUGGEST_RL.items())
+                  if not v or now - v[-1] > _GUEST_SUGGEST_RL_WINDOW]:
+            _GUEST_SUGGEST_RL.pop(k, None)
+    return True
+
+
+def _guest_suggestions_for(token_hash: str, limit: int = 5) -> list:
+    """這枚令牌最近的擬稿(guest 頁顯示狀態回饋用)。"""
+    import sqlite3
+    try:
+        con = sqlite3.connect(CANON_DB, timeout=30)
+        try:
+            # LEFT JOIN approvals:審批過期後 suggestion 列還是 pending ——
+            # guest 不能永遠看著「等待主人審核」,如實顯示已過期。
+            rows = con.execute(
+                "SELECT s.text,"
+                " CASE WHEN s.status='pending' AND a.status='expired'"
+                " THEN 'expired' ELSE s.status END, s.ts"
+                " FROM guest_suggestions s"
+                " LEFT JOIN approvals a ON a.id = s.approval_id"
+                " WHERE s.token_hash=? ORDER BY s.ts DESC LIMIT ?",
+                (token_hash, max(1, limit))).fetchall()
+            return [{"text": r[0], "status": r[1], "ts": r[2]} for r in rows]
+        finally:
+            con.close()
+    except Exception as e:  # noqa: BLE001
+        _log_event("guest_suggestions_read_failed", error=str(e)[:160])
+        return []
+
+
+_GUEST_SUGG_STATUS_LABEL = {"pending": "等待主人審核", "sent": "已送出",
+                            "ignored": "未採用", "failed": "送出失敗",
+                            "expired": "已過期未處理"}
+
+_GUEST_JS = (
+    "<script>(function(){"
+    "var P=location.pathname.replace(/\\/+$/,'');"
+    "var M=document.getElementById('msg');"
+    "async function poll(){try{"
+    "var r=await fetch(P,{cache:'no-store'});"
+    "if(r.status===410){M.textContent='連結已失效';return;}"
+    "var d=new DOMParser().parseFromString(await r.text(),'text/html');"
+    "['cards','mine'].forEach(function(id){"
+    "var n=d.getElementById(id),o=document.getElementById(id);"
+    "if(n&&o)o.innerHTML=n.innerHTML;});"
+    "}catch(e){}}"
+    "setInterval(poll,5000);"
+    "document.getElementById('sf').addEventListener('submit',async function(e){"
+    "e.preventDefault();"
+    "var ta=document.getElementById('st'),v=ta.value.trim();"
+    "if(!v)return;M.textContent='送出中…';"
+    "try{var r=await fetch(P+'/suggest',{method:'POST',"
+    "headers:{'Content-Type':'application/json'},"
+    "body:JSON.stringify({text:v})});"
+    "if(r.ok){ta.value='';M.textContent='已送出,等待主人核准';poll();}"
+    "else if(r.status===429){M.textContent='太快了,稍等一下再送';}"
+    "else if(r.status===410){M.textContent='連結已失效';}"
+    "else if(r.status===413){M.textContent='太長了(上限 2000 字)';}"
+    "else{M.textContent='送不出去('+r.status+')';}"
+    "}catch(e){M.textContent='網路問題,稍後再試';}});"
+    "})()</script>")
+
+
+def _guest_html(session_id: str, cards: list, suggestions: list | None = None) -> str:
     import html as _html
     rows = []
     for c in cards:
@@ -24272,6 +24377,13 @@ def _guest_html(session_id: str, cards: list) -> str:
         role = "you" if c.get("role") == "user" else "agent"
         rows.append(
             f'<div class="m {role}"><pre>{_html.escape(text)}</pre></div>')
+    mine = []
+    for s in (suggestions or []):
+        label = _GUEST_SUGG_STATUS_LABEL.get(str(s.get("status") or ""),
+                                             str(s.get("status") or ""))
+        mine.append('<div class="s"><pre>'
+                    f'{_html.escape(str(s.get("text") or ""))}</pre>'
+                    f'<span class="st">{_html.escape(label)}</span></div>')
     title = _html.escape(session_id)
     return ("<!doctype html><meta charset='utf-8'>"
             "<meta name='viewport' content='width=device-width,initial-scale=1'>"
@@ -24280,18 +24392,36 @@ def _guest_html(session_id: str, cards: list) -> str:
             "<style>body{font:15px/1.6 -apple-system,sans-serif;max-width:720px;"
             "margin:24px auto;padding:0 16px;background:#faf8f5;color:#222}"
             ".m{margin:10px 0;padding:10px 14px;border-radius:12px}"
-            ".m pre{margin:0;white-space:pre-wrap;word-break:break-word;font:inherit}"
+            ".m pre,.s pre{margin:0;white-space:pre-wrap;word-break:break-word;font:inherit}"
             ".you{background:#e8e2d8}.agent{background:#fff;border:1px solid #e5e0d8}"
-            "h1{font-size:17px}footer{color:#999;font-size:12px;margin:24px 0}"
+            ".s{margin:8px 0;padding:8px 12px;border-radius:10px;background:#f1ede6;"
+            "border:1px dashed #d8d2c6}.s .st{color:#8a7f6d;font-size:12px}"
+            "textarea{width:100%;box-sizing:border-box;font:inherit;padding:8px;"
+            "border:1px solid #d8d2c6;border-radius:10px;background:#fff}"
+            "button{font:inherit;margin-top:6px;padding:6px 16px;border:0;"
+            "border-radius:10px;background:#2f2a22;color:#fff}"
+            "#msg{margin-left:10px;color:#8a7f6d;font-size:13px}"
+            "h1{font-size:17px}h2{font-size:14px;margin:28px 0 6px}"
+            "footer{color:#999;font-size:12px;margin:24px 0}"
             "</style>"
-            f"<h1>Pocket 對話(唯讀)</h1>{''.join(rows) or '<p>(沒有內容)</p>'}"
-            "<footer>由 Pocket 分享的唯讀快照;連結到期自動失效。</footer>")
+            f"<h1>Pocket 對話</h1><div id='cards'>"
+            f"{''.join(rows) or '<p>(沒有內容)</p>'}</div>"
+            "<h2>向主人擬一句話</h2>"
+            f"<div id='mine'>{''.join(mine)}</div>"
+            "<form id='sf'><textarea id='st' rows='3' maxlength='2000' "
+            "placeholder='寫下你的建議…(主人核准後才會送進對話)'></textarea>"
+            "<div><button type='submit'>送出擬稿</button>"
+            "<span id='msg'></span></div></form>"
+            "<footer>由 Pocket 分享的對話;你送出的擬稿需由主人核准才會進入"
+            "對話。連結到期自動失效。</footer>"
+            + _GUEST_JS)
 
 
 @app.get("/guest/{token}")
 async def guest_view(token: str):
     """**無 auth,刻意的** —— 認證就是 token 本身(HMAC+exp)。只讀、只
-    渲染文字、HTML 轉義、noindex;壞/過期一律 410 不區分(不給探測面)。"""
+    渲染文字、HTML 轉義、noindex;壞/過期一律 410 不區分(不給探測面)。
+    E3:頁內 5s 輪詢(重抓本頁換 innerHTML)+ 擬稿框(送 suggest)。"""
     sid = _guest_token_verify(token)
     if not sid:
         raise HTTPException(status_code=410, detail="連結已失效")
@@ -24300,7 +24430,198 @@ async def guest_view(token: str):
     except Exception:  # noqa: BLE001
         raise HTTPException(status_code=410, detail="連結已失效")
     snap = store.snapshot(limit=300)
-    return HTMLResponse(_guest_html(sid, snap.get("cards") or []))
+    suggestions = await asyncio.to_thread(
+        _guest_suggestions_for, _guest_token_hash(token))
+    return HTMLResponse(_guest_html(sid, snap.get("cards") or [], suggestions))
+
+
+def _guest_cards_feed(session_id: str, record: dict, resolved: str = "") -> None:
+    """guest_message 審批卡 → 目標 session 的卡片流(best-effort;審批中心
+    與推播才是第一公民面)。只餵**已在記憶體**的 digest,不為一張卡冷建。"""
+    try:
+        sid = str(session_id or "")
+        if sid.startswith("hermes:"):
+            _hp_cards_feed_approval(sid, record, resolved=resolved)
+        elif sid.startswith("claude_code:"):
+            _cc_cards_feed_approval(sid.split(":", 1)[1], record,
+                                    resolved=resolved)
+        elif sid.startswith("openclaw:"):
+            _oc_cards_feed_approval(sid.split(":", 1)[1], record,
+                                    resolved=resolved)
+        elif sid.startswith("codex:"):
+            d = _CX_CARD_DIGESTS.get(sid.split(":", 1)[1])
+            if d:
+                d.feed_approval(record, resolved=resolved)
+        elif sid.startswith("gemini:"):
+            d = _GM_CARD_DIGESTS.get(sid.split(":", 1)[1])
+            if d:
+                (d.resolve_approval(record, resolved) if resolved
+                 else d.handle_approval(record))
+        elif sid.startswith("cc2:") and cc_sdk.enabled():
+            sess = cc_sdk.registry().get(sid.split(":", 1)[1])
+            if sess is not None:
+                (sess.digest.resolve_approval(record, resolved) if resolved
+                 else sess.digest.handle_approval(record))
+        elif ":" not in sid and sid:
+            _cc_cards_feed_approval(sid, record, resolved=resolved)
+    except Exception as e:  # noqa: BLE001
+        _log_event("guest_cards_feed_error", error=str(e)[:160])
+
+
+@app.post("/guest/{token}/suggest")
+async def guest_suggest(token: str, request: Request):
+    """guest 擬稿(**無 auth,同 guest_view —— 認證就是 token**)。
+    率限 6/分/令牌、長度 2k、文字落表(渲染端一律 HTML 轉義);
+    成功 = guest_suggestions 一列 pending + 審批中心一張 guest_message 卡。"""
+    import sqlite3
+    sid = _guest_token_verify(token)
+    if not sid:
+        raise HTTPException(status_code=410, detail="連結已失效")
+    body = await _json_body(request)
+    text = str(body.get("text") or "").strip()
+    if not text:
+        raise http_err(400, "TEXT_REQUIRED", "text 必填")
+    if len(text) > _GUEST_SUGGEST_TEXT_MAX:
+        raise http_err(413, "TEXT_TOO_LONG",
+                       f"擬稿上限 {_GUEST_SUGGEST_TEXT_MAX} 字")
+    th = _guest_token_hash(token)
+    if not _guest_rate_ok(th):
+        raise http_err(429, "RATE_LIMITED", "擬稿太頻繁,稍後再送")
+    # session 必須真的存在 —— 解析不了與過期同一張臉(410,不給探測面)。
+    try:
+        await _v2_card_store(sid)
+    except Exception:  # noqa: BLE001
+        raise HTTPException(status_code=410, detail="連結已失效")
+    now = time.time()
+    sugg_id = "gs-" + uuid.uuid4().hex[:16]
+    aid = "guestmsg-" + uuid.uuid4().hex[:16]
+    options = _approval_default_options("guest_message")
+    def _write():
+        con = sqlite3.connect(CANON_DB, timeout=30)
+        try:
+            con.execute(
+                "INSERT INTO guest_suggestions"
+                "(id, token_hash, session, text, ts, status, approval_id)"
+                " VALUES(?,?,?,?,?,'pending',?)",
+                (sugg_id, th, sid, text, now, aid))
+            con.execute(
+                "INSERT INTO approvals"
+                "(id,title,source,risk,detail,created_at,expires_at,status,"
+                "decided_at,result,callback,session_id,provider,kind,options,meta)"
+                " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (aid, "訪客擬稿", sid, "", text, now, now + 86400.0, "pending",
+                 None, None, None, sid, _approval_provider_of(sid),
+                 "guest_message",
+                 json.dumps(options, ensure_ascii=False),
+                 json.dumps({"suggestion_id": sugg_id, "origin": "guest"},
+                            ensure_ascii=False)))
+            con.commit()
+        finally:
+            con.close()
+    await asyncio.to_thread(_write)
+    _guest_cards_feed(sid, _approval_get_row(aid) or {})
+    try:
+        _approval_push(aid, "訪客擬稿", text[:120], sid)
+    except Exception as e:  # noqa: BLE001
+        _log_event("guest_suggest_push_failed", error=str(e)[:160])
+    _log_event("guest_suggest_created", session=sid, chars=len(text),
+               token_hash=th[:8])
+    return {"ok": True, "id": sugg_id, "status": "pending"}
+
+
+class _InternalRequest:
+    """內部轉發用的極簡 Request 替身(guest 擬稿核准 → 既有 input 路徑)。
+    只帶 v2_session_input 會碰的面:auth header、json body、client/query。"""
+    client = None
+
+    def __init__(self, body: dict):
+        self._body = dict(body or {})
+        self.headers = {"authorization": f"Bearer {BRIDGE_TOKEN}"}
+        self.query_params: dict = {}
+
+    async def json(self):
+        return self._body
+
+    async def body(self):
+        return json.dumps(self._body, ensure_ascii=False).encode()
+
+
+async def _guest_forward_to_session(session_id: str, text: str,
+                                    client_id: str = ""):
+    """核准後的擬稿 → 該 session **既有** input 路徑(v2 統一路由;cc=tmux
+    paste、cx=turn/start 或排隊、persona=回合機器……全部沿用,不另開路)。"""
+    body = {"text": text}
+    if client_id:
+        body["client_id"] = client_id
+    return await v2_session_input(session_id, _InternalRequest(body))
+
+
+async def _guest_message_decide(aid: str, d: dict, b: dict) -> dict:
+    """guest_message 審批決議:send=轉發進 session、ignore=只標記。
+    先佔列(pending→終態)再轉發 —— 兩台裝置同時按只會送一次。"""
+    import sqlite3
+    key = str(b.get("key") or "").strip()
+    if not key:
+        key = "send" if b.get("approve") else "ignore"
+    if key not in ("send", "ignore"):
+        raise http_err(400, "UNKNOWN_KEY", "key 必須是 ['send', 'ignore'] 之一")
+    status = "approved" if key == "send" else "denied"
+    sid = str(d.get("session_id") or d.get("source") or "")
+    meta = d.get("meta") if isinstance(d.get("meta"), dict) else {}
+    sugg_id = str((meta or {}).get("suggestion_id") or "")
+    now = time.time()
+
+    def _claim() -> tuple:
+        con = sqlite3.connect(CANON_DB, timeout=30)
+        try:
+            cur = con.execute(
+                "UPDATE approvals SET status=?, decided_at=?, result=?"
+                " WHERE id=? AND status='pending'", (status, now, key, aid))
+            text_row = None
+            if sugg_id:
+                text_row = con.execute(
+                    "SELECT text FROM guest_suggestions WHERE id=?",
+                    (sugg_id,)).fetchone()
+            con.commit()
+            return cur.rowcount, (text_row[0] if text_row else None)
+        finally:
+            con.close()
+
+    changed, text = await asyncio.to_thread(_claim)
+    if not changed:
+        raise HTTPException(status_code=409, detail="already decided or expired")
+    text = text or str(d.get("detail") or "")
+    sugg_status = "ignored"
+    forward_error = ""
+    if key == "send":
+        try:
+            await _guest_forward_to_session(
+                sid, text, client_id=f"guest-{sugg_id or aid}")
+            sugg_status = "sent"
+        except Exception as e:  # noqa: BLE001
+            sugg_status = "failed"
+            forward_error = (getattr(e, "detail", "") or str(e))[:200]
+            _log_event("guest_forward_failed", approval_id=aid, session=sid,
+                       error=type(e).__name__, error_message=forward_error)
+
+    def _mark():
+        con = sqlite3.connect(CANON_DB, timeout=30)
+        try:
+            con.execute("UPDATE guest_suggestions SET status=?, decided_at=?"
+                        " WHERE id=?", (sugg_status, now, sugg_id or ""))
+            con.commit()
+        finally:
+            con.close()
+    if sugg_id:
+        await asyncio.to_thread(_mark)
+    _guest_cards_feed(sid, d, resolved=status)
+    _log_event("guest_suggestion_decided", approval_id=aid, session=sid,
+               key=key, outcome=sugg_status)
+    if forward_error:
+        # 審批已落終態(不會重送),但要誠實告訴 owner 沒送進去。
+        raise http_err(502, "GUEST_FORWARD_FAILED",
+                       f"擬稿已核准,但送進 session 失敗:{forward_error}")
+    return {"id": aid, "status": status, "key": key}
 
 
 # ── Usage summary(2026-11-04,抄 t3code usage 面板的資料面)────────────
@@ -31358,13 +31679,17 @@ async def _persona_interrupt_core(session: str) -> dict:
 # A1:讀取端共用的欄位序 — SELECT 一律用這一串,tuple 索引不漂移。
 _APPROVAL_COLS = ("id,title,source,risk,detail,created_at,expires_at,status,"
                   "decided_at,result,session_id,provider,kind,options,meta")
-_APPROVAL_KINDS = ("permission", "question", "notice")
+_APPROVAL_KINDS = ("permission", "question", "notice", "guest_message")
 
 
 def _approval_default_options(kind: str) -> list:
     """options 未宣告時的預設鍵(APPROVAL_HUB_SPEC §1/§2)。"""
     if kind == "notice":
         return [{"key": "ack", "label": "知道了", "style": "primary"}]
+    if kind == "guest_message":
+        # E3 guest 互動版:訪客擬稿 → owner 核准才送進 session。
+        return [{"key": "send", "label": "送出", "style": "primary"},
+                {"key": "ignore", "label": "忽略", "style": "danger"}]
     return [{"key": "approve", "label": "允許", "style": "primary"},
             {"key": "deny", "label": "拒絕", "style": "danger"}]
 
@@ -31440,8 +31765,15 @@ def _approval_row(r):
            "provider": r[11] or _approval_provider_of(src),
            "kind": kind,
            "options": options or _approval_default_options(kind)}
-    out["response_capability"] = _approval_response_capability(
-        out["id"], out["provider"], src, str(out["status"] or ""))
+    if kind == "guest_message":
+        # E3:guest 擬稿審批是 DB-backed(等待者就是 DB 列本身),bridge 重啟
+        # 不滅 —— 不能走 provider 等待者探活(src 是目標 session 前綴,會被
+        # 誤判 not_resumable,app 把活按鈕灰掉)。
+        out["response_capability"] = (
+            "live" if str(out["status"] or "") == "pending" else "none")
+    else:
+        out["response_capability"] = _approval_response_capability(
+            out["id"], out["provider"], src, str(out["status"] or ""))
     if isinstance(meta, dict) and meta:
         out["meta"] = meta
     return out
@@ -31877,6 +32209,11 @@ async def _approval_decide_core(aid: str, b: dict) -> dict:
         if d.get("result"):
             out["result"] = d.get("result")
         return out
+    if d and str(d.get("kind") or "") == "guest_message":
+        # E3 guest 擬稿:DB-backed 審批,**必須在 provider 分支之前**攔下 ——
+        # 它的 source/session_id 帶目標 session 前綴(claude_code:/codex:…),
+        # 掉進下面任何 provider 分支都是 409 或盲送鍵。
+        return await _guest_message_decide(aid, d, b)
     src = str((d or {}).get("source") or "")
     if d and src.startswith("claude_code:"):
         # 批次 3 斷點③:CC 審核決議 → 回流 TUI 鍵。以「當下 pane 的 prompt」
