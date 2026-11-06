@@ -467,9 +467,19 @@ install_hermes_python() {
     return 0
   fi
   log_step "安裝 Python ${HERMES_PYTHON_VERSION}(Hermes 需要)"
-  sudo add-apt-repository -y ppa:deadsnakes/ppa >/dev/null 2>&1 \
+  # `add-apt-repository` 來自 software-properties-common —— **精簡版雲端映像
+  # 不一定有**(Vultr 的 Ubuntu 24.04 就是精簡的)。少了它上一版會死在
+  # 「command not found」,而訊息完全看不出是缺這個套件。
+  if ! command -v add-apt-repository >/dev/null 2>&1; then
+    sudo apt-get update -qq
+    sudo apt-get install -y -qq software-properties-common \
+      || die "裝 software-properties-common 失敗(add-apt-repository 需要它)"
+  fi
+  sudo add-apt-repository -y ppa:deadsnakes/ppa \
     || die "加 deadsnakes PPA 失敗 —— Hermes 需要 Python ${HERMES_PYTHON_VERSION},請手動安裝後重跑"
   sudo apt-get update -qq
+  # ✅2026-11-07 查證 deadsnakes noble 倉庫:python3.14=3.14.10-1+noble1,
+  # 且 -venv / -dev 都在。三個都要:venv 建虛擬環境、dev 給要編譯的輪子。
   sudo apt-get install -y -qq "${py}" "${py}-venv" "${py}-dev" \
     || die "安裝 ${py} 失敗 —— Hermes 需要 Python ${HERMES_PYTHON_VERSION}"
   command -v "$py" >/dev/null 2>&1 \
