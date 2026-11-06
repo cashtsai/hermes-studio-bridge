@@ -1236,6 +1236,8 @@ class CodexThreadDigest(ApprovalCardMixin):
 #: 里程碑鏡射 sink:bridge 啟動時設成
 #: lambda session, etype, payload, ext: _event_append(session, etype, payload, external_id=ext)
 #: 保持 None = 不鏡射(測試/獨立使用 carddigest 時零副作用)。
+#: 回傳值契約(2026-11-06):sink 應回傳 event_log 的全域 id(int);
+#: 0/None = 去重略過或失敗 —— _push 會把它放進信封的 durable_seq。
 MILESTONE_SINK = None
 
 
@@ -1307,15 +1309,20 @@ class SessionCardStore(ApprovalCardMixin):
     def _push(self, etype: str, data: dict) -> dict:
         self.seq += 1
         ev = {"seq": self.seq, "ts": time.time(), "type": etype, "data": data}
+        # durable_seq(2026-11-06,T3#1):這個事件若有對應的持久 event_log
+        # 列,信封帶上它的全域 id;純串流 delta / 鏡射失敗 / 去重略過 → null。
+        # client 以它維護「持久游標」,重啟後用 after_durable_seq 補洞,不再
+        # 吃 410 冷載。鏡射必須在 append/喚醒**之前**算好 —— 信封一旦被 SSE
+        # 訂閱者讀走就不能再回頭補欄位。
+        ev["durable_seq"] = self._mirror_milestone(etype, data)
         self.events.append(ev)
         if len(self.events) > self.ring_max:
             del self.events[:len(self.events) - self.ring_max]
         for w in self._wakers:      # 事件落地即刻喚醒所有 SSE 訂閱者
             w.set()
-        self._mirror_milestone(etype, data)
         return ev
 
-    def _mirror_milestone(self, etype: str, data: dict) -> None:
+    def _mirror_milestone(self, etype: str, data: dict) -> "int | None":
         """里程碑事件鏡射進持久 event_log(2026-11-04,t3code P3-lite)。
 
         ring 是記憶體,bridge 重啟即歸零 → 410 冷載;持久化里程碑給重啟後
@@ -1326,25 +1333,29 @@ class SessionCardStore(ApprovalCardMixin):
         sink 由 bridge 啟動時注入(MILESTONE_SINK);沒注入、或 store 沒有
         media_session_id(不知道自己是誰)就安靜跳過 —— 鏡射永遠是加分項,
         不准拖垮熱路徑(sink 端自己吞錯)。
+
+        回傳值(2026-11-06,T3#1):鏡射成功 → event_log 的全域 id(信封
+        的 durable_seq);非里程碑 / 去重略過 / 失敗 → None。
         """
         sink = MILESTONE_SINK
         sid = getattr(self, "media_session_id", "") or ""
         if sink is None or not sid:
-            return
+            return None
         if etype == "card.upsert":
             card = (data or {}).get("card") or {}
             if not card.get("final"):
-                return
+                return None
             body = card.get("body") or {}
             basis = f"{card.get('id')}|{body.get('text') or body.get('fallback_text') or ''}"
             ext = "card:" + hashlib.sha1(basis.encode("utf-8", "replace")).hexdigest()[:20]
-            sink(sid, "card.milestone", {"card": card}, ext)
-        elif etype == "session.status":
-            sink(sid, "session.status", data, None)
-        elif etype == "turn":
+            return sink(sid, "card.milestone", {"card": card}, ext) or None
+        if etype == "session.status":
+            return sink(sid, "session.status", data, None) or None
+        if etype == "turn":
             tid = (data or {}).get("turn_id") or ""
             st = (data or {}).get("state") or ""
-            sink(sid, "turn", data, f"turn:{tid}:{st}" if tid else None)
+            return sink(sid, "turn", data, f"turn:{tid}:{st}" if tid else None) or None
+        return None
 
     def attach_waker(self) -> "asyncio.Event":
         """SSE 訂閱者註冊喚醒器;斷線務必 detach_waker(不然洩漏)。"""
@@ -1450,8 +1461,10 @@ class SessionCardStore(ApprovalCardMixin):
                 "status": dict(self.status or {})}
 
     def ping(self) -> dict:
-        """keepalive 信封 — 不進 ring、不佔 seq。"""
-        return {"seq": self.seq, "ts": time.time(), "type": "ping", "data": {}}
+        """keepalive 信封 — 不進 ring、不佔 seq。durable_seq 恆為 null
+        (ping 沒有對應的持久事件;欄位存在只為信封形狀一致)。"""
+        return {"seq": self.seq, "ts": time.time(), "type": "ping", "data": {},
+                "durable_seq": None}
 
 
 # ───────────────── B3:studio-card 圍欄協定(persona 結構化輸出)──────────────
