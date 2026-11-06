@@ -129,5 +129,80 @@ class TestHeartbeatNotices(unittest.TestCase):
         self.assertEqual(pn.await_count, 1, "壞檔 = 空(寧可多推,不要永遠閉嘴)")
 
 
+class TestSubscriptionExpiringNotice(unittest.TestCase):
+    """到期倒數(2026-11-06)。伺服器每次心跳都帶 days_left 給 App 顯示倒數,
+    但只有 push=True 的節點(60/30/14/7/3/1)才推播 —— 節奏決策在伺服器。"""
+
+    def setUp(self):
+        try:
+            os.remove(bridge._hb_notice_state_path())
+        except FileNotFoundError:
+            pass
+
+    def _notice(self, days_left, push=True, expires_ts=1800000000.0):
+        return {"type": "subscription_expiring", "days_left": days_left,
+                "expires_ts": expires_ts, "push": push}
+
+    def test_push_day_sends_with_countdown_payload(self):
+        pn = _consume({"notices": [self._notice(7)]})
+        self.assertEqual(pn.await_count, 1)
+        args, kwargs = pn.await_args
+        title, body, data = args[0], args[1], args[2]
+        self.assertIn("到期", title)
+        self.assertIn("7", body)
+        self.assertEqual(data["pocket"]["kind"], "subscription_expiring")
+        self.assertEqual(data["pocket"]["daysLeft"], 7)
+        self.assertEqual(data["pocket"]["expiresTs"], 1800000000.0)
+        self.assertEqual(kwargs.get("thread_id"), "account-notices")
+
+    def test_non_push_day_does_not_notify(self):
+        """非節奏日照樣每 60s 來一則(App 要倒數),但**不准推播**。"""
+        pn = _consume({"notices": [self._notice(45, push=False)]})
+        self.assertEqual(pn.await_count, 0)
+        self.assertFalse(os.path.exists(bridge._hb_notice_state_path()),
+                         "沒推就不該佔 dedup 格 —— 否則真的到節奏日會被吃掉")
+
+    def test_each_cadence_day_pushes_separately(self):
+        """**回歸測試**:dedup key 若不含天數,整段倒數只會推出第一則
+        (T-60 推了,T-30/T-14/T-7… 全被 24h 窗當成重複吃掉)。"""
+        counts = [_consume({"notices": [self._notice(d)]}).await_count
+                  for d in (60, 30, 14, 7, 3, 1)]
+        self.assertEqual(counts, [1, 1, 1, 1, 1, 1],
+                         "每個倒數節點都要推 —— 這是續費不流失的關鍵")
+
+    def test_same_day_repeat_heartbeat_is_deduped(self):
+        n = self._notice(7)
+        self.assertEqual(_consume({"notices": [n]}).await_count, 1)
+        self.assertEqual(_consume({"notices": [n]}).await_count, 0,
+                         "同一天內重複心跳只推一次")
+
+    def test_last_day_wording_is_tomorrow_not_1_day(self):
+        pn = _consume({"notices": [self._notice(1)]})
+        body = pn.await_args[0][1]
+        self.assertIn("明天", body)
+
+    def test_garbage_countdown_fields_do_not_push_or_crash(self):
+        for n in ({"type": "subscription_expiring", "push": True},          # 缺天數
+                  self._notice("abc"),                                      # 非數字
+                  self._notice(0),                                          # 已到期
+                  self._notice(-3)):
+            pn = _consume({"notices": [n]})
+            self.assertEqual(pn.await_count, 0, f"不該推: {n}")
+
+    def test_expires_ts_optional(self):
+        n = {"type": "subscription_expiring", "days_left": 3, "push": True}
+        pn = _consume({"notices": [n]})
+        self.assertEqual(pn.await_count, 1)
+        self.assertNotIn("expiresTs", pn.await_args[0][2]["pocket"])
+
+    def test_mixed_with_backup_orphan_both_push(self):
+        pn = _consume({"notices": [
+            {"type": "backup_orphan", "product_id": "com.x.backup"},
+            self._notice(3)]})
+        self.assertEqual(pn.await_count, 2)
+        kinds = {c.args[2]["pocket"]["kind"] for c in pn.await_args_list}
+        self.assertEqual(kinds, {"backup_orphan", "subscription_expiring"})
+
+
 if __name__ == "__main__":
     unittest.main()
