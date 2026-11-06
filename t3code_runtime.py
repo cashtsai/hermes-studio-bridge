@@ -35,6 +35,13 @@ class T3CodeError(ValueError):
     """A client-correctable T3Code contract error."""
 
 
+BINDING_STATES = frozenset({"active", "dead", "detached"})
+# When an active binding is replaced, the outgoing row must land in a
+# terminal, auditable state: `dead` (the provider-native session is gone or
+# wedged — e.g. the CX writer-lock saga) or `detached` (deliberate hand-off,
+# the native session still exists but no longer backs this conversation).
+BINDING_RETIRE_STATES = frozenset({"dead", "detached"})
+
 CONTEXT_TRANSITIONS = {
     "dry_run": {"approved", "expired"},
     "approved": {"target_created", "failed", "expired"},
@@ -91,6 +98,34 @@ def ensure_schema(db_path: str) -> None:
             FOREIGN KEY(app_thread_id) REFERENCES app_threads(id))""")
         con.execute("CREATE INDEX IF NOT EXISTS idx_provider_thread_app "
                     "ON provider_threads(app_thread_id, updated_at)")
+        # AppThread ≠ ProviderThread dual-id binding ledger (t3code
+        # core-graph).  One row per (app thread ⇄ provider-native session)
+        # attachment; rebinding never rewrites history — the old row is
+        # flipped to dead/detached and a fresh active row is appended, so the
+        # full chain stays auditable.  `provider_thread_id` here is the
+        # bridge-native session id the app already speaks (codex:xxx /
+        # claude_code:name / …), which keeps this layer purely additive on
+        # top of the legacy session surface.
+        con.execute("""CREATE TABLE IF NOT EXISTS app_thread_bindings(
+            id TEXT PRIMARY KEY,
+            app_thread_id TEXT NOT NULL,
+            provider TEXT NOT NULL,
+            provider_thread_id TEXT NOT NULL,
+            state TEXT NOT NULL DEFAULT 'active',
+            reason TEXT,
+            bound_at REAL NOT NULL,
+            unbound_at REAL,
+            FOREIGN KEY(app_thread_id) REFERENCES app_threads(id))""")
+        # Invariants are enforced at the storage layer, not only in Python:
+        # at most one active binding per app thread, and one provider-native
+        # thread can be actively owned by at most one app thread.
+        con.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_binding_active_thread "
+                    "ON app_thread_bindings(app_thread_id) WHERE state='active'")
+        con.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_binding_active_provider "
+                    "ON app_thread_bindings(provider, provider_thread_id) "
+                    "WHERE state='active'")
+        con.execute("CREATE INDEX IF NOT EXISTS idx_binding_thread_time "
+                    "ON app_thread_bindings(app_thread_id, bound_at)")
         con.execute("""CREATE TABLE IF NOT EXISTS context_transfers(
             id TEXT PRIMARY KEY,
             app_thread_id TEXT NOT NULL,
@@ -262,6 +297,176 @@ def get_app_thread(db_path: str, thread_id: str) -> dict | None:
             item["capabilities"] = json.loads(item.get("capabilities") or "{}")
             out["provider_threads"].append(item)
         return out
+    finally:
+        con.close()
+
+
+def _binding_target(provider: Any, provider_thread_id: Any) -> tuple[str, str]:
+    provider = str(provider or "").strip().lower()
+    provider_thread_id = str(provider_thread_id or "").strip()
+    if not provider or not provider_thread_id:
+        raise T3CodeError("provider and provider_thread_id are required")
+    return provider, provider_thread_id
+
+
+def _require_app_thread(con: sqlite3.Connection, app_thread_id: str) -> None:
+    if not con.execute("SELECT 1 FROM app_threads WHERE id=?",
+                       (app_thread_id,)).fetchone():
+        raise T3CodeError("unknown app_thread")
+
+
+def _active_binding(con: sqlite3.Connection, app_thread_id: str) -> dict | None:
+    return _row(con.execute(
+        "SELECT * FROM app_thread_bindings WHERE app_thread_id=? AND state='active'",
+        (app_thread_id,)).fetchone())
+
+
+def _assert_target_free(con: sqlite3.Connection, provider: str,
+                        provider_thread_id: str, app_thread_id: str) -> None:
+    other = con.execute(
+        "SELECT app_thread_id FROM app_thread_bindings "
+        "WHERE provider=? AND provider_thread_id=? AND state='active'",
+        (provider, provider_thread_id)).fetchone()
+    if other and other["app_thread_id"] != app_thread_id:
+        raise T3CodeError(
+            "provider thread is actively bound to another app_thread")
+
+
+def active_binding_owner(db_path: str, provider: str,
+                         provider_thread_id: str) -> str | None:
+    """Return the app_thread_id that actively owns a provider thread, if any.
+
+    Lets callers pre-validate a bind target before creating an app thread so
+    a rejected bind does not leave an orphan thread behind.
+    """
+    ensure_schema(db_path)
+    provider, provider_thread_id = _binding_target(provider, provider_thread_id)
+    con = _connect(db_path)
+    try:
+        row = con.execute(
+            "SELECT app_thread_id FROM app_thread_bindings "
+            "WHERE provider=? AND provider_thread_id=? AND state='active'",
+            (provider, provider_thread_id)).fetchone()
+        return row["app_thread_id"] if row else None
+    finally:
+        con.close()
+
+
+def bind_app_thread(db_path: str, app_thread_id: str, provider: str,
+                    provider_thread_id: str,
+                    binding_id: str | None = None) -> dict:
+    """Attach a provider-native thread as the live backing of an app thread.
+
+    Idempotent when the same target is already the active binding.  A
+    different active binding must go through :func:`rebind_app_thread` so the
+    retirement state (dead/detached) and reason land in the audit chain.
+    """
+    ensure_schema(db_path)
+    provider, provider_thread_id = _binding_target(provider, provider_thread_id)
+    now = _now()
+    con = _connect(db_path)
+    try:
+        _require_app_thread(con, app_thread_id)
+        current = _active_binding(con, app_thread_id)
+        if current:
+            if (current["provider"] == provider
+                    and current["provider_thread_id"] == provider_thread_id):
+                return current
+            raise T3CodeError(
+                "app_thread already has an active binding; use rebind")
+        _assert_target_free(con, provider, provider_thread_id, app_thread_id)
+        bid = binding_id or _id("bind")
+        try:
+            con.execute("""INSERT INTO app_thread_bindings
+                (id,app_thread_id,provider,provider_thread_id,state,bound_at)
+                VALUES(?,?,?,?,'active',?)""",
+                        (bid, app_thread_id, provider, provider_thread_id, now))
+        except sqlite3.IntegrityError as exc:
+            # Lost a race against another writer: the partial unique indexes
+            # are the authoritative guard, surface it as a contract error.
+            raise T3CodeError("binding conflicts with an existing active binding") from exc
+        con.execute("UPDATE app_threads SET updated_at=? WHERE id=?",
+                    (now, app_thread_id))
+        con.commit()
+        return _row(con.execute(
+            "SELECT * FROM app_thread_bindings WHERE id=?", (bid,)).fetchone()) or {}
+    finally:
+        con.close()
+
+
+def current_binding(db_path: str, app_thread_id: str) -> dict | None:
+    """Return the single active binding of an app thread, if any."""
+    ensure_schema(db_path)
+    con = _connect(db_path)
+    try:
+        return _active_binding(con, app_thread_id)
+    finally:
+        con.close()
+
+
+def list_bindings(db_path: str, app_thread_id: str) -> list[dict]:
+    """Return the full binding chain, oldest first (audit view)."""
+    ensure_schema(db_path)
+    con = _connect(db_path)
+    try:
+        rows = con.execute(
+            "SELECT * FROM app_thread_bindings WHERE app_thread_id=? "
+            "ORDER BY bound_at, rowid", (app_thread_id,)).fetchall()
+        return [dict(row) for row in rows]
+    finally:
+        con.close()
+
+
+def rebind_app_thread(db_path: str, app_thread_id: str, provider: str,
+                      provider_thread_id: str, reason: str = "",
+                      prior_state: str = "dead",
+                      binding_id: str | None = None) -> dict:
+    """Swap the live provider thread under a stable app conversation.
+
+    The outgoing active row is retired to ``prior_state`` (dead|detached)
+    with ``reason`` and ``unbound_at`` recorded; a fresh active row is
+    appended.  History is never rewritten.  Rebinding to the current target
+    is a no-op (``changed: False``); rebinding when no binding is active
+    simply binds.  Both halves commit in one transaction so the chain can
+    never be observed with zero or two active rows.
+    """
+    ensure_schema(db_path)
+    provider, provider_thread_id = _binding_target(provider, provider_thread_id)
+    prior_state = str(prior_state or "dead").strip().lower()
+    if prior_state not in BINDING_RETIRE_STATES:
+        raise T3CodeError("prior_state must be one of: dead, detached")
+    reason = str(reason or "").strip()[:500]
+    now = _now()
+    con = _connect(db_path)
+    try:
+        _require_app_thread(con, app_thread_id)
+        current = _active_binding(con, app_thread_id)
+        if current and (current["provider"] == provider
+                        and current["provider_thread_id"] == provider_thread_id):
+            return {"changed": False, "binding": current, "previous": None}
+        _assert_target_free(con, provider, provider_thread_id, app_thread_id)
+        previous = None
+        if current:
+            con.execute("""UPDATE app_thread_bindings
+                SET state=?, reason=?, unbound_at=? WHERE id=? AND state='active'""",
+                        (prior_state, reason or None, now, current["id"]))
+            previous = _row(con.execute(
+                "SELECT * FROM app_thread_bindings WHERE id=?",
+                (current["id"],)).fetchone())
+        bid = binding_id or _id("bind")
+        try:
+            con.execute("""INSERT INTO app_thread_bindings
+                (id,app_thread_id,provider,provider_thread_id,state,bound_at)
+                VALUES(?,?,?,?,'active',?)""",
+                        (bid, app_thread_id, provider, provider_thread_id, now))
+        except sqlite3.IntegrityError as exc:
+            raise T3CodeError("binding conflicts with an existing active binding") from exc
+        con.execute("UPDATE app_threads SET updated_at=? WHERE id=?",
+                    (now, app_thread_id))
+        con.commit()
+        binding = _row(con.execute(
+            "SELECT * FROM app_thread_bindings WHERE id=?", (bid,)).fetchone()) or {}
+        return {"changed": True, "binding": binding, "previous": previous}
     finally:
         con.close()
 
