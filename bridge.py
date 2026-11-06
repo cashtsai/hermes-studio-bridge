@@ -25220,6 +25220,313 @@ async def t3_orchestrator_await(delegation_id: str, request: Request):
         await asyncio.sleep(min(0.25, max(0.0, deadline - time.monotonic())))
 
 
+# ─────────── Orchestrator MCP 工具面 v1(JSON-RPC over HTTP,POST /mcp)────────
+# 把 bridge 的編排能力做成 agent 可呼叫的 MCP 工具(agent 編排 agent)。
+# 設計依據:Codex #106 的 MCP 契約(/app/v3/orchestrator facade)+ t3code
+# orchestration-v2/orchestrator-mcp-server.md 的 HTTP MCP 模式(server 只是
+# command ingress,所有權限/配額/audit 都在既有路徑上強制)。
+#
+# 權限模型(t3code 原則「權限只縮不放」,v1 一刀切):
+#   · /mcp 只收 **master BRIDGE_TOKEN**(機器對機器;device token 一律 403)。
+#   · 並行 delegation 上限 3(ORCH_MCP_MAX_PARALLEL):以 delegation registry
+#     記帳(created_via=orchestrator_mcp 且 runtime 非終態),超額回 429。
+#   · 每個 open_thread 都落 delegation 表(audit 可查)+ `thread.delegated`
+#     事件進 event_log。
+# 四顆工具全部復用既有能力,不開新執行路徑:
+#   pocket_open_thread → app_delegation_create(codex thread/start、cc ccsess)
+#   pocket_send        → v2_session_input(統一 input 路由)
+#   pocket_status      → event_log 里程碑(session.status / card.milestone)
+#   pocket_wait_idle   → 輪詢 event_log 到回合結束(phase idle/blocked)或逾時
+ORCH_MCP_MAX_PARALLEL = int(os.environ.get("ORCH_MCP_MAX_PARALLEL", "3"))
+ORCH_MCP_PARENT = os.environ.get("ORCH_MCP_PARENT", "xcash")
+ORCH_MCP_CREATED_VIA = "orchestrator_mcp"
+_ORCH_MCP_PROTOCOL = "2025-06-18"
+_ORCH_MCP_PROTOCOLS = {"2024-11-05", "2025-03-26", "2025-06-18"}
+# 與 t3_orchestrator_await 同一組終態 —— 兩處判準必須一致,否則「await 說
+# 收斂了、配額卻還把它當活的」。
+_ORCH_MCP_TERMINAL = {"idle", "done", "failed", "archived", "cancelled",
+                      "denied", "expired"}
+
+_ORCH_MCP_TOOLS = [
+    {"name": "pocket_open_thread",
+     "description": ("開一條新的受管 agent 會話(codex 或 claude_code),"
+                     "回 session_id 供 pocket_send/pocket_status/"
+                     "pocket_wait_idle 使用。每次呼叫都落 delegation 工單"
+                     "(audit 可查);並行上限 3,超額回錯,先收割再開新的。"),
+     "inputSchema": {"type": "object", "properties": {
+         "provider": {"type": "string", "enum": ["codex", "claude_code"],
+                      "description": "要開在哪個 provider(cx/cc 別名也收)"},
+         "prompt": {"type": "string",
+                    "description": "開場任務指令(即第一回合的輸入)"},
+         "cwd": {"type": "string",
+                 "description": "工作目錄(必須在 home 底下;省略用預設)"}},
+         "required": ["provider", "prompt"]}},
+    {"name": "pocket_send",
+     "description": ("往既有會話送一則訊息(統一 input 路由:cc=tmux paste、"
+                     "cc2=SDK submit、cx=turn/start,忙碌會自動排隊)。"),
+     "inputSchema": {"type": "object", "properties": {
+         "session_id": {"type": "string",
+                        "description": "會話 id(codex:<thread>/claude_code:"
+                                       "<name>/cc2:<name>)"},
+         "text": {"type": "string", "description": "要送的訊息"},
+         "client_id": {"type": "string",
+                       "description": "選填:冪等鍵(重試帶同一個,避免重複執行)"}},
+         "required": ["session_id", "text"]}},
+    {"name": "pocket_status",
+     "description": ("讀會話目前狀態:phase(run/idle/queued/blocked)、busy、"
+                     "與最後一則 assistant 里程碑摘要(從 event_log 撈,"
+                     "不打擾對方、不佔對方回合)。"),
+     "inputSchema": {"type": "object", "properties": {
+         "session_id": {"type": "string"}},
+         "required": ["session_id"]}},
+    {"name": "pocket_wait_idle",
+     "description": ("輪詢到會話回合結束(phase=idle,或 blocked=對方在等"
+                     "輸入/核准)或逾時,回最後 assistant 里程碑文字。"
+                     "timeout_secs 上限 600;逾時 timed_out=true,"
+                     "不會取消對方的工作。"),
+     "inputSchema": {"type": "object", "properties": {
+         "session_id": {"type": "string"},
+         "timeout_secs": {"type": "number",
+                          "description": "等待秒數(1–600,預設 120)"}},
+         "required": ["session_id"]}},
+]
+
+
+class _OrchInternalRequest:
+    """內部轉發用的最小 request:只支撐 `_check_auth`(headers)與
+    `request.json()`。/mcp 已經用 master token 過了一次 auth,轉發時帶同
+    一個 Authorization —— 權限只縮不放:MCP 面不產生任何新的授權。"""
+
+    def __init__(self, auth_header: str, body: dict):
+        self.headers = {"authorization": auth_header or ""}
+        self.client = None
+        self._body = body
+
+    async def json(self) -> dict:
+        return self._body
+
+
+async def _orch_mcp_active_delegations() -> list:
+    """MCP 面開出去、runtime 還沒收斂的 delegation(並行配額的記帳基準)。
+    用 runtime 狀態而不是 registry 靜態 status —— 靜態欄位不保證回寫,
+    拿它記帳會把「做完但沒改欄位」的舊單永久算成活的,配額就鎖死了。"""
+    out = []
+    for row in _delegation_rows(limit=200):
+        d = dict(row)
+        if (d.get("created_via") or "") != ORCH_MCP_CREATED_VIA:
+            continue
+        runtime = await _delegation_runtime_status(row)
+        if runtime in _ORCH_MCP_TERMINAL:
+            continue
+        out.append({"id": d.get("id"), "work_order": d.get("work_order"),
+                    "status": runtime})
+    return out
+
+
+def _orch_mcp_session_id(provider: str, delegation: dict) -> str:
+    if provider == "codex":
+        key = (delegation.get("codex_thread_id")
+               or delegation.get("provider_session_id") or "")
+        return f"codex:{key}"
+    key = (delegation.get("cc_session_name")
+           or delegation.get("provider_session_id") or "")
+    return f"claude_code:{key}"
+
+
+async def _orch_tool_open_thread(request: Request, args: dict) -> dict:
+    provider = _normalise_provider(str(args.get("provider") or ""))
+    prompt = str(args.get("prompt") or "").strip()
+    if not prompt:
+        raise http_err(400, "ORCH_MCP_BAD_REQUEST", "prompt required")
+    active = await _orch_mcp_active_delegations()
+    if len(active) >= ORCH_MCP_MAX_PARALLEL:
+        raise http_err(
+            429, "ORCH_MCP_DELEGATION_LIMIT",
+            f"orchestrator MCP 並行 delegation 已達上限 {ORCH_MCP_MAX_PARALLEL}"
+            f"(active: {', '.join(str(a.get('id')) for a in active)});"
+            "先用 pocket_wait_idle 收割既有會話再開新的")
+    body = {"parent_persona": ORCH_MCP_PARENT, "provider": provider,
+            "objective": prompt, "task_code": "ORCH", "subtask_code": "MCP",
+            "created_via": ORCH_MCP_CREATED_VIA}
+    if str(args.get("cwd") or "").strip():
+        body["cwd"] = str(args["cwd"]).strip()
+    res = await app_delegation_create(_OrchInternalRequest(
+        request.headers.get("authorization", ""), body))
+    d = (res or {}).get("delegation") or {}
+    session_id = _orch_mcp_session_id(provider, d)
+    seq = _event_append(session_id, "thread.delegated",
+                        {"delegation_id": d.get("id"),
+                         "work_order": d.get("work_order"),
+                         "provider": provider,
+                         "parent_persona": ORCH_MCP_PARENT,
+                         "created_via": ORCH_MCP_CREATED_VIA},
+                        external_id=f"orchmcp:{d.get('id')}")
+    _log_event("orch_mcp_open_thread", provider=provider,
+               delegation=str(d.get("id") or ""),
+               work_order=str(d.get("work_order") or ""))
+    return {"ok": True, "session_id": session_id,
+            "delegation_id": d.get("id"), "work_order": d.get("work_order"),
+            "provider": provider, "status": d.get("status"),
+            "event_seq": seq}
+
+
+async def _orch_tool_send(request: Request, args: dict) -> dict:
+    session_id = str(args.get("session_id") or "").strip()
+    text = str(args.get("text") or "").strip()
+    if not session_id or not text:
+        raise http_err(400, "ORCH_MCP_BAD_REQUEST", "session_id and text required")
+    body = {"content": text}
+    if str(args.get("client_id") or "").strip():
+        body["client_id"] = str(args["client_id"]).strip()
+    res = await v2_session_input(session_id, _OrchInternalRequest(
+        request.headers.get("authorization", ""), body))
+    return res if isinstance(res, dict) else {"ok": True, "session_id": session_id}
+
+
+def _orch_event_status(session_id: str) -> dict:
+    """event_log 視角的會話狀態:最後一筆 session.status(phase/busy/label)
+    + 最後一則 assistant 里程碑卡的文字。唯讀、不打擾對方 session。"""
+    import sqlite3
+    out = {"session_id": session_id, "phase": "unknown", "busy": None,
+           "label": "", "last_assistant_milestone": None, "last_event_seq": 0}
+    try:
+        con = sqlite3.connect(f"file:{CANON_DB}?mode=ro", uri=True, timeout=5)
+        try:
+            rows = con.execute(
+                "SELECT id,type,payload,created_at FROM event_log "
+                "WHERE session=? AND type IN "
+                "('session.status','card.milestone') "
+                "ORDER BY id DESC LIMIT 120", (session_id,)).fetchall()
+        finally:
+            con.close()
+    except Exception as _exc:  # noqa: BLE001 — 表還沒建/唯讀打不開=沒有事件
+        _log_exc("_orch_event_status", _exc, expected=True)
+        return out
+    status_seen = False
+    for rid, etype, payload, ts in rows:
+        if not out["last_event_seq"]:
+            out["last_event_seq"] = int(rid or 0)
+        try:
+            data = json.loads(payload or "{}")
+        except (TypeError, ValueError):
+            data = {}
+        if etype == "session.status" and not status_seen:
+            status_seen = True
+            out["phase"] = str(data.get("phase") or "unknown")
+            out["busy"] = bool(data.get("busy"))
+            out["label"] = str(data.get("label") or "")
+        elif etype == "card.milestone" and out["last_assistant_milestone"] is None:
+            card = (data or {}).get("card") or {}
+            if card.get("role") != "assistant":
+                continue
+            card_body = card.get("body") or {}
+            text = str(card_body.get("text")
+                       or card_body.get("fallback_text") or "").strip()
+            if text:
+                out["last_assistant_milestone"] = {"ts": ts, "text": text[:2000]}
+        if status_seen and out["last_assistant_milestone"] is not None:
+            break
+    return out
+
+
+async def _orch_tool_status(args: dict) -> dict:
+    session_id = str(args.get("session_id") or "").strip()
+    if not session_id:
+        raise http_err(400, "ORCH_MCP_BAD_REQUEST", "session_id required")
+    _v2_card_source(session_id)   # 驗 id 形狀/存在(壞 provider 400、未知 404)
+    return {"ok": True, **_orch_event_status(session_id)}
+
+
+async def _orch_tool_wait_idle(args: dict) -> dict:
+    session_id = str(args.get("session_id") or "").strip()
+    if not session_id:
+        raise http_err(400, "ORCH_MCP_BAD_REQUEST", "session_id required")
+    _v2_card_source(session_id)
+    try:
+        timeout = float(args.get("timeout_secs") or 120.0)
+    except (TypeError, ValueError):
+        raise http_err(400, "ORCH_MCP_BAD_REQUEST", "timeout_secs must be numeric")
+    timeout = max(1.0, min(600.0, timeout))
+    deadline = time.monotonic() + timeout
+    while True:
+        st = _orch_event_status(session_id)
+        # idle = 回合結束;blocked = 對方在等輸入/核准 —— 不會自己前進,
+        # 繼續等只會等到逾時,直接把球交回編排方(phase 會說明原因)。
+        if st.get("phase") in ("idle", "blocked"):
+            return {"ok": True, "timed_out": False, **st}
+        if time.monotonic() >= deadline:
+            return {"ok": True, "timed_out": True, **st}
+        await asyncio.sleep(min(1.0, max(0.05, deadline - time.monotonic())))
+
+
+async def _orch_mcp_tool_call(request: Request, name: str, args: dict) -> dict:
+    if name == "pocket_open_thread":
+        return await _orch_tool_open_thread(request, args)
+    if name == "pocket_send":
+        return await _orch_tool_send(request, args)
+    if name == "pocket_status":
+        return await _orch_tool_status(args)
+    if name == "pocket_wait_idle":
+        return await _orch_tool_wait_idle(args)
+    raise http_err(400, "ORCH_MCP_UNKNOWN_TOOL", f"unknown tool: {name}")
+
+
+@app.post("/mcp")
+async def orchestrator_mcp_rpc(request: Request):
+    """Orchestrator MCP server(JSON-RPC over HTTP,無 SSE 的最小面)。
+
+    只收 master BRIDGE_TOKEN(_require_master_auth):這是機器對機器的
+    編排面,device token(手機配對出來的)拿到 403 —— 權限只縮不放。
+    支援 initialize / tools/list / tools/call / ping;notifications 回 202。
+    工具執行失敗走 MCP 的 isError(result 層),協定錯誤才用 JSON-RPC error。"""
+    _require_master_auth(request)
+    msg = await _json_body(request)
+    mid = msg.get("id")
+    method = str(msg.get("method") or "")
+    if method.startswith("notifications/"):
+        return Response(status_code=202)
+    if method == "initialize":
+        requested = str(((msg.get("params") or {}).get("protocolVersion")) or "")
+        proto = requested if requested in _ORCH_MCP_PROTOCOLS else _ORCH_MCP_PROTOCOL
+        return {"jsonrpc": "2.0", "id": mid, "result": {
+            "protocolVersion": proto,
+            "capabilities": {"tools": {}},
+            "serverInfo": {"name": "pocket-orchestrator", "version": "1.0.0"}}}
+    if method == "ping":
+        return {"jsonrpc": "2.0", "id": mid, "result": {}}
+    if method == "tools/list":
+        return {"jsonrpc": "2.0", "id": mid,
+                "result": {"tools": _ORCH_MCP_TOOLS}}
+    if method == "tools/call":
+        params = msg.get("params") or {}
+        name = str(params.get("name") or "")
+        args = params.get("arguments")
+        try:
+            out = await _orch_mcp_tool_call(
+                request, name, args if isinstance(args, dict) else {})
+            is_err = False
+        except HTTPException as exc:
+            code = (getattr(exc, "code", "")
+                    or _GENERIC_ERROR_CODES.get(exc.status_code, "HTTP_ERROR"))
+            out = {"error": {"code": code, "status": exc.status_code,
+                             "message": getattr(exc, "message", "")
+                             or str(exc.detail)}}
+            is_err = True
+        except Exception as exc:  # noqa: BLE001 — 工具錯誤必須回 isError,不准 500
+            _log_exc("orchestrator_mcp_rpc", exc)
+            out = {"error": {"code": "ORCH_MCP_TOOL_FAILED",
+                             "message": f"{type(exc).__name__}: {exc}"}}
+            is_err = True
+        return {"jsonrpc": "2.0", "id": mid, "result": {
+            "content": [{"type": "text",
+                         "text": json.dumps(out, ensure_ascii=False)}],
+            "isError": is_err}}
+    if mid is None:
+        return Response(status_code=202)
+    return {"jsonrpc": "2.0", "id": mid,
+            "error": {"code": -32601, "message": f"method not found: {method}"}}
+
+
 async def _v2_session_op(op: str, session_id: str, request: Request):
     """統一入口:auth → 解析 provider → 查表 → 委派。
 
