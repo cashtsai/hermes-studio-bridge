@@ -1756,3 +1756,44 @@ device token:
   藉錯誤碼探測檔案存不存在。
 - `/pair/devices` 上看得到(`is_remote_console: true` ＋ `scope` ＋ `expires`),
   機主可以隨時撤銷。app 的裝置清單應該把它標成「遠端瀏覽器」而不是一台裝置。
+
+## 附註 A:pocket-id 心跳 `notices` 下行(backup orphan 提醒,2026-11-06)
+
+> 這一節描述的是 **bridge ↔ pocket-id** 的機器間契約(不是 app ↔ bridge),
+> 放在這裡是因為消費端(bridge)與最終的使用者可見行為(本地推播)都在
+> 本 repo;pocket-id 端的產生邏輯由另一棒實作,照本節的形狀對齊。
+
+背景:pocket-id 的 reaper(`/v1/admin/cloud/reap`,每小時 timer)會掃出
+**備份孤兒** —— backup 家族訂閱還在扣款,但 host 權益已到期/名下機器已
+回收(帳號級清單 `backup_orphans`)。使用者在為一台不存在的機器付月費,
+必須主動告知。但推播通道在 bridge(APNs 金鑰與裝置 token 在各 host 的
+機主 Mac / lobster 上),pocket-id 自己推不了。
+
+通道:沿用 `POST /v1/hosts/heartbeat` **回應**的既有下行線(同
+`update_ref` 的「我們講、它聽」模式 —— 不開新常駐連線、不加狀態機)。
+
+```jsonc
+// 心跳回應(host 所屬帳號有備份孤兒時才帶 notices)
+{
+  "ok": true,
+  "notices": [
+    { "type": "backup_orphan", "product_id": "com.pocketagent.backup.monthly" }
+  ]
+}
+```
+
+規則:
+
+- **沒有 `notices` 欄位 = 無事**。舊版 pocket-id/bridge 因此雙向相容。
+- pocket-id 端**每次心跳都可以重複帶**(孤兒還在就帶),不需要 server 側
+  去重/簽收 —— 去重是 bridge 的本地責任:同一則 notice(`type:product_id`
+  為鍵)**24h 內只推一次**,記在 `~/.pocket/heartbeat-notices.json`
+  (env 把手 `POCKET_HB_NOTICE_STATE`),重啟不失憶。
+- bridge 收到 `type: "backup_orphan"` → 轉成本地推播(`push_notify` 既有
+  管線)給所有已配對裝置:「備份訂閱仍在扣款但主機已到期,記得取消」。
+  payload `data.pocket = {kind: "backup_orphan", productId}`,
+  `thread_id = "account-notices"`。
+- 不認識的 `type`:跳過 + `pocket_id_notice_unknown` 事件留痕(向前相容,
+  新型別由升級後的 bridge 接手)。
+- notices 消費失敗(APNs 掛了等)**不得**讓心跳本身看起來失敗 ——
+  否則 `_pocket_id_loop` 會對健康的 pocket-id 指數退避。

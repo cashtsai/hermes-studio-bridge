@@ -40,6 +40,8 @@ _ENV_TMP_DEFAULTS = {
     "POCKET_TUNNEL_URL_FILE": os.path.join(_TMP, "tunnel-url"),
     "PAIR_BOOT_CODE_FILE":    os.path.join(_TMP, "pair-boot-code"),
     "POCKET_ID_STATE_FILE":   os.path.join(_TMP, "pocket-id-enrollment.json"),
+    # bridge.py 心跳 notices 的 24h dedup 檔(backup orphan 推播提醒)
+    "POCKET_HB_NOTICE_STATE": os.path.join(_TMP, "heartbeat-notices.json"),
     # bridge.py 中繼隧道:grant.json 裡是 frp token(進隧道的鑰匙)、frpc.toml
     # 是活的設定、旗標檔決定隧道開不開 —— 三個都在 ~/.pocket/relay 底下,
     # 不導的話測試會改到真機的中繼狀態(落在 guard 層的 ~/.pocket 紅線內)。
