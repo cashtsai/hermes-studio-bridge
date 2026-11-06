@@ -79,6 +79,20 @@ launchctl print gui/$(id -u)/com.pocketconnect.bridge
 
 不要把 bridge token 貼進聊天或 log。若是新版本造成問題，先保留 log 與 commit，再用上一個已知可用 commit 的獨立 worktree 執行同一套 installer 做回退；不要在整合工作區 reset。
 
+若 bridge 因啟動崩潰進入 crash-loop hold，先清除 hold 再重試：
+
+```bash
+POCKET_BRIDGE_LABEL=pocket-bridge scripts/bridge-reset-crash-loop.sh
+```
+
+Vultr 的 `lobster-update.sh` 會在切版前保留 canonical/accounts SQLite snapshot，
+候選版探活失敗會自動切回舊 release。資料庫 snapshot 不會自動覆蓋目前資料；只有
+確認要捨棄 snapshot 之後的新寫入時，才使用：
+
+```bash
+CONFIRM_RESTORE=1 scripts/restore-sqlite-snapshot.sh <snapshot-prefix>
+```
+
 ## B. Pocket macOS release workflow
 
 Pocket app 的 PR #259 已合併，但 macOS archive/notarization 需要 release host 的 Apple secrets。GitHub 上依序操作：

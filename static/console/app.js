@@ -291,6 +291,55 @@ function cardText(c) {
   return b.text || b.fallback_text || b.typed_text || (typeof c.body === "string" ? c.body : "");
 }
 
+function safeHttpUrl(value) {
+  try {
+    const url = new URL(String(value || ""));
+    return (url.protocol === "http:" || url.protocol === "https:") ? esc(url.href) : "";
+  } catch (e) { return ""; }
+}
+
+// Typed visual replies are additive.  Keep HTML blocks as text so an old or
+// compromised provider payload cannot turn the web console into an HTML sink.
+function visualReplyHtml(c) {
+  const visual = (c.body || {}).visual;
+  if (!visual || !Array.isArray(visual.blocks)) return "";
+  const blocks = visual.blocks.map((b) => {
+    if (!b || typeof b !== "object") return "";
+    const type = String(b.type || "").toLowerCase();
+    if (type === "image") {
+      const url = safeHttpUrl(b.url || b.download_url);
+      return url ? '<img class="visual-image" loading="lazy" src="' + url +
+        '" alt="' + esc(b.alt || "圖片") + '">' : "";
+    }
+    if (type === "link" || type === "file") {
+      const url = safeHttpUrl(b.url || b.download_url);
+      if (!url) return "";
+      const label = esc(b.label || b.filename || (type === "file" ? "檔案" : "開啟連結"));
+      return '<a class="visual-link" href="' + url +
+        '" target="_blank" rel="noopener noreferrer">' + label + "</a>";
+    }
+    if (type === "text" || type === "markdown" || type === "html") {
+      const text = type === "html" ? (b.fallback_text || b.text || b.html) : b.text;
+      return text ? '<div class="visual-text">' + esc(text).replace(/\n/g, "<br>") + "</div>" : "";
+    }
+    return "";
+  }).filter(Boolean).join("");
+  if (!blocks) return "";
+  const fallback = visual.fallback_text ?
+    '<div class="visual-fallback">' + esc(visual.fallback_text).replace(/\n/g, "<br>") + "</div>" : "";
+  return '<div class="visual-reply">' + blocks + fallback + "</div>";
+}
+
+function cardBodyHtml(c) {
+  const visual = visualReplyHtml(c);
+  const text = cardText(c);
+  const body = c.body || {};
+  // visual cards normally carry fallback_text but no duplicate plain text.
+  const plain = body.text || body.typed_text || (typeof body === "string" ? body : "");
+  return visual + (visual ? (plain ? '<div class="visual-plain">' + esc(plain).replace(/\n/g, "<br>") + "</div>" : "")
+                     : esc(text).replace(/\n/g, "<br>"));
+}
+
 // ───────────────────────── 主題(與 App 的 PocketPalettes 同名同值)─────────────
 // App 端三個 preset:pocket(預設,奶油暖底)/ white / dark。console 不能讀手機上
 // 的選擇(不同裝置),所以本機記一份,預設與 App 預設相同。
@@ -368,7 +417,7 @@ function renderCards() {
       const kind = c.kind && c.kind !== "text"
         ? '<span class="kind">' + esc(c.kind) + "</span>" : "";
       return '<div class="card ' + t.role + mono + streaming + '">' + kind +
-             '<div class="card-body">' + esc(cardText(c)).replace(/\n/g, "<br>") +
+             '<div class="card-body">' + cardBodyHtml(c) +
              "</div></div>";
     }).join("");
     return '<div class="turn ' + t.role + '">' + meta + body + "</div>";

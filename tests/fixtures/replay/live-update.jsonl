@@ -1,0 +1,5 @@
+{"event":"live_update","payload":{"version":1,"session_id":"codex:fixture-1","seq":10,"state":"running","phase":"執行工具","updated_at":1783291200,"terminal":false}}
+{"event":"live_update","payload":{"version":1,"session_id":"codex:fixture-1","seq":12,"state":"streaming","phase":"回覆中","updated_at":1783291202,"terminal":false}}
+{"event":"live_update","payload":{"version":1,"session_id":"codex:fixture-1","seq":11,"state":"running","phase":"舊事件","updated_at":1783291201,"terminal":false}}
+{"event":"live_update","payload":{"version":1,"session_id":"codex:fixture-1","seq":13,"state":"completed","phase":"完成","updated_at":1783291203,"terminal":true}}
+{"event":"live_update","payload":{"version":1,"session_id":"codex:fixture-1","seq":14,"state":"running","phase":"遲到事件","updated_at":1783291204,"terminal":false}}

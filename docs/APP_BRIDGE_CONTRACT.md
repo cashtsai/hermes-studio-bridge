@@ -32,6 +32,47 @@ internals.
   commit real tokens to git.
 - `/health` may be used as a lightweight reachability check.
 
+## 1.1 Typed visual reply envelope (additive)
+
+Cards may include an optional `body.visual` envelope. It is versioned and must
+always be accompanied by the existing `fallback_text`; older clients ignore
+the envelope and render the fallback.
+
+```json
+{
+  "version": 1,
+  "fallback_text": "摘要",
+  "blocks": [
+    {"type": "text", "text": "摘要"},
+    {"type": "image", "url": "https://example.invalid/a.png",
+     "mime": "image/png", "alt": "預覽"},
+    {"type": "link", "url": "https://example.invalid", "label": "原文"},
+    {"type": "html", "html": "<p>已清理內容</p>", "sanitized": true}
+  ]
+}
+```
+
+Allowed block types are `text`, `markdown`, `image`, `file`, `link`, and
+`html`. `html` requires server-side sanitization and is rejected if common
+active-content markers are present. Provider-specific fields and secret-like
+fields are dropped or rejected. Raw HTML is never placed into the normal text
+field. The envelope is a capability-gated extension; it does not change the
+v2 fallback path.
+
+## 1.2 Live update event envelope (iOS and Android)
+
+ActivityKit payloads keep the existing iOS `busy`, `phaseLabel`, and
+`endedLabel` fields, and also carry the shared event fields:
+`version`, `sessionID`, `seq`, `state`, and `terminal`. The allowed states are
+`connecting`, `queued`, `running`, `waiting_user`, `streaming`, `completed`,
+`failed`, `disconnected`, and `idle`.
+
+`completed` and `failed` are the only terminal states. Clients must discard an
+event whose sequence is older than the last accepted event, must not turn a
+transport `disconnected` state into `idle`, and must always apply a terminal
+event even when non-terminal updates are throttled. Android Live Updates use
+the same envelope; only the platform presentation differs.
+
 ## 2. Stable v1 Endpoints
 
 ### `GET /health`
@@ -475,6 +516,23 @@ Rules:
   them for delivery/working UI and must not persist them as assistant text.
 - The stream ends with `data: [DONE]`.
 
+### Guest links（唯讀、短效、無帳號）
+
+`POST /app/v1/guest-links` requires the normal owner/device bearer token and
+accepts `{session_id, ttl_secs?}`. `ttl_secs` is clamped to 5 minutes through
+7 days. The response is `{url, expires_at}`. The URL itself is the only guest
+credential: it is an HMAC-signed token containing the session id and expiry.
+The bridge stores neither the raw URL nor a token row, renders text-only
+HTML with escaping and `noindex`, and returns `410` for invalid, expired or
+unknown links without distinguishing those cases.
+
+`POST /app/v1/guest-links/revoke-all` requires the same authenticated
+owner/device bearer as the create endpoint and rotates the host-local guest
+signing secret. It returns `{revoked: true}` and
+invalidates all previously issued guest links. This is intentionally
+all-links revocation; per-link revocation would require a token-hash denylist
+and a retention policy.
+
 ### `POST /app/v1/uploads/file`
 
 Uploads one composer attachment as a bearer-authenticated multipart request.
@@ -893,6 +951,8 @@ client 對接要知道的最小集合（2026-08-01 補：Android 端曾因本節
 | `GET  /app/v2/sessions/{id}/events?since_seq=&profile=` | SSE 卡片事件流（§5） | ✅ 上線（S1：cc；同上） |
 | `GET  /app/v2/sessions/{id}/media?limit=&cursor=` | session 媒體永久索引（§7） | ✅ 上線（cc/cx/persona） |
 | `GET  /app/v2/artifacts/{media_id}` | 已封存 artifact 位元組 | ✅ 上線 |
+| `POST /app/v1/guest-links` | 建立短效、唯讀、無帳號分享連結 | ✅ 上線 |
+| `POST /app/v1/guest-links/revoke-all` | authenticated owner/device 輪替 guest signing secret，使既有連結全部失效 | ✅ 上線 |
 | `POST /app/v2/sessions/{id}/approve` | 核准/拒絕（body: `{approve: bool}` 或 `{decision}`；`for_session` 可記住） | ✅ 上線（現路由僅 cx；cc/persona 併入待批次 2 統一路由） |
 | `POST /app/v2/sessions/{id}/input` | 送訊息/指令(可帶 attachments) | ⏳ 批次 2（統一路由；現走 v1 `/app/v1/delegations/{…}/input` 與 `/app/v1/messages`） |
 

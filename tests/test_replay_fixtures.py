@@ -26,27 +26,31 @@ os.environ.setdefault("BRIDGE_TOKEN", "test-unit-token")
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import carddigest  # noqa: E402
+from live_update_event import LiveUpdateCursor  # noqa: E402
+from replay_fixture import (ReplayFixtureError, load_jsonl,
+                            validate_manifest)  # noqa: E402
 
 
 FIXTURE_DIR = Path(__file__).parent / "fixtures" / "replay"
+MANIFEST_PATH = FIXTURE_DIR / "manifest.json"
+
+
+def load_manifest() -> dict:
+    """Load the reviewed provider/scenario coverage manifest."""
+    with MANIFEST_PATH.open(encoding="utf-8") as fh:
+        manifest = json.load(fh)
+    if manifest.get("schema_version") != 1:
+        raise AssertionError("unsupported replay fixture manifest schema")
+    validate_manifest(manifest, FIXTURE_DIR)
+    return manifest
 
 
 def load_fixture(name: str) -> list[dict]:
     """Load one reviewed provider transcript fixture from JSONL."""
-    frames = []
-    with (FIXTURE_DIR / name).open(encoding="utf-8") as fh:
-        for line_no, line in enumerate(fh, 1):
-            if not line.strip():
-                continue
-            try:
-                frame = json.loads(line)
-            except ValueError as exc:
-                raise AssertionError(f"invalid JSON in {name}:{line_no}") from exc
-            if (not isinstance(frame, dict)
-                    or not (frame.get("method") or frame.get("event"))):
-                raise AssertionError(f"invalid frame in {name}:{line_no}")
-            frames.append(frame)
-    return frames
+    try:
+        return load_jsonl(FIXTURE_DIR / name)
+    except ValueError as exc:
+        raise AssertionError(f"invalid replay fixture: {name}") from exc
 
 
 def replay(frames: list) -> "carddigest.CodexThreadDigest":
@@ -120,6 +124,71 @@ class TestCxSimpleTurn(unittest.TestCase):
         self.assertEqual(turns, ["begin", "end"])
 
 
+class TestReplayManifest(unittest.TestCase):
+    def test_manifest_references_existing_fixture_scenarios(self):
+        manifest = load_manifest()
+        fixture_names = {p.stem for p in FIXTURE_DIR.glob("*.jsonl")}
+        for provider, scenarios in manifest["providers"].items():
+            for scenario, filename in scenarios.items():
+                self.assertIn(
+                    Path(filename).stem,
+                    fixture_names,
+                    f"{provider} fixture 不存在: {scenario} -> {filename}",
+                )
+
+    def test_release_gate_has_explicit_six_scenario_contract(self):
+        manifest = load_manifest()
+        self.assertEqual(manifest["recorder_version"], "t3code-replay-1")
+        self.assertEqual(
+            manifest["digest_algorithm"],
+            "sha256-canonical-jsonl-v1",
+        )
+        self.assertTrue(manifest["recording_policy"]["sanitize_before_write"])
+        self.assertTrue(manifest["recording_policy"]["owner_only_output"])
+        self.assertFalse(manifest["recording_policy"]["raw_transcript_committed"])
+        self.assertEqual(
+            set(manifest["release_scenarios"]),
+            {
+                "simple_turn",
+                "stream_resume",
+                "interrupt_or_unsupported",
+                "approval_pending_and_resolved",
+                "queued_message",
+                "error_terminal",
+            },
+        )
+
+    def test_release_validator_rejects_partial_provider(self):
+        manifest = load_manifest()
+        with self.assertRaisesRegex(ReplayFixtureError,
+                                    "release fixture scenarios missing"):
+            validate_manifest(manifest, FIXTURE_DIR, release=True)
+
+    def test_manifest_rejects_fixture_path_escape(self):
+        manifest = load_manifest()
+        manifest["providers"] = {"codex": {"simple_turn": "../outside.jsonl"}}
+        with self.assertRaisesRegex(ReplayFixtureError, "escapes manifest"):
+            validate_manifest(manifest, FIXTURE_DIR)
+
+    def test_manifest_rejects_digest_drift(self):
+        manifest = load_manifest()
+        manifest["fixture_digests"]["cx-simple.jsonl"] = "0" * 64
+        with self.assertRaisesRegex(ReplayFixtureError, "digest mismatch"):
+            validate_manifest(manifest, FIXTURE_DIR)
+
+    def test_capability_fixtures_are_explicit_and_present(self):
+        manifest = load_manifest()
+        capabilities = manifest.get("capability_scenarios") or {}
+        self.assertEqual(set(capabilities), {"visual_replies", "live_updates"})
+        for capability, scenarios in capabilities.items():
+            self.assertTrue(scenarios, f"{capability} must have a scenario")
+            for scenario, filename in scenarios.items():
+                self.assertTrue(
+                    (FIXTURE_DIR / filename).is_file(),
+                    f"{capability}/{scenario} fixture missing: {filename}",
+                )
+
+
 class TestCxTurnError(unittest.TestCase):
     def test_error_turn_emits_error_card(self):
         d = replay(load_fixture("cx-error.jsonl"))
@@ -174,6 +243,34 @@ class TestOpenClawSimpleTurn(unittest.TestCase):
         turns = [e["data"]["state"] for e in d.store.events
                  if e["type"] == "turn"]
         self.assertEqual(turns, ["begin", "end"])
+
+
+class TestCapabilityReplay(unittest.TestCase):
+    def test_visual_fixture_projects_typed_blocks_and_fallback(self):
+        digest = replay_persona(load_fixture("visual-reply.jsonl"),
+                                carddigest.PersonaDigest())
+        visual_cards = [c for c in _cards(digest)
+                        if c.get("body", {}).get("visual")]
+        self.assertEqual(len(visual_cards), 1)
+        visual = visual_cards[0]["body"]["visual"]
+        self.assertEqual(visual["fallback_text"], "看圖與原文")
+        self.assertEqual([b["type"] for b in visual["blocks"]],
+                         ["image", "link"])
+
+    def test_live_update_fixture_rejects_stale_and_post_terminal_events(self):
+        cursor = LiveUpdateCursor("codex:fixture-1")
+        applied = []
+        for frame in load_fixture("live-update.jsonl"):
+            self.assertEqual(frame["event"], "live_update")
+            applied.append(cursor.accept(frame["payload"]))
+        self.assertEqual(applied, [True, True, False, True, False])
+        self.assertEqual(cursor.snapshot(), {
+            "session_id": "codex:fixture-1",
+            "seq": 13,
+            "state": "completed",
+            "phase": "完成",
+            "terminal": True,
+        })
 
 
 if __name__ == "__main__":

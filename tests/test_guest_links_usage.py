@@ -33,8 +33,15 @@ class TestGuestToken(unittest.TestCase):
     def test_secret_rotation_kills_all(self):
         tok, _ = bridge._guest_token_make("codex:abc", 3600)
         self.assertIsNotNone(bridge._guest_token_verify(tok))
-        bridge._GUEST_SECRET_PATH.unlink()        # 撤銷 = 刪密鑰
+        bridge._guest_revoke_all()
         self.assertIsNone(bridge._guest_token_verify(tok))
+
+    def test_revoke_all_keeps_new_links_working(self):
+        old, _ = bridge._guest_token_make("codex:old", 3600)
+        bridge._guest_revoke_all()
+        new, _ = bridge._guest_token_make("codex:new", 3600)
+        self.assertIsNone(bridge._guest_token_verify(old))
+        self.assertEqual(bridge._guest_token_verify(new), "codex:new")
 
     def test_html_escapes(self):
         html = bridge._guest_html("s", [

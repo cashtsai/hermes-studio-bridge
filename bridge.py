@@ -25,6 +25,7 @@ import ipaddress
 import json
 import math
 import difflib
+import functools
 import mimetypes
 import os
 import pty
@@ -51,6 +52,7 @@ from pathlib import Path
 import agent_call as agent_call_policy
 import agent_context as agent_context_policy
 import agent_registry
+import apns_key_provider
 import codex_home
 import host_discovery
 from harness import distill as harness_distill
@@ -61,6 +63,9 @@ import media_artifacts
 import hermes_media
 import openclaw_provider
 import gemini_provider
+import orchestrator
+import live_update_event
+import replay_fixture
 import t3code_runtime
 import cc_detect            # CC TUI 狀態偵測(manifest 引擎;herdr 設計移植)
 import cc_sdk               # CC provider v2(Agent SDK;模組內 lazy-import SDK)
@@ -96,16 +101,18 @@ _MAIN_LOOP = None
 # T3Code #3: opt-in Codex wire fixture recorder. It is deliberately disabled
 # by default because app-server frames can contain prompts, paths, and tool
 # output. When a maintainer sets POCKET_RECORD_FIXTURE, each inbound server
-# request/notification is appended as one JSONL frame for local replay tests.
+# request/notification is validated, sanitized, and appended as canonical JSONL
+# for local replay tests; rejected secret-like frames never land on disk.
 _FIXTURE_RECORD_LOCK = threading.Lock()
 
 
 def _record_fixture_frame(msg: dict) -> None:
-    """Append one inbound Codex app-server frame to an explicit local path.
+    """Append one validated inbound Codex frame to an explicit local path.
 
     This is a debugging/replay aid, not an audit log. The caller opts in with
-    ``POCKET_RECORD_FIXTURE=/private/tmp/codex.jsonl``; the file is created with
-    owner-only permissions and failures never affect the live bridge.
+    ``POCKET_RECORD_FIXTURE=/private/tmp/codex.jsonl``; the recorder rejects
+    secret-like fields/values, writes canonical JSONL with owner-only
+    permissions, and failures never affect the live bridge.
     """
     path = os.path.expanduser(os.environ.get("POCKET_RECORD_FIXTURE", "").strip())
     if not path or not isinstance(msg, dict) or not msg.get("method"):
@@ -117,20 +124,13 @@ def _record_fixture_frame(msg: dict) -> None:
     # but the replay digest intentionally ignores this optional field.
     if "id" in msg:
         frame["request_id"] = msg["id"]
-    raw = (json.dumps(frame, ensure_ascii=False, separators=(",", ":"),
-                      default=str) + "\n").encode("utf-8")
     try:
-        parent = os.path.dirname(os.path.abspath(path))
-        os.makedirs(parent, mode=0o700, exist_ok=True)
         with _FIXTURE_RECORD_LOCK:
-            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
-            try:
-                os.fchmod(fd, 0o600)
-                view = memoryview(raw)
-                while view:
-                    view = view[os.write(fd, view):]
-            finally:
-                os.close(fd)
+            replay_fixture.append_frame(path, frame)
+    except replay_fixture.ReplayFixtureError as exc:
+        # A rejected frame must never affect the live provider stream, but it
+        # is useful to leave a type-only diagnostic for the recorder owner.
+        _log_event("codex_fixture_frame_rejected", reason=type(exc).__name__)
     except Exception as exc:  # noqa: BLE001
         # Recording must never turn a healthy provider stream into an error.
         _log_event("codex_fixture_record_failed", error=type(exc).__name__)
@@ -4296,6 +4296,28 @@ APNS_HOST = os.environ.get(
 _apns_jwt_cache: list = [None, 0.0]        # [token, issued_at]
 _apns_disabled_logged: list = [False]      # 只記一次,避免每則推播都刷 log
 
+# ActivityKit updates are a low-priority background channel.  A provider can
+# emit several phase events in one second; forwarding all of them wastes APNs
+# budget and makes the lock screen visibly jumpy.  Final updates are never
+# throttled, so completion/interruption cannot be hidden behind this guard.
+LIVE_ACTIVITY_MIN_UPDATE_SECS = float(os.environ.get(
+    "APNS_LIVE_ACTIVITY_MIN_UPDATE_SECS", "8"))
+_LIVE_ACTIVITY_LAST_SENT: dict[str, float] = {}
+
+
+def _live_activity_update_throttled(session_id: str, busy: bool,
+                                    now: float | None = None) -> bool:
+    """Return whether a non-terminal ActivityKit update is inside the window."""
+    if not busy or LIVE_ACTIVITY_MIN_UPDATE_SECS <= 0:
+        return False
+    current = time.monotonic() if now is None else now
+    last = _LIVE_ACTIVITY_LAST_SENT.get(session_id)
+    return last is not None and current - last < LIVE_ACTIVITY_MIN_UPDATE_SECS
+
+
+def _live_activity_forget(session_id: str) -> None:
+    _LIVE_ACTIVITY_LAST_SENT.pop(session_id, None)
+
 
 def apns_configured() -> bool:
     """金鑰三件套(路徑上的 .p8 檔 + KEY_ID + TEAM_ID)齊備才算配置完成。
@@ -4303,7 +4325,12 @@ def apns_configured() -> bool:
     未配置 → 推播模組整體靜默停用:push_notify 短路回 disabled,不打 APNs、
     不讀金鑰、不炸例外。第一次偵測到未配置時 _log_event 一筆(此後安靜),
     讓「推播沒動靜」可以在 event log 裡查到原因而不是無聲消失。"""
-    ok = bool(APNS_KEY_ID) and bool(APNS_TEAM_ID) and os.path.isfile(APNS_KEY_PATH)
+    ok = bool(APNS_KEY_ID) and bool(APNS_TEAM_ID) and apns_key_provider.available(
+        source=os.environ.get("APNS_KEY_SOURCE", "file"),
+        path=APNS_KEY_PATH,
+        service=os.environ.get("APNS_KEYCHAIN_SERVICE"),
+        account=os.environ.get("APNS_KEYCHAIN_ACCOUNT"),
+    )
     if not ok and not _apns_disabled_logged[0]:
         _apns_disabled_logged[0] = True
         _log_event("apns_disabled",
@@ -4340,8 +4367,12 @@ def _apns_jwt() -> str:
     now = time.time()
     if _apns_jwt_cache[0] and now - _apns_jwt_cache[1] < 3000:
         return _apns_jwt_cache[0]
-    with open(APNS_KEY_PATH) as f:
-        key = f.read()
+    key = apns_key_provider.read_apns_key(
+        source=os.environ.get("APNS_KEY_SOURCE", "file"),
+        path=APNS_KEY_PATH,
+        service=os.environ.get("APNS_KEYCHAIN_SERVICE"),
+        account=os.environ.get("APNS_KEYCHAIN_ACCOUNT"),
+    )
     tok = pyjwt.encode({"iss": APNS_TEAM_ID, "iat": int(now)}, key,
                        algorithm="ES256", headers={"kid": APNS_KEY_ID})
     _apns_jwt_cache[0], _apns_jwt_cache[1] = tok, now
@@ -4507,7 +4538,8 @@ async def _apns_send(token: str, title: str, body: str, data: dict | None = None
 
 async def _apns_send_live_activity(session_id: str, busy: bool,
                                    phase_label: str | None = None,
-                                   ended_label: str | None = None) -> dict:
+                                   ended_label: str | None = None,
+                                   terminal_state: str | None = None) -> dict:
     """Send one ActivityKit update for a registered session token.
 
     Registration is opt-in and the normal alert push path remains untouched.
@@ -4522,9 +4554,16 @@ async def _apns_send_live_activity(session_id: str, busy: bool,
     problem = _push_http2_problem()
     if problem:
         return {"sent": False, "reason": "dependency_missing"}
+    if _live_activity_update_throttled(session_id, busy):
+        return {"sent": False, "reason": "throttled"}
+    state = "running" if busy else (terminal_state or "completed")
+    seq = live_update_event.next_seq(session_id, _event_latest_seq(session_id))
+    shared_event = live_update_event.make_event(
+        session_id, seq, state, phase=phase_label or ended_label)
+    content_state = live_update_event.apns_content_state(
+        shared_event, busy=busy, phase_label=phase_label,
+        ended_label=ended_label)
     event = "update" if busy else "end"
-    content_state = {"busy": bool(busy), "phaseLabel": phase_label,
-                     "endedLabel": ended_label}
     aps = {"timestamp": int(time.time()), "event": event,
            "content-state": content_state}
     if not busy:
@@ -4541,8 +4580,13 @@ async def _apns_send_live_activity(session_id: str, busy: bool,
             response = await client.post(
                 f"{APNS_HOST}/3/device/{rec['token']}",
                 headers=headers, json={"aps": aps})
+        if response.status_code == 200 and busy:
+            _LIVE_ACTIVITY_LAST_SENT[session_id] = time.monotonic()
         if response.status_code == 410:
             t3code_runtime.remove_live_activity(CANON_DB, session_id)
+            _live_activity_forget(session_id)
+        elif not busy and response.status_code in {200, 410}:
+            _live_activity_forget(session_id)
         if response.status_code != 200:
             _log_event("live_activity_push_failed", session=session_id,
                        status=response.status_code,
@@ -4557,14 +4601,15 @@ async def _apns_send_live_activity(session_id: str, busy: bool,
 
 def _live_activity_update(session_id: str, busy: bool,
                           phase_label: str | None = None,
-                          ended_label: str | None = None) -> None:
+                          ended_label: str | None = None,
+                          terminal_state: str | None = None) -> None:
     """Fire-and-forget ActivityKit update; the live stream stays independent."""
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
         return
     task = loop.create_task(_apns_send_live_activity(
-        session_id, busy, phase_label, ended_label))
+        session_id, busy, phase_label, ended_label, terminal_state))
     _BG_TASKS.add(task)
     task.add_done_callback(_BG_TASKS.discard)
 
@@ -4839,7 +4884,8 @@ def _turn_end_push(sid: str, display: str, summary: str, ok: bool = True) -> Non
     # If the iOS app requested an ActivityKit push token, keep the lock-screen
     # state truthful even after the app process is suspended.  The ordinary
     # alert push remains the fallback for older builds.
-    _live_activity_update(sid, False, ended_label=("已完成" if ok else "已中斷"))
+    _live_activity_update(sid, False, ended_label=("已完成" if ok else "已中斷"),
+                          terminal_state=("completed" if ok else "failed"))
     t = loop.create_task(push_notify(title, body, data,
                                      thread_id=sid, content_available=True,
                                      no_preview_body="回合已完成"))
@@ -23704,11 +23750,59 @@ _PROVIDER_CAPS: dict = {
 }
 
 
+@functools.lru_cache(maxsize=1)
+def _replay_capability_payload() -> dict:
+    """Return reviewed replay readiness without ever guessing capability.
+
+    The manifest is optional at runtime because some deployed bridge bundles do
+    not ship test fixtures.  Missing or malformed metadata is therefore an
+    explicit unavailable result, not a reason to advertise a release-ready
+    provider.  The cache keeps a capability request from rereading fixture
+    files; tests can call ``cache_clear`` when they replace the manifest path.
+    """
+    configured = os.environ.get("T3CODE_REPLAY_MANIFEST", "").strip()
+    manifest_path = Path(configured).expanduser() if configured else (
+        Path(__file__).resolve().parent / "tests" / "fixtures" / "replay" /
+        "manifest.json"
+    )
+    unknown = {
+        "source": "unavailable",
+        "schema_version": None,
+        "digest_algorithm": None,
+        "scenarios": [],
+        "release_ready": False,
+    }
+    try:
+        with manifest_path.open(encoding="utf-8") as handle:
+            manifest = json.load(handle)
+        summary = replay_fixture.validate_manifest(
+            manifest, manifest_path.parent, release=False)
+    except (OSError, ValueError, replay_fixture.ReplayFixtureError):
+        return {provider: dict(unknown) for provider in _PROVIDER_CAPS}
+
+    out = {}
+    for provider in _PROVIDER_CAPS:
+        coverage = (summary.get("providers") or {}).get(provider)
+        if not isinstance(coverage, dict):
+            out[provider] = dict(unknown)
+            continue
+        out[provider] = {
+            "source": "manifest",
+            "schema_version": manifest.get("schema_version"),
+            "digest_algorithm": manifest.get("digest_algorithm"),
+            "scenarios": list(coverage.get("scenarios") or []),
+            "release_ready": bool(coverage.get("release_ready")),
+        }
+    return out
+
+
 def _provider_caps_payload() -> dict:
     out = {}
+    replay = _replay_capability_payload()
     for prov, caps in _PROVIDER_CAPS.items():
         ops = sorted(op for op, tbl in _V2_SESSION_OPS.items() if prov in tbl)
-        out[prov] = {**caps, "ops": ops}
+        out[prov] = {**caps, "ops": ops,
+                     "replay": dict(replay.get(prov) or {})}
     return out
 
 
@@ -23772,6 +23866,15 @@ def _guest_token_verify(token: str) -> str | None:
         return None
 
 
+def _guest_revoke_all() -> None:
+    """Rotate the signing secret; existing stateless links all die at once."""
+    try:
+        _GUEST_SECRET_PATH.unlink()
+    except FileNotFoundError:
+        pass
+    _log_event("guest_links_revoked_all")
+
+
 def _guest_public_base() -> str:
     """對外可達的網址底:中繼網址優先(POCKET_TUNNEL_URL)。沒有公網
     就只好回空 —— 端點會 409,分享功能在純 LAN 配置下本來就不成立。"""
@@ -23796,6 +23899,14 @@ async def guest_link_create(request: Request):
     token, exp = _guest_token_make(sid, ttl)
     _log_event("guest_link_created", session=sid, ttl=ttl)
     return {"url": f"{base}/guest/{token}", "expires_at": exp}
+
+
+@app.post("/app/v1/guest-links/revoke-all")
+async def guest_link_revoke_all(request: Request):
+    """Revoke every stateless guest link without storing token denylist rows."""
+    _check_auth(request)
+    _guest_revoke_all()
+    return {"revoked": True}
 
 
 def _guest_html(session_id: str, cards: list) -> str:
@@ -23992,6 +24103,47 @@ async def t3_context_transfer_transition(transfer_id: str, request: Request):
         _t3_bad(exc)
 
 
+@app.post("/app/v3/credentials/handoffs")
+async def t3_credential_handoff_create(request: Request):
+    """Issue metadata-only handoff ticket; no credential value is accepted."""
+    _check_auth(request)
+    body = await _json_body(request)
+    try:
+        clean = t3code_runtime.validate_credential_handoff_payload(body)
+        item = t3code_runtime.create_credential_handoff(
+            CANON_DB, clean.get("source_host_id"), clean.get("target_host_id"),
+            clean.get("provider"), clean.get("audience"),
+            clean.get("ttl_secs", 300), clean.get("handoff_id"))
+        return {"ok": True, "handoff": item}
+    except t3code_runtime.T3CodeError as exc:
+        _t3_bad(exc)
+
+
+@app.get("/app/v3/credentials/handoffs/{handoff_id}")
+async def t3_credential_handoff_get(handoff_id: str, request: Request):
+    _check_auth(request)
+    item = t3code_runtime.get_credential_handoff(CANON_DB, handoff_id)
+    if item is None:
+        raise http_err(404, "T3CODE_HANDOFF_NOT_FOUND", "unknown credential handoff")
+    return {"ok": True, "handoff": item}
+
+
+@app.post("/app/v3/credentials/handoffs/{handoff_id}/consume")
+async def t3_credential_handoff_consume(handoff_id: str, request: Request):
+    """Consume a one-time ticket; storing the provider secret is a later Keychain step."""
+    _check_auth(request)
+    body = await _json_body(request)
+    try:
+        clean = t3code_runtime.validate_credential_handoff_payload(body)
+        item = t3code_runtime.consume_credential_handoff(
+            CANON_DB, handoff_id, clean.get("nonce"),
+            clean.get("target_host_id"), clean.get("provider"),
+            clean.get("audience"))
+        return {"ok": True, "handoff": item}
+    except t3code_runtime.T3CodeError as exc:
+        _t3_bad(exc)
+
+
 @app.post("/app/v3/threads/{thread_id}/checkpoints")
 async def t3_checkpoint(thread_id: str, request: Request):
     _check_auth(request)
@@ -24058,8 +24210,9 @@ async def t3_live_activity_register(session_id: str, request: Request):
 @app.delete("/app/v2/sessions/{session_id}/live-activity")
 async def t3_live_activity_remove(session_id: str, request: Request):
     _check_auth(request)
-    return {"ok": True, "removed": t3code_runtime.remove_live_activity(
-        CANON_DB, session_id)}
+    removed = t3code_runtime.remove_live_activity(CANON_DB, session_id)
+    _live_activity_forget(session_id)
+    return {"ok": True, "removed": removed}
 
 
 @app.get("/app/v2/providers/capabilities")
@@ -24074,6 +24227,26 @@ async def t3_orchestrator_capabilities(request: Request):
     """Typed orchestrator capability view; no provider credentials are exposed."""
     _check_auth(request)
     return {"version": 1, "providers": _provider_caps_payload()}
+
+
+@app.post("/app/v3/orchestrator/placement/preview")
+async def t3_orchestrator_placement_preview(request: Request):
+    """Plan placement without moving a session or touching credentials."""
+    _check_auth(request)
+    body = await _json_body(request)
+    try:
+        result = orchestrator.plan_placement(
+            body.get("hosts") or [],
+            required=body.get("required_capabilities") or [],
+            current_host_id=body.get("current_host_id"),
+            session_state=str(body.get("session_state") or "idle"),
+            checkpointed=bool(body.get("checkpointed")),
+            allow_failover=bool(body.get("allow_failover")),
+        )
+    except (TypeError, ValueError) as exc:
+        raise http_err(400, "T3CODE_BAD_REQUEST", str(exc))
+    return {"version": 1, "placement": result.as_dict(),
+            "applied": False}
 
 
 @app.post("/app/v3/orchestrator/delegations")

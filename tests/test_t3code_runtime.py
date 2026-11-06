@@ -143,6 +143,48 @@ class T3CodeRuntimeTests(unittest.TestCase):
         self.assertTrue(t3.remove_live_activity(self.db, "codex:thread-1"))
         self.assertIsNone(t3.get_live_activity(self.db, "codex:thread-1"))
 
+    def test_credential_handoff_is_metadata_only_and_one_time(self):
+        ticket = t3.create_credential_handoff(
+            self.db, "cashcamp", "siege", "codex",
+            "provider-session:thread-1", ttl_secs=300)
+        public = t3.get_credential_handoff(self.db, ticket["handoff_id"])
+        self.assertNotIn("nonce", public)
+        self.assertNotIn("nonce_hash", public)
+        self.assertEqual(public["status"], "issued")
+
+        consumed = t3.consume_credential_handoff(
+            self.db, ticket["handoff_id"], ticket["nonce"], "siege", "codex",
+            "provider-session:thread-1")
+        self.assertEqual(consumed["status"], "consumed")
+        with self.assertRaises(t3.T3CodeError):
+            t3.consume_credential_handoff(
+                self.db, ticket["handoff_id"], ticket["nonce"], "siege", "codex",
+                "provider-session:thread-1")
+
+    def test_credential_handoff_binds_target_and_rejects_secret_payload(self):
+        ticket = t3.create_credential_handoff(
+            self.db, "cashcamp", "siege", "gemini", "provider-session:1")
+        with self.assertRaises(t3.T3CodeError):
+            t3.consume_credential_handoff(
+                self.db, ticket["handoff_id"], ticket["nonce"], "other-host",
+                "gemini", "provider-session:1")
+        with self.assertRaises(t3.T3CodeError):
+            t3.validate_credential_handoff_payload({"api_key": "must-not-pass"})
+        with self.assertRaises(t3.T3CodeError):
+            t3.validate_credential_handoff_payload({"nested": {"token": "secret"}})
+
+    def test_expired_credential_handoff_cannot_be_consumed(self):
+        ticket = t3.create_credential_handoff(
+            self.db, "cashcamp", "siege", "codex", "provider-session:1",
+            ttl_secs=30)
+        with self.assertRaises(t3.T3CodeError):
+            t3.consume_credential_handoff(
+                self.db, ticket["handoff_id"], ticket["nonce"], "siege", "codex",
+                "provider-session:1", now=ticket["expires_at"] + 1)
+        self.assertEqual(
+            t3.get_credential_handoff(self.db, ticket["handoff_id"])["status"],
+            "expired")
+
 
 if __name__ == "__main__":
     unittest.main()

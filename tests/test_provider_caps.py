@@ -52,6 +52,18 @@ class TestProviderCaps(unittest.TestCase):
         self.assertTrue(
             bridge._PROVIDER_CAPS["codex"]["approval_callbacks_live_only"])
 
+    def test_replay_readiness_is_additive_and_conservative(self):
+        payload = bridge._provider_caps_payload()
+        codex = payload["codex"]["replay"]
+        self.assertEqual(codex["source"], "manifest")
+        self.assertEqual(codex["scenarios"], ["error_terminal", "simple_turn"])
+        self.assertFalse(codex["release_ready"])
+        # Hermes is a declared runtime provider but has no reviewed fixture yet;
+        # absence must not be interpreted as release readiness.
+        hermes = payload["hermes"]["replay"]
+        self.assertEqual(hermes["source"], "unavailable")
+        self.assertFalse(hermes["release_ready"])
+
 
 if __name__ == "__main__":
     unittest.main()

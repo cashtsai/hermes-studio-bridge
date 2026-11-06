@@ -7,9 +7,11 @@ tested without importing the full FastAPI application.
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import os
 import re
+import secrets
 import sqlite3
 import subprocess
 import time
@@ -136,6 +138,20 @@ def ensure_schema(db_path: str) -> None:
             token TEXT NOT NULL,
             bundle_id TEXT NOT NULL,
             updated_at REAL NOT NULL)""")
+        con.execute("""CREATE TABLE IF NOT EXISTS credential_handoffs(
+            id TEXT PRIMARY KEY,
+            source_host_id TEXT NOT NULL,
+            target_host_id TEXT NOT NULL,
+            provider TEXT NOT NULL,
+            audience TEXT NOT NULL,
+            nonce_hash TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'issued',
+            created_at REAL NOT NULL,
+            expires_at REAL NOT NULL,
+            consumed_at REAL,
+            last_error TEXT)""")
+        con.execute("CREATE INDEX IF NOT EXISTS idx_credential_handoffs_expiry "
+                    "ON credential_handoffs(status, expires_at)")
         con.execute("""CREATE TABLE IF NOT EXISTS t3code_meta(
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL,
@@ -336,6 +352,150 @@ def _contains_secret(value: Any, path: str = "") -> str | None:
     elif isinstance(value, str) and _SECRET_WORD.search(value):
         return path or "value"
     return None
+
+
+_HANDOFF_FIELDS = frozenset({
+    "version", "handoff_id", "source_host_id", "target_host_id", "provider",
+    "audience", "expires_at", "nonce", "ttl_secs",
+})
+
+
+def validate_credential_handoff_payload(value: Any) -> dict:
+    """Validate metadata-only handoff input and reject secret material.
+
+    This is intentionally separate from context transfer.  The returned value
+    contains no credential payload and is safe to pass to the ticket layer.
+    Unknown non-secret fields are ignored so clients can add display metadata
+    without making older bridges fail; secret-looking fields are never ignored.
+    """
+    if not isinstance(value, dict):
+        raise T3CodeError("credential handoff body must be an object")
+    secret_path = _contains_secret(value)
+    if secret_path:
+        raise T3CodeError(f"credential handoff contains secret material at {secret_path}")
+    return {str(key): child for key, child in value.items()
+            if str(key) in _HANDOFF_FIELDS}
+
+
+def _handoff_text(value: Any, name: str, limit: int = 200) -> str:
+    text = str(value or "").strip()
+    if not text:
+        raise T3CodeError(f"{name} is required")
+    if len(text) > limit:
+        raise T3CodeError(f"{name} is too long")
+    return text
+
+
+def create_credential_handoff(db_path: str, source_host_id: str,
+                             target_host_id: str, provider: str,
+                             audience: str, ttl_secs: int = 300,
+                             handoff_id: str | None = None) -> dict:
+    """Issue a one-time metadata ticket without storing a credential.
+
+    The returned nonce is the handoff capability and must only travel over the
+    already-authenticated host-to-host channel.  The database stores its hash,
+    never the nonce or an API key.
+    """
+    ensure_schema(db_path)
+    source = _handoff_text(source_host_id, "source_host_id")
+    target = _handoff_text(target_host_id, "target_host_id")
+    provider = _handoff_text(provider, "provider", 80).lower()
+    audience = _handoff_text(audience, "audience", 300)
+    try:
+        ttl = int(ttl_secs)
+    except (TypeError, ValueError) as exc:
+        raise T3CodeError("ttl_secs must be an integer") from exc
+    ttl = max(30, min(ttl, 900))
+    hid = _handoff_text(handoff_id or _id("handoff"), "handoff_id", 120)
+    nonce = secrets.token_urlsafe(32)
+    nonce_hash = hashlib.sha256(nonce.encode()).hexdigest()
+    now = _now()
+    expires = now + ttl
+    con = _connect(db_path)
+    try:
+        existing = con.execute("SELECT * FROM credential_handoffs WHERE id=?",
+                               (hid,)).fetchone()
+        if existing:
+            raise T3CodeError("handoff_id already exists")
+        con.execute("""INSERT INTO credential_handoffs
+            (id,source_host_id,target_host_id,provider,audience,nonce_hash,
+             status,created_at,expires_at)
+            VALUES(?,?,?,?,?,?,?,?,?)""",
+                    (hid, source, target, provider, audience, nonce_hash,
+                     "issued", now, expires))
+        con.commit()
+        return {"version": 1, "handoff_id": hid,
+                "source_host_id": source, "target_host_id": target,
+                "provider": provider, "audience": audience,
+                "expires_at": expires, "nonce": nonce,
+                "status": "issued"}
+    finally:
+        con.close()
+
+
+def get_credential_handoff(db_path: str, handoff_id: str) -> dict | None:
+    """Return public ticket metadata; never return nonce_hash."""
+    ensure_schema(db_path)
+    con = _connect(db_path)
+    try:
+        row = _row(con.execute(
+            "SELECT id,source_host_id,target_host_id,provider,audience,status,"
+            "created_at,expires_at,consumed_at,last_error "
+            "FROM credential_handoffs WHERE id=?", (str(handoff_id),)).fetchone())
+        if not row:
+            return None
+        return {"version": 1, "handoff_id": row["id"],
+                "source_host_id": row["source_host_id"],
+                "target_host_id": row["target_host_id"],
+                "provider": row["provider"], "audience": row["audience"],
+                "status": row["status"], "created_at": row["created_at"],
+                "expires_at": row["expires_at"],
+                "consumed_at": row["consumed_at"],
+                "last_error": row["last_error"]}
+    finally:
+        con.close()
+
+
+def consume_credential_handoff(db_path: str, handoff_id: str, nonce: str,
+                               target_host_id: str, provider: str,
+                               audience: str, now: float | None = None) -> dict:
+    """Consume a ticket once after checking every target binding."""
+    ensure_schema(db_path)
+    hid = _handoff_text(handoff_id, "handoff_id", 120)
+    nonce = _handoff_text(nonce, "nonce", 200)
+    target = _handoff_text(target_host_id, "target_host_id")
+    provider = _handoff_text(provider, "provider", 80).lower()
+    audience = _handoff_text(audience, "audience", 300)
+    current_time = _now() if now is None else float(now)
+    con = _connect(db_path)
+    try:
+        row = con.execute("SELECT * FROM credential_handoffs WHERE id=?",
+                          (hid,)).fetchone()
+        if row is None:
+            raise T3CodeError("unknown credential handoff")
+        if row["status"] != "issued":
+            raise T3CodeError("credential handoff is no longer available")
+        if current_time >= float(row["expires_at"]):
+            con.execute("UPDATE credential_handoffs SET status='expired',last_error=? "
+                        "WHERE id=?", ("expired", hid))
+            con.commit()
+            raise T3CodeError("credential handoff has expired")
+        if (row["target_host_id"] != target or row["provider"] != provider
+                or row["audience"] != audience):
+            raise T3CodeError("credential handoff target binding mismatch")
+        supplied_hash = hashlib.sha256(nonce.encode()).hexdigest()
+        if not hmac.compare_digest(supplied_hash, row["nonce_hash"]):
+            raise T3CodeError("credential handoff nonce mismatch")
+        con.execute("UPDATE credential_handoffs SET status='consumed',consumed_at=? "
+                    "WHERE id=? AND status='issued'", (current_time, hid))
+        if con.total_changes != 1:
+            raise T3CodeError("credential handoff was already consumed")
+        con.commit()
+        return {"version": 1, "handoff_id": hid, "target_host_id": target,
+                "provider": provider, "audience": audience,
+                "status": "consumed", "consumed_at": current_time}
+    finally:
+        con.close()
 
 
 def _normalise_transfer(value: Any, name: str) -> Any:
