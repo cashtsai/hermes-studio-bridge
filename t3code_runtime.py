@@ -138,6 +138,18 @@ def ensure_schema(db_path: str) -> None:
             token TEXT NOT NULL,
             bundle_id TEXT NOT NULL,
             updated_at REAL NOT NULL)""")
+        # 第二期 ActivityKit push:一顆 Live Activity 一列(同一 session 可能
+        # 同時有多顆 activity/多台裝置)。token 會輪替,同 activity_id 重報
+        # 即覆蓋(冪等);410/turn end 由 bridge 清列。
+        con.execute("""CREATE TABLE IF NOT EXISTS activity_tokens(
+            activity_id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            push_token TEXT NOT NULL,
+            device_env TEXT NOT NULL DEFAULT 'prod',
+            bundle_id TEXT NOT NULL,
+            updated_at REAL NOT NULL)""")
+        con.execute("CREATE INDEX IF NOT EXISTS idx_activity_tokens_session "
+                    "ON activity_tokens(session_id)")
         con.execute("""CREATE TABLE IF NOT EXISTS credential_handoffs(
             id TEXT PRIMARY KEY,
             source_host_id TEXT NOT NULL,
@@ -884,6 +896,92 @@ def remove_live_activity(db_path: str, session_id: str) -> bool:
         cur = con.execute("DELETE FROM live_activity_tokens WHERE session_id=?", (session_id,))
         con.commit()
         return bool(cur.rowcount)
+    finally:
+        con.close()
+
+
+# ── 第二期 ActivityKit push:activity_tokens(一顆 activity 一列)──────────
+
+ACTIVITY_DEVICE_ENVS = frozenset({"dev", "prod"})
+
+
+def register_activity_token(db_path: str, activity_id: str, session_id: str,
+                            push_token: str, device_env: str = "prod",
+                            bundle_id: str = "") -> dict:
+    """Upsert one Live Activity push token; same activity_id is idempotent."""
+    ensure_schema(db_path)
+    activity_id = str(activity_id or "").strip()
+    session_id = str(session_id or "").strip()
+    push_token = str(push_token or "").strip()
+    device_env = str(device_env or "prod").strip().lower()
+    bundle_id = str(bundle_id or "").strip()
+    if not activity_id or not session_id or not push_token or not bundle_id:
+        raise T3CodeError(
+            "activity_id, session_id, push_token and bundle_id are required")
+    if max(len(activity_id), len(session_id), len(bundle_id)) > 240 or \
+            len(push_token) > 2048:
+        raise T3CodeError("activity token field exceeds length limit")
+    if device_env not in ACTIVITY_DEVICE_ENVS:
+        raise T3CodeError("device_env must be 'dev' or 'prod'")
+    now = _now()
+    con = _connect(db_path)
+    try:
+        con.execute(
+            "INSERT OR REPLACE INTO activity_tokens"
+            "(activity_id,session_id,push_token,device_env,bundle_id,updated_at) "
+            "VALUES(?,?,?,?,?,?)",
+            (activity_id, session_id, push_token, device_env, bundle_id, now))
+        con.commit()
+        return {"activity_id": activity_id, "session_id": session_id,
+                "device_env": device_env, "bundle_id": bundle_id,
+                "token_set": True, "updated_at": now}
+    finally:
+        con.close()
+
+
+def session_activity_tokens(db_path: str, session_id: str) -> list[dict]:
+    ensure_schema(db_path)
+    con = _connect(db_path)
+    try:
+        rows = con.execute(
+            "SELECT * FROM activity_tokens WHERE session_id=?",
+            (session_id,)).fetchall()
+        return [_row(r) for r in rows]
+    finally:
+        con.close()
+
+
+def activity_token_sessions(db_path: str) -> set:
+    """Session ids with at least one live activity registered (hot-path gate)."""
+    ensure_schema(db_path)
+    con = _connect(db_path)
+    try:
+        rows = con.execute("SELECT DISTINCT session_id FROM activity_tokens").fetchall()
+        return {r[0] for r in rows}
+    finally:
+        con.close()
+
+
+def remove_activity_token(db_path: str, activity_id: str) -> bool:
+    ensure_schema(db_path)
+    con = _connect(db_path)
+    try:
+        cur = con.execute("DELETE FROM activity_tokens WHERE activity_id=?",
+                          (str(activity_id or "").strip(),))
+        con.commit()
+        return bool(cur.rowcount)
+    finally:
+        con.close()
+
+
+def remove_session_activity_tokens(db_path: str, session_id: str) -> int:
+    ensure_schema(db_path)
+    con = _connect(db_path)
+    try:
+        cur = con.execute("DELETE FROM activity_tokens WHERE session_id=?",
+                          (str(session_id or "").strip(),))
+        con.commit()
+        return int(cur.rowcount or 0)
     finally:
         con.close()
 

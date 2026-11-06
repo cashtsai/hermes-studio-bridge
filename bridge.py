@@ -2739,6 +2739,13 @@ def _milestone_sink(session_id: str, etype: str, payload: dict,
     except Exception as exc:  # noqa: BLE001
         _log_event("milestone_sink_failed", session=session_id, type=etype,
                    error=type(exc).__name__, expected=True)
+    # 第二期 ActivityKit push:turn begin/end 與 session.status 變更跟推鎖屏。
+    # 同樣吞錯 —— 推播是加分項,絕不准影響卡片熱路徑。
+    try:
+        _live_activity_on_milestone(session_id, etype, payload)
+    except Exception as exc:  # noqa: BLE001
+        _log_event("live_activity_milestone_failed", session=session_id,
+                   type=etype, error=type(exc).__name__, expected=True)
 
 
 carddigest.MILESTONE_SINK = _milestone_sink
@@ -4304,6 +4311,17 @@ LIVE_ACTIVITY_MIN_UPDATE_SECS = float(os.environ.get(
     "APNS_LIVE_ACTIVITY_MIN_UPDATE_SECS", "8"))
 _LIVE_ACTIVITY_LAST_SENT: dict[str, float] = {}
 
+# ── 第二期 ActivityKit push(activity_tokens,/app/v1/live-activity/register)──
+# 一顆 activity 一列;dev build 走 sandbox APNs。節流是「同 activity 最少間隔」
+# + 「內容沒變不推」雙閘;終態(end)不受節流,但同 activity 只送一次。
+LIVE_ACTIVITY_ACTIVITY_MIN_SECS = float(os.environ.get(
+    "APNS_LIVE_ACTIVITY_ACTIVITY_MIN_SECS", "3"))
+APNS_SANDBOX_HOST = os.environ.get(
+    "APNS_SANDBOX_HOST", "https://api.sandbox.push.apple.com")
+_ACTIVITY_PUSH_LAST: dict[str, tuple] = {}   # activity_id → (monotonic, signature)
+_ACTIVITY_ENDED: set = set()                 # 已送過 end 的 activity(防重複終態)
+_ACTIVITY_SESSIONS_CACHE: list = [None]      # [set[str] | None];None = 待重載
+
 
 def _live_activity_update_throttled(session_id: str, busy: bool,
                                     now: float | None = None) -> bool:
@@ -4610,6 +4628,179 @@ def _live_activity_update(session_id: str, busy: bool,
         return
     task = loop.create_task(_apns_send_live_activity(
         session_id, busy, phase_label, ended_label, terminal_state))
+    _BG_TASKS.add(task)
+    task.add_done_callback(_BG_TASKS.discard)
+
+
+def _activity_sessions_cached() -> set:
+    """有註冊中 activity 的 session 集合(熱路徑便宜閘;寫路徑負責失效)。"""
+    cached = _ACTIVITY_SESSIONS_CACHE[0]
+    if cached is None:
+        try:
+            cached = t3code_runtime.activity_token_sessions(CANON_DB)
+        except Exception as exc:  # noqa: BLE001
+            _log_exc("_activity_sessions_cached", exc, expected=True)
+            return set()    # 讀失敗:這一輪當作沒有,不快取錯誤結果
+        _ACTIVITY_SESSIONS_CACHE[0] = cached
+    return cached
+
+
+def _activity_cache_invalidate() -> None:
+    _ACTIVITY_SESSIONS_CACHE[0] = None
+
+
+def _activity_forget(activity_id: str) -> None:
+    _ACTIVITY_PUSH_LAST.pop(activity_id, None)
+    _ACTIVITY_ENDED.discard(activity_id)
+
+
+async def _apns_send_activity_update(rec: dict, busy: bool,
+                                     phase_label: str | None = None,
+                                     ended_label: str | None = None,
+                                     terminal_state: str | None = None,
+                                     busy_since: float | None = None) -> dict:
+    """Send one ActivityKit update for one registered activity row.
+
+    呼叫端已通過 apns_configured()/_push_http2_problem() 閘;這裡只處理
+    單列的節流、payload 組裝與失敗清理。永不 raise(熱路徑守則)。"""
+    aid = str(rec.get("activity_id") or "")
+    sid = str(rec.get("session_id") or "")
+    terminal = not busy
+    now = time.monotonic()
+    signature = (busy, phase_label, ended_label)
+    if terminal:
+        if aid in _ACTIVITY_ENDED:
+            return {"sent": False, "reason": "already_ended"}
+    else:
+        last = _ACTIVITY_PUSH_LAST.get(aid)
+        if last is not None:
+            last_ts, last_sig = last
+            if signature == last_sig:
+                return {"sent": False, "reason": "unchanged"}
+            if LIVE_ACTIVITY_ACTIVITY_MIN_SECS > 0 and \
+                    now - last_ts < LIVE_ACTIVITY_ACTIVITY_MIN_SECS:
+                return {"sent": False, "reason": "throttled"}
+    state = "running" if busy else (terminal_state or "completed")
+    try:
+        seq = live_update_event.next_seq(sid, _event_latest_seq(sid))
+        shared_event = live_update_event.make_event(
+            sid, seq, state, phase=phase_label or ended_label)
+        content_state = live_update_event.apns_content_state(
+            shared_event, busy=busy, phase_label=phase_label,
+            ended_label=ended_label)
+    except live_update_event.LiveUpdateEventError as exc:
+        _log_event("live_activity_push_failed", session=sid, activity=aid,
+                   error=type(exc).__name__)
+        return {"sent": False, "reason": "bad_event"}
+    if busy_since:
+        try:
+            # elapsed 起點(unix 秒):app 凍結後鎖屏計時器仍以此為錨。
+            # 額外鍵對 ActivityKit 的 Codable 是無害的(未知鍵被忽略)。
+            content_state["busySince"] = float(busy_since)
+        except (TypeError, ValueError):
+            pass
+    aps: dict = {"timestamp": int(time.time()),
+                 "event": "update" if busy else "end",
+                 "content-state": content_state}
+    if terminal:
+        aps["dismissal-date"] = int(time.time()) + 120
+    host = APNS_SANDBOX_HOST if rec.get("device_env") == "dev" else APNS_HOST
+    headers = {
+        "authorization": f"bearer {_apns_jwt()}",
+        "apns-topic": f"{rec.get('bundle_id')}.push-type.liveactivity",
+        "apns-push-type": "liveactivity",
+        "apns-priority": "10" if terminal else "5",
+    }
+    try:
+        import httpx
+        async with httpx.AsyncClient(http2=True, timeout=10) as client:
+            response = await client.post(
+                f"{host}/3/device/{rec.get('push_token')}",
+                headers=headers, json={"aps": aps})
+        status = response.status_code
+        if status == 200 and not terminal:
+            _ACTIVITY_PUSH_LAST[aid] = (now, signature)
+        if status == 410 or (terminal and status == 200):
+            # 410 = token 作廢;終態送達 = activity 即將 dismiss。都清列。
+            if terminal and status == 200:
+                if len(_ACTIVITY_ENDED) >= 512:
+                    _ACTIVITY_ENDED.clear()
+                _ACTIVITY_ENDED.add(aid)
+            t3code_runtime.remove_activity_token(CANON_DB, aid)
+            _ACTIVITY_PUSH_LAST.pop(aid, None)
+            _activity_cache_invalidate()
+        if status != 200:
+            _log_event("live_activity_push_failed", session=sid, activity=aid,
+                       status=status, detail=(response.text or "")[:160])
+        return {"sent": status == 200, "status": status}
+    except Exception as exc:  # noqa: BLE001
+        _log_event("live_activity_push_failed", session=sid, activity=aid,
+                   error=type(exc).__name__)
+        return {"sent": False, "reason": "exception"}
+
+
+async def _live_activity_fanout(session_id: str, busy: bool,
+                                phase_label: str | None = None,
+                                ended_label: str | None = None,
+                                terminal_state: str | None = None,
+                                busy_since: float | None = None) -> list:
+    """同 session 所有註冊中 activity 各推一則。無金鑰/缺 h2 = 靜默不啟用。"""
+    if not apns_configured():
+        return []
+    if _push_http2_problem():
+        return []
+    try:
+        recs = t3code_runtime.session_activity_tokens(CANON_DB, session_id)
+    except Exception as exc:  # noqa: BLE001
+        _log_exc("_live_activity_fanout", exc, expected=True)
+        return []
+    results = []
+    for rec in recs:
+        results.append(await _apns_send_activity_update(
+            rec, busy, phase_label, ended_label, terminal_state, busy_since))
+    return results
+
+
+def _live_activity_on_milestone(session_id: str, etype: str, payload) -> None:
+    """carddigest 里程碑 → ActivityKit push(第二期背景續更)。
+
+    熱路徑守則:同步段只做集合查表 + 丟背景任務;網路/DB 細節全在
+    _live_activity_fanout / _apns_send_activity_update,且永不 raise。
+    turn end / status busy→false → 終態(event:end + dismissal)並清列。"""
+    if etype not in ("turn", "session.status"):
+        return
+    if session_id not in _activity_sessions_cached():
+        return
+    data = payload if isinstance(payload, dict) else {}
+    busy_since = None
+    if etype == "turn":
+        state = str(data.get("state") or "")
+        if state == "begin":
+            busy, phase_label, ended_label, terminal_state = (
+                True, "工作中…", None, None)
+        elif state in ("end", "interrupted", "failed", "error"):
+            ok = state == "end"
+            busy, phase_label = False, None
+            ended_label = "已完成" if ok else "已中斷"
+            terminal_state = "completed" if ok else "failed"
+        else:
+            return
+    else:
+        busy = bool(data.get("busy"))
+        if busy:
+            phase_label = str(data.get("label") or "") or None
+            ended_label, terminal_state = None, None
+            busy_since = data.get("busy_since")
+        else:
+            # 正常收尾由 turn end 先到(同 tick,先清列 → 這條撲空);這裡是
+            # 「只發 status 不發 turn」的 session 的保底終態。
+            phase_label, ended_label, terminal_state = None, "已完成", "completed"
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    task = loop.create_task(_live_activity_fanout(
+        session_id, busy, phase_label, ended_label, terminal_state, busy_since))
     _BG_TASKS.add(task)
     task.add_done_callback(_BG_TASKS.discard)
 
@@ -24212,6 +24403,47 @@ async def t3_live_activity_remove(session_id: str, request: Request):
     _check_auth(request)
     removed = t3code_runtime.remove_live_activity(CANON_DB, session_id)
     _live_activity_forget(session_id)
+    return {"ok": True, "removed": removed}
+
+
+@app.post("/app/v1/live-activity/register")
+async def live_activity_register_v1(request: Request):
+    """第二期 ActivityKit push:一顆 activity 一列(activity_tokens)。
+
+    token 會輪替,同 activity_id 重報即覆蓋(冪等)。缺 APNs 金鑰時註冊照樣
+    成功(apns_configured=false 回給 app 參考),金鑰補上即生效。"""
+    _check_auth(request)
+    body = await _json_body(request)
+    try:
+        rec = t3code_runtime.register_activity_token(
+            CANON_DB, body.get("activity_id"), body.get("session_id"),
+            body.get("push_token"),
+            device_env=str(body.get("device_env") or "prod"),
+            bundle_id=str(body.get("bundle_id") or "").strip() or APNS_BUNDLE_ID)
+    except t3code_runtime.T3CodeError as exc:
+        _t3_bad(exc)
+    _activity_forget(str(body.get("activity_id") or "").strip())
+    _activity_cache_invalidate()
+    return {"ok": True, "activity": rec, "apns_configured": apns_configured()}
+
+
+@app.delete("/app/v1/live-activity/register")
+async def live_activity_unregister_v1(request: Request):
+    """登出:帶 activity_id 清一顆;只帶 session_id 清整個 session 的列。"""
+    _check_auth(request)
+    body = await _json_body(request)
+    activity_id = str(body.get("activity_id") or "").strip()
+    session_id = str(body.get("session_id") or "").strip()
+    if not activity_id and not session_id:
+        raise http_err(400, "LIVE_ACTIVITY_BAD_REQUEST",
+                       "activity_id or session_id is required")
+    if activity_id:
+        removed = int(t3code_runtime.remove_activity_token(CANON_DB, activity_id))
+        _activity_forget(activity_id)
+    else:
+        removed = t3code_runtime.remove_session_activity_tokens(
+            CANON_DB, session_id)
+    _activity_cache_invalidate()
     return {"ok": True, "removed": removed}
 
 

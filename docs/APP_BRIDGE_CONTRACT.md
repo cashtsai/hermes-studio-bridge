@@ -231,7 +231,54 @@ Rules:
   module silently disables itself (`push_notify` short-circuits with
   `disabled: true`) and logs a single `apns_disabled` event.
 
-### Subscription entitlement (StoreKit 2)
+### `POST /app/v1/live-activity/register` (ActivityKit push, phase 2)
+
+Registers one Live Activity's ActivityKit push token so the bridge can keep
+updating the lock screen after the app process is suspended. One row per
+activity (the same session may have several activities across devices).
+
+Request body:
+
+- `activity_id` (required): the app-side `Activity.id`; the upsert key.
+- `push_token` (required): hex token from `activity.pushTokenUpdates`. Tokens
+  rotate; the app re-posts on every new value (idempotent overwrite).
+- `session_id` (required): v2 wire session id (`claude_code:{name}` /
+  `codex:{tid}` / …) whose turn progress drives this activity.
+- `device_env` (optional, default `"prod"`): `"dev"` routes through the APNs
+  sandbox host (`api.sandbox.push.apple.com`), `"prod"` through production.
+  Debug/Xcode builds must send `"dev"`, TestFlight/App Store builds `"prod"`.
+- `bundle_id` (optional): defaults to the bridge's `APNS_BUNDLE_ID`
+  (`com.pocketagent.kernel`). Dev-variant builds pass their own.
+
+Response: `{ok, activity: {activity_id, session_id, device_env, bundle_id,
+token_set, updated_at}, apns_configured}`. As with `/app/v1/push/register`,
+`apns_configured=false` means registration succeeded but no APNs key is
+provisioned yet — the feature is silently disabled until the key appears.
+
+`DELETE /app/v1/live-activity/register` with body `{activity_id}` removes one
+row (the app calls this when it ends an activity itself); body `{session_id}`
+removes every row for that session. One of the two is required (400 otherwise).
+
+Push behaviour (bridge side, informative for the app team):
+
+- Trigger points are the session's milestone events: `turn` begin/end and
+  `session.status` changes.
+- Updates are sent as `apns-push-type: liveactivity` to topic
+  `<bundle_id>.push-type.liveactivity`. `content-state` is the §1.2 envelope:
+  `busy`, `phaseLabel`, `endedLabel` plus `version`, `sessionID`, `seq`,
+  `state`, `terminal`; while busy it may also carry `busySince` (unix seconds,
+  the elapsed-timer anchor). Keys must stay letter-for-letter aligned with
+  `PocketTurnActivityAttributes.ContentState` — ActivityKit drops undecodable
+  payloads silently (extra keys are fine, missing ones are not).
+- Throttle: per activity, non-terminal updates go out at most once per 3s
+  (`APNS_LIVE_ACTIVITY_ACTIVITY_MIN_SECS`) and only when
+  `(busy, phaseLabel, endedLabel)` actually changed.
+- Turn end sends the final content-state with `"event": "end"` and
+  `dismissal-date` = now + 120s at priority 10, then deletes the row. The app
+  must re-register for the next turn (new activity, new token).
+- APNs 410/BadDeviceToken prunes the row and logs; failures never propagate
+  into the card hot path. A missing APNs key disables the whole feature
+  silently (registration still accepted).
 
 Subscription state is **server-authoritative** so it survives reinstall and stays
 consistent across a user's devices. The app may never assert its own tier: the
