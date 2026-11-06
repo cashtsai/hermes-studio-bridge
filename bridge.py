@@ -2731,14 +2731,18 @@ def _event_append(session: str, etype: str, payload: dict,
 
 
 def _milestone_sink(session_id: str, etype: str, payload: dict,
-                    external_id: str | None) -> None:
+                    external_id: str | None) -> int:
     """carddigest 里程碑 → event_log(P3-lite)。吞錯:鏡射是加分項,
-    不准影響卡片熱路徑;_event_append 本身已絕不 raise。"""
+    不准影響卡片熱路徑;_event_append 本身已絕不 raise。
+
+    回傳 event_log 全域 id(0 = 去重略過/失敗)—— SessionCardStore._push
+    把它放進 SSE 信封的 durable_seq,client 據此維護持久游標(T3#1)。"""
     try:
-        _event_append(session_id, etype, payload, external_id=external_id)
+        return _event_append(session_id, etype, payload, external_id=external_id)
     except Exception as exc:  # noqa: BLE001
         _log_event("milestone_sink_failed", session=session_id, type=etype,
                    error=type(exc).__name__, expected=True)
+        return 0
 
 
 carddigest.MILESTONE_SINK = _milestone_sink
@@ -2829,6 +2833,32 @@ def _event_latest_seq(session: str) -> int:
     except Exception as _exc:  # noqa: BLE001
         _log_exc("_event_latest_seq", _exc, expected=True)
         return 0
+
+
+# ── T3#1:持久補洞(/app/v2/sessions/{id}/events?after_durable_seq=)────
+# ring 斷層(bridge 重啟 / 游標被擠出環)時,帶持久游標的新 client 不再吃
+# 410 冷載:從 event_log 撈里程碑(card.milestone/session.status/turn)轉成
+# 既有 wire 形狀補發,再接 ring 尾端續流。上限夠大 —— 里程碑本來就稀疏
+# (串流 delta 刻意不落地),一條 session 幾千筆就是好幾天的量。
+_DURABLE_BACKFILL_LIMIT = int(os.environ.get("POCKET_DURABLE_BACKFILL_MAX", "2000"))
+
+#: event_log type → SSE wire type。只有這三種進補洞段;message.upsert /
+#: read_cursor.update 等屬 /app/v2/events 的世界,不混進卡片流。
+_DURABLE_WIRE_TYPES = {"card.milestone": "card.upsert",
+                       "session.status": "session.status",
+                       "turn": "turn"}
+
+
+def _durable_wire_event(row: dict) -> dict | None:
+    """_event_since 的信封 → 卡片流 wire 信封;非里程碑型別回 None。
+
+    `seq` 固定 0:補洞段不是 ring 事件,沒有 ring 游標語意 —— client 以
+    `durable_seq` 推進持久游標,ring 游標等補洞段結尾的 `resync` 重定。"""
+    etype = _DURABLE_WIRE_TYPES.get(str(row.get("type") or ""))
+    if not etype:
+        return None
+    return {"seq": 0, "ts": row.get("ts"), "type": etype,
+            "data": row.get("data") or {}, "durable_seq": row.get("seq")}
 
 
 # ── Sync engine P1:三來源鏡射(SYNC_ENGINE_REWRITE_PLAN §4 P1)─────────
@@ -26440,10 +26470,18 @@ async def v2_session_cards(session_id: str, request: Request, limit: int = 100,
     (同一顆 `store.status`),app 可以走同一條套用路徑。**可能是 `{}`**(這條
     session 還沒巡邏過狀態)—— 空的代表「我沒資訊」,client 要**維持原狀**,
     不可當成「閒置」清掉忙碌旗標。理由見 `SessionCardStore.snapshot`。
+
+    `durable_seq`(2026-11-06,T3#1 加欄,既有欄位一個不動):該 session 在
+    持久 event_log 的最大全域 id(沒有里程碑 = 0)。client 冷載後同時記兩個
+    游標 —— ring 的 `latest_seq` 走既有 SSE 續流;`durable_seq` 是重連保險,
+    ring 斷層時帶 `after_durable_seq` 走持久補洞,不再 410 整頁重載。
     """
     _check_auth(request)
     store = await _v2_card_store(session_id)
-    return store.snapshot(limit=max(1, min(limit, 500)), before_seq=before_seq)
+    snap = store.snapshot(limit=max(1, min(limit, 500)), before_seq=before_seq)
+    sid = getattr(store, "media_session_id", "") or ""
+    snap["durable_seq"] = (await asyncio.to_thread(_event_latest_seq, sid)) if sid else 0
+    return snap
 
 
 @app.get("/app/v2/sessions/{session_id}/media")
@@ -26481,8 +26519,24 @@ async def v2_artifact_download(media_id: str, request: Request):
 
 @app.get("/app/v2/sessions/{session_id}/events")
 async def v2_session_events(session_id: str, request: Request, since_seq: int = 0,
-                            profile: str = "phone"):
-    """契約 §1 SSE 事件流:信封 {seq,ts,type,data};since_seq 補洞;超範圍 410。
+                            profile: str = "phone",
+                            after_durable_seq: int | None = None):
+    """契約 §1 SSE 事件流:信封 {seq,ts,type,data,durable_seq};since_seq 補洞;
+    超範圍 410 —— 除非帶了 `after_durable_seq`(T3#1 持久補洞,見下)。
+
+    `after_durable_seq`(2026-11-06):client 的**持久游標**(snapshot 的
+    `durable_seq` / 信封的 `durable_seq`)。ring 判定要 410(bridge 重啟、
+    游標被環擠掉)而 client 帶了它 → 不回 410,改走持久補洞:
+      1. 從 event_log 撈該 session `id > after_durable_seq` 的里程碑
+         (card.milestone→card.upsert / session.status / turn),以 wire 形狀
+         補發(信封 seq=0、durable_seq=全域 id);串流 delta 本來就不落地,
+         不會重放。
+      2. 補洞段結尾發 `{type:"resync", data:{durable_seq:N, ring_seq:M}}`
+         —— N = 持久游標推進到哪(含被濾掉的非里程碑列,client 下次帶 N),
+         M = ring 當前尾端,client 把 ring 游標重定到 M。
+      3. 接 ring 續流(從 M 起)。尾端在查 DB **之前**釘住 —— 競態窗內的
+         事件寧可 ring/補洞各出一次(card.upsert 冪等)也不准漏。
+    沒帶它的舊 client:410 行為一個 byte 不變。
 
     `profile=probe` 是**選路探測**專用(見下方)。
     """
@@ -26540,9 +26594,39 @@ async def v2_session_events(session_id: str, request: Request, since_seq: int = 
                        "只實作 profile=phone(契約 §4)與 profile=probe(選路探測)")
     store = await _v2_card_store(session_id)
     backlog = store.since(since_seq)
+    durable_backfill: list[dict] = []
     if backlog is None:
-        raise http_err(410, "SEQ_GONE",
-                       "since_seq 超出 ring buffer 範圍,請走 snapshot 冷載")
+        if after_durable_seq is None:
+            raise http_err(410, "SEQ_GONE",
+                           "since_seq 超出 ring buffer 範圍,請走 snapshot 冷載")
+        # T3#1 持久補洞(細節見 docstring)。先釘 ring 尾端再查 DB:查詢
+        # 期間落地的事件 seq > resume_seq,續流必然送到;若它也趕進了查詢
+        # 結果,最多補洞段多出一次 —— 重複可冪等,漏洞不可逆。
+        resume_seq = store.seq
+        sid = getattr(store, "media_session_id", "") or ""
+        rows = (await asyncio.to_thread(
+            _event_since, sid, int(after_durable_seq), _DURABLE_BACKFILL_LIMIT)
+            ) if sid else []
+        durable_cursor = int(after_durable_seq)
+        for row in rows:
+            durable_cursor = max(durable_cursor, int(row.get("seq") or 0))
+            wired = _durable_wire_event(row)
+            if wired:
+                durable_backfill.append(wired)
+        durable_backfill.append({
+            "seq": resume_seq, "ts": time.time(), "type": "resync",
+            "data": {"durable_seq": durable_cursor, "ring_seq": resume_seq},
+            "durable_seq": None})
+        # truncated:一口氣積了超過上限的持久列(極端離線量)。resync 的
+        # durable_seq 只推進到已送出的最後一列,client 下次重連自然從那裡
+        # 續補,不會漏 —— 但要留痕,這代表上限該調大或離線太久。
+        _log_event("v2_events_durable_backfill", session=session_id,
+                   after_durable_seq=int(after_durable_seq),
+                   milestones=len(durable_backfill) - 1,
+                   durable_seq=durable_cursor, ring_seq=resume_seq,
+                   truncated=(len(rows) >= _DURABLE_BACKFILL_LIMIT))
+        backlog = []
+        since_seq = resume_seq
 
     async def gen():
         cursor = since_seq
@@ -26563,6 +26647,8 @@ async def v2_session_events(session_id: str, request: Request, since_seq: int = 
         last_sent = last_event
         keepalive = max(1.0, float(SSE_KEEPALIVE_SECS))
         try:
+            for ev in durable_backfill:   # T3#1 持久補洞段(通常為空)
+                yield f"data: {json.dumps(ev, ensure_ascii=False)}\n\n"
             for ev in backlog:
                 yield f"data: {json.dumps(ev, ensure_ascii=False)}\n\n"
                 cursor = ev["seq"]

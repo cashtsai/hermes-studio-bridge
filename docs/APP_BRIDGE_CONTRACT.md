@@ -948,7 +948,7 @@ client 對接要知道的最小集合（2026-08-01 補：Android 端曾因本節
 | `GET  /app/v2/agents` | 後端清單 + auth/health | ✅ 上線 |
 | `GET  /app/v2/sessions?provider=&status=` | 統一 session 清單（delegations 一等 row） | ✅ 上線 |
 | `GET  /app/v2/sessions/{id}/cards?limit=&before_seq=` | 冷載 snapshot（§7） | ✅ 上線（S1：cc；cx 待 S2、persona 待 S3） |
-| `GET  /app/v2/sessions/{id}/events?since_seq=&profile=` | SSE 卡片事件流（§5） | ✅ 上線（S1：cc；同上） |
+| `GET  /app/v2/sessions/{id}/events?since_seq=&profile=&after_durable_seq=` | SSE 卡片事件流（§5；`after_durable_seq` = 持久補洞,§5.1） | ✅ 上線（S1：cc；同上） |
 | `GET  /app/v2/sessions/{id}/media?limit=&cursor=` | session 媒體永久索引（§7） | ✅ 上線（cc/cx/persona） |
 | `GET  /app/v2/artifacts/{media_id}` | 已封存 artifact 位元組 | ✅ 上線 |
 | `POST /app/v1/guest-links` | 建立短效、唯讀、無帳號分享連結 | ✅ 上線 |
@@ -998,13 +998,19 @@ client 對接要知道的最小集合（2026-08-01 補：Android 端曾因本節
 ## 5. 統一 Session 事件流（rendering 權威）
 
 ```
-GET /app/v2/sessions/{session_id}/events?since_seq=N&profile=phone     (SSE)
+GET /app/v2/sessions/{session_id}/events?since_seq=N&profile=phone&after_durable_seq=D   (SSE)
 ```
 
-- **事件信封**：`{"seq": int, "ts": epoch, "type": str, "data": {...}}`
+- **事件信封**：`{"seq": int, "ts": epoch, "type": str, "data": {...}, "durable_seq": int|null}`
+  - `durable_seq`（2026-11-06，T3#1）：此事件在持久 `event_log` 的全域 id。
+    **只有里程碑有值**（`final:true` 的 card.upsert、`session.status`、`turn`）；
+    純串流 delta（`final:false`）、ping、去重重放（同一終態卡 reseed）為
+    `null`。client 以「最後一個非 null 的 `durable_seq`」維護**持久游標**，
+    `null` 時游標不動。
 - **seq**：per-session 嚴格遞增。bridge 保留 ring buffer（近 2000 事件或 7 天），
   `since_seq` 補洞重放；超出範圍回 `410 Gone`（`SEQ_GONE`）→ app 改走
-  snapshot 冷載。
+  snapshot 冷載。**例外**：請求帶了 `after_durable_seq` 時不回 410，改走
+  §5.1 持久補洞。不帶新參數的舊 client 行為完全不變。
 - **事件類型**：
   - `card.upsert` — `{card}`（見 §6）。串流中的訊息＝同一 card id 反覆 upsert、
     `rev` 遞增、`final:false→true`。**app 只做替換渲染，永不解析 provider
@@ -1024,11 +1030,49 @@ GET /app/v2/sessions/{session_id}/events?since_seq=N&profile=phone     (SSE)
     `lockMessage`；`GET /app/v2/sessions` 每列的 `locked` 與 `meta.lock`。
   - `turn` — `{state: "begin"|"end"|"interrupted", turn_id}`。
   - `ping` — keepalive，統一 `SSE_KEEPALIVE_SECS`。
+  - `resync` — **只出現在 §5.1 持久補洞段的結尾**：
+    `{durable_seq: N, ring_seq: M}`。client 收到後把持久游標設為 `N`、
+    ring 游標重定為 `M`（之後的 ring 事件 `seq` 從 `M+1` 起）。
 - **真相原則**：SSE 為唯一真相；輪詢僅在 stream 斷線 >10s 時作 fallback，
   重連成功即停。
 - 取代關係：CONTROL_PLANE_V2 的
   `assistant_delta|tool_start|tool_result|thinking|…` 結構化事件 schema
   **由卡片 digest 取代**，不再實作；其 `seq`+`since_seq` 續傳設計保留如上。
+
+### 5.1 持久補洞（`after_durable_seq`，2026-11-06 T3#1）
+
+**為什麼**：ring 是記憶體，bridge 重啟即歸零；舊協定下 client 的 `since_seq`
+必然領先 → 410 → 整頁 snapshot 冷載，體感就是「閃舊訊息/整頁重載」。
+持久化側 `event_log`（canonical.db，全域單調 id）已鏡射所有里程碑
+（`card.milestone`、`session.status`、`turn`；串流 delta **刻意不落地**），
+重連改從它補洞，410 只剩沒帶新參數的舊 client 會看到。
+
+**client 要維護兩個游標**：
+- ring 游標（既有 `since_seq`）：snapshot 的 `latest_seq` / 信封 `seq`。
+- 持久游標（新 `after_durable_seq`）：snapshot 的 `durable_seq`（§7）/
+  信封非 null 的 `durable_seq` / `resync.data.durable_seq`。
+
+**重連協定**：
+1. 照舊帶 `since_seq`，**加帶** `after_durable_seq=<持久游標>`。
+2. ring 游標還有效 → 行為與舊協定完全相同（ring 補洞 + 續流），無補洞段。
+3. ring 斷層（重啟/游標被環擠掉）→ bridge **不回 410**，依序送：
+   a. **補洞段**：`event_log` 中該 session `id > after_durable_seq` 的里程碑，
+      轉成既有 wire 形狀（`card.milestone`→`card.upsert`，其餘同名）。
+      補洞信封 `seq=0`（不是 ring 游標，**不要**拿去推 ring 游標）、
+      `durable_seq`=全域 id（拿它推持久游標）。
+   b. **`resync` 信封**：`{durable_seq: N, ring_seq: M}`。`N` 含被濾掉的
+      非里程碑列（`message.upsert` 等屬 `/app/v2/events` 的型別不會漏進
+      卡片流，但持久游標要跨過它們）；`M` = ring 當前尾端。
+   c. **續流**：ring 事件照常，`seq` 從 `M+1` 起。
+4. 補洞上限 `POCKET_DURABLE_BACKFILL_MAX`（預設 2000）；里程碑稀疏，
+   正常天數的離線量遠在其下。
+
+**重複與漏洞的取捨**：bridge 先釘 ring 尾端再查 DB —— 競態窗內的里程碑
+可能補洞段與續流各出一次。`card.upsert` 以 id+rev 冪等、status/turn 重放
+無害；**寧可重複，不可漏洞**。client 不得假設補洞段與續流互斥。
+
+**delta 的語意**：重啟後打字機過程不重放（持久側只有終態卡）。app 重連
+看到的是「最後完整結果」，不是重播動畫 —— 這是拍板行為，不是缺陷。
 
 ## 6. 卡片 schema v1（裝置 UI 語言）
 
@@ -1069,7 +1113,10 @@ GET /app/v2/sessions/{session_id}/events?since_seq=N&profile=phone     (SSE)
 GET /app/v2/sessions/{session_id}/cards?limit=100&before_seq=M
 ```
 
-回 `{cards: […], latest_seq: N}` → app 渲染後從 `since_seq=N` 接 SSE。
+回 `{cards: […], latest_seq: N, status: {…}, durable_seq: D}` → app 渲染後從
+`since_seq=N` 接 SSE。`durable_seq`（2026-11-06 加欄，既有欄位一個不動）＝
+該 session 在持久 `event_log` 的最大全域 id（沒有里程碑 = 0）——冷載時
+一併記下，之後重連都帶 `after_durable_seq`（§5.1），ring 斷層不再 410。
 `limit` 上限 500。**app 本地快取＝卡片庫**（key: session_id + card.id + rev）：
 離線可讀、進場秒開；快取只是 snapshot，永不當真相。
 
