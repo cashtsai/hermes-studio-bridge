@@ -24065,6 +24065,92 @@ async def t3_provider_link(thread_id: str, request: Request):
         _t3_bad(exc)
 
 
+# ───────── AppThread ≠ ProviderThread 雙層 ID(/app/v2/threads,疊加層)─────────
+# 病史:CX thread 鎖事件 —— 桌面 app 搶走 Codex writer lock,provider-native
+# thread 整條報廢,app 對話只能陪葬;cc2 重啟後 provider_session_id 換新,
+# 同一個「對話」在 app 眼裡斷成兩截。治法(抄 t3code core-graph):app 對話
+# 身分(app_thread)穩定不動,底下的 provider-native 會話是**可替換的綁定**
+# (app_thread_bindings)。原生會話死了 → rebind 一下,舊綁定標 dead 留審計,
+# 對話繼續活。
+#
+# 相容紅線:這是**疊加層**。現有 session id(codex:xxx / claude_code:name /
+# cc2 名字)照舊全通,/app/v2/sessions 列表一個位元不動;binding 的
+# provider_thread_id 存的就是 bridge 既有的 session id,app 消費端(另一波)
+# 拿它去走所有舊路徑。rebind 落 event_log 事件 `thread.rebound`
+# (session=app thread id),讓 /app/v2/events 訂閱者即時看到換綁。
+
+
+@app.post("/app/v2/threads")
+async def v2_app_thread_create(request: Request):
+    """建 app thread,可一步綁上既有 provider session(provider +
+    provider_thread_id 同時給才會綁;只給一半是 400)。"""
+    _check_auth(request)
+    body = await _json_body(request)
+    provider = str(body.get("provider") or "").strip()
+    provider_thread_id = str(body.get("provider_thread_id") or "").strip()
+    try:
+        if provider or provider_thread_id:
+            # 先驗綁定目標再建 thread —— 綁定被拒時不留孤兒 app thread。
+            owner = t3code_runtime.active_binding_owner(
+                CANON_DB, provider, provider_thread_id)
+            if owner is not None:
+                raise t3code_runtime.T3CodeError(
+                    "provider thread is actively bound to another app_thread")
+        thread = t3code_runtime.create_app_thread(
+            CANON_DB, str(body.get("owner") or "xcash"),
+            str(body.get("title") or "Pocket thread"),
+            str(body.get("id") or "").strip() or None)
+        if provider or provider_thread_id:
+            t3code_runtime.bind_app_thread(
+                CANON_DB, thread["id"], provider, provider_thread_id)
+    except t3code_runtime.T3CodeError as exc:
+        _t3_bad(exc)
+    thread["binding"] = t3code_runtime.current_binding(CANON_DB, thread["id"])
+    thread["bindings"] = t3code_runtime.list_bindings(CANON_DB, thread["id"])
+    return {"ok": True, "thread": thread}
+
+
+@app.get("/app/v2/threads/{thread_id}")
+async def v2_app_thread_get(thread_id: str, request: Request):
+    """讀 app thread,含當前 binding 與完整 binding 鏈(審計視角)。"""
+    _check_auth(request)
+    thread = t3code_runtime.get_app_thread(CANON_DB, thread_id)
+    if thread is None:
+        raise http_err(404, "APP_THREAD_NOT_FOUND", "unknown app thread")
+    thread["binding"] = t3code_runtime.current_binding(CANON_DB, thread_id)
+    thread["bindings"] = t3code_runtime.list_bindings(CANON_DB, thread_id)
+    return {"ok": True, "thread": thread}
+
+
+@app.post("/app/v2/threads/{thread_id}/rebind")
+async def v2_app_thread_rebind(thread_id: str, request: Request):
+    """換綁:舊 active 綁定標 dead/detached(prior_state,預設 dead)+ 記
+    reason,新綁定成為唯一 active。冪等:綁到同一個目標回 changed=false,
+    不發事件。"""
+    _check_auth(request)
+    body = await _json_body(request)
+    try:
+        result = t3code_runtime.rebind_app_thread(
+            CANON_DB, thread_id, body.get("provider"),
+            body.get("provider_thread_id"), str(body.get("reason") or ""),
+            str(body.get("prior_state") or "dead"))
+    except t3code_runtime.T3CodeError as exc:
+        _t3_bad(exc)
+    if result.get("changed"):
+        binding = result["binding"]
+        previous = result.get("previous") or None
+        _event_append(thread_id, "thread.rebound", {
+            "app_thread_id": thread_id,
+            "from": ({"provider": previous["provider"],
+                      "provider_thread_id": previous["provider_thread_id"],
+                      "state": previous["state"]} if previous else None),
+            "to": {"provider": binding["provider"],
+                   "provider_thread_id": binding["provider_thread_id"]},
+            "reason": str(body.get("reason") or "").strip()[:500],
+        }, external_id=f"thread.rebound:{binding['id']}")
+    return {"ok": True, "thread_id": thread_id, **result}
+
+
 @app.post("/app/v3/threads/{thread_id}/context-transfers")
 async def t3_context_transfer(thread_id: str, request: Request):
     _check_auth(request)
