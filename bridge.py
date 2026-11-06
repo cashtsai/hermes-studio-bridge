@@ -117,6 +117,10 @@ def _record_fixture_frame(msg: dict) -> None:
     path = os.path.expanduser(os.environ.get("POCKET_RECORD_FIXTURE", "").strip())
     if not path or not isinstance(msg, dict) or not msg.get("method"):
         return
+    if os.path.isdir(path):
+        # 目錄 = per-thread digest 錄製模式(_record_digest_fixture_frame),
+        # wire recorder 讓位 —— 否則每一幀都會對目錄 append 失敗、刷一行錯誤 log。
+        return
     frame = {"method": str(msg["method"]),
              "params": msg.get("params") if isinstance(msg.get("params"), dict)
              else {}}
@@ -134,6 +138,34 @@ def _record_fixture_frame(msg: dict) -> None:
     except Exception as exc:  # noqa: BLE001
         # Recording must never turn a healthy provider stream into an error.
         _log_event("codex_fixture_record_failed", error=type(exc).__name__)
+
+
+def _record_digest_fixture_frame(thread_id: str, method: str, params) -> None:
+    """Per-thread 錄製鉤:digest 入口的每一幀 → `<目錄>/<thread_id>.jsonl`。
+
+    `POCKET_RECORD_FIXTURE` 指到**既存目錄**時啟用(指到檔案 = 上面的 wire
+    recorder,兩種模式互斥);一行一幀 `{method, params}`,正好是
+    tests/test_replay_fixtures.py runner 吃的形狀 —— 跑一次真會話,每條
+    thread 就是一份候選 fixture(見 scripts/record-fixture-readme.md)。
+    檔名只保留安全字元(OpenClaw sessionKey 帶 `:`,Gemini key 可能帶 `/`)。
+    沿用 wire recorder 的三件事:sanitize(secret-like 幀整幀拒收)、
+    owner-only 0600、**吞錯不影響熱路徑**。
+    """
+    try:
+        root = os.path.expanduser(
+            os.environ.get("POCKET_RECORD_FIXTURE", "").strip())
+        if not root or not thread_id or not method or not os.path.isdir(root):
+            return
+        name = re.sub(r"[^A-Za-z0-9._-]", "_", str(thread_id)).strip("._")
+        frame = {"method": str(method),
+                 "params": params if isinstance(params, dict) else {}}
+        with _FIXTURE_RECORD_LOCK:
+            replay_fixture.append_frame(
+                os.path.join(root, (name or "thread")[:120] + ".jsonl"), frame)
+    except replay_fixture.ReplayFixtureError as exc:
+        _log_event("digest_fixture_frame_rejected", reason=type(exc).__name__)
+    except Exception as exc:  # noqa: BLE001
+        _log_event("digest_fixture_record_failed", error=type(exc).__name__)
 
 # Durable media index.  Construction is lazy so importing bridge.py in tests
 # does not create production state under ~/.pocket.
@@ -12535,12 +12567,106 @@ async def _pocket_id_autoenroll(identity_token: str) -> None:
 
 async def _pocket_id_heartbeat() -> None:
     st = _pocket_id_state()
-    await _pocket_id_api("/v1/hosts/heartbeat", {
+    data = await _pocket_id_api("/v1/hosts/heartbeat", {
         "host_id": st.get("host_id"),
         "host_secret": st.get("host_secret"),
         "candidates": _pocket_id_candidates(),
         "capabilities": _host_capabilities(),
     })
+    # notices 下行的消費失敗**不能**長得像心跳失敗 —— 否則 _pocket_id_loop
+    # 會對一個健康的 pocket-id 指數退避。就地吞,留 log。
+    try:
+        await _pocket_id_consume_notices(data if isinstance(data, dict) else {})
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("pocket_id_notices", _exc, expected=True)
+
+
+# ── 心跳 notices 下行:backup orphan 提醒(2026-11-06)──────────────────
+#
+# pocket-id 的 reaper 每小時掃出「備份訂閱還在扣款,但 host 權益已到期/機器
+# 已回收」的帳號(/v1/admin/cloud/reap 的 backup_orphans)。使用者在為一台
+# 不存在的機器付月費 —— 必須主動告知。但 pocket-id 自己沒有推播通道:APNs
+# 金鑰與裝置 token 都在各 host 的 bridge 上。所以走既有心跳**回應**的下行
+# 通道(同 update_ref 的「我們講、它聽」線,不開新常駐連線、不加狀態機):
+#
+#   心跳回應(host 的帳號有孤兒時才帶):
+#     {"ok": true, "notices": [{"type": "backup_orphan", "product_id": "..."}]}
+#
+# 沒有 notices 欄位 = 無事 —— 舊版 pocket-id 因此天然相容。bridge 收到就轉成
+# 本地推播給已配對裝置;pocket-id 每次心跳(60s)都會重複帶,所以 dedup 在
+# bridge 本地做:同一則 notice 24h 內只推一次,記在檔案裡(重啟不失憶)。
+# pocket-id 端的 notices 產生由另一棒實作;契約見 docs/APP_BRIDGE_CONTRACT.md
+# 附註 A。
+_HB_NOTICE_DEDUP_SECS = 24 * 3600.0
+
+
+def _hb_notice_state_path() -> str:
+    # 路徑每次求值,不綁 import 當下(同 _relay_dir 的 2026-08-15 教訓)。
+    return os.path.expanduser(os.environ.get(
+        "POCKET_HB_NOTICE_STATE", "~/.pocket/heartbeat-notices.json"))
+
+
+def _hb_notice_seen() -> dict:
+    """{dedup_key: 上次推播的 epoch 秒}。壞檔/缺檔 = 空(寧可多推一次,
+    不要因為一個壞 JSON 永遠閉嘴)。"""
+    try:
+        with open(_hb_notice_state_path(), encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except FileNotFoundError:
+        return {}
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("_hb_notice_seen", _exc, expected=True)
+        return {}
+
+
+def _hb_notice_mark(seen: dict, key: str) -> None:
+    """記下「這則已推」並落盤;順手修剪超過 dedup 窗的陳年條目。"""
+    now = time.time()
+    pruned = {k: v for k, v in seen.items()
+              if isinstance(v, (int, float)) and now - v < _HB_NOTICE_DEDUP_SECS}
+    pruned[key] = now
+    path = _hb_notice_state_path()
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(pruned, f)
+    os.replace(tmp, path)
+
+
+async def _pocket_id_consume_notices(resp: dict) -> None:
+    """心跳回應的 notices → dedup → 本地推播(既有 push_notify 管線)。"""
+    notices = resp.get("notices")
+    if not isinstance(notices, list) or not notices:
+        return
+    seen = _hb_notice_seen()
+    now = time.time()
+    for n in notices:
+        if not isinstance(n, dict):
+            continue
+        ntype = str(n.get("type") or "")
+        if ntype != "backup_orphan":
+            # 不認識的型別:跳過但留痕(向前相容 —— 新型別由升級後的 bridge 接)。
+            _log_event("pocket_id_notice_unknown", type=ntype[:48])
+            continue
+        product_id = str(n.get("product_id") or "")
+        key = f"{ntype}:{product_id}"
+        last = seen.get(key)
+        if isinstance(last, (int, float)) and now - last < _HB_NOTICE_DEDUP_SECS:
+            continue
+        # **先記再推**(at-most-once):心跳每 60s 一次,推播失敗若不記,
+        # 同一位使用者會被每分鐘轟一次;寧可 24h 後重試。失敗 push_notify
+        # 自己會 _log_event。
+        _hb_notice_mark(seen, key)
+        seen[key] = now
+        await push_notify(
+            "備份訂閱提醒",
+            "備份訂閱仍在扣款,但主機方案已到期、機器已回收 —— "
+            "不需要的話記得到 App Store 取消備份訂閱。",
+            {"kind": "notice",
+             "pocket": {"kind": "backup_orphan", "productId": product_id}},
+            thread_id="account-notices")
+        _log_event("backup_orphan_notice_pushed", product_id=product_id[:64])
 
 
 async def _pocket_id_loop() -> None:
@@ -22366,6 +22492,9 @@ def _cx_cards_feed(method: str, params: dict) -> None:
     """CodexAppServerClient 通知 → 有訂閱過的 thread 餵進 digest。
     digest 只在首次 cards/events 請求時建立,之前的歷史由 seed 補。"""
     tid = str(params.get("threadId") or "")
+    # 錄製鉤刻意放在 digest 守門**之前**:fixture 要的是完整 transcript,
+    # 不是「剛好有人開著卡片流」那一段。未設(或非目錄)= 一次 isdir 就返回。
+    _record_digest_fixture_frame(tid, method, params)
     # Delta notifications can arrive many times per second. Full item events
     # contain the same attachment/path data without flooding the thread pool.
     if tid and method in {"item/started", "item/completed"}:
@@ -24955,6 +25084,10 @@ def _oc_events_feed(event: str, payload: dict) -> None:
         key = _oc_safe_session_key(str(payload.get("sessionKey") or ""))
         if not key:
             return
+        # 錄製鉤(POCKET_RECORD_FIXTURE=目錄):gateway 事件以 (method=event,
+        # params=payload) 入檔;重放給 OpenClawDigest 時鍵名換成 event/payload
+        # 即可(見 scripts/record-fixture-readme.md)。
+        _record_digest_fixture_frame(key, event, payload)
         if event == "agent" and payload.get("isHeartbeat"):
             rid = str(payload.get("runId") or "")
             if rid:
@@ -25651,6 +25784,10 @@ def _gm_on_update(acp_sid: str, update: dict) -> None:
     t = _GM_TURNS.get(acp_sid)
     if not t:
         return
+    # 錄製鉤(POCKET_RECORD_FIXTURE=目錄):ACP 通知的 method 固定是
+    # session/update。注意 Gemini 的 replay runner 吃的是 persona 正規化契約
+    # (turn_begin/turn_delta/…),raw 錄音要先手工正規化才能進 manifest。
+    _record_digest_fixture_frame(str(t["key"]), "session/update", update)
     d = _GM_CARD_DIGESTS.get(t["key"])
     if d is None:
         return
