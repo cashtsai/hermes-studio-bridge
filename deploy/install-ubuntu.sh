@@ -64,6 +64,16 @@ FRPC_VERSION="${POCKET_FRPC_VERSION:-0.61.1}"   # 與 frps 同版釘死
 CODEX_VERSION="${CODEX_VERSION:-0.166.0}"
 HERMES_REPO_URL="${HERMES_REPO_URL:-https://github.com/NousResearch/hermes-agent.git}"
 HERMES_INSTALL_DIR="${HERMES_INSTALL_DIR:-$HOME/apps/hermes-agent}"
+# 釘死版本(理由同 openclaw:預設分支是會動的靶,今天能跑不代表下週)。
+# 空字串 = 跟著預設分支走,只有要試上游新版時才這樣用。
+HERMES_REF="${HERMES_REF:-v0.22.2}"
+# **Hermes 要 Python 3.14,而 Ubuntu 24.04 只給 3.12。**
+# hermes 的 `requires-python` 寫 ">=3.11,<3.15",所以在 3.12 上
+# `pip install` 會**成功**;但它 50 條依賴裡有 45 條掛
+# `python_version >= '3.14'` 標記,在 3.12 全部被跳過 —— 裝出一個
+# 「零依賴的空殼」,`hermes acp` 一 import 就死,安裝器還印成功。
+# (2026-10-19 本機升級時踩過同一個坑:「成功但零依賴」。)
+HERMES_PYTHON_VERSION="${HERMES_PYTHON_VERSION:-3.14}"
 OPENCLAW_VERSION="${OPENCLAW_VERSION:-2026.7.1-2}"
 OPENCLAW_NODE_VERSION="${OPENCLAW_NODE_VERSION:-24.18.0}"
 OPENCLAW_INSTALL_DIR="${OPENCLAW_INSTALL_DIR:-$HOME/apps/openclaw-clean}"
@@ -445,12 +455,62 @@ PY
 fi
 
 # ── Hermes provider(選配) ────────────────────────────────────────────────
+#
+# 裝 Hermes 要自己帶 Python 3.14 進來(見檔頭 HERMES_PYTHON_VERSION 的說明:
+# 用系統的 3.12 會裝出零依賴空殼而且**不會報錯**)。deadsnakes PPA 是
+# Ubuntu 上拿 3.14 最省事的路;拿不到就直接 die —— 寧可開機失敗讓人看見,
+# 也不要交付一台「Hermes 看起來裝好了但一用就死」的機器。
+install_hermes_python() {
+  local py="python${HERMES_PYTHON_VERSION}"
+  if command -v "$py" >/dev/null 2>&1; then
+    HERMES_PYTHON="$(command -v "$py")"
+    return 0
+  fi
+  log_step "安裝 Python ${HERMES_PYTHON_VERSION}(Hermes 需要)"
+  sudo add-apt-repository -y ppa:deadsnakes/ppa >/dev/null 2>&1 \
+    || die "加 deadsnakes PPA 失敗 —— Hermes 需要 Python ${HERMES_PYTHON_VERSION},請手動安裝後重跑"
+  sudo apt-get update -qq
+  sudo apt-get install -y -qq "${py}" "${py}-venv" "${py}-dev" \
+    || die "安裝 ${py} 失敗 —— Hermes 需要 Python ${HERMES_PYTHON_VERSION}"
+  command -v "$py" >/dev/null 2>&1 \
+    || die "裝完還是找不到 ${py}"
+  HERMES_PYTHON="$(command -v "$py")"
+}
+
 if [ "$INSTALL_HERMES" = "1" ] && [ ! -x "$HERMES_INSTALL_DIR/runtime/venv/bin/hermes" ]; then
-  log_step "安裝 Hermes(選配)"
-  [ -d "$HERMES_INSTALL_DIR/.git" ] || git clone -q "$HERMES_REPO_URL" "$HERMES_INSTALL_DIR"
-  python3 -m venv "$HERMES_INSTALL_DIR/runtime/venv"
-  "$HERMES_INSTALL_DIR/runtime/venv/bin/pip" install -q -e "$HERMES_INSTALL_DIR"
+  log_step "安裝 Hermes(選配,${HERMES_REF:-預設分支})"
+  install_hermes_python
+  if [ ! -d "$HERMES_INSTALL_DIR/.git" ]; then
+    git clone -q "$HERMES_REPO_URL" "$HERMES_INSTALL_DIR" \
+      || die "git clone Hermes 失敗:$HERMES_REPO_URL"
+  fi
+  if [ -n "$HERMES_REF" ]; then
+    git -C "$HERMES_INSTALL_DIR" fetch -q --tags origin \
+      || die "fetch Hermes 失敗"
+    git -C "$HERMES_INSTALL_DIR" checkout -q "$HERMES_REF" \
+      || die "切到 Hermes $HERMES_REF 失敗(版本不存在?)"
+  fi
+  "$HERMES_PYTHON" -m venv "$HERMES_INSTALL_DIR/runtime/venv" \
+    || die "建 Hermes venv 失敗($HERMES_PYTHON)"
+  "$HERMES_INSTALL_DIR/runtime/venv/bin/pip" install -q --upgrade pip
+  "$HERMES_INSTALL_DIR/runtime/venv/bin/pip" install -q -e "$HERMES_INSTALL_DIR" \
+    || die "pip install Hermes 失敗"
   mkdir -p "$HERMES_HOME_ROOT"
+fi
+
+# 煙霧測試:**跟安裝分開一個 if**,重跑安裝器(venv 已存在、上面整段跳過)
+# 時照樣驗一次 —— 「上次裝好的」不等於「現在還能跑」。
+# 這裡驗的是**狀態**不是離開碼:真的把 CLI 叫起來、真的 import 一條
+# 3.14-gated 的依賴,零依賴空殼會在這裡原形畢露。
+if [ "$INSTALL_HERMES" = "1" ]; then
+  HERMES_BIN_PATH="$HERMES_INSTALL_DIR/runtime/venv/bin/hermes"
+  [ -x "$HERMES_BIN_PATH" ] || die "Hermes 沒裝成:找不到 $HERMES_BIN_PATH"
+  HERMES_VENV_PY="$HERMES_INSTALL_DIR/runtime/venv/bin/python"
+  "$HERMES_VENV_PY" -c 'import openai, httpx' 2>/dev/null \
+    || die "Hermes 依賴沒裝進去($("$HERMES_VENV_PY" -V 2>&1))—— 典型症狀是 venv 用了 Python 3.12,45 條依賴被 python_version>=3.14 標記全部跳過"
+  "$HERMES_BIN_PATH" --version >/dev/null 2>&1 \
+    || die "hermes --version 跑不起來 —— 安裝壞了,不要交付這台機器"
+  log_step "Hermes OK($("$HERMES_VENV_PY" -V 2>&1))"
 fi
 
 if [ "$INSTALL_HERMES" = "1" ]; then

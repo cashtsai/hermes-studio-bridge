@@ -1842,3 +1842,35 @@ device token:
   新型別由升級後的 bridge 接手)。
 - notices 消費失敗(APNs 掛了等)**不得**讓心跳本身看起來失敗 ——
   否則 `_pocket_id_loop` 會對健康的 pocket-id 指數退避。
+
+### A-2:`subscription_expiring` 到期倒數(2026-11-06)
+
+同一條下行線的第二種 notice。訂閱到期前 **60 天**起,pocket-id 每次心跳
+都帶這一則,讓 app 的訂閱管理顯示倒數;但**只有拍板的節奏日才推播**。
+
+```jsonc
+{
+  "ok": true,
+  "notices": [
+    { "type": "subscription_expiring",
+      "days_left": 7,              // 無條件進位的剩餘天數(>0)
+      "expires_ts": 1800000000.0,  // 選填
+      "push": true }               // 只有 60/30/14/7/3/1 這幾天為 true
+  ]
+}
+```
+
+規則(與 backup_orphan 的差異都在這):
+
+- **`push` 的決策權在伺服器,bridge 不自己算日子。** 兩邊各算一次遲早
+  不同步;bridge 只問「這則要不要推」。`push=false` 照樣會每 60s 送來
+  (app 要倒數),bridge **不推播、也不佔 dedup 格**。
+- **dedup 鍵是 `subscription_expiring:{days_left}`,必須含天數。**
+  沿用 `type:product_id` 那種不含天數的鍵 + 固定 24h 窗,會讓整段倒數
+  **只推出第一則**(T-60 推了,T-30/T-14/T-7 全被當重複吃掉)。含天數後:
+  同一天內重複心跳仍只推一次,換節奏日就是新的一則。
+  (回歸測試:`tests/test_heartbeat_notices.py` 的
+  `test_each_cadence_day_pushes_separately`)
+- `days_left` 解不出整數 / `<= 0` → 不推(已到期交給 reaper 的冬眠流程)。
+- payload `data.pocket = {kind: "subscription_expiring", daysLeft, expiresTs?}`,
+  `thread_id` 同樣是 `"account-notices"`。

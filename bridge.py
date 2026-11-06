@@ -12646,6 +12646,60 @@ def _hb_notice_mark(seen: dict, key: str) -> None:
     os.replace(tmp, path)
 
 
+def _hb_notice_plan(n: dict) -> dict | None:
+    """一則 notice → 推播計畫 {key, title, body, pocket, event} ;不推回 None。
+
+    把「這則長什麼樣」跟「要不要推、推過沒」分開 —— 後者是
+    `_pocket_id_consume_notices` 的事,這裡只負責翻譯。認不得的型別回 None。
+    """
+    ntype = str(n.get("type") or "")
+    if ntype == "backup_orphan":
+        product_id = str(n.get("product_id") or "")
+        return {
+            "key": f"{ntype}:{product_id}",
+            "title": "備份訂閱提醒",
+            "body": ("備份訂閱仍在扣款,但主機方案已到期、機器已回收 —— "
+                     "不需要的話記得到 App Store 取消備份訂閱。"),
+            "pocket": {"kind": "backup_orphan", "productId": product_id},
+            "event": ("backup_orphan_notice_pushed",
+                      {"product_id": product_id[:64]}),
+        }
+    if ntype == "subscription_expiring":
+        # 到期倒數(2026-11-06)。伺服器端每次心跳都帶 days_left 讓 App 顯示
+        # 倒數,但 **只有 push=True 的那幾天(60/30/14/7/3/1)才推播** ——
+        # 推播節奏的決策權在伺服器,bridge 不自己算日子(兩邊各算一次 =
+        # 遲早不同步)。
+        if not n.get("push"):
+            return None
+        try:
+            days_left = int(n.get("days_left"))
+        except (TypeError, ValueError):
+            return None
+        if days_left <= 0:
+            return None
+        # **dedup key 要含 days_left**:固定 24h 窗 + 不含天數的 key 會讓整段
+        # 倒數只推出第一則(T-60 推了,T-30/T-14/… 全被當重複吃掉)。
+        # 含天數後:同一天內重複心跳仍只推一次,換一個節點就是新的一則。
+        expires_ts = n.get("expires_ts")
+        if days_left == 1:
+            body = "你的 Pocket 訂閱明天到期。到期後主機會進入冬眠,資料保留 30 天。"
+        else:
+            body = (f"你的 Pocket 訂閱剩 {days_left} 天到期。"
+                    "到期後主機會進入冬眠,資料保留 30 天,續訂即可喚醒。")
+        pocket: dict = {"kind": "subscription_expiring", "daysLeft": days_left}
+        if isinstance(expires_ts, (int, float)):
+            pocket["expiresTs"] = float(expires_ts)
+        return {
+            "key": f"{ntype}:{days_left}",
+            "title": "訂閱即將到期",
+            "body": body,
+            "pocket": pocket,
+            "event": ("subscription_expiring_notice_pushed",
+                      {"days_left": days_left}),
+        }
+    return None
+
+
 async def _pocket_id_consume_notices(resp: dict) -> None:
     """心跳回應的 notices → dedup → 本地推播(既有 push_notify 管線)。"""
     notices = resp.get("notices")
@@ -12656,13 +12710,15 @@ async def _pocket_id_consume_notices(resp: dict) -> None:
     for n in notices:
         if not isinstance(n, dict):
             continue
-        ntype = str(n.get("type") or "")
-        if ntype != "backup_orphan":
-            # 不認識的型別:跳過但留痕(向前相容 —— 新型別由升級後的 bridge 接)。
-            _log_event("pocket_id_notice_unknown", type=ntype[:48])
+        plan = _hb_notice_plan(n)
+        if plan is None:
+            ntype = str(n.get("type") or "")
+            # 認得但這次不推(例:倒數非推播日)不算未知型別,別洗 log。
+            if ntype not in ("backup_orphan", "subscription_expiring"):
+                # 不認識的型別:跳過但留痕(向前相容 —— 新型別由升級後的 bridge 接)。
+                _log_event("pocket_id_notice_unknown", type=ntype[:48])
             continue
-        product_id = str(n.get("product_id") or "")
-        key = f"{ntype}:{product_id}"
+        key = plan["key"]
         last = seen.get(key)
         if isinstance(last, (int, float)) and now - last < _HB_NOTICE_DEDUP_SECS:
             continue
@@ -12672,13 +12728,11 @@ async def _pocket_id_consume_notices(resp: dict) -> None:
         _hb_notice_mark(seen, key)
         seen[key] = now
         await push_notify(
-            "備份訂閱提醒",
-            "備份訂閱仍在扣款,但主機方案已到期、機器已回收 —— "
-            "不需要的話記得到 App Store 取消備份訂閱。",
-            {"kind": "notice",
-             "pocket": {"kind": "backup_orphan", "productId": product_id}},
+            plan["title"], plan["body"],
+            {"kind": "notice", "pocket": plan["pocket"]},
             thread_id="account-notices")
-        _log_event("backup_orphan_notice_pushed", product_id=product_id[:64])
+        ev_name, ev_fields = plan["event"]
+        _log_event(ev_name, **ev_fields)
 
 
 async def _pocket_id_loop() -> None:
