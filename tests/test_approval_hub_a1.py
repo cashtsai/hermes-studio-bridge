@@ -86,6 +86,16 @@ class TestWireShape(unittest.TestCase):
 
 
 class TestDecideCore(unittest.TestCase):
+    def test_past_deadline_before_sweeper_never_dispatches(self):
+        aid = "late-device"
+        row = {"status": "pending", "expires_at": time.time() - 1, "source": "claude_code:qa"}
+        with patch.object(bridge, "_approval_get_row", return_value=row), \
+                patch.object(bridge, "_cc_status_core", AsyncMock()) as provider, \
+                self.assertRaises(bridge.BridgeError) as expired:
+            asyncio.run(bridge._approval_decide_core(aid, {"approve": True}))
+        self.assertEqual(expired.exception.status_code, 409)
+        provider.assert_not_awaited()
+
     def test_phone_and_web_cannot_dispatch_two_keys_for_one_prompt(self):
         aid, name = "qa-dual-device", "handoff-test"
         _insert_legacy(aid, "claude_code:" + name)

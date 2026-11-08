@@ -211,3 +211,16 @@ test("next question shares an approval ID; each displayed step sends its own ind
   await page.locator("#approval").waitFor({state:"hidden"});
   assert.deepEqual(decisions, [["aid",0,"opt0"],["aid",1,"opt0"]]);
 });
+
+test("approval expires on screen without waiting for a list refresh", async t => {
+  const now = Date.now();
+  const page = await fixture(t, (r, id, action) => {
+    assert.equal(r.request().method(), "GET");
+    return action === "events" ? stream(r) : r.fulfill({json:snap(0,[])});
+  }, () => ({approval:{id:"exp", title:"Short approval", expires_at:now / 1000 + 5}}));
+  await page.clock.install({time:new Date(now)});
+  await page.getByText("Beta",{exact:true}).click();
+  await page.getByRole("button",{name:"核准",exact:true}).waitFor();
+  await page.clock.fastForward(5100);
+  await page.locator("#approval").waitFor({state:"hidden"});
+});

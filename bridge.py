@@ -32677,6 +32677,9 @@ async def _approval_decide_serial(aid: str, b: dict) -> dict:
         if d.get("result"):
             out["result"] = d.get("result")
         return out
+    if (d and d.get("status") == "pending" and d.get("expires_at") is not None
+            and d["expires_at"] <= time.time()):
+        raise http_err(409, "APPROVAL_NOT_PENDING", "這項核准已過期")
     if d and str(d.get("kind") or "") == "guest_message":
         # E3 guest 擬稿:DB-backed 審批,**必須在 provider 分支之前**攔下 ——
         # 它的 source/session_id 帶目標 session 前綴(claude_code:/codex:…),

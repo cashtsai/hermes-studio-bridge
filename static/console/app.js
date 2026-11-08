@@ -269,7 +269,9 @@ function approvalIdOf(meta) {
 
 const deciding = new Set();
 const handledApproval = new Map();
+let approvalExpiry;
 function renderApproval() {
+  clearTimeout(approvalExpiry);
   const bar = $("approval");
   const s = currentSession();
   const meta = (s && s.meta) || {};
@@ -280,7 +282,10 @@ function renderApproval() {
   const options = prompt?.options?.length ? prompt.options : meta.approval?.options;
   const opts = Array.isArray(options) && options.length ? options : null;
 
-  if ((!opts && !aid) || (step && handledApproval.get(s.id) === step)) { bar.classList.add("hidden"); return; }
+  const expires = meta.approval?.expires_at;
+  const msLeft = Number.isFinite(expires) ? expires * 1000 - Date.now() : Infinity;
+  if (msLeft <= 0 || (!opts && !aid) || (step && handledApproval.get(s.id) === step)) { bar.classList.add("hidden"); return; }
+  if (msLeft !== Infinity) approvalExpiry = setTimeout(renderApproval, Math.min(msLeft + 1, 2147483647));
   bar.classList.remove("hidden");
   $("ap-title").textContent =
     (prompt && prompt.title) || (meta.approval && meta.approval.title) || "等待你放行";
@@ -364,11 +369,13 @@ function jumpToAwaiting() {
 }
 
 function subscribeCards(id, view) {
+  let resyncing = false;
   function resync() {
-    if (!currentView(view)) return;
+    if (!currentView(view) || resyncing) return;
+    resyncing = true;
     if (state.stopStream) { state.stopStream(); state.stopStream = null; }
     $("stream-health").textContent = "正在同步";
-    void loadCardSnapshot(id, ++state.view);
+    void loadCardSnapshot(id, view);
   }
   const url = () => "/app/v2/sessions/" + encodeURIComponent(id) +
               "/events?since_seq=" + state.latestSeq + "&profile=phone";
