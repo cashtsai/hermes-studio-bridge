@@ -9,6 +9,7 @@ const $ = (id) => document.getElementById(id);
 const state = {
   token: null,
   sessions: [],
+  host: "", degraded: [], listHealth: "loading",
   current: null,      // 目前選的 session id
   cards: [],          // 目前 session 的卡片
   latestSeq: 0,
@@ -93,6 +94,7 @@ async function bootstrap() {
 
 function fatalAuth(msg) {
   $("session-list").innerHTML = '<div class="empty err">' + esc(msg) + "</div>";
+  $("home-notice").textContent = msg;
   setConn(false, "未配對");
 }
 
@@ -159,27 +161,37 @@ async function loadSessions() {
   try {
     const d = await apiJSON("/app/v2/sessions");
     if (request !== listRequest || signingOut) return;
-    state.sessions = d.sessions || [];
-    const degraded = d.degraded_providers || [];
-    renderSessions(degraded);
+    if (!Array.isArray(d.sessions)) throw new Error("無效的工作清單");
+    state.sessions = d.sessions;
+    state.host = d.host_name || location.hostname;
+    state.listHealth = "ready";
+    const degraded = state.degraded = d.degraded_providers || [];
+    renderSessions();
+    renderHome();
     renderAwaiting();
     renderApproval();
     setConn(true, degraded.length ? ("降級:" + degraded.join(",")) : "已連線");
     const want = !state.current && hashSession();
     if (want && state.sessions.some(s => s.id === want)) openSession(want);
   } catch (err) {
-    if (request === listRequest && !signingOut) setConn(false, "取列表失敗");
+    if (request !== listRequest || signingOut) return;
+    state.listHealth = "failed";
+    renderHome(); renderSessions(); renderAwaiting(); renderApproval();
+    setConn(false, "取列表失敗");
   }
 }
 
-function renderSessions(degraded) {
+function renderSessions() {
   const el = $("session-list");
-  if (!state.sessions.length) { el.innerHTML = '<div class="empty">沒有 session</div>'; return; }
+  if (!state.sessions.length) {
+    el.textContent = state.listHealth === "failed" || state.degraded.length ? "清單暫時不完整" : "沒有 session";
+    return;
+  }
   const byProv = {};
   for (const s of state.sessions) (byProv[s.provider] = byProv[s.provider] || []).push(s);
   let html = "";
   for (const prov of Object.keys(byProv)) {
-    const dim = degraded.includes(prov) ? " degraded" : "";
+    const dim = state.degraded.includes(prov) ? " degraded" : "";
     html += '<div class="prov-group"><div class="prov-head' + dim + '">' +
             esc(PROVIDER_LABEL[prov] || prov) + (dim ? " ⚠" : "") + "</div>";
     for (const s of byProv[prov]) {
@@ -188,7 +200,7 @@ function renderSessions(degraded) {
       html += '<div class="sess' + active + '" data-id="' + esc(s.id) + '">' +
               '<div class="sess-name">' + esc(s.title || s.id) + locked + "</div>" +
               '<div class="sess-sub"><span class="st st-' + esc(s.status || "idle") + '">' +
-              esc(s.status || "idle") + "</span> " + esc(s.subtitle || "") + "</div></div>";
+              esc(workPhase(s)) + "</span> " + esc(s.subtitle || "") + "</div></div>";
     }
     html += "</div>";
   }
@@ -197,16 +209,97 @@ function renderSessions(degraded) {
     n.addEventListener("click", () => openSession(n.dataset.id)));
 }
 
+function activityTime(value) {
+  const ms = typeof value === "number" ? (value < 1e12 ? value * 1000 : value)
+    : typeof value === "string" && /^\d{4}-\d\d-\d\dT/.test(value) ? Date.parse(value) : NaN;
+  return ms > 0 && Number.isFinite(new Date(ms).getTime()) ? ms : 0;
+}
+
+function workMatches(s, query) {
+  const fields = [s.title, s.id, s.provider, PROVIDER_LABEL[s.provider], s.subtitle, s.meta?.workdir,
+    s.provider === "claude_code" || s.provider === "cc2" ? "Claude Code" : ""];
+  return query.toLowerCase().trim().split(/\s+/).every(term =>
+    fields.some(field => String(field || "").toLowerCase().includes(term)));
+}
+
+const PHASE_LABEL = { idle: "閒置", done: "已完成", running: "執行中", run: "執行中",
+  busy: "執行中", failed: "失敗", stalled: "停滯", waiting_approval: "等待核准", queued: "排隊中" };
+const activityFormat = new Intl.DateTimeFormat("zh-TW",
+  { year:"numeric", month:"numeric", day:"numeric", hour:"2-digit", minute:"2-digit", hour12:false });
+function workPhase(s) {
+  if (s.meta?.locked) return "被佔用";
+  if (s.status === "waiting_approval" && !actionable(s)) {
+    const a = s.meta?.approval, aid = approvalIdOf(s.meta), exp = activityTime(a?.expires_at);
+    if (aid && handledApproval.get(s.id) === aid || a?.status && a.status !== "pending") return "核准已結束";
+    if (exp && exp <= Date.now()) return "核准已逾時";
+    return "待主機確認";
+  }
+  return PHASE_LABEL[s.status] || s.status || "狀態未知";
+}
+function workRow(s) {
+  const time = activityTime(s.last_event_at);
+  const detail = [s.meta?.workdir || s.subtitle, s.id].filter(Boolean).join(" · ");
+  const phase = workPhase(s);
+  return '<button type="button" class="work-row" data-id="' + esc(s.id) + '">' +
+    '<span class="work-provider">' + esc(PROVIDER_LABEL[s.provider] || s.provider) + '</span>' +
+    '<span class="work-text"><strong>' + esc(s.title || s.id) + '</strong><small>' + esc(detail) +
+    '</small></span><span class="work-state">' + esc(phase) +
+    (time ? '<small>' + esc(activityFormat.format(time)) + '</small>' : '') + '</span></button>';
+}
+
+function renderHome() {
+  if (state.current || signingOut) return;
+  const ready = state.listHealth === "ready", partial = state.degraded.length > 0;
+  $("home-host").textContent = state.host ? "主機 · " + state.host : "";
+  $("home-notice").textContent = !ready ? (state.listHealth === "loading" ? "正在取得主機清單…" :
+    "無法更新主機清單；先前的資料可能已過時。") : partial
+    ? "部分服務暫時無法更新：" + state.degraded.join("、") : "";
+  const q = $("home-q").value.trim();
+  $("home-groups").classList.toggle("hidden", !!q);
+  $("home-results").classList.toggle("hidden", !q);
+  const rows = (id, sessions, empty) => {
+    const el = $(id);
+    const html = sessions.length ? sessions.map(workRow).join("") : '<p class="work-empty">' + esc(empty) + '</p>';
+    if (el.innerHTML !== html) el.innerHTML = html;
+  };
+  if (q) {
+    rows("home-results", state.sessions.filter(s => workMatches(s, q)),
+      ready && !partial ? "沒有符合的工作" : "尚無符合的可用資料");
+    return;
+  }
+  const recent = state.sessions.filter(s => activityTime(s.last_event_at))
+    .sort((a,b) => activityTime(b.last_event_at) - activityTime(a.last_event_at));
+  rows("recent-list", recent.slice(0, 5), ready && !partial ? "尚無可確認的活動時間" : "尚無最近活動資料");
+  rows("pending-list", state.sessions.filter(actionable), ready && !partial
+    ? "目前沒有可處理的核准" : "待處理清單尚不完整");
+}
+
+function showHome() {
+  ++state.view;
+  if (state.stopStream) { state.stopStream(); state.stopStream = null; }
+  state.current = null; state.cards = []; state.latestSeq = 0;
+  writeHash(null);
+  for (const id of ["stream-head", "approval", "cards", "composer", "delivery", "atts"]) $(id).classList.add("hidden");
+  $("cards").replaceChildren();
+  $("main").classList.add("at-home");
+  $("handoff").classList.remove("hidden");
+  renderSessions(); renderHome(); $("home-q").focus();
+}
+
 // ───────────────────────── 卡片流 ─────────────────────────
 let snapshotRetry;
-function openSession(id) {
+function openSession(id, preserveMode = false) {
   if (signingOut) return;
   const view = ++state.view;
   clearTimeout(snapshotRetry);
   if (state.stopStream) { state.stopStream(); state.stopStream = null; }
   state.current = id;
   state.cards = []; state.latestSeq = 0;
-  renderSessions([]);                      // 重畫 active 標記
+  if (!preserveMode) window.PocketConsoleMode?.set("agents");
+  $("main").classList.remove("at-home");
+  $("handoff").classList.add("hidden");
+  $("cards").classList.remove("hidden");
+  renderSessions();
   writeHash(id);                           // 深連結:可加書籤 / 重整不掉頁
   $("stream-head").classList.remove("hidden");
   $("composer").classList.remove("hidden");
@@ -270,6 +363,16 @@ function approvalIdOf(meta) {
 const deciding = new Set();
 const handledApproval = new Map();
 let approvalExpiry;
+function actionable(s) {
+  if (!s || state.listHealth !== "ready" || state.degraded.includes(s.provider)) return false;
+  if (Array.isArray(s.capabilities) && !s.capabilities.includes("approve")) return false;
+  const a = s.meta?.approval, aid = approvalIdOf(s.meta);
+  if (a?.status && a.status !== "pending") return false;
+  const exp = activityTime(a?.expires_at);
+  if (exp && exp <= Date.now()) return false;
+  if (aid) return handledApproval.get(s.id) !== JSON.stringify([aid, s.meta.approval?.q_index ?? null]);
+  return document.body.dataset.consoleAccess !== "remote" && !!s.meta?.prompt?.options?.length;
+}
 function renderApproval() {
   clearTimeout(approvalExpiry);
   const bar = $("approval");
@@ -282,20 +385,15 @@ function renderApproval() {
   const options = prompt?.options?.length ? prompt.options : meta.approval?.options;
   const opts = Array.isArray(options) && options.length ? options : null;
 
-  const expires = meta.approval?.expires_at;
-  const msLeft = Number.isFinite(expires) ? expires * 1000 - Date.now() : Infinity;
-  if (msLeft <= 0 || (!opts && !aid) || (step && handledApproval.get(s.id) === step)) { bar.classList.add("hidden"); return; }
-  if (msLeft !== Infinity) approvalExpiry = setTimeout(renderApproval, Math.min(msLeft + 1, 2147483647));
+  const expires = activityTime(meta.approval?.expires_at);
+  if (!actionable(s)) { bar.classList.add("hidden"); return; }
+  if (expires) approvalExpiry = setTimeout(() => { renderApproval(); renderAwaiting(); renderHome(); }, Math.min(Math.max(1, expires - Date.now() + 1), 2147483647));
   bar.classList.remove("hidden");
   $("ap-title").textContent =
     (prompt && prompt.title) || (meta.approval && meta.approval.title) || "等待你放行";
 
   const box = $("ap-actions");
   box.innerHTML = "";
-  if (!aid && document.body.dataset.consoleAccess === "remote") {
-    box.textContent = "等待主機確認核准項目";
-    return;
-  }
   if (opts) {
     // 有選項就照選項畫(CC 的數字選單/權限提示;label 可能是任何語言)
     opts.slice(0, 8).forEach((o) => {
@@ -318,7 +416,7 @@ function renderApproval() {
 }
 
 async function decide(id, aid, index, choice, btn) {
-  if (!id || id !== state.current || deciding.has(id) || signingOut) return;
+  if (!id || id !== state.current || deciding.has(id) || signingOut || !actionable(currentSession())) return;
   if (!aid && document.body.dataset.consoleAccess === "remote") return;
   deciding.add(id);
   const body = Object.assign({}, choice, aid ? { approval_id: aid } : {});
@@ -346,15 +444,14 @@ async function decide(id, aid, index, choice, btn) {
     if (!signingOut && state.current === id) toast("無法確認決定：" + err.message);
   } finally {
     deciding.delete(id);
-    if (!signingOut) { renderApproval(); loadSessions(); }
+    if (!signingOut) { renderApproval(); renderAwaiting(); renderHome(); loadSessions(); }
   }
 }
 
 // 跨 session 彙總:有幾件在等你。資料來源同上(sessions 的 meta/status),
 // 不必另外打 /app/v1/approvals —— 列表本來就每次都抓。
 function renderAwaiting() {
-  const n = state.sessions.filter((s) =>
-    s.status === "waiting_approval" || (s.meta && (s.meta.approval || s.meta.prompt))).length;
+  const n = state.sessions.filter(actionable).length;
   const el = $("awaiting");
   $("awaiting-n").textContent = String(n);
   el.classList.toggle("hidden", n === 0);
@@ -363,8 +460,7 @@ function renderAwaiting() {
 
 // 點徽章 → 跳到第一條在等的 session
 function jumpToAwaiting() {
-  const s = state.sessions.find((x) =>
-    x.status === "waiting_approval" || (x.meta && (x.meta.approval || x.meta.prompt)));
+  const s = state.sessions.find(actionable);
   if (s) openSession(s.id);
 }
 
@@ -669,6 +765,14 @@ function autosize() {
 
 // ───────────────────────── 綁定 + 啟動 ─────────────────────────
 function wire() {
+  $("back-home").addEventListener("click", showHome);
+  $("all-work").addEventListener("click", openPalette);
+  $("home-refresh").addEventListener("click", loadSessions);
+  $("home-q").addEventListener("input", renderHome);
+  $("handoff").addEventListener("click", e => {
+    const row = e.target.closest(".work-row");
+    if (row) openSession(row.dataset.id);
+  });
   $("logout").addEventListener("click", () => leaveConsole(true));
   $("retry-logout").addEventListener("click", () => leaveConsole());
   window.addEventListener("storage", e => {
@@ -746,7 +850,7 @@ function moveSelection(delta) {
   if (next && next !== state.current) openSession(next);
 }
 function firstApprovalButton(wantYes) {
-  if ($("approval").classList.contains("hidden")) return null;
+  if ($("approval").classList.contains("hidden") || !actionable(currentSession())) return null;
   const btns = Array.from($("ap-actions").querySelectorAll("button"));
   if (!btns.length) return null;
   const hit = btns.find((b) => b.classList.contains(wantYes ? "ap-yes" : "ap-no"));
@@ -758,6 +862,18 @@ function wireKeys() {
       e.preventDefault(); openPalette(); return;
     }
     if (e.key === "Escape") { closePalette(); return; }
+    if (!$("palette").classList.contains("hidden")) {
+      if (e.isComposing) return;
+      const rows = Array.from($("pal-list").querySelectorAll(".work-row"));
+      const i = rows.indexOf(document.activeElement);
+      if (rows.length && ["ArrowDown", "ArrowUp"].includes(e.key)) {
+        e.preventDefault();
+        rows[Math.max(0, Math.min(rows.length - 1, i + (e.key === "ArrowDown" ? 1 : -1)))].focus();
+      } else if (e.key === "Enter" && document.activeElement === $("pal-q") && rows.length) {
+        e.preventDefault(); rows[0].click();
+      }
+      return;
+    }
     if (typingNow()) return;
     if (e.key === "j") { e.preventDefault(); moveSelection(1); }
     else if (e.key === "k") { e.preventDefault(); moveSelection(-1); }
@@ -777,16 +893,11 @@ function openPalette() {
 function closePalette() { $("palette").classList.add("hidden"); }
 function renderPalette(q) {
   const needle = q.trim().toLowerCase();
-  const hits = state.sessions.filter((s) =>
-    !needle || (s.title || s.id).toLowerCase().includes(needle) ||
-    (s.provider || "").toLowerCase().includes(needle)).slice(0, 12);
+  const hits = state.sessions.filter(s => workMatches(s, needle));
   $("pal-list").innerHTML = hits.length
-    ? hits.map((s, i) => '<div class="pal-item' + (i === 0 ? " sel" : "") +
-        '" data-id="' + esc(s.id) + '"><span class="pill">' +
-        esc(PROVIDER_LABEL[s.provider] || s.provider || "") + "</span>" +
-        esc(s.title || s.id) + "</div>").join("")
+    ? hits.map(workRow).join("")
     : '<div class="empty">沒有符合的 session</div>';
-  $("pal-list").querySelectorAll(".pal-item").forEach((n) =>
+  $("pal-list").querySelectorAll(".work-row").forEach((n) =>
     n.addEventListener("click", () => { closePalette(); openSession(n.dataset.id); }));
 }
 
