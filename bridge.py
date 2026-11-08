@@ -24489,7 +24489,12 @@ _GUEST_SECRET_PATH = Path(os.path.expanduser("~/.pocket/guest-link-secret"))
 
 def _guest_secret() -> bytes:
     try:
-        b = _GUEST_SECRET_PATH.read_bytes().strip()
+        b = _GUEST_SECRET_PATH.read_bytes()
+        # Generated keys are exactly 32 binary bytes; edge whitespace is key
+        # material. Keep the old normalization for longer provisioned keys.
+        if len(b) == 32:
+            return b
+        b = b.strip()
         if len(b) >= 32:
             return b
     except FileNotFoundError:
