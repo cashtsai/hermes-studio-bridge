@@ -102,3 +102,7 @@ class BorrowedBrowserTest(unittest.TestCase):
         with patch.object(bridge, "_console_web_ok", return_value=True):
             self.assertIn("pocket://console-login", self.web.get("/console").text)
             self.assertEqual(self.web.post("/console/auth", json={"code": "123456"}).status_code, 403)
+
+
+if __name__ == "__main__":
+    unittest.main()
