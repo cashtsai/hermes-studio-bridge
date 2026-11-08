@@ -248,6 +248,7 @@ class CodexTransportTest(unittest.TestCase):
                 # Pixel's real full-history response exceeded the former cap.
                 self.assertGreater(captured["max_size"], 181272822)
                 self.assertLessEqual(captured["max_size"], 256 * 1024 * 1024)
+                self.assertEqual(captured["ping_timeout"], 90)
                 self.assertEqual(captured["user_agent_header"],
                                  "PocketAgent-Bridge/0.1")
             finally:
