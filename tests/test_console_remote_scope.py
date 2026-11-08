@@ -18,6 +18,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 
 _TMP = tempfile.mkdtemp(prefix="console-scope-")
 os.environ.setdefault("POCKET_CANON_DB", os.path.join(_TMP, "canonical.db"))
@@ -35,6 +36,9 @@ class ConsoleRemoteScopeTest(unittest.TestCase):
 
     def setUp(self):
         from fastapi.testclient import TestClient
+        roots = patch.object(bridge, "CONSOLE_REMOTE_FILE_ROOTS", [os.path.realpath(_ALLOWED)])
+        roots.start()
+        self.addCleanup(roots.stop)
         self.http = TestClient(bridge.app)
         self.ok = os.path.join(_ALLOWED, "ok.txt")
         with open(self.ok, "w") as f:

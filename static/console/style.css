@@ -190,6 +190,9 @@ body{background:var(--bg);color:var(--text);font-family:var(--sans);
   background:var(--bad);color:#fff;padding:10px 18px;border-radius:10px;
   box-shadow:0 6px 24px rgba(0,0,0,.3);z-index:10;font-size:13px;}
 .hidden{display:none !important;}
+#logout-screen{margin:3rem auto;padding:1rem;max-width:32rem;}
+body[data-console-access="remote"] [data-mode="term"],
+body[data-console-access="remote"] [data-mode="memory"]{display:none;}
 
 /* 手機:列表與卡片流上下疊(第一刀先簡單處理,之後再做抽屜) */
 @media (max-width:760px){

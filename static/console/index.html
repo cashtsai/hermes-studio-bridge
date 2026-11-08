@@ -15,7 +15,7 @@
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-title" content="Pocket">
 </head>
-<body>
+<body data-console-access="local">
 <div id="app">
   <header id="topbar">
     <div class="brand">
@@ -35,6 +35,7 @@
     <span id="usage" class="usage hidden" title="今日用量／花費"></span>
     <button id="theme-btn" class="icon-btn theme-btn" title="切換主題（Pocket／White／Dark，同 App）">◑</button>
     <div id="conn" class="conn" title="連線狀態"><span class="dot"></span><span id="conn-text">連線中…</span></div>
+    <button type="button" id="logout" class="btn-ghost">登出這台電腦</button>
   </header>
 
   <main id="main">
@@ -171,6 +172,10 @@
 
   <div id="toast" class="toast hidden"></div>
 </div>
+<section id="logout-screen" class="hidden" aria-live="polite">
+  <p id="logout-state"></p>
+  <button type="button" class="btn" id="retry-logout">重試登出</button>
+</section>
 <script src="/console/static/sse.js"></script>
 <script src="/console/static/app.js"></script>
 <script src="/console/static/filebrowser.js"></script>
