@@ -1220,6 +1220,22 @@ class CodexThreadDigest(ApprovalCardMixin):
                 for card in codex_item_to_cards(item, turn_id=tid, ts=ts, index=idx):
                     card = merge_input_accepted_echo(self.store, card)
                     card = dedupe_transcript_message(self.store, card)
+                    # Media capture enriches a seeded card after the canonical
+                    # item has been converted. Keep that server-side
+                    # enrichment when the next TTL reseed reconstructs the
+                    # same item; otherwise the generated card briefly loses
+                    # `attachments`, `_same_card` reports a false change, and
+                    # every Codex history card is emitted again on each poll.
+                    previous = self.store.cards.get(card["id"])
+                    previous_attachments = ((previous or {}).get("body") or {}).get(
+                        "attachments")
+                    generated_body = card.get("body") or {}
+                    if previous_attachments and not generated_body.get("attachments"):
+                        card = dict(card)
+                        card["body"] = dict(generated_body)
+                        card["body"]["attachments"] = [
+                            dict(attachment) for attachment in previous_attachments
+                        ]
                     if not emit_unchanged and self._same_card(
                         self.store.cards.get(card["id"]), card
                     ):
