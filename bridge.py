@@ -5785,7 +5785,29 @@ async def _probe_agent_auth() -> dict:
                                         env=_codex_prepare_home())
         codex["logged_in"], codex["account"] = _parse_codex_login(rc, out)
 
-    return {"claude": claude, "codex": codex}
+    return {"claude": claude, "codex": codex, "gemini": _local_gemini_auth()}
+
+
+def _local_gemini_auth() -> dict:
+    gm = {"installed": False, "logged_in": False, "account": None}
+    try:
+        if gemini_provider.provider_backend() == "antigravity":
+            gm["installed"] = shutil.which(gemini_provider.agy_bin()) is not None
+            # agy has no local auth-status probe; do not send a paid prompt.
+            if gm["installed"]:
+                gm["logged_in"] = None
+        elif shutil.which(gemini_provider.gemini_bin()):
+            gm["installed"] = True
+            plan = gemini_provider.auth_plan(gemini_provider.load_config(),
+                                             gemini_provider.oauth_available())
+            gm["logged_in"] = bool(plan)
+            if plan:
+                key = gemini_provider.backend_spec()["auth_ids"]["api-key"]
+                gm["account"] = "API key" if plan[0] == key else "Google"
+    except Exception as e:
+        _log_exc("probe_gemini_auth", e, expected=True)
+        gm["logged_in"] = None
+    return gm
 
 
 async def _agent_auth_refresh() -> None:
@@ -5816,6 +5838,9 @@ async def _agent_auth_status() -> dict:
                        "logged_in": None, "account": None},
             "codex": {"installed": os.path.exists(_resolve_codex_bin()),
                       "logged_in": None, "account": None},
+            # 首探未完成時 gemini 也要在場(缺欄位 = app 判成「這台沒有
+            # 這個引擎」,而真相是「還沒探」)。
+            "gemini": {"installed": True, "logged_in": None, "account": None},
             "checking": True}
 
 
@@ -33377,8 +33402,9 @@ async def app_dashboard(request: Request):
 
 @app.get("/app/v1/agents/auth")
 async def app_agents_auth(request: Request):
-    """CC/CX 這台 Mac 的登入狀態(app gate CC/CX 頁籤用)。
-    回 {"claude": {"installed", "logged_in", "account"}, "codex": {…}}。
+    """CC/CX/Gemini 在這台主機的登入狀態(app 的「引擎帳號」頁與頁籤 gate 用)。
+    回 {"claude": {"installed","logged_in","account"}, "codex": {…}, "gemini": {…}}。
+    `gemini` 2026-11-03 新增 —— 舊 app 不讀這個鍵,不受影響。
     TTL 60s 快取;純唯讀查狀態,不碰憑證。"""
     _check_auth(request)
     return await _agent_auth_status()
