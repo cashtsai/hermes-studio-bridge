@@ -3,6 +3,7 @@
 "use strict";
 
 const TOKEN_KEY = "pocket.console.token";
+const LOGOUT_EVENT = "pocket.console.logout";
 const $ = (id) => document.getElementById(id);
 
 const state = {
@@ -37,23 +38,23 @@ async function claimToken(code) {
   });
   const claim = await r.json().catch(() => ({}));
   if (!claim.token) throw new Error(claim.detail || "claim 無 token");
-  return claim.token;
+  return claim;
 }
 
 async function bootstrap() {
-  const saved = localStorage.getItem(TOKEN_KEY);
-  if (saved) { state.token = saved; return true; }
-
   // ① 主路徑(2026-10-19 起):在輸入頁打對碼 → bridge 303 回本頁,並種一枚
   //    60 秒的一次性 claim cookie。網址上**不留碼**,所以要從 cookie 取。
   const cookieCode = readCookie(CLAIM_COOKIE);
   // ② 相容路徑:舊的 /console?boot=… 連結(書籤/捷徑)仍要能用。
   const boot = new URLSearchParams(location.search).get("boot");
+  const remote = document.body.dataset.consoleAccess === "remote";
+  // Never resume an unscoped token left by an older release on a borrowed PC.
+  if (remote) localStorage.removeItem(TOKEN_KEY);
 
   if (!cookieCode && !boot) {
-    // 沒碼也沒 cookie:多半是 claim cookie 已過 60 秒。重新整理會被 bridge
-    // 擋回輸入頁(401),使用者再打一次碼即可。
-    fatalAuth("尚未配對 —— 請重新整理本頁，於輸入頁再輸入一次配對碼");
+    const saved = sessionStorage.getItem(TOKEN_KEY) || (!remote && localStorage.getItem(TOKEN_KEY));
+    if (saved) { state.token = saved; return true; }
+    location.replace("/console?signin=1");
     return false;
   }
 
@@ -66,8 +67,13 @@ async function bootstrap() {
       code = new URLSearchParams(qr.payload.split("?")[1]).get("code");
       if (!code) throw new Error("payload 無 code");
     }
-    state.token = await claimToken(code);
-    localStorage.setItem(TOKEN_KEY, state.token);
+    const claim = await claimToken(code);
+    if (remote && claim.scope !== "console-remote") throw new Error("主機尚未支援受限瀏覽器登入");
+    state.token = claim.token;
+    sessionStorage.removeItem(TOKEN_KEY);
+    localStorage.removeItem(TOKEN_KEY);
+    (claim.scope === "console-remote" ? sessionStorage : localStorage).setItem(TOKEN_KEY, state.token);
+    sessionStorage.removeItem(LOGOUT_EVENT);
     if (cookieCode) dropCookie(CLAIM_COOKIE);
     // 舊路徑:把 ?boot= 從網址列抹掉(別留在歷史/Referer)
     if (boot) history.replaceState(null, "", location.pathname);
@@ -84,12 +90,51 @@ function fatalAuth(msg) {
   setConn(false, "未配對");
 }
 
+let signingOut = false;
+let leaveRequest = false;
+async function leaveConsole(broadcast = false) {
+  if (leaveRequest) return;
+  signingOut = true;
+  leaveRequest = true;
+  $("app").classList.add("hidden");
+  $("app").inert = true;
+  $("logout-screen").classList.remove("hidden");
+  $("logout-state").textContent = "正在登出這台電腦…";
+  $("retry-logout").hidden = true;
+  sessionStorage.setItem(LOGOUT_EVENT, "pending");
+  if (broadcast) localStorage.setItem(LOGOUT_EVENT, String(Date.now()));
+  if (state.stopStream) state.stopStream();
+  if (state.stopList) state.stopList();
+  stopBlink();
+  try {
+    if (state.token) {
+      const r = await fetch("/console/logout", {
+        method: "POST", headers: { Authorization: "Bearer " + state.token },
+        credentials: "same-origin", cache: "no-store", signal: AbortSignal.timeout(8000),
+      });
+      const result = await r.json();
+      if (!(r.ok && result.revoked === true) && !(r.status === 401 && result.revoked === false)) {
+        throw new Error("logout not acknowledged");
+      }
+    }
+    localStorage.removeItem(TOKEN_KEY);
+    sessionStorage.removeItem(TOKEN_KEY);
+    sessionStorage.removeItem(LOGOUT_EVENT);
+    state.token = null;
+    location.replace("/console?signin=1");
+  } catch (_) {
+    $("logout-state").textContent = "畫面已鎖定，尚未確認登出。請連線後重試，或在手機上撤銷這台電腦。";
+    $("retry-logout").hidden = false;
+  } finally { leaveRequest = false; }
+}
+
 // ───────────────────────── API helpers ─────────────────────────
 async function api(path, opts) {
+  if (signingOut) throw new Error("已鎖定");
   opts = opts || {};
   opts.headers = Object.assign({ "Authorization": "Bearer " + state.token }, opts.headers || {});
   const r = await fetch(path, opts);
-  if (r.status === 401) { localStorage.removeItem(TOKEN_KEY); fatalAuth("token 失效,請重新用 boot 連結開啟"); throw new Error("401"); }
+  if (r.status === 401) { void leaveConsole(); throw new Error("401"); }
   return r;
 }
 async function apiJSON(path, opts) { return (await api(path, opts)).json(); }
@@ -480,6 +525,13 @@ function autosize() {
 
 // ───────────────────────── 綁定 + 啟動 ─────────────────────────
 function wire() {
+  $("logout").addEventListener("click", () => leaveConsole(true));
+  $("retry-logout").addEventListener("click", () => leaveConsole());
+  window.addEventListener("storage", e => {
+    if (e.key === LOGOUT_EVENT && state.token) void leaveConsole();
+  });
+  window.addEventListener("pagehide", e => { if (e.persisted) $("app").classList.add("hidden"); });
+  window.addEventListener("pageshow", e => { if (e.persisted) location.reload(); });
   $("refresh").addEventListener("click", loadSessions);
   $("awaiting").addEventListener("click", jumpToAwaiting);
   $("theme-btn").addEventListener("click", cycleTheme);
@@ -699,8 +751,12 @@ function beep() {
 async function main() {
   wire();
   if (!(await bootstrap())) return;
+  if (sessionStorage.getItem(LOGOUT_EVENT)) { await leaveConsole(); return; }
   await loadSessions();
-  loadUsage(); setInterval(loadUsage, 120000);
+  if (signingOut) return;
+  if (document.body.dataset.consoleAccess !== "remote") {
+    loadUsage(); setInterval(() => { if (!signingOut) loadUsage(); }, 120000);
+  }
   if ("serviceWorker" in navigator) {
     // scope 要 /console —— sw.js 由 bridge 從 /console/sw.js 服務並帶
     // Service-Worker-Allowed 標頭(放在 static/ 下的話管不到本頁)。
@@ -710,7 +766,12 @@ async function main() {
   const want = hashSession();              // 深連結:帶 #session= 就直接開
   if (want && state.sessions.some((s) => s.id === want)) openSession(want);
   // 全域 SSE:任何 session 狀態變動都刷新列表(無 410 問題,見規格)
-  sseStream("/app/v2/events?follow=true&since_seq=0", state.token, {
+  if (document.body.dataset.consoleAccess === "remote") {
+    // The scoped session list is allowed; the cross-session event log is not.
+    setInterval(() => { if (!document.hidden && !signingOut) loadSessions(); }, 10000);
+    return;
+  }
+  state.stopList = sseStream("/app/v2/events?follow=true&since_seq=0", state.token, {
     onEvent: () => { /* 去抖:每次事件觸發輕量刷新 */ scheduleListRefresh(); },
     onError: () => setConn(false, "事件流斷線,重連中…"),
     onOpen: () => {},

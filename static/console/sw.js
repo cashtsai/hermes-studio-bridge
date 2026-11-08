@@ -1,47 +1,26 @@
-// Service worker(P2):只做「離線時給一個誠實的畫面」,不做資料快取。
-//
-// 刻意**不快取 API 回應** —— 這個 app 的全部價值是「主機現在是什麼狀態」,
-// 給你一份三分鐘前的 session 列表比明說連不上更糟。所以:
-//   ‧ 靜態殼(HTML/CSS/JS/icon)→ 預先快取,離線也開得起來
-//   ‧ 其他所有請求 → 一律直接走網路,失敗就讓前端自己處理
-// v2:icon 換成與 iOS／Android 出貨版同一顆 App icon(PNG 多尺寸)。版本號一併
-// 跳,讓舊的殼快取(含舊的紅色 icon.svg)在 activate 時被清掉。
-const SHELL = "pocket-console-shell-v2";
-const ASSETS = [
-  "/console",
-  "/console/static/style.css",
-  "/console/static/sse.js",
-  "/console/static/app.js",
-  "/console/static/filebrowser.js",
-  "/console/static/changes.js",
-  "/console/static/terminal.js",
-  "/console/static/memory.js",
-  "/console/static/icon-192.png",
-];
+// The same /console URL can return a private login challenge or a workbench.
+// Never cache navigations (including query strings), even for offline launch.
+const SHELL = "pocket-console-shell-v3";
+const ASSETS = ["style.css", "sse.js", "app.js", "filebrowser.js", "changes.js",
+  "terminal.js", "memory.js", "icon-192.png"].map(name => "/console/static/" + name);
 
-self.addEventListener("install", (e) => {
-  e.waitUntil(caches.open(SHELL).then((c) => c.addAll(ASSETS)).then(() => self.skipWaiting()));
+self.addEventListener("install", e => {
+  e.waitUntil(caches.open(SHELL).then(c => c.addAll(ASSETS)).then(() => self.skipWaiting()));
 });
-
-self.addEventListener("activate", (e) => {
-  e.waitUntil(caches.keys()
-    .then((ks) => Promise.all(ks.filter((k) => k !== SHELL).map((k) => caches.delete(k))))
-    .then(() => self.clients.claim()));
+self.addEventListener("activate", e => {
+  e.waitUntil(caches.keys().then(keys => Promise.all(keys
+    .filter(key => key.startsWith("pocket-console-shell-") && key !== SHELL)
+    .map(key => caches.delete(key)))).then(() => self.clients.claim()));
 });
-
-self.addEventListener("fetch", (e) => {
-  const url = new URL(e.request.url);
-  const isShell = e.request.mode === "navigate" ||
-                  url.pathname.startsWith("/console/static/");
-  if (!isShell) return;                       // API/WS:不碰,直接走網路
-  e.respondWith(
-    fetch(e.request)
-      .then((r) => {                          // 網路優先:殼也要能更新
-        const copy = r.clone();
-        caches.open(SHELL).then((c) => c.put(e.request, copy)).catch(() => {});
-        return r;
-      })
-      .catch(() => caches.match(e.request).then((hit) =>
-        hit || caches.match("/console")))
-  );
+self.addEventListener("fetch", e => {
+  const req = e.request;
+  const url = new URL(req.url);
+  if (req.method !== "GET" || url.origin !== self.location.origin) return;
+  if (req.mode === "navigate" && url.pathname === "/console") {
+    e.respondWith(fetch(req).catch(() => new Response("離線中。請連上網路再開啟 Pocket。", {
+      status: 503, headers: { "Content-Type": "text/plain; charset=utf-8", "Cache-Control": "no-store" },
+    })));
+  } else if (!url.search && ASSETS.includes(url.pathname)) {
+    e.respondWith(fetch(req).catch(() => caches.open(SHELL).then(cache => cache.match(req))));
+  }
 });
