@@ -19,6 +19,7 @@ import sys
 import tempfile
 import time
 import unittest
+from pathlib import Path
 
 _TMP = tempfile.mkdtemp(prefix="dres-canon-")
 os.environ.setdefault("POCKET_CANON_DB", os.path.join(_TMP, "canonical.db"))
@@ -27,6 +28,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import bridge  # noqa: E402  (import 觸發 _canon_init → event_log 建表)
 import carddigest  # noqa: E402
+from replay_fixture import load_jsonl  # noqa: E402
 
 
 def _store(sid: str | None = None) -> "carddigest.SessionCardStore":
@@ -83,6 +85,46 @@ async def _drain(req, agen):
             await asyncio.wait_for(agen.__anext__(), 10.0)
     except StopAsyncIteration:
         pass
+
+
+class TestRecordedCxStream(unittest.IsolatedAsyncioTestCase):
+    async def test_disconnect_after_first_delta_then_resume_with_v2_cursor(self):
+        frames = load_jsonl(Path(__file__).parent / "fixtures/replay/cx-stream-resume.jsonl")
+        d = carddigest.CodexThreadDigest()
+        for frame in frames[:2]:
+            d.handle(frame["method"], frame["params"])
+        _, first = await _open_events(d.store, since_seq=0)
+        try:
+            for _ in range(d.store.seq):
+                event = await _next_frame(first)
+                if event["type"] == "card.upsert":
+                    break
+            else:
+                self.fail("first delta did not reach the v2 SSE stream")
+            partial = event["data"]["card"]
+            self.assertEqual(partial["body"]["text"], "FIRST")
+            self.assertFalse(partial["final"])
+            cursor = event["seq"]
+        finally:
+            await first.aclose()
+        self.assertEqual(d.store.subscribers, 0)
+
+        for frame in frames[2:]:
+            d.handle(frame["method"], frame["params"])
+        snap = d.store.snapshot()
+        _, resumed = await _open_events(d.store, since_seq=cursor)
+        try:
+            tail = [await _next_frame(resumed)
+                    for _ in range(snap["latest_seq"] - cursor)]
+        finally:
+            await resumed.aclose()
+        self.assertEqual([e["seq"] for e in tail], list(range(cursor + 1, snap["latest_seq"] + 1)))
+        cards = [e["data"]["card"] for e in tail if e["type"] == "card.upsert"]
+        self.assertEqual([(c["id"], c["body"]["text"], c["final"]) for c in cards],
+                         [(partial["id"], "FIRSTSECOND", False), (partial["id"], "FIRSTSECOND", True)])
+        self.assertEqual([e["data"]["state"] for e in tail if e["type"] == "turn"], ["end"])
+        self.assertEqual(len(snap["cards"]), 1)
+        self.assertFalse(snap["status"]["busy"])
 
 
 class TestOldClient410(unittest.TestCase):
