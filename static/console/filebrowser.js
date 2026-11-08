@@ -104,6 +104,7 @@
   // 模式切換(四模式共用;memory.js / changes.js 掛 onMode 做首次載入)
   window.PocketConsoleMode = { set: setMode, onMode: null };
   function setMode(mode) {
+    if (borrowed() && (mode !== "agents" && !(mode === "changes" && canUse("changes")))) mode = "agents";
     document.querySelectorAll(".mode-btn").forEach((b) =>
       b.classList.toggle("active", b.dataset.mode === mode));
     $("main").classList.toggle("hidden", mode !== "agents");
