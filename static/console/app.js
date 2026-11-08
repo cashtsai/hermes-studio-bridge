@@ -4,6 +4,8 @@
 
 const TOKEN_KEY = "pocket.console.token";
 const LOGOUT_EVENT = "pocket.console.logout";
+const RESUME_KEY = "pocket.console.personal-work";
+let ownerFingerprint = "", firstList = true;
 const $ = (id) => document.getElementById(id);
 
 const state = {
@@ -22,6 +24,36 @@ function draftFor(id) {
   return drafts.get(id);
 }
 function currentView(view) { return !signingOut && view === state.view; }
+
+// The preference belongs to this login, not just this browser origin.
+function forgetWork() {
+  try { localStorage.removeItem(RESUME_KEY); } catch (_) {}
+}
+function personalDevice() {
+  try {
+    return !signingOut && !borrowed() && !!ownerFingerprint && state.listHealth === "ready" &&
+      localStorage.getItem(TOKEN_KEY) === state.token;
+  } catch (_) { return false; }
+}
+function resumePreference() {
+  if (!personalDevice()) return null;
+  try {
+    const pref = JSON.parse(localStorage.getItem(RESUME_KEY));
+    return pref?.owner === ownerFingerprint ? pref : null;
+  } catch (_) { return null; }
+}
+function rememberWork(id) {
+  if (!personalDevice()) return;
+  try { localStorage.setItem(RESUME_KEY, JSON.stringify({owner:ownerFingerprint, id})); }
+  catch (_) { toast("這個瀏覽器無法記住工作"); }
+}
+async function identifyPersonalLogin() {
+  try {
+    if (borrowed() || !crypto.subtle || localStorage.getItem(TOKEN_KEY) !== state.token) return;
+    const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(state.token));
+    ownerFingerprint = Array.from(new Uint8Array(digest), b => b.toString(16).padStart(2,"0")).join("");
+  } catch (_) {} // No secure storage/crypto: still usable without personal resume.
+}
 
 // ───────────────────────── bootstrap(取得 token)─────────────────────────
 const CLAIM_COOKIE = "pocket_console_claim";
@@ -56,7 +88,7 @@ async function bootstrap() {
   const boot = new URLSearchParams(location.search).get("boot");
   const remote = document.body.dataset.consoleAccess === "remote";
   // Never resume an unscoped token left by an older release on a borrowed PC.
-  if (remote) localStorage.removeItem(TOKEN_KEY);
+  if (remote) { forgetWork(); localStorage.removeItem(TOKEN_KEY); }
 
   if (!cookieCode && !boot) {
     const saved = sessionStorage.getItem(TOKEN_KEY) || (!remote && localStorage.getItem(TOKEN_KEY));
@@ -78,6 +110,7 @@ async function bootstrap() {
     if (remote && claim.scope !== "console-remote") throw new Error("主機尚未支援受限瀏覽器登入");
     if (claim.scope === "console-remote") document.body.dataset.consoleAccess = "remote";
     state.token = claim.token;
+    forgetWork();
     sessionStorage.removeItem(TOKEN_KEY);
     localStorage.removeItem(TOKEN_KEY);
     (claim.scope === "console-remote" ? sessionStorage : localStorage).setItem(TOKEN_KEY, state.token);
@@ -104,6 +137,8 @@ let leaveRequest = false;
 async function leaveConsole(broadcast = false) {
   if (leaveRequest) return;
   signingOut = true;
+  forgetWork();
+  writeHash(null);
   leaveRequest = true;
   $("app").classList.add("hidden");
   $("app").inert = true;
@@ -149,7 +184,7 @@ async function api(path, opts) {
 }
 async function apiJSON(path, opts) {
   const r = await api(path, opts);
-  if (!r.ok) throw Object.assign(new Error(String(r.status)), { status: r.status });
+  if (!r.ok) throw Object.assign(new Error(String(r.status)), { status: r.status, code: r.headers.get("X-Error-Code") });
   return r.json();
 }
 
@@ -163,7 +198,14 @@ async function loadSessions() {
     const d = await apiJSON("/app/v2/sessions");
     if (request !== listRequest || signingOut) return;
     if (!Array.isArray(d.sessions)) throw new Error("無效的工作清單");
-    if (d.console_scope === "console-remote") document.body.dataset.consoleAccess = "remote";
+    if (d.console_scope === "console-remote") {
+      document.body.dataset.consoleAccess = "remote";
+      forgetWork();
+      if (localStorage.getItem(TOKEN_KEY) === state.token) {
+        sessionStorage.setItem(TOKEN_KEY, state.token);
+        localStorage.removeItem(TOKEN_KEY);
+      }
+    }
     state.sessions = d.sessions;
     state.host = d.host_name || location.hostname;
     state.listHealth = "ready";
@@ -184,7 +226,9 @@ async function loadSessions() {
     renderAwaiting();
     renderApproval();
     setConn(true, degraded.length ? ("降級:" + degraded.join(",")) : "已連線");
-    const want = !state.current && hashSession();
+    const pref = resumePreference();
+    const want = !state.current && (hashSession() || (firstList && pref?.id));
+    firstList = false;
     if (want && state.sessions.some(s => s.id === want)) openSession(want);
   } catch (err) {
     if (request !== listRequest || signingOut) return;
@@ -312,6 +356,7 @@ function openSession(id, preserveMode = false) {
   clearTimeout(snapshotRetry);
   if (state.stopStream) { state.stopStream(); state.stopStream = null; }
   state.current = id;
+  if (resumePreference()) rememberWork(id);
   state.cards = []; state.latestSeq = 0;
   if (!preserveMode) window.PocketConsoleMode?.set("agents");
   $("main").classList.remove("at-home");
@@ -380,6 +425,8 @@ function canUse(cap) {
   return !borrowed() || !!(state.listHealth === "ready" && currentSession()?.capabilities?.includes(cap));
 }
 function syncControls() {
+  $("personal-work").hidden = !personalDevice();
+  $("remember-work").checked = !!resumePreference();
   if (!borrowed()) return;
   const changes = canUse("changes");
   if (!changes && document.body.classList.contains("can-view-changes")) {
@@ -811,6 +858,11 @@ function autosize() {
 
 // ───────────────────────── 綁定 + 啟動 ─────────────────────────
 function wire() {
+  $("remember-work").addEventListener("change", e => {
+    if (e.target.checked) rememberWork(state.current);
+    else if (personalDevice()) forgetWork();
+    syncControls();
+  });
   $("back-home").addEventListener("click", showHome);
   $("all-work").addEventListener("click", openPalette);
   $("home-refresh").addEventListener("click", loadSessions);
@@ -823,6 +875,7 @@ function wire() {
   $("retry-logout").addEventListener("click", () => leaveConsole());
   window.addEventListener("storage", e => {
     if (e.key === LOGOUT_EVENT && state.token) void leaveConsole();
+    if (e.key === RESUME_KEY || e.key === TOKEN_KEY) syncControls();
   });
   window.addEventListener("pagehide", e => { if (e.persisted) $("app").classList.add("hidden"); });
   window.addEventListener("pageshow", e => { if (e.persisted) location.reload(); });
@@ -849,7 +902,7 @@ function wire() {
     if (f.length) { e.preventDefault(); addFiles(f); }   // 直接貼截圖
   });
   $("interrupt").addEventListener("click", interrupt);
-  $("composer").addEventListener("submit", (e) => { e.preventDefault(); sendInput($("input").value); });
+  $("composer").addEventListener("submit", (e) => { e.preventDefault(); if (!composing) sendInput($("input").value); });
   $("input").addEventListener("input", () => {
     if (state.current) {
       const d = draftFor(state.current);
@@ -865,7 +918,9 @@ function wire() {
       finishInput(id, d, "");
   });
   $("input").addEventListener("keydown", (e) => {
-    if (!e.isComposing && (e.metaKey || e.ctrlKey) && e.key === "Enter") { e.preventDefault(); sendInput($("input").value); }
+    if (!imeKey(e) && (e.metaKey || e.ctrlKey) && e.key === "Enter") {
+      e.preventDefault(); if (!e.repeat) sendInput($("input").value);
+    }
   });
 }
 
@@ -874,7 +929,7 @@ function wire() {
 // #session=<id> —— 把常用的工作釘成書籤,開筆電直接進去;重新整理也不會掉回首頁。
 function hashSession() {
   const m = /(?:^|&)session=([^&]+)/.exec(location.hash.slice(1));
-  return m ? decodeURIComponent(m[1]) : null;
+  try { return m ? decodeURIComponent(m[1]) : null; } catch (_) { return null; }
 }
 function writeHash(id) {
   const next = id ? "#session=" + encodeURIComponent(id) : "";
@@ -902,14 +957,19 @@ function firstApprovalButton(wantYes) {
   const hit = btns.find((b) => b.classList.contains(wantYes ? "ap-yes" : "ap-no"));
   return hit || (wantYes ? btns[0] : btns[btns.length - 1]);
 }
+let composing = false;
+const imeKey = e => composing || e.isComposing || e.keyCode === 229;
 function wireKeys() {
+  document.addEventListener("compositionstart", () => { composing = true; });
+  document.addEventListener("compositionend", () => { composing = false; });
+  window.addEventListener("blur", () => { composing = false; });
   document.addEventListener("keydown", (e) => {
+    if (imeKey(e)) return;
     if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
       e.preventDefault(); openPalette(); return;
     }
     if (e.key === "Escape") { closePalette(); return; }
     if (!$("palette").classList.contains("hidden")) {
-      if (e.isComposing) return;
       const rows = Array.from($("pal-list").querySelectorAll(".work-row"));
       const i = rows.indexOf(document.activeElement);
       if (rows.length && ["ArrowDown", "ArrowUp"].includes(e.key)) {
@@ -1074,6 +1134,7 @@ function beep() {
 async function main() {
   wire();
   if (!(await bootstrap())) return;
+  await identifyPersonalLogin();
   if (sessionStorage.getItem(LOGOUT_EVENT)) { await leaveConsole(); return; }
   await loadSessions();
   if (signingOut) return;

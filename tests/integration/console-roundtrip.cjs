@@ -34,7 +34,7 @@ test((live ? "live Codex" : "fixture CC and CX") + ": QR decision, shared turns,
   t.after(() => browser.close());
   const ctx = await browser.newContext({viewport:{width:1366,height:768},
     extraHTTPHeaders:{"X-Forwarded-For":"203.0.113.42"}});
-  const page = await ctx.newPage();
+  let page = await ctx.newPage();
   page.setDefaultTimeout(9000);
   const phone = await browser.newContext({extraHTTPHeaders:{Authorization:"Bearer " + owner}});
   const api = phone.request;
@@ -60,7 +60,10 @@ test((live ? "live Codex" : "fixture CC and CX") + ": QR decision, shared turns,
   const tabHeaders = {Authorization:"Bearer " + tabToken};
   for (const sid of sessions) {
     const url = origin + "/app/v2/sessions/" + encodeURIComponent(sid);
+    const first = "phone-" + randomUUID();
+    if (!live) assert.equal((await api.post(url + "/input",{data:{content:first,client_id:randomUUID()}})).status(),200);
     await page.locator('#session-list [data-id="' + sid + '"]').click();
+    if (!live) await page.locator("#cards").getByText("fixture reply: " + first,{exact:true}).waitFor();
     const nonce = randomUUID(), reply = live ? nonce : "fixture reply: " + nonce;
     const msg = live ? "Reply with exactly " + nonce + " and nothing else. Do not use tools." : nonce;
     const ack = page.waitForResponse(r => r.url() === url + "/input" && r.request().method() === "POST");
@@ -77,6 +80,11 @@ test((live ? "live Codex" : "fixture CC and CX") + ": QR decision, shared turns,
     await page.locator("#cards").getByText(expected,{exact:true}).waitFor({timeout:live ? 45000 : 9000});
     await page.reload();
     await page.locator("#cards").getByText(expected,{exact:true}).waitFor();
+    if (!live) {
+      const userTurns = page.locator("#cards .card.user .card-body");
+      const markers = [first,msg,next];
+      assert.deepEqual((await userTurns.allTextContents()).filter(s=>markers.includes(s)),markers);
+    }
   }
   const denied = await ctx.request.get(origin + "/files",{headers:tabHeaders});
   assert.equal(denied.status(),403);
@@ -84,5 +92,23 @@ test((live ? "live Codex" : "fixture CC and CX") + ": QR decision, shared turns,
   await page.locator("#logout").click();
   assert.equal((await revoked).status(),200);
   assert.equal((await ctx.request.get(origin + "/app/v2/sessions",{headers:tabHeaders})).status(),401);
+  for (const action of ["input","approve"]) {
+    assert.equal((await ctx.request.post(origin+"/app/v2/sessions/"+encodeURIComponent(sessions[0])+"/"+action,
+      {headers:tabHeaders,data:{}})).status(),401);
+  }
   assert.equal((await api.get(origin + "/app/v2/sessions")).status(),200);
+  if (!live) {
+    await page.close();
+    const marker="while-closed-"+randomUUID();
+    const url=origin+"/app/v2/sessions/"+encodeURIComponent(sessions[0]);
+    assert.equal((await api.post(url+"/input",{data:{content:marker,client_id:randomUUID()}})).status(),200);
+    page=await ctx.newPage(); page.setDefaultTimeout(9000);
+    await page.goto(origin+"/console");
+    await decision("approve");
+    await page.locator('#session-list [data-id="' + sessions[0] + '"]').click();
+    await page.locator("#cards").getByText("fixture reply: "+marker,{exact:true}).waitFor();
+    assert.equal((await ctx.request.get(url+"/cards",{headers:tabHeaders})).status(),401);
+    await page.locator("#logout").click();
+    await page.waitForURL("**/console?signin=1");
+  }
 });

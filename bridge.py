@@ -10133,12 +10133,14 @@ async def serve_file(request: Request, path: str):
     return FileResponse(archived_path, media_type=archived_mime or None)
 
 
-async def _capture_stdout(*args, cwd=None, timeout: float = 20.0):
+async def _capture_stdout(*args, cwd=None, timeout: float = 20.0, diagnose=False):
     proc = await asyncio.create_subprocess_exec(
         *args, cwd=cwd,
-        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+        env={**os.environ, "LC_ALL": "C"} if diagnose else None,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE if diagnose else asyncio.subprocess.DEVNULL)
     try:
-        out, _ = await asyncio.wait_for(proc.communicate(), timeout)
+        out, err = await asyncio.wait_for(proc.communicate(), timeout)
     except asyncio.TimeoutError:
         try:
             proc.kill()
@@ -10146,7 +10148,8 @@ async def _capture_stdout(*args, cwd=None, timeout: float = 20.0):
             pass
         _log_event("subprocess_timeout", executable=args[0], timeout_s=timeout)
         return 124, ""
-    return proc.returncode, (out or b"").decode("utf-8", "replace")
+    data = err if diagnose and proc.returncode else out
+    return proc.returncode, (data or b"").decode("utf-8", "replace")
 
 
 _git_capture = _capture_stdout
@@ -10258,6 +10261,23 @@ async def _codex_thread_workdir(thread_id: str) -> str:
     return ((res or {}).get("thread") or {}).get("cwd") or ""
 
 
+async def _session_git_root(wd: str, workdir: str) -> str:
+    if not workdir:
+        raise http_err(404, "WORKDIR_NOT_FOUND", "session 沒有可用的工作目錄")
+    rc, out = await _git_capture("git", "-C", wd, "rev-parse", "--show-toplevel", diagnose=True)
+    if rc == 0 and out.strip():
+        return out.rstrip("\n")
+    # C locale diagnostics distinguish an inaccessible/corrupt repo from a non-repo.
+    # Never return the diagnostic (it can include private absolute paths).
+    if "Permission denied" in out or "Operation not permitted" in out or "dubious ownership" in out:
+        raise http_err(403, "WORKDIR_FORBIDDEN", "無權讀取工作目錄")
+    if not os.path.isdir(wd):
+        raise http_err(404, "WORKDIR_NOT_FOUND", "找不到工作目錄")
+    if "not a git repository" in out.lower():
+        raise http_err(404, "NOT_GIT_REPO", "工作目錄不是 Git 儲存庫")
+    raise http_err(502, "GIT_FAILED", "無法確認 Git 工作目錄")
+
+
 async def _session_workdir_diff(workdir: str, path: str) -> dict:
     """Session workdir 內單檔的 pending diff 核心。
 
@@ -10266,19 +10286,13 @@ async def _session_workdir_diff(workdir: str, path: str) -> dict:
     有 +行綠可看(/filediff 這種情況只退回全文,是 #38 驗收的缺口)。
     回 {path, workdir, diff, truncated};diff 為空字串 = 該檔沒有待定變更。"""
     wd = os.path.realpath(os.path.expanduser(workdir or ""))
-    if not workdir or not os.path.isdir(wd):
-        raise HTTPException(status_code=404, detail="session 沒有可用的工作目錄")
+    top = await _session_git_root(wd, workdir)
     raw = os.path.expanduser(path or "")
     if not raw:
         raise HTTPException(status_code=400, detail="path required")
     p = os.path.realpath(raw if os.path.isabs(raw) else os.path.join(wd, raw))
     if p != wd and not p.startswith(wd + os.sep):
         raise HTTPException(status_code=400, detail="path 不在 session 工作目錄內")
-    rc, top = await _git_capture("git", "-C", wd, "rev-parse", "--show-toplevel")
-    if rc != 0 or not top.strip():
-        raise HTTPException(status_code=404,
-                            detail="工作目錄不在 git repo 裡,沒有 diff 可看")
-    top = top.strip()
     rel = os.path.relpath(p, top)
     rc2, out = await _git_capture("git", "--literal-pathspecs", "-C", top, "diff",
                                   "--no-ext-diff", "--no-textconv", "--no-renames", "HEAD", "--", rel)
@@ -10358,12 +10372,7 @@ async def _session_workdir_changes(workdir: str) -> dict:
     成清單,前端拿它列檔案,再逐檔打 `/diff` 看內容。
     """
     wd = os.path.realpath(os.path.expanduser(workdir or ""))
-    if not workdir or not os.path.isdir(wd):
-        raise HTTPException(status_code=404, detail="session 沒有可用的工作目錄")
-    rc, top = await _git_capture("git", "-C", wd, "rev-parse", "--show-toplevel")
-    if rc != 0 or not top.strip():
-        raise HTTPException(status_code=404, detail="session 工作目錄不是 git repo")
-    root = top.strip()
+    root = await _session_git_root(wd, workdir)
     rc, out = await _git_capture("git", "--literal-pathspecs", "-C", wd, "status",
                                  "--porcelain=v1", "-z", "--no-renames", "-uall", "--", ".")
     if rc != 0:
