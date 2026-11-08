@@ -1716,6 +1716,16 @@ CLAUDE.md 明寫那條已過時。)
 
 ## 16. Console QR 登入(`/app/v1/console/login/*`,2026-10-30)
 
+**單機 Relay QR（選用）**：主機管理員在 `POCKET_RELAY_DIR`（預設
+`~/.pocket/relay`）建立空檔 `console-qr-enabled`。只在 Console 已啟用且
+本機有 enabled relay grant 時，配對裝置取得的 `GET /app/v1/console/boot`
+會多一個 `relay_qr_url`（否則為 null）。舊版 `url/urls` 仍只代表內網；
+新版手機應另列 HTTPS QR 網址，不把 boot code 加進連結。
+此模式優先於舊的公網開關：瀏覽器的 QR、輪詢、兌換和授權資料請求只在該
+grant 的 HTTPS Host 服務。手機則經原已配對的連線批准；瀏覽器不能批准。
+移除標記即停用此模式，該模式簽發的 browser token 不會變成普通裝置憑證。
+單機試行時保持下列兩個舊公網旗標關閉，不等同多租戶共用入口放行。
+
 讓人在**任意一台電腦**上開桌面控制台:那台電腦開 `/console` → 不是可信來源
 → bridge 顯示 QR → **已配對的手機掃碼批准** → 瀏覽器才拿到憑證。
 
