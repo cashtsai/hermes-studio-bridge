@@ -31325,6 +31325,52 @@ def _persona_profile_of(home: str) -> str:
     return home[len(prefix):] if home.startswith(prefix) else os.path.basename(home or "")
 
 
+def _persona_meta_api(home: str):
+    # External homes remain routable, but are not bridge-managed metadata.
+    root = Path(HOME_ROOT).resolve()
+    path = Path(home).resolve()
+    if path != root and (path.parent != root / "profiles" or
+                         not _PERSONA_ID_RE.fullmatch(path.name)):
+        return None
+    if (path / "profile.yaml").is_symlink():
+        return None
+    try:
+        from hermes_cli import profiles
+        if callable(getattr(profiles, "read_profile_meta", None)) and callable(
+                getattr(profiles, "write_profile_meta", None)):
+            return profiles
+    except ImportError:
+        pass  # Standalone bridge without the Hermes runtime: legacy API.
+    return None
+
+
+async def _provision_persona_profile(pid: str, description: str) -> str:
+    """Create a real Hermes profile before registering its bridge route."""
+    env = os.environ.copy()
+    env["HERMES_HOME"] = HOME_ROOT
+    proc = await asyncio.create_subprocess_exec(
+        HERMES_BIN, "profile", "create", pid,
+        "--no-alias", f"--description={description}",
+        env=env, stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=90)
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+        raise http_err(504, "PROFILE_CREATE_TIMEOUT",
+                       "Hermes profile creation timed out")
+    if proc.returncode != 0:
+        raise http_err(502, "PROFILE_CREATE_FAILED",
+                       "Hermes profile creation failed")
+    home = os.path.realpath(os.path.join(HOME_ROOT, "profiles", pid))
+    if not os.path.isdir(home):
+        raise http_err(502, "PROFILE_CREATE_INCOMPLETE",
+                       "Hermes did not create the profile home")
+    return home
+
+
 def _persona_home_from_body(body: dict) -> str | None:
     """Resolve home from body {home} or {profile}; None when neither given."""
     home = str(body.get("home") or "").strip()
@@ -31340,8 +31386,10 @@ def _persona_public(pid: str, name: str, home: str, enabled: bool,
                     deleted: bool) -> dict:
     ent = _avatar_manifest().get(pid) or {}
     ap = _avatar_path(pid)
+    meta = _persona_meta_api(home)
     return {"id": pid, "name": ent.get("name") or name,
             "profile": _persona_profile_of(home),
+            **({"description": meta.read_profile_meta(Path(home))["description"]} if meta else {}),
             "home": home, "enabled": enabled, "deleted": deleted,
             "builtin": pid in _PERSONAS_BUILTIN,
             # TG 同源身分:@username(manifest.tg,可後補)與頭像版本
@@ -31419,13 +31467,12 @@ async def personas_avatar(pid: str, request: Request):
 
 @app.post("/app/v1/personas")
 async def personas_create(request: Request):
-    """Add a persona without touching bridge.py. The home (or profile) must
-    already exist on disk — a Hermes profile is provisioned outside the bridge;
-    this endpoint only registers it for routing."""
+    """Create and register a Hermes profile for Pocket persona management."""
     _check_auth(request)
     body = await request.json()
     pid = str(body.get("id") or "").strip().lower()
     name = str(body.get("name") or "").strip()
+    description = str(body.get("description") or "").strip()
     if not pid and name:
         pid = re.sub(r"[^a-z0-9_-]", "", name.lower())[:32]
     if not _PERSONA_ID_RE.match(pid or ""):
@@ -31433,18 +31480,24 @@ async def personas_create(request: Request):
                             detail="id required: 1-32 chars of a-z 0-9 _ -")
     if not name:
         raise HTTPException(status_code=400, detail="name required")
-    home = _persona_home_from_body(body)
-    if not home:
-        raise HTTPException(status_code=400, detail="profile or home required")
-    if not os.path.isdir(home):
-        raise HTTPException(status_code=400,
-                            detail=f"persona home not found: {home}")
     existing = _persona_row_get(pid)
     if pid in PERSONAS or (existing and not existing[4]):
         raise http_err(409, "PERSONA_EXISTS", "persona id already in use")
+    home = _persona_home_from_body(body)
+    if description:
+        if home or pid.startswith("-") or not _persona_meta_api(HOME_ROOT):
+            raise HTTPException(status_code=400, detail="unsupported profile creation parameters")
+        home = await _provision_persona_profile(pid, description)
+    if not home:
+        raise HTTPException(status_code=400,
+                            detail="description, profile or home required")
+    if not os.path.isdir(home):
+        raise HTTPException(status_code=400,
+                            detail=f"persona home not found: {home}")
     _persona_row_upsert(pid, name, home, 1, 0)
     _personas_reload()
-    _log_event("persona_created", id=pid, home=home)
+    _log_event("persona_created", id=pid, home=home,
+               provisioned=bool(description))
     return _persona_public(pid, name, home, True, False)
 
 
@@ -31467,6 +31520,15 @@ async def personas_patch(pid: str, request: Request):
     if not os.path.isdir(home):
         raise HTTPException(status_code=400,
                             detail=f"persona home not found: {home}")
+    if "description" in body:
+        description = str(body.get("description") or "").strip()
+        meta = _persona_meta_api(cur_home)
+        if not meta or home != cur_home:
+            raise HTTPException(status_code=400, detail="cannot edit description for this home")
+        # Profile names may differ from bridge IDs. The metadata API also
+        # supports clearing text; the CLI treats --text "" as read-only.
+        await asyncio.to_thread(meta.write_profile_meta, Path(cur_home),
+                                description=description, description_auto=False)
     if "enabled" in body:
         enabled = bool(body.get("enabled"))
         deleted = False if enabled else cur_deleted
