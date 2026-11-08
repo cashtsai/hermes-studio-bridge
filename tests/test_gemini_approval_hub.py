@@ -38,7 +38,7 @@ REJECT = {"optionId": "reject-1", "name": "Reject", "kind": "reject_once"}
 
 
 def _status(aid):
-    con = sqlite3.connect(os.environ["POCKET_CANON_DB"])
+    con = sqlite3.connect(bridge.CANON_DB)
     try:
         row = con.execute("SELECT status FROM approvals WHERE id=?",
                           (aid,)).fetchone()
@@ -48,7 +48,7 @@ def _status(aid):
 
 
 def _pending_ids():
-    con = sqlite3.connect(os.environ["POCKET_CANON_DB"])
+    con = sqlite3.connect(bridge.CANON_DB)
     try:
         return [r[0] for r in con.execute(
             "SELECT id FROM approvals WHERE provider='gemini' "
@@ -74,6 +74,9 @@ class PickOptionTest(unittest.TestCase):
 
 class RequestFlowTest(unittest.TestCase):
     def setUp(self):
+        # bridge may already be imported when several providers run together.
+        self.addCleanup(setattr, bridge, "_GM_PERM_TIMEOUT", bridge._GM_PERM_TIMEOUT)
+        bridge._GM_PERM_TIMEOUT = 0.4
         self._orig_push = bridge._approval_push
         bridge._approval_push = lambda *a, **k: None
         bridge._GM_CARD_DIGESTS.clear()

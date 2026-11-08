@@ -7,9 +7,16 @@
 
 let chFiles = [];
 let chSessionID = null;
+let listGeneration = 0, diffGeneration = 0, railGeneration = 0;
+let requestedPath = null;
 
 async function chLoad() {
   const id = state.current;
+  const view = state.view, generation = ++listGeneration;
+  const active = () => currentView(view) && generation === listGeneration;
+  ++diffGeneration;
+  chFiles = [];
+  document.getElementById("ch-diff").textContent = "";
   const lab = document.getElementById("ch-session");
   const list = document.getElementById("ch-list");
   if (!id) {
@@ -23,6 +30,7 @@ async function chLoad() {
   list.innerHTML = '<div class="empty">讀取變更…</div>';
   try {
     const d = await apiJSON("/app/v2/sessions/" + encodeURIComponent(id) + "/changes");
+    if (!active()) return;
     chFiles = d.files || [];
     if (!chFiles.length) {
       list.innerHTML = '<div class="empty">工作目錄乾淨,沒有待定變更</div>';
@@ -38,7 +46,13 @@ async function chLoad() {
       (d.truncated ? '<div class="empty">(只列前 400 個)</div>' : "");
     list.querySelectorAll(".ch-item").forEach((n) =>
       n.addEventListener("click", () => chOpen(Number(n.dataset.i), n)));
+    if (requestedPath && requestedPath.id === id) {
+      const index = chFiles.findIndex(f => f.path === requestedPath.path);
+      requestedPath = null;
+      if (index >= 0) chOpen(index, list.querySelector('[data-i="' + index + '"]'));
+    }
   } catch (err) {
+    if (!active()) return;
     // 人格沒有工作目錄 → bridge 回 400,這是預期狀況,不是故障
     list.innerHTML = '<div class="empty">' +
       esc(err.message === "400" ? "這個 provider 沒有工作目錄(人格)" : "讀取失敗") +
@@ -48,7 +62,9 @@ async function chLoad() {
 
 async function chOpen(i, node) {
   const f = chFiles[i];
-  if (!f) return;
+  if (!f || chSessionID !== state.current) return;
+  const view = state.view, generation = ++diffGeneration;
+  const active = () => currentView(view) && generation === diffGeneration;
   document.querySelectorAll(".ch-item.active").forEach((n) => n.classList.remove("active"));
   if (node) node.classList.add("active");
   const box = document.getElementById("ch-diff");
@@ -56,6 +72,7 @@ async function chOpen(i, node) {
   try {
     const d = await apiJSON("/app/v2/sessions/" + encodeURIComponent(chSessionID) +
                             "/diff?path=" + encodeURIComponent(f.path));
+    if (!active()) return;
     const text = d.diff || "";
     if (!text.trim()) { box.innerHTML = '<div class="placeholder">這個檔沒有待定變更</div>'; return; }
     // 逐行著色:+ 綠 / - 紅 / @@ 藍。不引入任何語法高亮套件。
@@ -68,7 +85,7 @@ async function chOpen(i, node) {
       return '<span class="' + cls + '">' + esc(ln) + "</span>";
     }).join("\n") + (d.truncated ? '\n<span class="d-meta">(diff 已截斷)</span>' : "");
   } catch (err) {
-    box.textContent = "讀取 diff 失敗:" + err.message;
+    if (active()) box.textContent = "讀取 diff 失敗:" + err.message;
   }
 }
 
@@ -84,10 +101,13 @@ async function railLoad() {
   const box = document.getElementById("rail-list");
   if (!box || !railVisible()) return;
   const id = state.current;
+  const view = state.view, generation = ++railGeneration;
+  const active = () => currentView(view) && generation === railGeneration;
   if (!id) { box.innerHTML = '<div class="empty">選一條 session</div>'; return; }
   box.innerHTML = '<div class="empty">讀取中…</div>';
   try {
     const d = await apiJSON("/app/v2/sessions/" + encodeURIComponent(id) + "/changes");
+    if (!active()) return;
     const fs = d.files || [];
     if (!fs.length) { box.innerHTML = '<div class="empty">工作目錄乾淨</div>'; return; }
     box.innerHTML = fs.slice(0, 60).map((f) =>
@@ -97,13 +117,13 @@ async function railLoad() {
       '<span class="ch-path">' + esc(f.path) + "</span></div>").join("");
     box.querySelectorAll(".rail-item").forEach((n) =>
       n.addEventListener("click", () => {
+        if (!active()) return;
+        requestedPath = {id, path: n.dataset.path};
         window.PocketConsoleMode.set("changes");
-        const i = chFiles.findIndex((x) => x.path === n.dataset.path);
-        if (i >= 0) chOpen(i, null);
       }));
   } catch (err) {
     // 人格沒有工作目錄 → 400,是預期狀況
-    box.innerHTML = '<div class="empty">此 provider 無工作目錄</div>';
+    if (active()) box.textContent = err.message === "400" ? "此 provider 無工作目錄" : "讀取變更失敗";
   }
 }
 document.getElementById("rail-reload").addEventListener("click", railLoad);

@@ -46,6 +46,7 @@ import time
 import urllib.parse
 import urllib.request
 import uuid
+import weakref
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -32636,7 +32637,18 @@ async def approval_decide(aid: str, request: Request):
     return await _approval_decide_core(aid, b)
 
 
+_APPROVAL_DECISION_LOCKS = weakref.WeakValueDictionary()
+
+
 async def _approval_decide_core(aid: str, b: dict) -> dict:
+    # The phone and web share this entry point. Hold the lock through the
+    # provider side effect and receipt write, not just the initial row read.
+    lock = _APPROVAL_DECISION_LOCKS.setdefault(aid, asyncio.Lock())
+    async with lock:
+        return await _approval_decide_serial(aid, b)
+
+
+async def _approval_decide_serial(aid: str, b: dict) -> dict:
     """Approval Center 決議核心 — v1 與 v2 統一路由 approve 共用。
     A1(spec §3.2):`{key}` 為決定的第一公民;`{approve: bool}` 保留為相容糖
     (approve→第一個 primary、deny→第一個 danger)。status 依 kind 落:
