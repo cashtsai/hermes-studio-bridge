@@ -135,6 +135,61 @@ class CxDupScenarioTests(unittest.TestCase):
         d.seed_turns(turns, emit_unchanged=False)
         self.assertEqual(d.store.seq, seq_after_first)
 
+    def test_over_capacity_reseed_only_streams_retained_edits_and_new_items(self):
+        for clock in ("missing", "tied", "distinct"):
+            with self.subTest(clock=clock):
+                d = self._digest()
+                d.store.cards_max = 5
+                turns = [{"id": f"turn-{i}", "items": [_agent_item(str(i), str(i))]}
+                         for i in range(17)]
+                if clock != "missing":
+                    for i, turn in enumerate(turns):
+                        turn["startedAtMs"] = 1788650000000 + (i if clock == "distinct" else 0) * 2000
+                d.seed_turns(turns)
+                cursor = d.store.seq
+                snapshot = d.store.snapshot()
+                d.seed_turns([], emit_unchanged=False)
+                for _ in range(3):
+                    d.seed_turns(turns, emit_unchanged=False)
+                self.assertEqual(d.store.since(cursor), [])
+                self.assertEqual(d.store.snapshot(), snapshot)
+                turns[-1]["items"][0]["text"] = "edited"
+                turns[-1]["items"].append(_agent_item("new", "desktop reply"))
+                d.seed_turns(turns, emit_unchanged=False)
+                self.assertEqual([e["data"]["card"]["id"] for e in d.store.since(cursor)],
+                                 ["card-cx-16", "card-cx-new"])
+                cursor = d.store.seq
+                d.seed_turns(turns, emit_unchanged=False)
+                self.assertEqual(d.store.since(cursor), [])
+
+    def test_new_turn_reusing_evicted_id_is_new_without_a_source_clock(self):
+        d = self._digest()
+        d.store.cards_max = 2
+        turns = [{"id": f"turn-{i}", "items": [_agent_item(str(i), str(i))]}
+                 for i in range(3)]
+        d.seed_turns(turns)
+        cursor = d.store.seq
+        turns.append({"id": "turn-new", "items": [_agent_item("0", "fresh")]})
+        d.seed_turns(turns, emit_unchanged=False)
+        self.assertEqual([e["data"]["card"]["turn_id"] for e in d.store.since(cursor)],
+                         ["turn-new"])
+        cursor = d.store.seq
+        d.seed_turns(turns, emit_unchanged=False)
+        self.assertEqual(d.store.since(cursor), [])
+
+    def test_first_seen_history_before_full_store_does_not_publish(self):
+        d = self._digest()
+        d.store.cards_max = 2
+        def turn(i):
+            return {"id": str(i), "startedAtMs": 1788650000000 + i * 2000,
+                    "items": [_agent_item(str(i), str(i))]}
+        d.seed_turns([turn(2), turn(4)])
+        cursor = d.store.seq
+        d.seed_turns([turn(1), turn(2), turn(3), turn(4)], emit_unchanged=False)
+        self.assertEqual([e["data"]["card"]["id"] for e in d.store.since(cursor)],
+                         ["card-cx-3"])
+        self.assertEqual(d.store.order, ["card-cx-3", "card-cx-4"])
+
     def test_seed期間live事件在歷史之後重播(self):
         """冷載 await turns/list 時 live 先到,仍須維持舊→新順序。"""
         d = self._digest()
