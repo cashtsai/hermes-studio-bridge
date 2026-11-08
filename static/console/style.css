@@ -194,7 +194,10 @@ body{background:var(--bg);color:var(--text);font-family:var(--sans);
 .hidden{display:none !important;}
 #logout-screen{margin:3rem auto;padding:1rem;max-width:32rem;}
 body[data-console-access="remote"] [data-mode="term"],
+body[data-console-access="remote"] :is([data-mode="files"],#newsess-open,#newsess),
+body[data-console-access="remote"]:not(.can-view-changes) :is([data-mode="changes"],#rail),
 body[data-console-access="remote"] [data-mode="memory"]{display:none;}
+#read-only{padding:10px 16px;color:var(--dim);background:var(--panel);border-top:1px solid var(--line);}
 
 /* 手機:列表與卡片流上下疊(第一刀先簡單處理,之後再做抽屜) */
 @media (max-width:760px){

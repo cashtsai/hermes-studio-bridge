@@ -10,16 +10,20 @@ let chSessionID = null;
 let listGeneration = 0, diffGeneration = 0, railGeneration = 0;
 let requestedPath = null;
 
+function changeError(err) {
+  return ({"400":"這個對話沒有可用的工作目錄", "403":"這台電腦無權讀取工作目錄",
+    "404":"找不到工作目錄或 Git 儲存庫"})[err.message] || "無法讀取工作目錄變更";
+}
 async function chLoad() {
   const id = state.current;
   const view = state.view, generation = ++listGeneration;
-  const active = () => currentView(view) && generation === listGeneration;
+  const active = () => currentView(view) && generation === listGeneration && canUse("changes");
   ++diffGeneration;
   chFiles = [];
   document.getElementById("ch-diff").textContent = "";
   const lab = document.getElementById("ch-session");
   const list = document.getElementById("ch-list");
-  if (!id) {
+  if (!id || !canUse("changes")) {
     lab.textContent = "先在 Agents 選一條 session";
     list.innerHTML = '<div class="empty">沒有選取的 session</div>';
     return;
@@ -31,7 +35,8 @@ async function chLoad() {
   try {
     const d = await apiJSON("/app/v2/sessions/" + encodeURIComponent(id) + "/changes");
     if (!active()) return;
-    chFiles = d.files || [];
+    if (!Array.isArray(d.files)) throw new Error("invalid changes");
+    chFiles = d.files;
     if (!chFiles.length) {
       list.innerHTML = '<div class="empty">工作目錄乾淨,沒有待定變更</div>';
       document.getElementById("ch-diff").innerHTML =
@@ -55,16 +60,16 @@ async function chLoad() {
     if (!active()) return;
     // 人格沒有工作目錄 → bridge 回 400,這是預期狀況,不是故障
     list.innerHTML = '<div class="empty">' +
-      esc(err.message === "400" ? "這個 provider 沒有工作目錄(人格)" : "讀取失敗") +
+      esc(changeError(err)) +
       "</div>";
   }
 }
 
 async function chOpen(i, node) {
   const f = chFiles[i];
-  if (!f || chSessionID !== state.current) return;
+  if (!f || chSessionID !== state.current || !canUse("changes")) return;
   const view = state.view, generation = ++diffGeneration;
-  const active = () => currentView(view) && generation === diffGeneration;
+  const active = () => currentView(view) && generation === diffGeneration && canUse("changes");
   document.querySelectorAll(".ch-item.active").forEach((n) => n.classList.remove("active"));
   if (node) node.classList.add("active");
   const box = document.getElementById("ch-diff");
@@ -73,7 +78,8 @@ async function chOpen(i, node) {
     const d = await apiJSON("/app/v2/sessions/" + encodeURIComponent(chSessionID) +
                             "/diff?path=" + encodeURIComponent(f.path));
     if (!active()) return;
-    const text = d.diff || "";
+    if (typeof d.diff !== "string") throw new Error("invalid diff");
+    const text = d.diff;
     if (!text.trim()) { box.innerHTML = '<div class="placeholder">這個檔沒有待定變更</div>'; return; }
     // 逐行著色:+ 綠 / - 紅 / @@ 藍。不引入任何語法高亮套件。
     box.innerHTML = text.split("\n").map((ln) => {
@@ -85,7 +91,7 @@ async function chOpen(i, node) {
       return '<span class="' + cls + '">' + esc(ln) + "</span>";
     }).join("\n") + (d.truncated ? '\n<span class="d-meta">(diff 已截斷)</span>' : "");
   } catch (err) {
-    if (active()) box.textContent = "讀取 diff 失敗:" + err.message;
+    if (active()) box.textContent = changeError(err);
   }
 }
 
@@ -99,16 +105,17 @@ function railVisible() { return window.innerWidth >= RAIL_MIN_WIDTH; }
 
 async function railLoad() {
   const box = document.getElementById("rail-list");
-  if (!box || !railVisible()) return;
+  if (!box || !railVisible() || !canUse("changes")) return;
   const id = state.current;
   const view = state.view, generation = ++railGeneration;
-  const active = () => currentView(view) && generation === railGeneration;
+  const active = () => currentView(view) && generation === railGeneration && canUse("changes");
   if (!id) { box.innerHTML = '<div class="empty">選一條 session</div>'; return; }
   box.innerHTML = '<div class="empty">讀取中…</div>';
   try {
     const d = await apiJSON("/app/v2/sessions/" + encodeURIComponent(id) + "/changes");
     if (!active()) return;
-    const fs = d.files || [];
+    if (!Array.isArray(d.files)) throw new Error("invalid changes");
+    const fs = d.files;
     if (!fs.length) { box.innerHTML = '<div class="empty">工作目錄乾淨</div>'; return; }
     box.innerHTML = fs.slice(0, 60).map((f) =>
       '<div class="rail-item" data-path="' + esc(f.path) + '">' +
@@ -123,7 +130,7 @@ async function railLoad() {
       }));
   } catch (err) {
     // 人格沒有工作目錄 → 400,是預期狀況
-    if (active()) box.textContent = err.message === "400" ? "此 provider 無工作目錄" : "讀取變更失敗";
+    if (active()) box.textContent = changeError(err);
   }
 }
 document.getElementById("rail-reload").addEventListener("click", railLoad);

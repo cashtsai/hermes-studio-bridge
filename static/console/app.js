@@ -76,6 +76,7 @@ async function bootstrap() {
     }
     const claim = await claimToken(code);
     if (remote && claim.scope !== "console-remote") throw new Error("主機尚未支援受限瀏覽器登入");
+    if (claim.scope === "console-remote") document.body.dataset.consoleAccess = "remote";
     state.token = claim.token;
     sessionStorage.removeItem(TOKEN_KEY);
     localStorage.removeItem(TOKEN_KEY);
@@ -161,10 +162,22 @@ async function loadSessions() {
     const d = await apiJSON("/app/v2/sessions");
     if (request !== listRequest || signingOut) return;
     if (!Array.isArray(d.sessions)) throw new Error("無效的工作清單");
+    if (d.console_scope === "console-remote") document.body.dataset.consoleAccess = "remote";
     state.sessions = d.sessions;
     state.host = d.host_name || location.hostname;
     state.listHealth = "ready";
     const degraded = state.degraded = d.degraded_providers || [];
+    if (borrowed() && state.current && !canUse("replay")) {
+      window.PocketConsoleMode?.set("agents"); showHome();
+    }
+    const gainedChanges = !document.body.classList.contains("can-view-changes") && canUse("changes");
+    syncControls();
+    if (borrowed() && gainedChanges && state.current) window.PocketConsoleRail?.load();
+    if (borrowed() && state.current && state.snapshotView === state.view) {
+      if (!canUse("follow") && state.stopStream) {
+        state.stopStream(); state.stopStream = null; $("stream-health").textContent = "對話快照";
+      } else if (canUse("follow") && !state.stopStream) subscribeCards(state.current, state.view);
+    }
     renderSessions();
     renderHome();
     renderAwaiting();
@@ -173,6 +186,7 @@ async function loadSessions() {
   } catch (err) {
     if (request !== listRequest || signingOut) return;
     state.listHealth = "failed";
+    syncControls();
     renderHome(); renderSessions(); renderAwaiting(); renderApproval();
     setConn(false, "取列表失敗");
   }
@@ -275,6 +289,7 @@ function showHome() {
   ++state.view;
   if (state.stopStream) { state.stopStream(); state.stopStream = null; }
   state.current = null; state.cards = []; state.latestSeq = 0;
+  syncControls();
   writeHash(null);
   for (const id of ["stream-head", "approval", "cards", "composer", "delivery", "atts"]) $(id).classList.add("hidden");
   $("cards").replaceChildren();
@@ -286,6 +301,9 @@ function showHome() {
 // ───────────────────────── 卡片流 ─────────────────────────
 async function openSession(id, preserveMode = false) {
   if (signingOut) return;
+  if (borrowed() && !state.sessions.find(s => s.id === id)?.capabilities?.includes("replay")) {
+    toast("這台電腦無權讀取此對話"); return;
+  }
   const view = ++state.view;
   if (state.stopStream) { state.stopStream(); state.stopStream = null; }
   state.current = id;
@@ -304,6 +322,7 @@ async function openSession(id, preserveMode = false) {
   $("sh-provider").textContent = PROVIDER_LABEL[s.provider] || s.provider || "";
   $("sh-name").textContent = s.title || id;
   updateStatusChip(s.status, s.meta);
+  syncControls();
   renderApproval();
   if (window.PocketConsoleRail) window.PocketConsoleRail.load();
   $("cards").innerHTML = '<div class="placeholder">載入卡片…</div>';
@@ -317,7 +336,9 @@ async function openSession(id, preserveMode = false) {
     renderCards();
     if (snap.status && snap.status.phase) updateStatusChip(snap.status.phase, snap.status);
     confirmEcho(id, state.cards);
-    subscribeCards(id, view);
+    state.snapshotView = view;
+    if (canUse("follow")) subscribeCards(id, view);
+    else $("stream-health").textContent = "對話快照";
   } catch (err) {
     if (!currentView(view)) return;
     $("stream-health").textContent = "未連線";
@@ -338,6 +359,27 @@ function currentSession() {
   return state.sessions.find((x) => x.id === state.current) || null;
 }
 
+function borrowed() { return document.body.dataset.consoleAccess === "remote"; }
+function canUse(cap) {
+  return !borrowed() || !!(state.listHealth === "ready" && currentSession()?.capabilities?.includes(cap));
+}
+function syncControls() {
+  if (!borrowed()) return;
+  const changes = canUse("changes");
+  if (!changes && document.body.classList.contains("can-view-changes")) {
+    for (const id of ["rail-list","ch-list","ch-diff"]) $(id).replaceChildren();
+  }
+  document.body.classList.toggle("can-view-changes", changes);
+  if (!changes && !$("changes-view").classList.contains("hidden")) window.PocketConsoleMode?.set("agents");
+  if (state.current) {
+    $("composer").classList.toggle("hidden", !canUse("input"));
+    $("attach").classList.toggle("hidden", !canUse("attachments"));
+    $("interrupt").classList.toggle("hidden", !(canUse("interrupt") && state.busy));
+    $("read-only").classList.toggle("hidden", canUse("input"));
+    $("read-only").textContent = state.listHealth === "failed" ? "清單未更新，暫停操作" : "這台電腦只能閱讀此對話";
+  } else $("read-only").classList.add("hidden");
+}
+
 function approvalIdOf(meta) {
   const a = meta && meta.approval;
   if (!a) return null;
@@ -348,7 +390,7 @@ const deciding = new Set();
 const handledApproval = new Map();
 function actionable(s) {
   if (!s || state.listHealth !== "ready" || state.degraded.includes(s.provider)) return false;
-  if (Array.isArray(s.capabilities) && !s.capabilities.includes("approve")) return false;
+  if ((borrowed() || Array.isArray(s.capabilities)) && !s.capabilities?.includes("approve")) return false;
   const a = s.meta?.approval, aid = approvalIdOf(s.meta);
   if (a?.status && a.status !== "pending") return false;
   const exp = activityTime(a?.expires_at);
@@ -362,8 +404,8 @@ function renderApproval() {
   const meta = (s && s.meta) || {};
   const prompt = meta.prompt;
   const aid = approvalIdOf(meta);
-  const opts = (prompt && Array.isArray(prompt.options) && prompt.options.length)
-    ? prompt.options : null;
+  const choices = borrowed() ? meta.console_options : prompt?.options;
+  const opts = choices?.length ? choices : null;
 
   if (!actionable(s)) { bar.classList.add("hidden"); return; }
   bar.classList.remove("hidden");
@@ -468,6 +510,7 @@ function subscribeCards(id, view) {
     onError: () => { if (currentView(view)) $("stream-health").textContent = "連線中斷，正在補接"; },
     onDenied: code => {
       if (!currentView(view)) return;
+      state.stopStream = null;
       if (code === 401) void leaveConsole();
       else $("stream-health").textContent = "無權讀取";
     },
@@ -625,7 +668,8 @@ function updateStatusChip(phase, meta) {
   const label = locked ? "🔒 被佔用" : (phase || "idle");
   chip.textContent = label;
   chip.className = "status-chip st-" + esc(phase || "idle");
-  $("interrupt").classList.toggle("hidden", !(phase === "run" || phase === "running" || phase === "busy"));
+  state.busy = ["run", "running", "busy"].includes(phase);
+  $("interrupt").classList.toggle("hidden", !state.busy || !canUse("interrupt"));
 }
 
 // ───────────────────────── 送出 / 中斷 ─────────────────────────
@@ -675,8 +719,9 @@ async function checkDelivery() {
 
 async function sendInput(text) {
   const id = state.current;
-  if (!id || signingOut) return;
+  if (!id || signingOut || !canUse("input")) return;
   const d = draftFor(id);
+  if (d.atts.length && !canUse("attachments")) { toast("這條對話不允許附件，請先移除"); return; }
   if (d.pending || d.reading || (!text.trim() && !d.atts.length)) return;
   d.text = text;
   if (!navigator.onLine) { d.notice = "目前離線，訊息尚未送出"; showDraft(id); return; }
@@ -705,7 +750,7 @@ async function sendInput(text) {
 }
 
 async function interrupt() {
-  if (!state.current) return;
+  if (!state.current || !canUse("interrupt")) return;
   try {
     const r = await api("/app/v2/sessions/" + encodeURIComponent(state.current) + "/interrupt", { method: "POST" });
     if (r.status === 409) { toast("目前沒有進行中的回合"); return; }
@@ -871,6 +916,7 @@ function renderPalette(q) {
 
 // ───────────────────────── P1:開新工作 ─────────────────────────
 async function createSession() {
+  if (borrowed()) return;
   const kind = $("new-kind").value;
   const name = $("new-name").value.trim();
   const wd = $("new-dir").value.trim();
@@ -913,7 +959,7 @@ function attKind(mime) {
 
 function addFiles(files) {
   const id = state.current;
-  if (!id || signingOut) return;
+  if (!id || signingOut || !canUse("input") || !canUse("attachments")) return;
   const d = draftFor(id);
   if (d.pending) return;
   Array.from(files || []).forEach((f) => {
@@ -1013,6 +1059,7 @@ async function main() {
   if (document.body.dataset.consoleAccess === "remote") {
     // The scoped session list is allowed; the cross-session event log is not.
     setInterval(() => { if (!document.hidden && !signingOut) loadSessions(); }, 10000);
+    document.addEventListener("visibilitychange", () => { if (!document.hidden && !signingOut) loadSessions(); });
     return;
   }
   state.stopList = sseStream("/app/v2/events?follow=true&since_seq=0", state.token, {

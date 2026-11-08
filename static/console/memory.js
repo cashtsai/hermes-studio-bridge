@@ -50,7 +50,11 @@
     $("mem-go").addEventListener("click", run);
     $("mem-q").addEventListener("keydown", (e) => { if (e.key === "Enter") run(); });
     if (window.PocketConsoleMode) {
-      window.PocketConsoleMode.onMode = (m) => { if (m === "memory") setTimeout(() => $("mem-q").focus(), 50); };
+      const prev = window.PocketConsoleMode.onMode;
+      window.PocketConsoleMode.onMode = (m) => {
+        if (prev) prev(m);
+        if (m === "memory") setTimeout(() => $("mem-q").focus(), 50);
+      };
     }
   }
   wire();
