@@ -87,6 +87,11 @@ python scripts/validate-replay-fixtures.py --release
 gate 允許 provider 先以部分 fixture 增量接入。兩種模式都拒絕路徑穿越、不安全
 recording policy 與 fixture digest drift。
 
+這些檢查也適用於每個已宣告的 `capability_scenarios`（舊 manifest 未宣告時視為空）。
+CLI 摘要中的 `capabilities` 只列出通過安全載入與 digest 核對的情境。同一個
+provider 或 capability 不能用相同內容冒充兩個情境，即使換檔名或改 JSON 排版。
+這是 fixture 完整性檢查，不代表實機已通過；畫面、通知與 fallback 仍需各自的行為斷言。
+
 新 provider 進入 `_V2_SESSION_OPS` 時，CI 必須同時檢查：
 
 1. 有 capability manifest。

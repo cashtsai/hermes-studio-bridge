@@ -176,10 +176,46 @@ class TestReplayManifest(unittest.TestCase):
         with self.assertRaisesRegex(ReplayFixtureError, "digest mismatch"):
             validate_manifest(manifest, FIXTURE_DIR)
 
+    def test_capability_entries_are_checked_like_provider_fixtures(self):
+        for filename, pin, message in [
+                ("visual-reply.jsonl", "0" * 64, "digest mismatch"),
+                ("live-update.jsonl", None, "digest is missing"),
+                ("../outside.jsonl", None, "escapes manifest"),
+                ("missing.jsonl", None, "does not exist")]:
+            with self.subTest(filename=filename):
+                manifest = load_manifest()
+                manifest["capability_scenarios"] = {"cap": {"scenario": filename}}
+                if pin is None:
+                    manifest["fixture_digests"].pop(filename, None)
+                else:
+                    manifest["fixture_digests"][filename] = pin
+                with self.assertRaisesRegex(ReplayFixtureError, message):
+                    validate_manifest(manifest, FIXTURE_DIR)
+
+    def test_capability_section_can_be_absent_but_not_malformed(self):
+        manifest = load_manifest()
+        del manifest["capability_scenarios"]
+        self.assertIn("providers", validate_manifest(manifest, FIXTURE_DIR))
+        for value in (None, [], {"visual_replies": {}}):
+            with self.subTest(value=value), self.assertRaises(ReplayFixtureError):
+                validate_manifest(dict(manifest, capability_scenarios=value), FIXTURE_DIR)
+
+    def test_release_gate_rejects_relabeling_one_file_as_six_scenarios(self):
+        manifest = load_manifest()
+        manifest["providers"] = {"codex": {
+            scenario: "./cx-simple.jsonl" if i else "cx-simple.jsonl"
+            for i, scenario in enumerate(manifest["release_scenarios"])}}
+        with self.assertRaisesRegex(ReplayFixtureError, "reuses a fixture"):
+            validate_manifest(manifest, FIXTURE_DIR, release=True)
+
     def test_capability_fixtures_are_explicit_and_present(self):
         manifest = load_manifest()
         capabilities = manifest.get("capability_scenarios") or {}
         self.assertEqual(set(capabilities), {"visual_replies", "live_updates"})
+        checked = validate_manifest(manifest, FIXTURE_DIR)
+        self.assertEqual(checked["capabilities"], {
+            name: sorted(scenarios) for name, scenarios in capabilities.items()
+        })
         for capability, scenarios in capabilities.items():
             self.assertTrue(scenarios, f"{capability} must have a scenario")
             for scenario, filename in scenarios.items():
