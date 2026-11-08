@@ -606,17 +606,17 @@ CONSOLE_REMOTE_FILE_ROOTS = [
 # 白名單而不是黑名單:新增端點時,黑名單會**安靜地**把它放行 —— 而這條路的
 # 前提是「人不一定在可信的電腦前」,安靜放行等於把新端點預設交出去。
 # 白名單的代價是新增端點要記得加,但漏加只會壞功能、不會漏權限。
-_CONSOLE_REMOTE_ALLOW = (
-    "/console",            # 控制台本體與其靜態資源
-    "/app/v2/sessions",    # session 清單、卡片流、輸入、核准
-    "/app/v1/approvals",
-    "/ccsessions",
-    "/codexsessions",
-    "/sessions",
-    "/health",
-    "/file",               # 受 CONSOLE_REMOTE_FILE_ROOTS 進一步限制
-    "/filediff",
-)
+_CONSOLE_GET = {"/console", "/console/manifest.json", "/console/sw.js", "/health",
+                "/file", "/filediff", "/app/v2/sessions"}
+_CONSOLE_SESSION_OPS = {
+    ("GET", "cards"): "replay", ("GET", "events"): "follow",
+    ("GET", "changes"): "changes", ("GET", "diff"): "changes",
+    ("POST", "input"): "input", ("POST", "interrupt"): "interrupt", ("POST", "approve"): "approve",
+}
+# In-memory only, per browser. No full session rows, tokens or chat payloads on disk.
+_CONSOLE_GRANTS: dict = {}
+_CONSOLE_GRANT_TTL = 120  # active borrowed Console refreshes the unfiltered list every 10s
+_CONSOLE_CC_INPUT = contextvars.ContextVar("console_cc_input", default=False)
 
 
 def _token_entry(token: str) -> dict | None:
@@ -665,9 +665,71 @@ def _console_remote_expired(token: str, now: float | None = None) -> bool:
     return _console_entry_expired(entry, now)
 
 
-def _console_remote_path_allowed(path: str) -> bool:
-    return any(path == a or path.startswith(a + "/") or path.startswith(a + "?")
-               for a in _CONSOLE_REMOTE_ALLOW)
+def _console_grant_key(token):
+    return hashlib.sha256(token.encode()).digest()
+
+
+def _console_options(provider, meta):
+    a, prompt = meta.get("approval") or {}, meta.get("prompt") or {}
+    opts = prompt.get("options") or a.get("options") or []
+    if a.get("kind") == "question":
+        return [o for o in opts if isinstance(o, dict) and o.get("key")]
+    if provider == "claude_code" and prompt:
+        return [o for o in opts if str(o.get("label", "")).strip().casefold() in
+                {"yes", "allow", "allow once", "no", "deny", "reject", "是", "否"}]
+    return [o for o in opts if o.get("key") in {"approve", "deny", "allow-once", "allow_once", "reject_once"}]
+
+
+def _console_remote_list(rows, token, started, degraded):
+    grants = {}
+    for row in rows:
+        caps = set(row.get("capabilities") or ()) & {"input", "attachments", "interrupt", "approve", "replay", "follow"}
+        meta = row.get("meta") or {}
+        prefix = row["id"].partition(":")[0]
+        wd = (row.get("subtitle") if prefix in ("claude_code", "codex") else
+              meta.get("workdir") if prefix == "cc2" else None)
+        if wd and os.path.isabs(wd) and _console_remote_file_ok(os.path.realpath(wd)):
+            caps.add("changes")
+        a = meta.get("approval") or {}
+        aid = a.get("id") or a.get("aid") or a.get("approval_id")
+        opts = _console_options(row.get("provider"), meta)
+        binary = row.get("provider") == "codex" and a.get("kind", "permission") == "permission"
+        question = row.get("provider") == "codex" and a.get("kind") == "question"
+        index = a.get("q_index") if question else None
+        if (not aid or a.get("status", "pending") != "pending" or not (opts or binary)
+                or (question and type(index) is not int)):
+            caps.discard("approve")
+        if row.get("provider") in degraded:
+            caps -= {"approve", "interrupt", "input", "attachments"}
+        row["capabilities"] = sorted(caps)
+        row["meta"] = {**meta, "console_options": opts}
+        grants[row["id"]] = (caps, aid, {str(o["key"]): o.get("label") for o in opts}, binary, index)
+    cutoff = time.monotonic() - _CONSOLE_GRANT_TTL
+    for key, (when, _) in list(_CONSOLE_GRANTS.items()):
+        if when < cutoff:
+            _CONSOLE_GRANTS.pop(key, None)
+    key = _console_grant_key(token)
+    if started >= _CONSOLE_GRANTS.get(key, (0,))[0]:
+        _CONSOLE_GRANTS[key] = (started, grants)
+
+
+def _console_remote_allowed(request, token):
+    path, method = request.scope["path"], request.method
+    if method == "GET" and path in _CONSOLE_GET:
+        # Only the normal active inventory can grant subsequent session operations.
+        return path != "/app/v2/sessions" or not request.query_params
+    if method == "GET" and re.fullmatch(r"/console/static/[\w.-]+", path):
+        return True
+    match = re.fullmatch(r"/app/v2/sessions/([^/]+)/([a-z]+)", path)
+    if not match:
+        return False
+    sid, op = match.groups()
+    when, grants = _CONSOLE_GRANTS.get(_console_grant_key(token), (0, {}))
+    grant = grants.get(sid)
+    if not grant or time.monotonic() - when > _CONSOLE_GRANT_TTL or _CONSOLE_SESSION_OPS.get((method, op)) not in grant[0]:
+        return False
+    request.state.console_grant = grant
+    return True
 
 
 def _console_remote_file_ok(real_path: str) -> bool:
@@ -700,6 +762,8 @@ def _token_is_valid(token: str) -> bool:
     with _PAIR_LOCK:
         dev = _DEVICE_TOKENS.get(token)
         if dev is not None:
+            if dev.get("scope") == CONSOLE_REMOTE_SCOPE and _console_entry_expired(dev):
+                return False
             if not dev.get("apple_user_id") or _account_device_for_token(token) is not None:
                 dev["last_seen"] = time.time()
                 return True
@@ -1035,14 +1099,14 @@ async def _console_remote_scope_guard(request: Request, call_next):
     """
     token = _request_token(request)
     remote = bool(token and _token_scope(token) == CONSOLE_REMOTE_SCOPE)
-    if remote and request.url.path != "/console/logout":
+    if remote and (request.method, request.scope["path"]) != ("POST", "/console/logout"):
         if _console_remote_expired(token):
             _log_event("console_remote_token_expired", path=request.url.path)
             return JSONResponse(
                 status_code=401,
                 content={"error": {"code": "TOKEN_EXPIRED",
                                    "message": "遠端控制台的授權已到期,請重新掃碼登入"}})
-        if not _console_remote_path_allowed(request.url.path):
+        if not _console_remote_allowed(request, token):
             _log_event("console_remote_path_denied", path=request.url.path)
             return JSONResponse(
                 status_code=403,
@@ -1050,18 +1114,21 @@ async def _console_remote_scope_guard(request: Request, call_next):
                                    "message": "遠端控制台沒有這項權限"}})
         request.state.console_remote = True
     response = await call_next(request)
+    if remote:
+        response.headers["Cache-Control"] = "no-store"
     if remote and response.headers.get("content-type", "").startswith("text/event-stream"):
-        response.body_iterator = _console_guard_stream(token, response.body_iterator)
+        response.body_iterator = _console_guard_stream(token, response.body_iterator,
+                                                       lambda: _console_remote_allowed(request, token))
     return response
 
 
-async def _console_guard_stream(token, chunks):
+async def _console_guard_stream(token, chunks, allowed=None):
     # An SSE request may outlive its authorization. Do not emit another chunk
     # after the owner revokes this browser, even on an existing connection.
     try:
         async for chunk in chunks:
             entry = _token_entry(token)
-            if not entry or _console_entry_expired(entry):
+            if not entry or _console_entry_expired(entry) or allowed and not allowed():
                 break
             yield chunk
     finally:
@@ -10040,6 +10107,12 @@ async def serve_file(request: Request, path: str):
             roots.append(rt)
     if not any(p == r or p.startswith(r + os.sep) for r in roots):
         raise HTTPException(status_code=404, detail="not found")
+    if getattr(request.state, "console_remote", False) is True:
+        if not os.path.isfile(p):
+            raise HTTPException(status_code=404, detail="not found")
+        return FileResponse(p, filename=os.path.basename(p), headers={
+            "Cache-Control": "no-store", "Content-Security-Policy": "sandbox; default-src 'none'",
+            "X-Content-Type-Options": "nosniff"})
     if os.path.isfile(p):
         # Compatibility traffic also protects the file from disappearing after
         # this response. Session-aware callers use the v2 media index instead.
@@ -10060,10 +10133,7 @@ async def serve_file(request: Request, path: str):
     return FileResponse(archived_path, media_type=archived_mime or None)
 
 
-async def _git_capture(*args, cwd=None, timeout: float = 20.0):
-    """git 子行程一次呼叫 → (returncode, stdout 文字)。逾時殺行程回 (124, "")
-    — git on a wedged repo/mount must not hang the handler (issue #7)。
-    /filediff 與 session diff 端點(S2 / #38)共用。"""
+async def _capture_stdout(*args, cwd=None, timeout: float = 20.0):
     proc = await asyncio.create_subprocess_exec(
         *args, cwd=cwd,
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
@@ -10074,10 +10144,12 @@ async def _git_capture(*args, cwd=None, timeout: float = 20.0):
             proc.kill()
         except ProcessLookupError:
             pass
-        _log_event("filediff_git_timeout", args=" ".join(args[:4]),
-                   timeout_s=timeout)
+        _log_event("subprocess_timeout", executable=args[0], timeout_s=timeout)
         return 124, ""
     return proc.returncode, (out or b"").decode("utf-8", "replace")
+
+
+_git_capture = _capture_stdout
 
 
 @app.get("/filediff")
@@ -10111,17 +10183,21 @@ async def serve_filediff(request: Request, path: str):
             or not (os.path.isfile(p) or os.path.isdir(p))):
         raise HTTPException(status_code=404, detail="not found")
 
+    # Preserve native rename display; a scoped diff must not include a rename's old content from outside the root.
+    scoped = getattr(getattr(request, "state", None), "console_remote", False) is True
+    diff_opts = ("--no-ext-diff", "--no-textconv", "--no-renames") if scoped else ()
     if os.path.isdir(p):
         rc, top = await _git_capture("git", "-C", p, "rev-parse", "--show-toplevel")
         if rc != 0 or not top.strip():
             raise HTTPException(status_code=404, detail="目錄不在 git repo 裡，沒有 diff 可看")
         top = top.strip()
-        rc2, out = await _git_capture("git", "-C", top, "diff", "HEAD", "--", p)
+        rc2, out = await _git_capture("git", "--literal-pathspecs", "-C", top, "diff",
+                                     *diff_opts, "HEAD", "--", p)
         diff = out if rc2 == 0 else ""
         if not diff:
             raise HTTPException(status_code=404, detail="目錄內沒有待提交的變更")
         files = []
-        rc3, names = await _git_capture("git", "-C", top, "diff", "HEAD",
+        rc3, names = await _git_capture("git", "--literal-pathspecs", "-C", top, "diff", *diff_opts, "HEAD",
                                 "--name-status", "--", p)
         if rc3 == 0:
             for line in names.splitlines():
@@ -10139,7 +10215,8 @@ async def serve_filediff(request: Request, path: str):
     diff = ""
     if rc == 0 and top.strip():
         # HEAD..worktree for this file — covers staged + unstaged edits.
-        rc2, out = await _git_capture("git", "-C", top.strip(), "diff", "HEAD", "--", p)
+        rc2, out = await _git_capture("git", "--literal-pathspecs", "-C", top.strip(), "diff",
+                                     *diff_opts, "HEAD", "--", p)
         if rc2 == 0:
             diff = out
     if diff:
@@ -10191,7 +10268,7 @@ async def _session_workdir_diff(workdir: str, path: str) -> dict:
     wd = os.path.realpath(os.path.expanduser(workdir or ""))
     if not workdir or not os.path.isdir(wd):
         raise HTTPException(status_code=404, detail="session 沒有可用的工作目錄")
-    raw = os.path.expanduser((path or "").strip())
+    raw = os.path.expanduser(path or "")
     if not raw:
         raise HTTPException(status_code=400, detail="path required")
     p = os.path.realpath(raw if os.path.isabs(raw) else os.path.join(wd, raw))
@@ -10203,17 +10280,24 @@ async def _session_workdir_diff(workdir: str, path: str) -> dict:
                             detail="工作目錄不在 git repo 裡,沒有 diff 可看")
     top = top.strip()
     rel = os.path.relpath(p, top)
-    rc2, out = await _git_capture("git", "-C", top, "diff", "HEAD", "--", rel)
+    rc2, out = await _git_capture("git", "--literal-pathspecs", "-C", top, "diff",
+                                  "--no-ext-diff", "--no-textconv", "--no-renames", "HEAD", "--", rel)
     diff = out if rc2 == 0 else ""
     if not diff and os.path.isfile(p):
         # tracked 且乾淨 vs untracked 新檔:porcelain 分辨;新檔合成 no-index
         # diff(它的 rc=1 是「有差異」,不是錯)。
-        rcs, st = await _git_capture("git", "-C", top, "status", "--porcelain",
+        rcs, st = await _git_capture("git", "--literal-pathspecs", "-C", top, "status", "--porcelain",
                                      "--untracked-files=all", "--", rel)
-        if rcs == 0 and st.lstrip().startswith("??"):
+        if rcs:
+            raise http_err(502, "GIT_FAILED", "無法確認工作目錄狀態")
+        if st.lstrip().startswith("??"):
             _rcn, out_n = await _git_capture("git", "-C", top, "diff",
-                                             "--no-index", "--", os.devnull, rel)
-            diff = out_n
+                                             "--no-index", "--no-ext-diff", "--no-textconv", "--", os.devnull, rel)
+            if _rcn not in (0, 1):
+                raise http_err(502, "GIT_FAILED", "無法讀取新檔案差異")
+            diff, rc2 = out_n, 0
+    if rc2:
+        raise http_err(502, "GIT_FAILED", "無法讀取差異或儲存庫還沒有基準提交")
     truncated = False
     if len(diff) > _SESSION_DIFF_MAX:
         diff = diff[:_SESSION_DIFF_MAX]
@@ -10241,23 +10325,29 @@ async def codex_session_diff(thread_id: str, request: Request, path: str):
     return await _session_workdir_diff(await _codex_thread_workdir(thread_id), path)
 
 
-@app.get("/app/v2/sessions/{session_id}/diff")
-async def v2_session_diff(session_id: str, request: Request, path: str):
-    """統一路由 diff(卡片流表面直接用 store 的 v2 session id 打):cc=conf
-    workdir、cx/delegation=thread cwd;hermes 沒有工作目錄 → 400。"""
-    _check_auth(request)
+async def _v2_diff_workdir(session_id, request):
     src = _v2_card_source(session_id)
     if src[0] == "cc":
-        return await _session_workdir_diff(src[2], path)
-    if src[0] == "cc2":
-        # cc2 自己就知道 workdir(建立時指定),直接走同一套。
+        wd = src[2]
+    elif src[0] == "cc2":
         _s = cc_sdk.registry().get(src[1])
         if _s is None:
             raise http_err(404, "SESSION_NOT_FOUND", f"找不到 cc2 session {src[1]}")
-        return await _session_workdir_diff(_s.workdir, path)
-    if src[0] == "cx":
-        return await _session_workdir_diff(await _codex_thread_workdir(src[1]), path)
-    raise http_err(400, "UNSUPPORTED_PROVIDER", "persona session 沒有工作目錄")
+        wd = _s.workdir
+    elif src[0] == "cx":
+        wd = await _codex_thread_workdir(src[1])
+    else:
+        raise http_err(400, "UNSUPPORTED_PROVIDER", "這個 session 沒有工作目錄")
+    if getattr(getattr(request, "state", None), "console_remote", False) is True:
+        if not wd or not os.path.isabs(wd) or not _console_remote_file_ok(os.path.realpath(wd)):
+            raise http_err(403, "SCOPE_FORBIDDEN", "此工作目錄未開放")
+    return wd
+
+
+@app.get("/app/v2/sessions/{session_id}/diff")
+async def v2_session_diff(session_id: str, request: Request, path: str):
+    _check_auth(request)
+    return await _session_workdir_diff(await _v2_diff_workdir(session_id, request), path)
 
 
 async def _session_workdir_changes(workdir: str) -> dict:
@@ -10274,21 +10364,22 @@ async def _session_workdir_changes(workdir: str) -> dict:
     if rc != 0 or not top.strip():
         raise HTTPException(status_code=404, detail="session 工作目錄不是 git repo")
     root = top.strip()
-    rc, out = await _git_capture("git", "-C", root, "status", "--porcelain=v1", "-uall")
+    rc, out = await _git_capture("git", "--literal-pathspecs", "-C", wd, "status",
+                                 "--porcelain=v1", "-z", "--no-renames", "-uall", "--", ".")
     if rc != 0:
         raise http_err(502, "GIT_FAILED", "git status 失敗")
     files = []
-    for line in (out or "").splitlines():
+    for line in (out or "").split("\0"):
         if len(line) < 4:
             continue
-        code, rel = line[:2], line[3:].strip()
-        # rename 是 "old -> new",只取新路徑(那才是看得到內容的那個)
-        if " -> " in rel:
-            rel = rel.split(" -> ", 1)[1]
+        code = line[:2]
+        rel = os.path.relpath(os.path.join(root, line[3:]), wd)
+        if rel == ".." or rel.startswith(".." + os.sep):
+            continue
         files.append({"path": rel, "status": code.strip() or "?",
                       "untracked": code == "??"})
     files.sort(key=lambda f: f["path"])
-    return {"workdir": root, "files": files[:400], "truncated": len(files) > 400}
+    return {"workdir": wd, "files": files[:400], "truncated": len(files) > 400}
 
 
 @app.get("/app/v2/sessions/{session_id}/changes")
@@ -10300,17 +10391,7 @@ async def v2_session_changes(session_id: str, request: Request):
     猜檔名。provider 支援與 `/diff` 一致(cc / cx 有工作目錄;人格沒有)。
     """
     _check_auth(request)
-    src = _v2_card_source(session_id)
-    if src[0] == "cc":
-        return await _session_workdir_changes(src[2])
-    if src[0] == "cc2":
-        _s = cc_sdk.registry().get(src[1])
-        if _s is None:
-            raise http_err(404, "SESSION_NOT_FOUND", f"找不到 cc2 session {src[1]}")
-        return await _session_workdir_changes(_s.workdir)
-    if src[0] == "cx":
-        return await _session_workdir_changes(await _codex_thread_workdir(src[1]))
-    raise http_err(400, "UNSUPPORTED_PROVIDER", "persona session 沒有工作目錄")
+    return await _session_workdir_changes(await _v2_diff_workdir(session_id, request))
 
 
 # --- Client error log ------------------------------------------------------
@@ -11876,6 +11957,7 @@ async def console_logout(request: Request):
             del remaining[token]
             _save_device_tokens(remaining)
             del _DEVICE_TOKENS[token]
+    _CONSOLE_GRANTS.pop(_console_grant_key(token), None)
     # A repeated request after a lost acknowledgement still expires the cookies.
     response = JSONResponse({"revoked": entry is not None}, headers=_CONSOLE_SECURITY_HEADERS,
                             status_code=200 if entry is not None else 401)
@@ -18693,6 +18775,23 @@ async def _cc_paste_text(name: str, text: str, expect_dialog: bool = False) -> d
         return await _cc_paste_text_locked(name, text, expect_dialog=expect_dialog)
 
 
+async def _cc_console_pane(name: str) -> str:
+    """A familiar-looking prompt isn't proof: target the active pane by ID and verify its foreground job."""
+    rc, info, _ = await _tmux_run("display-message", "-p", "-t", name, "#{pane_id} #{pane_tty}")
+    parts = info.strip().split()
+    if not rc and len(parts) == 2 and re.fullmatch(r"%\d+", parts[0]) and parts[1].startswith("/dev/"):
+        try:
+            rc, out = await _capture_stdout("ps", "-t", parts[1][5:], "-o", "pgid=,tpgid=,command=", timeout=2)
+        except OSError:
+            rc, out = 1, ""
+        if not rc:
+            for line in out.splitlines():
+                p = line.split(None, 2)
+                if len(p) == 3 and p[0].isdigit() and p[0] == p[1] and host_discovery.is_claude_cmdline(p[2]):
+                    return parts[0]
+    raise http_err(403, "SCOPE_FORBIDDEN", "無法確認前景程序是 Claude Code，未送出輸入")
+
+
 async def _cc_paste_text_locked(name: str, text: str, expect_dialog: bool = False) -> dict:
     if not await _tmux_alive(name):
         raise http_err(409, "SESSION_NOT_RUNNING", "session not running")
@@ -18701,7 +18800,11 @@ async def _cc_paste_text_locked(name: str, text: str, expect_dialog: bool = Fals
     # 選單裡的垃圾輸入(而且送不出去)—— 與其之後回報擱淺,不如當場擋下並
     # 告訴使用者要先處理選單。AskUserQuestion(semantic=question)容許自由
     # 文字作答,放行。busy 中 _cc_prompt 本來就回 None,不影響正常送出。
-    pre_pane = await _cc_capture_pane_fresh(name)
+    remote = _CONSOLE_CC_INPUT.get()
+    target = await _cc_console_pane(name) if remote else name
+    if remote and (text.lstrip().startswith(("!", "/")) or re.search(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]", text)):
+        raise http_err(403, "SCOPE_FORBIDDEN", "借用電腦只接受對話文字")
+    pre_pane = await _cc_capture_pane_fresh(target)
     pre_prompt = _cc_prompt(pre_pane)
     if pre_prompt and pre_prompt.get("semantic") != "question":
         _log_event("cc_input_not_accepted", session=name, reason="awaiting_prompt",
@@ -18769,14 +18872,20 @@ async def _cc_paste_text_locked(name: str, text: str, expect_dialog: bool = Fals
     gen0 = _CC_TURN_GEN.get(name, 0)
     buf = "pa-" + uuid.uuid4().hex[:8]
     try:
-        rc_clear, _, e_clear = await _tmux_run("send-keys", "-t", name, "C-u")
+        if remote:
+            await _cc_console_pane(target)
+        rc_clear, _, e_clear = await _tmux_run("send-keys", "-t", target, "C-u")
         rc_load, _, e_load = await _tmux_run_stdin(
             ["load-buffer", "-b", buf, "-"],
             text.encode("utf-8", "replace"))
-        rc_paste, _, e_paste = await _tmux_run("paste-buffer", "-t", name,
+        rc_paste, _, e_paste = await _tmux_run("paste-buffer", "-t", target,
                                                "-b", buf, "-p", "-d")
         await asyncio.sleep(0.25)                    # let the editor settle
-        rc_enter, _, e_enter = await _tmux_run("send-keys", "-t", name, "Enter")
+        if remote:
+            await _cc_console_pane(target)
+        rc_enter, _, e_enter = await _tmux_run("send-keys", "-t", target, "Enter")
+    except HTTPException:
+        raise
     except Exception as e:  # noqa: BLE001
         _log_event("cc_paste_failed", session=name, text_chars=len(text),
                    step="exec", error=f"{type(e).__name__}: {str(e)[:160]}")
@@ -21160,6 +21269,7 @@ async def v2_agents(request: Request):
 async def v2_sessions(request: Request, provider: str = "", status: str = "",
                       archived: bool = False):
     _check_auth(request)
+    started = time.monotonic()
     out = []
     degraded = []   # 取清單失敗的 provider(目前只有 codex 分支會標)
     out.extend(await _delegation_v2_sessions())
@@ -21237,7 +21347,7 @@ async def v2_sessions(request: Request, provider: str = "", status: str = "",
                 drow = _approval_get_row(str(pub.get("id") or ""))
                 if drow:
                     pub = {**drow,
-                           **{k: pub[k] for k in ("method", "thread_id") if k in pub},
+                           **{k: pub[k] for k in ("method", "thread_id", "q_index", "q_total") if k in pub},
                            "options": pub.get("options") or drow.get("options")}
             # thread-store 寫入鎖:清單這一層也要看得出來,不然 app 只能在
             # 使用者按下送出、吃到 409 之後才知道這條進不去。
@@ -21312,7 +21422,12 @@ async def v2_sessions(request: Request, provider: str = "", status: str = "",
     if _CODEX_V2_STALE and "codex" not in degraded:
         # stale cache 撐著畫面 ≠ 健康(深診 §4:v2 幾乎每次都走 stale 路)
         degraded.append("codex")
-    return {"sessions": out, "degraded_providers": degraded, "host_name": _pocket_id_host_name()}
+    result = {"degraded_providers": degraded, "host_name": _pocket_id_host_name()}
+    if getattr(getattr(request, "state", None), "console_remote", False) is True:
+        out = [dict(row) for row in out]
+        _console_remote_list(out, _request_token(request), started, degraded)
+        result["console_scope"] = CONSOLE_REMOTE_SCOPE
+    return {"sessions": out, **result}
 
 
 def _approval_bool_from_body(body: dict) -> bool:
@@ -21349,15 +21464,31 @@ async def v2_session_approve(session_id: str, request: Request):
     {key},即 approval/prompt 的 option key)、hermes=Approval Center 決議
     (body {approval_id, approve})。"""
     _check_auth(request)
-    try:
-        body = await request.json()
-    except Exception as _exc:  # noqa: BLE001
-        _log_exc("v2_session_approve", _exc, expected=True)
-        body = {}
+    body = await _json_body(request)
     # A1(spec §3.3):統一 body {approval_id, key}(approve bool 相容糖)—
     # 三 provider 一律轉呼 _approval_decide_core;三種舊 body({key}/{approve}/
     # {approval_id})走下方原分支,相容期照收(A4 刪)。
     uni_aid = str(body.get("approval_id") or "").strip()
+    if getattr(getattr(request, "state", None), "console_remote", False) is True:
+        _, aid, keys, binary, index = request.state.console_grant
+        choice_fields = {"approval_id", "key"} if index is None else {"approval_id", "key", "expected_q_index"}
+        allowed = (binary and set(body) == {"approval_id", "approve"} and isinstance(body["approve"], bool) or
+                   set(body) == choice_fields and str(body["key"]) in keys)
+        if not aid or uni_aid != aid or not allowed:
+            raise http_err(403, "SCOPE_FORBIDDEN", "只能處理本對話顯示的核准項目")
+        if index is not None and (type(body["expected_q_index"]) is not int or body["expected_q_index"] != index):
+            raise http_err(409, "STALE_QUESTION", "題目已更新，請重新確認")
+        current = _approval_get_row(uni_aid)
+        if not current or (current.get("expires_at") and _expires_passed(current["expires_at"])):
+            raise http_err(409, "APPROVAL_NOT_PENDING", "核准已失效")
+        target = ("codex:" + _codex_thread_from_v2_session_id(session_id)
+                  if session_id.startswith("delegation:") else session_id)
+        if current.get("session_id") != target:
+            raise http_err(403, "SCOPE_FORBIDDEN", "核准不屬於本對話")
+        if "key" in body and current.get("status") == "pending":
+            if not any(str(o.get("key")) == str(body["key"]) and
+                       o.get("label") == keys[str(body["key"])] for o in current.get("options") or []):
+                raise http_err(409, "APPROVAL_CHANGED", "核准選項已更新，請重整")
     if uni_aid and ("key" in body or "approve" in body or "decision" in body):
         result = await _approval_decide_core(uni_aid, body)
         return {"ok": True, "session_id": session_id, **result}
@@ -21434,12 +21565,27 @@ async def v2_session_input(session_id: str, request: Request):
     _check_auth(request)
     body = await _json_body(request)
     src = _v2_card_source(session_id)
+    if getattr(getattr(request, "state", None), "console_remote", False) is True:
+        atts = body.get("attachments") or []
+        if (set(body) - {"content", "text", "client_id", "attachments"} or
+                atts and ("attachments" not in request.state.console_grant[0] or not isinstance(atts, list) or
+                          any(not isinstance(a, dict) or set(a) - {"kind", "filename", "mime", "data"}
+                              or not isinstance(a.get("data"), str) or not a["data"].startswith("data:") for a in atts))):
+            raise http_err(403, "SCOPE_FORBIDDEN", "只能送出訊息與此瀏覽器上傳的附件")
+        if src[0] == "cc":
+            message = str(body.get("text") or body.get("content") or "").lstrip()
+            if message.startswith(("!", "/")) or _cc_composer_region(await _cc_capture_pane_fresh(src[1])) is None:
+                raise http_err(403, "SCOPE_FORBIDDEN", "借用電腦只能在 Claude 對話輸入區傳訊息")
     # 戶政:任何 turn 輸入 = 活著的證據(active⇄idle 的 idle 判定基準)。
     _registry_call_safe("touch", session_id)
     if src[0] == "cx" and not session_id.startswith("codex:"):
         _registry_call_safe("touch", f"codex:{src[1]}")
     if src[0] == "cc":
-        res = await _cc_input_core(src[1], body)
+        marker = _CONSOLE_CC_INPUT.set(getattr(getattr(request, "state", None), "console_remote", False) is True)
+        try:
+            res = await _cc_input_core(src[1], body)
+        finally:
+            _CONSOLE_CC_INPUT.reset(marker)
         return {"session_id": session_id, **res}
     if src[0] == "oc":
         return await _oc_input_core(src[1], session_id, body)

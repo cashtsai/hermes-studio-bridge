@@ -5,6 +5,7 @@ const path = require("node:path");
 const { chromium } = require("playwright");
 
 const A = "claude_code:alpha", B = "codex:beta";
+const fixtureCaps = ["replay","follow","input","attachments","interrupt","changes"];
 const folder = path.resolve(__dirname, "../../static/console");
 function gate() {
   let resolve;
@@ -29,8 +30,12 @@ async function fixture(t, handle, list, viewport, sessionMeta = () => ({})) {
     if (match) return handle(route, decodeURIComponent(match[1]), match[2], url);
     if (url.pathname === "/app/v2/sessions" && list) return list(route);
     if (url.pathname === "/app/v2/sessions") return route.fulfill({json: {sessions: [
-      {id:A, provider:"claude_code", title:"Alpha"}, {id:B, provider:"codex", title:"Beta"},
-    ].map(s => ({...s, meta:sessionMeta(s.id)}))}});
+      {id:A, provider:"claude_code", title:"Alpha", capabilities:fixtureCaps},
+      {id:B, provider:"codex", title:"Beta", capabilities:fixtureCaps},
+    ].map(s => {
+      const meta = sessionMeta(s.id);
+      return {...s, meta, capabilities: meta.approval ? [...fixtureCaps, "approve"] : fixtureCaps};
+    })}});
     if (url.pathname === "/console") return route.fulfill({contentType:"text/html", body:
       (await fs.readFile(path.join(folder, "index.html"), "utf8")).replace(
         'data-console-access="local"', 'data-console-access="remote"')});
@@ -44,11 +49,56 @@ async function fixture(t, handle, list, viewport, sessionMeta = () => ({})) {
 const stream = (route, envelopes = []) => route.fulfill({contentType:"text/event-stream",
   body: envelopes.map(e => "data: " + JSON.stringify(e) + "\n\n").join("")});
 
+test("borrowed UI follows each session grant and never fetches hidden host tools", async t => {
+  const rows = [{id:A,provider:"claude_code",title:"Demo chat",status:"running",capabilities:["replay"]},
+    {id:B,provider:"codex",title:"Demo project",status:"running",capabilities:["replay","input","changes"]}];
+  const calls = [];
+  let changeStatus = 403;
+  const page = await fixture(t, (r,id,action) => {
+    calls.push([id,action]);
+    if (action === "cards") return r.fulfill({json:{cards:[],latest_seq:1,status:{phase:"running"}}});
+    if (action === "changes") return r.fulfill({status:changeStatus,json:changeStatus===200?{files:[]}:{detail:"unavailable"}});
+    if (action === "input") return r.fulfill({json:{ok:true,session_id:id}});
+    return r.fulfill({status:403,json:{}});
+  }, r => r.fulfill({json:{sessions:rows}}), {width:1366,height:768});
+  for (const sel of ['[data-mode="files"]','[data-mode="term"]','[data-mode="memory"]','#newsess-open','[data-mode="changes"]']) {
+    assert.ok(await page.locator(sel).isHidden(), sel);
+  }
+  await page.getByText("Demo chat",{exact:true}).click();
+  await page.getByText("這台電腦只能閱讀此對話").waitFor();
+  for (const sel of ["#composer","#interrupt","#rail"]) assert.ok(await page.locator(sel).isHidden());
+  await page.evaluate(() => {
+    window.PocketConsoleMode.set("files");
+    document.getElementById("composer").requestSubmit();
+    document.getElementById("interrupt").click();
+  });
+  assert.ok(await page.locator("#files-view").isHidden());
+  await page.getByText("Demo project",{exact:true}).click();
+  await page.locator("#rail").getByText("這台電腦無權讀取工作目錄").waitFor();
+  assert.ok(await page.locator("#attach").isHidden());
+  assert.ok(await page.locator("#interrupt").isHidden());
+  await page.locator("#input").fill("send to the existing thread");
+  await page.locator("#send").click();
+  await page.getByText("主機已收到").waitFor();
+  changeStatus = 404;
+  await page.locator('[data-mode="changes"]').click();
+  await page.locator("#ch-list").getByText("找不到工作目錄或 Git 儲存庫").waitFor();
+  changeStatus = 200;
+  await page.locator("#ch-reload").click();
+  await page.locator("#ch-list").getByText("工作目錄乾淨", {exact:false}).waitFor();
+  rows[1].capabilities = ["replay"];
+  await page.evaluate(() => loadSessions());
+  assert.ok(await page.locator("#changes-view").isHidden());
+  await page.getByText("這台電腦只能閱讀此對話").waitFor();
+  assert.deepEqual(calls.filter(([id])=>id===A), [[A,"cards"]]);
+  assert.deepEqual(calls.filter(([,op])=>["input","events","interrupt"].includes(op)), [[B,"input"]]);
+});
+
 test("Chromebook-sized fresh Chrome profile: resume host activity, distinguish names and settle just one approval", async t => {
   const titles = ["首頁搜尋", "工作區導覽", "字型樣張", "交接清單", "發佈檢查", "附件預覽"];
   const rows = Array.from({length:36}, (_,i) => ({id:"codex:job-" + i, title:titles[i % titles.length],
     provider:"codex", subtitle:i === 31 ? "/demo/brand" : "/demo/console",
-    status:"idle", capabilities:["input","approve"]}));
+    status:"idle", capabilities:["replay","input","approve"]}));
   rows[31].title = rows[35].title = "Release";
   rows[35].status = "running";
   rows[31].last_event_at = "2026-01-02T00:00:00Z";
@@ -105,8 +155,8 @@ test("Chromebook-sized fresh Chrome profile: resume host activity, distinguish n
 
 test("narrow home: retry a failed list, search all sessions and don't misreport degraded approvals", async t => {
   let fails = true, degraded = false;
-  const sessions = [{id:A,title:"Same",provider:"claude_code",subtitle:"/demo/A",status:"idle"},
-    {id:B,title:"Same",provider:"codex",subtitle:"/demo/B",status:"idle"}];
+  const sessions = [{id:A,title:"Same",provider:"claude_code",subtitle:"/demo/A",status:"idle",capabilities:fixtureCaps},
+    {id:B,title:"Same",provider:"codex",subtitle:"/demo/B",status:"idle",capabilities:fixtureCaps}];
   const page = await fixture(t, (r,id,action) => action === "events" ? stream(r) : r.fulfill({json:snap(0,[])}),
     r => fails ? r.fulfill({status:503,json:{}}) :
       r.fulfill({json:{sessions,degraded_providers:degraded?["codex"]:[]}}), {width:390,height:844});
@@ -289,8 +339,8 @@ test("next question shares an approval ID; each displayed step sends its own ind
     }
     return action === "events" ? stream(r) : r.fulfill({json:snap(0,[])});
   }, undefined, undefined, id => id === B && step < 2 ? {approval:{id:"aid", kind:"question", q_index:step, q_total:2,
-    title:"Question " + step, options:[{key:"opt0",label:"Option " + step}]}} : {});
-  await page.getByText("Beta",{exact:true}).click();
+    title:"Question " + step}, console_options:[{key:"opt0",label:"Option " + step}]} : {});
+  await page.locator('#pending-list [data-id="' + B + '"]').click();
   await page.getByRole("button",{name:"opt0. Option 0",exact:true}).click();
   await page.getByRole("button",{name:"opt0. Option 1",exact:true}).click();
   await page.locator("#approval").waitFor({state:"hidden"});
@@ -304,7 +354,7 @@ test("approval expires on screen without waiting for a list refresh", async t =>
     return action === "events" ? stream(r) : r.fulfill({json:snap(0,[])});
   }, undefined, undefined, () => ({approval:{id:"exp", title:"Short approval", expires_at:now / 1000 + 5}}));
   await page.clock.install({time:new Date(now)});
-  await page.getByText("Beta",{exact:true}).click();
+  await page.locator('#pending-list [data-id="' + B + '"]').click();
   await page.getByRole("button",{name:"核准",exact:true}).waitFor();
   await page.clock.fastForward(5100);
   await page.locator("#approval").waitFor({state:"hidden"});
