@@ -5664,6 +5664,9 @@ CODEX_APP_SERVER_SOCKET = os.path.expanduser(
 #   managed = 只用共用 daemon,連不上就大聲壞掉(刻意要 daemon-only 的人用)
 #   stdio   = 只 spawn 自己的 app-server,完全不碰 socket
 CODEX_APP_SERVER_MODES = ("auto", "managed", "stdio")
+# A real image-heavy Pixel history page is ~181 MB. Keep both transports
+# bounded, but allow that existing history without disconnecting every thread.
+CODEX_APP_SERVER_MAX_MESSAGE_BYTES = 256 * 1024 * 1024
 CODEX_APP_SERVER_MODE = os.environ.get("CODEX_APP_SERVER_MODE", "auto").strip().lower()
 if CODEX_APP_SERVER_MODE not in CODEX_APP_SERVER_MODES:
     CODEX_APP_SERVER_MODE = "auto"
@@ -6482,8 +6485,8 @@ class CodexAppServerClient:
             compression=None,
             # 單一訊息上限。thread/turns/list itemsView=full 若含 computer-use
             # 截圖(base64)可能單則破 8MB → 預設 1MB 上限會直接把連線關掉。
-            # 對齊 stdio 那條路徑的 128MB,吃得下含圖的大回應。
-            max_size=128 * 1024 * 1024,
+            # 與 stdio 共用上限，涵蓋產圖 session 的大型歷史回應。
+            max_size=CODEX_APP_SERVER_MAX_MESSAGE_BYTES,
             user_agent_header="PocketAgent-Bridge/0.1",
         )
         self.transport = "unix-websocket"
@@ -6523,8 +6526,8 @@ class CodexAppServerClient:
                 # 送;thread/turns/list itemsView=full 若含 computer-use 截圖(base64)可能
                 # 單行破 8MB → asyncio 讀取器丟 LimitOverrunError(「Separator is not found,
                 # and chunk exceed the limit」)→ reader task 死 → app-server「stopped」→ 整條
-                # codex 卡死(XCash 就是這樣)。放大到 128MB 吃得下含圖的大回應。
-                limit=128 * 1024 * 1024,
+                # codex 卡死。與 WebSocket 共用有界上限，避免兩種傳輸行為分歧。
+                limit=CODEX_APP_SERVER_MAX_MESSAGE_BYTES,
                 **({"env": env} if env is not None else {}),
             )
         except (FileNotFoundError, PermissionError) as e:
