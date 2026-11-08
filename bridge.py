@@ -7351,6 +7351,7 @@ class CodexAppServerClient:
             "created_at": record.get("created_at"),
             "thread_id": record.get("thread_id"),
             "options": record.get("options"),   # 發起方宣告的選項(去二元);None → app 用二元預設
+            **{k: record[k] for k in ("q_index", "q_total") if k in record},
         }
 
     def _approval_db_upsert(self, record: dict) -> None:
@@ -32745,6 +32746,13 @@ async def _approval_decide_serial(aid: str, b: dict) -> dict:
         # mcpServer/elicitation/request)不是二元核准 —— key 就是答案，
         # 另有自由輸入 text。走 answer_question，狀態落 answered。
         if (d.get("kind") or "") == "question":
+            # One approval ID spans the entire questionnaire. A second device's
+            # stale choice must not become the answer to the following question.
+            if "expected_q_index" in b:
+                live = CODEX_APP.pending_approvals.get(aid) or {}
+                index = b["expected_q_index"]
+                if type(index) is not int or index != live.get("q_index"):
+                    raise http_err(409, "STALE_QUESTION", "題目已更新，請重新確認")
             try:
                 result = await CODEX_APP.answer_question(
                     aid, key=key, text=str(b.get("text") or b.get("answer") or ""))

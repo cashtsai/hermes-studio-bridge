@@ -14,7 +14,7 @@ function gate() {
 const row = (id, text, cid) => ({ id, kind: "text", role: cid ? "user" : "agent",
   body: { text, ...(cid ? { client_id: cid } : {}) } });
 const snap = (seq, cards) => ({ latest_seq: seq, cards, status: {phase:"idle"} });
-async function fixture(t, handle) {
+async function fixture(t, handle, sessionMeta = () => ({})) {
   const browser = await chromium.launch({channel:"chrome"});
   t.after(() => browser.close());
   const page = await browser.newPage({serviceWorkers:"block"});
@@ -29,7 +29,7 @@ async function fixture(t, handle) {
     if (match) return handle(route, decodeURIComponent(match[1]), match[2], url);
     if (url.pathname === "/app/v2/sessions") return route.fulfill({json: {sessions: [
       {id:A, provider:"claude_code", title:"Alpha"}, {id:B, provider:"codex", title:"Beta"},
-    ]}});
+    ].map(s => ({...s, meta:sessionMeta(s.id)}))}});
     if (url.pathname === "/console") return route.fulfill({contentType:"text/html", body:
       (await fs.readFile(path.join(folder, "index.html"), "utf8")).replace(
         'data-console-access="local"', 'data-console-access="remote"')});
@@ -152,4 +152,62 @@ test("late attachment stays with A, and the first A snapshot cannot replace the 
   await (await stale).finished();
   await page.evaluate(() => new Promise(done => requestAnimationFrame(() => requestAnimationFrame(done))));
   assert.equal(await page.locator("#cards .card-body").textContent(), "current " + A);
+});
+
+test("expired stream and temporarily unavailable snapshot preserve history and recover without replay", async t => {
+  const cursors = [];
+  let snapshots = 0, offline = true, reopened = false;
+  const page = await fixture(t, async (r, id, action, url) => {
+    if (action === "cards") {
+      ++snapshots;
+      if (snapshots > 1 && offline) return r.fulfill({status:503, json:{}});
+      return r.fulfill({json:snap(snapshots === 1 ? 6 : reopened ? 16 : 15, [
+        row("old", "already visible"), ...(snapshots === 1 ? [] : [row("new", "arrived while away")]),
+        ...(reopened ? [row("tail","live again")] : [])])});
+    }
+    if (action === "events") {
+      cursors.push(url.searchParams.get("since_seq"));
+      if (cursors.length === 1) return r.fulfill({status:410, json:{}});
+      return stream(r, [{type:"card.upsert", seq:15, data:{card:row("new","duplicate old event")}},
+        {type:"card.upsert", seq:16, data:{card:row("tail","live again")}}]);
+    }
+    assert.equal(r.request().method(), "GET", "recovery must only read");
+    return r.fulfill({json:{}});
+  });
+  await page.getByText("Beta", {exact:true}).click();
+  await page.locator("#stream-health").getByText("連線中斷，正在補接").waitFor();
+  assert.equal(await page.locator("#cards .card-body").textContent(), "already visible");
+  await page.locator("#input").fill("draft survived");
+  if (process.env.POCKET_TEST_LONG_OUTAGE === "1") await new Promise(r => setTimeout(r, 30000));
+  offline = false;
+  await page.locator("#cards").getByText("live again").waitFor({timeout:20000});
+  assert.deepEqual(await page.locator("#cards .card-body").allTextContents(),
+    ["already visible", "arrived while away", "live again"]);
+  assert.deepEqual(cursors.slice(0,2), ["6","15"]);
+  assert.equal(await page.locator("#input").inputValue(), "draft survived");
+  reopened = true;
+  await page.reload();
+  await page.locator("#cards").getByText("live again").waitFor();
+  assert.equal(await page.locator("#cards .card").count(), 3);
+  assert.equal(await page.locator("#input").inputValue(), "", "borrowed-browser drafts are not persisted");
+});
+
+test("next question shares an approval ID; each displayed step sends its own index and option", async t => {
+  let step = 0;
+  const decisions = [];
+  const page = await fixture(t, async (r, id, action) => {
+    if (action === "approve") {
+      const b = r.request().postDataJSON();
+      decisions.push([b.approval_id, b.expected_q_index, b.key]);
+      step++;
+      return r.fulfill({json:{ok:true, status:step === 1 ? "next_question" : "answered"}});
+    }
+    return action === "events" ? stream(r) : r.fulfill({json:snap(0,[])});
+  }, id => id === B && step < 2 ? {approval:{id:"aid", kind:"question", q_index:step, q_total:2,
+    title:"Question " + step, options:[{key:"opt0",label:"Option " + step}]}} : {});
+  await page.getByText("Beta",{exact:true}).click();
+  await page.getByRole("button",{name:"opt0. Option 0",exact:true}).click();
+  await page.getByRole("button",{name:"opt0. Option 1",exact:true}).click();
+  await page.locator("#approval").waitFor({state:"hidden"});
+  assert.deepEqual(decisions, [["aid",0,"opt0"],["aid",1,"opt0"]]);
 });

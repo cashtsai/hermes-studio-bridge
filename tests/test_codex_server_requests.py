@@ -21,6 +21,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 
 _TMP = tempfile.mkdtemp(prefix="cxreq-canon-")
 os.environ["POCKET_CANON_DB"] = os.path.join(_TMP, "canonical.db")
@@ -252,8 +253,16 @@ class TestRequestUserInput(unittest.TestCase):
         record = client.pending_question_for_thread("t-2")
         # 逐題推進(2026-08-21):第一題答完只換下一題的卡,還不回 app-server
         # (提早回 = 把其餘題目用空答案定案,舊版就是這樣丟掉第二題答案的)。
+        self.assertEqual(client._approval_public(record)["q_index"], 0)
         out = _run(client.answer_question(record["id"], key="opt0"))
         self.assertEqual(out["status"], "next_question")
+        self.assertEqual(client.replies_for(23), [])
+        self.assertEqual(client._approval_public(record)["q_index"], 1)
+        with patch.object(bridge, "CODEX_APP", client), patch.object(
+            bridge, "_approval_get_row", return_value={"source":"codex:t-2", "kind":"question"}
+        ), self.assertRaises(bridge.BridgeError) as stale:
+            _run(bridge._approval_decide_core(record["id"], {"key":"opt0", "expected_q_index":0}))
+        self.assertEqual(stale.exception.status_code, 409)
         self.assertEqual(client.replies_for(23), [])
         _run(client.answer_question(record["id"], key="deny"))   # 第二題跳過
         self.assertEqual(client.replies_for(23)[0]["result"],

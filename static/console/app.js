@@ -110,6 +110,7 @@ async function leaveConsole(broadcast = false) {
   sessionStorage.setItem(LOGOUT_EVENT, "pending");
   if (broadcast) localStorage.setItem(LOGOUT_EVENT, String(Date.now()));
   if (state.stopStream) state.stopStream();
+  clearTimeout(snapshotRetry);
   if (state.stopList) state.stopList();
   stopBlink();
   try {
@@ -145,7 +146,7 @@ async function api(path, opts) {
 }
 async function apiJSON(path, opts) {
   const r = await api(path, opts);
-  if (!r.ok) throw new Error(String(r.status));
+  if (!r.ok) throw Object.assign(new Error(String(r.status)), { status: r.status });
   return r.json();
 }
 
@@ -164,6 +165,8 @@ async function loadSessions() {
     renderAwaiting();
     renderApproval();
     setConn(true, degraded.length ? ("降級:" + degraded.join(",")) : "已連線");
+    const want = !state.current && hashSession();
+    if (want && state.sessions.some(s => s.id === want)) openSession(want);
   } catch (err) {
     if (request === listRequest && !signingOut) setConn(false, "取列表失敗");
   }
@@ -195,9 +198,11 @@ function renderSessions(degraded) {
 }
 
 // ───────────────────────── 卡片流 ─────────────────────────
-async function openSession(id) {
+let snapshotRetry;
+function openSession(id) {
   if (signingOut) return;
   const view = ++state.view;
+  clearTimeout(snapshotRetry);
   if (state.stopStream) { state.stopStream(); state.stopStream = null; }
   state.current = id;
   state.cards = []; state.latestSeq = 0;
@@ -214,11 +219,17 @@ async function openSession(id) {
   renderApproval();
   if (window.PocketConsoleRail) window.PocketConsoleRail.load();
   $("cards").innerHTML = '<div class="placeholder">載入卡片…</div>';
+  void loadCardSnapshot(id, view);
+}
 
+async function loadCardSnapshot(id, view, delay = 1000) {
+  if (!currentView(view)) return;
   try {
-    const snap = await apiJSON("/app/v2/sessions/" + encodeURIComponent(id) + "/cards?limit=100");
+    const snap = await apiJSON("/app/v2/sessions/" + encodeURIComponent(id) + "/cards?limit=100",
+      { cache: "no-store", signal: AbortSignal.timeout(15000) });
     if (!currentView(view)) return;
-    if (!Array.isArray(snap.cards)) throw new Error("無效的卡片回應");
+    if (!Array.isArray(snap.cards) || !Number.isSafeInteger(snap.latest_seq) || snap.latest_seq < 0)
+      throw new Error("無效的卡片回應");
     state.cards = snap.cards || [];
     state.latestSeq = snap.latest_seq || 0;
     renderCards();
@@ -227,8 +238,13 @@ async function openSession(id) {
     subscribeCards(id, view);
   } catch (err) {
     if (!currentView(view)) return;
-    $("stream-health").textContent = "未連線";
-    $("cards").innerHTML = '<div class="placeholder err">卡片載入失敗:' + esc(err.message) + "</div>";
+    if (err.status >= 400 && err.status < 500 && ![408, 429].includes(err.status)) {
+      $("stream-health").textContent = "卡片無法讀取：" + err.status;
+      $("cards").replaceChildren();
+      return;
+    }
+    $("stream-health").textContent = "連線中斷，正在補接";
+    snapshotRetry = setTimeout(() => loadCardSnapshot(id, view, Math.min(delay * 2, 15000)), delay);
   }
 }
 
@@ -259,10 +275,12 @@ function renderApproval() {
   const meta = (s && s.meta) || {};
   const prompt = meta.prompt;
   const aid = approvalIdOf(meta);
-  const opts = (prompt && Array.isArray(prompt.options) && prompt.options.length)
-    ? prompt.options : null;
+  const index = meta.approval?.q_index;
+  const step = aid && JSON.stringify([aid, index ?? null]);
+  const options = prompt?.options?.length ? prompt.options : meta.approval?.options;
+  const opts = Array.isArray(options) && options.length ? options : null;
 
-  if ((!opts && !aid) || (aid && handledApproval.get(s.id) === aid)) { bar.classList.add("hidden"); return; }
+  if ((!opts && !aid) || (step && handledApproval.get(s.id) === step)) { bar.classList.add("hidden"); return; }
   bar.classList.remove("hidden");
   $("ap-title").textContent =
     (prompt && prompt.title) || (meta.approval && meta.approval.title) || "等待你放行";
@@ -279,28 +297,28 @@ function renderApproval() {
       const b = document.createElement("button");
       b.className = "ap-btn";
       b.textContent = (o.key ? o.key + ". " : "") + (o.label || "");
-      b.addEventListener("click", () => decide({ key: String(o.key) }, b));
+      b.addEventListener("click", () => decide(s.id, aid, index, { key: String(o.key) }, b));
       box.appendChild(b);
     });
   } else {
     const yes = document.createElement("button");
     yes.className = "ap-btn ap-yes"; yes.textContent = "核准";
-    yes.addEventListener("click", () => decide({ approve: true }, yes));
+    yes.addEventListener("click", () => decide(s.id, aid, index, { approve: true }, yes));
     const no = document.createElement("button");
     no.className = "ap-btn ap-no"; no.textContent = "否決";
-    no.addEventListener("click", () => decide({ approve: false }, no));
+    no.addEventListener("click", () => decide(s.id, aid, index, { approve: false }, no));
     box.append(yes, no);
   }
   if (deciding.has(s.id)) box.querySelectorAll("button").forEach(b => b.disabled = true);
 }
 
-async function decide(choice, btn) {
-  const id = state.current;
-  if (!id || deciding.has(id)) return;
-  const aid = approvalIdOf((currentSession() || {}).meta);
+async function decide(id, aid, index, choice, btn) {
+  if (!id || id !== state.current || deciding.has(id) || signingOut) return;
   if (!aid && document.body.dataset.consoleAccess === "remote") return;
   deciding.add(id);
   const body = Object.assign({}, choice, aid ? { approval_id: aid } : {});
+  if (Number.isInteger(index)) body.expected_q_index = index;
+  const step = JSON.stringify([aid, index ?? null]);
   // 樂觀:整排先停用,避免連點送出兩個決定
   const box = $("ap-actions");
   box.querySelectorAll("button").forEach((b) => (b.disabled = true));
@@ -312,10 +330,12 @@ async function decide(choice, btn) {
     });
     if (!r.ok) {
       const e = await r.json().catch(() => ({}));
+      if (aid && r.status === 409 && ["STALE_QUESTION", "APPROVAL_NOT_PENDING"].includes(e.error?.code))
+        handledApproval.set(id, step);
       throw new Error((e.error && e.error.message) || ("HTTP " + r.status));
     }
     const receipt = await r.json();
-    if (aid) handledApproval.set(id, aid);
+    if (aid) handledApproval.set(id, step);
     if (!signingOut && state.current === id) toast(receipt.idempotent ? "這項核准已處理" : "已送出決定");
   } catch (err) {
     if (!signingOut && state.current === id) toast("無法確認決定：" + err.message);
@@ -344,6 +364,12 @@ function jumpToAwaiting() {
 }
 
 function subscribeCards(id, view) {
+  function resync() {
+    if (!currentView(view)) return;
+    if (state.stopStream) { state.stopStream(); state.stopStream = null; }
+    $("stream-health").textContent = "正在同步";
+    void loadCardSnapshot(id, ++state.view);
+  }
   const url = () => "/app/v2/sessions/" + encodeURIComponent(id) +
               "/events?since_seq=" + state.latestSeq + "&profile=phone";
   state.stopStream = sseStream(url, state.token, {
@@ -352,11 +378,11 @@ function subscribeCards(id, view) {
       const envelope = evt.data || {}, payload = envelope.data || {}, seq = envelope.seq;
       if (!Number.isSafeInteger(seq)) return;
       if (envelope.type === "ping") {
-        if (seq !== state.latestSeq) openSession(id);
+        if (seq !== state.latestSeq) resync();
         return;
       }
       if (seq <= state.latestSeq) return;
-      if (seq !== state.latestSeq + 1) { openSession(id); return; }
+      if (seq !== state.latestSeq + 1) { resync(); return; }
       if (envelope.type === "card.upsert" && payload.card) {
         upsertCard(payload.card);
         confirmEcho(id, [payload.card]);
@@ -366,7 +392,7 @@ function subscribeCards(id, view) {
       }
       state.latestSeq = seq;
     },
-    onGone: () => { if (currentView(view)) openSession(id); },
+    onGone: resync,
     onOpen: () => { if (currentView(view)) $("stream-health").textContent = ""; },
     onError: () => { if (currentView(view)) $("stream-health").textContent = "連線中斷，正在補接"; },
     onDenied: code => {
@@ -713,6 +739,7 @@ function moveSelection(delta) {
   if (next && next !== state.current) openSession(next);
 }
 function firstApprovalButton(wantYes) {
+  if ($("approval").classList.contains("hidden")) return null;
   const btns = Array.from($("ap-actions").querySelectorAll("button"));
   if (!btns.length) return null;
   const hit = btns.find((b) => b.classList.contains(wantYes ? "ap-yes" : "ap-no"));
@@ -894,16 +921,19 @@ async function main() {
     navigator.serviceWorker.register("/console/sw.js", { scope: "/console" })
       .catch(() => { /* 裝不起來不影響使用,不要吵使用者 */ });
   }
-  const want = hashSession();              // 深連結:帶 #session= 就直接開
-  if (want && state.sessions.some((s) => s.id === want)) openSession(want);
   // 全域 SSE:任何 session 狀態變動都刷新列表(無 410 問題,見規格)
   if (document.body.dataset.consoleAccess === "remote") {
     // The scoped session list is allowed; the cross-session event log is not.
     setInterval(() => { if (!document.hidden && !signingOut) loadSessions(); }, 10000);
     return;
   }
-  state.stopList = sseStream("/app/v2/events?follow=true&since_seq=0", state.token, {
-    onEvent: () => { /* 去抖:每次事件觸發輕量刷新 */ scheduleListRefresh(); },
+  let listCursor = 0;
+  state.stopList = sseStream(() => "/app/v2/events?follow=true&since_seq=" + listCursor, state.token, {
+    onEvent: ({data}) => {
+      if (!Number.isSafeInteger(data?.seq) || data.seq <= listCursor) return;
+      listCursor = data.seq;
+      scheduleListRefresh();
+    },
     onError: () => setConn(false, "事件流斷線,重連中…"),
     onOpen: () => {},
     onDenied: code => { if (code === 401) void leaveConsole(); else setConn(false, "無權讀取事件"); },
