@@ -592,6 +592,8 @@ def _auth_fail_summary_locked(request: Request, status: int, now: float) -> dict
 # 預設**一個目錄都不開**:沒設 env 就等於規格原本的「擋掉檔案面」。
 # 要開就明確列出要開哪幾個 —— 安全的那一側當預設,放寬是刻意動作。
 CONSOLE_REMOTE_SCOPE = "console-remote"
+CONSOLE_REMOTE_TOKEN_TTL = int(os.environ.get("POCKET_CONSOLE_REMOTE_TOKEN_TTL", "1800"))
+CONSOLE_REMOTE_IDLE = int(os.environ.get("POCKET_CONSOLE_REMOTE_IDLE", "900"))
 CONSOLE_REMOTE_FILE_ROOTS = [
     os.path.realpath(os.path.expanduser(r.strip()))
     for r in (os.environ.get("POCKET_CONSOLE_REMOTE_FILE_ROOTS") or "").split(":")
@@ -643,6 +645,15 @@ def _expires_passed(exp, now: float | None = None) -> bool:
         return True
 
 
+def _console_entry_expired(entry: dict, now: float | None = None) -> bool:
+    now = time.time() if now is None else now
+    try:
+        idle_until = float(entry["last_seen"]) + CONSOLE_REMOTE_IDLE
+    except (KeyError, TypeError, ValueError):
+        return True
+    return not idle_until > now or _expires_passed(entry.get("expires"), now)
+
+
 def _console_remote_expired(token: str, now: float | None = None) -> bool:
     """console-remote token 有有效期 —— **一般 device token 完全沒有**,
     這是這條路獨有的新行為(規格 §9)。沒有 expires 欄位視為已過期:
@@ -650,7 +661,7 @@ def _console_remote_expired(token: str, now: float | None = None) -> bool:
     entry = _token_entry(token) or {}
     if str(entry.get("scope") or "") != CONSOLE_REMOTE_SCOPE:
         return False
-    return _expires_passed(entry.get("expires"), now)
+    return _console_entry_expired(entry, now)
 
 
 def _console_remote_path_allowed(path: str) -> bool:
@@ -718,7 +729,7 @@ def _check_auth(request: Request) -> None:
                 # 單獨跑那條測試是綠的(middleware 先擋掉所以走不到這裡),
                 # 五條一起跑才卡死。
                 if str(dev.get("scope") or "") == CONSOLE_REMOTE_SCOPE \
-                        and _expires_passed(dev.get("expires")):
+                        and _console_entry_expired(dev):
                     raise http_err(401, "TOKEN_EXPIRED",
                                    "遠端控制台的授權已到期,請重新掃碼登入")
                 if not dev.get("apple_user_id") or _account_device_for_token(token) is not None:
@@ -1022,7 +1033,8 @@ async def _console_remote_scope_guard(request: Request, call_next):
     只擋 header 那條的話,`<img src="...&token=">` 就是現成的繞過。
     """
     token = _request_token(request)
-    if token and _token_scope(token) == CONSOLE_REMOTE_SCOPE:
+    remote = bool(token and _token_scope(token) == CONSOLE_REMOTE_SCOPE)
+    if remote and request.url.path != "/console/logout":
         if _console_remote_expired(token):
             _log_event("console_remote_token_expired", path=request.url.path)
             return JSONResponse(
@@ -1036,7 +1048,23 @@ async def _console_remote_scope_guard(request: Request, call_next):
                 content={"error": {"code": "SCOPE_FORBIDDEN",
                                    "message": "遠端控制台沒有這項權限"}})
         request.state.console_remote = True
-    return await call_next(request)
+    response = await call_next(request)
+    if remote and response.headers.get("content-type", "").startswith("text/event-stream"):
+        response.body_iterator = _console_guard_stream(token, response.body_iterator)
+    return response
+
+
+async def _console_guard_stream(token, chunks):
+    # An SSE request may outlive its authorization. Do not emit another chunk
+    # after the owner revokes this browser, even on an existing connection.
+    try:
+        async for chunk in chunks:
+            entry = _token_entry(token)
+            if not entry or _console_entry_expired(entry):
+                break
+            yield chunk
+    finally:
+        await chunks.aclose()
 
 
 @app.middleware("http")
@@ -10295,6 +10323,7 @@ def _pair_code_meta(value):
         return {
             "expiry": float(value.get("expiry") or 0),
             "apple_user_id": value.get("apple_user_id"),
+            "console": value.get("console"),
         }
     try:
         return {"expiry": float(value), "apple_user_id": None}
@@ -10348,7 +10377,7 @@ def _pair_clamp_ttl(raw) -> int:
     return max(60, min(1800, ttl))
 
 
-def _pair_mint_code(apple_user_id=None, ttl=None) -> str:
+def _pair_mint_code(apple_user_id=None, ttl=None, *, console=None) -> str:
     """鑄一枚一次性配對碼(/pair/new 與本機 /pair/qr 頁共用)。"""
     now = time.monotonic()
     code = secrets.token_urlsafe(9)
@@ -10359,6 +10388,8 @@ def _pair_mint_code(apple_user_id=None, ttl=None) -> str:
             "expiry": now + (ttl or _PAIR_CODE_TTL),
             "apple_user_id": apple_user_id,
         }
+        if console:
+            _PAIR_CODES[code]["console"] = console
     return code
 
 
@@ -10424,14 +10455,23 @@ async def pair_claim(request: Request):
         if not code or not meta["expiry"] or meta["expiry"] < time.monotonic():
             _pair_code_reject(request)
         _PAIR_CODES.pop(code, None)           # one-time
-    token, device = _pair_issue_device_token(name, platform, claim_user_id)
+    # Only the issuer can mark a browser claim. Never infer scope or identity
+    # from the claimant's platform, label, or optional account credentials.
+    console = meta.get("console")
+    extra = None
+    if console:
+        name, platform, claim_user_id = "Console", "web", None
+        extra = {"console_session": True}
+        if console == CONSOLE_REMOTE_SCOPE:
+            extra.update(scope=CONSOLE_REMOTE_SCOPE, expires=time.time() + CONSOLE_REMOTE_TOKEN_TTL)
+    token, device = _pair_issue_device_token(name, platform, claim_user_id, extra=extra)
     _log_event("pair_claim",
                device=name,
                platform=platform,
                account_bound=bool(claim_user_id),
                apple_user_hash=_short_hash(claim_user_id),
                token_hash=_short_hash(token))
-    return {"token": token,
+    return {"token": token, **({"scope": CONSOLE_REMOTE_SCOPE} if console == CONSOLE_REMOTE_SCOPE else {}),
             "device_id": (device or {}).get("device_id"),
             "account_bound": bool(claim_user_id)}
 
@@ -11354,7 +11394,7 @@ _CONSOLE_CLAIM_COOKIE_NAME = "pocket_console_claim"
 _CONSOLE_CLAIM_COOKIE_TTL = 60          # 秒;短到只夠「303 落地 → 立刻 claim」
 
 
-def _console_mint_claim_code() -> str:
+def _console_mint_claim_code(*, remote: bool = False) -> str:
     """驗過碼的當下鑄一枚一次性配對碼;鑄不出來(被節流)回空字串。
 
     鑄碼節流**沿用 `/pair/qr.json` 那一桶**(`_pair_qr_check_mint_rate`,
@@ -11367,7 +11407,8 @@ def _console_mint_claim_code() -> str:
     except HTTPException:
         _log_event("console_claim_mint_throttled")
         return ""
-    return _pair_mint_code(None, ttl=_pair_clamp_ttl(_CONSOLE_CLAIM_COOKIE_TTL))
+    return _pair_mint_code(None, ttl=_pair_clamp_ttl(_CONSOLE_CLAIM_COOKIE_TTL),
+                           console=CONSOLE_REMOTE_SCOPE if remote else "local")
 
 
 def _console_set_claim_cookie(request: Request, resp: Response, code: str) -> None:
@@ -11683,7 +11724,7 @@ async def console_page(request: Request):
     #   · cookie 續命走 session-only(見下方 `session_only=not local`)。
     local = _pair_local_ok(request)
     web = (not local) and _console_web_ok(request)
-    if local or web:
+    if local or (web and not POCKET_CONSOLE_QR_LOGIN):
         boot_supplied = bool((request.query_params.get("boot") or "").strip())
         if web and boot_supplied:
             wait = _console_auth_retry_after(request)
@@ -11691,12 +11732,12 @@ async def console_page(request: Request):
                 raise HTTPException(status_code=429,
                                     detail="too many attempts; slow down",
                                     headers={"Retry-After": str(int(wait) + 1)})
-        if not _pair_boot_ok(request, allow_cookie=True):
+        if request.query_params.get("signin") == "1" or not _pair_boot_ok(request, allow_cookie=True):
             if web and boot_supplied:
                 _console_auth_note_failure(request)
             # 沒碼/碼錯/cookie 過期 → 輸入頁(web 面的頁尾說明對齊 session cookie)
             return _console_login_response(request, persistent=local)
-    elif not _console_cookie_ok(request):
+    elif request.query_params.get("signin") == "1" or not _console_cookie_ok(request):
         if not POCKET_CONSOLE_QR_LOGIN:
             # 維持裸 403 —— **連輸入框都不給**,見 _console_login_html 的規矩 1。
             # 旗標預設關,所以這就是預設行為(規格 §14):這支的現狀不變。
@@ -11709,6 +11750,8 @@ async def console_page(request: Request):
         html = open(index, encoding="utf-8").read()
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail="console not installed")
+    if not local:
+        html = html.replace('data-console-access="local"', 'data-console-access="remote"', 1)
     resp = HTMLResponse(html, headers=_CONSOLE_SECURITY_HEADERS)
     # 滑動視窗:每次成功開頁都續命。但**遠端來源只能續成 session cookie** ——
     # 若照本機那樣換發 14 天的,掃碼登入的人每開一次頁就把「關瀏覽器即失效」
@@ -11770,6 +11813,8 @@ async def console_auth(request: Request):
     # 旗標開才算)以外,連表單都不該看到。403 的內容與日誌維持單一來源
     # (`_pair_local_only` 剛回報過 False,必定會丟)。
     local = _pair_local_ok(request)
+    if not local and POCKET_CONSOLE_QR_LOGIN:
+        raise HTTPException(status_code=403, detail="use QR login")
     if not (local or _console_web_ok(request)):
         _pair_local_only(request)
     if _console_login_cross_site(request):
@@ -11800,12 +11845,42 @@ async def console_auth(request: Request):
     _console_set_cookie(request, resp, session_only=not local)
     # 交棒給前端:只有「這一次驗過碼」才鑄碼,長命 cookie 永遠換不到(見
     # _CONSOLE_CLAIM_COOKIE_NAME 上方的安全邊界)。碼放 cookie 不放 query。
-    claim = _console_mint_claim_code()
+    claim = _console_mint_claim_code(remote=not local)
     _console_set_claim_cookie(request, resp, claim)
     _log_event("console_auth_ok", client=_client_host(request),
                claim=bool(claim),      # 只記「有沒有鑄」,不記碼
                web=not local)          # 公網中繼面成功登入要留痕,可稽核
     return resp
+
+
+@app.post("/console/logout")
+async def console_logout(request: Request):
+    if _console_login_cross_site(request):
+        raise HTTPException(status_code=403, detail="cross-site logout")
+    auth = request.headers.get("authorization", "")
+    token = auth[7:].strip() if auth.lower().startswith("bearer ") else ""
+    if not token:
+        raise HTTPException(status_code=401, detail="browser authorization required")
+    if hmac.compare_digest(token, BRIDGE_TOKEN):
+        raise HTTPException(status_code=403, detail="not a console session")
+    with _PAIR_LOCK:
+        entry = _DEVICE_TOKENS.get(token)
+        if entry is not None:
+            legacy = entry.get("platform") == "web" and entry.get("name") == "Console"
+            if entry.get("apple_user_id") or not (entry.get("console_session") or legacy
+                                                  or entry.get("scope") == CONSOLE_REMOTE_SCOPE):
+                raise HTTPException(status_code=403, detail="not a console session")
+            remaining = _DEVICE_TOKENS.copy()
+            del remaining[token]
+            _save_device_tokens(remaining)
+            del _DEVICE_TOKENS[token]
+    # A repeated request after a lost acknowledgement still expires the cookies.
+    response = JSONResponse({"revoked": entry is not None}, headers=_CONSOLE_SECURITY_HEADERS,
+                            status_code=200 if entry is not None else 401)
+    for key in (_CONSOLE_COOKIE_NAME, _CONSOLE_CLAIM_COOKIE_NAME, _CONSOLE_LOGIN_SID_COOKIE):
+        response.delete_cookie(key, path=_CONSOLE_COOKIE_PATH, secure=_console_cookie_secure(request),
+                               httponly=key != _CONSOLE_CLAIM_COOKIE_NAME, samesite="strict")
+    return response
 
 
 # PWA 的兩個檔案必須從 **/console/** 這一層服務,不能只掛在 /console/static/:
@@ -12322,7 +12397,7 @@ def _console_login_decide(rid: str, request: Request, *, approve: bool) -> dict:
             return {"ok": True, "state": "denied"}
         # 批准當下才鑄一次性 claim code(與 `/console/auth` 同一條安全論證:
         # 鑄碼只發生在「授權成立的那一刻」,長命憑證永遠換不到碼)。
-        code = _console_mint_claim_code()
+        code = _console_mint_claim_code(remote=True)
         if not code:
             # 鑄碼被節流 —— **不要**把 state 改掉,讓使用者可以重按。
             raise HTTPException(status_code=503, detail="mint throttled, retry")
@@ -13497,6 +13572,8 @@ def _ws_token_authorized(token: str) -> bool:
     with _PAIR_LOCK:
         dev = _DEVICE_TOKENS.get(token)
         if dev is not None:
+            if dev.get("scope") == CONSOLE_REMOTE_SCOPE:
+                return False
             if not dev.get("apple_user_id") or _account_device_for_token(token) is not None:
                 dev["last_seen"] = time.time()
                 return True
@@ -28614,6 +28691,8 @@ def _terminal_device_id_for_token(token: str) -> str | None:
     with _PAIR_LOCK:
         dev = _DEVICE_TOKENS.get(token)
         if dev is not None:
+            if dev.get("scope") == CONSOLE_REMOTE_SCOPE:
+                return None
             if not dev.get("apple_user_id") or _account_device_for_token(token) is not None:
                 dev["last_seen"] = time.time()
                 return dev.get("device_id") or _short_hash(token)
