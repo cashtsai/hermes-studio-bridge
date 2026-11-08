@@ -55,6 +55,7 @@
         <div class="sh-title"><span id="sh-provider" class="pill"></span><span id="sh-name"></span></div>
         <div class="sh-actions">
           <span id="sh-status" class="status-chip"></span>
+          <span id="stream-health" role="status"></span>
           <button id="interrupt" class="btn btn-danger" title="中斷目前回合">■ 中斷</button>
         </div>
       </div>
@@ -66,6 +67,11 @@
         <div id="ap-actions" class="ap-actions"></div>
       </div>
       <div id="cards"><div class="placeholder">← 從左邊選一條 session</div></div>
+      <div id="delivery" class="hidden" role="status">
+        <span id="delivery-text"></span>
+        <button type="button" id="check-delivery" class="btn-ghost">確認送達</button>
+        <button type="button" id="forget-delivery" class="btn-ghost">結束追蹤</button>
+      </div>
       <div id="atts" class="atts hidden"></div>
       <form id="composer" class="composer hidden">
         <input id="file-pick" type="file" multiple class="hidden-input">
