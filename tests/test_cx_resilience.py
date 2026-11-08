@@ -35,6 +35,25 @@ def _client():
 
 
 class TestThreadNotFoundAutoRecover(unittest.TestCase):
+    def test_thread_closed_requires_resuming_the_next_input(self):
+        c = _client()
+        c.loaded_threads.add(TID)
+        c.loaded_threads.add("other-thread")
+        calls = []
+
+        async def call(method, params=None, timeout=30.0):
+            calls.append(method)
+            return {"turn": {"id": "reopened"}} if method == "turn/start" else {}
+
+        with patch.object(bridge, "_cx_cards_feed"), \
+             patch.object(c, "call", side_effect=call), \
+             patch.object(c, "_start_turn_watchdog"):
+            c._handle_notification({"method": "thread/closed",
+                                    "params": {"threadId": TID}})
+            asyncio.run(c.start_turn(TID, [{"type": "text", "text": "continue"}]))
+        self.assertEqual(calls, ["thread/resume", "turn/start"])
+        self.assertIn("other-thread", c.loaded_threads)
+
     def test_turn_start_recovers_once_via_resume(self):
         c = _client()
         c.loaded_threads.add(TID)   # 舊 daemon 時代的殘影

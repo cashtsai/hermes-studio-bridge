@@ -243,7 +243,11 @@ class CodexTransportTest(unittest.TestCase):
                 self.assertEqual(captured["path"], self.sock_path)
                 self.assertEqual(captured["uri"], "ws://localhost/")
                 self.assertIsNone(captured["compression"])
-                self.assertEqual(captured["max_size"], 128 * 1024 * 1024)
+                self.assertEqual(captured["max_size"],
+                                 bridge.CODEX_APP_SERVER_MAX_MESSAGE_BYTES)
+                # Pixel's real full-history response exceeded the former cap.
+                self.assertGreater(captured["max_size"], 181272822)
+                self.assertLessEqual(captured["max_size"], 256 * 1024 * 1024)
                 self.assertEqual(captured["user_agent_header"],
                                  "PocketAgent-Bridge/0.1")
             finally:
