@@ -142,6 +142,26 @@ class ConsoleRemoteUsableTest(unittest.TestCase):
         with patch.object(bridge, "_CONSOLE_GRANT_TTL", -1):
             self.assertEqual(self.http.get(self.base+"/cards",headers=self._hdr()).status_code,403)
 
+    def test_changes_distinguish_clean_missing_non_git_and_denied(self):
+        url = self.base + "/changes"
+        def read():
+            return self.http.get(url, headers=self._hdr())
+        def error(status, code):
+            result = read()
+            self.assertEqual((result.status_code, result.headers["X-Error-Code"]), (status, code))
+        error(404, "NOT_GIT_REPO")
+        self.wd.rmdir()
+        error(404, "WORKDIR_NOT_FOUND")
+        self.wd.mkdir()
+        subprocess.run(["git", "init", "-q", str(self.wd)], check=True)
+        result = read()
+        self.assertEqual(result.status_code, 200)
+        self.assertEqual(result.json()["files"], [])
+        with patch.object(bridge, "CONSOLE_REMOTE_FILE_ROOTS", []):
+            self.assertEqual(read().status_code, 403)
+        with patch.object(bridge, "_git_capture", AsyncMock(return_value=(128, "unexpected failure"))):
+            error(502, "GIT_FAILED")
+
     def test_scoped_changes_and_diff_cannot_escape_subdirectory(self):
         subprocess.run(["git","init","-q",str(self.repo)], check=True)
         (self.repo / "private.txt").write_text("secret")

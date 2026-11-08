@@ -11,6 +11,8 @@ let listGeneration = 0, diffGeneration = 0, railGeneration = 0;
 let requestedPath = null;
 
 function changeError(err) {
+  if (err.code === "NOT_GIT_REPO") return "這個工作目錄不是 Git 儲存庫";
+  if (err.code === "WORKDIR_NOT_FOUND") return "找不到工作目錄";
   return ({"400":"這個對話沒有可用的工作目錄", "403":"這台電腦無權讀取工作目錄",
     "404":"找不到工作目錄或 Git 儲存庫"})[err.message] || "無法讀取工作目錄變更";
 }

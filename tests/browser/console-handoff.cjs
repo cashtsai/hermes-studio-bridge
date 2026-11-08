@@ -57,7 +57,9 @@ test("borrowed UI follows each session grant and never fetches hidden host tools
   const page = await fixture(t, (r,id,action) => {
     calls.push([id,action]);
     if (action === "cards") return r.fulfill({json:{cards:[],latest_seq:1,status:{phase:"running"}}});
-    if (action === "changes") return r.fulfill({status:changeStatus,json:changeStatus===200?{files:[]}:{detail:"unavailable"}});
+    if (action === "changes") return r.fulfill({status:changeStatus,
+      headers:changeStatus === 404 ? {"X-Error-Code":"NOT_GIT_REPO"} : {},
+      json:changeStatus===200?{files:[]}:{detail:"unavailable"}});
     if (action === "input") return r.fulfill({json:{ok:true,session_id:id}});
     return r.fulfill({status:403,json:{}});
   }, r => r.fulfill({json:{sessions:rows}}), {width:1366,height:768});
@@ -82,7 +84,7 @@ test("borrowed UI follows each session grant and never fetches hidden host tools
   await page.getByText("主機已收到").waitFor();
   changeStatus = 404;
   await page.locator('[data-mode="changes"]').click();
-  await page.locator("#ch-list").getByText("找不到工作目錄或 Git 儲存庫").waitFor();
+  await page.locator("#ch-list").getByText("這個工作目錄不是 Git 儲存庫").waitFor();
   changeStatus = 200;
   await page.locator("#ch-reload").click();
   await page.locator("#ch-list").getByText("工作目錄乾淨", {exact:false}).waitFor();
