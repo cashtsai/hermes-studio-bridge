@@ -924,6 +924,15 @@ def codex_terminal_error(turn: dict) -> str:
     return "Codex 回合執行失敗" if error or turn.get("status") == "failed" else ""
 
 
+def codex_terminal_result(turn: dict, local_error: str = "") -> tuple[str, str]:
+    error = codex_terminal_error(turn) or local_error
+    if error:
+        return "failed", error
+    if isinstance(turn, dict) and turn.get("status") == "interrupted":
+        return "interrupted", ""
+    return "completed", ""
+
+
 def error_card_body(text: str) -> tuple[dict, dict | None]:
     """error 卡 body 統一產生點:⚠️ 文案 + (命中時)分類 meta。
     回 (body, meta) —— 宿主 digest 拿 meta 去記 usage_limited 狀態。"""
@@ -1066,6 +1075,7 @@ class CodexThreadDigest(ApprovalCardMixin):
         # normalized runtime state beside the digest so the card stream can
         # mirror that authoritative source.
         self.runtime_status = ""
+        self.last_turn_outcome = ""
         self.turn_started_at = 0.0   # turn/started 的時間(見該處註解)
         self.prompt = None                     # pending approval title（label 素材）
         # 最近一次限額類錯誤的分類 meta({"error_kind","reset_at"});
@@ -1130,7 +1140,7 @@ class CodexThreadDigest(ApprovalCardMixin):
             # Keep the card-stream terminal wording aligned with CC and the
             # existing Pocket contract: the turn event records completion;
             # the steady state is ready/idle rather than a transient banner.
-            label = "待命"
+            label = "已停止" if self.last_turn_outcome == "interrupted" else "待命"
         if phase == "run":
             label = cc_status_label(self.busy, self.prompt,
                                     self.store.last_tool, self.store.saw_output)
@@ -1157,6 +1167,8 @@ class CodexThreadDigest(ApprovalCardMixin):
             # 鎖放開時它翻回 False，banner 自己消失（不需要重啟 bridge）。
             "locked": locked,
         }
+        if self.last_turn_outcome:
+            status["last_turn_outcome"] = self.last_turn_outcome
         if locked:
             status["lock_reason"] = (getattr(self, "lock_reason", "")
                                      or "thread_store_conflict")
@@ -1188,6 +1200,7 @@ class CodexThreadDigest(ApprovalCardMixin):
         self.runtime_status = normalized
         if normalized in {"running", "stalled", "waiting_approval"}:
             self.busy = True
+            self.last_turn_outcome = ""
         else:
             self.busy = False
             if normalized in {"idle", "done", "failed"}:
@@ -1316,6 +1329,7 @@ class CodexThreadDigest(ApprovalCardMixin):
             self.store.turn_id = str(turn.get("id") or "")
             self.busy = True
             self.runtime_status = "running"
+            self.last_turn_outcome = ""
             self.usage_limit = None   # 新回合開得起來 = 限額已解
             # 回合起算時間 —— 與 CC 的 `busy_since` 同一件事、同一個理由:app 的
             # WorkingBar 只有一顆脈動點,2 秒與 20 分鐘看起來一模一樣,而遠端
@@ -1329,12 +1343,15 @@ class CodexThreadDigest(ApprovalCardMixin):
             self._status()
         elif method == "turn/completed":
             turn = params.get("turn") or {}
-            msg = codex_terminal_error(turn)
+            outcome, msg = codex_terminal_result(turn)
             self.busy = False
-            self.runtime_status = "failed" if msg else "done"
+            self.runtime_status = {"completed": "done", "failed": "failed",
+                                   "interrupted": "idle"}[outcome]
+            self.last_turn_outcome = outcome
             self.prompt = None
             self.turn_started_at = 0.0     # 起算點跟著回合走,不留給下一輪
-            self.store.push_turn("end", self.store.turn_id or str(turn.get("id") or ""))
+            self.store.push_turn("end", self.store.turn_id or str(turn.get("id") or ""),
+                                 outcome=outcome)
             if msg:
                 body, ul_meta = error_card_body(msg)
                 if ul_meta:
@@ -1617,8 +1634,11 @@ class SessionCardStore(ApprovalCardMixin):
             return self._push("session.status", status)
         return None
 
-    def push_turn(self, state: str, turn_id: str = "") -> dict:
-        return self._push("turn", {"state": state, "turn_id": turn_id})
+    def push_turn(self, state: str, turn_id: str = "", *, outcome: str = "") -> dict:
+        data = {"state": state, "turn_id": turn_id}
+        if outcome:
+            data["outcome"] = outcome
+        return self._push("turn", data)
 
     def since(self, since_seq: int):
         """since_seq 之後的事件；洞（已被 ring 擠掉）或 client 領先（bridge

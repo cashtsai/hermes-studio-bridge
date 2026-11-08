@@ -3957,7 +3957,7 @@ async def _delegation_notify(d: dict, event: str, summary: str = "") -> None:
     wo = d.get("work_order") or d.get("id") or ""
     title = d.get("title") or ""
     status_txt = {"created": "已建立", "done": "已完成", "failed": "失敗",
-                  "report": "進度回報"}.get(event, event)
+                  "interrupted": "已停止", "report": "進度回報"}.get(event, event)
     parent_dlg = str(meta.get("parent_delegation") or "")
     if parent_dlg:
         # CC↔CX 互調:結果注回父 delegation 的 session(喚醒父代理繼續),
@@ -3994,9 +3994,10 @@ async def _delegation_notify(d: dict, event: str, summary: str = "") -> None:
             "external_source": "delegation",
             "external_id": f"dlg:{d.get('id')}:{event}:{int(time.time())}",
         })
-    if event in ("done", "failed"):
+    if event in ("done", "failed", "interrupted"):
         try:
-            await push_notify(("✅ " if event == "done" else "❌ ") + f"[{wo}] {title[:40]}",
+            prefix = {"done": "✅ ", "failed": "❌ ", "interrupted": "⏹ "}[event]
+            await push_notify(prefix + f"[{wo}] {title[:40]}",
                               (summary.strip() or status_txt)[:160],
                               {"kind": "delegation_done",
                                "delegation_id": str(d.get("id") or "")})
@@ -4005,7 +4006,7 @@ async def _delegation_notify(d: dict, event: str, summary: str = "") -> None:
             pass
 
 
-async def _delegation_codex_completed(tid: str, failed: bool, err_msg: str = "") -> None:
+async def _delegation_codex_completed(tid: str, outcome: str, err_msg: str = "") -> None:
     """codex turn/completed → 對應委派 running→idle/failed 一次性回流。"""
     for row in _delegation_rows(limit=200):
         d = dict(row)
@@ -4015,11 +4016,12 @@ async def _delegation_codex_completed(tid: str, failed: bool, err_msg: str = "")
             continue
         if (d.get("status") or "") != "running":
             return                       # 只在 running→完成 的轉換回流一次
+        failed = outcome == "failed"
         new_status = "failed" if failed else "idle"
         _delegation_update(d["id"], status=new_status, updated_at=time.time(),
                            last_error=(err_msg[:300] if failed else ""))
         d["status"] = new_status
-        await _delegation_notify(d, "failed" if failed else "done",
+        await _delegation_notify(d, "done" if outcome == "completed" else outcome,
                                  summary=(err_msg if failed else ""))
         return
 
@@ -4956,6 +4958,9 @@ def _live_activity_on_milestone(session_id: str, etype: str, payload) -> None:
             busy, phase_label = False, None
             ended_label = "已完成" if ok else "已中斷"
             terminal_state = "completed" if ok else "failed"
+            if data.get("outcome") in _TURN_OUTCOME_LABELS:
+                terminal_state = data["outcome"]
+                ended_label = _TURN_OUTCOME_LABELS[terminal_state]
         else:
             return
     else:
@@ -4968,6 +4973,15 @@ def _live_activity_on_milestone(session_id: str, etype: str, payload) -> None:
             # 正常收尾由 turn end 先到(同 tick,先清列 → 這條撲空);這裡是
             # 「只發 status 不發 turn」的 session 的保底終態。
             phase_label, ended_label, terminal_state = None, "已完成", "completed"
+            if data.get("last_turn_outcome") in _TURN_OUTCOME_LABELS:
+                terminal_state = data["last_turn_outcome"]
+                ended_label = _TURN_OUTCOME_LABELS[terminal_state]
+            elif session_id.startswith("codex:"):
+                # A provider idle notification can arrive before turn/completed.
+                # Ending ActivityKit now would discard the authoritative result.
+                if data.get("phase") != "error":
+                    return
+                terminal_state, ended_label = "failed", _TURN_OUTCOME_LABELS["failed"]
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
@@ -5223,7 +5237,10 @@ def _turnend_last_reply(store) -> str:
     return ""
 
 
-def _turn_end_push(sid: str, display: str, summary: str, ok: bool = True) -> None:
+_TURN_OUTCOME_LABELS = {"completed": "已完成", "failed": "執行失敗", "interrupted": "已停止"}
+
+
+def _turn_end_push(sid: str, display: str, summary: str, *, outcome: str = "completed") -> None:
     """直開 session 的回合完成推播(fire-and-forget)。
 
     sid = v2 wire session id(claude_code:{name} / codex:{tid});payload 沿用
@@ -5236,9 +5253,11 @@ def _turn_end_push(sid: str, display: str, summary: str, ok: bool = True) -> Non
     if now - _TURNEND_PUSH_LAST.get(sid, 0.0) < _TURNEND_PUSH_MIN_SECS:
         _log_event("turnend_push_throttled", session=sid)
         return
-    private_body = "回合已完成" if ok else "回合執行失敗"
-    body = (summary or "").strip()[:80] or f"{private_body},回來看看結果"
-    title = ("✅ " if ok else "⚠️ ") + (display or sid)[:40]
+    label = _TURN_OUTCOME_LABELS[outcome]
+    private_body = f"回合{label}"
+    body = (private_body if outcome == "interrupted" else
+            (summary or "").strip()[:80] or f"{private_body},回來看看結果")
+    title = {"completed": "✅ ", "failed": "⚠️ ", "interrupted": "⏹ "}[outcome] + (display or sid)[:40]
     data = {"kind": "message",
             "pocket": {"kind": "message", "sessionId": sid}}
     try:
@@ -5249,14 +5268,14 @@ def _turn_end_push(sid: str, display: str, summary: str, ok: bool = True) -> Non
     # If the iOS app requested an ActivityKit push token, keep the lock-screen
     # state truthful even after the app process is suspended.  The ordinary
     # alert push remains the fallback for older builds.
-    _live_activity_update(sid, False, ended_label=("已完成" if ok else "已中斷"),
-                          terminal_state=("completed" if ok else "failed"))
+    _live_activity_update(sid, False, ended_label=label, terminal_state=outcome)
     t = loop.create_task(push_notify(title, body, data,
                                      thread_id=sid, content_available=True,
                                      no_preview_body=private_body))
     _BG_TASKS.add(t)
     t.add_done_callback(_BG_TASKS.discard)
-    _log_event("turnend_push", session=sid, ok=ok, chars=len(body))
+    _log_event("turnend_push", session=sid, ok=(outcome == "completed"),
+               outcome=outcome, chars=len(body))
 
 
 def _cc_turn_end_push(name: str, store) -> None:
@@ -5279,7 +5298,7 @@ def _cx_thread_display(tid: str) -> str:
     return f"Codex {tid[:8]}" if tid else "Codex"
 
 
-def _cx_turn_end_push(tid: str, err_msg: str = "") -> None:
+def _cx_turn_end_push(tid: str, outcome: str, err_msg: str = "") -> None:
     """CX turn/completed 且沒人在看 → 推播。由 _handle_notification 呼叫。
 
     digest 不存在 = app 從沒開過這條 thread(桌面/內部 thread)→ 不推:
@@ -5295,9 +5314,9 @@ def _cx_turn_end_push(tid: str, err_msg: str = "") -> None:
         return   # 桌面版 Codex 佔用中 → 使用者人在 Mac 前,推手機是噪音
     if _turnend_delegation_covers("codex", tid):
         return
-    summary = err_msg or _turnend_last_reply(d.store)
+    summary = _turnend_last_reply(d.store) if outcome == "completed" else err_msg
     _turn_end_push(f"codex:{tid}", _cx_thread_display(tid), summary,
-                   ok=not err_msg)
+                   outcome=outcome)
 
 
 _canon_init()
@@ -6387,6 +6406,7 @@ class CodexAppServerClient:
         self.active_turns = {}
         self.turn_started_at = {}
         self.turn_terminal_at = {}
+        self.interrupted_turns = set()
         self.turn_watchdogs = {}
         self.last_event_at = {}
         self.thread_errors = {}
@@ -6975,7 +6995,7 @@ class CodexAppServerClient:
                 task.cancel()
             try:
                 t = asyncio.create_task(_delegation_codex_completed(
-                    tid, True, self.app_server_error))
+                    tid, "failed", self.app_server_error))
                 _BG_TASKS.add(t)
                 t.add_done_callback(_BG_TASKS.discard)
             except RuntimeError:
@@ -7724,8 +7744,15 @@ class CodexAppServerClient:
     def _handle_notification(self, msg: dict):
         method = msg.get("method")
         params = msg.get("params") or {}
+        local_error = ""
+        if method == "turn/completed":
+            # A provider acknowledgement after a bridge-forced stop must not
+            # erase the actual failure. New turns clear thread_errors.
+            prior = self.thread_errors.get(params.get("threadId"), "")
+            if prior.startswith(("Codex turn stalled", "Codex provider 連線持續失敗")):
+                local_error = prior
         try:
-            _cx_cards_feed(method, params)   # S2 卡片 digest(有訂閱的 thread 才有)
+            _cx_cards_feed(method, params, local_error=local_error)
         except Exception as e:  # noqa: BLE001
             _log_event("cx_cards_feed_error", error=str(e)[:160])
         if method == "remoteControl/status/changed":
@@ -7783,6 +7810,7 @@ class CodexAppServerClient:
             self.active_turns[tid] = turn.get("id") or True
             self.turn_started_at[tid] = time.time()
             self.turn_terminal_at.pop(tid, None)
+            self.interrupted_turns.discard(tid)
             self.last_event_at[tid] = time.time()
             self.thread_errors.pop(tid, None)
             self.retry_escalations.pop(tid, None)   # 新回合 → 重試計數歸零
@@ -7812,20 +7840,21 @@ class CodexAppServerClient:
             _codex_history_invalidate(tid)   # cached /history page is now stale
             self._drop_thread_approvals(tid)
             turn = params.get("turn") or {}
-            msg = carddigest.codex_terminal_error(turn)
+            outcome, msg = carddigest.codex_terminal_result(turn, local_error)
+            if outcome == "interrupted":
+                self.interrupted_turns.add(tid)
+            else:
+                self.interrupted_turns.discard(tid)
             if msg:
                 self.thread_errors[tid] = msg
-                self._append(tid, ("text", f"\n⚠️ Codex turn failed: {msg}\n"))
-            elif not self.thread_errors.get(tid, "").startswith("Codex turn stalled"):
-                # stalled 在這裡**刻意保留**:watchdog 中止卡住的回合時 codex 會
-                # 補送一個「正常完成」的 turn/completed,不擋就來不及看到卡過。
-                # 它的清除點在 start_turn(下一個回合真的開跑)—— 在那之前只有
-                # 這個守衛、卻沒有任何地方會清,才會變成永久黏著。
+                if msg != local_error:
+                    self._append(tid, ("text", f"\n⚠️ Codex turn failed: {msg}\n"))
+            else:
                 self.thread_errors.pop(tid, None)
             # M1:是委派 thread → 回流父對話(running→idle/failed 轉換內部去重)。
             try:
                 t = asyncio.create_task(_delegation_codex_completed(
-                    tid, bool(msg), msg[:300]))
+                    tid, outcome, msg[:300]))
                 _BG_TASKS.add(t)
                 t.add_done_callback(_BG_TASKS.discard)
             except RuntimeError:
@@ -7834,7 +7863,7 @@ class CodexAppServerClient:
             # 「誰在看/委派雙響/桌面版鎖定/節流」的不推判定都在函式內;
             # 絕不讓它把例外拋進通知處理路徑。
             try:
-                _cx_turn_end_push(tid, msg[:160])
+                _cx_turn_end_push(tid, outcome, msg[:160])
             except Exception as e:  # noqa: BLE001
                 _log_exc("_cx_turn_end_push", e, expected=True)
             return
@@ -8010,6 +8039,7 @@ class CodexAppServerClient:
         self.active_turns[thread_id] = turn.get("id") or True
         self.turn_started_at[thread_id] = time.time()
         self.turn_terminal_at.pop(thread_id, None)
+        self.interrupted_turns.discard(thread_id)
         self.last_event_at[thread_id] = time.time()
         self._start_turn_watchdog(thread_id)
         return res
@@ -8140,7 +8170,7 @@ class CodexAppServerClient:
                         pass
                 try:
                     t = asyncio.create_task(_delegation_codex_completed(
-                        thread_id, True, message))
+                        thread_id, "failed", message))
                     _BG_TASKS.add(t)
                     t.add_done_callback(_BG_TASKS.discard)
                 except RuntimeError:
@@ -8474,7 +8504,7 @@ class CodexAppServerClient:
         if error:
             return "failed"
         if thread_id in self.turn_terminal_at:
-            return "done"
+            return "idle" if thread_id in self.interrupted_turns else "done"
         # 5. 舊式 raw 字串(codex 不吐這些,留著相容其它呼叫端)。
         raw = (raw_status or "").lower()
         if raw in {"completed", "done", "success"}:
@@ -22805,7 +22835,7 @@ def _cx_sync_digest_runtime(thread_id: str) -> None:
         _log_exc("_cx_sync_digest_runtime", exc, expected=True)
 
 
-def _cx_cards_feed(method: str, params: dict) -> None:
+def _cx_cards_feed(method: str, params: dict, *, local_error: str = "") -> None:
     """CodexAppServerClient 通知 → 有訂閱過的 thread 餵進 digest。
     digest 只在首次 cards/events 請求時建立,之前的歷史由 seed 補。"""
     tid = str(params.get("threadId") or "")
@@ -22818,6 +22848,10 @@ def _cx_cards_feed(method: str, params: dict) -> None:
         _schedule_media_capture(f"codex:{tid}", params)
     d = _CX_CARD_DIGESTS.get(tid) if tid else None
     if d:
+        # Record the original wire frame above. Only the UI projection is
+        # enriched with the cause of an interrupt initiated by the bridge.
+        if local_error and not carddigest.codex_terminal_error(params.get("turn")):
+            params = {**params, "turn": {**(params.get("turn") or {}), "error": local_error}}
         d.handle(method, params)
         # 修 ②:最新卡文字進持久快取(內部有 30s/thread 節流,熱串流的
         # delta 洪水只會偶爾真的落盤)。
@@ -27223,7 +27257,8 @@ def _gm_turn_end_push(key: str, digest, summary: str, ok: bool) -> None:
             return                      # 有人開著對話在看,不吵
         row = gemini_provider.get_session(key) or {}
         display = (row.get("title") or "").strip() or f"Gemini {key[:8]}"
-        _turn_end_push(f"gemini:{key}", display, summary, ok=ok)
+        _turn_end_push(f"gemini:{key}", display, summary,
+                       outcome="completed" if ok else "failed")
     except Exception as exc:            # noqa: BLE001
         _log_exc("gm_turn_end_push", exc, expected=True)
 
