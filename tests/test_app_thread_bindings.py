@@ -14,11 +14,13 @@
 """
 import _isolation  # noqa: F401  # 測試隔離閂:必須是第一個 import
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 import json
 import os
 import sqlite3
 import sys
 import tempfile
+from threading import Barrier
 import unittest
 
 _TMP = tempfile.mkdtemp(prefix="app-thread-bindings-test-")
@@ -199,11 +201,75 @@ class BindingStateMachineTests(unittest.TestCase):
         self.assertEqual(t3.active_binding_owner(self.db, "codex", "codex:abc"),
                          self.thread["id"])
 
+    def test_two_devices_rebinding_the_same_generation_only_one_wins(self):
+        tid = self.thread["id"]
+        first = t3.bind_app_thread(self.db, tid, "codex", "c0")
+        start = Barrier(2)
+
+        def swap(target):
+            start.wait(timeout=5)
+            try:
+                return t3.rebind_app_thread(self.db, tid, "codex", target,
+                                            expected_binding_id=first["id"])["changed"]
+            except t3.BindingConflict:
+                return False
+
+        with ThreadPoolExecutor(2) as pool:
+            self.assertCountEqual(pool.map(swap, ("c1", "c2")), (True, False))
+        chain = t3.list_bindings(self.db, tid)
+        self.assertEqual([r["state"] for r in chain], ["dead", "active"])
+
+    def test_create_and_bind_rolls_back_thread_on_insert_failure(self):
+        with sqlite3.connect(self.db) as con:
+            con.execute("CREATE TRIGGER fail_binding BEFORE INSERT ON app_thread_bindings "
+                        "BEGIN SELECT RAISE(ABORT,'simulated failure'); END")
+        with self.assertRaises(t3.T3CodeError):
+            t3.create_app_thread(self.db, "user", "rollback", "rollback-id",
+                                 initial_binding=("codex", "c1"))
+        self.assertIsNone(t3.get_app_thread(self.db, "rollback-id"))
+
+    def test_resolve_does_not_create_or_migrate_an_old_database(self):
+        path = os.path.join(self.tmp.name, "old.db")
+        self.assertIsNone(t3.resolve_provider_binding(path, "codex", "old"))
+        self.assertFalse(os.path.exists(path))
+        with sqlite3.connect(path) as con:
+            con.execute("CREATE TABLE legacy(id)")
+            self.assertIsNone(t3.resolve_provider_binding(path, "codex", "old"))
+            self.assertEqual(con.execute("SELECT name FROM sqlite_master").fetchall(), [("legacy",)])
+
 
 # ───────────────────────── 端點層(/app/v2/threads)─────────────────────────
 
 
 class AppThreadEndpointTests(unittest.TestCase):
+    def test_resolve_retired_handle_stale_retry_and_reused_names(self):
+        old = {"provider": "codex", "provider_thread_id": "codex:resolve-old"}
+        new = {"provider": "codex", "provider_thread_id": "codex:resolve-new"}
+        def resolve(token="test-unit-token"):
+            return asyncio.run(bridge.v2_app_thread_resolve(FakeRequest(token=token), **old))
+
+        for token, status in (("wrong", 401), ("test-unit-token", 404)):
+            with self.assertRaises(HTTPException) as cm:
+                resolve(token)
+            self.assertEqual(cm.exception.status_code, status)
+        thread = _create(old)["thread"]
+        tid = thread["id"]
+        guard = {"expected_binding_id": thread["binding"]["id"]}
+        winner = _rebind(tid, {**new, **guard})["binding"]
+        with self.assertRaises(HTTPException) as invalid:
+            _rebind(tid, {**old, "expected_binding_id": None})
+        self.assertEqual(invalid.exception.status_code, 400)
+        self.assertFalse(_rebind(tid, {**new, **guard})["changed"])
+        with self.assertRaises(HTTPException) as cm:
+            _rebind(tid, {**old, **guard})
+        self.assertEqual(cm.exception.status_code, 409)
+        self.assertEqual(resolve(), {"ok": True, "app_thread_id": tid, "binding": winner})
+        self.assertEqual(len(_get(tid)["thread"]["bindings"]), 2)
+        _create(old)
+        with self.assertRaises(HTTPException) as cm:
+            resolve()
+        self.assertEqual(cm.exception.status_code, 409)
+
     def test_create_bind_get_roundtrip(self):
         created = _create({"title": "殺手級第二檔", "provider": "codex",
                            "provider_thread_id": "codex:ep-roundtrip"})

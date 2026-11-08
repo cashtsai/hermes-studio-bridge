@@ -24762,36 +24762,37 @@ async def v2_app_thread_create(request: Request):
     provider = str(body.get("provider") or "").strip()
     provider_thread_id = str(body.get("provider_thread_id") or "").strip()
     try:
-        if provider or provider_thread_id:
-            # 先驗綁定目標再建 thread —— 綁定被拒時不留孤兒 app thread。
-            owner = t3code_runtime.active_binding_owner(
-                CANON_DB, provider, provider_thread_id)
-            if owner is not None:
-                raise t3code_runtime.T3CodeError(
-                    "provider thread is actively bound to another app_thread")
         thread = t3code_runtime.create_app_thread(
             CANON_DB, str(body.get("owner") or "xcash"),
             str(body.get("title") or "Pocket thread"),
-            str(body.get("id") or "").strip() or None)
-        if provider or provider_thread_id:
-            t3code_runtime.bind_app_thread(
-                CANON_DB, thread["id"], provider, provider_thread_id)
+            str(body.get("id") or "").strip() or None,
+            initial_binding=(provider, provider_thread_id) if provider or provider_thread_id else None)
     except t3code_runtime.T3CodeError as exc:
         _t3_bad(exc)
-    thread["binding"] = t3code_runtime.current_binding(CANON_DB, thread["id"])
-    thread["bindings"] = t3code_runtime.list_bindings(CANON_DB, thread["id"])
-    return {"ok": True, "thread": thread}
+    return {"ok": True, "thread": t3code_runtime.get_app_thread(CANON_DB, thread["id"], with_bindings=True)}
+
+
+@app.get("/app/v2/threads/by-provider/resolve")
+async def v2_app_thread_resolve(request: Request, provider: str, provider_thread_id: str):
+    _check_auth(request)
+    try:
+        result = t3code_runtime.resolve_provider_binding(CANON_DB, provider, provider_thread_id)
+    except t3code_runtime.BindingConflict as exc:
+        raise http_err(409, "APP_THREAD_AMBIGUOUS", str(exc))
+    except t3code_runtime.T3CodeError as exc:
+        _t3_bad(exc)
+    if result is None:
+        raise http_err(404, "APP_THREAD_NOT_FOUND", "no binding for this provider thread")
+    return {"ok": True, **result}
 
 
 @app.get("/app/v2/threads/{thread_id}")
 async def v2_app_thread_get(thread_id: str, request: Request):
     """讀 app thread,含當前 binding 與完整 binding 鏈(審計視角)。"""
     _check_auth(request)
-    thread = t3code_runtime.get_app_thread(CANON_DB, thread_id)
+    thread = t3code_runtime.get_app_thread(CANON_DB, thread_id, with_bindings=True)
     if thread is None:
         raise http_err(404, "APP_THREAD_NOT_FOUND", "unknown app thread")
-    thread["binding"] = t3code_runtime.current_binding(CANON_DB, thread_id)
-    thread["bindings"] = t3code_runtime.list_bindings(CANON_DB, thread_id)
     return {"ok": True, "thread": thread}
 
 
@@ -24802,11 +24803,17 @@ async def v2_app_thread_rebind(thread_id: str, request: Request):
     不發事件。"""
     _check_auth(request)
     body = await _json_body(request)
+    expected = body.get("expected_binding_id")
+    if "expected_binding_id" in body and (not isinstance(expected, str) or not expected.strip()):
+        raise http_err(400, "T3CODE_BAD_REQUEST", "expected_binding_id must be a non-empty string")
     try:
         result = t3code_runtime.rebind_app_thread(
             CANON_DB, thread_id, body.get("provider"),
             body.get("provider_thread_id"), str(body.get("reason") or ""),
-            str(body.get("prior_state") or "dead"))
+            str(body.get("prior_state") or "dead"),
+            expected_binding_id=expected)
+    except t3code_runtime.BindingConflict as exc:
+        raise http_err(409, "APP_THREAD_BINDING_CHANGED", str(exc))
     except t3code_runtime.T3CodeError as exc:
         _t3_bad(exc)
     if result.get("changed"):
@@ -24930,7 +24937,7 @@ async def v2_app_thread_transfer(thread_id: str, request: Request):
     try:
         result = t3code_runtime.rebind_app_thread(
             CANON_DB, thread_id, to_provider, new_session_id,
-            reason="transfer", prior_state="detached")
+            reason="transfer", prior_state="detached", expected_binding_id=binding["id"])
     except t3code_runtime.T3CodeError as exc:
         raise http_err(409, "TRANSFER_REBIND_CONFLICT",
                        f"目標會話 {new_session_id} 已建立,但 rebind 失敗:{exc}")

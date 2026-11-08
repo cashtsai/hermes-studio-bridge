@@ -362,6 +362,22 @@ class TransferEndpointTests(unittest.TestCase):
         self.assertEqual(binding["provider_thread_id"], src)
         self.assertEqual(_events(thread_id, "thread.transferred"), [])
 
+    def test_slow_spawn_does_not_overwrite_an_intervening_rebind(self):
+        thread_id = _create({"provider": "cc2", "provider_thread_id": "cc2:slow-source"})["thread"]["id"]
+
+        async def slow_create(request):
+            t3.rebind_app_thread(bridge.CANON_DB, thread_id, "cc2", "cc2:device-b")
+            return {"ok": True, "thread_id": "spawned-but-unbound"}
+
+        bridge.codex_session_create = slow_create
+        with self.assertRaises(HTTPException) as cm:
+            _transfer(thread_id, {"to_provider": "codex"})
+        self.assertEqual(cm.exception.status_code, 409)
+        self.assertIn("spawned-but-unbound", str(cm.exception.detail))
+        chain = t3.list_bindings(bridge.CANON_DB, thread_id)
+        self.assertEqual([b["provider_thread_id"] for b in chain], ["cc2:slow-source", "cc2:device-b"])
+        self.assertEqual(_events(thread_id, "thread.transferred"), [])
+
     # ── 驗證/graceful 面 ─────────────────────────────────────────────────
 
     def test_unknown_thread_404_and_no_binding_404(self):
