@@ -11,6 +11,9 @@
 import _isolation  # noqa: F401  # 測試隔離閂:必須是第一個 import(2026-08-15 事故防線,見 tests/_isolation.py)
 import asyncio
 import unittest
+from unittest.mock import patch
+
+import httpx
 
 import bridge
 import carddigest
@@ -218,7 +221,7 @@ class QueueDepthSyncTests(unittest.TestCase):
 
         texts = [(card.get("body") or {}).get("text", "")
                  for card in d.store.cards.values()]
-        self.assertTrue(any("丟棄" in t for t in texts),
+        self.assertTrue(any("未收到 Codex 的送達確認" in t for t in texts),
                         f"排隊訊息被丟掉卻沒有任何卡片告知使用者:{texts}")
         self.assertTrue(any("會被丟掉" in t for t in texts), "錯誤卡要帶原文摘要")
 
@@ -398,6 +401,63 @@ class InputAckShapeTests(unittest.TestCase):
                          "同一個 client_id 打了兩次 turn/start = 真的執行兩次")
         self.assertTrue(second.get("duplicate"))
         self.assertEqual(second.get("delivery"), first.get("delivery"))
+
+    def _reconnect(self, terminal, fail=False):
+        c = fresh_client(fail_start=fail)
+        bridge.CODEX_APP = c
+        bridge._CX_CARD_DIGESTS.pop("t1", None)
+        c.active_turns["t1"] = "first"
+        data = {"text": "next", "client_id": "phone-1"}
+
+        async def post(path):
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=bridge.app),
+                                         base_url="http://test") as phone:
+                return await phone.post(path, json=data)
+
+        async def scenario():
+            v1 = "/codexsessions/t1/input"
+            v2 = "/app/v2/sessions/codex:t1/input"
+            self.assertTrue((await post(v1)).json()["queued"])
+            store = bridge._CX_CARD_DIGESTS["t1"].store
+            bubble = next(k for k, v in store.cards.items() if v["role"] == "user")
+            ts = store.cards[bubble]["ts"]
+            entry = bridge._CX_INPUT_INFLIGHT[("t1", "phone-1")]
+            entry["ts"] -= bridge._CX_INPUT_INFLIGHT_TTL + 1
+            retry = (await post(v2)).json()
+            self.assertTrue(retry["duplicate"])
+            self.assertTrue(retry["queued"])
+            self.assertEqual(c.pending_count("t1"), 1)
+            c._handle_notification({"method": "turn/completed", "params": {
+                "threadId": "t1", "turn": {"id": "first", "status": terminal}}})
+            await asyncio.sleep(0)
+            final = await post(v2)
+            self.assertEqual(c.call.calls.count("turn/start"), 1)
+            self.assertEqual(c.pending_count("t1"), 0)
+            self.assertEqual(store.cards[bubble]["ts"], ts)
+            self.assertEqual(sum(v["role"] == "user" for v in store.cards.values()), 1)
+            if fail:
+                self.assertEqual(final.status_code, 409)
+                self.assertEqual(store.cards[bubble]["body"]["delivery"], "unconfirmed")
+            else:
+                ack = final.json()
+                self.assertTrue(ack["duplicate"])
+                self.assertFalse(ack["queued"])
+                self.assertEqual(ack["delivery"], "accepted")
+                self.assertEqual(store.cards[bubble]["body"]["delivery"], "accepted")
+            entry["ts"] -= bridge._CX_INPUT_INFLIGHT_TTL + 1
+            self.assertIsNotNone((await bridge._cx_input_claim("t1", "phone-1"))[0])
+
+        with patch.object(bridge, "_check_auth"), patch.object(bridge, "_cx_turn_end_push"):
+            run(scenario())
+
+    def test_phone_reconnect_after_completed_turn(self):
+        self._reconnect("completed")
+
+    def test_phone_reconnect_after_interrupted_turn(self):
+        self._reconnect("interrupted")
+
+    def test_delivery_not_confirmed_is_not_retried(self):
+        self._reconnect("completed", fail=True)
 
 
 if __name__ == "__main__":

@@ -8289,12 +8289,13 @@ class CodexAppServerClient:
                     return                  # 新的一輪已經開跑,交給它結束時再 drain
                 item = self.pending_inputs[thread_id].pop(0)
                 try:
-                    await self.start_turn(thread_id, item["input"],
-                                          client_id=item.get("client_id"),
-                                          cwd=item.get("cwd"))
-                    _log_event("codex_pending_input_sent", thread=thread_id[:16],
-                               remaining=len(self.pending_inputs.get(thread_id) or []))
-                    return                  # 開跑了 → 下一則等這輪結束
+                    started = await self.start_turn(thread_id, item["input"],
+                                                    client_id=item.get("client_id"),
+                                                    cwd=item.get("cwd"))
+                except asyncio.CancelledError as exc:
+                    _cx_finish_queued_input(thread_id, item, "unconfirmed", self.pending_count(thread_id))
+                    _cx_feed_queue_drop(thread_id, item, exc)
+                    raise
                 except Exception as exc:    # noqa: BLE001
                     if _codex_thread_lock_conflict(exc) is not None:
                         # 鎖又被搶回去(桌面 app 的 re-grab race,memory 有
@@ -8310,7 +8311,13 @@ class CodexAppServerClient:
                                error_message=str(exc)[:200])
                     # 排隊中的訊息被丟掉,使用者那顆泡泡卻停在「已排入下一輪」——
                     # 不推張錯誤卡的話,他到死都不知道這則根本沒送出去。
+                    _cx_finish_queued_input(thread_id, item, "unconfirmed", self.pending_count(thread_id))
                     _cx_feed_queue_drop(thread_id, item, exc)
+                else:
+                    remaining = self.pending_count(thread_id)
+                    _cx_finish_queued_input(thread_id, item, "accepted", remaining, started)
+                    _log_event("codex_pending_input_sent", thread=thread_id[:16], remaining=remaining)
+                    return                  # 開跑了 → 下一則等這輪結束
         finally:
             self._draining_threads.discard(thread_id)
             # 只在成功路徑同步 → 整個佇列全部失敗清空時 depth 永遠卡著不歸零,
@@ -14023,7 +14030,8 @@ async def _cx_input_claim(thread_id: str, client_id):
     async with _CX_INPUT_INFLIGHT_LOCK:
         now = time.monotonic()
         for k in [k for k, e in _CX_INPUT_INFLIGHT.items()
-                  if now - e["ts"] > _CX_INPUT_INFLIGHT_TTL]:
+                  if now - e["ts"] > _CX_INPUT_INFLIGHT_TTL
+                  and e["event"].is_set() and not (e["result"] or {}).get("queued")]:
             _CX_INPUT_INFLIGHT.pop(k, None)      # 每次存取順手清 TTL,不會洩漏
         prior = _CX_INPUT_INFLIGHT.get(key)
         if prior is not None:
@@ -14050,6 +14058,25 @@ def _cx_input_release(entry) -> None:
     entry["event"].set()
 
 
+def _cx_finish_queued_input(thread_id, item, delivery, remaining, started=None):
+    cid = item.get("client_id")
+    if not cid:
+        return
+    entry = _CX_INPUT_INFLIGHT.get((str(thread_id), str(cid)))
+    if entry and (entry["result"] or {}).get("queued"):
+        result = dict(entry["result"], delivery=delivery, queued=False, queue_depth=remaining)
+        if "turn" in result:
+            result["turn"] = (started or {}).get("turn")
+        _cx_input_settle(entry, result)
+    digest = _CX_CARD_DIGESTS.get(thread_id)
+    if digest:
+        for card in digest.store.cards.values():
+            body = card.get("body") or {}
+            if card.get("role") == "user" and body.get("client_id") == cid and body.get("delivery") == "queued":
+                digest.store.upsert_card(dict(card, body=dict(body, delivery=delivery)))
+                break
+
+
 async def _cx_input_replay(prior) -> dict:
     """重複請求:回傳第一次的結果。第一次還沒跑完就等一下(它可能正在
     await turn/start),等不到就回「收下了、排隊中」——重點是**不再送第二次**。"""
@@ -14059,7 +14086,10 @@ async def _cx_input_replay(prior) -> dict:
                                    timeout=_CX_INPUT_INFLIGHT_WAIT)
         except (asyncio.TimeoutError, TimeoutError):
             pass
-    return dict(prior.get("result") or {"queued": True, "delivery": "queued"})
+    result = dict(prior.get("result") or {"queued": True, "delivery": "queued"})
+    if result.get("delivery") == "unconfirmed":
+        raise HTTPException(status_code=409, detail="無法確認 Codex 是否接收；請先查看對話，系統不會自動重送。")
+    return result
 
 
 @app.post("/codexsessions/{thread_id}/input")
@@ -23219,7 +23249,7 @@ def _cx_feed_queue_drop(thread_id: str, item: dict, exc: BaseException) -> None:
         cause = (f"({type(exc).__name__})"
                  if _codex_thread_lock_conflict(exc) is None
                  else f"({CX_THREAD_LOCKED_MESSAGE})")
-        msg = ("⚠️ 排隊中的訊息送不出去,已丟棄,請重送"
+        msg = ("⚠️ 未收到 Codex 的送達確認，已從佇列移除。請先查看對話再決定是否重送"
                + (f":「{preview}」" if preview else "")
                + cause)
         d.store.upsert_card(carddigest.make_card(
