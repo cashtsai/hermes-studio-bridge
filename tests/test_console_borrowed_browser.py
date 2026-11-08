@@ -5,6 +5,7 @@ import sys
 import time
 import unittest
 from unittest.mock import patch
+from contextlib import ExitStack
 
 os.environ.setdefault("BRIDGE_TOKEN", "test-unit-token")
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -97,6 +98,29 @@ class BorrowedBrowserTest(unittest.TestCase):
                               json={"session": "qa-work", "content": "test", "dry_run": True})
         self.assertEqual(r.status_code, 200)
         self.assertIn("data: [DONE]", r.text)
+
+    def test_home_recency_is_per_cc_lane_not_per_directory(self):
+        h = {"Authorization": "Bearer " + self.login()}
+        with ExitStack() as stack:
+            def stub(key, value):
+                stack.enter_context(patch.object(bridge, key, return_value=value))
+            stub("_cc_conf_rows", [(n, "/demo", "1") for n in ("edited", "unseen")])
+            stub("_v2_cc_state", ("idle", None))
+            stub("_delegation_v2_sessions", [])
+            stub("_delegated_codex_thread_ids", set())
+            stub("_hermes_pending_by_session", {})
+            stub("_codex_v2_visible_threads", [])
+            stack.enter_context(patch.object(bridge, "_CC_HOOK_STATE", {"edited": {"updated_at": 1000}}))
+            stack.enter_context(patch.object(bridge, "PERSONAS", {}))
+            for mod, flag in [(bridge.GEMINI, "configured"), (bridge.OPENCLAW, "configured"), (bridge.cc_sdk, "enabled")]:
+                stack.enter_context(patch.object(mod, flag, return_value=False))
+            stack.enter_context(patch.dict(os.environ, {"POCKET_HOST_NAME": "QA Studio"}))
+            res = self.web.get("/app/v2/sessions", headers=h)
+        self.assertEqual(res.status_code, 200)
+        data = res.json()
+        self.assertEqual(data["host_name"], "QA Studio")
+        self.assertEqual({s["id"]: s["last_event_at"] for s in data["sessions"]},
+                         {"claude_code:edited": "1970-01-01T00:16:40Z", "claude_code:unseen": None})
 
     def test_qr_enabled_relay_does_not_offer_short_code_bypass(self):
         with patch.object(bridge, "_console_web_ok", return_value=True):

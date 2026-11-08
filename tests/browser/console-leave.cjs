@@ -59,7 +59,9 @@ test("borrowed browser locks on failure, revokes on retry, and caches no work", 
   assert.equal(await page.evaluate(() => sessionStorage.getItem("pocket.console.token")), "fixture");
   await page.waitForFunction(() => !!navigator.serviceWorker.controller, null, {timeout: 12000});
   const paths = await page.evaluate(async () => {
-    const cache = await caches.open("pocket-console-shell-v3");
+    const keys = (await caches.keys()).filter(k => k.startsWith("pocket-console-shell-"));
+    if (keys.length !== 1) throw new Error("expected a single current shell");
+    const cache = await caches.open(keys[0]);
     return (await cache.keys()).map(req => new URL(req.url).pathname);
   });
   assert.ok(paths.length && paths.every(p => p.startsWith("/console/static/")));

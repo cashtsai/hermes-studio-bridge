@@ -38,7 +38,7 @@
     <button type="button" id="logout" class="btn-ghost">登出這台電腦</button>
   </header>
 
-  <main id="main">
+  <main id="main" class="at-home">
     <!-- 左:session 列表 -->
     <aside id="sidebar">
       <div class="side-head">
@@ -51,8 +51,22 @@
 
     <!-- 右:卡片流 -->
     <section id="stream">
+      <section id="handoff" aria-labelledby="home-title">
+        <header class="home-head"><div><h1 id="home-title">工作接力</h1>
+          <div id="home-host"></div></div>
+          <div class="home-tools"><input id="home-q" type="search" aria-label="搜尋工作" placeholder="搜尋名稱、專案或 ID" autocomplete="off">
+          <button id="home-refresh" class="icon-btn" title="更新工作清單" aria-label="更新工作清單">↻</button></div>
+        </header>
+        <p id="home-notice" role="status">正在取得主機清單…</p>
+        <div id="home-groups">
+          <section><h2>繼續上次工作</h2><div id="recent-list"></div></section>
+          <section><h2>待我處理</h2><div id="pending-list"></div></section>
+          <button id="all-work" class="btn-ghost" type="button">全部工作</button>
+        </div>
+        <div id="home-results" class="hidden"></div>
+      </section>
       <div id="stream-head" class="stream-head hidden">
-        <div class="sh-title"><span id="sh-provider" class="pill"></span><span id="sh-name"></span></div>
+        <div class="sh-title"><button type="button" id="back-home" class="icon-btn" aria-label="回到工作接力" title="回到工作接力">←</button><span id="sh-provider" class="pill"></span><span id="sh-name"></span></div>
         <div class="sh-actions">
           <span id="sh-status" class="status-chip"></span>
           <span id="stream-health" role="status"></span>
@@ -66,7 +80,7 @@
         </div>
         <div id="ap-actions" class="ap-actions"></div>
       </div>
-      <div id="cards"><div class="placeholder">← 從左邊選一條 session</div></div>
+      <div id="cards" class="hidden"></div>
       <div id="delivery" class="hidden" role="status">
         <span id="delivery-text"></span>
         <button type="button" id="check-delivery" class="btn-ghost">確認送達</button>

@@ -21108,7 +21108,9 @@ async def v2_sessions(request: Request, provider: str = "", status: str = "",
             if d and d.get("status") == "pending":
                 meta["approval"] = d
         out.append({"id": f"claude_code:{name}", "provider": "claude_code", "title": name,
-                    "subtitle": workdir, "status": st, "last_event_at": None,
+                    "subtitle": workdir, "status": st,
+                    # A confirmed turn/interrupt, not the most recently touched file in a shared cwd.
+                    "last_event_at": _v2_iso_utc((_CC_HOOK_STATE.get(name) or {}).get("updated_at")),
                     "capabilities": caps, "meta": meta})
     # A1(spec §7-5):hermes persona 有 pending 待審 → waiting_approval +
     # meta.approval 統一物件(之前恆 idle 是 spec 點名的缺口)。
@@ -21238,7 +21240,7 @@ async def v2_sessions(request: Request, provider: str = "", status: str = "",
     if _CODEX_V2_STALE and "codex" not in degraded:
         # stale cache 撐著畫面 ≠ 健康(深診 §4:v2 幾乎每次都走 stale 路)
         degraded.append("codex")
-    return {"sessions": out, "degraded_providers": degraded}
+    return {"sessions": out, "degraded_providers": degraded, "host_name": _pocket_id_host_name()}
 
 
 def _approval_bool_from_body(body: dict) -> bool:

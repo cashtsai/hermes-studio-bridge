@@ -14,10 +14,10 @@ function gate() {
 const row = (id, text, cid) => ({ id, kind: "text", role: cid ? "user" : "agent",
   body: { text, ...(cid ? { client_id: cid } : {}) } });
 const snap = (seq, cards) => ({ latest_seq: seq, cards, status: {phase:"idle"} });
-async function fixture(t, handle) {
+async function fixture(t, handle, list, viewport) {
   const browser = await chromium.launch({channel:"chrome"});
   t.after(() => browser.close());
-  const page = await browser.newPage({serviceWorkers:"block"});
+  const page = await browser.newPage({serviceWorkers:"block", viewport});
   page.setDefaultTimeout(6000);
   await page.addInitScript(() => sessionStorage.setItem("pocket.console.token", "test-only"));
   const errors = [];
@@ -27,6 +27,7 @@ async function fixture(t, handle) {
     assert.equal(url.host, "console.test");
     const match = /^\/app\/v2\/sessions\/([^/]+)\/(\w+)$/.exec(url.pathname);
     if (match) return handle(route, decodeURIComponent(match[1]), match[2], url);
+    if (url.pathname === "/app/v2/sessions" && list) return list(route);
     if (url.pathname === "/app/v2/sessions") return route.fulfill({json: {sessions: [
       {id:A, provider:"claude_code", title:"Alpha"}, {id:B, provider:"codex", title:"Beta"},
     ]}});
@@ -42,6 +43,88 @@ async function fixture(t, handle) {
 }
 const stream = (route, envelopes = []) => route.fulfill({contentType:"text/event-stream",
   body: envelopes.map(e => "data: " + JSON.stringify(e) + "\n\n").join("")});
+
+test("Chromebook-sized fresh Chrome profile: resume host activity, distinguish names and settle just one approval", async t => {
+  const titles = ["首頁搜尋", "工作區導覽", "字型樣張", "交接清單", "發佈檢查", "附件預覽"];
+  const rows = Array.from({length:36}, (_,i) => ({id:"codex:job-" + i, title:titles[i % titles.length],
+    provider:"codex", subtitle:i === 31 ? "/demo/brand" : "/demo/console",
+    status:"idle", capabilities:["input","approve"]}));
+  rows[31].title = rows[35].title = "Release";
+  rows[35].status = "running";
+  rows[31].last_event_at = "2026-01-02T00:00:00Z";
+  rows[35].last_event_at = "2026-01-03T00:00:00Z";
+  rows[34].last_event_at = "unknown";
+  const waiting = i => Object.assign(rows[i], {status:"waiting_approval",
+    meta:{approval:{id:"aid-" + i, status:"pending"}}});
+  waiting(4); waiting(5).meta.approval.status = "approved";
+  waiting(6).meta.approval.expires_at = 1; waiting(7).capabilities = ["input"];
+  rows[8].status = "waiting_approval"; rows[8].meta = {prompt:{options:[{key:"1"}]}};
+  const posted = [];
+  const page = await fixture(t, async (r,id,action) => {
+    if (action === "cards") return r.fulfill({json:snap(0,[row("msg","original " + id)])});
+    if (action === "events") return stream(r);
+    if (action === "approve") posted.push([id, r.request().postDataJSON()]);
+    return r.fulfill({json:{ok:true}});
+  }, r => r.fulfill({json:{host_name:"Demo Studio", sessions:rows}}), {width:1366,height:768});
+  await page.getByText("主機 · Demo Studio").waitFor();
+  const recent = page.locator("#recent-list .work-row"), pending = page.locator("#pending-list .work-row");
+  for (const id of ["#all-work","#logout"]) {
+    assert.ok(await page.locator(id).evaluate(el => el.scrollHeight <= el.clientHeight && el.scrollWidth <= el.clientWidth));
+  }
+  if (process.env.POCKET_QA_SCREENSHOTS) {
+    await fs.mkdir(process.env.POCKET_QA_SCREENSHOTS, {recursive:true});
+    await page.screenshot({path:path.join(process.env.POCKET_QA_SCREENSHOTS, "handoff-home.png")});
+  }
+  assert.deepEqual(await recent.evaluateAll(els => els.map(e => e.dataset.id)), ["codex:job-35","codex:job-31"]);
+  assert.equal(await pending.count(), 1);
+  assert.equal(await page.locator("#awaiting-n").textContent(), "1");
+  await recent.first().click();
+  await page.locator("#cards").getByText("original codex:job-35").waitFor();
+  await page.locator("#input").fill("my draft");
+  await page.getByRole("button",{name:"回到工作接力"}).click();
+  assert.equal(new URL(page.url()).hash,"");
+  await recent.first().click();
+  assert.equal(await page.locator("#input").inputValue(),"my draft");
+  await page.locator("#back-home").click();
+  await page.getByRole("searchbox").fill("brand release");
+  const hit = page.locator("#home-results .work-row");
+  assert.equal(await hit.count(),1);
+  assert.match(await hit.innerText(),/job-31/);
+  await hit.click();
+  await page.locator("#cards").getByText("original codex:job-31").waitFor();
+  await page.locator("#back-home").click();
+  await page.getByRole("searchbox").fill("");
+  await pending.click();
+  await page.getByRole("button",{name:"核准", exact:true}).click();
+  await page.locator("#awaiting").waitFor({state:"hidden"});
+  await page.locator("#back-home").click();
+  await page.getByText("目前沒有可處理的核准").waitFor();
+  assert.deepEqual(posted,[["codex:job-4",{approve:true,approval_id:"aid-4"}]]);
+  assert.ok(!(await page.evaluate(() => JSON.stringify(localStorage))).includes("codex:job"));
+});
+
+test("narrow home: retry a failed list, search all sessions and don't misreport degraded approvals", async t => {
+  let fails = true, degraded = false;
+  const sessions = [{id:A,title:"Same",provider:"claude_code",subtitle:"/demo/A",status:"idle"},
+    {id:B,title:"Same",provider:"codex",subtitle:"/demo/B",status:"idle"}];
+  const page = await fixture(t, (r,id,action) => action === "events" ? stream(r) : r.fulfill({json:snap(0,[])}),
+    r => fails ? r.fulfill({status:503,json:{}}) :
+      r.fulfill({json:{sessions,degraded_providers:degraded?["codex"]:[]}}), {width:390,height:844});
+  await page.locator("#home-notice").getByText(/無法更新/).waitFor();
+  assert.equal(await page.getByText("目前沒有可處理的核准").count(),0);
+  fails = false;
+  await page.locator("#home-refresh").click();
+  await page.getByText("尚無可確認的活動時間").waitFor();
+  await page.getByRole("button",{name:"全部工作"}).click();
+  await page.locator("#pal-q").fill("demo/B");
+  await page.locator("#pal-q").press("Enter");
+  await page.waitForURL(/#session=codex%3Abeta$/);
+  await page.locator("#back-home").click();
+  degraded = true;
+  await page.locator("#home-refresh").click();
+  await page.getByText("待處理清單尚不完整").waitFor();
+  assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth),false);
+});
 
 test("lost HTTP acknowledgement: read back by ID, never post twice or change the other draft", async t => {
   const posts = [], posted = gate(), lose = gate(), oldSnap = gate(), oldStarted = gate();
@@ -111,8 +194,10 @@ test("live card envelope, cursor on reconnect, expired cursor snapshot without d
   await page.getByText("Beta", {exact:true}).click();
   await page.locator("#cards").getByText("live reply").waitFor();
   assert.equal(await page.locator("#sh-status").textContent(), "run");
+  await page.locator('[data-mode="changes"]').click();
   expire.resolve();
-  await page.locator("#cards").getByText("from phone while away").waitFor();
+  await page.locator("#cards").getByText("from phone while away").waitFor({state:"attached"});
+  assert.ok(await page.locator("#changes-view").isVisible());
   assert.deepEqual(cursors.slice(0,2), ["10","12"]);
   assert.equal(await page.locator("#sh-status").textContent(), "idle");
   assert.equal(await page.locator("#cards .card").count(), 1);
