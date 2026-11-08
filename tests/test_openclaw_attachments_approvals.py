@@ -283,8 +283,9 @@ class ToolStreamTests(unittest.TestCase):
 # ─────────────────────────── 缺陷 2:審批 ────────────────────────────────────
 
 def _requested(aid="ap-1", key="agent:main:main", allowed=None):
-    return {"id": aid, "createdAtMs": 1785119281390,
-            "expiresAtMs": 1785119281390 + 60000,
+    now_ms = time.time_ns() // 1_000_000
+    return {"id": aid, "createdAtMs": now_ms,
+            "expiresAtMs": now_ms + 60000,
             "request": {"command": "rm -rf /tmp/x", "cwd": "/tmp",
                         "host": "gateway", "agentId": "main",
                         "sessionKey": key, "ask": "on-miss",
@@ -389,6 +390,18 @@ class ApprovalEventTests(unittest.TestCase):
         bridge._oc_events_feed("exec.approval.resolved", {})
 
     # ── /approve 路由 ──
+
+    def test_expired_request_is_not_forwarded_to_gateway(self):
+        event = _requested(aid="ap-expired")
+        event["createdAtMs"] -= 90000
+        event["expiresAtMs"] = event["createdAtMs"] + 60000
+        bridge._oc_events_feed("exec.approval.requested", event)
+        with self.assertRaises(HTTPException) as cm:
+            _run(bridge.v2_session_approve(
+                "openclaw:agent:main:main",
+                _FakeReq({"approval_id": "ap-expired", "key": "allow-once"})))
+        self.assertEqual(cm.exception.status_code, 409)
+        self.assertEqual(self.fake.calls, [])
 
     def test_approve_resolves_via_gateway(self):
         d = _digest("agent:main:main")
