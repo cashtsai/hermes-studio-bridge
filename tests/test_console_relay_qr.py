@@ -2,6 +2,7 @@ import _isolation  # noqa: F401
 import collections
 import json
 import os
+import plistlib
 import re
 import sys
 import tempfile
@@ -21,14 +22,18 @@ class RelayQRTest(unittest.TestCase):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         root = Path(tmp.name)
-        self.marker = root / "console-qr-enabled"
-        self.marker.touch()
+        self.env = patch.dict(os.environ, {"POCKET_CONSOLE_ENTRY_MODE": "relay",
+                                            "POCKET_RELAY_ENABLED": ""})
+        self.env.start()
+        self.addCleanup(self.env.stop)
         self.enabled = root / "enabled"
         self.enabled.touch()
-        (root / "grant.json").write_text(json.dumps({"hostname": self.relay}))
+        self.grant = root / "grant.json"
+        self.grant.write_text(json.dumps({"hostname": self.relay, "frp_token": "fixture"}))
         for key, val in dict(POCKET_CONSOLE_ENABLED=True, POCKET_CONSOLE_WEB=False,
                              POCKET_CONSOLE_QR_LOGIN=False, _DEVICE_TOKENS={},
                              _PAIR_CODES={}, _CONSOLE_LOGIN_REQS={}, _CONSOLE_GRANTS={},
+                             _RELAY_STATUS={"state": "connected", "hostname": self.relay},
                              _CONSOLE_LOGIN_MINTS=collections.deque(), _relay_dir=lambda: str(root),
                              _save_device_tokens=lambda _: None, _pair_qr_check_mint_rate=lambda: None,
                              _account_device_for_token=lambda _: None, _console_boot_hosts=lambda: [],
@@ -52,9 +57,64 @@ class RelayQRTest(unittest.TestCase):
         self.assertIsNone(discover()["relay_qr_url"])
         self.assertEqual(self.web.get("/console").status_code, 403)
         self.enabled.touch()
-        self.marker.unlink()
+        self.grant.unlink()
         self.assertIsNone(discover()["relay_qr_url"])
         self.assertEqual(self.web.get("/console").status_code, 403)
+
+    def test_stale_or_unentitled_routes_are_not_advertised(self):
+        for state in ("not_enrolled", "claiming", "connecting", "unentitled", "rejected", "off"):
+            with self.subTest(state=state), patch.dict(bridge._RELAY_STATUS, state=state):
+                data = self.web.get("/app/v1/console/boot", headers=self.phone).json()
+                self.assertIsNone(data["relay_qr_url"])
+                self.assertEqual(self.web.get("/console").status_code, 403)
+        with patch.dict(bridge._RELAY_STATUS, hostname="stale.relay.example"):
+            self.assertIsNone(self.web.get("/app/v1/console/boot", headers=self.phone).json()["relay_qr_url"])
+
+    def test_unconfigured_upgrade_recognizes_existing_grant(self):
+        with patch.dict(os.environ, {"POCKET_CONSOLE_ENTRY_MODE": ""}):
+            self.assertIn("pocket://console-login", self.web.get("/console").text)
+            self.assertEqual(self.web.get("/console", headers={"Host": "another.example"}).status_code, 403)
+
+    def test_no_relay_still_allows_private_login_not_public_login(self):
+        self.enabled.unlink()
+        self.grant.unlink()
+        with patch.object(bridge, "POCKET_CONSOLE_QR_LOGIN", True):
+            private = TestClient(bridge.app, client=("127.0.0.1", 8081))
+            self.addCleanup(private.close)
+            self.assertEqual(private.get("/console", headers={"Host": "localhost:8081"}).status_code, 401)
+            self.assertEqual(self.web.get("/console").status_code, 403)
+            self.assertEqual(self.web.get("/console/login/status").status_code, 404)
+
+    def test_customer_installers_enable_same_mode_and_bundle_qr_support(self):
+        root = Path(__file__).resolve().parents[1]
+        mac = (root / "deploy/install-local-bridge.sh").read_text()
+        plist = mac.split('cat > "$LAUNCH_AGENT" <<PLIST\n', 1)[1].split("\nPLIST", 1)[0]
+        env = plistlib.loads(plist.encode())["EnvironmentVariables"]
+        self.assertEqual(env["POCKET_CONSOLE_ENABLED"], "${POCKET_CONSOLE_ENABLED:-1}")
+        self.assertEqual(env["POCKET_CONSOLE_ENTRY_MODE"], "${POCKET_CONSOLE_ENTRY_MODE:-relay}")
+        self.assertIn("qrcode", mac.split('"$BRIDGE_VENV/bin/python" -m pip install \\\n', 1)[1].split("\n", 1)[0].split())
+        linux = (root / "deploy/install-ubuntu.sh").read_text()
+        self.assertIn('CONSOLE_ENTRY_MODE="${POCKET_CONSOLE_ENTRY_MODE:-relay}"', linux)
+        self.assertIn('CONSOLE_QR_LOGIN="${POCKET_CONSOLE_QR_LOGIN:-0}"', linux)
+        self.assertIn('pip install -q -r "$INSTALL_ROOT/requirements.txt"', linux)
+        self.assertIn("qrcode", (root / "requirements.txt").read_text().splitlines())
+
+    def test_second_customer_gets_their_own_bookmark_and_cannot_approve_the_first(self):
+        rid = re.search(r"pocket://console-login\?rid=([0-9a-f]{32})", self.web.get("/console").text)[1]
+        second = "other.customer.example"
+        with tempfile.TemporaryDirectory() as home, patch.object(bridge, "_relay_dir", return_value=home), \
+                patch.object(bridge, "_CONSOLE_LOGIN_REQS", {}), patch.object(bridge, "_DEVICE_TOKENS", {}), \
+                patch.dict(bridge._RELAY_STATUS, hostname=second):
+            Path(home, "enabled").touch()
+            bridge._relay_save_grant({"hostname": second, "frp_token": "fixture-b"})
+            phone_b = {"Authorization": "Bearer " + bridge._pair_issue_device_token("Phone B", "ios")[0]}
+            self.assertEqual(self.web.get("/app/v1/console/boot", headers=phone_b).json()["relay_qr_url"],
+                             "https://" + second + "/console")
+            self.assertEqual(self.web.get("/console").status_code, 403)
+            self.assertEqual(self.web.post(f"/app/v1/console/login/requests/{rid}/approve", headers=phone_b).status_code, 404)
+            self.assertIn("pocket://console-login", self.web.get("https://" + second + "/console").text)
+        self.assertEqual(self.web.post(f"/app/v1/console/login/requests/{rid}/approve", headers=phone_b).status_code, 401)
+        self.assertEqual(self.web.get("/console/login/status").json()["state"], "pending")
 
     def test_wrong_ingress_cannot_mint_poll_or_use_a_signed_cookie(self):
         with patch.object(bridge, "POCKET_CONSOLE_WEB", True), patch.object(bridge, "POCKET_CONSOLE_QR_LOGIN", True):
@@ -96,8 +156,10 @@ class RelayQRTest(unittest.TestCase):
         auth = {"Authorization": "Bearer " + claim["token"]}
         self.assertIn('data-console-access="remote"', self.web.get("/console").text)
         self.assertEqual(self.web.get("/health", headers=auth).status_code, 200)
+        with patch.object(bridge, "POCKET_CONSOLE_ENABLED", False):
+            self.assertEqual(self.web.get("/app/v2/sessions", headers=auth).status_code, 403)
         self.assertEqual(self.web.get("/app/v2/sessions", headers={**auth, "Host": "other.example"}).status_code, 403)
-        self.marker.unlink()
+        self.enabled.unlink()
         self.assertEqual(self.web.get("/health", headers=auth).status_code, 403)
         self.assertEqual(self.web.post("/console/logout", headers=auth).status_code, 200)
         self.assertEqual(self.web.get("/app/v2/sessions", headers=auth).status_code, 401)

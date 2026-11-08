@@ -68,7 +68,8 @@ class _Base(unittest.TestCase):
 
     def setUp(self):
         self.boot = bridge._pair_boot_code()
-        self.env = patch.dict(os.environ, {"POCKET_RELAY_DIR": _RELAY_DIR})
+        self.env = patch.dict(os.environ, {"POCKET_RELAY_DIR": _RELAY_DIR,
+                                           "POCKET_CONSOLE_ENTRY_MODE": "custom"})
         self.env.start()
         self.patches = [
             patch.object(bridge, "POCKET_CONSOLE_ENABLED", True),

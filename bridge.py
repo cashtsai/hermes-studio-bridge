@@ -715,7 +715,7 @@ def _console_remote_list(rows, token, started, degraded):
 
 def _console_remote_allowed(request, token):
     audience = (_token_entry(token) or {}).get("relay_host")
-    if audience or _console_relay_qr_enabled():
+    if audience or _console_uses_relay_policy():
         if not _console_relay_request_ok(request, audience):
             return False
     path, method = request.scope["path"], request.method
@@ -11849,7 +11849,7 @@ async def console_page(request: Request):
     #     只在「真的供了碼」時計失敗 —— 裸開輸入頁不是嘗試,不該把 PWA
     #     每次啟動都記成一次攻擊。
     #   · cookie 續命走 session-only(見下方 `session_only=not local`)。
-    relay_only = _console_relay_qr_enabled()
+    relay_only = _console_uses_relay_policy()
     relay = relay_only and _console_is_granted_host(request)
     local = _console_local_entry_ok(request, relay_only)
     if relay_only and not local and not (relay and _console_cookie_secure(request)):
@@ -11943,7 +11943,7 @@ async def console_auth(request: Request):
     # 與 GET 同一條線:直連(loopback/tailnet)或本機中繼 vhost(web-first,
     # 旗標開才算)以外,連表單都不該看到。403 的內容與日誌維持單一來源
     # (`_pair_local_only` 剛回報過 False,必定會丟)。
-    relay_only = _console_relay_qr_enabled()
+    relay_only = _console_uses_relay_policy()
     local = _console_local_entry_ok(request, relay_only)
     if not local and (relay_only or POCKET_CONSOLE_QR_LOGIN):
         raise HTTPException(status_code=403, detail="use QR login")
@@ -12125,7 +12125,7 @@ async def app_v1_console_boot(request: Request):
     # 碼走 query 等於寫進日誌。所以 url/urls 只負責「把人帶到登入頁」,
     # 碼由使用者照著手機上的 6 位數手打(或 app 代填進 POST body)。
     urls = ["http://%s/console" % h for h in hosts]
-    relay_host = _console_web_vhost() if _console_relay_qr_enabled() else ""
+    relay_host = _console_live_relay_host() if _console_uses_relay_policy() else ""
     auth = request.headers.get("authorization", "")
     tok = auth[7:].strip() if auth.lower().startswith("bearer ") else ""
     # 只記「誰拿了、有幾個候選」—— boot code 本身絕不進日誌。
@@ -12221,26 +12221,45 @@ def _console_web_ok(request: Request) -> bool:
     return host == vhost
 
 
-def _console_relay_qr_enabled() -> bool:
-    # Host opt-in, separate from the legacy all-proxy QR switch.
-    return os.path.isfile(os.path.join(_relay_dir(), "console-qr-enabled"))
+def _console_uses_relay_policy() -> bool:
+    # Managed installs never fall back to all-proxy QR, even without a grant.
+    # Also recognize previously installed hosts using the normal Relay service.
+    policy = os.environ.get("POCKET_CONSOLE_ENTRY_MODE", "").strip().lower()
+    if policy:
+        return policy != "custom"
+    return (_relay_enabled() or os.path.isfile(_relay_grant_path())
+            or os.path.isfile(_POCKET_ID_STATE_PATH))
+
+
+def _console_live_relay_host() -> str:
+    if not _relay_enabled() or _RELAY_STATUS.get("state") != "connected":
+        return ""
+    host = _relay_load_grant().get("hostname")
+    if not isinstance(host, str) or host != _RELAY_STATUS.get("hostname"):
+        return ""
+    # Never publish userinfo, a port, query or path as part of a bookmark.
+    label = r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+    return host.lower() if len(host) <= 253 and re.fullmatch(
+        rf"(?:{label}\.)+{label}", host, re.ASCII | re.I) else ""
 
 
 def _console_is_granted_host(request: Request) -> bool:
-    host = _console_web_vhost()
+    host = _console_live_relay_host()
     values = request.headers.getlist("host")
     return bool(host and len(values) == 1 and values[0].lower() in (host, host + ":443"))
 
 
 def _console_relay_request_ok(request: Request, audience=None) -> bool:
-    if not _console_relay_qr_enabled() or not _console_cookie_secure(request):
+    if not POCKET_CONSOLE_ENABLED or not _console_uses_relay_policy() or not _console_cookie_secure(request):
         return False
     return _console_is_granted_host(request) and (
         not audience or audience == request.headers["host"].lower().removesuffix(":443"))
 
 
 def _console_qr_enabled() -> bool:
-    return POCKET_CONSOLE_QR_LOGIN or _console_relay_qr_enabled()
+    if _console_uses_relay_policy():
+        return bool(_console_live_relay_host())
+    return POCKET_CONSOLE_QR_LOGIN
 
 
 def _console_local_entry_ok(request: Request, relay_only: bool) -> bool:
@@ -12263,7 +12282,7 @@ def _console_local_entry_ok(request: Request, relay_only: bool) -> bool:
 
 def _console_approval_auth(request: Request) -> None:
     _check_auth(request)
-    if _console_relay_qr_enabled():
+    if _console_uses_relay_policy():
         token = _request_token(request)
         entry = _token_entry(token) or {}
         if (hmac.compare_digest(token, BRIDGE_TOKEN) or entry.get("console_session")
@@ -12330,7 +12349,8 @@ def _console_login_create(request: Request):
         _CONSOLE_LOGIN_MINTS.append(now)
         _CONSOLE_LOGIN_REQS[rid] = {
             "sid_hash": hashlib.sha256(sid.encode()).hexdigest(),
-            "relay_host": _console_web_vhost() if _console_relay_qr_enabled() else "",
+            "relay_host": request.headers["host"].lower().removesuffix(":443")
+                          if _console_uses_relay_policy() else "",
             "client": _console_login_client_key(request),
             "ua": ua,
             "created": now,
@@ -12492,7 +12512,7 @@ async def console_login_status(request: Request):
     """
     if not (POCKET_CONSOLE_ENABLED and _console_qr_enabled()):
         raise HTTPException(status_code=404, detail="not found")
-    if _console_relay_qr_enabled() and not (
+    if _console_uses_relay_policy() and not (
             _console_is_granted_host(request) and _console_cookie_secure(request)):
         raise HTTPException(status_code=403, detail="relay only")
     sid = request.cookies.get(_CONSOLE_LOGIN_SID_COOKIE) or ""
@@ -12510,7 +12530,7 @@ async def console_login_status(request: Request):
                     entry = v
                     break
         if entry is not None and (not entry.get("relay_host")
-                                  or entry["relay_host"] == _console_web_vhost()):
+                                  or entry["relay_host"] == _console_live_relay_host()):
             if entry.get("state") == "approved":
                 # 來源一致性:不符就當過期(**不回專屬錯誤** —— 不當探測器用)。
                 if entry.get("client") == _console_login_client_key(request):
@@ -12588,7 +12608,7 @@ def _console_login_decide(rid: str, request: Request, *, approve: bool) -> dict:
         # 批准當下才鑄一次性 claim code(與 `/console/auth` 同一條安全論證:
         # 鑄碼只發生在「授權成立的那一刻」,長命憑證永遠換不到碼)。
         audience = entry.get("relay_host")
-        if audience and (not _console_relay_qr_enabled() or audience != _console_web_vhost()):
+        if audience and (not _console_uses_relay_policy() or audience != _console_live_relay_host()):
             raise HTTPException(status_code=403, detail="relay no longer available")
         code = (_console_mint_claim_code(remote=True, relay_host=audience) if audience
                 else _console_mint_claim_code(remote=True))
@@ -13588,7 +13608,7 @@ def _qrcode_problem() -> str | None:
 
 async def _check_qrcode_dependency_at_startup() -> None:
     """QR 登入已啟用卻缺 qrcode → 啟動時大聲說一次。功能沒開就完全安靜。"""
-    if not (POCKET_CONSOLE_ENABLED and _console_qr_enabled()):
+    if not (POCKET_CONSOLE_ENABLED and (_console_uses_relay_policy() or POCKET_CONSOLE_QR_LOGIN)):
         return
     problem = _qrcode_problem()
     if not problem:

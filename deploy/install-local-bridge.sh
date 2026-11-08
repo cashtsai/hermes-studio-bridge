@@ -298,7 +298,7 @@ install_bridge_runtime() {
   # 吞掉 —— 機主那台 204 次嘗試 0 次送達,而且**每個照 DMG 裝桌面端的使用者
   # 都一樣壞**,因為 DMG 跑的就是這支腳本。
   "$BRIDGE_VENV/bin/python" -m pip install \
-    fastapi uvicorn 'httpx[http2]' PyJWT cryptography websockets python-multipart eval_type_backport >/dev/null
+    fastapi uvicorn 'httpx[http2]' PyJWT cryptography websockets python-multipart eval_type_backport qrcode >/dev/null
 }
 
 install_requested_provider
@@ -380,6 +380,10 @@ cat > "$LAUNCH_AGENT" <<PLIST
         <string>$OPENCLAW_CONFIG_FILE</string>
         <key>POCKET_ID_URL</key>
         <string>$POCKET_ID_URL</string>
+        <key>POCKET_CONSOLE_ENABLED</key>
+        <string>${POCKET_CONSOLE_ENABLED:-1}</string>
+        <key>POCKET_CONSOLE_ENTRY_MODE</key>
+        <string>${POCKET_CONSOLE_ENTRY_MODE:-relay}</string>
         <!-- 安裝時選的 provider。bridge 的 _dashboard_active_provider() 讀這個
              (或 POCKET_PROVIDER)來決定儀表板顯示哪個 runtime 的人格。
              ⚠️ 以前**沒有**傳進來,所以 launchd 起的 bridge 永遠拿到 "auto" ——
