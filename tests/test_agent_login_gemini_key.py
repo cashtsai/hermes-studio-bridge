@@ -23,7 +23,12 @@ import unittest
 _TMP = tempfile.mkdtemp(prefix="agent-login-gm-")
 os.environ.setdefault("POCKET_CANON_DB", os.path.join(_TMP, "canonical.db"))
 os.environ.setdefault("BRIDGE_TOKEN", "test-unit-token")
-os.environ["GEMINI_CONFIG_FILE"] = os.path.join(_TMP, "gemini.json")
+# **setdefault,不是硬指派**(2026-11-03 改):`_isolation` 已經把這個 env
+# 導到它的 tmp,而 `gemini_provider.py:31` 在 import 時就把它讀成模組常數 ——
+# 這裡硬指派的話,env 指向本檔的 tmp、常數卻指向先 import 時的那個,
+# 兩邊不一致 → 下面用 `os.environ[...]` 檢查檔案就會落空。
+# (加 test_agent_auth_gemini.py 時踩到:它字母序在前,先 import 了 provider。)
+os.environ.setdefault("GEMINI_CONFIG_FILE", os.path.join(_TMP, "gemini.json"))
 os.environ.pop("GEMINI_API_KEY", None)
 os.environ["POCKET_AGENT_LOGIN_IN_APP"] = "1"   # 旗標:這一檔測開啟後的行為
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))

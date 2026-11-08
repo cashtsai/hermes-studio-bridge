@@ -14,6 +14,7 @@ Run:  uvicorn bridge:app --host 0.0.0.0 --port 8081
 import asyncio
 import base64
 import carddigest
+import codecs
 import collections
 import contextlib
 import contextvars
@@ -5814,7 +5815,29 @@ async def _probe_agent_auth() -> dict:
                                         env=_codex_prepare_home())
         codex["logged_in"], codex["account"] = _parse_codex_login(rc, out)
 
-    return {"claude": claude, "codex": codex}
+    return {"claude": claude, "codex": codex, "gemini": _local_gemini_auth()}
+
+
+def _local_gemini_auth() -> dict:
+    gm = {"installed": False, "logged_in": False, "account": None}
+    try:
+        if gemini_provider.provider_backend() == "antigravity":
+            gm["installed"] = shutil.which(gemini_provider.agy_bin()) is not None
+            # agy has no local auth-status probe; do not send a paid prompt.
+            if gm["installed"]:
+                gm["logged_in"] = None
+        elif shutil.which(gemini_provider.gemini_bin()):
+            gm["installed"] = True
+            plan = gemini_provider.auth_plan(gemini_provider.load_config(),
+                                             gemini_provider.oauth_available())
+            gm["logged_in"] = bool(plan)
+            if plan:
+                key = gemini_provider.backend_spec()["auth_ids"]["api-key"]
+                gm["account"] = "API key" if plan[0] == key else "Google"
+    except Exception as e:
+        _log_exc("probe_gemini_auth", e, expected=True)
+        gm["logged_in"] = None
+    return gm
 
 
 async def _agent_auth_refresh() -> None:
@@ -5845,6 +5868,9 @@ async def _agent_auth_status() -> dict:
                        "logged_in": None, "account": None},
             "codex": {"installed": os.path.exists(_resolve_codex_bin()),
                       "logged_in": None, "account": None},
+            # 首探未完成時 gemini 也要在場(缺欄位 = app 判成「這台沒有
+            # 這個引擎」,而真相是「還沒探」)。
+            "gemini": {"installed": True, "logged_in": None, "account": None},
             "checking": True}
 
 
@@ -13626,6 +13652,8 @@ async def app_v1_terminal(websocket: WebSocket):
                mode="tmux" if tmux_bin else "shell")  # no keystrokes/output
 
     loop = asyncio.get_running_loop()
+    # A PTY read can stop in the middle of a code point; keep state per socket.
+    utf8_decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
 
     def _read_master() -> bytes:
         try:
@@ -13637,13 +13665,14 @@ async def app_v1_terminal(websocket: WebSocket):
         """PTY → client. Ends (returns) on EOF, i.e. the shell exited."""
         while True:
             data = await loop.run_in_executor(None, _read_master)
-            if not data:
-                return
+            text = utf8_decoder.decode(data, final=not data)
             try:
-                await websocket.send_text(json.dumps(
-                    {"type": "output", "data": data.decode("utf-8", "replace")}))
+                if text:
+                    await websocket.send_text(json.dumps({"type": "output", "data": text}))
             except Exception as _exc:  # noqa: BLE001 — socket went away mid-send
                 _log_exc("app_v1_terminal.pump_output", _exc, expected=True)
+                return
+            if not data:
                 return
 
     async def pump_input():
@@ -15464,12 +15493,45 @@ _TMUX_TIMED_OUT: contextvars.ContextVar[bool] = contextvars.ContextVar(
     "tmux_timed_out", default=False)
 
 
+_TMUX_MISSING_LOGGED: list = [False]   # 只記一次,避免每次輪詢都刷 log
+
+
+def _tmux_installed() -> bool:
+    return shutil.which(TMUX_BIN) is not None
+
+
+def _tmux_missing_note() -> None:
+    if not _TMUX_MISSING_LOGGED[0]:
+        _TMUX_MISSING_LOGGED[0] = True
+        _log_event("tmux_missing", tmux_bin=TMUX_BIN)
+
+
+def _require_tmux() -> None:
+    """建立/啟動 CC session 前確認 tmux 在。
+
+    乾淨的 Mac 預設沒有 tmux,而原生 CC session 管理整個靠它。以前缺 tmux 時
+    `create_subprocess_exec` 直接丟 FileNotFoundError、沒人接,使用者只看到不透明
+    的失敗。這裡給一個帶「下一步」的明確錯誤 —— app 對沒有對映的錯誤碼會直接顯示
+    這段 hint,所以不必改 app 就會到使用者眼前。"""
+    if not _tmux_installed():
+        _tmux_missing_note()
+        raise http_err(424, "TMUX_MISSING", "tmux is not installed",
+                       "請先安裝 tmux 並確認 bridge 可以執行它。"
+                       "macOS: brew install tmux；Debian/Ubuntu: sudo apt install tmux。")
+
+
 async def _tmux_run(*args, timeout: float = _TMUX_TIMEOUT):
     """Run one tmux command with a kill-on-timeout guard.
-    Returns (rc, stdout_str, stderr_str); rc=124 on timeout."""
-    p = await asyncio.create_subprocess_exec(
-        TMUX_BIN, *args,
-        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+    Returns (rc, stdout_str, stderr_str); rc=124 on timeout, rc=127 if tmux is not installed."""
+    try:
+        p = await asyncio.create_subprocess_exec(
+            TMUX_BIN, *args,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+    except (FileNotFoundError, PermissionError):
+        # tmux 沒裝。當成「tmux 回了失敗」(rc=127),與「沒有 tmux 伺服器」同一類:
+        # 列表是空的、儀表板照常,而不是每個碰 tmux 的端點都 500。
+        _tmux_missing_note()
+        return 127, "", "tmux not installed"
     try:
         out, err = await asyncio.wait_for(p.communicate(), timeout)
     except asyncio.TimeoutError:
@@ -17280,6 +17342,7 @@ async def _cc_native_trust_unblock(name: str, workdir: str) -> None:
 
 
 async def _cc_native_launch(name: str, workdir: str) -> None:
+    _require_tmux()
     wd = workdir if os.path.isdir(workdir) else os.path.expanduser("~")
     rc, _, err = await _tmux_run("new-session", "-d", "-s", name, "-c", wd,
                                  _CC_PANE_SHELL, "--noprofile", "--norc")
@@ -17310,6 +17373,10 @@ async def _cc_native(verb: str, *rest) -> str:
                                f"workdir already used by session '{n}'",
                                "同一個目錄給兩條 session 會互搶對話歷史;"
                                "換個目錄,或先封存舊的那條。")
+        # 先確認 tmux 在,**再**動設定檔:否則缺 tmux 時名單已登記、session 卻起不來,
+        # 之後每次 ensure 都在失敗重試。
+        if verb == "new":
+            _require_tmux()
         _cc_conf_backup()
         _cc_conf_upsert(name, workdir, "1")
         if len(rest) > 2 and rest[2]:
@@ -18269,10 +18336,14 @@ async def _cc_input_core_locked(name: str, body: dict) -> dict:
 async def _tmux_run_stdin(args: list, data: bytes,
                           timeout: float = _TMUX_TIMEOUT):
     """同 _tmux_run,但把 data 餵進 stdin(load-buffer 用)。"""
-    p = await asyncio.create_subprocess_exec(
-        TMUX_BIN, *args,
-        stdin=asyncio.subprocess.PIPE,
-        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+    try:
+        p = await asyncio.create_subprocess_exec(
+            TMUX_BIN, *args,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+    except (FileNotFoundError, PermissionError):
+        _tmux_missing_note()
+        return 127, "", "tmux not installed"
     try:
         out, err = await asyncio.wait_for(p.communicate(input=data), timeout)
     except asyncio.TimeoutError:
@@ -33479,8 +33550,9 @@ async def app_dashboard(request: Request):
 
 @app.get("/app/v1/agents/auth")
 async def app_agents_auth(request: Request):
-    """CC/CX 這台 Mac 的登入狀態(app gate CC/CX 頁籤用)。
-    回 {"claude": {"installed", "logged_in", "account"}, "codex": {…}}。
+    """CC/CX/Gemini 在這台主機的登入狀態(app 的「引擎帳號」頁與頁籤 gate 用)。
+    回 {"claude": {"installed","logged_in","account"}, "codex": {…}, "gemini": {…}}。
+    `gemini` 2026-11-03 新增 —— 舊 app 不讀這個鍵,不受影響。
     TTL 60s 快取;純唯讀查狀態,不碰憑證。"""
     _check_auth(request)
     return await _agent_auth_status()

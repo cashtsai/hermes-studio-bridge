@@ -58,6 +58,15 @@ _ENV_TMP_DEFAULTS = {
     "POCKET_CODEX_HOME":      os.path.join(_TMP, "codex-home"),
     # openclaw_provider.py
     "OPENCLAW_CONFIG_FILE":   os.path.join(_TMP, "openclaw.json"),
+    # gemini_provider.py —— **漏在這張表外面**(2026-11-03 補)。
+    # 它在 import 時就把這個 env 讀成模組常數(`_CONFIG_FILE`),所以
+    # 「誰先 import 誰決定路徑」。原本只有
+    # `test_agent_login_gemini_key.py` 在自己模組頂端設它 —— 只要有**任何**
+    # 字母序更前面的測試檔先 import gemini_provider,那一檔的三條測試就會
+    # 在全套裡紅而單獨跑是綠的(加 test_agent_auth_gemini.py 時當場踩到)。
+    # 導在這裡,每個檔案都吃得到,不必各自處理。
+    "GEMINI_CONFIG_FILE":     os.path.join(_TMP, "gemini.json"),
+    "GEMINI_STATE_DIR":       os.path.join(_TMP, "gemini"),
     # studio_memory_mcp.py
     "STUDIO_MEMORY_HOME":     os.path.join(_TMP, "studio-memory-home"),
     # bridge.py HOME_ROOT:persona home 一律指到 tmp。不導的話,測試打到的
