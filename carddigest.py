@@ -1062,6 +1062,9 @@ class CodexThreadDigest(ApprovalCardMixin):
         # notification；先記下並在 canonical 舊→新卡片落地後依到達順序重播，
         # 避免「最新 live 在前、較舊 seed 歷史被 append 到尾端」污染對話順序。
         self._seed_pending: list[tuple[str, object, object]] = []
+        # IDs only, replaced on each canonical page. Eviction is not a new
+        # message, even when the provider supplies no usable item timestamps.
+        self._last_seed_keys: set[tuple[str, str]] = set()
         self.last_seed_at = 0.0
         # thread-store 寫入鎖（這條 thread 正被桌面版 Codex/ChatGPT 佔用）。
         # 由 bridge 的 `_cx_sync_thread_lock` 灌進來；app 讀
@@ -1208,6 +1211,7 @@ class CodexThreadDigest(ApprovalCardMixin):
 
     def seed_turns(self, turns: list, emit_unchanged: bool = True):
         """thread/turns/list 的 data（呼叫端先 reverse 成舊→新）→ 卡片庫。"""
+        page_keys = set()
         for turn in turns or []:
             tid = str(turn.get("id") or "")
             items = turn.get("items") or []
@@ -1218,15 +1222,33 @@ class CodexThreadDigest(ApprovalCardMixin):
                 # 而不是整串同一個時間(codex 的 item 本身沒有時間欄位)。
                 ts = _cx_item_ts(turn, item, index=idx, total=len(items))
                 for card in codex_item_to_cards(item, turn_id=tid, ts=ts, index=idx):
+                    source_key = (tid, card["id"])
+                    page_keys.add(source_key)
                     card = merge_input_accepted_echo(self.store, card)
                     card = dedupe_transcript_message(self.store, card)
+                    previous = self.store.cards.get(card["id"])
+                    if self.store.order and len(self.store.order) >= self.store.cards_max:
+                        # A position-like source ID can be reused by a newer
+                        # turn after eviction. Do not overwrite its resident
+                        # card with the earlier turn during the next replay.
+                        if (previous and previous["turn_id"] != tid
+                                and source_key in self._last_seed_keys
+                                and (previous["turn_id"], card["id"]) in self._last_seed_keys):
+                            continue
+                        if previous is None:
+                            floor = self.store.cards[self.store.order[0]]["ts"]
+                            # Time can admit a late discovery inside the window.
+                            # At a tie or without a clock, only admit unseen IDs.
+                            if ((ts is not None and ts < floor)
+                                    or (source_key in self._last_seed_keys
+                                        and (ts is None or ts == floor))):
+                                continue
                     # Media capture enriches a seeded card after the canonical
                     # item has been converted. Keep that server-side
                     # enrichment when the next TTL reseed reconstructs the
                     # same item; otherwise the generated card briefly loses
                     # `attachments`, `_same_card` reports a false change, and
                     # every Codex history card is emitted again on each poll.
-                    previous = self.store.cards.get(card["id"])
                     previous_attachments = ((previous or {}).get("body") or {}).get(
                         "attachments")
                     generated_body = card.get("body") or {}
@@ -1236,11 +1258,11 @@ class CodexThreadDigest(ApprovalCardMixin):
                         card["body"]["attachments"] = [
                             dict(attachment) for attachment in previous_attachments
                         ]
-                    if not emit_unchanged and self._same_card(
-                        self.store.cards.get(card["id"]), card
-                    ):
+                    if not emit_unchanged and self._same_card(previous, card):
                         continue
                     self.store.upsert_card(card)
+        if page_keys:
+            self._last_seed_keys = page_keys
 
     def feed_approval(self, record: dict, resolved: str = "") -> None:
         """Seed 期間也延後 approval 卡，保留 live 與歷史的到達順序。"""
