@@ -1313,6 +1313,11 @@ app 端先行件（不等 bridge）：卡片渲染元件 + 傳輸層抽象
   v2 統一 body:`POST /app/v2/sessions/{id}/approve {approval_id, key}`;
   三種舊 body(`{key}`/`{approve}`/`{approval_id}`)相容期照收。
   409 語意不變(已決/失效);未知 key 回 400 `UNKNOWN_KEY`。
+  CX 的指令／檔案核准若帶 `availableDecisions`，卡片只顯示本次可表達的選項。
+  沒有 `acceptForSession` 就不提供「本次全允許」；永久規則修改不是 session 授權。
+  若可拒絕指令，`deny` 送 `decline`；若供應端只提供取消回合，按鈕改標
+  「停止這一輪」，送 `cancel`。回傳未提供的選項會收到 400 且原請求保留。
+  舊供應端省略清單時才沿用該方法原有的選項。
 - **status 字彙**:pending / approved / **denied**(新決議;歷史列 `rejected` 等價,
   codex 線相容期仍寫 rejected)/ answered(question,result=key)/
   acknowledged(notice)/ expired。

@@ -52,6 +52,7 @@ Both captures can be reproduced independently:
 ```sh
 python3 scripts/probe-cx-lifecycle.py stream --check
 python3 scripts/probe-cx-lifecycle.py interrupt --check
+python3 scripts/probe-cx-lifecycle.py approval --check
 ```
 
 - `stream_resume`: the provider emitted two text chunks for the same item.
@@ -59,6 +60,12 @@ python3 scripts/probe-cx-lifecycle.py interrupt --check
   chunk, then reopens the same store with the phone cursor. It checks every
   remaining sequence, the final card and the turn boundary. This tests
   the Bridge reconnect contract, not iPhone networking or a daemon restart.
+- `approval_pending_and_resolved`: the isolated model stub requests a no-op.
+  The real provider offers one-time accept, a persistent policy amendment and
+  cancel. The probe chooses only cancel; no policy is granted. IDs and the
+  shell wrapper are normalized. The replay sends the phone decision through
+  the approval HTTP endpoint and checks the exact provider reply, receipt,
+  card identity and wait flags. It does not test delivery to a physical phone.
 - `cx-interrupt.jsonl` is a pinned **candidate**, not release promotion
   evidence yet. A real `turn/interrupt` acknowledgement and an
   `interrupted` terminal frame are required for capture. The digest ends its
