@@ -12,6 +12,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest.mock import AsyncMock, patch
 
 _TMP = tempfile.mkdtemp(prefix="a1-canon-")
 os.environ["POCKET_CANON_DB"] = os.path.join(_TMP, "canonical.db")
@@ -85,6 +86,40 @@ class TestWireShape(unittest.TestCase):
 
 
 class TestDecideCore(unittest.TestCase):
+    def test_past_deadline_before_sweeper_never_dispatches(self):
+        aid = "late-device"
+        row = {"status": "pending", "expires_at": time.time() - 1, "source": "claude_code:qa"}
+        with patch.object(bridge, "_approval_get_row", return_value=row), \
+                patch.object(bridge, "_cc_status_core", AsyncMock()) as provider, \
+                self.assertRaises(bridge.BridgeError) as expired:
+            asyncio.run(bridge._approval_decide_core(aid, {"approve": True}))
+        self.assertEqual(expired.exception.status_code, 409)
+        provider.assert_not_awaited()
+
+    def test_phone_and_web_cannot_dispatch_two_keys_for_one_prompt(self):
+        aid, name = "qa-dual-device", "handoff-test"
+        _insert_legacy(aid, "claude_code:" + name)
+        async def exercise():
+            entered, release = asyncio.Event(), asyncio.Event()
+            async def key(*args):
+                entered.set()
+                await release.wait()
+            with patch.dict(bridge._CC_APPROVAL_ACTIVE, {name: {"aid": aid}}), \
+                    patch.object(bridge, "_cc_status_core", AsyncMock(return_value={"prompt":{"title":"QA"}})), \
+                    patch.object(bridge, "_cc_key_core", AsyncMock(side_effect=key)) as send, \
+                    patch.object(bridge, "_cc_cards_feed_approval"):
+                phone = asyncio.create_task(bridge._approval_decide_core(aid, {"key":"1", "approve":True}))
+                await asyncio.wait_for(entered.wait(), 2)
+                web = asyncio.create_task(bridge._approval_decide_core(aid, {"key":"2", "approve":False}))
+                await asyncio.sleep(0)
+                release.set()
+                first, second = await asyncio.gather(phone, web)
+                send.assert_awaited_once_with(name, "1")
+                self.assertEqual(first["status"], "approved")
+                self.assertTrue(second["idempotent"])
+                self.assertEqual(second["status"], first["status"])
+        asyncio.run(exercise())
+
     def _decide(self, aid, body):
         return asyncio.run(bridge._approval_decide_core(aid, body))
 

@@ -47,6 +47,7 @@ import time
 import urllib.parse
 import urllib.request
 import uuid
+import weakref
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -7376,6 +7377,7 @@ class CodexAppServerClient:
             "created_at": record.get("created_at"),
             "thread_id": record.get("thread_id"),
             "options": record.get("options"),   # 發起方宣告的選項(去二元);None → app 用二元預設
+            **{k: record[k] for k in ("q_index", "q_total") if k in record},
         }
 
     def _approval_db_upsert(self, record: dict) -> None:
@@ -32707,7 +32709,18 @@ async def approval_decide(aid: str, request: Request):
     return await _approval_decide_core(aid, b)
 
 
+_APPROVAL_DECISION_LOCKS = weakref.WeakValueDictionary()
+
+
 async def _approval_decide_core(aid: str, b: dict) -> dict:
+    # The phone and web share this entry point. Hold the lock through the
+    # provider side effect and receipt write, not just the initial row read.
+    lock = _APPROVAL_DECISION_LOCKS.setdefault(aid, asyncio.Lock())
+    async with lock:
+        return await _approval_decide_serial(aid, b)
+
+
+async def _approval_decide_serial(aid: str, b: dict) -> dict:
     """Approval Center 決議核心 — v1 與 v2 統一路由 approve 共用。
     A1(spec §3.2):`{key}` 為決定的第一公民;`{approve: bool}` 保留為相容糖
     (approve→第一個 primary、deny→第一個 danger)。status 依 kind 落:
@@ -32735,6 +32748,9 @@ async def _approval_decide_core(aid: str, b: dict) -> dict:
         if d.get("result"):
             out["result"] = d.get("result")
         return out
+    if (d and d.get("status") == "pending" and d.get("expires_at") is not None
+            and d["expires_at"] <= time.time()):
+        raise http_err(409, "APPROVAL_NOT_PENDING", "這項核准已過期")
     if d and str(d.get("kind") or "") == "guest_message":
         # E3 guest 擬稿:DB-backed 審批,**必須在 provider 分支之前**攔下 ——
         # 它的 source/session_id 帶目標 session 前綴(claude_code:/codex:…),
@@ -32804,6 +32820,13 @@ async def _approval_decide_core(aid: str, b: dict) -> dict:
         # mcpServer/elicitation/request)不是二元核准 —— key 就是答案，
         # 另有自由輸入 text。走 answer_question，狀態落 answered。
         if (d.get("kind") or "") == "question":
+            # One approval ID spans the entire questionnaire. A second device's
+            # stale choice must not become the answer to the following question.
+            if "expected_q_index" in b:
+                live = CODEX_APP.pending_approvals.get(aid) or {}
+                index = b["expected_q_index"]
+                if type(index) is not int or index != live.get("q_index"):
+                    raise http_err(409, "STALE_QUESTION", "題目已更新，請重新確認")
             try:
                 result = await CODEX_APP.answer_question(
                     aid, key=key, text=str(b.get("text") or b.get("answer") or ""))

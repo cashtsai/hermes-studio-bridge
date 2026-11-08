@@ -13,8 +13,14 @@ const state = {
   cards: [],          // 目前 session 的卡片
   latestSeq: 0,
   stopStream: null,   // 當前 session SSE 的中止函式
-  atts: [],           // 待送附件 [{kind,filename,mime,data}]
+  view: 0,            // A -> B -> A must invalidate the first A response too.
 };
+const drafts = new Map();  // Page memory only, never persisted on a borrowed device.
+function draftFor(id) {
+  if (!drafts.has(id)) drafts.set(id, { text: "", atts: [], reading: 0, pending: null, notice: "" });
+  return drafts.get(id);
+}
+function currentView(view) { return !signingOut && view === state.view; }
 
 // ───────────────────────── bootstrap(取得 token)─────────────────────────
 const CLAIM_COOKIE = "pocket_console_claim";
@@ -104,6 +110,7 @@ async function leaveConsole(broadcast = false) {
   sessionStorage.setItem(LOGOUT_EVENT, "pending");
   if (broadcast) localStorage.setItem(LOGOUT_EVENT, String(Date.now()));
   if (state.stopStream) state.stopStream();
+  clearTimeout(snapshotRetry);
   if (state.stopList) state.stopList();
   stopBlink();
   try {
@@ -137,22 +144,31 @@ async function api(path, opts) {
   if (r.status === 401) { void leaveConsole(); throw new Error("401"); }
   return r;
 }
-async function apiJSON(path, opts) { return (await api(path, opts)).json(); }
+async function apiJSON(path, opts) {
+  const r = await api(path, opts);
+  if (!r.ok) throw Object.assign(new Error(String(r.status)), { status: r.status });
+  return r.json();
+}
 
 // ───────────────────────── session 列表 ─────────────────────────
 const PROVIDER_LABEL = { claude_code: "CC", codex: "CX", hermes: "人格", openclaw: "OC", cc2: "CC" };
 
+let listRequest = 0;
 async function loadSessions() {
+  const request = ++listRequest;
   try {
     const d = await apiJSON("/app/v2/sessions");
+    if (request !== listRequest || signingOut) return;
     state.sessions = d.sessions || [];
     const degraded = d.degraded_providers || [];
     renderSessions(degraded);
     renderAwaiting();
     renderApproval();
     setConn(true, degraded.length ? ("降級:" + degraded.join(",")) : "已連線");
+    const want = !state.current && hashSession();
+    if (want && state.sessions.some(s => s.id === want)) openSession(want);
   } catch (err) {
-    setConn(false, "取列表失敗");
+    if (request === listRequest && !signingOut) setConn(false, "取列表失敗");
   }
 }
 
@@ -182,7 +198,11 @@ function renderSessions(degraded) {
 }
 
 // ───────────────────────── 卡片流 ─────────────────────────
-async function openSession(id) {
+let snapshotRetry;
+function openSession(id) {
+  if (signingOut) return;
+  const view = ++state.view;
+  clearTimeout(snapshotRetry);
   if (state.stopStream) { state.stopStream(); state.stopStream = null; }
   state.current = id;
   state.cards = []; state.latestSeq = 0;
@@ -190,6 +210,8 @@ async function openSession(id) {
   writeHash(id);                           // 深連結:可加書籤 / 重整不掉頁
   $("stream-head").classList.remove("hidden");
   $("composer").classList.remove("hidden");
+  $("stream-health").textContent = "連線中";
+  showDraft(id);
   const s = state.sessions.find((x) => x.id === id) || {};
   $("sh-provider").textContent = PROVIDER_LABEL[s.provider] || s.provider || "";
   $("sh-name").textContent = s.title || id;
@@ -197,15 +219,32 @@ async function openSession(id) {
   renderApproval();
   if (window.PocketConsoleRail) window.PocketConsoleRail.load();
   $("cards").innerHTML = '<div class="placeholder">載入卡片…</div>';
+  void loadCardSnapshot(id, view);
+}
 
+async function loadCardSnapshot(id, view, delay = 1000) {
+  if (!currentView(view)) return;
   try {
-    const snap = await apiJSON("/app/v2/sessions/" + encodeURIComponent(id) + "/cards?limit=100");
+    const snap = await apiJSON("/app/v2/sessions/" + encodeURIComponent(id) + "/cards?limit=100",
+      { cache: "no-store", signal: AbortSignal.timeout(15000) });
+    if (!currentView(view)) return;
+    if (!Array.isArray(snap.cards) || !Number.isSafeInteger(snap.latest_seq) || snap.latest_seq < 0)
+      throw new Error("無效的卡片回應");
     state.cards = snap.cards || [];
     state.latestSeq = snap.latest_seq || 0;
     renderCards();
-    subscribeCards(id);
+    if (snap.status && snap.status.phase) updateStatusChip(snap.status.phase, snap.status);
+    confirmEcho(id, state.cards);
+    subscribeCards(id, view);
   } catch (err) {
-    $("cards").innerHTML = '<div class="placeholder err">卡片載入失敗:' + esc(err.message) + "</div>";
+    if (!currentView(view)) return;
+    if (err.status >= 400 && err.status < 500 && ![408, 429].includes(err.status)) {
+      $("stream-health").textContent = "卡片無法讀取：" + err.status;
+      $("cards").replaceChildren();
+      return;
+    }
+    $("stream-health").textContent = "連線中斷，正在補接";
+    snapshotRetry = setTimeout(() => loadCardSnapshot(id, view, Math.min(delay * 2, 15000)), delay);
   }
 }
 
@@ -228,47 +267,63 @@ function approvalIdOf(meta) {
   return a.aid || a.id || a.approval_id || null;
 }
 
+const deciding = new Set();
+const handledApproval = new Map();
+let approvalExpiry;
 function renderApproval() {
+  clearTimeout(approvalExpiry);
   const bar = $("approval");
   const s = currentSession();
   const meta = (s && s.meta) || {};
   const prompt = meta.prompt;
   const aid = approvalIdOf(meta);
-  const opts = (prompt && Array.isArray(prompt.options) && prompt.options.length)
-    ? prompt.options : null;
+  const index = meta.approval?.q_index;
+  const step = aid && JSON.stringify([aid, index ?? null]);
+  const options = prompt?.options?.length ? prompt.options : meta.approval?.options;
+  const opts = Array.isArray(options) && options.length ? options : null;
 
-  if (!opts && !aid) { bar.classList.add("hidden"); return; }
+  const expires = meta.approval?.expires_at;
+  const msLeft = Number.isFinite(expires) ? expires * 1000 - Date.now() : Infinity;
+  if (msLeft <= 0 || (!opts && !aid) || (step && handledApproval.get(s.id) === step)) { bar.classList.add("hidden"); return; }
+  if (msLeft !== Infinity) approvalExpiry = setTimeout(renderApproval, Math.min(msLeft + 1, 2147483647));
   bar.classList.remove("hidden");
   $("ap-title").textContent =
     (prompt && prompt.title) || (meta.approval && meta.approval.title) || "等待你放行";
 
   const box = $("ap-actions");
   box.innerHTML = "";
+  if (!aid && document.body.dataset.consoleAccess === "remote") {
+    box.textContent = "等待主機確認核准項目";
+    return;
+  }
   if (opts) {
     // 有選項就照選項畫(CC 的數字選單/權限提示;label 可能是任何語言)
     opts.slice(0, 8).forEach((o) => {
       const b = document.createElement("button");
       b.className = "ap-btn";
       b.textContent = (o.key ? o.key + ". " : "") + (o.label || "");
-      b.addEventListener("click", () => decide({ key: String(o.key) }, b));
+      b.addEventListener("click", () => decide(s.id, aid, index, { key: String(o.key) }, b));
       box.appendChild(b);
     });
   } else {
     const yes = document.createElement("button");
     yes.className = "ap-btn ap-yes"; yes.textContent = "核准";
-    yes.addEventListener("click", () => decide({ approve: true }, yes));
+    yes.addEventListener("click", () => decide(s.id, aid, index, { approve: true }, yes));
     const no = document.createElement("button");
     no.className = "ap-btn ap-no"; no.textContent = "否決";
-    no.addEventListener("click", () => decide({ approve: false }, no));
+    no.addEventListener("click", () => decide(s.id, aid, index, { approve: false }, no));
     box.append(yes, no);
   }
+  if (deciding.has(s.id)) box.querySelectorAll("button").forEach(b => b.disabled = true);
 }
 
-async function decide(choice, btn) {
-  const id = state.current;
-  if (!id) return;
-  const aid = approvalIdOf((currentSession() || {}).meta);
+async function decide(id, aid, index, choice, btn) {
+  if (!id || id !== state.current || deciding.has(id) || signingOut) return;
+  if (!aid && document.body.dataset.consoleAccess === "remote") return;
+  deciding.add(id);
   const body = Object.assign({}, choice, aid ? { approval_id: aid } : {});
+  if (Number.isInteger(index)) body.expected_q_index = index;
+  const step = JSON.stringify([aid, index ?? null]);
   // 樂觀:整排先停用,避免連點送出兩個決定
   const box = $("ap-actions");
   box.querySelectorAll("button").forEach((b) => (b.disabled = true));
@@ -280,15 +335,18 @@ async function decide(choice, btn) {
     });
     if (!r.ok) {
       const e = await r.json().catch(() => ({}));
+      if (aid && r.status === 409 && ["STALE_QUESTION", "APPROVAL_NOT_PENDING"].includes(e.error?.code))
+        handledApproval.set(id, step);
       throw new Error((e.error && e.error.message) || ("HTTP " + r.status));
     }
-    toast("已送出決定");
-    $("approval").classList.add("hidden");   // 事件流會把真實狀態補回來
-    loadSessions();
+    const receipt = await r.json();
+    if (aid) handledApproval.set(id, step);
+    if (!signingOut && state.current === id) toast(receipt.idempotent ? "這項核准已處理" : "已送出決定");
   } catch (err) {
-    toast("放行失敗:" + err.message);
-    box.querySelectorAll("button").forEach((b) => (b.disabled = false));
-    if (btn) btn.classList.remove("ap-busy");
+    if (!signingOut && state.current === id) toast("無法確認決定：" + err.message);
+  } finally {
+    deciding.delete(id);
+    if (!signingOut) { renderApproval(); loadSessions(); }
   }
 }
 
@@ -310,18 +368,45 @@ function jumpToAwaiting() {
   if (s) openSession(s.id);
 }
 
-function subscribeCards(id) {
-  const url = "/app/v2/sessions/" + encodeURIComponent(id) +
+function subscribeCards(id, view) {
+  let resyncing = false;
+  function resync() {
+    if (!currentView(view) || resyncing) return;
+    resyncing = true;
+    if (state.stopStream) { state.stopStream(); state.stopStream = null; }
+    $("stream-health").textContent = "正在同步";
+    void loadCardSnapshot(id, view);
+  }
+  const url = () => "/app/v2/sessions/" + encodeURIComponent(id) +
               "/events?since_seq=" + state.latestSeq + "&profile=phone";
   state.stopStream = sseStream(url, state.token, {
     onEvent: (evt) => {
-      const c = evt.data && evt.data.card;
-      if (c) { upsertCard(c); if (evt.data.seq) state.latestSeq = evt.data.seq; }
-      // status 事件:更新狀態 chip
-      if (evt.data && evt.data.status) updateStatusChip(evt.data.status.phase, evt.data.status);
+      if (!currentView(view)) return;
+      const envelope = evt.data || {}, payload = envelope.data || {}, seq = envelope.seq;
+      if (!Number.isSafeInteger(seq)) return;
+      if (envelope.type === "ping") {
+        if (seq !== state.latestSeq) resync();
+        return;
+      }
+      if (seq <= state.latestSeq) return;
+      if (seq !== state.latestSeq + 1) { resync(); return; }
+      if (envelope.type === "card.upsert" && payload.card) {
+        upsertCard(payload.card);
+        confirmEcho(id, [payload.card]);
+      } else if (envelope.type === "session.status") {
+        updateStatusChip(payload.phase, payload);
+        scheduleListRefresh();
+      }
+      state.latestSeq = seq;
     },
-    onGone: () => openSession(id),         // 410 → 冷載重來
-    onError: () => {},                     // sse.js 內建重連
+    onGone: resync,
+    onOpen: () => { if (currentView(view)) $("stream-health").textContent = ""; },
+    onError: () => { if (currentView(view)) $("stream-health").textContent = "連線中斷，正在補接"; },
+    onDenied: code => {
+      if (!currentView(view)) return;
+      if (code === 401) void leaveConsole();
+      else $("stream-health").textContent = "無權讀取";
+    },
   });
 }
 
@@ -480,20 +565,79 @@ function updateStatusChip(phase, meta) {
 }
 
 // ───────────────────────── 送出 / 中斷 ─────────────────────────
-async function sendInput(text) {
-  if (!state.current) return;
-  if (!text.trim() && !state.atts.length) return;
-  const cid = (crypto.randomUUID ? crypto.randomUUID() : String(Date.now()));
+function showDraft(id) {
+  if (signingOut || state.current !== id) return;
+  const d = draftFor(id), pending = d.pending;
+  $("input").value = d.text;
+  $("input").readOnly = !!pending;
+  $("attach").disabled = !!pending;
+  $("send").disabled = !!pending || d.reading > 0;
+  $("delivery").classList.toggle("hidden", !d.notice);
+  $("delivery-text").textContent = d.notice;
+  $("check-delivery").hidden = !pending || pending.phase !== "unknown";
+  $("forget-delivery").hidden = $("check-delivery").hidden;
+  renderAtts(); autosize();
+}
+
+function finishInput(id, d, notice) {
+  d.pending = null; d.text = ""; d.atts = []; d.notice = notice;
+  showDraft(id);
+}
+
+function confirmEcho(id, cards) {
+  const d = draftFor(id);
+  if (d.pending && cards.some(c => c.role === "user" && c.body?.client_id === d.pending.cid)) {
+    finishInput(id, d, "主機已收到");
+    return true;
+  }
+  return false;
+}
+
+async function checkDelivery() {
+  const id = state.current, d = draftFor(id), p = d.pending;
+  if (!p || p.phase !== "unknown") return;
+  p.phase = "checking"; d.notice = "正在查詢送達紀錄…"; showDraft(id);
   try {
-    const r = await api("/app/v2/sessions/" + encodeURIComponent(state.current) + "/input", {
+    const snap = await apiJSON("/app/v2/sessions/" + encodeURIComponent(id) + "/cards?limit=100",
+      { signal: AbortSignal.timeout(15000), cache: "no-store" });
+    if (d.pending !== p || confirmEcho(id, snap.cards || [])) return;
+    d.notice = "目前未找到收據，請核對原對話。未重新送出。";
+  } catch (_) {
+    if (d.pending !== p) return;
+    d.notice = "暫時無法確認送達。未重新送出。";
+  }
+  p.phase = "unknown"; showDraft(id);
+}
+
+async function sendInput(text) {
+  const id = state.current;
+  if (!id || signingOut) return;
+  const d = draftFor(id);
+  if (d.pending || d.reading || (!text.trim() && !d.atts.length)) return;
+  d.text = text;
+  if (!navigator.onLine) { d.notice = "目前離線，訊息尚未送出"; showDraft(id); return; }
+  const cid = crypto.randomUUID ? crypto.randomUUID() : Array.from(crypto.getRandomValues(
+    new Uint32Array(4)), n => n.toString(16).padStart(8, "0")).join("");
+  const p = { cid, phase: "sending" };
+  d.pending = p; d.notice = "送出中…"; showDraft(id);
+  try {
+    const r = await api("/app/v2/sessions/" + encodeURIComponent(id) + "/input", {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(Object.assign({ content: text, client_id: cid },
-        state.atts.length ? { attachments: state.atts } : {})),
+      signal: AbortSignal.timeout(90000),
+      body: JSON.stringify({ content: text, client_id: cid, ...(d.atts.length ? { attachments: d.atts } : {}) }),
     });
-    if (!r.ok) { const e = await r.json().catch(() => ({})); throw new Error((e.error && e.error.message) || ("HTTP " + r.status)); }
-    $("input").value = ""; autosize();
-    state.atts = []; renderAtts();
-  } catch (err) { toast("送出失敗:" + err.message); }
+    const ack = await r.json();
+    if (d.pending !== p) return; // SSE may acknowledge first, freeing the next draft.
+    if ([400, 403, 404, 413, 422].includes(r.status) && ack.error?.code) {
+      d.pending = null; d.notice = "主機拒絕送出：" + (ack.error.message || r.status);
+      showDraft(id); return;
+    }
+    if (!r.ok || ack.ok !== true || (ack.session_id && ack.session_id !== id)) throw new Error();
+    finishInput(id, d, ack.queued || ack.delivery === "queued" ? "已排入佇列" : "主機已收到");
+  } catch (_) {
+    if (d.pending !== p) return;
+    p.phase = "unknown"; d.notice = "送達狀態不明，請先確認。未重新送出。"; showDraft(id);
+  }
 }
 
 async function interrupt() {
@@ -556,9 +700,22 @@ function wire() {
   });
   $("interrupt").addEventListener("click", interrupt);
   $("composer").addEventListener("submit", (e) => { e.preventDefault(); sendInput($("input").value); });
-  $("input").addEventListener("input", autosize);
+  $("input").addEventListener("input", () => {
+    if (state.current) {
+      const d = draftFor(state.current);
+      d.text = $("input").value;
+      if (!d.pending) { d.notice = ""; $("delivery").classList.add("hidden"); }
+    }
+    autosize();
+  });
+  $("check-delivery").addEventListener("click", checkDelivery);
+  $("forget-delivery").addEventListener("click", () => {
+    const id = state.current, d = draftFor(id);
+    if (d.pending?.phase === "unknown" && confirm("指令可能已在執行。結束追蹤並清空這則草稿？不會重送或停止工作。"))
+      finishInput(id, d, "");
+  });
   $("input").addEventListener("keydown", (e) => {
-    if ((e.metaKey || e.ctrlKey) && e.key === "Enter") { e.preventDefault(); sendInput($("input").value); }
+    if (!e.isComposing && (e.metaKey || e.ctrlKey) && e.key === "Enter") { e.preventDefault(); sendInput($("input").value); }
   });
 }
 
@@ -589,6 +746,7 @@ function moveSelection(delta) {
   if (next && next !== state.current) openSession(next);
 }
 function firstApprovalButton(wantYes) {
+  if ($("approval").classList.contains("hidden")) return null;
   const btns = Array.from($("ap-actions").querySelectorAll("button"));
   if (!btns.length) return null;
   const hit = btns.find((b) => b.classList.contains(wantYes ? "ap-yes" : "ap-no"));
@@ -675,27 +833,34 @@ function attKind(mime) {
 }
 
 function addFiles(files) {
+  const id = state.current;
+  if (!id || signingOut) return;
+  const d = draftFor(id);
+  if (d.pending) return;
   Array.from(files || []).forEach((f) => {
     if (f.size > ATT_MAX_BYTES) { toast(f.name + " 超過 8MB,改用檔案路徑引用"); return; }
     const fr = new FileReader();
+    d.reading++;
     fr.onload = () => {
-      state.atts.push({ kind: attKind(f.type), filename: f.name,
+      d.atts.push({ kind: attKind(f.type), filename: f.name,
                         mime: f.type || "application/octet-stream", data: fr.result });
-      renderAtts();
     };
-    fr.onerror = () => toast("讀取 " + f.name + " 失敗");
+    fr.onerror = () => { d.notice = "讀取 " + f.name + " 失敗"; };
+    fr.onloadend = () => { d.reading--; showDraft(id); };
     fr.readAsDataURL(f);
   });
+  showDraft(id);
 }
 
 function renderAtts() {
   const box = $("atts");
-  box.classList.toggle("hidden", !state.atts.length);
-  box.innerHTML = state.atts.map((a, i) =>
+  const d = draftFor(state.current);
+  box.classList.toggle("hidden", !d.atts.length);
+  box.innerHTML = d.atts.map((a, i) =>
     '<span class="att">' + esc(a.filename) +
-    '<button class="att-x" data-i="' + i + '" title="移除">×</button></span>').join("");
+    '<button class="att-x" ' + (d.pending ? "disabled " : "") + 'data-i="' + i + '" title="移除">×</button></span>').join("");
   box.querySelectorAll(".att-x").forEach((b) =>
-    b.addEventListener("click", () => { state.atts.splice(Number(b.dataset.i), 1); renderAtts(); }));
+    b.addEventListener("click", () => { if (!d.pending) d.atts.splice(Number(b.dataset.i), 1); renderAtts(); }));
 }
 
 
@@ -763,18 +928,22 @@ async function main() {
     navigator.serviceWorker.register("/console/sw.js", { scope: "/console" })
       .catch(() => { /* 裝不起來不影響使用,不要吵使用者 */ });
   }
-  const want = hashSession();              // 深連結:帶 #session= 就直接開
-  if (want && state.sessions.some((s) => s.id === want)) openSession(want);
   // 全域 SSE:任何 session 狀態變動都刷新列表(無 410 問題,見規格)
   if (document.body.dataset.consoleAccess === "remote") {
     // The scoped session list is allowed; the cross-session event log is not.
     setInterval(() => { if (!document.hidden && !signingOut) loadSessions(); }, 10000);
     return;
   }
-  state.stopList = sseStream("/app/v2/events?follow=true&since_seq=0", state.token, {
-    onEvent: () => { /* 去抖:每次事件觸發輕量刷新 */ scheduleListRefresh(); },
+  let listCursor = 0;
+  state.stopList = sseStream(() => "/app/v2/events?follow=true&since_seq=" + listCursor, state.token, {
+    onEvent: ({data}) => {
+      if (!Number.isSafeInteger(data?.seq) || data.seq <= listCursor) return;
+      listCursor = data.seq;
+      scheduleListRefresh();
+    },
     onError: () => setConn(false, "事件流斷線,重連中…"),
     onOpen: () => {},
+    onDenied: code => { if (code === 401) void leaveConsole(); else setConn(false, "無權讀取事件"); },
   });
 }
 let listTimer = null;
