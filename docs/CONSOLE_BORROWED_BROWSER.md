@@ -20,7 +20,7 @@
 1. 先在測試主機套用 bridge 與整套 Console 靜態資產，驗證舊 service worker 能更新。只在已審核的測試入口驗收 QR；不要為了測試而開放正式主機所有轉送入口。
 2. 先前發過的瀏覽器 token 不會因這次更新而自動被降權。擁有者應從配對裝置清單核對來源，撤銷已辨認的舊瀏覽器授權後重新掃碼；**不可按裝置名稱批量撤銷手機或其他既有裝置**。核對完之前不建議對外開放。
 3. 用未連私網的 Chromebook、真手機和測試主機驗證：拒絕/核准、CC 和 Codex 原對話各一來一回、手機撤銷單一瀏覽器、離線重開、第二位使用者重新登入。輪用電腦不要使用 Chrome 同步保存網站授權。不要保存 QR 或 token 到 QA 證據。
-4. 以上通過再決定推出範圍。下方各批為獨立工作樹進度；跨使用者固定入口與外網實機驗收仍未交付，不要把隔離測試通過當成公網已能上工。
+4. 以上通過再決定推出範圍。W01–W06 已在同一候選版整合；跨使用者固定入口與外網實機驗收不在本機測試結果內。
 
 驗證：`pytest -q tests/test_console*.py`。有 Playwright 和 Google Chrome 的環境可另跑 `node --test tests/browser/console-leave.cjs`：使用臨時瀏覽器與 loopback fixture，不接觸正式資料。Python 測真實 bridge 登入與換證處理器；Chrome 測畫面、多分頁、重試及離線快取。
 
@@ -56,3 +56,30 @@
 這是瀏覽器入口的權限限制，**不是 agent 的沙箱**。能在原對話下工作指令，就可能動用機主本來授予 agent 的工具；上線前另外確認 Claude Code／Codex 的主機核准政策。
 
 重跑：`BRIDGE_TOKEN=test-unit-token python -m pytest -q tests/test_console*.py`（只用合成 token），以及 `node --test tests/browser/*.cjs`。隔離測試包含正常 Codex thread 派送及冪等、未知 session、HTTP 方法混用、跨瀏覽器、跨對話核准、路徑逃逸及前端權限收回；未連線至正式 provider。下一關在測試主機上以真手機掃碼，從外網 Chromebook 對 CC 與 Codex 各跑一次收發、核准與離席；不直接開正式 relay。
+
+## 整合驗收（2026-11-08）
+
+整合版本保留題號與 capability 白名單兩層檢查：借用瀏覽器只能回答自己剛取得權限的 Codex 題目，派送前還要比對 provider 現在停留的題號。手機已答同一題時，舊頁面不能替下一題作答。斷線補快照期間，即使首頁清單更新也不會拿舊游標重新訂閱。
+
+| 測試 | 實測範圍 |
+| --- | --- |
+| Chrome 介面回歸 | 10 個情境通過，含 30 秒斷線、收據遺失、同名工作、窄版、兩題共用核准 ID、授權撤回。用合成資料。 |
+| Chrome → 真 bridge → 測試 provider | 真 HTTP、QR 登入拒絕與核准、換證、CC/CX 各一條對話、SSE、手機 API 續答、重整、登出後舊 token 收到 401、手機 API 仍可讀。只有 provider 邊界用合成回覆。 |
+| Chrome → 真 bridge → 真 Codex app-server | 用新 thread。網頁送隨機字串；手機 API 不重述該字串，只請它延續上一個答案，再從網頁驗證完整結果。重整後答案仍在。通過，沒有使用任何既有工作對話。 |
+| 後端 | repo runner 的 185 個測試檔均已執行並通過（含分開補測）。首次以 CI 條件跑，178 通過、2 受環境影響、5 跳過。另以測試用 Unix socket、獨立 HOME/PTY、模擬 persona 目錄補齊；plist 取 token 的測試不可預設 BRIDGE_TOKEN。 |
+
+先準備 repo 的 Python 測試依賴、Node Playwright 與 Chrome。從 repo 根目錄執行：
+
+```sh
+POCKET_TEST_LONG_OUTAGE=1 node --test tests/browser/*.cjs
+PYTHON=python3 node --test tests/integration/console-roundtrip.cjs
+```
+
+第二條會自行啟停 loopback bridge、建立臨時 profile，無需模型帳號。下列為**選用的真模型驗收**，會使用登入帳號的少量額度。僅在信任的本機執行；使用 repo 既有的 auth 連結機制，不複製憑證或使用者設定。測試會在工作樹旁建立臨時空專案（macOS 的 /private/tmp 工作會被清單過濾），結束即移除。
+
+```sh
+CONSOLE_QA_CODEX_BIN="$(command -v codex)" CONSOLE_QA_CODEX_SOURCE="${CODEX_HOME:-$HOME/.codex}" \
+  PYTHON=python3 node --test tests/integration/console-roundtrip.cjs
+```
+
+**放行條件仍未滿足：**本次 Claude Code 已登入但帳號週額度用完，不能將合成 CC 回覆計為真 CC 收發。手機 API 驗收也不是 iPhone 相機掃碼。最終仍須在受限 HTTPS 測試入口，用真 iPhone 與不連私網的 Pixelbook 跑 CC、CX 原對話接力與離席；驗收前勿切正式入口。
