@@ -6489,6 +6489,10 @@ class CodexAppServerClient:
             # 截圖(base64)可能單則破 8MB → 預設 1MB 上限會直接把連線關掉。
             # 與 stdio 共用上限，涵蓋產圖 session 的大型歷史回應。
             max_size=CODEX_APP_SERVER_MAX_MESSAGE_BYTES,
+            # A 181 MB history response takes ~30s locally. The default 20s
+            # pong deadline can expire while that frame is still transferring.
+            # RPC and turn watchdogs remain independently bounded.
+            ping_timeout=90,
             user_agent_header="PocketAgent-Bridge/0.1",
         )
         self.transport = "unix-websocket"
