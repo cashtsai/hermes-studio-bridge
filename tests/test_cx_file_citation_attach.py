@@ -77,6 +77,24 @@ class CXFileCitationAttachTest(unittest.TestCase):
         self.d.store.upsert_card(_card(f'see {self.path}'))
         self.assertEqual(carddigest.attach_captured_media(self.d.store, []), 0)
 
+    def test_reseed_preserves_media_enrichment_without_emitting_history_again(self):
+        turns = [{"id": "turn-1", "items": [{
+            "id": "item-1", "type": "agentMessage",
+            "text": f'完成。\n:codex-file-citation{{path="{self.path}" purpose="output"}}',
+        }]}]
+        self.d.seed_turns(turns)
+        self.assertEqual(carddigest.attach_captured_media(self.d.store, self.cap), 1)
+        seq_before_reseed = self.d.store.seq
+
+        self.d.seed_turns(turns, emit_unchanged=False)
+
+        self.assertEqual(self.d.store.seq, seq_before_reseed,
+                         "已掛附件的相同歷史不得在 TTL reseed 再發 card.upsert")
+        self.assertEqual(
+            self.d.store.cards["card-cx-item-1"]["body"]["attachments"][0]["media_id"],
+            "med_1",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
