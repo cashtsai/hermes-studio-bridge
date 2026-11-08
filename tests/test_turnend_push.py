@@ -97,6 +97,7 @@ class TurnEndPushCoreTest(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(0)
         self.assertTrue(rec.calls[0]["title"].startswith("⚠️ "))
         self.assertEqual(len(rec.calls[0]["body"]), 80)
+        self.assertEqual(rec.calls[0]["kwargs"]["no_preview_body"], "回合執行失敗")
         self.assertEqual(rec.calls[1]["body"], "回合已完成,回來看看結果")
 
 
@@ -148,6 +149,23 @@ class CxTurnEndPushTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(calls[0]["body"], "PR 已開好")
         self.assertEqual(calls[0]["data"]["pocket"]["sessionId"],
                          f"codex:{self.TID}")
+
+    async def test_failed_wire_turn_agrees_across_status_cards_and_push(self):
+        client = bridge.CodexAppServerClient()
+        for error, expected in [(None, "Codex 回合執行失敗"), ("boom", "boom")]:
+            with self.subTest(error=error), \
+                    patch.object(bridge, "_cx_preview_cache_note"), \
+                    patch.object(bridge, "_cx_toolsteps_note"), \
+                    patch.object(bridge, "_delegation_codex_completed") as delegated, \
+                    patch.object(bridge, "_cx_turn_end_push") as push:
+                turn = {"id": "fixture", "status": "failed", "error": error}
+                client._handle_notification({"method": "turn/completed",
+                                             "params": {"threadId": self.TID, "turn": turn}})
+                await asyncio.sleep(0)
+                self.assertEqual(client.runtime_status(self.TID, "idle"), "failed")
+                self.assertEqual(self.digest.store.snapshot()["status"]["phase"], "error")
+                push.assert_called_once_with(self.TID, expected)
+                delegated.assert_awaited_once_with(self.TID, True, expected)
 
     async def test_display_falls_back_to_tid(self):
         bridge._CODEX_V2_VISIBLE_CACHE = []

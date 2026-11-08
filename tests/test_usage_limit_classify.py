@@ -108,12 +108,13 @@ class TestCxDigest(unittest.TestCase):
         self.assertEqual(d.store.status["phase"], "run")
         self.assertIsNone(d.usage_limit)
 
-    def test_ordinary_error_keeps_idle(self):
+    def test_ordinary_failure_is_terminal_but_not_usage_limited(self):
         d = carddigest.CodexThreadDigest()
         d.handle("turn/started", {"turn": {"id": "t1"}})
         d.handle("turn/completed", {"turn": {
             "id": "t1", "error": {"message": "sandbox denied: exit 1"}}})
-        self.assertEqual(d.store.status["phase"], "idle")
+        self.assertFalse(d.store.status["busy"])
+        self.assertEqual(d.store.status["phase"], "error")
         metas = [c for c in d.store.cards.values()
                  if (c.get("body") or {}).get("meta")]
         self.assertEqual(metas, [])

@@ -909,6 +909,21 @@ def classify_error(text: str, now: float | None = None) -> dict | None:
             "reset_at": parse_usage_reset_at(t, now)}
 
 
+def codex_terminal_error(turn: dict) -> str:
+    """Interpret turn/completed once for the transcript, status and notifications."""
+    if not isinstance(turn, dict):
+        return ""
+    error = turn.get("error")
+    if isinstance(error, str) and error.strip():
+        return error.strip()
+    if isinstance(error, dict):
+        message = error.get("message")
+        if isinstance(message, str) and message.strip():
+            return message.strip()
+    # A failed turn need not carry details. Do not dump arbitrary provider metadata.
+    return "Codex 回合執行失敗" if error or turn.get("status") == "failed" else ""
+
+
 def error_card_body(text: str) -> tuple[dict, dict | None]:
     """error 卡 body 統一產生點:⚠️ 文案 + (命中時)分類 meta。
     回 (body, meta) —— 宿主 digest 拿 meta 去記 usage_limited 狀態。"""
@@ -1314,14 +1329,13 @@ class CodexThreadDigest(ApprovalCardMixin):
             self._status()
         elif method == "turn/completed":
             turn = params.get("turn") or {}
-            err = turn.get("error") if isinstance(turn, dict) else None
+            msg = codex_terminal_error(turn)
             self.busy = False
-            self.runtime_status = "done"
+            self.runtime_status = "failed" if msg else "done"
             self.prompt = None
             self.turn_started_at = 0.0     # 起算點跟著回合走,不留給下一輪
             self.store.push_turn("end", self.store.turn_id or str(turn.get("id") or ""))
-            if err:
-                msg = str(err.get("message", err))
+            if msg:
                 body, ul_meta = error_card_body(msg)
                 if ul_meta:
                     self.usage_limit = ul_meta

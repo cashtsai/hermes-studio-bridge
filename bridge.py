@@ -5236,7 +5236,8 @@ def _turn_end_push(sid: str, display: str, summary: str, ok: bool = True) -> Non
     if now - _TURNEND_PUSH_LAST.get(sid, 0.0) < _TURNEND_PUSH_MIN_SECS:
         _log_event("turnend_push_throttled", session=sid)
         return
-    body = (summary or "").strip()[:80] or "回合已完成,回來看看結果"
+    private_body = "回合已完成" if ok else "回合執行失敗"
+    body = (summary or "").strip()[:80] or f"{private_body},回來看看結果"
     title = ("✅ " if ok else "⚠️ ") + (display or sid)[:40]
     data = {"kind": "message",
             "pocket": {"kind": "message", "sessionId": sid}}
@@ -5252,7 +5253,7 @@ def _turn_end_push(sid: str, display: str, summary: str, ok: bool = True) -> Non
                           terminal_state=("completed" if ok else "failed"))
     t = loop.create_task(push_notify(title, body, data,
                                      thread_id=sid, content_available=True,
-                                     no_preview_body="回合已完成"))
+                                     no_preview_body=private_body))
     _BG_TASKS.add(t)
     t.add_done_callback(_BG_TASKS.discard)
     _log_event("turnend_push", session=sid, ok=ok, chars=len(body))
@@ -7811,10 +7812,9 @@ class CodexAppServerClient:
             _codex_history_invalidate(tid)   # cached /history page is now stale
             self._drop_thread_approvals(tid)
             turn = params.get("turn") or {}
-            err = turn.get("error") if isinstance(turn, dict) else None
-            if err:
-                msg = err.get("message", err)
-                self.thread_errors[tid] = str(msg)
+            msg = carddigest.codex_terminal_error(turn)
+            if msg:
+                self.thread_errors[tid] = msg
                 self._append(tid, ("text", f"\n⚠️ Codex turn failed: {msg}\n"))
             elif not self.thread_errors.get(tid, "").startswith("Codex turn stalled"):
                 # stalled 在這裡**刻意保留**:watchdog 中止卡住的回合時 codex 會
@@ -7825,8 +7825,7 @@ class CodexAppServerClient:
             # M1:是委派 thread → 回流父對話(running→idle/failed 轉換內部去重)。
             try:
                 t = asyncio.create_task(_delegation_codex_completed(
-                    tid, bool(err),
-                    str(err.get("message", err))[:300] if err else ""))
+                    tid, bool(msg), msg[:300]))
                 _BG_TASKS.add(t)
                 t.add_done_callback(_BG_TASKS.discard)
             except RuntimeError:
@@ -7835,8 +7834,7 @@ class CodexAppServerClient:
             # 「誰在看/委派雙響/桌面版鎖定/節流」的不推判定都在函式內;
             # 絕不讓它把例外拋進通知處理路徑。
             try:
-                _cx_turn_end_push(
-                    tid, str(err.get("message", err))[:160] if err else "")
+                _cx_turn_end_push(tid, msg[:160])
             except Exception as e:  # noqa: BLE001
                 _log_exc("_cx_turn_end_push", e, expected=True)
             return

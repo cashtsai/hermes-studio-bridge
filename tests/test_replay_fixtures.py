@@ -196,6 +196,12 @@ class TestCxTurnError(unittest.TestCase):
                 (c["body"].get("text") or "")]
         self.assertEqual(len(errs), 1)
         self.assertFalse(d.busy)
+        self.assertEqual(d.runtime_status, "failed")
+        self.assertEqual(d.store.snapshot()["status"]["phase"], "error")
+        self.assertEqual([e["data"]["state"] for e in d.store.events
+                          if e["type"] == "turn"], ["begin", "end"])
+        d.handle("turn/started", {"turn": {"id": "next"}})
+        self.assertEqual(d.store.snapshot()["status"]["phase"], "run")
 
 
 class TestCxApproval(unittest.TestCase):
