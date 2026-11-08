@@ -341,9 +341,46 @@ class AlignOnStartTests(unittest.TestCase):
         self.assertEqual([m for m, _ in seen],
                          ["thread/loaded/list", "thread/list"])
         self.assertEqual(app.runtime_status(TID, ""), "running")
-        self.assertIn(TID, app.loaded_threads)
+        # Daemon residency is not a subscription on this new connection.
+        self.assertNotIn(TID, app.loaded_threads)
         # 沒 loaded 的那條不該被灌進來
         self.assertNotIn("other", app.provider_status)
+
+    def test_first_input_after_reconnect_resumes_before_starting_turn(self):
+        app, seen = self._client_with_calls({
+            "thread/loaded/list": {"data": [TID]},
+            "thread/list": {"data": [
+                {"id": TID, "status": {"type": "idle"}}]},
+            "thread/resume": {"thread": {"id": TID}},
+            "turn/start": {"turn": {"id": "after-reconnect"}},
+        })
+
+        async def run():
+            await app.align_provider_status()
+            await app.start_turn(TID, [{"type": "text", "text": "continue"}])
+
+        with patch.object(app, "_start_turn_watchdog"):
+            asyncio.run(run())
+        self.assertEqual([m for m, _ in seen], [
+            "thread/loaded/list", "thread/list", "thread/resume", "turn/start"])
+        self.assertIn(TID, app.loaded_threads)
+
+    def test_alignment_preserves_an_existing_connection_subscription(self):
+        app, seen = self._client_with_calls({
+            "thread/loaded/list": {"data": [TID]},
+            "thread/list": {"data": [
+                {"id": TID, "status": {"type": "idle"}}]},
+            "turn/start": {"turn": {"id": "already-subscribed"}},
+        })
+        app.loaded_threads.add(TID)
+
+        async def run():
+            await app.align_provider_status()
+            await app.start_turn(TID, [{"type": "text", "text": "continue"}])
+
+        with patch.object(app, "_start_turn_watchdog"):
+            asyncio.run(run())
+        self.assertNotIn("thread/resume", [m for m, _ in seen])
 
     def test_align_is_the_restart_survival_path(self):
         """重啟後 active_turns 是空的,狀態完全靠 align 撈回來。"""
@@ -413,7 +450,7 @@ class AlignOnStartTests(unittest.TestCase):
             "thread/list": bridge.CodexAppServerError("nope"),
         })
         self.assertEqual(asyncio.run(app.align_provider_status()), 0)
-        self.assertIn(TID, app.loaded_threads)
+        self.assertNotIn(TID, app.loaded_threads)
 
     def test_align_noop_when_nothing_loaded(self):
         app, seen = self._client_with_calls({"thread/loaded/list": {"data": []}})

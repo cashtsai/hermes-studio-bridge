@@ -6268,6 +6268,8 @@ class CodexAppServerClient:
         self.last_event_at = {}
         self.thread_errors = {}
         self._unknown_notif_seen: dict = {}   # method -> 上次記錄時間(節流,見 _handle_notification)
+        # Threads started/resumed on this connection (and therefore subscribed).
+        # The daemon's loaded/list is global and cannot populate this set.
         self.loaded_threads = set()
         # thread-store 寫入鎖(被別的 codex app-server 佔用)。
         # thread_id -> {"since": wall, "last_at": wall, "attempts": int,
@@ -7614,6 +7616,9 @@ class CodexAppServerClient:
                 self.loaded_threads.add(tid)
             return
         tid = params.get("threadId")
+        if method == "thread/closed" and tid:
+            self.loaded_threads.discard(tid)
+            return
         # 看門狗活著訊號:**任何**帶 threadId 的通知都算「這個回合還活著」。
         #
         # 原本只有 `_append` 會更新 last_event_at,而 `_append` 只在
@@ -8095,11 +8100,16 @@ class CodexAppServerClient:
             for tid in ((res or {}).get("data") or []):
                 if isinstance(tid, str) and tid:
                     loaded.add(tid)
-                    self.loaded_threads.add(tid)
+                    # This only reports daemon residency. After a bridge
+                    # reconnect, this socket has not resumed/subscribed to
+                    # these threads. Marking them loaded locally skips resume
+                    # on the next input: turn/start succeeds, but progress is
+                    # not delivered and the watchdog interrupts healthy work.
         except Exception as e:  # noqa: BLE001
             _log_event("codex_loaded_list_failed", error=type(e).__name__,
                        error_message=str(e)[:200])
             return 0
+        loaded_count = len(loaded)
         aligned = 0
         if loaded:
             # loaded/list 只給 id,狀態要靠 thread/list 的 `status` 欄。
@@ -8130,7 +8140,7 @@ class CodexAppServerClient:
             except Exception as e:  # noqa: BLE001
                 _log_event("codex_status_read_failed", thread=tid[:16],
                            error=type(e).__name__, error_message=str(e)[:200])
-        _log_event("codex_status_aligned", loaded=len(self.loaded_threads),
+        _log_event("codex_status_aligned", loaded=loaded_count,
                    aligned=aligned)
         return aligned
 
