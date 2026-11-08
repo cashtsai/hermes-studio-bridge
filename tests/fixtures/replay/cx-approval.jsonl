@@ -1,0 +1,6 @@
+{"method":"turn/started","params":{"threadId":"fixture-thread","turn":{"id":"fixture-turn","status":"inProgress"}}}
+{"method":"thread/status/changed","params":{"status":{"activeFlags":["waitingOnApproval"],"type":"active"},"threadId":"fixture-thread"}}
+{"id":101,"method":"item/commandExecution/requestApproval","params":{"availableDecisions":["accept",{"acceptWithExecpolicyAmendment":{"execpolicy_amendment":["true"]}},"cancel"],"command":"true","itemId":"fixture-item","reason":"Allow the fixture no-op?","threadId":"fixture-thread","turnId":"fixture-turn"}}
+{"method":"serverRequest/resolved","params":{"requestId":101,"threadId":"fixture-thread"}}
+{"method":"thread/status/changed","params":{"status":{"activeFlags":[],"type":"active"},"threadId":"fixture-thread"}}
+{"method":"turn/completed","params":{"threadId":"fixture-thread","turn":{"id":"fixture-turn","status":"interrupted"}}}

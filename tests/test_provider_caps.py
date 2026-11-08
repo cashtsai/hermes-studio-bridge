@@ -56,7 +56,8 @@ class TestProviderCaps(unittest.TestCase):
         payload = bridge._provider_caps_payload()
         codex = payload["codex"]["replay"]
         self.assertEqual(codex["source"], "manifest")
-        self.assertEqual(codex["scenarios"], ["error_terminal", "simple_turn", "stream_resume"])
+        self.assertEqual(codex["scenarios"], ["approval_pending_and_resolved", "error_terminal",
+                                             "simple_turn", "stream_resume"])
         self.assertFalse(codex["release_ready"])
         # Hermes is a declared runtime provider but has no reviewed fixture yet;
         # absence must not be interpreted as release readiness.

@@ -16,6 +16,7 @@ import _isolation  # noqa: F401  # 測試隔離閂:必須是第一個 import(202
 import asyncio
 import json
 import os
+from pathlib import Path
 import sqlite3
 import sys
 import tempfile
@@ -434,6 +435,84 @@ class TestAnswerEndpoint(unittest.TestCase):
                          ["opt0", "opt1", "deny"])
         # deny style 落庫要收斂成 canonical 字彙(A1)
         self.assertEqual(row["options"][-1]["style"], "danger")
+
+
+class RecordedApprovalFlow(unittest.IsolatedAsyncioTestCase):
+    async def test_offer_to_phone_decision_to_provider_ack(self):
+        import httpx
+        from replay_fixture import load_jsonl
+
+        frames = load_jsonl(Path(__file__).parent / "fixtures/replay/cx-approval.jsonl")
+        tid = frames[0]["params"]["threadId"]
+        client = RecordingClient()
+        digest = bridge.carddigest.CodexThreadDigest()
+        def cards():
+            return [c for c in digest.store.snapshot()["cards"] if c["kind"] == "approval"]
+
+        with patch.object(bridge, "CODEX_APP", client), patch.dict(bridge._CX_CARD_DIGESTS, {tid: digest}), \
+                patch.object(bridge, "_approval_push"), patch.object(bridge, "_live_activity_update"), \
+                patch.object(bridge, "_cx_turn_end_push"), patch.object(bridge, "_delegation_codex_completed"):
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=bridge.app),
+                                         base_url="http://test", headers={
+                                             "Authorization": "Bearer " + bridge.BRIDGE_TOKEN}) as http:
+                for frame in frames:
+                    await client._dispatch_wire_message(json.dumps(frame))
+                    params = frame["params"]
+                    if frame["method"] == "thread/status/changed":
+                        waiting = bool(params["status"]["activeFlags"])
+                        self.assertEqual(client.runtime_status(tid), "waiting_approval" if waiting else "running")
+                        self.assertEqual(digest.store.status["phase"], "waiting" if waiting else "run")
+                    elif "id" in frame:
+                        card, = cards()
+                        aid = card["body"]["approval_id"]
+                        path = f"/app/v1/approvals/{aid}/decision"
+                        self.assertEqual([(o["key"], o["label"]) for o in card["body"]["options"]],
+                                         [("approve", "允許執行"), ("deny", "停止這一輪")])
+                        for bad in ({"key": "typo"}, {"approve": "false"}, {"key": "approve_for_session"},
+                                    {"approve": True, "remember": True}):
+                            self.assertEqual((await http.post(path, json=bad)).status_code, 400)
+                            self.assertEqual(client.replies_for(frame["id"]), [])
+                            self.assertIsNotNone(client.pending_approval_for_thread(tid))
+                        response = await http.post(path, json={"key": "deny"})
+                        self.assertEqual(response.status_code, 200, response.text)
+                        self.assertEqual(response.json()["result"], {"decision": "cancel"})
+                        self.assertTrue((await http.post(path, json={"key": "deny"})).json()["idempotent"])
+                    elif frame["method"] == "serverRequest/resolved":
+                        replies = client.replies_for(params["requestId"])
+                        self.assertEqual([r["result"] for r in replies], [{"decision": "cancel"}])
+                        self.assertIsNone(client.pending_approval_for_thread(tid))
+                        final, = cards()
+                        self.assertEqual(final["id"], card["id"])
+                        self.assertEqual(final["body"]["options"], [])
+                        self.assertEqual(final["body"]["resolved"], "rejected")
+                self.assertFalse(digest.busy)
+
+    async def test_policy_only_request_never_grants_or_shows_default_buttons(self):
+        client = RecordingClient()
+        method = "item/commandExecution/requestApproval"
+        for offered in ([], [{"acceptWithExecpolicyAmendment": {}}], "accept"):
+            with self.subTest(offered=offered):
+                client.sent.clear()
+                await client._handle_server_message({"method": method, "id": 77,
+                    "params": {"threadId": "fixture-thread", "availableDecisions": offered}})
+                reply, = client.replies_for(77)
+                self.assertIn("error", reply)
+                self.assertNotIn("result", reply)
+                self.assertFalse(client.pending_approvals)
+
+    async def test_decline_just_the_command_and_session_grant_only_when_offered(self):
+        client = RecordingClient()
+        with patch.object(bridge, "_approval_push"):
+            for rid, approve, remember, decision in [(1, False, False, "decline"), (2, True, False, "accept"),
+                                                      (3, True, True, "acceptForSession")]:
+                await client._handle_server_message({"method": "item/commandExecution/requestApproval",
+                    "id": rid, "params": {"threadId": "fixture-thread", "availableDecisions":
+                                          ["cancel", "accept", "decline", "acceptForSession"]}})
+                record = client.pending_approval_for_thread("fixture-thread")
+                self.assertEqual(record["options"][-1]["label"], "拒絕")
+                await client.decide_approval(record["id"], approve, for_session=remember)
+                reply, = client.replies_for(rid)
+                self.assertEqual(reply["result"], {"decision": decision})
 
 
 class TestApprovalRegressions(unittest.TestCase):

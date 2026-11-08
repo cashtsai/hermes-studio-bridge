@@ -8,6 +8,7 @@
     "raw_transcript_committed": false
   },
   "fixture_digests": {
+    "cx-approval.jsonl": "348fc7c6221dd809dc5ead9b395d4197493a6b01847681ef8b5fbdd77d2e42a4",
     "cx-error.jsonl": "c365893bea610b50f3123de379a7d52d465770f291ab7bb66bc73b2b1afd7994",
     "cx-simple.jsonl": "e3b132cc181426ce10eb8d90026e2f05a19ab15e92d4e759cbabbb66beccd9aa",
     "cx-interrupt.jsonl": "c3a5ac5ead433f90948d3feca27aaed316c07c301ffa524a30d171a1246c564d",
@@ -32,6 +33,7 @@
   ],
   "providers": {
     "codex": {
+      "approval_pending_and_resolved": "cx-approval.jsonl",
       "simple_turn": "cx-simple.jsonl",
       "stream_resume": "cx-stream-resume.jsonl",
       "error_terminal": "cx-error.jsonl"

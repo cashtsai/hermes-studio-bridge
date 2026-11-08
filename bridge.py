@@ -7043,6 +7043,10 @@ class CodexAppServerClient:
         if "id" in msg:
             params = msg.get("params") if isinstance(msg.get("params"), dict) else {}
             if method in CODEX_APPROVAL_REQUEST_METHODS:
+                if not self._approval_choices(method, params):
+                    await self._write_server_error(msg["id"], -32602,
+                                                   "No supported Pocket approval decision")
+                    return
                 self._handle_approval_request(msg)
                 return
             if method == "currentTime/read":
@@ -7485,6 +7489,23 @@ class CodexAppServerClient:
         finally:
             con.close()
 
+    @staticmethod
+    def _approval_choices(method, params):
+        if method not in ("item/commandExecution/requestApproval", "item/fileChange/requestApproval"):
+            return {"approve": "approved", "deny": "denied"}
+        offered = params.get("availableDecisions")
+        if offered is None:  # Older providers omit the per-request list.
+            return {"approve": "accept", "approve_for_session": "acceptForSession", "deny": "decline"}
+        if not isinstance(offered, list):
+            return {}
+        # An exec/network policy amendment is NOT equivalent to session approval.
+        # Only reproduce scalar decisions that the phone can express faithfully.
+        choices = {k: v for k, v in (("approve", "accept"), ("approve_for_session", "acceptForSession"),
+                                      ("deny", "decline")) if v in offered}
+        if "deny" not in choices and "cancel" in offered:
+            choices["deny"] = "cancel"
+        return choices
+
     def _handle_approval_request(self, msg: dict) -> None:
         method = msg.get("method") or ""
         params = msg.get("params") or {}
@@ -7514,19 +7535,10 @@ class CodexAppServerClient:
         _allow_label = ("允許執行" if "command" in _mlow
                         else "允許修改" if "filechange" in _mlow.replace("_", "")
                         else "允許")
-        record["options"] = [
-            {"key": "approve", "label": _allow_label, "style": "primary"},
-        ]
-        # 只有支援 acceptForSession 的 method 才給第三顆(見 _approval_response_result)。
-        # key 用 approve_for_session:非 deny-ish → 舊 App(build ≤44,只認 approve/
-        # deny)會安全退成「一般允許」,不會誤送拒絕;新 App 認得此 key → 送
-        # for_session=true。style=secondary(較軟的允許)。
-        if method in ("item/commandExecution/requestApproval",
-                      "item/fileChange/requestApproval"):
-            record["options"].append(
-                {"key": "approve_for_session", "label": "本次全允許", "style": "secondary"})
-        record["options"].append(
-            {"key": "deny", "label": "拒絕", "style": "deny"})
+        choices = self._approval_choices(method, params)
+        labels = {"approve": (_allow_label, "primary"), "approve_for_session": ("本次全允許", "secondary"),
+                  "deny": ("停止這一輪" if choices.get("deny") == "cancel" else "拒絕", "deny")}
+        record["options"] = [{"key": k, "label": labels[k][0], "style": labels[k][1]} for k in choices]
         self._register_pending_request(record)
         _log_event("codex_approval_request",
                    approval_id=approval_id,
@@ -7618,18 +7630,13 @@ class CodexAppServerClient:
 
     def _approval_response_result(self, record: dict, approved: bool,
                                   for_session: bool = False) -> dict:
-        method = record.get("method")
-        if method in ("item/commandExecution/requestApproval",
-                      "item/fileChange/requestApproval"):
-            if approved:
-                decision = "acceptForSession" if for_session else "accept"
-            else:
-                decision = "decline"
-            return {"decision": decision}
-        if approved:
-            decision = "approved_for_session" if for_session else "approved"
-        else:
-            decision = "denied"
+        if approved and for_session and record.get("method") in ("execCommandApproval", "applyPatchApproval"):
+            return {"decision": "approved_for_session"}
+        choices = self._approval_choices(record.get("method"), record.get("params") or {})
+        key = ("approve_for_session" if for_session else "approve") if approved else "deny"
+        decision = choices.get(key)
+        if not decision:
+            raise CodexAppServerError("這次 Codex 核准沒有提供這個選項", code=400)
         return {"decision": decision}
 
     async def decide_approval(self, approval_id: str, approved: bool,
@@ -7648,8 +7655,8 @@ class CodexAppServerClient:
                 "請改用 POST /codexsessions/{{thread_id}}/answer 或帶 key 的 "
                 "approvals decision 作答。".format(record.get("method") or "question"),
                 code=409)
-        result = self._approval_response_result(record, approved, for_session=for_session)
         try:
+            result = self._approval_response_result(record, approved, for_session=for_session)
             await self._write_server_result(record.get("request_id"), result)
         except Exception:
             self._unclaim_pending(record)
@@ -8456,6 +8463,13 @@ class CodexAppServerClient:
                 thread_id, self.turn_started_at.get(thread_id, time.time()))
             if time.time() - last >= CODEX_TURN_STALL_SECS:
                 return "stalled"
+            # Codex announces a wait before it delivers the actionable RPC.
+            # A flag from the previous turn must not block the new one.
+            prov = self.provider_status.get(thread_id) or {}
+            started = self.turn_started_at.get(thread_id)
+            if (started and prov.get("type") == "active" and prov.get("at", 0) >= started
+                    and any(f in ("waitingOnApproval", "waitingOnUserInput") for f in prov.get("flags", []))):
+                return "waiting_approval"
             return "running"
         # 3. provider 說了算。notLoaded/idle 不在這裡下結論(往下走),
         #    因為 notLoaded = 沒資訊,而 idle 不該蓋掉本地的 failed/done。
@@ -9545,6 +9559,8 @@ def _codex_http_error(e: Exception):
             if locked_tid:
                 _cx_feed_thread_locked(locked_tid, create_if_missing=True)
             raise http_err(409, "CX_THREAD_LOCKED", CX_THREAD_LOCKED_MESSAGE, str(e))
+        if e.code == 400:
+            raise http_err(400, "CX_DECISION_NOT_OFFERED", str(e))
         if e.code == _CX_NO_ACTIVE_TURN_CODE:
             # interrupt 專用:真的沒有回合可中斷。必須跟下面的 CX_TURN_IN_FLIGHT
             # 分開,否則中斷端點會回報「上一輪正在跑」——與事實完全相反。
@@ -21450,6 +21466,18 @@ def _approval_bool_from_body(body: dict) -> bool:
     raise HTTPException(status_code=400, detail="approve boolean or decision required")
 
 
+def _codex_permission_choice(body: dict) -> tuple[bool, bool]:
+    key = body.get("key")
+    if key is not None and key != "":
+        if key not in ("approve", "approve_for_session", "deny"):
+            raise http_err(400, "UNKNOWN_KEY", "不認得的 Codex 核准選項")
+        return key != "deny", key == "approve_for_session"
+    flags = ("approve", "for_session", "approve_for_session", "remember")
+    if any(k in body and type(body[k]) is not bool for k in flags):
+        raise http_err(400, "BAD_APPROVAL_CHOICE", "Codex 核准旗標需要布林值")
+    return _approval_bool_from_body(body), any(body.get(k) for k in flags[1:])
+
+
 def _codex_thread_from_v2_session_id(session_id: str) -> str:
     if session_id.startswith("codex:"):
         return session_id.split(":", 1)[1]
@@ -21550,9 +21578,7 @@ async def v2_session_approve(session_id: str, request: Request):
         _cc2_approval_db_mark(aid, status)
         return {"ok": True, "session_id": session_id,
                 "approval_id": aid, "status": status}
-    approved = _approval_bool_from_body(body)
-    for_session = bool(body.get("for_session") or body.get("approve_for_session") or
-                       body.get("remember"))
+    approved, for_session = _codex_permission_choice(body)
     thread_id = src[1]
     client = _cx_client_for_thread(thread_id)
     try:
@@ -33006,13 +33032,7 @@ async def _approval_decide_serial(aid: str, b: dict) -> dict:
         # {key} → app-server 決議參數;approve_for_session 映射 Codex 原生
         # acceptForSession(_approval_response_result 既有機制)。codex 線的
         # 狀態字彙(approved/rejected)相容期不動 — 卡片流/記憶體 record 同源。
-        if key:
-            approved = key != "deny"
-            for_session = key == "approve_for_session"
-        else:
-            approved = bool(b.get("approve"))
-            for_session = bool(b.get("for_session") or b.get("approve_for_session") or
-                               b.get("remember"))
+        approved, for_session = _codex_permission_choice(b)
         try:
             result = await CODEX_APP.decide_approval(aid, approved,
                                                      for_session=for_session)
