@@ -152,16 +152,16 @@ grep -q '^POCKET_ACTIVE_PROVIDER=' "$ENV_FILE" || printf 'POCKET_ACTIVE_PROVIDER
 # 而且那些檔案本來就會被 rsync 進 payload。也就是說「Ubuntu 桌面端」其實
 # 早就在了,只差沒打開。不需要為 Linux 另外寫一個 GUI app。
 #
-# QR 登入一併開:雲端龍蝦**沒有「本機」可言**,每一次存取都是遠端,
-# 而遠端走 `_pair_local_only` 一律裸 403。沒有 QR 登入 = 控制台開了也進不去。
-#   → 遠端開頁 → 顯示 QR → 已配對的手機批准 → 進去(見 CONSOLE_QR_LOGIN_SPEC)
+# Standard installs serve public QR only through their own connected Relay.
 CONSOLE_ENABLED="${POCKET_CONSOLE_ENABLED:-1}"
-CONSOLE_QR_LOGIN="${POCKET_CONSOLE_QR_LOGIN:-1}"
+CONSOLE_QR_LOGIN="${POCKET_CONSOLE_QR_LOGIN:-0}"
+CONSOLE_ENTRY_MODE="${POCKET_CONSOLE_ENTRY_MODE:-relay}"
 # **檔案面預設一個都不開。** 遠端控制台的能力降級規則:沒設這個變數就等於
 # 看不到任何檔案。龍蝦上使用者自己的工作目錄要不要開放,由他自己決定 ——
 # 我們不替他把家目錄掛上去。設法:POCKET_CONSOLE_REMOTE_FILE_ROOTS=/path:/path2
 CONSOLE_FILE_ROOTS="${POCKET_CONSOLE_REMOTE_FILE_ROOTS:-}"
 grep -q '^POCKET_CONSOLE_ENABLED=' "$ENV_FILE" || printf 'POCKET_CONSOLE_ENABLED=%s\n' "$CONSOLE_ENABLED" >> "$ENV_FILE"
+grep -q '^POCKET_CONSOLE_ENTRY_MODE=' "$ENV_FILE" || printf 'POCKET_CONSOLE_ENTRY_MODE=%s\n' "$CONSOLE_ENTRY_MODE" >> "$ENV_FILE"
 grep -q '^POCKET_CONSOLE_QR_LOGIN=' "$ENV_FILE" || printf 'POCKET_CONSOLE_QR_LOGIN=%s\n' "$CONSOLE_QR_LOGIN" >> "$ENV_FILE"
 grep -q '^POCKET_CONSOLE_REMOTE_FILE_ROOTS=' "$ENV_FILE" || printf 'POCKET_CONSOLE_REMOTE_FILE_ROOTS=%s\n' "$CONSOLE_FILE_ROOTS" >> "$ENV_FILE"
 # ── App 內 agent 登入(2026-10-31:龍蝦沒有「你的 Mac」可去桌面控制台登入)──

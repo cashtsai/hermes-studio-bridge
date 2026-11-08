@@ -59,7 +59,7 @@ _PLACEHOLDER = re.compile(
 SHAPES = {
     # tailnet 主機名:`<host>.<tailnet>.ts.net`。佔位(`<your-tailnet>` /
     # `tailnet-example`)放行。
-    "tailnet 主機名": re.compile(r"[^\s/\"'`]*\.ts\.net\b"),
+    "tailnet 主機名": re.compile(r"[^\s/\"'`]+\.ts\.net\b"),
     # 家目錄:macOS 的 `/Users/<人名>`。`/Users/you`、`/Users/<you>` 這種
     # 佔位放行;`$HOME` 與 `~` 本來就不會命中(這也是正解,見下面的 ⚠️)。
     "家目錄路徑": re.compile(r"/Users/[^\s/\"'`:)\]]+"),
@@ -126,6 +126,11 @@ def tracked_files():
 
 
 class NoPrivateInfraLeak(unittest.TestCase):
+    def test_tailnet_suffix_is_not_a_hostname(self):
+        pattern = SHAPES["tailnet 主機名"]
+        self.assertIsNone(pattern.search('name.endswith(".ts.net")'))
+        self.assertTrue(pattern.search("https://desktop.tail1234.ts.net:8443/console"))
+
     def test_tracked_files_have_no_private_infra_identifiers(self):
         hits = []
         for rel in tracked_files():

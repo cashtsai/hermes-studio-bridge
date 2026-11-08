@@ -1716,6 +1716,21 @@ CLAUDE.md 明寫那條已過時。)
 
 ## 16. Console QR 登入(`/app/v1/console/login/*`,2026-10-30)
 
+**所有消費者走同一條 Relay 路徑。** 官方 macOS / Ubuntu 安裝器預設
+`POCKET_CONSOLE_ENTRY_MODE=relay`。不必在主機建立額外檔案，也不依使用者名稱、
+方案名稱、固定網域或 IP 判斷。Relay 權益由 Pocket ID 控制；每台主機使用自己
+獲配的 grant，已有 Relay 或 Pocket ID 登錄的既有主機亦採用這個模式。
+當 Console 已啟用、Relay 已開、supervisor 回報 connected，且當前連線主機名與
+grant 一致時，`GET /app/v1/console/boot` 才提供 `relay_qr_url`；否則為 null。
+舊欄位 `url/urls` 仍只代表內網，手機不把短碼放進 Relay 網址。
+
+Relay 模式不會退回其他公網入口：瀏覽器只能在該 grant 的 HTTPS Host 建立請求、
+輪詢、兌換或使用授權。手機使用既有配對連線明示批准，瀏覽器不能批准。
+停用 Relay 或 supervisor 偵測失去連線後，既有 Relay token 不准再讀資料；
+不影響本機／tailnet 登入。Apple 取消自動續訂不等於有效期已到。
+驗收至少包含兩個獨立帳號／主機各自登入、交叉拒絕、無 Relay 的內網直連、登出及停用。
+單機先測是分批驗收，不是為單一機主改授權規則。
+
 讓人在**任意一台電腦**上開桌面控制台:那台電腦開 `/console` → 不是可信來源
 → bridge 顯示 QR → **已配對的手機掃碼批准** → 瀏覽器才拿到憑證。
 
@@ -1726,9 +1741,9 @@ CLAUDE.md 明寫那條已過時。)
 
 | 旗標 | 預設 | 關掉時 |
 |---|---|---|
-| `POCKET_CONSOLE_ENABLED` | `0` | 整個 `/console` 與本節三支都 **404** |
-| `POCKET_CONSOLE_QR_LOGIN` | `0` | 本節三支 **404**;`/console` 對遠端維持**裸 403**(現狀) |
-| `POCKET_CONSOLE_WEB` | `0` | `/console` 對**本機中繼 vhost**(付費 relay 的 hostname)維持 403。開了之後,只有 Host 等於本機 relay grant 的 hostname 的請求能進到 **401 配對碼輸入頁**(其餘門禁與率限照舊;公網面的 cookie 一律 session-only)。與 QR 旗標各自獨立;同一個請求兩者都適用時走輸入頁。手機端三支端點不受本旗標影響 |
+| `POCKET_CONSOLE_ENABLED` | 官方安裝器 `1`、獨立 runtime `0` | 關閉時 Console 與登入端點均 **404** |
+| `POCKET_CONSOLE_ENTRY_MODE` | 官方安裝器 `relay` | 自架者可明確選 `custom` 使用自己的入口；不會自動把自架網址當作付費 Relay |
+| `POCKET_CONSOLE_QR_LOGIN`、`POCKET_CONSOLE_WEB` | `0` | 自訂入口的舊開關；不能替 Relay 模式開後門 |
 
 **404 而不是 403/501**:app 探不到就當這台 bridge 不支援,安靜地不顯示 ——
 舊 bridge 的使用者不該看到錯誤。這與 `/capabilities` 的降級慣例一致。
