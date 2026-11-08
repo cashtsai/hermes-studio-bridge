@@ -445,20 +445,11 @@ PY
 fi
 
 # ── Hermes provider(選配) ────────────────────────────────────────────────
-if [ "$INSTALL_HERMES" = "1" ] && [ ! -x "$HERMES_INSTALL_DIR/runtime/venv/bin/hermes" ]; then
-  log_step "安裝 Hermes(選配)"
-  [ -d "$HERMES_INSTALL_DIR/.git" ] || git clone -q "$HERMES_REPO_URL" "$HERMES_INSTALL_DIR"
-  python3 -m venv "$HERMES_INSTALL_DIR/runtime/venv"
-  "$HERMES_INSTALL_DIR/runtime/venv/bin/pip" install -q -e "$HERMES_INSTALL_DIR"
-  mkdir -p "$HERMES_HOME_ROOT"
-fi
-
 if [ "$INSTALL_HERMES" = "1" ]; then
+  log_step "檢查 Hermes CLI 並補齊執行依賴"
+  HERMES_HOME="$HERMES_HOME_ROOT" HERMES_INSTALL_DIR="$HERMES_INSTALL_DIR" HERMES_REPO_URL="$HERMES_REPO_URL" \
+    bash "$SCRIPT_DIR/ensure-hermes-runtime.sh"
   # ── 預設人格「pocket」(2026-11-03,同 OpenClaw 那段 workspace 的理由)────
-  #
-  # 跟上面的安裝區塊**刻意分開一個 if**:上面那個只在第一次裝(venv 還不
-  # 存在)時跑,重跑安裝器升級版本時會整段跳過——人格內容要能跟著升級,
-  # 所以另開一個只看 INSTALL_HERMES 的區塊,逐檔案 idempotent 自己擋覆蓋。
   #
   # Hermes 的 SOUL.md 沒有 OpenClaw BOOTSTRAP.md 那種「第一次見面自動退場」
   # 機制(查過 hermes_cli/plugins.py 的 hook 清單,沒有 on_session_start 之外
