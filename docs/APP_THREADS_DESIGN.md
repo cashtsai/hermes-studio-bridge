@@ -96,6 +96,28 @@ cc2 重啟換 `provider_session_id` 同理:rebind 一下,舊綁定標 `detached`
 
 ## 下一步:CC↔CX 接力(ContextTransfer)
 
+### P1.2 Phase A/B：既有對話續接
+
+- **A，找回身分**：已授權的用戶端可以用
+  `GET /app/v2/threads/by-provider/resolve?provider=codex&provider_thread_id=codex%3Aold`
+  查 `{app_thread_id, binding}`。歷史綁定可以找到現在的來源；空資料庫或未登記回
+  `404 APP_THREAD_NOT_FOUND`，不建表、不建對話。若名稱曾分屬不同對話，
+  即使其中之一仍 active，也只回 `409 APP_THREAD_AMBIGUOUS`，不猜使用者要哪一條。
+  已知穩定 ID 時，以 `GET /app/v2/threads/{id}` 一次讀同一版綁定與歷史帳本。
+- **B，安全續接**：`POST /app/v2/threads` 的初始綁定與對話同交易提交；
+  `rebind` 的新選填欄位 `expected_binding_id` 填讀取時的 `binding.id`。
+  換成功後重試同目標是 no-op；若其他裝置已換至不同目標，回
+  `409 APP_THREAD_BINDING_CHANGED`，不追加事件或改寫歷史。舊客戶端可不給此欄。
+  跨 provider transfer 內部也檢查它：等待開新會話期間若有人先換綁，
+  回 `409 TRANSFER_REBIND_CONFLICT` 並指出已建但未綁的會話，不自動殺掉或重試。
+- **手機範圍**：CC/CX 設定面板按需查詢；只有使用者明確點選才登記現有會話。
+  本輪沒有背景輪詢、批次搬移逐字稿、在背景新建 provider session，或修改核准路由。
+- **重現**：用 bridge 測試環境、`BRIDGE_TOKEN=test-unit-token` 分別執行
+  `tests/test_app_thread_bindings.py`、`tests/test_context_transfer.py`。
+  測試使用暫存 SQLite 與模擬 provider，不觸碰真實會話。
+
+### 跨 provider 的上下文移交
+
 換綁只保住**身分**;要把**上下文**也搬過去(CC 做到一半換 CX 接手),走
 phase2 已落地的 checkpoint / context transfer 契約:
 
