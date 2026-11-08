@@ -5,6 +5,8 @@ import sys
 import tempfile
 import time
 import unittest
+from pathlib import Path
+from unittest.mock import patch
 
 _TMP = tempfile.mkdtemp(prefix="guest-")
 os.environ.setdefault("POCKET_CANON_DB", os.path.join(_TMP, "canonical.db"))
@@ -16,6 +18,23 @@ import bridge  # noqa: E402
 
 
 class TestGuestToken(unittest.TestCase):
+    def test_binary_secret_is_not_rotated_when_edges_are_whitespace(self):
+        key = b"\t" + bytes(range(30)) + b"\n"
+        with tempfile.TemporaryDirectory() as tmp, \
+                patch.object(bridge, "_GUEST_SECRET_PATH", Path(tmp) / "secret"), \
+                patch.object(bridge.secrets, "token_bytes", side_effect=[key, b"x" * 32]) as generate:
+            token, _ = bridge._guest_token_make("codex:binary", 3600)
+            self.assertEqual(bridge._guest_token_verify(token), "codex:binary")
+            generate.assert_called_once_with(32)
+            self.assertEqual(bridge._GUEST_SECRET_PATH.read_bytes(), key)
+
+    def test_longer_preexisting_key_keeps_legacy_signature_material(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "secret"
+            path.write_bytes(b"k" * 48 + b"\n")
+            with patch.object(bridge, "_GUEST_SECRET_PATH", path):
+                self.assertEqual(bridge._guest_secret(), b"k" * 48)
+
     def test_roundtrip_and_tamper(self):
         tok, exp = bridge._guest_token_make("codex:abc", 3600)
         self.assertEqual(bridge._guest_token_verify(tok), "codex:abc")
