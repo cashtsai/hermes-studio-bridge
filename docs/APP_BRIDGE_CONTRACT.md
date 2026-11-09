@@ -1857,3 +1857,11 @@ device token:
   新型別由升級後的 bridge 接手)。
 - notices 消費失敗(APNs 掛了等)**不得**讓心跳本身看起來失敗 ——
   否則 `_pocket_id_loop` 會對健康的 pocket-id 指數退避。
+#### Console history paging
+
+`GET /app/v2/sessions/{session_id}/cards?history_page=true&limit=24` returns
+the usual snapshot plus `older_cursor` (an opaque card ID, or null). Fetch an
+older page with `before_id=<encoded cursor>`; do not combine this with
+`before_seq`. An evicted anchor returns 409. Paging only covers history
+retained by the card store. Never advance the live SSE cursor from an older
+page. The default snapshot and existing sequence-based clients are unchanged.

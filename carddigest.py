@@ -1617,7 +1617,8 @@ class SessionCardStore(ApprovalCardMixin):
             return None
         return [e for e in self.events if e["seq"] > since_seq]
 
-    def snapshot(self, limit: int = 100, before_seq: int | None = None) -> dict:
+    def snapshot(self, limit: int = 100, before_seq: int | None = None, *,
+                 before_id: str | None = None, paged: bool = False) -> dict:
         """快照 = 卡片 + **當前狀態** + 游標。
 
         `status` 是 2026-08-14 補的契約(見 `set_status` 的長註解)。舊版快照只帶
@@ -1629,10 +1630,16 @@ class SessionCardStore(ApprovalCardMixin):
         client 每次冷載/輪詢都無條件對帳回真值。
         """
         ids = self.order
+        if before_id is not None:
+            # Revisions advance card_seq even for old cards. Page by position,
+            # never by the latest revision's SSE sequence.
+            ids = ids[:ids.index(before_id)]
         if before_seq is not None:
             ids = [i for i in ids if self.card_seq.get(i, 0) < before_seq]
+        more = len(ids) > max(1, limit)
         ids = ids[-max(1, limit):]
-        return {"cards": [{**self.cards[i], "seq": self.card_seq.get(i)}
+        return {**({"older_cursor": ids[0] if more else None} if paged else {}),
+                "cards": [{**self.cards[i], "seq": self.card_seq.get(i)}
                           for i in ids if i in self.cards],
                 "latest_seq": self.seq,
                 "status": dict(self.status or {})}

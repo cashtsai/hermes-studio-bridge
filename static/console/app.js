@@ -189,7 +189,7 @@ async function apiJSON(path, opts) {
 }
 
 // ───────────────────────── session 列表 ─────────────────────────
-const PROVIDER_LABEL = { claude_code: "CC", codex: "CX", hermes: "人格", openclaw: "OC", cc2: "CC" };
+const PROVIDER_LABEL = { claude_code: "CC", codex: "CX", hermes: "人格", gemini: "Gemini", openclaw: "OC", cc2: "CC" };
 
 let listRequest = 0;
 async function loadSessions() {
@@ -218,7 +218,7 @@ async function loadSessions() {
     if (borrowed() && gainedChanges && state.current) window.PocketConsoleRail?.load();
     if (borrowed() && state.current && state.snapshotView === state.view) {
       if (!canUse("follow") && state.stopStream) {
-        state.stopStream(); state.stopStream = null; $("stream-health").textContent = "對話快照";
+        state.stopStream(); state.stopStream = null; setStreamHealth("對話快照");
       } else if (canUse("follow") && !state.stopStream) subscribeCards(state.current, state.view);
     }
     renderSessions();
@@ -245,14 +245,18 @@ function renderSessions() {
     el.textContent = state.listHealth === "failed" || state.degraded.length ? "清單暫時不完整" : "沒有 session";
     return;
   }
-  const byProv = {};
-  for (const s of state.sessions) (byProv[s.provider] = byProv[s.provider] || []).push(s);
+  const byProv = new Map(["hermes", "claude_code", "codex", "gemini"].map(p => [p, []]));
+  for (const s of state.sessions) {
+    const p = s.provider === "cc2" ? "claude_code" : s.provider;
+    if (!byProv.has(p)) byProv.set(p, []);
+    byProv.get(p).push(s);
+  }
   let html = "";
-  for (const prov of Object.keys(byProv)) {
-    const dim = state.degraded.includes(prov) ? " degraded" : "";
+  for (const [prov, rows] of byProv) {
+    const dim = state.degraded.includes(prov) || (prov === "claude_code" && state.degraded.includes("cc2")) ? " degraded" : "";
     html += '<div class="prov-group"><div class="prov-head' + dim + '">' +
             esc(PROVIDER_LABEL[prov] || prov) + (dim ? " ⚠" : "") + "</div>";
-    for (const s of byProv[prov]) {
+    for (const s of rows) {
       const active = s.id === state.current ? " active" : "";
       const locked = s.meta && s.meta.locked ? ' 🔒' : "";
       html += '<div class="sess' + active + '" data-id="' + esc(s.id) + '">' +
@@ -260,6 +264,7 @@ function renderSessions() {
               '<div class="sess-sub"><span class="st st-' + esc(s.status || "idle") + '">' +
               esc(workPhase(s)) + "</span> " + esc(s.subtitle || "") + "</div></div>";
     }
+    if (!rows.length) html += '<div class="provider-empty">' + (dim ? "暫時無法讀取" : "無對話") + '</div>';
     html += "</div>";
   }
   el.innerHTML = html;
@@ -334,6 +339,7 @@ function renderHome() {
 
 function showHome() {
   ++state.view;
+  resetHistory();
   if (state.stopStream) { state.stopStream(); state.stopStream = null; }
   state.current = null; state.cards = []; state.latestSeq = 0;
   syncControls();
@@ -347,12 +353,31 @@ function showHome() {
 
 // ───────────────────────── 卡片流 ─────────────────────────
 let snapshotRetry;
+let historyAbort, olderCursor = null, loadingOlder = false;
+function resetHistory() {
+  historyAbort?.abort();
+  historyAbort = new AbortController();
+  olderCursor = null;
+  loadingOlder = false;
+  updateOlderButton();
+}
+function updateOlderButton() {
+  const b = $("earlier-cards");
+  b.hidden = !olderCursor;
+  b.disabled = loadingOlder;
+  b.textContent = loadingOlder ? "載入中…" : "更早訊息";
+  b.classList.toggle("working", loadingOlder);
+}
 function openSession(id, preserveMode = false) {
   if (signingOut) return;
   if (borrowed() && !state.sessions.find(s => s.id === id)?.capabilities?.includes("replay")) {
     toast("這台電腦無權讀取此對話"); return;
   }
+  if (state.current === id && state.snapshotView === state.view && !preserveMode) {
+    window.PocketConsoleMode?.set("agents"); return;
+  }
   const view = ++state.view;
+  resetHistory();
   clearTimeout(snapshotRetry);
   if (state.stopStream) { state.stopStream(); state.stopStream = null; }
   state.current = id;
@@ -366,7 +391,7 @@ function openSession(id, preserveMode = false) {
   writeHash(id);                           // 深連結:可加書籤 / 重整不掉頁
   $("stream-head").classList.remove("hidden");
   $("composer").classList.remove("hidden");
-  $("stream-health").textContent = "連線中";
+  setStreamHealth("連線中", true);
   showDraft(id);
   const s = state.sessions.find((x) => x.id === id) || {};
   $("sh-provider").textContent = PROVIDER_LABEL[s.provider] || s.provider || "";
@@ -374,35 +399,37 @@ function openSession(id, preserveMode = false) {
   updateStatusChip(s.status, s.meta);
   syncControls();
   renderApproval();
-  if (window.PocketConsoleRail) window.PocketConsoleRail.load();
-  $("cards").innerHTML = '<div class="placeholder">載入卡片…</div>';
+  $("cards").innerHTML = '<div class="placeholder working" role="status">讀取最近訊息…</div>';
   void loadCardSnapshot(id, view);
+  if (window.PocketConsoleRail) window.PocketConsoleRail.load();
 }
 
 async function loadCardSnapshot(id, view, delay = 1000) {
   if (!currentView(view)) return;
   try {
-    const snap = await apiJSON("/app/v2/sessions/" + encodeURIComponent(id) + "/cards?limit=100",
-      { cache: "no-store", signal: AbortSignal.timeout(15000) });
+    const snap = await apiJSON("/app/v2/sessions/" + encodeURIComponent(id) + "/cards?limit=24&history_page=true",
+      { cache: "no-store", signal: AbortSignal.any([historyAbort.signal, AbortSignal.timeout(15000)]) });
     if (!currentView(view)) return;
     if (!Array.isArray(snap.cards) || !Number.isSafeInteger(snap.latest_seq) || snap.latest_seq < 0)
       throw new Error("無效的卡片回應");
     state.cards = snap.cards || [];
     state.latestSeq = snap.latest_seq || 0;
+    olderCursor = snap.older_cursor || null;
+    updateOlderButton();
     renderCards();
     if (snap.status && snap.status.phase) updateStatusChip(snap.status.phase, snap.status);
     confirmEcho(id, state.cards);
     state.snapshotView = view;
     if (canUse("follow")) subscribeCards(id, view);
-    else $("stream-health").textContent = "對話快照";
+    else setStreamHealth("對話快照");
   } catch (err) {
     if (!currentView(view)) return;
     if (err.status >= 400 && err.status < 500 && ![408, 429].includes(err.status)) {
-      $("stream-health").textContent = "卡片無法讀取：" + err.status;
+      setStreamHealth("卡片無法讀取：" + err.status);
       $("cards").replaceChildren();
       return;
     }
-    $("stream-health").textContent = "連線中斷，正在補接";
+    setStreamHealth("連線中斷，正在補接", true);
     snapshotRetry = setTimeout(() => loadCardSnapshot(id, view, Math.min(delay * 2, 15000)), delay);
   }
 }
@@ -416,6 +443,29 @@ async function loadCardSnapshot(id, view, delay = 1000) {
 //   ‧ CX      {approve: bool}
 //   ‧ hermes / openclaw {approval_id, key|approve}
 //   ‧ 有 approval_id 時一律帶上 —— bridge 會走統一的 _approval_decide_core
+async function loadOlderCards() {
+  const { current: id, view } = state, cursor = olderCursor;
+  if (!cursor || loadingOlder || !canUse("replay")) return;
+  loadingOlder = true; updateOlderButton();
+  try {
+    const page = await apiJSON("/app/v2/sessions/" + encodeURIComponent(id) +
+      "/cards?limit=48&before_id=" + encodeURIComponent(cursor), {
+        cache: "no-store", signal: AbortSignal.any([historyAbort.signal, AbortSignal.timeout(15000)])
+      });
+    if (!currentView(view) || olderCursor !== cursor) return;
+    if (!Array.isArray(page.cards)) throw new Error("invalid page");
+    const known = new Set(state.cards.map(c => c.id));
+    state.cards = page.cards.filter(c => !known.has(c.id)).concat(state.cards);
+    olderCursor = page.older_cursor || null;
+    renderCards(true); // Paging never advances the live SSE cursor.
+  } catch (err) {
+    if (!currentView(view) || olderCursor !== cursor) return;
+    if (err.status === 409) olderCursor = null;
+    toast(err.status === 409 ? "這段歷史已超出主機保留範圍" : "更早訊息讀取失敗");
+  } finally {
+    if (currentView(view)) { loadingOlder = false; updateOlderButton(); }
+  }
+}
 function currentSession() {
   return state.sessions.find((x) => x.id === state.current) || null;
 }
@@ -560,7 +610,7 @@ function subscribeCards(id, view) {
     // A list refresh must not resubscribe with the expired cursor during snapshot backoff.
     state.snapshotView = null;
     if (state.stopStream) { state.stopStream(); state.stopStream = null; }
-    $("stream-health").textContent = "正在同步";
+    setStreamHealth("正在同步", true);
     void loadCardSnapshot(id, view);
   }
   const url = () => "/app/v2/sessions/" + encodeURIComponent(id) +
@@ -586,13 +636,13 @@ function subscribeCards(id, view) {
       state.latestSeq = seq;
     },
     onGone: resync,
-    onOpen: () => { if (currentView(view)) $("stream-health").textContent = ""; },
-    onError: () => { if (currentView(view)) $("stream-health").textContent = "連線中斷，正在補接"; },
+    onOpen: () => { if (currentView(view)) setStreamHealth(""); },
+    onError: () => { if (currentView(view)) setStreamHealth("連線中斷，正在補接", true); },
     onDenied: code => {
       if (!currentView(view)) return;
       state.stopStream = null;
       if (code === 401) void leaveConsole();
-      else $("stream-health").textContent = "無權讀取";
+      else setStreamHealth("無權讀取");
     },
   });
 }
@@ -600,7 +650,12 @@ function subscribeCards(id, view) {
 function upsertCard(card) {
   const i = state.cards.findIndex((c) => c.id === card.id);
   if (i >= 0) state.cards[i] = card; else state.cards.push(card);
-  renderCards();
+  if (state.frameView === state.view) return;
+  const view = state.frameView = state.view;
+  requestAnimationFrame(() => {
+    if (!currentView(view)) return;
+    state.frameView = null; renderCards();
+  });
 }
 
 function cardText(c) {
@@ -712,43 +767,47 @@ function groupTurns(cards) {
   return turns;
 }
 
-function renderCards() {
+function renderCards(prepending = false) {
   const el = $("cards");
-  const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+  const oldHeight = el.scrollHeight, oldTop = el.scrollTop;
+  const follow = !prepending && el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+  const oldNodes = new Map(Array.from(el.children, n => [n.dataset.key, n]));
+  const firstVisible = follow ? null : Array.from(el.children).find(n =>
+    n.getBoundingClientRect().bottom > el.getBoundingClientRect().top);
+  const anchorTop = firstVisible?.getBoundingClientRect().top;
   if (!state.cards.length) { el.innerHTML = '<div class="placeholder">（還沒有卡片）</div>'; return; }
-  // 排序:優先用 ts(伺服器時間),缺的保持原插入順序 —— SSE 亂序到達時
-  // 才不會把回合排錯。slice() 避免就地改動 state.cards。
-  const ordered = state.cards
-    .map((c, i) => ({ c, i }))
-    .sort((a, b) => ((a.c.ts || 0) - (b.c.ts || 0)) || (a.i - b.i))
-    .map((x) => x.c);
-
-  el.innerHTML = groupTurns(ordered).map((t) => {
-    const who = t.role === "user" ? "你" : "Agent";
-    const time = cardTime(t.cards[t.cards.length - 1].ts);
-    const meta = '<div class="turn-meta"><span class="turn-who">' + who + "</span>" +
-                 (time ? '<span class="turn-time">' + esc(time) + "</span>" : "") + "</div>";
-    const body = t.cards.map((c) => {
-      const mono = PROSE_KINDS.has(c.kind || "text") ? "" : " mono";
-      const streaming = c.final === false ? " streaming" : "";
-      const kind = c.kind && c.kind !== "text"
-        ? '<span class="kind">' + esc(c.kind) + "</span>" : "";
-      return '<div class="card ' + t.role + mono + streaming + '">' + kind +
-             '<div class="card-body">' + cardBodyHtml(c) +
-             "</div></div>";
-    }).join("");
-    return '<div class="turn ' + t.role + '">' + meta + body + "</div>";
-  }).join("");
-  if (atBottom) el.scrollTop = el.scrollHeight;
+  const ordered = state.cards.slice().sort((a,b) => (a.ts || 0) - (b.ts || 0));
+  let cursor = el.firstElementChild;
+  for (const turn of groupTurns(ordered)) {
+    const key = turn.cards[0].id;
+    const node = oldNodes.get(key) || document.createElement("div");
+    oldNodes.delete(key);
+    node.className = "turn " + turn.role; node.dataset.key = key;
+    if (!node._cards || turn.cards.length !== node._cards.length ||
+        turn.cards.some((c, i) => node._cards[i] !== c)) {
+      renderTurnContent(turn, node); node._cards = turn.cards;
+    }
+    if (node !== cursor) el.insertBefore(node, cursor);
+    cursor = node.nextElementSibling;
+  }
+  for (const n of oldNodes.values()) n.remove();
+  if (follow) el.scrollTop = el.scrollHeight;
+  else if (firstVisible?.isConnected) el.scrollTop += firstVisible.getBoundingClientRect().top - anchorTop;
+  else if (prepending) el.scrollTop = oldTop + el.scrollHeight - oldHeight;
 }
 
+function setStreamHealth(label, working = false) {
+  const el = $("stream-health");
+  el.textContent = label; el.classList.toggle("working", working);
+}
 function updateStatusChip(phase, meta) {
   const chip = $("sh-status");
   const locked = meta && meta.locked;
-  const label = locked ? "🔒 被佔用" : (phase || "idle");
+  const label = locked ? "🔒 被佔用" : (PHASE_LABEL[phase] || phase || "狀態未知");
   chip.textContent = label;
   chip.className = "status-chip st-" + esc(phase || "idle");
   state.busy = ["run", "running", "busy"].includes(phase);
+  chip.classList.toggle("working", state.busy && !locked);
   $("interrupt").classList.toggle("hidden", !state.busy || !canUse("interrupt"));
 }
 
@@ -762,6 +821,7 @@ function showDraft(id) {
   $("send").disabled = !!pending || d.reading > 0;
   $("delivery").classList.toggle("hidden", !d.notice);
   $("delivery-text").textContent = d.notice;
+  $("delivery-text").classList.toggle("working", ["checking","sending"].includes(pending?.phase));
   $("check-delivery").hidden = !pending || pending.phase !== "unknown";
   $("forget-delivery").hidden = $("check-delivery").hidden;
   renderAtts(); autosize();
@@ -858,6 +918,7 @@ function autosize() {
 
 // ───────────────────────── 綁定 + 啟動 ─────────────────────────
 function wire() {
+  $("earlier-cards").addEventListener("click", loadOlderCards);
   $("remember-work").addEventListener("change", e => {
     if (e.target.checked) rememberWork(state.current);
     else if (personalDevice()) forgetWork();

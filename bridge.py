@@ -28057,7 +28057,8 @@ async def _v2_card_store(session_id: str):
 
 @app.get("/app/v2/sessions/{session_id}/cards")
 async def v2_session_cards(session_id: str, request: Request, limit: int = 100,
-                           before_seq: int | None = None):
+                           before_seq: int | None = None, history_page: bool = False,
+                           before_id: str | None = None):
     """契約 §3 冷載 snapshot:{cards, latest_seq, status} → app 渲染後從 since_seq 接流。
 
     `status` 2026-08-14 補入契約:形狀與 `session.status` 事件的 data 完全相同
@@ -28072,7 +28073,15 @@ async def v2_session_cards(session_id: str, request: Request, limit: int = 100,
     """
     _check_auth(request)
     store = await _v2_card_store(session_id)
-    snap = store.snapshot(limit=max(1, min(limit, 500)), before_seq=before_seq)
+    limit = max(1, min(limit, 500))
+    if history_page or before_id is not None:
+        if before_seq is not None:
+            raise HTTPException(400, "use only one history cursor")
+        if before_id is not None and before_id not in store.cards:
+            raise HTTPException(409, "history cursor no longer retained")
+        snap = store.snapshot(limit=limit, before_id=before_id, paged=True)
+    else:
+        snap = store.snapshot(limit=limit, before_seq=before_seq)
     sid = getattr(store, "media_session_id", "") or ""
     snap["durable_seq"] = (await asyncio.to_thread(_event_latest_seq, sid)) if sid else 0
     return snap
