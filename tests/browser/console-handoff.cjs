@@ -49,6 +49,37 @@ async function fixture(t, handle, list, viewport, sessionMeta = () => ({})) {
 const stream = (route, envelopes = []) => route.fulfill({contentType:"text/event-stream",
   body: envelopes.map(e => "data: " + JSON.stringify(e) + "\n\n").join("")});
 
+test("recent history first, collapsed traces, visible final replies and stable live cursor", async t => {
+  const pages = [];
+  const page = await fixture(t, (r,id,action,url) => {
+    if (action !== "cards") return r.fulfill({status:403,json:{}});
+    pages.push(url.searchParams.get("limit"));
+    if (url.searchParams.has("before_id")) return r.fulfill({json:{...snap(999, [
+      {...row("earlier","earlier answer"),ts:1}]),older_cursor:null}});
+    return r.fulfill({json:{...snap(7, [
+      {...row("req","please check"),role:"user",ts:2},
+      {...row("tool","private tool text"),kind:"tool_result",ts:3},
+      {...row("mixed","<details><summary>執行記錄</summary>trace & <img src=x></details>Final answer"),ts:4}
+    ]),older_cursor:"req"}});
+  },r=>r.fulfill({json:{sessions:[{id:A,provider:"claude_code",title:"Alpha",capabilities:["replay"]}]}}));
+  await page.locator('#session-list [data-id="'+A+'"]').click();
+  const cards=page.locator("#cards");
+  await cards.getByText("Final answer",{exact:true}).waitFor();
+  assert.deepEqual(await page.locator(".prov-head").allTextContents(),["人格","CC","CX","Gemini"]);
+  assert.equal(await cards.locator("details").count(),2);
+  assert.equal(await cards.locator("pre,img").count(),0);
+  await cards.getByText("執行記錄",{exact:true}).click();
+  await cards.getByText("trace & <img src=x>",{exact:true}).waitFor();
+  await page.evaluate(()=>upsertCard({id:"live",kind:"text",role:"assistant",ts:5,body:{text:"new output"}}));
+  await cards.getByText("new output").waitFor();
+  assert.equal(await cards.locator("details[open]").count(),1);
+  await page.locator("#earlier-cards").click();
+  await cards.getByText("earlier answer").waitFor();
+  assert.deepEqual(pages,["24","48"]);
+  assert.equal(await page.evaluate(()=>state.latestSeq),7);
+  assert.equal(await cards.getByText("Final answer",{exact:true}).count(),1);
+});
+
 test("borrowed UI follows each session grant and never fetches hidden host tools", async t => {
   const rows = [{id:A,provider:"claude_code",title:"Demo chat",status:"running",capabilities:["replay"]},
     {id:B,provider:"codex",title:"Demo project",status:"running",capabilities:["replay","input","changes"]}];
@@ -245,24 +276,26 @@ test("live card envelope, cursor on reconnect, expired cursor snapshot without d
   });
   await page.getByText("Beta", {exact:true}).click();
   await page.locator("#cards").getByText("live reply").waitFor();
-  assert.equal(await page.locator("#sh-status").textContent(), "run");
+  assert.equal(await page.locator("#sh-status").textContent(), "執行中");
   await page.locator('[data-mode="changes"]').click();
   expire.resolve();
   await page.locator("#cards").getByText("from phone while away").waitFor({state:"attached"});
   assert.ok(await page.locator("#changes-view").isVisible());
   assert.deepEqual(cursors.slice(0,2), ["10","12"]);
-  assert.equal(await page.locator("#sh-status").textContent(), "idle");
+  assert.equal(await page.locator("#sh-status").textContent(), "閒置");
   assert.equal(await page.locator("#cards .card").count(), 1);
 });
 
 test("late attachment stays with A, and the first A snapshot cannot replace the second A", async t => {
-  const hold = gate(), started = gate();
+  const hold = gate(), started = gate(), released = gate();
   let aLoads = 0;
   const page = await fixture(t, async (r, id, action) => {
     if (action === "cards") {
       if (id === A && ++aLoads === 1) {
         started.resolve(); await hold.promise;
-        return r.fulfill({json:snap(0, [row("old", "obsolete snapshot")])});
+        try { await r.fulfill({json:snap(0, [row("old", "obsolete snapshot")])}); }
+        finally { released.resolve(); }
+        return;
       }
       return r.fulfill({json:snap(20, [row("fresh", "current " + id)])});
     }
@@ -275,6 +308,7 @@ test("late attachment stays with A, and the first A snapshot cannot replace the 
     };
   });
   await page.getByText("Alpha", {exact:true}).click(); await started.promise;
+  await page.evaluate(() => { window.firstHistorySignal = historyAbort.signal; });
   await page.locator("#file-pick").setInputFiles({name:"alpha-only.txt", mimeType:"text/plain", buffer:Buffer.from("A")});
   assert.ok(await page.locator("#send").isDisabled());
   await page.getByText("Beta", {exact:true}).first().click();
@@ -284,9 +318,9 @@ test("late attachment stays with A, and the first A snapshot cannot replace the 
   await page.getByText("Alpha", {exact:true}).first().click();
   await page.locator("#cards").getByText("current " + A).waitFor();
   await page.locator("#atts").getByText("alpha-only.txt", {exact:false}).waitFor();
-  const stale = page.waitForResponse(r => decodeURIComponent(r.url()).includes(A + "/cards"));
+  assert.ok(await page.evaluate(() => window.firstHistorySignal.aborted));
   hold.resolve();
-  await (await stale).finished();
+  await released.promise;
   await page.evaluate(() => new Promise(done => requestAnimationFrame(() => requestAnimationFrame(done))));
   assert.equal(await page.locator("#cards .card-body").textContent(), "current " + A);
 });

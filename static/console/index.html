@@ -69,8 +69,9 @@
       <div id="stream-head" class="stream-head hidden">
         <div class="sh-title"><button type="button" id="back-home" class="icon-btn" aria-label="回到工作接力" title="回到工作接力">←</button><span id="sh-provider" class="pill"></span><span id="sh-name"></span></div>
         <div class="sh-actions">
-          <span id="sh-status" class="status-chip"></span>
+          <span id="sh-status" class="status-chip" role="status"></span>
           <span id="stream-health" role="status"></span>
+          <button id="earlier-cards" type="button" hidden>更早訊息</button>
           <button id="interrupt" class="btn btn-danger" title="中斷目前回合">■ 中斷</button>
         </div>
       </div>
@@ -200,6 +201,7 @@
   <button type="button" class="btn" id="retry-logout">重試登出</button>
 </section>
 <script src="/console/static/sse.js"></script>
+<script src="/console/static/transcript.js"></script>
 <script src="/console/static/app.js"></script>
 <script src="/console/static/filebrowser.js"></script>
 <script src="/console/static/changes.js"></script>
