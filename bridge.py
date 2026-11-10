@@ -593,8 +593,9 @@ def _auth_fail_summary_locked(request: Request, status: int, now: float) -> dict
 # 預設**一個目錄都不開**:沒設 env 就等於規格原本的「擋掉檔案面」。
 # 要開就明確列出要開哪幾個 —— 安全的那一側當預設,放寬是刻意動作。
 CONSOLE_REMOTE_SCOPE = "console-remote"
-CONSOLE_REMOTE_TOKEN_TTL = int(os.environ.get("POCKET_CONSOLE_REMOTE_TOKEN_TTL", "1800"))
-CONSOLE_REMOTE_IDLE = int(os.environ.get("POCKET_CONSOLE_REMOTE_IDLE", "900"))
+_CONSOLE_DAY = 24 * 3600
+CONSOLE_REMOTE_TOKEN_TTL = min(_CONSOLE_DAY, int(os.environ.get("POCKET_CONSOLE_REMOTE_TOKEN_TTL", str(_CONSOLE_DAY))))
+CONSOLE_REMOTE_IDLE = min(_CONSOLE_DAY, int(os.environ.get("POCKET_CONSOLE_REMOTE_IDLE", str(_CONSOLE_DAY))))
 CONSOLE_REMOTE_FILE_ROOTS = [
     os.path.realpath(os.path.expanduser(r.strip()))
     for r in (os.environ.get("POCKET_CONSOLE_REMOTE_FILE_ROOTS") or "").split(":")
@@ -653,6 +654,14 @@ def _console_entry_expired(entry: dict, now: float | None = None) -> bool:
     except (KeyError, TypeError, ValueError):
         return True
     return not idle_until > now or _expires_passed(entry.get("expires"), now)
+
+
+def _browser_token_expired(entry: dict) -> bool:
+    if entry.get("scope") == CONSOLE_REMOTE_SCOPE:
+        return _console_entry_expired(entry)
+    if not entry.get("console_session"):
+        return False
+    return _expires_passed(entry.get("expires") or float(entry.get("created") or 0) + _CONSOLE_DAY)
 
 
 def _console_remote_expired(token: str, now: float | None = None) -> bool:
@@ -766,7 +775,7 @@ def _token_is_valid(token: str) -> bool:
     with _PAIR_LOCK:
         dev = _DEVICE_TOKENS.get(token)
         if dev is not None:
-            if dev.get("scope") == CONSOLE_REMOTE_SCOPE and _console_entry_expired(dev):
+            if _browser_token_expired(dev):
                 return False
             if not dev.get("apple_user_id") or _account_device_for_token(token) is not None:
                 dev["last_seen"] = time.time()
@@ -797,8 +806,7 @@ def _check_auth(request: Request) -> None:
                 # 掛住、沒有錯誤、沒有逾時。2026-10-30 我第一版就這樣寫,
                 # 單獨跑那條測試是綠的(middleware 先擋掉所以走不到這裡),
                 # 五條一起跑才卡死。
-                if str(dev.get("scope") or "") == CONSOLE_REMOTE_SCOPE \
-                        and _console_entry_expired(dev):
+                if _browser_token_expired(dev):
                     raise http_err(401, "TOKEN_EXPIRED",
                                    "遠端控制台的授權已到期,請重新掃碼登入")
                 if not dev.get("apple_user_id") or _account_device_for_token(token) is not None:
@@ -10488,6 +10496,7 @@ def _pair_code_meta(value):
             "expiry": float(value.get("expiry") or 0),
             "apple_user_id": value.get("apple_user_id"),
             "console": value.get("console"),
+            "issued_at": value.get("issued_at"),
             "relay_host": value.get("relay_host"),
         }
     try:
@@ -10555,6 +10564,7 @@ def _pair_mint_code(apple_user_id=None, ttl=None, *, console=None, relay_host=No
         }
         if console:
             _PAIR_CODES[code]["console"] = console
+            _PAIR_CODES[code]["issued_at"] = time.time()
             if relay_host:
                 _PAIR_CODES[code]["relay_host"] = relay_host
     return code
@@ -10587,7 +10597,7 @@ def _pair_issue_device_token(name: str, platform: str, claim_user_id=None,
 
 @app.post("/app/v1/pair/claim")
 @app.post("/pair/claim")
-async def pair_claim(request: Request):
+async def pair_claim(request: Request, response: Response = None):
     """Phone exchanges a one-time code for its OWN device token. The code IS the
     credential (no bearer needed); it is single-use and expires after
     `_PAIR_CODE_TTL` (10 minutes by default; the minting call may widen it)."""
@@ -10630,12 +10640,17 @@ async def pair_claim(request: Request):
     extra = None
     if console:
         name, platform, claim_user_id = "Console", "web", None
-        extra = {"console_session": True}
+        issued = float(meta.get("issued_at") or time.time())
+        extra = {"console_session": True, "expires":issued + _CONSOLE_DAY}
         if console == CONSOLE_REMOTE_SCOPE:
-            extra.update(scope=CONSOLE_REMOTE_SCOPE, expires=time.time() + CONSOLE_REMOTE_TOKEN_TTL)
+            extra.update(scope=CONSOLE_REMOTE_SCOPE, expires=issued + CONSOLE_REMOTE_TOKEN_TTL)
             if meta.get("relay_host"):
                 extra["relay_host"] = meta["relay_host"]
     token, device = _pair_issue_device_token(name, platform, claim_user_id, extra=extra)
+    if response is not None and console == CONSOLE_REMOTE_SCOPE and meta.get("relay_host"):
+        response.set_cookie("pocket_console_resume", token, max_age=max(0, int(extra["expires"]-time.time())),
+                            path="/console/session", secure=True, httponly=True, samesite="strict")
+        response.headers["Cache-Control"] = "no-store"
     _log_event("pair_claim",
                device=name,
                platform=platform,
@@ -11447,11 +11462,9 @@ _CONSOLE_SECURITY_HEADERS = {
 #   2. **簽發時間簽進值裡**(`<ts>.<hmac(boot, ts)>`)並在驗證時檢查有效期 ——
 #      純 `HMAC(boot, 固定字串)` 是定值,等於一張永不過期、只能靠換碼撤銷的
 #      通行證。console 能瀏覽檔案與記憶面板(等同那台機器的鑰匙),不給長命。
-#   3. 每次成功開 /console 都重新簽發(滑動視窗):常用的人不會被踢,
-#      閒置超過 TTL 就得再用一次 boot 連結。
+#   3. Only a fresh login sets the timestamp; reloads never renew it.
 _CONSOLE_COOKIE_NAME = "pocket_console"
-_CONSOLE_COOKIE_TTL = int(os.environ.get("POCKET_CONSOLE_COOKIE_TTL",
-                                         str(14 * 24 * 3600)))   # 14 天
+_CONSOLE_COOKIE_TTL = min(_CONSOLE_DAY, int(os.environ.get("POCKET_CONSOLE_COOKIE_TTL", str(_CONSOLE_DAY))))
 # cookie 的 path 刻意只放 /console(見下方 _console_set_cookie 的註解)。
 _CONSOLE_COOKIE_PATH = "/console"
 _CONSOLE_COOKIE_CLOCK_SKEW = 300.0       # 機器時鐘微調不要害人重新配對
@@ -11480,7 +11493,7 @@ def _console_cookie_ok(request: Request) -> bool:
         if not sep or not sig or not ts_s.isdigit():
             return False
         age = time.time() - int(ts_s)
-        if age > _CONSOLE_COOKIE_TTL or age < -_CONSOLE_COOKIE_CLOCK_SKEW:
+        if age >= _CONSOLE_COOKIE_TTL or age < -_CONSOLE_COOKIE_CLOCK_SKEW:
             return False                       # 過期(或時間戳在未來)
         return hmac.compare_digest(sig, _console_cookie_sign(ts_s))
     except Exception as e:  # noqa: BLE001 — 壞 cookie 不該讓頁面 500,但要留痕
@@ -11509,9 +11522,8 @@ def _console_cookie_secure(request: Request) -> bool:
     return xfp.split(",")[0].strip().lower() == "https"
 
 
-def _console_set_cookie(request: Request, resp: Response, *,
-                        session_only: bool = False) -> None:
-    """成功開 /console 就(重新)簽發 cookie。
+def _console_set_cookie(request: Request, resp: Response) -> None:
+    """Sign a fixed-lifetime page gate for a fresh login.
 
     `path="/console"` 是**查過才敢收這麼窄的**:整個 console 只有 `GET /console`
     這一條走 `_console_guard`,其餘全部不靠 cookie ——
@@ -11527,10 +11539,7 @@ def _console_set_cookie(request: Request, resp: Response, *,
     """
     resp.set_cookie(
         _CONSOLE_COOKIE_NAME, _console_cookie_value(),
-        # session_only(QR 登入那條路):**不帶 max-age** → session cookie,
-        # 關掉瀏覽器就死。機主的要求,而且比 14 天滑動視窗緊得多 —— QR 登入
-        # 的前提是「人不一定在可信的電腦前」,憑證不該活過那個分頁。
-        max_age=(None if session_only else _CONSOLE_COOKIE_TTL),
+        max_age=_CONSOLE_COOKIE_TTL,
         path=_CONSOLE_COOKIE_PATH,
         httponly=True, samesite="strict",
         secure=_console_cookie_secure(request),
@@ -11703,15 +11712,8 @@ __ERR__<form method="post" action="/console/auth">
 <b>Settings → Desktop Console</b>.</span></p>
 </div>
 <p class="note">__NOTE__</p>
-</main></body></html>""".replace("__ERR__", err).replace("__NOTE__", (
-        "驗證成功後,這個瀏覽器會記住 14 天。<br>"
-        "<span class=\"en\">This browser stays signed in for 14 days.</span>"
-        if persistent else
-        # web-first 中繼面發的是 session cookie(關瀏覽器即失效),頁面上的
-        # 承諾要跟實際發的憑證一致,不能沿用 14 天那句。
-        "驗證成功後,登入維持到關閉瀏覽器為止。<br>"
-        "<span class=\"en\">You stay signed in until this browser is closed."
-        "</span>"))
+</main></body></html>""".replace("__ERR__", err).replace("__NOTE__",
+        "登入最長有效 24 小時。<br><span class=\"en\">Sign in again after 24 hours.</span>")
 
 
 def _console_login_response(request: Request, *, error: str = "",
@@ -11928,19 +11930,10 @@ async def console_page(request: Request):
     if not local:
         html = html.replace('data-console-access="local"', 'data-console-access="remote"', 1)
     resp = HTMLResponse(html, headers=_CONSOLE_SECURITY_HEADERS)
-    # 滑動視窗:每次成功開頁都續命。但**遠端來源只能續成 session cookie** ——
-    # 若照本機那樣換發 14 天的,掃碼登入的人每開一次頁就把「關瀏覽器即失效」
-    # (規格 §10)換成一張 14 天通行證,等於這條路徑的安全前提被無聲抵銷。
-    # QR 登入的前提正是「人不一定在可信的電腦前」。
-    # web-first 的中繼面(`web=True` → `local=False`)**同樣只續 session
-    # cookie**:機主對這條路的原始要求就是「關掉瀏覽器就重新用碼登入」,
-    # 而且 QR 批准發的 session cookie 不該因為多開了 web 旗標就被升級成
-    # 14 天(兩種 cookie 在值上無從分辨,一視同仁收緊)。
-    #
-    # 續命失敗只影響「這一次的續命」,不毀掉本次請求:頁面照送,舊 cookie
-    # 活到它原本的 TTL,下次再續(t3code「憑證續期不斷線」原則)。
+    # An already authenticated page load must never renew the original timestamp.
     try:
-        _console_set_cookie(request, resp, session_only=not local)
+        if not _console_cookie_ok(request):
+            _console_set_cookie(request, resp)
     except Exception as _exc:  # noqa: BLE001 — 續不了命 ≠ 開不了頁
         _log_exc("console_cookie_renew", _exc, expected=True)
     return resp
@@ -12018,7 +12011,7 @@ async def console_auth(request: Request):
     # 機主對這條路的原始要求是「關掉瀏覽器或 timeout 就重新六碼登入」,
     # 公網面的憑證不活過那個分頁(與 GET 的續命規則一致,不然 GET 下一次
     # 續命也會把它收斂成 session cookie,發 14 天只是自欺)。
-    _console_set_cookie(request, resp, session_only=not local)
+    _console_set_cookie(request, resp)
     # 交棒給前端:只有「這一次驗過碼」才鑄碼,長命 cookie 永遠換不到(見
     # _CONSOLE_CLAIM_COOKIE_NAME 上方的安全邊界)。碼放 cookie 不放 query。
     claim = _console_mint_claim_code(remote=not local)
@@ -12057,7 +12050,23 @@ async def console_logout(request: Request):
     for key in (_CONSOLE_COOKIE_NAME, _CONSOLE_CLAIM_COOKIE_NAME, _CONSOLE_LOGIN_SID_COOKIE):
         response.delete_cookie(key, path=_CONSOLE_COOKIE_PATH, secure=_console_cookie_secure(request),
                                httponly=key != _CONSOLE_CLAIM_COOKIE_NAME, samesite="strict")
+    response.delete_cookie("pocket_console_resume", path="/console/session", secure=True,
+                           httponly=True, samesite="strict")
     return response
+
+
+@app.post("/console/session/resume")
+async def console_session_resume(request: Request):
+    host = _console_live_relay_host()
+    if (not host or not _console_relay_request_ok(request, host) or
+            request.headers.getlist("origin") != ["https://"+host] or not _console_cookie_ok(request)):
+        raise HTTPException(status_code=403, detail="relay only")
+    token = request.cookies.get("pocket_console_resume") or ""
+    entry = _token_entry(token) or {}
+    if (entry.get("scope") != CONSOLE_REMOTE_SCOPE or entry.get("relay_host") != host
+            or _console_entry_expired(entry)):
+        raise HTTPException(status_code=401, detail="login required")
+    return JSONResponse({"token":token, "scope":CONSOLE_REMOTE_SCOPE}, headers=_CONSOLE_SECURITY_HEADERS)
 
 
 # PWA 的兩個檔案必須從 **/console/** 這一層服務,不能只掛在 /console/static/:
@@ -12593,6 +12602,31 @@ async def console_entry_select(request: Request):
     return JSONResponse({"challenge":challenge, "relay_host":host}, headers=_CONSOLE_SECURITY_HEADERS)
 
 
+@app.post("/app/v1/console/entry/code")
+async def console_entry_code(request: Request):
+    if not POCKET_CONSOLE_ENABLED or not _console_uses_relay_policy() or not _console_live_relay_host():
+        raise HTTPException(status_code=404, detail="relay unavailable")
+    _console_approval_auth(request)
+    body = await _json_body(request)
+    if not isinstance(body, dict) or set(body) - {"handle"} or (
+            "handle" in body and not re.fullmatch("[a-f0-9]{32}", str(body["handle"]))):
+        raise HTTPException(status_code=400, detail="invalid handle")
+    st = _pocket_id_state() or {}
+    if not POCKET_ID_URL.startswith("https://") or st.get("url") != POCKET_ID_URL or not st.get("host_secret"):
+        raise HTTPException(status_code=503, detail="no enrolled host")
+    import httpx
+    try:
+        result = await _pocket_id_api("/v1/console-entry/code-host", {
+            "host_id":st["host_id"], "host_secret":st["host_secret"], **body})
+    except httpx.HTTPStatusError as exc:
+        code = exc.response.status_code
+        raise HTTPException(status_code=code if code in (404,429) else 503, detail="code unavailable") from None
+    except httpx.HTTPError:
+        raise HTTPException(status_code=503, detail="entry unavailable") from None
+    return JSONResponse({k:result[k] for k in ("code","handle","expires_in","state","rid") if k in result},
+                        headers=_CONSOLE_SECURITY_HEADERS)
+
+
 @app.post("/app/v1/console/entry/lookup")
 async def console_entry_lookup(request: Request):
     if not POCKET_CONSOLE_ENABLED or not _console_uses_relay_policy() or not (host := _console_live_relay_host()):
@@ -12657,7 +12691,7 @@ async def console_login_status(request: Request):
     # 機制:claim cookie 非 httpOnly,前端用 document.cookie 讀、換 device token)。
     resp = JSONResponse({"state": "approved", "redirect": "/console"},
                         headers=_CONSOLE_SECURITY_HEADERS)
-    _console_set_cookie(request, resp, session_only=True)   # 關瀏覽器即死(規格 §10)
+    _console_set_cookie(request, resp)
     _console_set_claim_cookie(request, resp, code)
     resp.delete_cookie(_CONSOLE_LOGIN_SID_COOKIE, path=_CONSOLE_COOKIE_PATH)
     _log_event("console_login_approved_consumed")

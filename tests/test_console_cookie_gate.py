@@ -174,8 +174,8 @@ class TestConsoleCookieGate(_ConsoleCookieBase):
         self.assertLoginPage(
             self.client.get("/console", headers=self._cookie_header(future)))
 
-    def test_ttl_is_14_days(self):
-        self.assertEqual(bridge._CONSOLE_COOKIE_TTL, 14 * 24 * 3600)
+    def test_ttl_is_one_day(self):
+        self.assertEqual(bridge._CONSOLE_COOKIE_TTL, 24 * 3600)
 
     # ── 6. 換掉 boot code → 舊 cookie 立刻失效 ────────────────────────
     def test_cookie_dies_with_boot_code_rotation(self):

@@ -137,7 +137,7 @@ class WebFlagOn(_Base):
             self.assertIn(mark, r.text)
         # 公網面發的是 session cookie,頁尾承諾必須對齊(不能再寫 14 天)。
         self.assertNotIn("14 天", r.text)
-        self.assertIn("關閉瀏覽器", r.text)
+        self.assertIn("24 小時", r.text)
 
     def test_other_host_still_403(self):
         r = self.http.get("/console", headers={"Host": "evil.example.com",
@@ -153,7 +153,7 @@ class WebFlagOn(_Base):
         # 本機直連(無轉送標頭):輸入頁照舊,文案仍是 14 天那句。
         r = self.http.get("/console")
         self.assertEqual(r.status_code, 401)
-        self.assertIn("14 天", r.text)
+        self.assertIn("24 小時", r.text)
         # 本機 POST 正確碼:14 天滑動視窗照舊,http 下不帶 Secure。
         p = self.http.post("/console/auth", data={"code": self.boot},
                            follow_redirects=False)
@@ -218,7 +218,7 @@ class WebFlagOn(_Base):
         (console,) = self._set_cookies(r, bridge._CONSOLE_COOKIE_NAME)
         (claim,) = self._set_cookies(r, bridge._CONSOLE_CLAIM_COOKIE_NAME)
         # 公網面:session cookie(無 Max-Age),https 中繼必帶 Secure。
-        self.assertNotIn("Max-Age", console)
+        self.assertIn("Max-Age=86400", console)
         self.assertIn("Secure", console)
         self.assertIn(f"Max-Age={bridge._CONSOLE_CLAIM_COOKIE_TTL}", claim)
         self.assertIn("Secure", claim)
@@ -227,14 +227,13 @@ class WebFlagOn(_Base):
         self.assertEqual(r2.status_code, 401)
 
     # ── cookie 開頁 + 續命 ─────────────────────────────────────────────
-    def test_cookie_opens_shell_renews_session_only(self):
+    def test_cookie_opens_shell_without_extending_lifetime(self):
         r = self.http.get("/console", headers=_WEB,
                           cookies={bridge._CONSOLE_COOKIE_NAME:
                                    bridge._console_cookie_value()})
         self.assertEqual(r.status_code, 200)
         self.assertIn(_CONSOLE_MARK, r.text)
-        (renewed,) = self._set_cookies(r, bridge._CONSOLE_COOKIE_NAME)
-        self.assertNotIn("Max-Age", renewed)   # 公網面只續 session cookie
+        self.assertFalse(self._set_cookies(r, bridge._CONSOLE_COOKIE_NAME))
 
     def test_renew_failure_only_affects_renewal(self):
         # t3code 原則:續期失敗只影響該請求的續期,頁面照送、舊憑證照活。

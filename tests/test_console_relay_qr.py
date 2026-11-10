@@ -154,6 +154,14 @@ class RelayQRTest(unittest.TestCase):
                                        json={"code": code}).status_code, 403)
         claim = self.web.post("/pair/claim", json={"code": code, "scope": "owner"}).json()
         self.assertEqual(claim["scope"], bridge.CONSOLE_REMOTE_SCOPE)
+        origin = {"Origin":"https://"+self.relay}
+        self.assertEqual(self.web.post("/console/session/resume", headers=origin).json(),
+                         {"scope":"console-remote","token":claim["token"]})
+        self.assertEqual(self.web.post("/console/session/resume", headers={"Origin":"https://other.example"}).status_code,403)
+        deadline = bridge._token_entry(claim["token"])["expires"]
+        with patch.object(bridge.time, "time", return_value=deadline+1):
+            self.assertIn(self.web.post("/console/session/resume", headers=origin).status_code, (401,403))
+            self.assertTrue(bridge._console_remote_expired(claim["token"]))
         auth = {"Authorization": "Bearer " + claim["token"]}
         self.assertIn('data-console-access="remote"', self.web.get("/console").text)
         self.assertEqual(self.web.get("/health", headers=auth).status_code, 200)
