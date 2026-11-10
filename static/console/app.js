@@ -400,6 +400,8 @@ function openSession(id, preserveMode = false) {
   syncControls();
   renderApproval();
   $("cards").innerHTML = '<div class="placeholder working" role="status">讀取最近訊息…</div>';
+  cardScroll.follow = true;
+  cardScroll.top = $("cards").scrollTop;
   void loadCardSnapshot(id, view);
   if (window.PocketConsoleRail) window.PocketConsoleRail.load();
 }
@@ -767,10 +769,19 @@ function groupTurns(cards) {
   return turns;
 }
 
+const cardScroll = { follow: true, top: 0 };
+function trackCardScroll(el) {
+  if (!el.clientHeight || el.scrollTop === cardScroll.top) return;
+  cardScroll.top = el.scrollTop;
+  // scrollTop can be fractional; this is rounding tolerance, not a follow zone.
+  cardScroll.follow = el.scrollHeight - el.clientHeight - el.scrollTop <= 1;
+}
+
 function renderCards(prepending = false) {
   const el = $("cards");
   const oldHeight = el.scrollHeight, oldTop = el.scrollTop;
-  const follow = !prepending && el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+  trackCardScroll(el); // Native scrolling can precede its queued scroll event.
+  const follow = !prepending && cardScroll.follow;
   const oldNodes = new Map(Array.from(el.children, n => [n.dataset.key, n]));
   const firstVisible = follow ? null : Array.from(el.children).find(n =>
     n.getBoundingClientRect().bottom > el.getBoundingClientRect().top);
@@ -794,6 +805,7 @@ function renderCards(prepending = false) {
   if (follow) el.scrollTop = el.scrollHeight;
   else if (firstVisible?.isConnected) el.scrollTop += firstVisible.getBoundingClientRect().top - anchorTop;
   else if (prepending) el.scrollTop = oldTop + el.scrollHeight - oldHeight;
+  cardScroll.top = el.scrollTop; // Our anchor correction is not a reader gesture.
 }
 
 function setStreamHealth(label, working = false) {
@@ -918,6 +930,7 @@ function autosize() {
 
 // ───────────────────────── 綁定 + 啟動 ─────────────────────────
 function wire() {
+  $("cards").addEventListener("scroll", e => trackCardScroll(e.currentTarget), { passive: true });
   $("earlier-cards").addEventListener("click", loadOlderCards);
   $("remember-work").addEventListener("change", e => {
     if (e.target.checked) rememberWork(state.current);

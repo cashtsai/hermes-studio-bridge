@@ -23,6 +23,8 @@ POCKET_TEST_LONG_OUTAGE=1 POCKET_QA_INSTALL_PWA=1 PYTHON=python3 node --test tes
 
 真 Codex 的選用指令見[整合驗收](CONSOLE_BORROWED_BROWSER.md)。不要對正式 session 跑故障注入。
 
+日常 Web 改動另有[三種尺寸的接力與閱讀驗收](CONSOLE_WEB_DESIGN_QA.md)，不取代下列外網放行程序。
+
 ## 外網放行程序
 
 只使用 HTTPS staging、已配對的實體 iPhone、兩個測試帳號及分別歸屬的主機。借用瀏覽器用無痕或乾淨 profile，不登入 Google、不預裝 Pocket、不連私人網路。以同一候選版部署的 bridge、靜態資產、入口及 iOS build 為一批；任一元件更換即記新批次，不混用證據。
