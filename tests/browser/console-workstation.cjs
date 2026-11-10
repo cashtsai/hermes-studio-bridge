@@ -58,10 +58,10 @@ for (const mode of ["browser","standalone"]) test("1366x768 "+mode+": work, late
     const last=page.locator("#cards").getByText("測試訊息 79",{exact:true});
     await last.waitFor();
     const input=page.locator("#input");
-    await input.fill("第一行"); await input.press("Enter"); await page.keyboard.insertText("第二行");
+    await input.fill("第一行"); await input.press("Shift+Enter"); await page.keyboard.insertText("第二行");
     const ime=await context.newCDPSession(page);
     await ime.send("Input.imeSetComposition",{text:"選字",selectionStart:2,selectionEnd:2});
-    await input.press("Control+Enter"); await input.press("Control+k");
+    await input.dispatchEvent("keydown",{key:"Enter",isComposing:true}); await input.press("Control+k");
     await ime.send("Input.insertText",{text:"選字"});
     assert.ok(await page.locator("#palette").isHidden());
     await input.dispatchEvent("keydown",{key:"Enter",ctrlKey:true,keyCode:229});
@@ -79,7 +79,7 @@ for (const mode of ["browser","standalone"]) test("1366x768 "+mode+": work, late
       await page.screenshot({path:path.join(process.env.POCKET_QA_SCREENSHOTS,"workstation-"+mode+".png")});
     }
     const sent=page.waitForResponse(r=>r.url().endsWith("/input"));
-    await input.press("Control+Enter"); await sent;
+    await input.press("Enter"); await sent;
     assert.deepEqual(model.posts.map(p=>p.content),["第一行\n第二行選字"]);
     await page.locator("#rail-list").getByText("sample.txt").click();
     await page.locator("#ch-diff").getByText("+sample",{exact:true}).waitFor();

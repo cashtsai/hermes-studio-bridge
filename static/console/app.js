@@ -1019,7 +1019,7 @@ function wire() {
       finishInput(id, d, "");
   });
   $("input").addEventListener("keydown", (e) => {
-    if (!imeKey(e) && (e.metaKey || e.ctrlKey) && e.key === "Enter") {
+    if (!imeKey(e) && !e.shiftKey && !e.altKey && e.key === "Enter") {
       e.preventDefault(); if (!e.repeat) sendInput($("input").value);
     }
   });
