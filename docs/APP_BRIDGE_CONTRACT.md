@@ -1892,3 +1892,8 @@ older page with `before_id=<encoded cursor>`; do not combine this with
 `before_seq`. An evicted anchor returns 409. Paging only covers history
 retained by the card store. Never advance the live SSE cursor from an older
 page. The default snapshot and existing sequence-based clients are unchanged.
+# Desktop Console login
+
+The paired mobile client posts `{}` to `/app/v1/console/entry/code` when Desktop Console opens. The response contains a six-digit string, a private poll handle and `expires_in: 900`. Poll the same endpoint with the handle. A returned browser rid goes through the existing select, lookup and explicit approve/deny flow. The code cannot mint a device or a login by itself.
+
+The public relay login and scoped token have a fixed maximum lifetime of 24 hours. Visiting Console does not extend it. A host-only Secure HttpOnly cookie on `/console/session` lets the same browser recover **only its existing scoped token** via a same-origin POST to `/console/session/resume`; expiration and device revocation remain server-enforced.
