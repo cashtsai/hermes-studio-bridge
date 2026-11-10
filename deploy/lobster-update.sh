@@ -28,6 +28,11 @@ RELEASES="$BASE/releases"
 SNAPSHOTS="$BASE/snapshots"
 SRC="$HOME/pocket-bridge"                 # 與 cloud-init 的 setup 腳本共用
 UNIT="${POCKET_BRIDGE_LABEL:-pocket-bridge}"
+# 安裝器(相對 $SRC):雲端龍蝦=完全體 install-ubuntu.sh;自架機(bridge.env 的
+# POCKET_BRIDGE_INSTALLER=deploy/selfhost-install.sh)=精簡安裝器。自架的每日
+# 更新**必須**走同一支精簡安裝器 —— 走完全體會把 OpenClaw/frpc/tunnel 整套
+# 裝回去,把一台自架機默默變成龍蝦。
+INSTALLER_REL="${POCKET_BRIDGE_INSTALLER:-deploy/install-ubuntu.sh}"
 ENV_FILE="${POCKET_ENV_DIR:-$HOME/.config/pocket-lobster}/bridge.env"
 CRASH_STATE_DIR="${POCKET_BRIDGE_CRASH_STATE_DIR:-$HOME/.local/state/pocket-lobster/bridge}"
 PYTHON="${POCKET_PYTHON:-python3}"
@@ -40,6 +45,7 @@ if [ -f "$ENV_FILE" ]; then
   # print its contents; only the named variables are consumed below.
   . "$ENV_FILE"
   UNIT="${POCKET_BRIDGE_LABEL:-$UNIT}"
+  INSTALLER_REL="${POCKET_BRIDGE_INSTALLER:-$INSTALLER_REL}"
   CRASH_STATE_DIR="${POCKET_BRIDGE_CRASH_STATE_DIR:-$CRASH_STATE_DIR}"
   PYTHON="${POCKET_PYTHON:-$PYTHON}"
 fi
@@ -121,6 +127,9 @@ reset_crash_loop
 git -C "$SRC" fetch --depth 1 origin "refs/tags/$latest:refs/tags/$latest" \
   || die "fetch $latest 失敗"
 git -C "$SRC" checkout -q --force "refs/tags/$latest" || die "checkout 失敗"
+# 安裝器不存在(tag 太舊,還沒收進自架安裝器之類)→ 現在就停,一個 unit 都
+# 還沒動,舊版繼續服務。
+[ -f "$SRC/$INSTALLER_REL" ] || die "$SRC/$INSTALLER_REL 不存在($latest 沒帶這支安裝器)—— 不升級"
 
 NEW="$RELEASES/$latest"
 log "安裝 $latest → $NEW(官方安裝器,同一條路徑)"
@@ -141,7 +150,7 @@ restore_units() {
 }
 if ! POCKET_BRIDGE_INSTALL_ROOT="$NEW" POCKET_BRIDGE_VENV="$NEW/venv" \
      POCKET_BRIDGE_RUN_ROOT="$CURRENT" POCKET_BRIDGE_RUN_VENV="$CURRENT/venv" \
-     bash "$SRC/deploy/install-ubuntu.sh" >"$BASE/update-$latest.log" 2>&1; then
+     bash "$SRC/$INSTALLER_REL" >"$BASE/update-$latest.log" 2>&1; then
   log "✗ 安裝器失敗 —— 回復 unit 快照並重啟舊版(log:$BASE/update-$latest.log)"
   restore_units
   exit 1
