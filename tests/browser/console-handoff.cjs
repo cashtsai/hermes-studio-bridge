@@ -104,14 +104,22 @@ test("reading history survives a live card and a prepend; another session starts
     return {key:n.dataset.key,y:n.getBoundingClientRect().top};
   });
   const anchorY=() => cards.locator('[data-key="'+anchor.key+'"]').evaluate(el => el.getBoundingClientRect().top);
-  await page.evaluate(card => upsertCard(card),{...row("new","live"),ts:49});
+  const jump=page.locator("#new-reply");
+  for (const [n,extra] of [["tool",{kind:"tool_result"}],["echo",{role:"user"}],["trace",{body:{text:"<think>trace only</think>"}}]]) {
+    await page.evaluate(card=>upsertCard(card),{...row(n,"activity"),ts:48.5,turn_id:n,...extra});
+    await cards.locator('[data-key="'+n+'"]').waitFor();
+    assert.ok(await jump.isHidden());
+  }
+  await page.evaluate(card => upsertCard(card),{...row("new","live"),turn_id:"new",ts:49});
   await cards.locator('[data-key="new"]').waitFor();
+  assert.ok(await jump.isVisible());
   assert.ok(Math.abs(await anchorY()-anchor.y)<=1,"live append moved the reader");
   await page.locator("#earlier-cards").click();
   await cards.locator('[data-key="r0"]').waitFor();
   assert.ok(Math.abs(await anchorY()-anchor.y)<=1,"older page moved the reader");
   await page.locator('#session-list [data-id="'+B+'"]').click();
   await cards.locator('[data-key="r47"]').waitFor();
+  assert.ok(await jump.isHidden());
   assert.ok(await cards.evaluate(el => el.scrollHeight-el.clientHeight-el.scrollTop<=1),"new session inherited detached mode");
 });
 

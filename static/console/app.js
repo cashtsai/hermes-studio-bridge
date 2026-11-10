@@ -355,6 +355,8 @@ function showHome() {
 let snapshotRetry;
 let historyAbort, olderCursor = null, loadingOlder = false;
 function resetHistory() {
+  $("new-reply").hidden = true;
+  cardScroll.replyView = null;
   historyAbort?.abort();
   historyAbort = new AbortController();
   olderCursor = null;
@@ -649,14 +651,30 @@ function subscribeCards(id, view) {
   });
 }
 
+function visibleReplyText(card) {
+  if (!card || card.role === "user" || !PROSE_KINDS.has(card.kind || "text")) return "";
+  const text = cardText(card);
+  if (/^💭\s/u.test(text)) return "";
+  return /<(?:details|think)\b/i.test(text)
+    ? replySegments(text).filter(p => !p.label).map(p => p.text).join("") : text;
+}
+
 function upsertCard(card) {
   const i = state.cards.findIndex((c) => c.id === card.id);
+  if (!cardScroll.follow && $("new-reply").hidden) {
+    const reply = visibleReplyText(card);
+    if (reply && reply !== visibleReplyText(state.cards[i])) cardScroll.replyView = state.view;
+  }
   if (i >= 0) state.cards[i] = card; else state.cards.push(card);
   if (state.frameView === state.view) return;
   const view = state.frameView = state.view;
   requestAnimationFrame(() => {
     if (!currentView(view)) return;
     state.frameView = null; renderCards();
+    if (cardScroll.replyView === view) {
+      if (!cardScroll.follow) $("new-reply").hidden = false;
+      cardScroll.replyView = null;
+    }
   });
 }
 
@@ -769,12 +787,13 @@ function groupTurns(cards) {
   return turns;
 }
 
-const cardScroll = { follow: true, top: 0 };
+const cardScroll = { follow: true, top: 0, replyView: null };
 function trackCardScroll(el) {
   if (!el.clientHeight || el.scrollTop === cardScroll.top) return;
   cardScroll.top = el.scrollTop;
   // scrollTop can be fractional; this is rounding tolerance, not a follow zone.
   cardScroll.follow = el.scrollHeight - el.clientHeight - el.scrollTop <= 1;
+  if (cardScroll.follow) $("new-reply").hidden = true;
 }
 
 function renderCards(prepending = false) {
@@ -930,6 +949,14 @@ function autosize() {
 
 // ───────────────────────── 綁定 + 啟動 ─────────────────────────
 function wire() {
+  $("new-reply").addEventListener("click", () => {
+    const el = $("cards");
+    el.scrollTop = el.scrollHeight;
+    cardScroll.top = el.scrollTop;
+    cardScroll.follow = true;
+    $("new-reply").hidden = true;
+    el.focus({preventScroll:true});
+  });
   $("cards").addEventListener("scroll", e => trackCardScroll(e.currentTarget), { passive: true });
   $("earlier-cards").addEventListener("click", loadOlderCards);
   $("remember-work").addEventListener("change", e => {
