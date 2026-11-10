@@ -204,7 +204,7 @@ class RemoteApprovedTest(_Base):
         self.assertIn(_CONSOLE_MARK, r.text, "批准過的遠端瀏覽器應該進得去")
         self.assertNotIn("pocket://console-login", r.text, "不該又丟回 QR 頁")
 
-    def test_remote_refresh_stays_session_cookie(self):
+    def test_remote_refresh_never_extends_login(self):
         """**我第一版寫錯的地方。**
 
         底下的續命原本無條件 `_console_set_cookie(request, resp)` —— 遠端
@@ -215,10 +215,7 @@ class RemoteApprovedTest(_Base):
         r = self.http.get("/console", headers={**_REMOTE, **self._cookie_header()})
         self.assertEqual(r.status_code, 200)
         sc = r.headers.get("set-cookie", "")
-        self.assertIn(bridge._CONSOLE_COOKIE_NAME, sc, sc)
-        self.assertNotIn(
-            "Max-Age=", sc,
-            "遠端續命發了有期限的 cookie —— 關瀏覽器即失效被抵銷了:" + sc)
+        self.assertNotIn(bridge._CONSOLE_COOKIE_NAME, sc)
 
 
 if __name__ == "__main__":

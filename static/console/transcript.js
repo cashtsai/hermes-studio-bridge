@@ -33,6 +33,16 @@ function replySegments(text) {
   return parts.filter(p => p.label || p.text.trim());
 }
 
+// 每則訊息泡下方的動作列(對齊手機版):時間戳常駐小字,動作鈕 hover 才現。
+// 按鈕走 #cards 的事件代理(app.js wire()),這裡只畫靜態結構。
+function messageActionsHtml(c) {
+  return '<div class="msg-actions" data-card="' + esc(c.id) + '">' +
+    '<span class="msg-time">' + esc(cardTime(c.ts)) + '</span>' +
+    '<button type="button" class="msg-act" data-act="reply" title="引用這則回覆">回覆</button>' +
+    '<button type="button" class="msg-act" data-act="copy" title="複製原始文字">複製</button>' +
+    '<button type="button" class="msg-act" data-act="share" title="分享/複製全文">分享</button></div>';
+}
+
 function renderTurnContent(turn, node) {
   const wasOpen = new Set(Array.from(node.querySelectorAll("details[open]"), d => d.dataset.key));
   const body = document.createDocumentFragment();
@@ -54,12 +64,19 @@ function renderTurnContent(turn, node) {
     details(group[0].id + ":steps", "執行步驟 · " + group.length,
       () => group.map(c => cardText(c)).join("\n\n"));
   }
-  function bubble(c, html) {
+  function bubble(c, html, actions = true) {
     const div = document.createElement("div");
     div.className = "card " + turn.role + (PROSE_KINDS.has(c.kind || "text") ? "" : " mono") +
       (c.final === false ? " streaming" : "");
+    div.dataset.card = c.id;
     div.innerHTML = '<div class="card-body">' + html + "</div>";
     body.append(div);
+    if (actions) {
+      const row = document.createElement("div");
+      row.innerHTML = messageActionsHtml(c);
+      row.firstElementChild.classList.add(turn.role === "user" ? "from-user" : "from-agent");
+      body.append(row.firstElementChild);
+    }
   }
   for (const c of turn.cards) {
     const text = cardText(c);
@@ -68,16 +85,38 @@ function renderTurnContent(turn, node) {
     flush();
     if (turn.role !== "user" && /<(?:details|think)\b/i.test(text)) {
       const visual = visualReplyHtml(c);
-      if (visual) bubble(c, visual);
-      replySegments(text).forEach((p, i) => {
+      if (visual) bubble(c, visual, false);
+      const parts = replySegments(text);
+      parts.forEach((p, i) => {
         if (p.label) details(c.id + ":" + i, p.label, () => p.text);
-        else bubble(c, esc(p.text.trim()).replace(/\n/g, "<br>"));
+        else bubble(c, proseHtml(c, p.text.trim()), i === parts.length - 1);
       });
-    } else bubble(c, cardBodyHtml(c));
+    } else bubble(c, cardBodyHtmlCached(c));
   }
   flush();
   const meta = document.createElement("div"); meta.className = "turn-meta";
-  meta.innerHTML = '<span class="turn-who">' + (turn.role === "user" ? "你" : "Agent") +
-    '</span><span class="turn-time">' + esc(cardTime(turn.cards[turn.cards.length - 1].ts)) + '</span>';
+  meta.innerHTML = '<span class="turn-who">' + (turn.role === "user" ? "你" : "Agent") + '</span>';
   node.replaceChildren(meta, body);
+}
+
+// 串流尾塊快修(交付 3/5):delta 進來時,若回合裡只有「最後那顆散文泡」在長,
+// 就地換它的 body,不整回合重建 —— 已完成的訊息(含 markdown 渲染結果)不重算。
+function patchStreamingTail(turn, node) {
+  const prev = node._cards;
+  if (!prev || prev.length !== turn.cards.length) return false;
+  for (let i = 0; i < prev.length - 1; i++) if (prev[i] !== turn.cards[i]) return false;
+  const c = turn.cards[turn.cards.length - 1];
+  if (turn.role === "user" || !PROSE_KINDS.has(c.kind || "text")) return false;
+  const text = cardText(c);
+  if (/<(?:details|think)\b/i.test(text) || /^💭\s/u.test(text)) return false;
+  if ((c.body || {}).visual) return false;
+  const cards = node.querySelectorAll('.card[data-card]');
+  const el = cards[cards.length - 1];
+  if (!el || el.dataset.card !== c.id || !el.firstElementChild) return false;
+  el.className = "card " + turn.role + (c.final === false ? " streaming" : "");
+  el.firstElementChild.innerHTML = cardBodyHtmlCached(c);
+  const time = node.querySelector('.msg-actions[data-card="' + (window.CSS && CSS.escape ?
+    CSS.escape(c.id) : c.id) + '"] .msg-time');
+  if (time) time.textContent = cardTime(c.ts);
+  return true;
 }

@@ -93,6 +93,17 @@ async function bootstrap() {
   if (!cookieCode && !boot) {
     const saved = sessionStorage.getItem(TOKEN_KEY) || (!remote && localStorage.getItem(TOKEN_KEY));
     if (saved) { state.token = saved; return true; }
+    if (remote) {
+      const r = await fetch("/console/session/resume", {method:"POST", credentials:"same-origin", cache:"no-store"});
+      if (r.ok) {
+        const claim = await r.json();
+        if (claim.scope === "console-remote" && claim.token) {
+          state.token = claim.token;
+          sessionStorage.setItem(TOKEN_KEY, state.token);
+          return true;
+        }
+      }
+    }
     location.replace("/console?signin=1");
     return false;
   }
@@ -225,6 +236,16 @@ async function loadSessions() {
     renderHome();
     renderAwaiting();
     renderApproval();
+    // 交付 4 實錘修法:開著的對話,標頭狀態要跟著「清單的」狀態走 ——
+    // 手機那頭發起的回合,有些 provider 的忙/閒只反映在列表 status,
+    // per-session 事件沒跟上時,這裡就是唯一會把「閒置」翻成「執行中」的路。
+    // 以顯示文案比對(run/running 同文案)避免把事件流帶來的細 label 洗掉。
+    const cur = currentSession();
+    if (cur && state.snapshotView === state.view && !cur.meta?.locked) {
+      const listLabel = PHASE_LABEL[cur.status] || cur.status || "";
+      const chipLabel = PHASE_LABEL[state.phase] || state.phase || "";
+      if (listLabel && listLabel !== chipLabel) updateStatusChip(cur.status, cur.meta || {});
+    }
     setConn(true, degraded.length ? ("降級:" + degraded.join(",")) : "已連線");
     const pref = resumePreference();
     const want = !state.current && (hashSession() || (firstList && pref?.id));
@@ -239,18 +260,29 @@ async function loadSessions() {
   }
 }
 
+// 交付 7:組內分層排序 —— 需要你(actionable)> 執行中 > 一般。穩定排序:
+// 同層維持清單原本順序,只有狀態真的翻轉那一列才會移動。
+function sessionRank(s) {
+  if (actionable(s)) return 0;
+  return ["run", "running", "busy", "queued"].includes(s.status) ? 1 : 2;
+}
+
 function renderSessions() {
   const el = $("session-list");
   if (!state.sessions.length) {
     el.textContent = state.listHealth === "failed" || state.degraded.length ? "清單暫時不完整" : "沒有 session";
     return;
   }
+  // FLIP 前置:記住每列現在的位置,重畫後只對「真的移動了」的列補一段位移動畫。
+  const oldTops = new Map(Array.from(el.querySelectorAll(".sess"),
+    (n) => [n.dataset.id, n.getBoundingClientRect().top]));
   const byProv = new Map(["hermes", "claude_code", "codex", "gemini"].map(p => [p, []]));
   for (const s of state.sessions) {
     const p = s.provider === "cc2" ? "claude_code" : s.provider;
     if (!byProv.has(p)) byProv.set(p, []);
     byProv.get(p).push(s);
   }
+  for (const rows of byProv.values()) rows.sort((a, b) => sessionRank(a) - sessionRank(b));
   let html = "";
   for (const [prov, rows] of byProv) {
     const dim = state.degraded.includes(prov) || (prov === "claude_code" && state.degraded.includes("cc2")) ? " degraded" : "";
@@ -268,8 +300,16 @@ function renderSessions() {
     html += "</div>";
   }
   el.innerHTML = html;
-  el.querySelectorAll(".sess").forEach((n) =>
-    n.addEventListener("click", () => openSession(n.dataset.id)));
+  el.querySelectorAll(".sess").forEach((n) => {
+    n.addEventListener("click", () => openSession(n.dataset.id));
+    const was = oldTops.get(n.dataset.id);
+    if (was === undefined || !n.animate ||
+        window.matchMedia?.("(prefers-reduced-motion: reduce)").matches) return;
+    const delta = was - n.getBoundingClientRect().top;
+    if (Math.abs(delta) > 1) n.animate(
+      [{ transform: "translateY(" + delta + "px)" }, { transform: "none" }],
+      { duration: 180, easing: "ease-out" });
+  });
 }
 
 function activityTime(value) {
@@ -286,7 +326,8 @@ function workMatches(s, query) {
 }
 
 const PHASE_LABEL = { idle: "閒置", done: "已完成", running: "執行中", run: "執行中",
-  busy: "執行中", failed: "失敗", stalled: "停滯", waiting_approval: "等待核准", queued: "排隊中" };
+  busy: "執行中", failed: "失敗", stalled: "停滯", waiting_approval: "等待核准", queued: "排隊中",
+  usage_limited: "用量受限", error: "錯誤", waiting: "等待中" };
 const activityFormat = new Intl.DateTimeFormat("zh-TW",
   { year:"numeric", month:"numeric", day:"numeric", hour:"2-digit", minute:"2-digit", hour12:false });
 function workPhase(s) {
@@ -342,6 +383,7 @@ function showHome() {
   resetHistory();
   if (state.stopStream) { state.stopStream(); state.stopStream = null; }
   state.current = null; state.cards = []; state.latestSeq = 0;
+  state.busy = false; state.phase = "idle"; bodyHtmlCache.clear(); syncBusyBar(false);
   syncControls();
   writeHash(null);
   for (const id of ["stream-head", "approval", "cards", "composer", "delivery", "atts"]) $(id).classList.add("hidden");
@@ -384,7 +426,7 @@ function openSession(id, preserveMode = false) {
   if (state.stopStream) { state.stopStream(); state.stopStream = null; }
   state.current = id;
   if (resumePreference()) rememberWork(id);
-  state.cards = []; state.latestSeq = 0;
+  state.cards = []; state.latestSeq = 0; bodyHtmlCache.clear(); busyStartAt = 0;
   if (!preserveMode) window.PocketConsoleMode?.set("agents");
   $("main").classList.remove("at-home");
   $("handoff").classList.add("hidden");
@@ -635,7 +677,19 @@ function subscribeCards(id, view) {
         confirmEcho(id, [payload.card]);
       } else if (envelope.type === "session.status") {
         updateStatusChip(payload.phase, payload);
+        reflectSessionStatus(id, payload.phase);
         scheduleListRefresh();
+      } else if (envelope.type === "turn") {
+        // turn begin/end 是最早的忙/閒轉場訊號(session.status 是輪詢巡出來
+        // 的,可能晚幾拍)。先翻狀態,之後的 status 事件再帶 label 蓋細節。
+        if (payload.state === "begin") {
+          updateStatusChip("run", { busy: true });
+          reflectSessionStatus(id, "running");
+        } else if (payload.state === "end") {
+          updateStatusChip(payload.outcome === "failed" ? "failed" : "idle", {});
+          reflectSessionStatus(id, payload.outcome === "failed" ? "failed" : "idle");
+          scheduleListRefresh();
+        }
       }
       state.latestSeq = seq;
     },
@@ -712,7 +766,10 @@ function visualReplyHtml(c) {
     }
     if (type === "text" || type === "markdown" || type === "html") {
       const text = type === "html" ? (b.fallback_text || b.text || b.html) : b.text;
-      return text ? '<div class="visual-text">' + esc(text).replace(/\n/g, "<br>") + "</div>" : "";
+      if (!text) return "";
+      if (type === "markdown" && window.PocketMarkdown)
+        return '<div class="visual-text md">' + PocketMarkdown.render(text) + "</div>";
+      return '<div class="visual-text">' + esc(text).replace(/\n/g, "<br>") + "</div>";
     }
     return "";
   }).filter(Boolean).join("");
@@ -722,14 +779,166 @@ function visualReplyHtml(c) {
   return '<div class="visual-reply">' + blocks + fallback + "</div>";
 }
 
+// 散文(agent 的 text/markdown 卡)走 md.js 全功能渲染;使用者訊息與等寬卡
+// 只做「轉義 + 裸網址連結化 + 換行」—— 打什麼看到什麼,與手機版一致。
+// md.js 沒載成功時退回舊的純轉義路徑,訊息永遠不會變成 HTML 水槽。
+function proseHtml(c, text) {
+  const md = window.PocketMarkdown;
+  if (!md) return esc(text).replace(/\n/g, "<br>");
+  if (c.role !== "user" && PROSE_KINDS.has(c.kind || "text"))
+    return '<div class="md">' + md.render(text) + "</div>";
+  return md.renderText(text);
+}
+
+function fmtBytes(n) {
+  if (!Number.isFinite(n) || n <= 0) return "";
+  if (n < 1024) return n + " B";
+  if (n < 1024 * 1024) return (n / 1024).toFixed(n < 10240 ? 1 : 0) + " KB";
+  return (n / 1024 / 1024).toFixed(1) + " MB";
+}
+
+// 卡片附件(bridge carddigest 掛的 body.attachments):圖片縮圖內嵌(經
+// authed fetch → blob,見 hydrateCardMedia —— <img> 自己帶不了 Bearer),
+// 其他檔案一列 chip。download_url 只認自家 /app/v2/artifacts/ 路徑,
+// 不讓一張壞卡誘使 Console 把 token 打到任意位址。
+function attachmentsHtml(c) {
+  const atts = (c.body || {}).attachments;
+  if (!Array.isArray(atts) || !atts.length) return "";
+  const parts = atts.map((a) => {
+    if (!a || typeof a !== "object") return "";
+    const name = String(a.filename || String(a.path || "").split("/").pop() || "附件");
+    const local = typeof a.download_url === "string" &&
+      a.download_url.startsWith("/app/v2/artifacts/") ? a.download_url : "";
+    const ext = safeHttpUrl(a.url || a.source_url);
+    const size = fmtBytes(a.byte_size);
+    if (a.kind === "image" && local && a.available !== false)
+      return '<figure class="att-media"><img class="att-img" alt="' + esc(name) +
+        '" data-src="' + esc(local) + '"><figcaption>' + esc(name) + "</figcaption></figure>";
+    const icon = { image: "🖼️", video: "🎬", audio: "🎵" }[a.kind] || "📄";
+    const label = icon + ' <span class="att-name">' + esc(name) + "</span>" +
+      (size ? ' <small>' + size + "</small>" : "");
+    if (local) return '<button type="button" class="att-chip" data-dl="' + esc(local) +
+      '" data-name="' + esc(name) + '" title="下載">' + label + "</button>";
+    if (ext) return '<a class="att-chip" href="' + ext +
+      '" target="_blank" rel="noopener noreferrer">' + label + "</a>";
+    return '<span class="att-chip att-dead" title="' + esc(a.path || "來源未封存") + '">' +
+      label + "</span>";
+  }).filter(Boolean).join("");
+  return parts ? '<div class="card-atts">' + parts + "</div>" : "";
+}
+
 function cardBodyHtml(c) {
   const visual = visualReplyHtml(c);
   const text = cardText(c);
   const body = c.body || {};
   // visual cards normally carry fallback_text but no duplicate plain text.
   const plain = body.text || body.typed_text || (typeof body === "string" ? body : "");
-  return visual + (visual ? (plain ? '<div class="visual-plain">' + esc(plain).replace(/\n/g, "<br>") + "</div>" : "")
-                     : esc(text).replace(/\n/g, "<br>"));
+  const main = visual
+    ? (plain ? '<div class="visual-plain">' + proseHtml(c, plain) + "</div>" : "")
+    : proseHtml(c, text);
+  return visual + main + attachmentsHtml(c);
+}
+
+// 已完成卡片的渲染結果不重算(交付 3):markdown 轉換只對「串流中的尾塊」
+// 每個 delta 跑一次;final 卡以 id+內容簽名快取,重畫回合時直接取。
+const bodyHtmlCache = new Map();
+function cardBodyHtmlCached(c) {
+  if (c.final === false) return cardBodyHtml(c);
+  const atts = (c.body || {}).attachments;
+  const sig = cardText(c) + "\x00" + (Array.isArray(atts) ? atts.length : 0);
+  const hit = bodyHtmlCache.get(c.id);
+  if (hit && hit.sig === sig) return hit.html;
+  const html = cardBodyHtml(c);
+  bodyHtmlCache.set(c.id, { sig, html });
+  return html;
+}
+
+// ── 圖片/檔案的 authed 載入 ──────────────────────────────────────────────
+// /app/v2/artifacts/* 只認 Bearer header,<img src> 帶不了 → fetch 轉 blob。
+// blob URL 以 download_url 為鍵快取,重畫回合不重抓;上限內先進先出回收。
+const mediaCache = new Map();
+const MEDIA_CACHE_MAX = 48;
+async function mediaBlobUrl(url) {
+  const hit = mediaCache.get(url);
+  if (hit) return hit.promise;
+  const promise = (async () => {
+    const r = await api(url, { cache: "no-store" });
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    return URL.createObjectURL(await r.blob());
+  })();
+  mediaCache.set(url, { promise });
+  if (mediaCache.size > MEDIA_CACHE_MAX) {
+    const [oldKey, old] = mediaCache.entries().next().value;
+    mediaCache.delete(oldKey);
+    old.promise.then((u) => URL.revokeObjectURL(u), () => {});
+  }
+  try { return await promise; }
+  catch (err) { mediaCache.delete(url); throw err; }
+}
+
+function hydrateCardMedia() {
+  $("cards").querySelectorAll("img.att-img[data-src]").forEach((img) => {
+    const url = img.dataset.src;
+    delete img.dataset.src;
+    mediaBlobUrl(url).then((blobUrl) => {
+      if (!img.isConnected) return;
+      img.addEventListener("load", () => {
+        // 縮圖載入會長高:貼底閱讀中就跟著貼住,不要讓圖把對話頂歪。
+        const el = $("cards");
+        if (cardScroll.follow) { el.scrollTop = el.scrollHeight; cardScroll.top = el.scrollTop; }
+      }, { once: true });
+      img.src = blobUrl;
+    }).catch(() => {
+      img.closest(".att-media")?.classList.add("att-broken");
+      img.alt = "圖片載入失敗";
+    });
+  });
+}
+
+async function downloadAttachment(url, name) {
+  try {
+    const blobUrl = await mediaBlobUrl(url);
+    const a = document.createElement("a");
+    a.href = blobUrl; a.download = name || "attachment";
+    document.body.append(a); a.click(); a.remove();
+  } catch (err) { toast("下載失敗:" + err.message); }
+}
+
+async function copyText(text, doneMsg) {
+  try {
+    if (navigator.clipboard && window.isSecureContext !== false)
+      await navigator.clipboard.writeText(text);
+    else {
+      const ta = document.createElement("textarea");
+      ta.value = text; ta.style.position = "fixed"; ta.style.opacity = "0";
+      document.body.append(ta); ta.select(); document.execCommand("copy"); ta.remove();
+    }
+    toast(doneMsg || "已複製");
+  } catch (_) { toast("無法複製(瀏覽器不允許)"); }
+}
+
+// 訊息動作列(交付 6):回覆=引用塞進輸入框;複製=原始文字;分享=系統分享
+// (navigator.share),沒有就退「複製全文」。轉貼到別條 session 需要後端支
+// 援,先不硬造。
+function handleMessageAction(act, cardId) {
+  const card = state.cards.find((c) => c.id === cardId);
+  if (!card) { toast("這則訊息已不在目前視窗"); return; }
+  const text = cardText(card);
+  if (act === "copy") { void copyText(text); return; }
+  if (act === "reply") {
+    if (!canUse("input")) { toast("這台電腦無法在此對話輸入"); return; }
+    const quote = text.trim().split("\n").slice(0, 6).map((l) => "> " + l).join("\n");
+    const input = $("input");
+    const d = draftFor(state.current);
+    d.text = quote + "\n\n" + (d.text ? d.text : "");
+    input.value = d.text; autosize(); input.focus();
+    input.setSelectionRange(input.value.length, input.value.length);
+    return;
+  }
+  if (act === "share") {
+    if (navigator.share) navigator.share({ text }).catch(() => {});
+    else void copyText(text, "已複製全文(此瀏覽器無系統分享)");
+  }
 }
 
 // ───────────────────────── 主題(與 App 的 PocketPalettes 同名同值)─────────────
@@ -815,7 +1024,9 @@ function renderCards(prepending = false) {
     node.className = "turn " + turn.role; node.dataset.key = key;
     if (!node._cards || turn.cards.length !== node._cards.length ||
         turn.cards.some((c, i) => node._cards[i] !== c)) {
-      renderTurnContent(turn, node); node._cards = turn.cards;
+      // 串流 delta 走尾塊快修;結構變了(新卡、分段、visual)才整回合重建。
+      if (!patchStreamingTail(turn, node)) renderTurnContent(turn, node);
+      node._cards = turn.cards;
     }
     if (node !== cursor) el.insertBefore(node, cursor);
     cursor = node.nextElementSibling;
@@ -825,6 +1036,7 @@ function renderCards(prepending = false) {
   else if (firstVisible?.isConnected) el.scrollTop += firstVisible.getBoundingClientRect().top - anchorTop;
   else if (prepending) el.scrollTop = oldTop + el.scrollHeight - oldHeight;
   cardScroll.top = el.scrollTop; // Our anchor correction is not a reader gesture.
+  hydrateCardMedia();
 }
 
 function setStreamHealth(label, working = false) {
@@ -837,9 +1049,47 @@ function updateStatusChip(phase, meta) {
   const label = locked ? "🔒 被佔用" : (PHASE_LABEL[phase] || phase || "狀態未知");
   chip.textContent = label;
   chip.className = "status-chip st-" + esc(phase || "idle");
+  state.phase = phase || "idle";
   state.busy = ["run", "running", "busy"].includes(phase);
   chip.classList.toggle("working", state.busy && !locked);
   $("interrupt").classList.toggle("hidden", !state.busy || !canUse("interrupt"));
+  // 交付 4:輕量活動列。busy / 排隊中都算「在忙」;phase label(bridge 的
+  // 人話 label,例如「正在執行 Read…」)有就用,elapsed 以 busy_since 起算。
+  state.statusLabel = (meta && typeof meta.label === "string" && meta.label) || "";
+  const working = !locked && (state.busy || phase === "queued");
+  if (working) {
+    const since = activityTime(meta && meta.busy_since);
+    if (since) busyStartAt = since;
+    else if (!busyStartAt) busyStartAt = Date.now();
+  } else busyStartAt = 0;
+  syncBusyBar(working);
+}
+
+let busyTimer = null, busyStartAt = 0;
+function syncBusyBar(on) {
+  const bar = $("workbar");
+  on = !!on && !!state.current && !signingOut;
+  clearInterval(busyTimer); busyTimer = null;
+  bar.classList.toggle("hidden", !on);
+  if (!on) return;
+  const tick = () => {
+    $("workbar-label").textContent = state.statusLabel ||
+      (state.phase === "queued" ? "已排入佇列…" : "Agent 工作中…");
+    const secs = Math.max(0, Math.round((Date.now() - busyStartAt) / 1000));
+    $("workbar-elapsed").textContent = secs >= 60
+      ? Math.floor(secs / 60) + " 分 " + (secs % 60) + " 秒" : secs + " 秒";
+  };
+  tick();
+  busyTimer = setInterval(tick, 1000); // 只動兩個文字節點,不重畫訊息
+}
+
+// 別的客戶端(手機)發起的回合也要亮:per-session 事件一到,先就地改掉
+// 列表裡那一列的狀態再排程抓清單,不等 800ms debounce。
+function reflectSessionStatus(id, phase) {
+  const s = state.sessions.find((x) => x.id === id);
+  if (!s || !phase || s.status === phase) return;
+  s.status = phase;
+  renderSessions(); renderHome();
 }
 
 // ───────────────────────── 送出 / 中斷 ─────────────────────────
@@ -958,6 +1208,25 @@ function wire() {
     el.focus({preventScroll:true});
   });
   $("cards").addEventListener("scroll", e => trackCardScroll(e.currentTarget), { passive: true });
+  // 訊息區的互動全走事件代理:卡片每次重畫都換節點,逐顆綁太浪費。
+  $("cards").addEventListener("click", (e) => {
+    const copy = e.target.closest(".md-copy");
+    if (copy) {
+      const code = copy.closest(".md-code")?.querySelector("code");
+      if (code) void copyText(code.textContent, "已複製程式碼");
+      return;
+    }
+    const act = e.target.closest(".msg-act");
+    if (act) {
+      const id = act.closest(".msg-actions")?.dataset.card;
+      if (id) handleMessageAction(act.dataset.act, id);
+      return;
+    }
+    const img = e.target.closest("img.att-img");
+    if (img && img.src) { window.open(img.src, "_blank", "noopener"); return; }
+    const chip = e.target.closest(".att-chip[data-dl]");
+    if (chip) void downloadAttachment(chip.dataset.dl, chip.dataset.name);
+  });
   $("earlier-cards").addEventListener("click", loadOlderCards);
   $("remember-work").addEventListener("change", e => {
     if (e.target.checked) rememberWork(state.current);

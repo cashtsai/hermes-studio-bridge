@@ -1,7 +1,7 @@
 // The same /console URL can return a private login challenge or a workbench.
 // Never cache navigations (including query strings), even for offline launch.
-const SHELL = "pocket-console-shell-v7";
-const ASSETS = ["style.css", "sse.js", "app.js", "transcript.js", "filebrowser.js", "changes.js",
+const SHELL = "pocket-console-shell-v8";
+const ASSETS = ["style.css", "sse.js", "md.js", "app.js", "transcript.js", "filebrowser.js", "changes.js",
   "terminal.js", "memory.js", "icon-192.png"].map(name => "/console/static/" + name);
 
 self.addEventListener("install", e => {

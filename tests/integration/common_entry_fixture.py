@@ -50,7 +50,7 @@ def main():
                 return await bridge.app(scope,receive,send)
             if scope["method"]=="POST" and headers.get(b"x-qa")==os.environ["ENTRY_QA_KEY"].encode():
                 body=await Request(scope,receive).json()
-                path={"/scan":"/app/v1/console/entry/select","/lookup":"/app/v1/console/entry/lookup",
+                path={"/code":"/app/v1/console/entry/code","/scan":"/app/v1/console/entry/select","/lookup":"/app/v1/console/entry/lookup",
                       "/approve":"/app/v1/console/login/requests/"+str(body.get("rid"))+"/approve"}.get(scope["path"])
                 if path:
                     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=bridge.app),
