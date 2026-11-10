@@ -243,6 +243,27 @@ class LiveActivityRegisterV1Test(unittest.TestCase):
         self.assertEqual(cs["state"], "failed")
         self.assertTrue(cs["terminal"])
 
+    def test_cx_card_end_and_idle_fallback_both_send_stopped_not_completed(self):
+        for event, data in (
+            ("turn", {"state": "end", "outcome": "interrupted"}),
+            ("session.status", {"busy": False, "phase": "idle", "last_turn_outcome": "interrupted"}),
+        ):
+            with self.subTest(event=event):
+                self._register()
+                before = len(_FakeClient.calls)
+                asyncio.run(_drive_milestone(
+                    SID, "session.status", {"busy": False, "phase": "idle"}))
+                self.assertEqual(len(_FakeClient.calls), before)
+                self.assertTrue(self._rows())
+                _FakeClient.responses.append(_Response(200))
+                asyncio.run(_drive_milestone(SID, event, data))
+                aps = _FakeClient.calls[-1]["json"]["aps"]
+                self.assertEqual(aps["event"], "end")
+                cs = aps["content-state"]
+                self.assertEqual((cs["state"], cs["endedLabel"], cs["busy"], cs["terminal"]),
+                                 ("interrupted", "已停止", False, True))
+                self.assertEqual(self._rows(), [])
+
     # ── 4. 410 清列、無金鑰靜默 ─────────────────────────────────────────
     def test_410_clears_row_without_raising(self):
         self._register()

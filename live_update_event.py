@@ -16,9 +16,9 @@ from typing import Any
 VERSION = 1
 STATES = frozenset({
     "connecting", "queued", "running", "waiting_user", "streaming",
-    "completed", "failed", "disconnected", "idle",
+    "completed", "failed", "interrupted", "disconnected", "idle",
 })
-TERMINAL_STATES = frozenset({"completed", "failed"})
+TERMINAL_STATES = frozenset({"completed", "failed", "interrupted"})
 ACTIVE_STATES = frozenset({"queued", "running", "waiting_user", "streaming"})
 
 

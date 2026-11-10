@@ -65,13 +65,23 @@ ActivityKit payloads keep the existing iOS `busy`, `phaseLabel`, and
 `endedLabel` fields, and also carry the shared event fields:
 `version`, `sessionID`, `seq`, `state`, and `terminal`. The allowed states are
 `connecting`, `queued`, `running`, `waiting_user`, `streaming`, `completed`,
-`failed`, `disconnected`, and `idle`.
+`failed`, `interrupted`, `disconnected`, and `idle`.
 
-`completed` and `failed` are the only terminal states. Clients must discard an
+`completed`, `failed`, and `interrupted` are terminal states. Clients must discard an
 event whose sequence is older than the last accepted event, must not turn a
 transport `disconnected` state into `idle`, and must always apply a terminal
 event even when non-terminal updates are throttled. Android Live Updates use
 the same envelope; only the platform presentation differs.
+
+For Codex, `turn/completed` is a provider event name, not a success verdict.
+A stopped turn emits the existing v2 `turn` event with `state: "end"` and
+an additive `outcome: "interrupted"`. A status snapshot can include
+`last_turn_outcome`; the session is idle and ready for input unless another
+turn is queued or running. A prior bridge timeout or exhausted provider retry
+is reported as failure, even if the provider acknowledges the stop. Do not
+end a CX activity on an idle notification alone: the actual outcome may follow.
+Clients without the typed state can use the existing `busy` and `endedLabel`
+fields. No v2 client needs a new phase to continue sending messages.
 
 ## 2. Stable v1 Endpoints
 
