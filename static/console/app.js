@@ -93,6 +93,17 @@ async function bootstrap() {
   if (!cookieCode && !boot) {
     const saved = sessionStorage.getItem(TOKEN_KEY) || (!remote && localStorage.getItem(TOKEN_KEY));
     if (saved) { state.token = saved; return true; }
+    if (remote) {
+      const r = await fetch("/console/session/resume", {method:"POST", credentials:"same-origin", cache:"no-store"});
+      if (r.ok) {
+        const claim = await r.json();
+        if (claim.scope === "console-remote" && claim.token) {
+          state.token = claim.token;
+          sessionStorage.setItem(TOKEN_KEY, state.token);
+          return true;
+        }
+      }
+    }
     location.replace("/console?signin=1");
     return false;
   }

@@ -5,7 +5,7 @@ const {createInterface}=require("node:readline"), path=require("node:path");
 const {randomUUID}=require("node:crypto");
 const {chromium}=require("playwright");
 
-test("common QR to scoped relay login across browser origins",{skip:process.env.ENTRY_QA!=="1",timeout:45000},async t=>{
+for(const mode of ["qr","code"]) test("common "+mode+" to scoped relay login across browser origins",{skip:process.env.ENTRY_QA!=="1",timeout:45000},async t=>{
   const key=randomUUID(), child=spawn(process.env.PYTHON||"python3",[path.join(__dirname,"common_entry_fixture.py")],
     {env:{...process.env,BRIDGE_TOKEN:"fixture-test-only",ENTRY_QA_KEY:key},stdio:["ignore","pipe","inherit"]});
   t.after(()=>child.kill());
@@ -38,6 +38,14 @@ test("common QR to scoped relay login across browser origins",{skip:process.env.
   const {rid}=await (await ticket).json();
   await page.waitForFunction(()=>{const q=document.querySelector("#qr");return q && !q.hidden && q.naturalWidth>0});
   if(process.env.POCKET_QA_SCREENSHOTS) await page.screenshot({path:path.join(process.env.POCKET_QA_SCREENSHOTS,"common-entry.png")});
+  if(mode==="code"){
+    const offer=await mobile("code",{});
+    assert.equal(offer.expires_in,900);
+    await page.locator("#code").fill(offer.code);
+    await page.locator("#manual button").click();
+    await page.locator("#handoff").waitFor();
+    assert.equal((await mobile("code",{handle:offer.handle})).rid,rid);
+  }
   const {challenge}=await mobile("scan",{rid});
   await page.getByRole("button",{name:"繼續到這台主機"}).click();
   await page.getByText("請回到手機上的 Pocket 核對並批准，不需要再掃一次。").waitFor();
