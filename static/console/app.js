@@ -666,12 +666,17 @@ function subscribeCards(id, view) {
       if (!currentView(view)) return;
       const envelope = evt.data || {}, payload = envelope.data || {}, seq = envelope.seq;
       if (!Number.isSafeInteger(seq)) return;
+      // seq 是**全域** event_log 序號:別的 session 的事件會在中間佔號,
+      // 本 lane 看到的序號天生有洞。「不連號就 resync」= 永遠在重同步
+      // (2026-11-10 機主實錘:進 session 卡死在「連線中斷,正在補接」)。
+      // 正解同 app 端 TerminalCardStore:只要往前就收,洞是正常的;
+      // 真正的斷層由 410/resync 協定負責。
       if (envelope.type === "ping") {
-        if (seq !== state.latestSeq) resync();
+        // ping 帶全域尖端,僅用來推進重連游標,絕不觸發 resync。
+        if (seq > state.latestSeq) state.latestSeq = seq;
         return;
       }
       if (seq <= state.latestSeq) return;
-      if (seq !== state.latestSeq + 1) { resync(); return; }
       if (envelope.type === "card.upsert" && payload.card) {
         upsertCard(payload.card);
         confirmEcho(id, [payload.card]);
