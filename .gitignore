@@ -10,3 +10,6 @@ credentials/
 # bridge 執行期輪替 log(不進版控)
 bridge.out.log*
 bridge.err.log*
+
+# FCM / Firebase service account(機密,永不入版控)
+secrets/
