@@ -84,6 +84,11 @@
       </div>
       <div id="cards" class="hidden" tabindex="0" aria-label="對話紀錄"></div>
       <div class="reply-jump"><button type="button" id="new-reply" class="btn-ghost" aria-controls="cards" hidden>有新回覆 ↓</button></div>
+      <div id="workbar" class="workbar hidden" role="status">
+        <span class="workbar-spin working" aria-hidden="true"></span>
+        <span id="workbar-label"></span>
+        <span id="workbar-elapsed"></span>
+      </div>
       <div id="read-only" class="hidden" role="status"></div>
       <div id="delivery" class="hidden" role="status">
         <span id="delivery-text"></span>
@@ -202,6 +207,7 @@
   <button type="button" class="btn" id="retry-logout">重試登出</button>
 </section>
 <script src="/console/static/sse.js"></script>
+<script src="/console/static/md.js"></script>
 <script src="/console/static/transcript.js"></script>
 <script src="/console/static/app.js"></script>
 <script src="/console/static/filebrowser.js"></script>
