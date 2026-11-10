@@ -27,7 +27,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import carddigest  # noqa: E402
 from live_update_event import LiveUpdateCursor  # noqa: E402
-from replay_fixture import (ReplayFixtureError, load_jsonl,
+from replay_fixture import (ReplayFixtureError, fixture_digest, load_jsonl,
                             validate_manifest)  # noqa: E402
 
 
@@ -238,6 +238,19 @@ class TestCxTurnError(unittest.TestCase):
                           if e["type"] == "turn"], ["begin", "end"])
         d.handle("turn/started", {"turn": {"id": "next"}})
         self.assertEqual(d.store.snapshot()["status"]["phase"], "run")
+
+
+class TestCxInterruptRecording(unittest.TestCase):
+    def test_provider_interrupt_closes_one_turn_without_an_error_card(self):
+        frames = load_fixture("cx-interrupt.jsonl")
+        self.assertEqual(fixture_digest(frames),
+                         load_manifest()["fixture_digests"]["cx-interrupt.jsonl"])
+        self.assertEqual(frames[-1]["params"]["turn"]["status"], "interrupted")
+        digest = replay(frames)
+        self.assertEqual([e["data"]["state"] for e in digest.store.events
+                          if e["type"] == "turn"], ["begin", "end"])
+        self.assertFalse(digest.store.snapshot()["status"]["busy"])
+        self.assertEqual(_cards(digest), [])
 
 
 class TestCxApproval(unittest.TestCase):
