@@ -87,56 +87,69 @@ def validate_manifest(manifest: Any, fixture_dir: str | os.PathLike[str], *,
     if not isinstance(digests, dict):
         raise ReplayFixtureError("manifest fixture_digests must be an object")
 
-    required = RELEASE_SCENARIOS if release else ()
     root = Path(fixture_dir).expanduser().resolve()
-    coverage: dict[str, dict[str, Any]] = {}
-    for provider, scenarios in providers.items():
-        if not isinstance(provider, str) or not provider.strip():
-            raise ReplayFixtureError("provider name must be a non-empty string")
+
+    def check_scenarios(owner: str, scenarios: Any, required=()) -> list[str]:
+        if not isinstance(owner, str) or not owner.strip():
+            raise ReplayFixtureError("fixture owner name must be a non-empty string")
         if not isinstance(scenarios, dict) or not scenarios:
-            raise ReplayFixtureError(f"{provider}: scenarios must be non-empty")
+            raise ReplayFixtureError(f"{owner}: scenarios must be non-empty")
         missing = sorted(set(required) - set(scenarios))
         if missing:
             raise ReplayFixtureError(
-                f"{provider}: release fixture scenarios missing: {', '.join(missing)}"
+                f"{owner}: release fixture scenarios missing: {', '.join(missing)}"
             )
-        files: dict[str, str] = {}
+        seen: dict[str, str] = {}
         for scenario, filename in scenarios.items():
             if not isinstance(scenario, str) or not scenario.strip():
-                raise ReplayFixtureError(f"{provider}: scenario name is invalid")
+                raise ReplayFixtureError(f"{owner}: scenario name is invalid")
             if not isinstance(filename, str) or not filename.strip():
                 raise ReplayFixtureError(
-                    f"{provider}/{scenario}: fixture filename is invalid"
+                    f"{owner}/{scenario}: fixture filename is invalid"
                 )
             candidate = (root / filename).resolve()
             try:
                 candidate.relative_to(root)
             except ValueError as exc:
                 raise ReplayFixtureError(
-                    f"{provider}/{scenario}: fixture escapes manifest directory"
+                    f"{owner}/{scenario}: fixture escapes manifest directory"
                 ) from exc
             if not candidate.is_file():
                 raise ReplayFixtureError(
-                    f"{provider}/{scenario}: fixture does not exist"
+                    f"{owner}/{scenario}: fixture does not exist"
                 )
             frames = load_jsonl(candidate)
             expected_digest = digests.get(candidate.name)
             if not isinstance(expected_digest, str) or not re.fullmatch(
                     r"[0-9a-f]{64}", expected_digest):
                 raise ReplayFixtureError(
-                    f"{provider}/{scenario}: fixture digest is missing or invalid"
+                    f"{owner}/{scenario}: fixture digest is missing or invalid"
                 )
             actual_digest = fixture_digest(frames)
             if actual_digest != expected_digest:
                 raise ReplayFixtureError(
-                    f"{provider}/{scenario}: fixture digest mismatch"
+                    f"{owner}/{scenario}: fixture digest mismatch"
                 )
-            files[scenario] = candidate.name
+            if actual_digest in seen:
+                raise ReplayFixtureError(
+                    f"{owner}/{scenario}: reuses a fixture from {seen[actual_digest]}"
+                )
+            seen[actual_digest] = scenario
+        return sorted(scenarios)
+
+    coverage: dict[str, dict[str, Any]] = {}
+    for provider, scenarios in providers.items():
+        checked = check_scenarios(provider, scenarios, RELEASE_SCENARIOS if release else ())
         coverage[provider] = {
-            "scenarios": sorted(files),
-            "release_ready": set(RELEASE_SCENARIOS).issubset(files),
+            "scenarios": checked,
+            "release_ready": set(RELEASE_SCENARIOS).issubset(checked),
         }
-    return {"release": release, "providers": coverage}
+    capabilities = manifest.get("capability_scenarios", {})
+    if not isinstance(capabilities, dict):
+        raise ReplayFixtureError("manifest capability_scenarios must be an object")
+    return {"release": release, "providers": coverage, "capabilities": {
+        name: check_scenarios(name, scenarios) for name, scenarios in capabilities.items()
+    }}
 
 
 def _check_safe(value: Any, path: str = "frame") -> None:
