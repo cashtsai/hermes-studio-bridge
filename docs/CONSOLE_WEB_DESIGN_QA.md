@@ -17,9 +17,21 @@
 | 離線未送、已排隊、主機已收到、送達不明提示可見 | 通過 | 通過 | 通過 |
 | 點「確認送達」讀取卡片、無新增 POST | 通過 | 通過 | 通過 |
 
-**優先修捲動。** 目前 `static/console/app.js` 的 `renderCards` 以距底部不足 80px 決定跟隨，48px 因此被當成仍在底部。修正應辨別「正在跟隨」與「使用者已上滑」：停在底部仍能看直播，上滑後即使只離開一點也保留原文，回到底部再恢復。修後同跑上表，並補驗回底會恢復跟隨、載入更早訊息時位置不變。
+**舊版原因。** `renderCards` 曾以距底部不足 80px 決定跟隨，48px 因此被當成仍在底部。
 
 **區分請求與執行。** 測試主機收完訊息便切斷連線、不給收據。該次單擊在三個尺寸分別留下 5、4、4 個 HTTP POST，但同一尺寸內每個 POST 的內容與 `client_id` 都相同。這是斷線注入下的觀察，不是正式流量或模型執行次數。之後按查詢只有 GET。另跑 bridge 現有的兩個 `same_client_id` 回歸均通過。這些證據不等同外網斷線端到端驗收。
+
+## 捲動修後複驗
+
+2026-11-10，同樣的三種 Chrome 視窗、同一份合成歷史，更新後的 `renderCards` 記住閱讀狀態，不再讓新卡決定是否恢復跟隨。
+
+| 操作 | 三種尺寸的實測結果 |
+| --- | --- |
+| 開啟 CX，第一則串流回覆進來 | 開啟時在最新處，更新後距底部 0px |
+| 各自從底部上滑 4、48、320px，加入一則新回覆 | 9 次原文位移皆為 0px（舊版 48px 情境位移 −154px） |
+| 各自手動捲回底部，再加入一則新回覆 | 9 次皆恢復跟隨，距底部 0px |
+
+常規瀏覽器回歸另外覆蓋：在合成 CC 上滑後新增卡、按「更早訊息」都不移走正在讀的訊息；切到另一個 CX 時從最新處開始，不繼承前一條對話的閱讀位置。
 
 ## 重跑與交接
 
@@ -27,10 +39,10 @@
 
 ```sh
 POCKET_QA_READING_PILOT=1 POCKET_QA_SCREENSHOTS="$(mktemp -d -t pocket-console-qa)" \
-  node --test tests/browser/console-reading-pilot.cjs tests/browser/console-workstation.cjs
+  node --test tests/browser/console-reading-pilot.cjs tests/browser/console-handoff.cjs tests/browser/console-workstation.cjs
 ```
 
-要保留結果可將 `POCKET_QA_SCREENSHOTS` 改為指定的本機資料夾。閱覽 `<寬度>.json`、`<寬度>-read-48-before.png` 與 `-after.png`；送達狀態另有獨立截圖。任一尺寸超過位移容差會回傳非零；目前三個尺寸都應報同一項失敗。未指定試點旗標時，這三項不納入平日測試。
+要保留結果可將 `POCKET_QA_SCREENSHOTS` 改為指定的本機資料夾。閱覽 `<寬度>.json`、`<寬度>-read-48-before.png` 與 `-after.png`；送達狀態另有獨立截圖。任一尺寸超過位移容差會回傳非零。未指定試點旗標時，三尺寸走查略過，一般接力回歸仍執行。
 
 新的畫面只選一個主要操作，先寫預期，再重播現有合成 fixture；PR 列出版本、尺寸、實測差異和一組前後圖。保留 Pocket 的元件、字體、品牌色和手勢。兩個 UI PR 後再判斷是否納入例行檢查。不把憑證、私人 session 或真實工作截圖放進交接。
 

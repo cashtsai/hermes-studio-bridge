@@ -80,6 +80,41 @@ test("recent history first, collapsed traces, visible final replies and stable l
   assert.equal(await cards.getByText("Final answer",{exact:true}).count(),1);
 });
 
+test("reading history survives a live card and a prepend; another session starts at latest", async t => {
+  const rows = Array.from({length:48}, (_,i) => ({
+    ...row("r"+i,"line "+i), ts:i+1, role:i%2 ? "user" : "agent"
+  }));
+  const page = await fixture(t, (r,id,action,url) => {
+    if (action !== "cards") return r.fulfill({status:403,json:{}});
+    const older=url.searchParams.has("before_id");
+    return r.fulfill({json:{...snap(48,older ? rows.slice(0,24) : rows.slice(24)),older_cursor:older ? null : "r24"}});
+  }, r => r.fulfill({json:{sessions:[A,B].map(id => ({id,provider:id.split(":")[0],capabilities:["replay"]}))}}));
+  const cards=page.locator("#cards");
+  await page.locator('#session-list [data-id="'+A+'"]').click();
+  await cards.locator('[data-key="r47"]').waitFor();
+  await cards.hover();
+  await page.mouse.wheel(0,-48);
+  await page.waitForFunction(() => {
+    const el=document.querySelector("#cards");
+    return Math.abs(el.scrollHeight-el.clientHeight-el.scrollTop-48)<2;
+  });
+  const anchor=await cards.evaluate(el => {
+    const top=el.getBoundingClientRect().top;
+    const n=Array.from(el.children).find(node => node.getBoundingClientRect().bottom>top+8);
+    return {key:n.dataset.key,y:n.getBoundingClientRect().top};
+  });
+  const anchorY=() => cards.locator('[data-key="'+anchor.key+'"]').evaluate(el => el.getBoundingClientRect().top);
+  await page.evaluate(card => upsertCard(card),{...row("new","live"),ts:49});
+  await cards.locator('[data-key="new"]').waitFor();
+  assert.ok(Math.abs(await anchorY()-anchor.y)<=1,"live append moved the reader");
+  await page.locator("#earlier-cards").click();
+  await cards.locator('[data-key="r0"]').waitFor();
+  assert.ok(Math.abs(await anchorY()-anchor.y)<=1,"older page moved the reader");
+  await page.locator('#session-list [data-id="'+B+'"]').click();
+  await cards.locator('[data-key="r47"]').waitFor();
+  assert.ok(await cards.evaluate(el => el.scrollHeight-el.clientHeight-el.scrollTop<=1),"new session inherited detached mode");
+});
+
 test("borrowed UI follows each session grant and never fetches hidden host tools", async t => {
   const rows = [{id:A,provider:"claude_code",title:"Demo chat",status:"running",capabilities:["replay"]},
     {id:B,provider:"codex",title:"Demo project",status:"running",capabilities:["replay","input","changes"]}];

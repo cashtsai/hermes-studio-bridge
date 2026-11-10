@@ -46,8 +46,21 @@ for (const viewport of viewports) test("Pocket CX reading / " + viewport.width, 
   const send = page.locator("#send");
   check("send exposed",await send.evaluate(onScreen),await send.boundingBox());
   let seq=80;
-  for (const distance of [320,48]) {
-    await cards.evaluate(el => { el.scrollTop = el.scrollHeight; });
+  await page.waitForFunction(() => document.querySelector("#stream-health").textContent==="");
+  const gap = () => cards.evaluate(el => el.scrollHeight-el.clientHeight-el.scrollTop);
+  async function appendLive() {
+    const stream=model.streams.get(base+"/events");
+    assert.ok(stream,"fixture session stream is connected");
+    ++seq;
+    const text="合成串流回覆 "+seq;
+    const card={id:"qa-"+seq,ts:seq,role:"agent",turn_id:"qa-turn-"+seq,kind:"text",body:{text}};
+    stream.write("data: "+JSON.stringify({type:"card.upsert",seq,data:{card}})+"\n\n");
+    await cards.getByText(text,{exact:true}).waitFor({state:"attached"});
+  }
+  check("opens at latest",Math.abs(await gap())<=1,await gap());
+  await appendLive();
+  check("live update follows by default",Math.abs(await gap())<=1,await gap());
+  for (const distance of [320,48,4]) {
     await cards.hover();
     await page.mouse.wheel(0,-distance);
     await page.waitForFunction(n => {
@@ -60,17 +73,19 @@ for (const viewport of viewports) test("Pocket CX reading / " + viewport.width, 
       return {key:node.dataset.key,y:node.getBoundingClientRect().top};
     });
     await shot("read-"+distance+"-before");
-    const stream=model.streams.get(base+"/events");
-    assert.ok(stream,"fixture session stream is connected");
-    ++seq;
-    const text="合成串流回覆 "+seq;
-    const card={id:"qa-"+seq,ts:seq,role:"agent",turn_id:"qa-turn-"+seq,kind:"text",body:{text}};
-    stream.write("data: "+JSON.stringify({type:"card.upsert",seq,data:{card}})+"\n\n");
-    await cards.getByText(text,{exact:true}).waitFor({state:"attached"});
+    await appendLive();
     const y=await cards.locator('[data-key="'+anchor.key+'"]').evaluate(el => el.getBoundingClientRect().top);
     const drift=Math.round((y-anchor.y)*10)/10;
     check(distance+"px scroll: reader holds position",Math.abs(drift)<=8,{driftPx:drift});
     await shot("read-"+distance+"-after");
+    await page.mouse.wheel(0,1200);
+    await page.waitForFunction(() => {
+      const el=document.querySelector("#cards");
+      return el.scrollHeight-el.clientHeight-el.scrollTop<=1;
+    });
+    await appendLive();
+    const bottomGap=await gap();
+    check(distance+"px scroll: follows again at bottom",Math.abs(bottomGap)<=1,{gapPx:bottomGap});
   }
 
   const notice=page.locator("#delivery-text");
