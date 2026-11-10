@@ -12327,7 +12327,7 @@ def _console_login_rate_ok_locked(now: float) -> bool:
     return len(_CONSOLE_LOGIN_MINTS) < _CONSOLE_LOGIN_RATE_MAX
 
 
-def _console_login_create(request: Request):
+def _console_login_create(request: Request, entry_key=None):
     """建一筆 pending 登入請求。回 `(rid, sid)`;被節流回 `(None, None)`。
 
     **rid 與 sid 是兩個不同的秘密,刻意的**:
@@ -12343,11 +12343,14 @@ def _console_login_create(request: Request):
     ua = (request.headers.get("user-agent") or "")[:200]
     with _CONSOLE_LOGIN_LOCK:
         _console_login_gc_locked(now)
+        if entry_key and any(v.get("entry_key") == entry_key for v in _CONSOLE_LOGIN_REQS.values()):
+            raise HTTPException(status_code=409, detail="entry already opened")
         if not _console_login_rate_ok_locked(now):
             _log_event("console_login_rate_limited")
             return None, None
         _CONSOLE_LOGIN_MINTS.append(now)
         _CONSOLE_LOGIN_REQS[rid] = {
+            "entry_key": entry_key,
             "sid_hash": hashlib.sha256(sid.encode()).hexdigest(),
             "relay_host": request.headers["host"].lower().removesuffix(":443")
                           if _console_uses_relay_policy() else "",
@@ -12388,7 +12391,7 @@ def _console_login_ip_label(client: str) -> str:
     return "公網(%s)" % host
 
 
-def _console_qr_login_html(rid: str) -> str:
+def _console_qr_login_html(rid: str, routed: bool = False) -> str:
     """QR 登入頁。自包含(inline CSS/JS、零外部資源),沿用輸入頁的品牌色票。
 
     與 `_console_login_html` 的差別:那頁刻意零 JS(只有一個表單),這頁需要
@@ -12400,12 +12403,15 @@ def _console_qr_login_html(rid: str) -> str:
     """
     payload = "pocket://console-login?rid=%s" % urllib.parse.quote(rid)
     svg = ""
-    try:
+    def render_qr():
         import qrcode
         from qrcode.image.svg import SvgPathImage
         qr = qrcode.QRCode(border=2, error_correction=qrcode.constants.ERROR_CORRECT_M)
         qr.add_data(payload)
-        svg = qr.make_image(image_factory=SvgPathImage).to_string().decode("utf-8")
+        return qr.make_image(image_factory=SvgPathImage).to_string().decode("utf-8")
+    try:
+        if not routed:
+            svg = render_qr()
     except Exception as _exc:  # noqa: BLE001 — 沒 qrcode 套件時仍給可複製的 payload
         _log_exc("console_qr_login_svg", _exc, expected=True)
     return """<!doctype html><html lang="zh-Hant"><head><meta charset="utf-8">
@@ -12432,12 +12438,7 @@ code{font-size:.74rem;word-break:break-all;color:var(--muted)}
 .bad{color:var(--bad)}
 </style></head><body><main>
 <h1>用手機批准這次登入</h1>
-<p class="sub">打開 Pocket 掃這個 QR，在手機上按「批准」。</p>
-<div class="card">
-  <div class="qr">%(svg)s</div>
-  <p class="sub" style="margin-top:12px">掃不到？用 Pocket 開這個連結：</p>
-  <code>%(payload)s</code>
-</div>
+%(instruction)s
 <p class="st" id="st">等待手機批准…（<span id="t">%(ttl)d</span> 秒內有效）</p>
 <p class="sub" id="hint" style="margin-top:8px">
   如果這不是你現在面前的電腦，請在手機上按「不是我」。</p>
@@ -12463,13 +12464,15 @@ function poll(){
 setTimeout(poll, 2000);
 </script>
 </main></body></html>""" % {
-        "svg": svg or "<p class=\"sub bad\">(這台主機缺 qrcode 套件,請用下面的連結)</p>",
-        "payload": payload,
+        "instruction": ('<p class="sub">請回到手機上的 Pocket 核對並批准，不需要再掃一次。</p>' if routed else
+                        '<p class="sub">打開 Pocket 掃這個 QR，在手機上按「批准」。</p>'
+                        '<div class="card"><div class="qr">' + svg + '</div>'
+                        '<p class="sub">掃不到？用 Pocket 開這個連結：</p><code>' + payload + '</code></div>'),
         "ttl": int(_CONSOLE_LOGIN_TTL),
     }
 
 
-def _console_qr_login_response(request: Request) -> Response:
+def _console_qr_login_response(request: Request, entry_key=None) -> Response:
     """遠端來源的登入方式:鑄一筆 pending 請求 → 種 sid cookie → 回 QR 頁。
 
     sid cookie 的四個屬性都是刻意的(規格 §6.1):
@@ -12484,13 +12487,13 @@ def _console_qr_login_response(request: Request) -> Response:
     針對這個來源的配額 —— 503 + Retry-After 才是誠實的語意。per-IP 配額
     擋不住殭屍網路,所以規格 §8.3 刻意選全域。
     """
-    rid, sid = _console_login_create(request)
+    rid, sid = _console_login_create(request, entry_key) if entry_key else _console_login_create(request)
     if not rid:
         raise HTTPException(
             status_code=503,
             detail="這台主機同時進行的登入請求太多,請過一分鐘再試一次",
             headers={"Retry-After": "60"})
-    resp = HTMLResponse(_console_qr_login_html(rid),
+    resp = HTMLResponse(_console_qr_login_html(rid, routed=bool(entry_key)),
                         headers=_CONSOLE_SECURITY_HEADERS)
     resp.set_cookie(
         _CONSOLE_LOGIN_SID_COOKIE, sid,
@@ -12498,6 +12501,69 @@ def _console_qr_login_response(request: Request) -> Response:
         secure=_console_cookie_secure(request),
         path=_CONSOLE_COOKIE_PATH)       # 無 max_age = session cookie
     return resp
+
+
+@app.post("/console/entry/start")
+async def console_entry_start(request: Request):
+    if not _console_relay_request_ok(request):
+        raise HTTPException(status_code=404, detail="relay unavailable")
+    if (request.headers.getlist("origin") != ["https://console.pocketone.app"] or
+            request.headers.get("content-type", "").split(";")[0] != "application/x-www-form-urlencoded"):
+        raise HTTPException(status_code=403, detail="wrong origin or format")
+    raw = bytearray()
+    async for part in request.stream():
+        if len(raw) + len(part) > 200:
+            raise HTTPException(status_code=413, detail="entry too large")
+        raw.extend(part)
+    m = re.fullmatch(rb"rid=([0-9a-f]{32})&verifier=([0-9a-f]{64})", raw)
+    if not m:
+        raise HTTPException(status_code=400, detail="invalid entry")
+    key = (m[1].decode("ascii"), hashlib.sha256(m[2]).hexdigest())
+    return _console_qr_login_response(request, key)
+
+
+@app.post("/app/v1/console/entry/select")
+async def console_entry_select(request: Request):
+    if not POCKET_CONSOLE_ENABLED or not _console_uses_relay_policy() or not (host := _console_live_relay_host()):
+        raise HTTPException(status_code=404, detail="relay unavailable")
+    _console_approval_auth(request)
+    body = await _json_body(request)
+    rid = body.get("rid")
+    if not isinstance(rid, str) or not re.fullmatch("[0-9a-f]{32}", rid):
+        raise HTTPException(status_code=400, detail="invalid entry")
+    st = _pocket_id_state() or {}
+    if not POCKET_ID_URL.startswith("https://") or st.get("url") != POCKET_ID_URL or not st.get("host_secret"):
+        raise HTTPException(status_code=503, detail="no enrolled host")
+    import httpx
+    try:
+        result = await _pocket_id_api("/v1/console-entry/select-host",
+            {"rid":rid, "host_id":st["host_id"], "host_secret":st["host_secret"]})
+    except httpx.HTTPStatusError as exc:
+        raise HTTPException(status_code=404 if exc.response.status_code in (401,403,404,409) else 503,
+                            detail="entry unavailable") from None
+    except httpx.HTTPError:
+        raise HTTPException(status_code=503, detail="entry unavailable") from None
+    challenge = result.get("challenge")
+    if not isinstance(challenge, str) or not re.fullmatch("[0-9a-f]{64}", challenge):
+        raise HTTPException(status_code=502, detail="invalid entry response")
+    return JSONResponse({"challenge":challenge, "relay_host":host}, headers=_CONSOLE_SECURITY_HEADERS)
+
+
+@app.post("/app/v1/console/entry/lookup")
+async def console_entry_lookup(request: Request):
+    if not POCKET_CONSOLE_ENABLED or not _console_uses_relay_policy() or not (host := _console_live_relay_host()):
+        raise HTTPException(status_code=404, detail="relay unavailable")
+    _console_approval_auth(request)
+    body = await _json_body(request)
+    key = (body.get("rid"), body.get("challenge"))
+    if not all(isinstance(x, str) and re.fullmatch(p, x) for x,p in zip(key, ("[0-9a-f]{32}","[0-9a-f]{64}"))):
+        raise HTTPException(status_code=400, detail="invalid entry")
+    with _CONSOLE_LOGIN_LOCK:
+        _console_login_gc_locked(time.monotonic())
+        for local_id, v in _CONSOLE_LOGIN_REQS.items():
+            if v.get("entry_key") == key and v.get("relay_host") == host and v["state"] == "pending":
+                return JSONResponse({"rid":local_id}, headers=_CONSOLE_SECURITY_HEADERS)
+    return JSONResponse({"state":"waiting"}, status_code=202, headers=_CONSOLE_SECURITY_HEADERS)
 
 
 @app.get("/console/login/status")

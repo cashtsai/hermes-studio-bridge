@@ -1750,6 +1750,18 @@ Relay 模式不會退回其他公網入口：瀏覽器只能在該 grant 的 HTT
 
 ### 16.1 `GET /app/v1/console/login/requests/{rid}`
 
+The shared Console entry is additive: the browser starts on `https://console.pocketone.app`;
+chat and approval still belong to the granted Relay. The shared QR carries only
+`pocket://console-entry?rid=<32 hex>`. A paired phone calls its own bridge's
+`POST /app/v1/console/entry/select` with that rid; bridge authenticates to its enrolled
+Pocket ID service and returns a challenge (never a browser token). After the browser
+posts its verifier and rid to the selected Relay's `/console/entry/start`, the same
+phone polls `POST /app/v1/console/entry/lookup` with rid and challenge. 202 means
+waiting, 200 returns a **host-local** rid. The phone shows the normal approval
+sheet for that local rid. The browser keeps its own HttpOnly sid; scanning alone,
+resubmitting the form, or possessing the public rid does not grant a session.
+Existing host bookmarks and `console-login` QRs continue to work unchanged.
+
 掃到 QR 之後先讀這支,把「誰在請求」顯示給人看。**需要 `Authorization: Bearer`**
 (一般 device token)。
 
