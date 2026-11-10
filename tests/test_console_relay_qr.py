@@ -1,5 +1,6 @@
 import _isolation  # noqa: F401
 import collections
+import hashlib
 import json
 import os
 import plistlib
@@ -163,3 +164,30 @@ class RelayQRTest(unittest.TestCase):
         self.assertEqual(self.web.get("/health", headers=auth).status_code, 403)
         self.assertEqual(self.web.post("/console/logout", headers=auth).status_code, 200)
         self.assertEqual(self.web.get("/app/v2/sessions", headers=auth).status_code, 401)
+
+    def test_shared_entry_one_scan_requires_original_browser_and_paired_approval(self):
+        rid, verifier = "c"*32, "d"*64
+        proof = {"rid":rid, "challenge":hashlib.sha256(verifier.encode()).hexdigest()}
+        page = "/console/entry/start"
+        form = {"rid":rid, "verifier":verifier}
+        origin = {"Origin":"https://console.pocketone.app"}
+        lookup = "/app/v1/console/entry/lookup"
+        self.assertEqual(self.web.post(page, data=form).status_code,403)
+        self.assertEqual(self.web.post(lookup,json=proof).status_code,401)
+        self.assertEqual(self.web.post(lookup,json=proof,headers=self.phone).status_code,202)
+        r = self.web.post(page,data=form,headers=origin)
+        self.assertEqual(r.status_code,200)
+        self.assertNotIn("pocket://console-login", r.text)
+        self.assertNotIn(verifier, r.text)
+        self.assertEqual(self.web.post(page,data=form,headers=origin).status_code,409)
+        self.assertEqual(self.web.post(lookup,json={**proof,"challenge":"0"*64},headers=self.phone).status_code,202)
+        local = self.web.post(lookup,json=proof,headers=self.phone).json()["rid"]
+        self.assertEqual(self.web.get("/console/login/status").json()["state"],"pending")
+        self.assertEqual(self.web.post("/app/v1/console/login/requests/"+local+"/approve",headers=self.phone).status_code,200)
+        stranger=TestClient(bridge.app, base_url=f"https://{self.relay}", client=("127.0.0.1", 2345))
+        self.addCleanup(stranger.close)
+        self.assertEqual(stranger.get("/console/login/status").json()["state"],"expired")
+        self.assertEqual(self.web.get("/console/login/status").json()["state"],"approved")
+        code=self.web.cookies.get(bridge._CONSOLE_CLAIM_COOKIE_NAME)
+        self.assertEqual(self.web.post("/pair/claim",json={"code":code}).json()["scope"],bridge.CONSOLE_REMOTE_SCOPE)
+        self.assertEqual(self.web.get("/console/login/status").json()["state"],"expired")
