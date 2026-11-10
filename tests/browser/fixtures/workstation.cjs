@@ -8,6 +8,7 @@ async function workstation(t, standalone = false, options = {}) {
   const assets = path.resolve(__dirname, "../../../static/console");
   const jobs = options.jobs || ["codex:a","codex:b"].map(id => ({id, title:id, provider:"codex", status:"idle"}));
   const model = {posts:[], remote:false, jobs, streams:new Map()};
+  const historySize = options.historySize || 80;
   const server = http.createServer(async (req,res) => {
     const url = new URL(req.url,"http://localhost");
     const send = (type,body,status=200) => {
@@ -18,7 +19,7 @@ async function workstation(t, standalone = false, options = {}) {
     if (url.pathname === "/console/logout") return json({revoked:true});
     if (url.pathname === "/app/v2/sessions") return json({sessions:model.jobs,
       ...(model.remote ? {console_scope:"console-remote"} : {})});
-    if (url.pathname.endsWith("/cards")) return json({latest_seq:80, cards:Array.from({length:80},(_,i) => ({
+    if (url.pathname.endsWith("/cards")) return json({latest_seq:historySize, cards:Array.from({length:historySize},(_,i) => ({
       id:"m"+i, ts:i+1, role:i%2?"agent":"user", kind:"text", body:{text:"測試訊息 "+i}}))});
     if (url.pathname.endsWith("/changes")) return json({files:[{path:"sample.txt",status:"M"}]});
     if (url.pathname.endsWith("/diff")) return json({diff:"+sample"});

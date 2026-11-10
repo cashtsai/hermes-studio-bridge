@@ -60,6 +60,8 @@ for (const viewport of viewports) test("Pocket CX reading / " + viewport.width, 
   check("opens at latest",Math.abs(await gap())<=1,await gap());
   await appendLive();
   check("live update follows by default",Math.abs(await gap())<=1,await gap());
+  const jump=page.locator("#new-reply");
+  assert.ok(await jump.isHidden());
   for (const distance of [320,48,4]) {
     await cards.hover();
     await page.mouse.wheel(0,-distance);
@@ -73,17 +75,22 @@ for (const viewport of viewports) test("Pocket CX reading / " + viewport.width, 
       return {key:node.dataset.key,y:node.getBoundingClientRect().top};
     });
     await shot("read-"+distance+"-before");
+    assert.ok(await jump.isHidden(),"scrolling alone is not a new reply");
     await appendLive();
     const y=await cards.locator('[data-key="'+anchor.key+'"]').evaluate(el => el.getBoundingClientRect().top);
     const drift=Math.round((y-anchor.y)*10)/10;
     check(distance+"px scroll: reader holds position",Math.abs(drift)<=8,{driftPx:drift});
     await shot("read-"+distance+"-after");
-    await page.mouse.wheel(0,1200);
+    assert.ok(await jump.evaluate(onScreen),"new reply control is exposed");
+    assert.ok(await jump.evaluate(el=>el.scrollWidth<=el.clientWidth && el.scrollHeight<=el.clientHeight),"new reply label fits");
+    if (distance===4) await jump.click();
+    else await page.mouse.wheel(0,1200);
     await page.waitForFunction(() => {
       const el=document.querySelector("#cards");
       return el.scrollHeight-el.clientHeight-el.scrollTop<=1;
     });
     await appendLive();
+    assert.ok(await jump.isHidden());
     const bottomGap=await gap();
     check(distance+"px scroll: follows again at bottom",Math.abs(bottomGap)<=1,{gapPx:bottomGap});
   }
