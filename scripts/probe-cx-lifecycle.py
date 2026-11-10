@@ -6,6 +6,7 @@ sanitized JSONL; diagnostics and non-fixture RPC metadata never enter it.
 """
 import argparse
 import asyncio
+from functools import partial
 import json
 from pathlib import Path
 import shutil
@@ -13,16 +14,17 @@ import sys
 import tempfile
 
 
-async def fixture_response(reader, writer):
+async def fixture_response(reader, writer, *, approval=False):
     """Loopback-only Responses stub; no request contents go into fixture output."""
     try:
         header = await reader.readuntil(b"\r\n\r\n")
         if not header.startswith(b"POST /v1/responses "):
             writer.write(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n")
             return
+        body = {}
         for line in header.split(b"\r\n"):
             if line.lower().startswith(b"content-length:"):
-                await reader.readexactly(int(line.split(b":", 1)[1]))
+                body = json.loads(await reader.readexactly(int(line.split(b":", 1)[1])))
         writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n")
         item = {"id": "msg_probe", "type": "message", "role": "assistant",
                 "status": "in_progress", "content": []}
@@ -34,6 +36,17 @@ async def fixture_response(reader, writer):
             writer.write(b"event: " + kind.encode() + b"\ndata: " + packet + b"\n\n")
 
         emit("response.created", response=response)
+        if approval and not any(x.get("type") == "function_call_output"
+                                for x in body.get("input", [])):
+            call = {"type": "function_call", "id": "fc_probe", "call_id": "call_probe",
+                    "name": "exec_command", "arguments": json.dumps({
+                        "cmd": "true", "sandbox_permissions": "require_escalated",
+                        "justification": "Allow the fixture no-op?"})}
+            emit("response.output_item.done", output_index=0, item=call)
+            response.update(status="completed", output=[call])
+            emit("response.completed", response=response)
+            await writer.drain()
+            return
         emit("response.output_item.added", output_index=0, item=item)
         for delta in ("FIRST", "SECOND"):
             emit("response.output_text.delta", item_id=item["id"],
@@ -96,7 +109,8 @@ async def record(binary, home, scenario, model_url):
         await result(1)
         await send("initialized", {})
         await send("thread/start", {"cwd": str(home), "model": "probe-model",
-                                    "approvalPolicy": "never", "sandbox": "read-only"}, 2)
+                                    "approvalPolicy": "on-request" if scenario == "approval" else "never",
+                                    "sandbox": "read-only"}, 2)
         thread = (await result(2))["thread"]["id"]
         await send("turn/start", {"threadId": thread, "input": [
             {"type": "text", "text": "Fixture only.", "text_elements": []}]}, 3)
@@ -106,6 +120,9 @@ async def record(binary, home, scenario, model_url):
         ended = False
         item_id = None
         deltas = []
+        request_id = None
+        resolved = False
+        waiting = False
         while not ended or (scenario == "interrupt" and not acknowledged):
             msg = await read()
             if msg.get("id") == 4 and "result" in msg:
@@ -113,6 +130,41 @@ async def record(binary, home, scenario, model_url):
             method = msg.get("method")
             params = msg.get("params") or {}
             if params.get("threadId") != thread:
+                continue
+            if scenario == "approval" and method == "thread/status/changed":
+                status = params["status"]
+                flags = status.get("activeFlags") or []
+                if status.get("type") == "active" and (flags == ["waitingOnApproval"]
+                                                        or (waiting and not flags)):
+                    waiting = bool(flags)
+                    frames.append({"method": method, "params": {"threadId": "fixture-thread",
+                                  "status": {"type": "active", "activeFlags": flags}}})
+                continue
+            if scenario == "approval" and method == "item/commandExecution/requestApproval":
+                if (request_id is not None or not started or params.get("turnId") != started
+                        or msg.get("id") is None or not params.get("itemId")):
+                    raise RuntimeError("unexpected approval request")
+                request_id = msg["id"]
+                offered = params.get("availableDecisions")
+                amendment = {"acceptWithExecpolicyAmendment": {"execpolicy_amendment": ["true"]}}
+                if (offered != ["accept", amendment, "cancel"]
+                        or params.get("command") not in ("true", "/bin/zsh -lc true", "/bin/bash -lc true")
+                        or params.get("reason") != "Allow the fixture no-op?"):
+                    raise RuntimeError("changed approval contract; review before recording")
+                frames.append({"id": 101, "method": method, "params": {
+                    "threadId": "fixture-thread", "turnId": "fixture-turn", "itemId": "fixture-item",
+                    "availableDecisions": offered, "command": "true", "reason": params["reason"]}})
+                # Never approve or run the command, even in this disposable home.
+                proc.stdin.write(json.dumps({"id": request_id, "result": {
+                    "decision": "cancel"}}).encode() + b"\n")
+                await proc.stdin.drain()
+                continue
+            if scenario == "approval" and method == "serverRequest/resolved":
+                if request_id is None or params.get("requestId") != request_id or resolved:
+                    raise RuntimeError("unexpected resolution")
+                resolved = True
+                frames.append({"method": method, "params": {
+                    "threadId": "fixture-thread", "requestId": 101}})
                 continue
             if scenario == "stream" and method == "item/agentMessage/delta":
                 delta = params["delta"]
@@ -141,7 +193,8 @@ async def record(binary, home, scenario, model_url):
                 if scenario == "interrupt":
                     await send("turn/interrupt", {"threadId": thread, "turnId": started}, 4)
             elif (method == "turn/completed" and started and turn["id"] == started
-                  and turn["status"] == ("interrupted" if scenario == "interrupt" else "completed")
+                  and turn["status"] in (("interrupted", "completed") if scenario == "approval"
+                                         else ("interrupted" if scenario == "interrupt" else "completed",))
                   and turn.get("error") is None):
                 ended = True
             else:
@@ -151,6 +204,8 @@ async def record(binary, home, scenario, model_url):
         if scenario == "stream" and (deltas != ["FIRST", "SECOND"] or
                 not any(f["method"] == "item/completed" for f in frames)):
             raise RuntimeError("incomplete stream fixture")
+        if scenario == "approval" and not resolved:
+            raise RuntimeError("provider did not confirm resolution of the cancelled approval")
         return frames
     finally:
         if proc.returncode is None:
@@ -165,7 +220,8 @@ async def record(binary, home, scenario, model_url):
 async def probe(binary, home, scenario):
     if scenario == "interrupt":
         return await record(binary, home, scenario, "http://127.0.0.1:1")
-    async with await asyncio.start_server(fixture_response, "127.0.0.1", 0) as server:
+    handler = partial(fixture_response, approval=scenario == "approval")
+    async with await asyncio.start_server(handler, "127.0.0.1", 0) as server:
         port = server.sockets[0].getsockname()[1]
         return await record(binary, home, scenario, f"http://127.0.0.1:{port}")
 
@@ -173,7 +229,7 @@ async def probe(binary, home, scenario):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--codex", default="codex", help="local Codex CLI executable")
-    parser.add_argument("scenario", choices=("interrupt", "stream"))
+    parser.add_argument("scenario", choices=("interrupt", "stream", "approval"))
     parser.add_argument("--check", action="store_true",
                         help="compare the fresh capture to its committed fixture")
     args = parser.parse_args()
@@ -186,7 +242,8 @@ def main():
                        for frame in frames)
     if args.check:
         fixtures = Path(__file__).resolve().parents[1] / "tests/fixtures/replay"
-        filename = "cx-stream-resume.jsonl" if args.scenario == "stream" else "cx-interrupt.jsonl"
+        filename = {"stream": "cx-stream-resume.jsonl", "interrupt": "cx-interrupt.jsonl",
+                    "approval": "cx-approval.jsonl"}[args.scenario]
         if recorded.encode() != (fixtures / filename).read_bytes():
             sys.exit(f"{filename}: captured protocol differs from reviewed fixture")
         print(f"{filename}: matched {len(frames)} frames")
