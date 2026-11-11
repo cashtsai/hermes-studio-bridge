@@ -450,11 +450,55 @@ function openSession(id, preserveMode = false) {
   if (window.PocketConsoleRail) window.PocketConsoleRail.load();
 }
 
+
+// ── 2026-11-11 黑盒子:console 的 JS 錯誤自己寄回 bridge(/clientlog),
+//    不然遠端使用者炸在哪永遠只能用猜的。節流:同 key 60 秒一次。
+const _errReported = new Map();
+function reportConsoleError(where, err) {
+  try {
+    const key = where + ":" + String(err && err.message).slice(0, 80);
+    const now = Date.now();
+    if ((_errReported.get(key) || 0) > now - 60000) return;
+    _errReported.set(key, now);
+    const body = JSON.stringify({ context: "console." + where, level: "error",
+      msg: String(err && err.message).slice(0, 300),
+      detail: String(err && err.stack).slice(0, 900),
+      build: "console", ua: navigator.userAgent.slice(0, 120) });
+    fetch("/clientlog", { method: "POST", headers: Object.assign(
+      { "Content-Type": "application/json" },
+      state.token ? { Authorization: "Bearer " + state.token } : {}), body }).catch(() => {});
+  } catch (_) {}
+}
+window.addEventListener("error", e => reportConsoleError("window", e.error || { message: e.message, stack: e.filename + ":" + e.lineno }));
+window.addEventListener("unhandledrejection", e => reportConsoleError("promise", e.reason || {}));
+
+// 舊瀏覽器沒有 AbortSignal.any / AbortSignal.timeout(各 Chrome 116/103+)。
+// 有就雙訊號,沒有就退 historyAbort 單訊號 —— 寧可少逾時,不可整頁炸。
+function snapshotSignal() {
+  try {
+    if (AbortSignal.any && AbortSignal.timeout)
+      return AbortSignal.any([historyAbort.signal, AbortSignal.timeout(15000)]);
+  } catch (_) {}
+  return historyAbort.signal;
+}
+
+// 渲染保底:富渲染炸掉時至少把文字放上去(純 textContent,零解析)。
+function renderCardsPlain() {
+  const host = $("cards");
+  host.replaceChildren();
+  for (const c of state.cards.slice(-50)) {
+    const d = document.createElement("div");
+    d.className = "card-plain";
+    d.textContent = ((c.body && (c.body.fallback_text || c.body.text)) || c.kind || "");
+    host.appendChild(d);
+  }
+}
+
 async function loadCardSnapshot(id, view, delay = 1000) {
   if (!currentView(view)) return;
   try {
     const snap = await apiJSON("/app/v2/sessions/" + encodeURIComponent(id) + "/cards?limit=24&history_page=true",
-      { cache: "no-store", signal: AbortSignal.any([historyAbort.signal, AbortSignal.timeout(15000)]) });
+      { cache: "no-store", signal: snapshotSignal() });
     if (!currentView(view)) return;
     if (!Array.isArray(snap.cards) || !Number.isSafeInteger(snap.latest_seq) || snap.latest_seq < 0)
       throw new Error("無效的卡片回應");
@@ -462,7 +506,15 @@ async function loadCardSnapshot(id, view, delay = 1000) {
     state.latestSeq = snap.latest_seq || 0;
     olderCursor = snap.older_cursor || null;
     updateOlderButton();
-    renderCards();
+    // 渲染炸 ≠ 網路斷:掉進下面的 catch 會變成「連線中斷,正在補接」無限
+    // 重抓(2026-11-11 機主實錘的卡死路徑)。渲染錯誤要顯性+回報+保底,
+    // 且**不能擋住訂閱** —— 靜默失敗是最大病原。
+    try { renderCards(); }
+    catch (renderErr) {
+      reportConsoleError("renderCards", renderErr);
+      setStreamHealth("顯示層發生錯誤(已回報),改用純文字顯示");
+      try { renderCardsPlain(); } catch (_) {}
+    }
     if (snap.status && snap.status.phase) updateStatusChip(snap.status.phase, snap.status);
     confirmEcho(id, state.cards);
     state.snapshotView = view;
@@ -475,6 +527,7 @@ async function loadCardSnapshot(id, view, delay = 1000) {
       $("cards").replaceChildren();
       return;
     }
+    reportConsoleError("snapshot", err);
     setStreamHealth("連線中斷，正在補接", true);
     snapshotRetry = setTimeout(() => loadCardSnapshot(id, view, Math.min(delay * 2, 15000)), delay);
   }
