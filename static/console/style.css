@@ -1,67 +1,113 @@
-/* 主題 = App 的 PocketPalettes 1:1 對位(pocket-android ui/Theme.kt /
-   iOS PocketTheme.swift,CIS v2 五色:Pocket Red / Overall Blue / White /
-   Star Yellow / Ink)。三個 preset 與 App 同名同值:
-     pocket(奶油暖底,預設,同 App 預設)/ white(中性純白)/ dark(深色)
-   切換 = <html data-theme="…">,由 app.js 落 localStorage。
-   變數名沿用既有的 --bg/--panel/… 以免動到全檔,語意對位註在右側。 */
+/* ═══════════ Token 三層制(Studio Design System v0.2)═══════════
+   L1 palette(品牌常數,只在本檔頭出現)
+   → L2 語意別名(--color-*,命名對位 PocketThemeSpec 的 role:
+     canvas / surface / text / accent 族)
+   → L3 元件只引用語意名(--bg/--panel/--dim… = L2 的過渡別名)。
+
+   ⚠️ 合流打樁:L2 token 未來由 PocketThemeSpec JSON 生成
+   (schema 見 pocket app repo docs/THEME_SPEC.md,53-role 跨端單一真相;
+   生成器把同一份 JSON 吐成 iOS/Android/console 三端主題)。
+   本檔 L2 命名已對齊該 spec 的 role 名,真生成器留下一波。
+
+   主題 = App 的 PocketPalettes 對位(CIS v2 五色:Pocket Red / Overall Blue /
+   White / Star Yellow / Ink)。三個 preset 與 App 同名:
+     pocket(奶油暖底,預設)/ white(中性純白)/ dark(深色)
+   切換 = <html data-theme="…">,由 app.js 落 localStorage。 */
 :root{
+  /* ── L1 palette:品牌常數 ── */
+  --pocket-red:#EE2D2A;    --pocket-red-300:#FF4D4A;   /* dark 用亮一階 */
+  --overall-blue:#049CD8;  --overall-blue-300:#2AA8E0;
+  --star-yellow:#FBD000;   --star-yellow-300:#FFD426;
+  --ink:#17171A;           --paper-cream:#FFF2D6;      /* 品牌奶油底,拍板保留 */
+
   /* ── 結構 token(跨主題不變)── */
   --btn-radius:9999px;   /* 按鈕=膠囊(SDS 簽名):送出/繼續/中斷/mode 鈕 */
   --field-radius:10px;   /* 欄位/列/chip:輸入框、sess 列、附件 chip、程式碼框 */
   --dialog-radius:20px;  /* 彈窗/浮層:⌘K 面板、toast */
   /* 文字級小裝飾(inline code、mark 等非互動元素)保留 3–6px 細圓角,不入三檔 */
+
+  /* ── 動效 token(SDS):一條曲線兩檔時長,全檔 transition 只准引用 ── */
+  --ease-standard:cubic-bezier(.2,0,0,1);
+  --duration-base:.2s; --duration-slow:.25s;
+
+  /* ── 陰影兩級(SDS 柔影):奶油底用暖灰基底 oklch(25% .04 55 / α),
+        卡片用 1、浮層/彈窗用 2;dark 在下面覆蓋成純黑基底 ── */
+  --shadow-1:0 1px 2px oklch(25% .04 55 / .08),0 1px 6px oklch(25% .04 55 / .07);
+  --shadow-2:0 2px 8px oklch(25% .04 55 / .12),0 14px 40px oklch(25% .04 55 / .20);
+
+  --mono:ui-monospace,SFMono-Regular,Menlo,monospace;
+  --sans:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang TC","Microsoft JhengHei",sans-serif;
+
+  /* ── L2 → 舊名別名過渡(元件現 still 吃 --bg/--panel/--dim…,
+        之後生成器只要吐 --color-* 就能整站換膚)── */
+  --bg:var(--color-canvas); --surface:var(--color-canvas);
+  --panel:var(--color-surface); --surface-raised:var(--color-surface);
+  --panel-2:var(--color-surface-sunken); --surface-sunken:var(--color-surface-sunken);
+  --surface-hover:var(--color-surface-hover);
+  --surface-selected:var(--color-accent-surface);
+  --line:var(--color-border);
+  --text:var(--color-text); --dim:var(--color-text-muted); --faint:var(--color-text-faint);
+  --accent:var(--color-accent); --on-accent:var(--color-accent-foreground);
+  --accent-2:var(--color-link); --amber:var(--color-amber);
+  --success:var(--color-success); --danger:var(--color-danger);
+  --info:var(--color-info); --warning:var(--color-warning);
+  --on-danger:var(--color-danger-foreground);
+  --good:var(--color-success); --warn:var(--color-warning); --bad:var(--color-danger);
 }
 :root,
 :root[data-theme="pocket"]{
-  /* surface 三層(SDS):surface=頁底 / raised=卡片浮層 / sunken=側欄、代碼框 */
-  --surface:#FFF2D6;        /* canvas — Warm Cream(品牌保留) */
-  --surface-raised:#FFFFFF;
-  --surface-sunken:#F7EACB; /* 比頁底深一階的暖紙 */
-  --surface-hover:rgba(23,23,26,.06);
-  --bg:var(--surface);            /* 舊名=別名過渡 */
-  --panel:var(--surface-raised);
-  --panel-2:var(--surface-sunken);
-  --line:rgba(23,23,26,.14);/* borderBase(Ink)淡化 */
-  --text:#17171A;          /* foregroundPrimary — Ink */
-  --dim:#6B6760;           /* foregroundMuted — 奶油底 5.07:1(≥4.5) */
-  --faint:#8A847A;         /* foregroundFaint — 奶油底 3.34:1(≥3,輔助字下限) */
-  --accent:#EE2D2A;        /* Pocket Red — 只用於:主按鈕/選取指示/focus/連結強調(SDS accent 紀律) */
-  --on-accent:#FFFFFF;
-  --surface-selected:#FBDFD6; /* accentSurface — user 泡泡/選取底,淡暖紅,Ink 文字 14.2:1 */
-  --accent-2:#049CD8;      /* Overall Blue — info / 連結 */
-  --amber:#FBD000;         /* Star Yellow — 點綴 */
+  /* ── L2 語意別名(role 名對位 PocketThemeSpec)── */
+  --color-canvas:var(--paper-cream);   /* canvas — 頁底(品牌保留) */
+  --color-surface:#FFFFFF;             /* surface — 卡片浮層 */
+  --color-surface-sunken:#F7EACB;      /* 側欄、代碼框:比頁底深一階的暖紙 */
+  --color-surface-hover:rgba(23,23,26,.06);
+  --color-accent-surface:#FBDFD6;      /* accentSurface — user 泡泡/選取底,Ink 字 14.2:1 */
+  --color-border:rgba(23,23,26,.14);   /* border — Ink 淡化 */
+  --color-text:var(--ink);             /* text */
+  --color-text-muted:#6B6760;          /* textMuted — 奶油底 5.07:1(≥4.5) */
+  --color-text-faint:#8A847A;          /* placeholder/iconMuted — 3.34:1(≥3) */
+  --color-accent:var(--pocket-red);    /* accent — 只用於主按鈕/選取指示/focus/連結強調 */
+  --color-accent-foreground:#FFFFFF;   /* accentForeground */
+  --color-link:var(--overall-blue);    /* 連結/info 點綴 — Overall Blue */
+  --color-amber:var(--star-yellow);
   /* 狀態色對位 SDS(跨品牌固定,light 用深階) */
-  --success:#1d7a4a; --danger:#b42318; --info:#1f6aa1; --warning:oklch(48% .1 85);
-  --on-danger:#FFFFFF;
-  --good:var(--success); --warn:var(--warning); --bad:var(--danger); /* 舊名=別名 */
+  --color-success:#1d7a4a; --color-danger:#b42318;
+  --color-info:#1f6aa1;    --color-warning:oklch(48% .1 85);
+  --color-danger-foreground:#FFFFFF;
   /* diff / 檔案狀態色:淺底用深一階,深色主題在下面覆蓋。
      ⚠️ 這幾個以前是掛 @media (prefers-color-scheme) —— 那會跟著「系統」深淺走,
      使用者選了 pocket 淺色但系統是深色時就整組錯配。改成跟著 data-theme。 */
   --diff-add:#2f7a5e; --diff-del:#b03b32; --diff-hunk:#3f6ea8;
-  --mono:ui-monospace,SFMono-Regular,Menlo,monospace;
-  --sans:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang TC","Microsoft JhengHei",sans-serif;
 }
 :root[data-theme="white"]{
-  --surface:#F5F5F7; --surface-raised:#FFFFFF; --surface-sunken:#E9E9EC;
-  --surface-hover:rgba(23,23,26,.05);
-  --line:rgba(23,23,26,.14);
-  --text:#17171A; --dim:#68686D; --faint:#84848D; /* dim 5.09:1、faint 3.40:1 on #F5F5F7 */
-  --accent:#EE2D2A; --on-accent:#FFFFFF; --accent-2:#049CD8; --amber:#FBD000;
-  --surface-selected:#FBDFDE;
-  --success:#1d7a4a; --danger:#b42318; --info:#1f6aa1; --warning:oklch(48% .1 85);
-  --on-danger:#FFFFFF;
+  --color-canvas:#F5F5F7; --color-surface:#FFFFFF; --color-surface-sunken:#E9E9EC;
+  --color-surface-hover:rgba(23,23,26,.05);
+  --color-accent-surface:#FBDFDE;
+  --color-border:rgba(23,23,26,.14);
+  --color-text:var(--ink);
+  --color-text-muted:#68686D; --color-text-faint:#84848D; /* 5.09:1、3.40:1 on #F5F5F7 */
+  --color-accent:var(--pocket-red); --color-accent-foreground:#FFFFFF;
+  --color-link:var(--overall-blue); --color-amber:var(--star-yellow);
+  --color-success:#1d7a4a; --color-danger:#b42318;
+  --color-info:#1f6aa1;    --color-warning:oklch(48% .1 85);
+  --color-danger-foreground:#FFFFFF;
 }
 :root[data-theme="dark"]{
-  --surface:#131317; --surface-raised:#1E1E25; --surface-sunken:#0E0E12;
-  --surface-hover:rgba(255,255,255,.07);
-  --line:rgba(255,255,255,.12);
-  --text:#F2F2F5; --dim:#9A9AA2; --faint:#70707A; /* dim 6.63:1、faint 3.78:1 on #131317 */
-  --accent:#FF4D4A; --on-accent:#FFFFFF; --accent-2:#2AA8E0; --amber:#FFD426;
-  --surface-selected:#4A2B2C;
+  --color-canvas:#131317; --color-surface:#1E1E25; --color-surface-sunken:#0E0E12;
+  --color-surface-hover:rgba(255,255,255,.07);
+  --color-accent-surface:#4A2B2C;
+  --color-border:rgba(255,255,255,.12);
+  --color-text:#F2F2F5;
+  --color-text-muted:#9A9AA2; --color-text-faint:#70707A; /* 6.63:1、3.78:1 on #131317 */
+  --color-accent:var(--pocket-red-300); --color-accent-foreground:#FFFFFF;
+  --color-link:var(--overall-blue-300); --color-amber:var(--star-yellow-300);
   /* 狀態色 dark 用 SDS 300 階 */
-  --success:#6fd39d; --danger:#f59a90; --info:#7cc0ec; --warning:oklch(82% .14 85);
-  --on-danger:#2A1210; /* 淡紅底上的深字(toast 等實底) */
+  --color-success:#6fd39d; --color-danger:#f59a90;
+  --color-info:#7cc0ec;    --color-warning:oklch(82% .14 85);
+  --color-danger-foreground:#2A1210; /* 淡紅實底上的深字(toast 等) */
   --diff-add:#5bb68f; --diff-del:#e2726a; --diff-hunk:#7aa6e8;
+  --shadow-1:0 1px 2px oklch(0% 0 0 / .35),0 1px 6px oklch(0% 0 0 / .28);
+  --shadow-2:0 2px 8px oklch(0% 0 0 / .45),0 14px 40px oklch(0% 0 0 / .55);
 }
 *{box-sizing:border-box;}
 html,body{height:100%;margin:0;}
@@ -134,9 +180,9 @@ body{background:var(--bg);color:var(--text);font-family:var(--sans);
    Pocket Red 禁大面積,只留主按鈕/選取指示/focus/連結強調。 */
 .card.user{align-self:flex-end;background:var(--surface-selected);color:var(--text);
   border:1px solid color-mix(in srgb,var(--accent) 28%,transparent);
-  border-bottom-right-radius:6px;}
+  border-bottom-right-radius:6px;box-shadow:var(--shadow-1);}
 .card.agent{align-self:flex-start;background:var(--panel);border:1px solid var(--line);
-  border-bottom-left-radius:6px;}
+  border-bottom-left-radius:6px;box-shadow:var(--shadow-1);}
 .card .kind{display:inline-block;font-size:13px;line-height:1.6;text-transform:uppercase;letter-spacing:.08em;
   color:var(--dim);margin-bottom:4px;}
 /* 預設用易讀的無襯線;只有「真的是程式碼/工具輸出」的卡片才等寬 */
@@ -210,7 +256,8 @@ body{background:var(--bg);color:var(--text);font-family:var(--sans);
 .msg-actions.from-agent{align-self:flex-start;}
 .msg-time{font-variant-numeric:tabular-nums;padding:0 4px;}
 .msg-act{font:inherit;font-size:13px;border:0;background:transparent;color:var(--dim);
-  cursor:pointer;padding:2px 6px;border-radius:5px;opacity:0;transition:opacity .12s;}
+  cursor:pointer;padding:2px 6px;border-radius:5px;opacity:0;
+  transition:opacity var(--duration-base) var(--ease-standard);}
 .msg-act:hover{background:var(--surface-hover);color:var(--text);}
 .card:hover+.msg-actions .msg-act,.msg-actions:hover .msg-act,.msg-act:focus-visible{opacity:1;}
 @media(hover:none){.msg-act{opacity:1;}}
@@ -285,7 +332,8 @@ body{background:var(--bg);color:var(--text);font-family:var(--sans);
 .mem-sel{background:var(--panel-2);color:var(--text);border:1px solid var(--line);border-radius:var(--field-radius);padding:0 10px;}
 .mem-results{flex:1;overflow-y:auto;padding:12px 16px;}
 .mem-count{font-size:13px;line-height:1.6;color:var(--dim);margin-bottom:10px;}
-.mem-hit{border:1px solid var(--line);border-radius:var(--field-radius);padding:12px 14px;margin-bottom:10px;background:var(--panel);}
+.mem-hit{border:1px solid var(--line);border-radius:var(--field-radius);padding:12px 14px;
+  margin-bottom:10px;background:var(--panel);box-shadow:var(--shadow-1);}
 .mem-head{display:flex;align-items:center;gap:8px;margin-bottom:6px;}
 .mem-title{font-weight:600;flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
 .mem-when{font-size:13px;line-height:1.6;color:var(--dim);flex:none;}
@@ -297,7 +345,7 @@ body{background:var(--bg);color:var(--text);font-family:var(--sans);
 /* toast */
 .toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);
   background:var(--danger);color:var(--on-danger);padding:10px 18px;border-radius:var(--dialog-radius);
-  box-shadow:0 6px 24px rgba(0,0,0,.3);z-index:10;font-size:13px;line-height:1.6;}
+  box-shadow:var(--shadow-2);z-index:10;font-size:13px;line-height:1.6;}
 .hidden{display:none !important;}
 #logout-screen{margin:3rem auto;padding:1rem;max-width:32rem;}
 body[data-console-access="remote"] [data-mode="term"],
@@ -325,7 +373,7 @@ body[data-console-access="remote"] [data-mode="memory"]{display:none;}
   margin:10px 14px 0;padding:11px 13px;border-radius:14px; /* 卡片家族,同泡泡 */
   border:1px solid color-mix(in srgb,var(--accent) 45%,transparent);
   background:color-mix(in srgb,var(--accent) 10%,transparent);
-  display:flex;flex-direction:column;gap:9px;
+  display:flex;flex-direction:column;gap:9px;box-shadow:var(--shadow-1);
 }
 .ap-head{display:flex;align-items:center;gap:7px;font-size:16px;font-weight:600;}
 .ap-icon{flex:none;}
@@ -379,7 +427,7 @@ body[data-console-access="remote"] [data-mode="memory"]{display:none;}
          padding-top:12vh;z-index:40;}
 .pal-box{width:min(560px,92vw);background:var(--panel);color:var(--text);
          border:1px solid var(--line);
-         border-radius:var(--dialog-radius);box-shadow:0 18px 48px rgba(0,0,0,.32);
+         border-radius:var(--dialog-radius);box-shadow:var(--shadow-2);
          overflow:hidden;display:flex;flex-direction:column;}
 .pal-q{border:0;border-bottom:1px solid rgba(127,127,127,.25);padding:13px 15px;
        font:inherit;font-size:16px;background:transparent;color:inherit;}
@@ -450,12 +498,15 @@ body[data-console-access="remote"] [data-mode="memory"]{display:none;}
 #topbar{gap:14px;}
 #mode-nav{flex:0 1 auto;overflow-x:auto;scrollbar-width:none;}
 #mode-nav::-webkit-scrollbar{display:none;}
-.mode-btn{white-space:nowrap;transition:background .12s,color .12s;}
+.mode-btn{white-space:nowrap;
+  transition:background var(--duration-base) var(--ease-standard),
+             color var(--duration-base) var(--ease-standard);}
 .mode-btn:hover:not(.active){color:var(--text);background:var(--surface-hover);}
 
 /* 側欄 session 列表:sunken 層(SDS:側欄比頁底深一階)+ 可點面積 */
 #sidebar{background:var(--surface-sunken);}
-.sess{padding:9px 11px;border-radius:var(--field-radius);transition:background .12s;}
+.sess{padding:9px 11px;border-radius:var(--field-radius);
+  transition:background var(--duration-base) var(--ease-standard);}
 .sess.active{background:var(--surface-selected);
   box-shadow:inset 3px 0 0 var(--accent);}
 .sess.active .sess-name{color:var(--accent);}
