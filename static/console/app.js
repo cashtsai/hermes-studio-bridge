@@ -267,6 +267,28 @@ function sessionRank(s) {
   return ["run", "running", "busy", "queued"].includes(s.status) ? 1 : 2;
 }
 
+// 列表位置的「降級遲滯」。CC 在工具步驟之間會短暫回 idle,排序立刻把那列
+// 往下丟、下一步開跑又彈回來 —— 2026-11-13 機主回報「執行中跑上去又跑下來」
+// 就是這個。規則:**升級(變更緊急)立即生效**,降級要連續維持 15 秒才算數;
+// 同級之內按最近活動排,再用 id 墊底,讓次序完全確定(原本同級順序跟著
+// 資料到達順序飄)。
+const RANK_DEMOTE_MS = 15000;
+const rankMemo = new Map();   // id → { rank, at }
+
+function stickyRank(s, now) {
+  const raw = sessionRank(s);
+  const memo = rankMemo.get(s.id);
+  if (!memo || raw < memo.rank) {           // 升級或首見:立即生效並記住
+    rankMemo.set(s.id, { rank: raw, at: now });
+    return raw;
+  }
+  if (raw === memo.rank) { memo.at = now; return raw; }
+  // 降級:15 秒內先維持原位;過了才真的掉下去。
+  if (now - memo.at < RANK_DEMOTE_MS) return memo.rank;
+  rankMemo.set(s.id, { rank: raw, at: now });
+  return raw;
+}
+
 function renderSessions() {
   const el = $("session-list");
   if (!state.sessions.length) {
@@ -282,7 +304,11 @@ function renderSessions() {
     if (!byProv.has(p)) byProv.set(p, []);
     byProv.get(p).push(s);
   }
-  for (const rows of byProv.values()) rows.sort((a, b) => sessionRank(a) - sessionRank(b));
+  const now = Date.now();
+  for (const rows of byProv.values()) rows.sort((a, b) =>
+    (stickyRank(a, now) - stickyRank(b, now)) ||
+    (activityTime(b.last_event_at) - activityTime(a.last_event_at)) ||
+    (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
   let html = "";
   for (const [prov, rows] of byProv) {
     const dim = state.degraded.includes(prov) || (prov === "claude_code" && state.degraded.includes("cc2")) ? " degraded" : "";
@@ -1160,9 +1186,11 @@ function showDraft(id) {
   $("send").disabled = !!pending || d.reading > 0;
   $("delivery").classList.toggle("hidden", !d.notice);
   $("delivery-text").textContent = d.notice;
-  $("delivery-text").classList.toggle("working", ["checking","sending"].includes(pending?.phase));
+  $("delivery-text").classList.toggle("working", ["checking","sending","verifying"].includes(pending?.phase));
   $("check-delivery").hidden = !pending || pending.phase !== "unknown";
-  $("forget-delivery").hidden = $("check-delivery").hidden;
+  // 自動確認(verifying)期間查詢鈕不用出(機器正在查),但「結束追蹤」要
+  // 可按 —— 不然使用者會被鎖在輸入框外最長 30 秒,沒有任何出口。
+  $("forget-delivery").hidden = !pending || !["unknown", "verifying"].includes(pending.phase);
   renderAtts(); autosize();
 }
 
@@ -1224,8 +1252,29 @@ async function sendInput(text) {
     finishInput(id, d, ack.queued || ack.delivery === "queued" ? "已排入佇列" : "主機已收到");
   } catch (_) {
     if (d.pending !== p) return;
-    p.phase = "unknown"; d.notice = "送達狀態不明，請先確認。未重新送出。"; showDraft(id);
+    // POST 逾時/斷線 ≠ 沒送到 —— CC 的投遞走 tmux,慢起來會超過 90s,而指令
+    // 其實已經在跑(2026-11-13 機主回報「多次送出好像沒成功」,就是每次都
+    // 被丟進手動確認)。所以先**自動**查收據(憑 client_id 比對),三次都
+    // 找不到才降級成手動的「查詢送達/結束追蹤」。
+    autoVerifyDelivery(id, d, p);
   }
+}
+
+/// 送出結果不明時的自動確認:2s/8s/20s 三次查收據,中間使用者仍可「結束追蹤」。
+async function autoVerifyDelivery(id, d, p) {
+  p.phase = "verifying";
+  for (const wait of [2000, 8000, 20000]) {
+    d.notice = "連線不穩，正在確認送達…(可按「結束追蹤」放棄等待)"; showDraft(id);
+    await new Promise(r => setTimeout(r, wait));
+    if (d.pending !== p) return;          // SSE 收據先到、或使用者已結束追蹤
+    try {
+      const snap = await apiJSON("/app/v2/sessions/" + encodeURIComponent(id) + "/cards?limit=100",
+        { signal: AbortSignal.timeout(15000), cache: "no-store" });
+      if (d.pending !== p) return;
+      if (confirmEcho(id, snap.cards || [])) return;   // 找到收據 → 解鎖,結案
+    } catch (_) { if (d.pending !== p) return; }
+  }
+  p.phase = "unknown"; d.notice = "送達狀態不明，請先確認。未重新送出。"; showDraft(id);
 }
 
 async function interrupt() {
@@ -1342,7 +1391,7 @@ function wire() {
   $("check-delivery").addEventListener("click", checkDelivery);
   $("forget-delivery").addEventListener("click", () => {
     const id = state.current, d = draftFor(id);
-    if (d.pending?.phase === "unknown" && confirm("指令可能已在執行。結束追蹤並清空這則草稿？不會重送或停止工作。"))
+    if (["unknown", "verifying"].includes(d.pending?.phase) && confirm("指令可能已在執行。結束追蹤並清空這則草稿？不會重送或停止工作。"))
       finishInput(id, d, "");
   });
   $("input").addEventListener("keydown", (e) => {
