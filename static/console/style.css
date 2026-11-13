@@ -16,6 +16,11 @@
 :root{
   /* ── L1 palette:品牌常數 ── */
   --pocket-red:#EE2D2A;    --pocket-red-300:#FF4D4A;   /* dark 用亮一階 */
+  /* v0.3 L1 theme 家族對位(--palette-theme-*):品牌主題色就是 Pocket Red 階。 */
+  --palette-theme-600:var(--pocket-red); --palette-theme-300:var(--pocket-red-300);
+  /* v0.3 L2 新 token */
+  --color-text-disabled:#A89F93;  /* disabled 階(允許 <3:1,僅限禁用態) */
+  --color-action-link:#C42320;    /* 連結專用:比 accent 深一階,內文可讀 */
   --overall-blue:#049CD8;  --overall-blue-300:#2AA8E0;
   --star-yellow:#FBD000;   --star-yellow-300:#FFD426;
   --ink:#17171A;           --paper-cream:#FFF2D6;      /* 品牌奶油底,拍板保留 */
@@ -32,8 +37,10 @@
 
   /* ── 陰影兩級(SDS 柔影):奶油底用暖灰基底 oklch(25% .04 55 / α),
         卡片用 1、浮層/彈窗用 2;dark 在下面覆蓋成純黑基底 ── */
-  --shadow-1:0 1px 2px oklch(25% .04 55 / .08),0 1px 6px oklch(25% .04 55 / .07);
-  --shadow-2:0 2px 8px oklch(25% .04 55 / .12),0 14px 40px oklch(25% .04 55 / .20);
+  --shadow-1:0 2px 6px oklch(25% .04 55/.12),0 1px 2px oklch(25% .04 55/.08);   /* SDS 卡片 */
+  --shadow-2:0 8px 24px oklch(25% .04 55/.17),0 1px 2px oklch(25% .04 55/.08);  /* 彈出/選單 */
+  --shadow-3:0 16px 48px oklch(25% .04 55/.23),0 1px 2px oklch(25% .04 55/.08); /* v0.3 toast/抽屜 */
+  --shadow-4:0 28px 80px oklch(25% .04 55/.3),0 1px 2px oklch(25% .04 55/.08);  /* v0.3 對話框+遮罩 */
 
   --mono:ui-monospace,SFMono-Regular,Menlo,monospace;
   --sans:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang TC","Microsoft JhengHei",sans-serif;
@@ -106,8 +113,11 @@
   --color-info:#7cc0ec;    --color-warning:oklch(82% .14 85);
   --color-danger-foreground:#2A1210; /* 淡紅實底上的深字(toast 等) */
   --diff-add:#5bb68f; --diff-del:#e2726a; --diff-hunk:#7aa6e8;
+  /* v0.3 深色層級策略:表面越高越亮(surface→raised→hover)為主,陰影只當輔助。 */
   --shadow-1:0 1px 2px oklch(0% 0 0 / .35),0 1px 6px oklch(0% 0 0 / .28);
   --shadow-2:0 2px 8px oklch(0% 0 0 / .45),0 14px 40px oklch(0% 0 0 / .55);
+  --shadow-3:0 16px 48px oklch(0% 0 0 / .55),0 1px 2px oklch(0% 0 0 / .35);
+  --shadow-4:0 28px 80px oklch(0% 0 0 / .6),0 1px 2px oklch(0% 0 0 / .35);
 }
 *{box-sizing:border-box;}
 html,body{height:100%;margin:0;}
@@ -344,6 +354,7 @@ body{background:var(--bg);color:var(--text);font-family:var(--sans);
 
 /* toast */
 .toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);
+  box-shadow:var(--shadow-3); /* v0.3:toast 用第 3 級 */
   background:var(--danger);color:var(--on-danger);padding:10px 18px;border-radius:var(--dialog-radius);
   box-shadow:var(--shadow-2);z-index:10;font-size:13px;line-height:1.6;}
 .hidden{display:none !important;}
@@ -427,7 +438,7 @@ body[data-console-access="remote"] [data-mode="memory"]{display:none;}
          padding-top:12vh;z-index:40;}
 .pal-box{width:min(560px,92vw);background:var(--panel);color:var(--text);
          border:1px solid var(--line);
-         border-radius:var(--dialog-radius);box-shadow:var(--shadow-2);
+         border-radius:var(--dialog-radius);box-shadow:var(--shadow-4); /* v0.3:對話框用第 4 級 */
          overflow:hidden;display:flex;flex-direction:column;}
 .pal-q{border:0;border-bottom:1px solid rgba(127,127,127,.25);padding:13px 15px;
        font:inherit;font-size:16px;background:transparent;color:inherit;}
