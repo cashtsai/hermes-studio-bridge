@@ -18839,10 +18839,32 @@ def _cc_shell_mode(pane: str) -> bool:
     return region.splitlines()[0].lstrip().startswith("!\u00a0")
 
 
+_CC_SURVEY_MARK = "How is Claude doing this session?"
+
+def _cc_survey_overlay(pane: str) -> bool:
+    """CC 的評分問卷(How is Claude doing?)有沒有蓋住輸入框。
+
+    這個框是 2026-11-13 與 11-15 **兩天內兩次**把機主的 shan-ops 卡死的
+    犯人:它佔走輸入框的位置,bridge 掃不到 composer → 手機端只會說
+    「不在可輸入狀態」,而使用者完全看不到有個框在等按鍵。
+
+    判定刻意用**雙條件**:問卷文字出現在畫面**尾段**、而且輸入框真的
+    不見了。少任何一個都不算 —— 對話內容裡聊到這個 bug 時,transcript
+    會原封不動帶著同一句英文(11-13 的對話就有),單看文字必誤觸。
+    """
+    tail = "\n".join(pane.rstrip().splitlines()[-15:])
+    if _CC_SURVEY_MARK not in tail or "0: Dismiss" not in tail:
+        return False
+    _, region = _cc_composer_split(pane)
+    return region is None
+
+
 def _cc_not_accepted_reason(pane: str) -> str:
     """文字卡在輸入框時,分辨 CLI 是處在哪種「吃掉 Enter」的狀態。"""
     if _CC_CONTEXT_FULL_RE.search(pane):
         return "context_full"
+    if _cc_survey_overlay(pane):
+        return "survey_blocking"
     if _cc_prompt(pane):
         return "awaiting_prompt"
     return "composer_stuck"
@@ -18852,6 +18874,8 @@ _CC_NOT_ACCEPTED_HINT = {
     "context_full": "CC 這條線 context 已滿,先 /compact 或壓縮再送",
     "awaiting_prompt": "CC 正在等你回覆畫面上的選項,先處理再送",
     "composer_stuck": "CC 沒有收下這則訊息,請重送",
+    "survey_blocking": "CC 跳出了評分問卷擋住輸入框,自動關閉沒有成功 —— "
+                       "請在那台機器按一下 0 關掉後重送",
     "composer_missing": "CC 現在不在可輸入狀態(啟動中或有對話框蓋住畫面),"
                         "處理完再重送",
     "never_rendered_idle": "CC 沒有收下這則訊息(當時是待命中,收到就會立刻開跑),"
@@ -19102,6 +19126,15 @@ async def _cc_paste_text_locked(name: str, text: str, expect_dialog: bool = Fals
     if remote and (text.lstrip().startswith(("!", "/")) or re.search(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]", text)):
         raise http_err(403, "SCOPE_FORBIDDEN", "借用電腦只接受對話文字")
     pre_pane = await _cc_capture_pane_fresh(target)
+    # 評分問卷自動關閉:按 **單鍵 0、不帶 Enter**(11-13 實機試過,0+Enter
+    # 反而關不掉)。機主已拍板不需要給評分(2026-11-15:「這個壞掉很好笑」)。
+    # 關完重拍畫面再走原流程;關不掉就讓後面的 reason 誠實回報 survey_blocking。
+    if _cc_survey_overlay(pre_pane):
+        await _tmux_run("send-keys", "-t", target, "0")
+        await asyncio.sleep(0.8)
+        pre_pane = await _cc_capture_pane_fresh(target)
+        _log_event("cc_survey_dismissed", session=name,
+                   cleared=not _cc_survey_overlay(pre_pane))
     pre_prompt = _cc_prompt(pre_pane)
     if pre_prompt and pre_prompt.get("semantic") != "question":
         _log_event("cc_input_not_accepted", session=name, reason="awaiting_prompt",
