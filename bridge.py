@@ -13282,6 +13282,34 @@ async def _pocket_id_loop() -> None:
             backoff = min(backoff * 2, 3600.0)
 
 
+# ── B3(2026-11-16,grok steal #6):長連外路活性登記表 ────────────────────
+# 治「401 靜默斷五天」族:長連線的死法不是斷線,是**半開** —— TCP 活著、
+# 探活 200、但應用流一個訊框都不來。判準統一為「讀側活性死線」:
+# N×keepalive 週期內零 inbound frame 即判死重連(N=4 起,有任何 inbound
+# 就重計,半開才判死、閒聊慢不誤殺);退避 reset 的條件一律是「憑證被接受
+# 的證據」,不是「連線建立」。bridge 的長連外路與各自的活性機制:
+#
+#   1. openclaw gateway WS(openclaw_provider)— gateway 有 tick/health
+#      inbound 心跳 → 真 read-liveness:_watch_reader 盯 _last_rx,
+#      4×OPENCLAW_KEEPALIVE_SECS 零訊框 → close→重連(WS 層 ping/pong 不算
+#      數:pong 由對端程式庫自動答,應用層死了照答)。backoff 只在
+#      hello-ok(token 驗過)後 reset。
+#   2. relay frpc 子進程(本段)— 隧道健康唯一真相是 frpc 日誌:
+#      `start proxy success` = frps 驗過 token + NewProxy 放行,**只有它**
+#      能 reset 退避(_relay_run_frpc 回傳 proxied 證據);frpc 對 frps 的
+#      心跳/重連是 frpc 自己的事,我們盯的是「開關 vs 行程」一致性。
+#   3. hermes ACP 流(acp_client)— stdio pipe 無中介層、無半開(EOF 即
+#      斷,readline 立刻看到);回合內的讀側活性 = _watch_turn 看門狗
+#      (_last_item_at 閒置上限)。閒置時人格本來就零訊框,**不可**套
+#      零訊框判死(會把每個發呆的人格殺一輪)。
+#   4. codex app-server(unix socket WS / stdio 子進程)— unix socket 無
+#      網路中介層;WS 層 ping_timeout=90 + 每個 RPC 自帶 wait_for timeout
+#      + turn watchdog。同 3,閒置零訊框是常態,不套零訊框判死。
+#   5. cc2 Agent SDK(行程內)— turn-scoped streams,審批等待 fail-closed
+#      (110s),無常駐外路。
+#
+# 新增長連外路時到這張表報到:它的 keepalive 來源是什麼、半開可能嗎、
+# 退避 reset 的「證據」是哪一行。
 # ═════════════ Pocket Relay(中繼隧道):claim + frpc 子進程 ═════════════
 # 伺服器端在 ~/apps/pocket-id:frps 收隧道、pocket-id 當收費閘(claim 要訂閱、
 # frp 的 Login/NewProxy 每次都問、on-demand TLS 不幫沒授權的子網域簽憑證)。
@@ -13493,8 +13521,13 @@ def _relay_kill_stale_frpc() -> int:
     return killed
 
 
-async def _relay_run_frpc(binary: str) -> str:
-    """跑 frpc 直到它結束,回傳輸出尾巴(用來判斷是不是授權問題)。
+async def _relay_run_frpc(binary: str) -> tuple:
+    """跑 frpc 直到它結束,回傳 (輸出尾巴, 隧道曾真的通過)。
+
+    第二個回傳值是 B3 的「憑證被接受的證據」:`start proxy success` =
+    frps 驗過 token、NewProxy 放行 —— 只有看到它,呼叫端才准 reset 退避。
+    「frpc 行程起來了」或「TCP 連上 frps」都不是證據(token 被撤/沒訂閱時
+    行程照樣活著重試,憑行程狀態 reset 退避就是 30 秒重試風暴)。
 
     frpc 自己會重連,所以它不會自己結束 —— 因此**必須在跑的時候盯著開關**。
 
@@ -13512,6 +13545,7 @@ async def _relay_run_frpc(binary: str) -> str:
         binary, "-c", _relay_conf_path(),
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
     tail: list[str] = []
+    proxied = [False]   # B3:曾看到 start proxy success(憑證被接受的證據)
 
     async def _pump() -> None:
         assert proc.stdout is not None
@@ -13520,6 +13554,7 @@ async def _relay_run_frpc(binary: str) -> str:
             tail.append(line)
             del tail[:-40]
             if _RELAY_PROXY_OK in line:
+                proxied[0] = True
                 _relay_set_status("connected", detail=None)
             elif _RELAY_PROXY_ERR in line:
                 # 連上了 frps 卻開不了通道 —— 行程還活著,但隧道是不通的。
@@ -13546,7 +13581,7 @@ async def _relay_run_frpc(binary: str) -> str:
                 proc.kill()
                 await proc.wait()
         pump.cancel()
-    return "\n".join(tail)
+    return "\n".join(tail), proxied[0]
 
 
 async def _relay_loop() -> None:
@@ -13598,9 +13633,14 @@ async def _relay_loop() -> None:
                        local_port=_relay_local_port())
             # 先進 connecting;真的通了由 _relay_run_frpc 讀到 frpc 的日誌才改。
             _relay_set_status("connecting", hostname=grant.get("hostname"))
-            fail_logged = False
-            backoff = 30.0
-            tail = await _relay_run_frpc(binary)
+            tail, proxied = await _relay_run_frpc(binary)
+            if proxied:
+                # B3:退避只在「憑證被接受的證據」(start proxy success =
+                # frps 驗過 token + NewProxy 放行)出現後 reset,不在「行程
+                # 起來/TCP 連上」就 reset —— token 被撤或訂閱斷的 frpc 一樣
+                # 會跑起來再被拒,憑啟動 reset 退避等於永遠 30 秒重試風暴。
+                fail_logged = False
+                backoff = 30.0
 
             if not _relay_enabled():
                 # 使用者關掉的 —— frpc 結束是**預期**的,不是故障。
