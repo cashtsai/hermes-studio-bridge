@@ -513,6 +513,9 @@ fi
 # 這裡驗的是**狀態**不是離開碼:真的把 CLI 叫起來、真的 import 一條
 # 3.14-gated 的依賴,零依賴空殼會在這裡原形畢露。
 if [ "$INSTALL_HERMES" = "1" ]; then
+  log_step "檢查 Hermes CLI 並補齊執行依賴"
+  HERMES_HOME="$HERMES_HOME_ROOT" HERMES_INSTALL_DIR="$HERMES_INSTALL_DIR" HERMES_REPO_URL="$HERMES_REPO_URL" \
+    bash "$SCRIPT_DIR/ensure-hermes-runtime.sh"
   HERMES_BIN_PATH="$HERMES_INSTALL_DIR/runtime/venv/bin/hermes"
   [ -x "$HERMES_BIN_PATH" ] || die "Hermes 沒裝成:找不到 $HERMES_BIN_PATH"
   HERMES_VENV_PY="$HERMES_INSTALL_DIR/runtime/venv/bin/python"
@@ -524,9 +527,6 @@ if [ "$INSTALL_HERMES" = "1" ]; then
 fi
 
 if [ "$INSTALL_HERMES" = "1" ]; then
-  log_step "檢查 Hermes CLI 並補齊執行依賴"
-  HERMES_HOME="$HERMES_HOME_ROOT" HERMES_INSTALL_DIR="$HERMES_INSTALL_DIR" HERMES_REPO_URL="$HERMES_REPO_URL" \
-    bash "$SCRIPT_DIR/ensure-hermes-runtime.sh"
   # ── 預設人格「pocket」(2026-11-03,同 OpenClaw 那段 workspace 的理由)────
   #
   # Hermes 的 SOUL.md 沒有 OpenClaw BOOTSTRAP.md 那種「第一次見面自動退場」

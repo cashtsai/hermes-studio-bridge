@@ -7,6 +7,7 @@ import unittest
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "deploy" / "ensure-hermes-runtime.sh"
+INSTALLER = SCRIPT.with_name("install-ubuntu.sh")
 
 
 class CloudHermesStartupTest(unittest.TestCase):
@@ -44,6 +45,27 @@ touch "$HERMES_INSTALL_DIR/ready"''')
     def test_install_failure_is_not_masked(self):
         self.exe("python", "exit 17")
         self.assertEqual(self.check().returncode, 17)
+
+    def test_installer_repairs_existing_runtime_before_smoke_check(self):
+        self.exe("hermes", 'test -f "$HERMES_INSTALL_DIR/ready"')
+        self.exe("python", '''case "$1" in
+-m) echo repair >> "$HERMES_INSTALL_DIR/calls"; touch "$HERMES_INSTALL_DIR/ready" ;;
+-c) test -f "$HERMES_INSTALL_DIR/ready"; echo smoke >> "$HERMES_INSTALL_DIR/calls" ;;
+-V) echo Python-3.14 ;;
+*) exit 19 ;;
+esac''')
+        source = INSTALLER.read_text()
+        start = source.index("if [ \"$INSTALL_HERMES\" = \"1\" ]; then", source.index("# 煙霧測試:"))
+        end = source.index("\nfi", start) + len("\nfi")
+        script = 'set -eu\nlog_step() { :; }\ndie() { echo "$*" >&2; exit 1; }\n' + source[start:end]
+        result = subprocess.run(["bash", "-c", script], capture_output=True, text=True,
+                                env=dict(os.environ, INSTALL_HERMES="1",
+                                         HERMES_INSTALL_DIR=str(self.root),
+                                         HERMES_HOME_ROOT=str(self.root / "home"),
+                                         HERMES_REPO_URL="unused-no-network",
+                                         SCRIPT_DIR=str(SCRIPT.parent)))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((self.root / "calls").read_text().splitlines(), ["repair", "smoke"])
 
 
 if __name__ == "__main__":
