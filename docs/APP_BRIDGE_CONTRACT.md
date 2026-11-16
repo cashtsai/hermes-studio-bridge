@@ -1222,6 +1222,36 @@ GET /app/v2/sessions/{session_id}/cards?limit=100&before_seq=M
 `limit` 上限 500。**app 本地快取＝卡片庫**（key: session_id + card.id + rev）：
 離線可讀、進場秒開；快取只是 snapshot，永不當真相。
 
+### 7.1 歷史拉取:負 offset 取尾 + 回合切片(2026-11-16,grok steal #4)
+
+> 治「進場閃舊訊息」:client 要的是「最後一回合/最後 N 張」秒開,再按需
+> 往前翻 —— 不是冷載整包再自己丟掉前面。語義照 grok `x.ai/session/updates`
+> 的 offset/turnIndex 設計。全部 additive;既有 `before_seq`/`before_id`
+> 分頁一個 byte 不動,但**與新參數互斥**(混用回 400)。
+
+```
+GET /app/v2/sessions/{id}/cards?offset=-50&limit=50      # 尾巴 50 張
+GET /app/v2/sessions/{id}/cards?turn_index=-1&limit=200  # 最新一個使用者回合
+```
+
+- `offset`:位置視窗。**負值從尾巴數**(Python slicing 語義:`-50` =
+  最後 50 張起);非負 = 從頭數。回應多帶:
+  - `window_start`(視窗落在第幾張)、`total_cards`(卡片庫現存總數)
+  - `has_more`(視窗之前還有歷史)、`has_more_after`(視窗之後還有,
+    正向分頁用)
+- `turn_index`:按**使用者回合**切片(邊界 = `role=="user"` 的卡開新回
+  合;被裁掉的歷史開頭無主卡自成第 0 片)。負值從最新回合倒數
+  (`-1` = 最新)。回應多帶 `turn_index`(正規化後的非負值)、
+  `turn_count`;超出保留範圍回 **409 `TURN_INDEX_GONE`**(卡片庫只保留
+  最近 `POCKET_CARD_STORE_MAX` 張,更早的回合 bridge 已經沒有 ——
+  client 退 `offset` 位置視窗或放棄)。
+- `has_more` 同時升格為**所有模式**的一等回應欄位(含既有
+  snapshot/`before_seq` 路徑;以前只在 paged 模式以 `older_cursor` 間接
+  表達)。
+- 兩個新參數彼此互斥、也與 `before_seq`/`before_id`/`history_page` 互斥
+  (400)。`latest_seq`/`status`/`durable_seq` 欄位照舊 —— 不論用哪種
+  視窗拿歷史,SSE 續流與持久游標語義完全不變。
+
 ### Durable session media
 
 ```
@@ -1843,6 +1873,66 @@ device token:
   藉錯誤碼探測檔案存不存在。
 - `/pair/devices` 上看得到(`is_remote_console: true` ＋ `scope` ＋ `expires`),
   機主可以隨時撤銷。app 的裝置清單應該把它標成「遠端瀏覽器」而不是一台裝置。
+
+## 17. Sessions Roster(`/app/v2/sessions/roster`,2026-11-16)
+
+> 動機(grok-build steal #3):列表頁/FleetView 要的是「一眼看懂每條
+> session 在幹嘛」,不是整包 provider meta。既有 `/app/v2/sessions`
+> **一個 byte 不動**(相容);roster 是疊加的瘦 facade,治「列表預覽怪/
+> 未讀不亮」—— activity 用六態說真話(`needs_input`/`dead` 是一級狀態),
+> 摘要由 bridge 生成,app 不再自己猜。
+
+### 17.1 冷載
+
+```
+GET /app/v2/sessions/roster
+→ {"sessions": [RosterRow…], "degraded_providers": ["codex", …]}
+```
+
+RosterRow:
+
+```jsonc
+{
+  "id": "claude_code:Ops",            // 同 §4.1 全寫 session id
+  "provider": "claude_code|cc2|codex|hermes|gemini|openclaw",
+  "title": "Ops",
+  "activity": "working|idle|needs_input|dormant|completed|dead",
+  "last_turn_summary": "部署腳本改好了…",   // 規則式 ≤12 字;可為 ""
+  "updated_ts": 1795000000.0           // epoch;從無活動 → null
+}
+```
+
+`activity` 六態(照 grok RosterActivity)與導出規則:
+
+| activity | 導出 | app 端建議 |
+| --- | --- | --- |
+| `needs_input` | `status==waiting_approval` 或 `meta.approval` 存在(與 pending approvals 同步導出,**優先序最高** —— 在等你的事比什麼都搶眼) | 醒目徽章,點進去可答 |
+| `working` | `status ∈ running/stalled/dispatching`(stalled 照 §4.1a 比照 running,「疑似卡住」不誤報成死) | 轉圈 |
+| `dead` | `status ∈ failed/error` 或 `meta.degraded`(persona crash-loop/連續 stall)—— **runner 死也要顯示得出來**,不是從列表消失 | 紅字 |
+| `completed` | `status ∈ done/completed` | 一般樣式 |
+| `idle` | 無上述,且 `updated_ts` 距今 < `POCKET_ROSTER_DORMANT_SECS`(預設 24h) | 一般樣式 |
+| `dormant` | 無上述且久無活動(或從無活動) | 淡化/摺疊 |
+
+`last_turn_summary`:目前規則式 —— 該 session 最後一筆持久里程碑
+(`card.milestone`/`message.upsert`)的文字壓空白截斷(≤12 字)。
+TODO:回合結束時 LLM 生成 5-12 字摘要落地,wire 欄位不變,app 零改動升級。
+
+### 17.2 差分訂閱
+
+```
+GET /app/v2/sessions/roster/events        (SSE)
+data: {"ts": …, "type": "sessions.changed",
+       "data": {"upserted": [RosterRow…], "removed": ["codex:…", …]}}
+```
+
+- **transient 事件**(B1 三分類):信封無 `seq`、不落 event_log —— roster
+  任何時刻可由 §17.1 全量重建,持久游標在這裡沒有意義。
+- 連上先推一包全量(`upserted` = 全部列):冷載與重連走同一條「以 id
+  upsert」套用路徑,client 不必分支。
+- 之後每 `POCKET_ROSTER_POLL_SECS`(預設 3s)比對一次,有差才推;
+  安靜期間每 `SSE_KEEPALIVE_SECS` 一行 `: keepalive` 註解。
+- 長時間零變化(30 分鐘)bridge 主動斷線(半死 client 不佔 task,同既有
+  follow 流);client 重連即重拿全量。
 
 ## 附註 A:pocket-id 心跳 `notices` 下行(backup orphan 提醒,2026-11-06)
 

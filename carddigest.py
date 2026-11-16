@@ -1448,6 +1448,45 @@ class CodexThreadDigest(ApprovalCardMixin):
 #: 0/None = 去重略過或失敗 —— _push 會把它放進信封的 durable_seq。
 MILESTONE_SINK = None
 
+# ── B1(2026-11-16,grok-build steal #2):transient 事件登記表 ─────────────
+# bridge.EVENT_PERSISTED/EVENT_PERSIST_ONLY 的孿生表:那邊登記「蓋全域 seq
+# 的持久事件」,這邊登記「只走 SSE ring 的 transient 信封」。每型別標理由,
+# 新型別必須先登記 —— tests/test_event_taxonomy_b1.py 掃全部發射點,漏登記
+# 直接紅。transient 絕不蓋全域 seq(理由見 bridge.py 登記表的長註解);
+# 持久影子只能經 _mirror_milestone → MILESTONE_SINK → bridge._event_append
+# 這一條單一 chokepoint。
+RING_TRANSIENT = {
+    "card.upsert": "串流 delta 高頻 upsert — 只走 ring;final=True 那一發由 "
+                   "_mirror_milestone 鏡射成 persisted card.milestone(影子),"
+                   "ring 信封本身永不蓋全域 seq",
+    "session.status": "ring 活流版(set_status 邊緣觸發);持久影子由 "
+                      "_mirror_milestone 落同名 persisted 型別",
+    "turn": "ring 活流版(push_turn);持久影子同上",
+    "resync": "持久補洞段結尾的游標重定信封(bridge v2_session_events 手工"
+              "組裝)— 本質是指令不是事實,絕不落庫",
+    "ping": "keepalive — 不進 ring、不佔 seq(SessionCardStore.ping)",
+    "sessions.changed": "roster 差分推送(C1,bridge roster SSE 手工組裝)— "
+                        "可由 roster 全量重建,落庫只會製造解不開的游標",
+}
+#: 沒登記就 _push 的型別會被記在這裡(carddigest 無 log hook,靠 bridge /
+#: 測試讀這個集合);完整性測試才是真正的閘,這裡只是 runtime 留痕。
+UNREGISTERED_RING_TYPES: set = set()
+
+
+def emit_transient(store: "SessionCardStore", etype: str, data: dict) -> dict:
+    """transient 事件的獨立發射函式(B1 型別層分流)。
+
+    與持久軌(bridge._event_append)在**函式層**就分開:transient 走這裡
+    (或 store 的 upsert_card/set_status/push_turn 三個既有語意入口),
+    持久事件走 _event_append。想發一個「新型別」的 ring 事件時用這個,
+    未登記直接 raise —— 新增型別的人當場被迫去登記表報到,而不是上線後
+    才發現游標解不開。
+    """
+    if etype not in RING_TRANSIENT:
+        raise ValueError(
+            f"transient 事件型別未登記:{etype!r} — 先登記 carddigest.RING_TRANSIENT")
+    return store._push(etype, data)
+
 
 class SessionCardStore(ApprovalCardMixin):
     """契約 §1/§3 的 per-session 卡片庫 + 事件 ring buffer。
@@ -1515,6 +1554,8 @@ class SessionCardStore(ApprovalCardMixin):
         self._wakers: set = set()
 
     def _push(self, etype: str, data: dict) -> dict:
+        if etype not in RING_TRANSIENT:      # B1:留痕不擋路(熱路徑不准炸)
+            UNREGISTERED_RING_TYPES.add(etype)
         self.seq += 1
         ev = {"seq": self.seq, "ts": time.time(), "type": etype, "data": data}
         # durable_seq(2026-11-06,T3#1):這個事件若有對應的持久 event_log
@@ -1676,7 +1717,67 @@ class SessionCardStore(ApprovalCardMixin):
                 "cards": [{**self.cards[i], "seq": self.card_seq.get(i)}
                           for i in ids if i in self.cards],
                 "latest_seq": self.seq,
+                # C2(2026-11-16):hasMore 升格為一等欄位(之前算了卻只在
+                # paged 模式以 older_cursor 間接表達)。additive,舊 client 不讀。
+                "has_more": more,
                 "status": dict(self.status or {})}
+
+    # ── C2(2026-11-16,grok steal #4):歷史拉取 — 負 offset 取尾 + 回合切片 ──
+
+    def turn_slices(self) -> list:
+        """order 裡的卡片按「使用者回合」切片 → list[list[card_id]]。
+
+        邊界 = role=="user" 的卡開新片(照 grok session_updates 的
+        turnIndex:以使用者 prompt 為回合錨點);歷史被裁掉後開頭的
+        無主卡(第一張 user 卡之前)自成第 0 片 —— 裁切是事實,不假裝
+        它們屬於某個看不見的回合。
+        """
+        slices, cur = [], []
+        for cid in self.order:
+            if (self.cards.get(cid) or {}).get("role") == "user" and cur:
+                slices.append(cur)
+                cur = []
+            cur.append(cid)
+        if cur:
+            slices.append(cur)
+        return slices
+
+    def page(self, limit: int = 100, offset: int | None = None,
+             turn_index: int | None = None) -> dict:
+        """位置視窗(offset,**負值取尾**)或回合切片(turn_index,負值
+        從最新回合倒數)。治「進場閃舊訊息」:client 要的是「最後一回合/
+        最後 N 張」,而不是冷載整包再自己丟掉前面。
+
+        turn_index 超出保留範圍 → IndexError(呼叫端回 409:卡片庫只保留
+        最近 cards_max 張,更早的回合 bridge 已經沒有)。
+        """
+        limit = max(1, limit)
+        base = {"latest_seq": self.seq, "status": dict(self.status or {})}
+        if turn_index is not None:
+            slices = self.turn_slices()
+            n = len(slices)
+            idx = turn_index if turn_index >= 0 else n + turn_index
+            if not 0 <= idx < n:
+                raise IndexError(f"turn_index {turn_index} out of range (turns={n})")
+            ids = slices[idx]
+            trimmed = len(ids) > limit
+            ids = ids[-limit:]
+            return {**base,
+                    "cards": [{**self.cards[i], "seq": self.card_seq.get(i)}
+                              for i in ids if i in self.cards],
+                    "turn_index": idx, "turn_count": n,
+                    "has_more": idx > 0 or trimmed}
+        ids = self.order
+        total = len(ids)
+        off = int(offset or 0)
+        start = max(0, total + off) if off < 0 else min(off, total)
+        window = ids[start:start + limit]
+        return {**base,
+                "cards": [{**self.cards[i], "seq": self.card_seq.get(i)}
+                          for i in window if i in self.cards],
+                "window_start": start, "total_cards": total,
+                "has_more": start > 0,                       # 往前還有歷史
+                "has_more_after": start + limit < total}     # 往後還有(正向分頁)
 
     def ping(self) -> dict:
         """keepalive 信封 — 不進 ring、不佔 seq。durable_seq 恆為 null

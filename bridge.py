@@ -2828,6 +2828,48 @@ async def _event_wait(session: str, seen_ver: int) -> None:
         await asyncio.sleep(0.2)
 
 
+# ── B1(2026-11-16,grok-build steal #2):事件三分類登記表 ────────────────
+# 每個事件型別在**定義處**標分類,治「事件副本落後」的病根:之前「哪些事件
+# 落 event_log、哪些只走 SSE ring」是散在各呼叫點的隱性知識,新事件型別加錯
+# 軌(該持久的沒持久 → 未讀不亮;不該持久的持久 → cursor 指向解不開的洞)
+# 正是那一族 bug 的誕生地。三分類對齊 grok-build updates.rs 的紀律:
+#
+#   persisted    — 進 event_log、由 _event_append(唯一 chokepoint)蓋全域
+#                  seq;client 持久游標(/app/v2/events 全域訂閱、
+#                  after_durable_seq per-session 補洞)靠它追進度。
+#   persist-only — 進 event_log 蓋 seq,但不對應任何活流推送(審計/投影
+#                  專用;目前只有 app-thread 遷移軌跡那三種)。
+#   transient    — 只進 SSE ring(per-session ring seq),**絕不蓋全域 seq**:
+#                  登記表在 carddigest.RING_TRANSIENT,發射函式是
+#                  SessionCardStore._push / carddigest.emit_transient。
+#                  transient 蓋了全域 seq 的話,client 的持久游標會推進到
+#                  一個重啟後不存在的位置,補洞永遠解不開(grok updates.rs
+#                  同一條理由:transient 通知刻意不蓋 eventId)。
+#
+# 鐵律(tests/test_event_taxonomy_b1.py 釘住):
+#   1. event_log 的唯一寫入點是 _event_append —— 全檔 grep "INTO event_log"
+#      只准命中本函式。
+#   2. 新事件型別必須先登記才可發射:漏登記 → 完整性測試紅;runtime 照寫
+#      (fail-open,event_log 故障不准拖垮熱路徑)但大聲記
+#      event_type_unregistered,絕不無聲。
+EVENT_PERSISTED = {
+    "message.upsert": "三來源訊息鏡射(app/TG/cron)— 未讀與列表預覽的事實來源",
+    "card.milestone": "卡片終態(final=True)— 重啟後補洞 / durable cursor 的脊椎",
+    "session.status": "session 狀態邊緣觸發 — 補洞時 client 要能對帳回真值",
+    "turn": "回合轉換 — 持久補洞與 roster 活動推導都要它",
+    "read_cursor.update": "已讀游標伺服器真相 — 多裝置未讀一致性",
+    "approval.resolved": "審批終局廣播(B2)— A 端答了/waiter 消亡,"
+                         "所有端收到即收卡,不留懸空",
+}
+EVENT_PERSIST_ONLY = {
+    "thread.rebound": "app thread 重綁軌跡 — 審計/除錯,不推活流",
+    "thread.transferred": "app thread 跨 provider 轉移軌跡 — 同上",
+    "thread.delegated": "thread 轉為 delegation 的軌跡 — 同上",
+}
+_EVENT_LOG_TYPES = set(EVENT_PERSISTED) | set(EVENT_PERSIST_ONLY)
+_EVENT_TYPE_WARNED: set = set()   # 每型別只警一次,不洗版
+
+
 def _event_append(session: str, etype: str, payload: dict,
                   external_id: str | None = None,
                   con=None) -> int:
@@ -2848,6 +2890,13 @@ def _event_append(session: str, etype: str, payload: dict,
     """
     import sqlite3
     try:
+        # B1 登記表守門:沒登記的型別照寫(fail-open)但大聲留痕 ——
+        # 「安靜地走錯軌」才是事件副本落後的病原,寫壞至少查得到。
+        if etype not in _EVENT_LOG_TYPES and etype not in _EVENT_TYPE_WARNED:
+            _EVENT_TYPE_WARNED.add(etype)
+            _log_event("event_type_unregistered", session=session, type=etype,
+                       hint="登記進 bridge.EVENT_PERSISTED/EVENT_PERSIST_ONLY"
+                            "(transient 請改走 carddigest.emit_transient)")
         if con is not None:
             cur = con.execute(
                 "INSERT OR IGNORE INTO event_log(session,type,external_id,payload,created_at) "
@@ -6864,6 +6913,12 @@ class CodexAppServerClient:
         try:
             con = sqlite3.connect(CANON_DB, timeout=30)
             try:
+                # B2 waiter RAII:provider 死(app-server 重啟/連線重置)時
+                # 等待者已不可能被叫醒 —— 先撈出受影響的列,過期後逐筆廣播
+                # approval.resolved(outcome=expired),app 端懸空卡收得掉。
+                stale = [r[0] for r in con.execute(
+                    "SELECT id FROM approvals WHERE status='pending' "
+                    "AND source LIKE 'codex%'").fetchall()]
                 cur = con.execute(
                     "UPDATE approvals SET status='expired', decided_at=?, result=? "
                     "WHERE status='pending' AND source LIKE 'codex%'",
@@ -6872,6 +6927,8 @@ class CodexAppServerClient:
                 con.commit()
                 changed = cur.rowcount
                 con.close()
+                for aid in stale:
+                    _approval_resolved_broadcast(aid, "expired")
                 if changed:
                     _log_event("codex_approval_stale_expired", count=changed)
             finally:
@@ -7528,6 +7585,8 @@ class CodexAppServerClient:
                         (status, time.time(), result, approval_id))
             con.commit()
             con.close()
+            # B2:終局即廣播(external_id 以 aid+status 去重,重複 mark 無害)
+            _approval_resolved_broadcast(approval_id, status)
         finally:
             con.close()
 
@@ -13223,6 +13282,34 @@ async def _pocket_id_loop() -> None:
             backoff = min(backoff * 2, 3600.0)
 
 
+# ── B3(2026-11-16,grok steal #6):長連外路活性登記表 ────────────────────
+# 治「401 靜默斷五天」族:長連線的死法不是斷線,是**半開** —— TCP 活著、
+# 探活 200、但應用流一個訊框都不來。判準統一為「讀側活性死線」:
+# N×keepalive 週期內零 inbound frame 即判死重連(N=4 起,有任何 inbound
+# 就重計,半開才判死、閒聊慢不誤殺);退避 reset 的條件一律是「憑證被接受
+# 的證據」,不是「連線建立」。bridge 的長連外路與各自的活性機制:
+#
+#   1. openclaw gateway WS(openclaw_provider)— gateway 有 tick/health
+#      inbound 心跳 → 真 read-liveness:_watch_reader 盯 _last_rx,
+#      4×OPENCLAW_KEEPALIVE_SECS 零訊框 → close→重連(WS 層 ping/pong 不算
+#      數:pong 由對端程式庫自動答,應用層死了照答)。backoff 只在
+#      hello-ok(token 驗過)後 reset。
+#   2. relay frpc 子進程(本段)— 隧道健康唯一真相是 frpc 日誌:
+#      `start proxy success` = frps 驗過 token + NewProxy 放行,**只有它**
+#      能 reset 退避(_relay_run_frpc 回傳 proxied 證據);frpc 對 frps 的
+#      心跳/重連是 frpc 自己的事,我們盯的是「開關 vs 行程」一致性。
+#   3. hermes ACP 流(acp_client)— stdio pipe 無中介層、無半開(EOF 即
+#      斷,readline 立刻看到);回合內的讀側活性 = _watch_turn 看門狗
+#      (_last_item_at 閒置上限)。閒置時人格本來就零訊框,**不可**套
+#      零訊框判死(會把每個發呆的人格殺一輪)。
+#   4. codex app-server(unix socket WS / stdio 子進程)— unix socket 無
+#      網路中介層;WS 層 ping_timeout=90 + 每個 RPC 自帶 wait_for timeout
+#      + turn watchdog。同 3,閒置零訊框是常態,不套零訊框判死。
+#   5. cc2 Agent SDK(行程內)— turn-scoped streams,審批等待 fail-closed
+#      (110s),無常駐外路。
+#
+# 新增長連外路時到這張表報到:它的 keepalive 來源是什麼、半開可能嗎、
+# 退避 reset 的「證據」是哪一行。
 # ═════════════ Pocket Relay(中繼隧道):claim + frpc 子進程 ═════════════
 # 伺服器端在 ~/apps/pocket-id:frps 收隧道、pocket-id 當收費閘(claim 要訂閱、
 # frp 的 Login/NewProxy 每次都問、on-demand TLS 不幫沒授權的子網域簽憑證)。
@@ -13434,8 +13521,13 @@ def _relay_kill_stale_frpc() -> int:
     return killed
 
 
-async def _relay_run_frpc(binary: str) -> str:
-    """跑 frpc 直到它結束,回傳輸出尾巴(用來判斷是不是授權問題)。
+async def _relay_run_frpc(binary: str) -> tuple:
+    """跑 frpc 直到它結束,回傳 (輸出尾巴, 隧道曾真的通過)。
+
+    第二個回傳值是 B3 的「憑證被接受的證據」:`start proxy success` =
+    frps 驗過 token、NewProxy 放行 —— 只有看到它,呼叫端才准 reset 退避。
+    「frpc 行程起來了」或「TCP 連上 frps」都不是證據(token 被撤/沒訂閱時
+    行程照樣活著重試,憑行程狀態 reset 退避就是 30 秒重試風暴)。
 
     frpc 自己會重連,所以它不會自己結束 —— 因此**必須在跑的時候盯著開關**。
 
@@ -13453,6 +13545,7 @@ async def _relay_run_frpc(binary: str) -> str:
         binary, "-c", _relay_conf_path(),
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
     tail: list[str] = []
+    proxied = [False]   # B3:曾看到 start proxy success(憑證被接受的證據)
 
     async def _pump() -> None:
         assert proc.stdout is not None
@@ -13461,6 +13554,7 @@ async def _relay_run_frpc(binary: str) -> str:
             tail.append(line)
             del tail[:-40]
             if _RELAY_PROXY_OK in line:
+                proxied[0] = True
                 _relay_set_status("connected", detail=None)
             elif _RELAY_PROXY_ERR in line:
                 # 連上了 frps 卻開不了通道 —— 行程還活著,但隧道是不通的。
@@ -13487,7 +13581,7 @@ async def _relay_run_frpc(binary: str) -> str:
                 proc.kill()
                 await proc.wait()
         pump.cancel()
-    return "\n".join(tail)
+    return "\n".join(tail), proxied[0]
 
 
 async def _relay_loop() -> None:
@@ -13539,9 +13633,14 @@ async def _relay_loop() -> None:
                        local_port=_relay_local_port())
             # 先進 connecting;真的通了由 _relay_run_frpc 讀到 frpc 的日誌才改。
             _relay_set_status("connecting", hostname=grant.get("hostname"))
-            fail_logged = False
-            backoff = 30.0
-            tail = await _relay_run_frpc(binary)
+            tail, proxied = await _relay_run_frpc(binary)
+            if proxied:
+                # B3:退避只在「憑證被接受的證據」(start proxy success =
+                # frps 驗過 token + NewProxy 放行)出現後 reset,不在「行程
+                # 起來/TCP 連上」就 reset —— token 被撤或訂閱斷的 frpc 一樣
+                # 會跑起來再被拒,憑啟動 reset 退避等於永遠 30 秒重試風暴。
+                fail_logged = False
+                backoff = 30.0
 
             if not _relay_enabled():
                 # 使用者關掉的 —— frpc 結束是**預期**的,不是故障。
@@ -21005,6 +21104,8 @@ def _cc_approval_set_status(aid: str, status: str) -> bool:
                               (status, time.time(), aid))
             con.commit()
             con.close()
+            if cur.rowcount:
+                _approval_resolved_broadcast(aid, status)   # B2:終局即廣播
             return bool(cur.rowcount)
         finally:
             con.close()
@@ -21812,6 +21913,216 @@ async def v2_sessions(request: Request, provider: str = "", status: str = "",
         _console_remote_list(out, _request_token(request), started, degraded)
         result["console_scope"] = CONSOLE_REMOTE_SCOPE
     return {"sessions": out, **result}
+
+
+# ── C1(2026-11-16,grok steal #3):roster 契約 ───────────────────────────
+# 列表頁要的是「一眼看懂每條 session 在幹嘛」,不是整包 provider meta ——
+# /app/v2/sessions 原樣保留(相容),roster 是**疊加的瘦 facade**:
+# activity 六態(照 grok RosterActivity:working/idle/needs_input/dormant/
+# completed/dead)+ last_turn_summary(規則式,LLM 摘要留 TODO)+
+# updated_ts。差分推送走 SSE `sessions.changed`(transient,登記在
+# carddigest.RING_TRANSIENT)。契約:APP_BRIDGE_CONTRACT.md §17。
+_ROSTER_DORMANT_SECS = float(os.environ.get("POCKET_ROSTER_DORMANT_SECS",
+                                            str(24 * 3600.0)))
+_ROSTER_POLL_SECS = float(os.environ.get("POCKET_ROSTER_POLL_SECS", "3.0"))
+_ROSTER_SUMMARY_CHARS = 12   # 規則式摘要上限(grok 是 LLM 生成 5-12 字)
+
+#: v2 status → roster activity。查無的值(含新 provider 自創字串)落
+#: idle/dormant 路 —— 寬鬆降級,照契約 §4.1a「未處理的值當 idle」。
+_ROSTER_ACTIVITY_BY_STATUS = {
+    "running": "working",
+    # stalled = 回合開著但一陣子沒事件(契約 §4.1a:建議比照 running)——
+    # 它是「疑似卡住」不是「確定死了」,誤報 dead 比漏報更傷信任。
+    "stalled": "working",
+    "dispatching": "working",
+    "waiting_approval": "needs_input",
+    "failed": "dead",
+    "error": "dead",
+    "dead": "dead",
+    "done": "completed",
+    "completed": "completed",
+}
+
+
+def _roster_event_session(row_id: str) -> str:
+    """v2 session id → event_log 的 session 鍵(persona 走裸 mid,見
+    _approval_resolved_broadcast 的同款註解)。"""
+    return (row_id.split(":", 1)[1] if str(row_id).startswith("hermes:")
+            else str(row_id))
+
+
+def _roster_ts_epoch(val) -> float:
+    """last_event_at 的兩種形狀(ISO 字串 / epoch float)→ epoch;解不動 0。"""
+    if isinstance(val, (int, float)):
+        return float(val)
+    if isinstance(val, str) and val:
+        try:
+            from datetime import datetime
+            return datetime.fromisoformat(val.replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            return 0.0
+    return 0.0
+
+
+def _roster_summary_text(raw: str) -> str:
+    """原文 → 5-12 字級的規則式摘要:壓空白、去圍欄雜訊、截斷。"""
+    t = re.sub(r"\s+", " ", str(raw or "")).strip()
+    t = re.sub(r"^```[a-z-]*\s*", "", t)
+    if len(t) > _ROSTER_SUMMARY_CHARS:
+        t = t[:_ROSTER_SUMMARY_CHARS] + "…"
+    return t
+
+
+def _roster_enrich(ids: list) -> dict:
+    """一口氣撈每條 session 的 (updated_ts, last_turn_summary)。
+
+    單一 ro 連線 + 走 idx_event_session_seq,整包 roster 一次 build 只開一條
+    連線。摘要規則式:最後一筆 card.milestone / message.upsert 的文字截斷
+    (TODO:回合結束時 LLM 生成 5-12 字摘要,存起來這裡只讀 —— grok 的
+    summary.json 模式;規則式先把 wire 欄位占住,app 零改動升級)。
+    """
+    import sqlite3
+    out = {i: (0.0, "") for i in ids}
+    if not ids:
+        return out
+    try:
+        con = sqlite3.connect(f"file:{CANON_DB}?mode=ro", uri=True, timeout=5)
+        try:
+            for rid in ids:
+                ev = _roster_event_session(rid)
+                row = con.execute(
+                    "SELECT MAX(created_at) FROM event_log WHERE session=?",
+                    (ev,)).fetchone()
+                ts = float(row[0] or 0.0) if row else 0.0
+                summary = ""
+                for (etype, payload) in con.execute(
+                        "SELECT type,payload FROM event_log WHERE session=? "
+                        "AND type IN ('card.milestone','message.upsert') "
+                        "ORDER BY id DESC LIMIT 8", (ev,)):
+                    try:
+                        data = json.loads(payload or "{}")
+                    except Exception:  # noqa: BLE001
+                        continue
+                    if etype == "card.milestone":
+                        body = ((data.get("card") or {}).get("body") or {})
+                        text = body.get("text") or body.get("fallback_text") or ""
+                    else:
+                        text = (data.get("message") or {}).get("content") or ""
+                    text = _roster_summary_text(text)
+                    if text:
+                        summary = text
+                        break
+                out[rid] = (ts, summary)
+        finally:
+            con.close()
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("roster_enrich", _exc, expected=True)
+    return out
+
+
+def _roster_activity(row: dict, updated_ts: float) -> str:
+    """v2 列 → activity 六態。優先序:needs_input(待審是「在等你」,比
+    其他狀態都該搶眼)> dead > 狀態表 > idle/dormant(以最近活動分)。"""
+    meta = row.get("meta") or {}
+    status = str(row.get("status") or "")
+    if status == "waiting_approval" or meta.get("approval"):
+        return "needs_input"      # 從 pending approvals 同步導出,不另掃 DB
+    if meta.get("degraded"):
+        # 人格 crash-loop 冷卻/連續 stall → runner 實質掛了,要顯示得出來
+        # (grok:Dead 是一級狀態,actor panic 不是「不顯示」的理由)。
+        return "dead"
+    act = _ROSTER_ACTIVITY_BY_STATUS.get(status)
+    if act:
+        return act
+    ts = updated_ts or _roster_ts_epoch(row.get("last_event_at"))
+    if ts and time.time() - ts < _ROSTER_DORMANT_SECS:
+        return "idle"
+    return "dormant"
+
+
+async def _roster_build(request: Request) -> dict:
+    """roster 全量:疊在 /app/v2/sessions 之上(provider 邏輯零複製)。"""
+    base = await v2_sessions(request)
+    rows = base.get("sessions") or []
+    enrich = _roster_enrich([str(r.get("id") or "") for r in rows])
+    out = []
+    for r in rows:
+        rid = str(r.get("id") or "")
+        ts, summary = enrich.get(rid, (0.0, ""))
+        ts = max(ts, _roster_ts_epoch(r.get("last_event_at")))
+        out.append({
+            "id": rid,
+            "provider": r.get("provider"),
+            "title": r.get("title"),
+            "activity": _roster_activity(r, ts),
+            "last_turn_summary": summary,
+            "updated_ts": ts or None,
+        })
+    return {"sessions": out,
+            "degraded_providers": base.get("degraded_providers") or []}
+
+
+def _roster_diff(prev: dict, cur: dict, first: bool) -> tuple:
+    """(upserted, removed) 差分;first=True 推全量(冷載=重連同一條路)。"""
+    upserted = [r for i, r in cur.items() if first or prev.get(i) != r]
+    removed = [i for i in prev if i not in cur]
+    return upserted, removed
+
+
+@app.get("/app/v2/sessions/roster")
+async def v2_sessions_roster(request: Request):
+    """契約 §17:列表頁的瘦 facade —— activity 六態 + last_turn_summary +
+    updated_ts。既有 /app/v2/sessions 不動(相容);差分訂閱見
+    /app/v2/sessions/roster/events。"""
+    _check_auth(request)
+    return await _roster_build(request)
+
+
+@app.get("/app/v2/sessions/roster/events")
+async def v2_sessions_roster_events(request: Request):
+    """契約 §17 SSE:`sessions.changed` 差分(upserted/removed)。
+
+    transient(B1 分類):信封無 seq、不落 event_log —— roster 任何時刻可
+    由 GET 全量重建,落庫只會製造解不開的游標。連上先推一包全量 upserted
+    (client 以 id upsert,冷載/重連同一條套用路徑),之後每
+    POCKET_ROSTER_POLL_SECS 比對一次,有差才推。
+    """
+    _check_auth(request)
+
+    async def gen():
+        prev: dict = {}
+        first = True
+        last_sent = time.monotonic()
+        last_change = time.monotonic()
+        while True:
+            if await request.is_disconnected():
+                break
+            if time.monotonic() - last_change >= _STREAM_IDLE_CUTOFF_SECS:
+                # 半死 client 不准永久佔 task(issue #7 同款出口)。
+                _log_event("roster_events_idle_cutoff")
+                break
+            try:
+                cur = {r["id"]: r for r in
+                       (await _roster_build(request))["sessions"]}
+            except Exception as _exc:  # noqa: BLE001
+                # provider 清單抖一下不斷流 —— 下一輪再試。
+                _log_exc("roster_events_poll", _exc, expected=True)
+                cur = prev
+            upserted, removed = _roster_diff(prev, cur, first)
+            if upserted or removed or first:
+                ev = {"ts": time.time(), "type": "sessions.changed",
+                      "data": {"upserted": upserted, "removed": removed}}
+                yield f"data: {json.dumps(ev, ensure_ascii=False)}\n\n"
+                last_sent = time.monotonic()
+                last_change = last_sent
+            prev, first = cur, False
+            if time.monotonic() - last_sent >= SSE_KEEPALIVE_SECS:
+                yield ": keepalive\n\n"
+                last_sent = time.monotonic()
+            await asyncio.sleep(_ROSTER_POLL_SECS)
+
+    return StreamingResponse(gen(), media_type="text/event-stream",
+                             headers=SSE_HEADERS)
 
 
 def _approval_bool_from_body(body: dict) -> bool:
@@ -24192,6 +24503,8 @@ def _oc_approval_mark(aid: str, status: str, result: str = "") -> bool:
         con.commit()
         n = cur.rowcount
         con.close()
+        if n:
+            _approval_resolved_broadcast(aid, status)   # B2:openclaw+cc2 共用
         return bool(n)
     finally:
         con.close()
@@ -24214,6 +24527,17 @@ def _cc2_approval_db_upsert(record: dict) -> None:
     try:
         row = con.execute("SELECT status FROM approvals WHERE id=?",
                           (record["id"],)).fetchone()
+        if row and row[0] != "pending":
+            # B2 waiter key 穩定性:cc2 的 aid 是 (session,tool,參數) 的持久
+            # 雜湊(cc_sdk.approval_key)。bridge 重啟→resume 後 CLI 重問同
+            # 一個工具呼叫 → 同 aid 撞上已終局(expired)的舊列 —— 這**就是
+            # 同一個審批問題回來了**,復活同列回 pending(新 TTL),對回同
+            # 一張卡;不開新列才不會留一張懸空舊卡 + 一張新卡。
+            # 若舊列不復活,決議路由的冪等收據會先攔下(status 已終局),
+            # 新 waiter 永遠等不到人 → fail-closed 空耗 110s。
+            con.execute("UPDATE approvals SET status='pending', decided_at=NULL,"
+                        " result=NULL, created_at=?, expires_at=? WHERE id=?",
+                        (record["created_at"], record["expires_at"], record["id"]))
         if not row:
             con.execute("INSERT INTO approvals"
                         "(id,title,source,risk,detail,created_at,expires_at,"
@@ -24609,6 +24933,12 @@ def _cc2_reconcile_orphan_approvals() -> int:
     try:
         con = sqlite3.connect(CANON_DB, timeout=30)
         try:
+            # B2 waiter RAII:這條就是「bridge 重啟 → waiter 全滅」的收尾路,
+            # 跟 TTL 過期/provider 死同級 —— 先撈受影響列,過期後逐筆廣播
+            # approval.resolved,app 端開著的舊卡才收得掉。
+            stale = [r[0] for r in con.execute(
+                "SELECT id FROM approvals WHERE status='pending' "
+                "AND (provider='cc2' OR source LIKE 'cc2:%')").fetchall()]
             cur = con.execute(
                 "UPDATE approvals SET status='expired', decided_at=?, result=? "
                 "WHERE status='pending' AND (provider='cc2' OR source LIKE 'cc2:%')",
@@ -24619,6 +24949,8 @@ def _cc2_reconcile_orphan_approvals() -> int:
             n = cur.rowcount
         finally:
             con.close()
+        for aid in stale:
+            _approval_resolved_broadcast(aid, "expired")
         if n:
             _log_event("cc2_approval_reconcile", expired=n)
         return n
@@ -27482,6 +27814,13 @@ async def _gm_on_request(req: dict):
                            "已自動拒絕。")
         _log_event("gemini_permission_expired", approval_id=aid, tool=tool)
         return {"outcome": {"outcome": "cancelled"}}
+    except asyncio.CancelledError:
+        # B2 waiter RAII:ACP 流死亡/回合被取消 → waiter 消亡也不准留懸空卡。
+        # mark expired 會連動 approval.resolved 廣播(所有端收卡)。
+        _gm_approval_set_status(aid, "expired")
+        _gm_resolve_approval_card(key, record, "expired")
+        _log_event("gemini_permission_waiter_died", approval_id=aid, tool=tool)
+        raise
     finally:
         _GM_PERM_WAITERS.pop(aid, None)
 
@@ -27511,10 +27850,12 @@ def _gm_approval_set_status(aid: str, status: str) -> None:
     import sqlite3
     con = sqlite3.connect(CANON_DB, timeout=30)
     try:
-        con.execute("UPDATE approvals SET status=?, decided_at=? "
-                    "WHERE id=? AND status='pending'",
-                    (status, int(time.time()), aid))
+        cur = con.execute("UPDATE approvals SET status=?, decided_at=? "
+                          "WHERE id=? AND status='pending'",
+                          (status, int(time.time()), aid))
         con.commit()
+        if cur.rowcount:
+            _approval_resolved_broadcast(aid, status)   # B2:終局即廣播
     except Exception as e:  # noqa: BLE001
         _log_event("gemini_approval_status_failed", error=str(e)[:160])
     finally:
@@ -28304,7 +28645,9 @@ async def _v2_card_store(session_id: str):
 @app.get("/app/v2/sessions/{session_id}/cards")
 async def v2_session_cards(session_id: str, request: Request, limit: int = 100,
                            before_seq: int | None = None, history_page: bool = False,
-                           before_id: str | None = None):
+                           before_id: str | None = None,
+                           offset: int | None = None,
+                           turn_index: int | None = None):
     """契約 §3 冷載 snapshot:{cards, latest_seq, status} → app 渲染後從 since_seq 接流。
 
     `status` 2026-08-14 補入契約:形狀與 `session.status` 事件的 data 完全相同
@@ -28316,11 +28659,29 @@ async def v2_session_cards(session_id: str, request: Request, limit: int = 100,
     持久 event_log 的最大全域 id(沒有里程碑 = 0)。client 冷載後同時記兩個
     游標 —— ring 的 `latest_seq` 走既有 SSE 續流;`durable_seq` 是重連保險,
     ring 斷層時帶 `after_durable_seq` 走持久補洞,不再 410 整頁重載。
+
+    C2(2026-11-16,grok steal #4,契約 §7.1):`offset`(**負值取尾**,
+    offset=-50 = 最後 50 張)與 `turn_index`(按使用者回合切片,-1 = 最新
+    回合)兩個新參數,治「進場閃舊訊息」—— client 先拿尾巴/最後一回合秒開
+    畫面,再按需往前翻。回應多 `has_more`(所有模式)與視窗欄位
+    (window_start/total_cards 或 turn_index/turn_count)。與既有游標互斥。
     """
     _check_auth(request)
     store = await _v2_card_store(session_id)
     limit = max(1, min(limit, 500))
-    if history_page or before_id is not None:
+    if offset is not None or turn_index is not None:
+        # C2(契約 §7.1):位置視窗 / 回合切片,與既有游標互斥 —— 兩套座標
+        # 混用的結果沒有定義,寧可 400 也不猜。
+        if before_seq is not None or before_id is not None or history_page:
+            raise HTTPException(400, "use only one history cursor")
+        if offset is not None and turn_index is not None:
+            raise HTTPException(400, "use only one of offset/turn_index")
+        try:
+            snap = store.page(limit=limit, offset=offset, turn_index=turn_index)
+        except IndexError:
+            raise http_err(409, "TURN_INDEX_GONE",
+                           "turn_index 超出保留範圍(卡片庫只留最近一段歷史)")
+    elif history_page or before_id is not None:
         if before_seq is not None:
             raise HTTPException(400, "use only one history cursor")
         if before_id is not None and before_id not in store.cards:
@@ -32881,6 +33242,41 @@ def _approval_get_row(aid: str):
         con.close()
 
 
+def _approval_resolved_broadcast(aid: str, status: str, *, key: str = "",
+                                 row: dict | None = None) -> None:
+    """審批終局 → persisted `approval.resolved` 事件(B2,grok steal #1)。
+
+    治兩個病:(1) 多端搶答 —— A 端答了,B 端卡片還掛著可按,按了才吃 409;
+    (2) waiter 消亡(逾時/provider 死/bridge 收攤)後 app 端懸空卡。所有把
+    approvals 列翻成終局狀態的 chokepoint(決議路由各分支、TTL 過期掃除、
+    provider 死亡掃除、waiter RAII 出口)都要經過這裡 —— client 收到事件即
+    收卡,不必輪詢猜。
+
+    external_id 以 (aid, status) 去重:同一終局被重複 mark(冪等收據、
+    多路收尾)不會灌出第二筆。絕不 raise —— 審批收尾不准被事件鏡射拖垮。
+    呼叫時機:**DB 狀態已 commit 之後**(_event_append 自開連線,夾在未
+    commit 的寫交易中間會等鎖)。
+    """
+    try:
+        d = row or _approval_get_row(aid) or {}
+        sid = str(d.get("session_id") or "")
+        payload = {"approval_id": aid, "status": status, "session_id": sid,
+                   "provider": str(d.get("provider") or ""),
+                   "kind": str(d.get("kind") or "")}
+        if key:
+            payload["key"] = key
+        # event_log 的 session 鍵:persona 走裸 mid(對齊 /app/v2/events
+        # 全域訂閱只收 PERSONAS 的過濾);其他 provider 用完整 v2 id
+        # (對齊各自 store 的 media_session_id,per-session durable 補洞
+        # 才撈得到)。session_id 缺席的舊列落 "approvals" 桶,至少可稽核。
+        ev_session = (sid.split(":", 1)[1] if sid.startswith("hermes:")
+                      else (sid or "approvals"))
+        _event_append(ev_session, "approval.resolved", payload,
+                      external_id=f"apr:{aid}:{status}")
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("approval_resolved_broadcast", _exc, expected=True)
+
+
 def _hermes_pending_by_session() -> dict:
     """hermes persona 的 pending 待審(session_id='hermes:{mid}')→ 統一物件,
     每 persona 取最早一筆。v2 sessions 補 waiting_approval 用(spec §7-5)。"""
@@ -32968,9 +33364,16 @@ def _approvals_expire(con):
         stale = []
     con.execute("UPDATE approvals SET status='expired' WHERE status='pending' "
                 "AND expires_at IS NOT NULL AND expires_at < ?", (now,))
+    if stale:
+        # B2:先 commit 再廣播 —— _approval_resolved_broadcast 的 _event_append
+        # 自開連線,夾在呼叫端未 commit 的寫交易中間會等鎖等到 timeout。
+        # 呼叫端(各 pending 掃描/清單端點)本來就在本函式返回後立刻 commit,
+        # 提前無害。
+        con.commit()
     for aid, title, sid in stale:
         rec = {"id": aid, "title": title}
         sid = str(sid or "")
+        _approval_resolved_broadcast(aid, "expired")   # waiter RAII:過期即廣播
         try:
             if sid.startswith("hermes:"):
                 _hp_cards_feed_approval(sid, rec, resolved="expired")
@@ -33446,6 +33849,9 @@ async def _approval_decide_serial(aid: str, b: dict) -> dict:
         con.close()
         if not changed:
             raise HTTPException(status_code=409, detail="already decided or expired")
+        # B2:終局即廣播(persisted approval.resolved)— 多端只有一端答得進
+        # (UPDATE … WHERE status='pending' 先到先贏),其餘端收到事件收卡。
+        _approval_resolved_broadcast(aid, status, key=key, row=d)
         try:
             # A3:hermes 決定發生時收尾卡片流(同一決定路徑,三 provider 一致)。
             # _hp_cards_feed_approval 內部會篩 session_id 前綴,非 hermes: 的列

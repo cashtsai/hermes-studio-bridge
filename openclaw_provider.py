@@ -33,6 +33,16 @@ _CALL_TIMEOUT = float(os.environ.get("OPENCLAW_CALL_TIMEOUT", "30"))
 _CONNECT_TIMEOUT = float(os.environ.get("OPENCLAW_CONNECT_TIMEOUT", "20"))
 _MAX_FRAME = 32 * 1024 * 1024          # gateway maxPayload 26MB,留餘裕
 _BACKOFF_MAX = 60.0
+# ── B3 讀側活性死線(grok steal #6,治 401 靜默斷五天族)────────────────
+# gateway 平時有 tick/health 心跳 inbound(read_loop 會濾掉不外流,但**算
+# 活著**)。half-open TCP / 中介層把應用流吞掉時,WS 層的 ping/pong 可能
+# 照常(pong 由對端的 ws 程式庫自己答,應用層死了也會答)—— 所以判準必須
+# 是「應用訊框」:READ_LIVENESS 秒內**零 inbound frame 即判死重連**,有任
+# 何一個訊框就重計(半開不誤殺)。N=4×tick 週期起跳,寧遲勿誤殺。
+_KEEPALIVE_SECS = float(os.environ.get("OPENCLAW_KEEPALIVE_SECS", "30"))
+_READ_LIVENESS_SECS = float(os.environ.get(
+    "OPENCLAW_READ_LIVENESS_SECS", str(_KEEPALIVE_SECS * 4)))
+_LIVENESS_POLL_SECS = 5.0              # run_forever 盯活性的步距
 
 
 class OpenClawError(Exception):
@@ -103,6 +113,7 @@ class OpenClawClient:
         self._rid = 0
         self._connected_once = False
         self._backoff = 1.0
+        self._last_rx = 0.0            # B3:最後一個 inbound frame(monotonic)
         self.on_event = None
         self.on_reconnect = None
         # 每次握手成功都呼叫(含冷啟第一次),參數 was_reconnect: bool。
@@ -176,7 +187,12 @@ class OpenClawClient:
                                     code="CONNECT_FAILED", retryable=True) from e
             self.server_info = hello.get("server") or {}
             self._ws = ws
+            # backoff reset 的條件是「憑證被接受的證據」,不是「連線建立」
+            # (B3):_handshake 的 connect req 帶 token、hello-ok 即 gateway
+            # 驗過 —— 走到這行就是證據本身。TCP 連上但 connect 被拒(401 族)
+            # 會在 _handshake raise,backoff 持續墊高,不會變成 1 秒重試風暴。
             self._backoff = 1.0
+            self._last_rx = time.monotonic()   # B3:握手訊框就是 inbound
             was_reconnect = self._connected_once
             self._connected_once = True
             self._reader = asyncio.create_task(self._read_loop(ws))
@@ -201,6 +217,9 @@ class OpenClawClient:
     async def _read_loop(self, ws):
         try:
             async for raw in ws:
+                # B3:**先記活性再解析** —— tick/health 會被濾掉不外流,但它
+                # 們是 read-liveness 的主食;解析失敗的訊框也算「線是活的」。
+                self._last_rx = time.monotonic()
                 try:
                     f = json.loads(raw)
                 except Exception:  # noqa: BLE001
@@ -286,6 +305,31 @@ class OpenClawClient:
 
     # ── 常駐事件泵(bridge startup 啟用;沒配置就純 no-op)──
 
+    async def _watch_reader(self, reader: "asyncio.Task") -> str:
+        """盯 reader 到它斷線,或 read-liveness 逾時主動判死(B3)。
+
+        回傳 "reader_exited"(連線自然斷,walk 既有重連路)或 "liveness"
+        (READ_LIVENESS 秒零 inbound frame → 我們自己殺連線)。判死動作是
+        close ws:reader 的 `async for` 隨之結束,_drop_ws 清 pending ——
+        與自然斷線走**同一條**清理路,不另闢收屍邏輯。
+        """
+        while True:
+            done, _ = await asyncio.wait({reader}, timeout=_LIVENESS_POLL_SECS)
+            if done:
+                return "reader_exited"
+            idle = time.monotonic() - self._last_rx
+            if idle >= _READ_LIVENESS_SECS:
+                self._log("openclaw_read_liveness_dead",
+                          idle_secs=round(idle, 1),
+                          threshold=_READ_LIVENESS_SECS)
+                ws, self._ws = self._ws, None
+                if ws is not None:
+                    try:
+                        await ws.close()
+                    except Exception:  # noqa: BLE001
+                        pass
+                return "liveness"
+
     async def run_forever(self):
         """保持連線活著(斷了退避重連),事件經 on_event 外流。"""
         while True:
@@ -294,10 +338,11 @@ class OpenClawClient:
                 continue
             try:
                 await self._ensure_ws()
-                # reader 活著時本 task 只要等它斷
+                # reader 活著時本 task 盯兩件事:它斷了沒、線還有沒有在講話
+                # (B3 read-liveness —— HTTP 通不代表流通,探活≠探串流)。
                 reader = self._reader
                 if reader is not None:
-                    await asyncio.shield(asyncio.wait({reader}))
+                    await asyncio.shield(self._watch_reader(reader))
             except OpenClawError as e:
                 self._log("openclaw_reconnect_wait", error=e.code or str(e),
                           backoff=self._backoff)
