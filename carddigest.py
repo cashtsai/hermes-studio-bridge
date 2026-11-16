@@ -1960,6 +1960,21 @@ class GeminiDigest(PersonaDigest):
     _card_prefix = "card-gm-"
 
 
+class GrokDigest(PersonaDigest):
+    """S6:Grok Build(純 ACP)session 的卡片 digest。
+
+    與 GeminiDigest 同構(ACP 的 session/update 形狀兩家一致 —— grok 是
+    標準 ACP agent,這正是它接入成本低的原因):
+    - seed:grok_sdk.transcript_read 的訊息(mid 穩定 → 卡 id)。
+    - live:bridge 把 agent_message_chunk 餵進 turn_delta,
+      session/prompt 回來時 turn_end。
+    - approval:session/request_permission → handle_approval(來源 "grok")。
+    """
+    _appr_prefix = "card-gk-appr-"
+    _appr_source = "grok"
+    _card_prefix = "card-gk-"
+
+
 # ───────────────────────── S4:openclaw gateway 事件 → 卡片 ───────────────────
 # 契約依據 docs/OPENCLAW_PROVIDER_SPEC.md(§2/§3)。兩個來源,一個卡片庫:
 # - seed:chat.history messages(__openclaw.id 穩定 → 卡 id,重放同 id)。

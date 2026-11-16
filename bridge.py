@@ -65,6 +65,7 @@ import media_artifacts
 import hermes_media
 import openclaw_provider
 import gemini_provider
+import grok_sdk
 import orchestrator
 import live_update_event
 import replay_fixture
@@ -21589,6 +21590,13 @@ async def v2_agents(request: Request):
         {"provider": "gemini", "name": "Gemini", "kind": "code_agent",
          "status": "ready", "auth": {"connected": True, "account": None}, "can_create": True},
     ] if GEMINI.configured() else []) + ([
+        # S6:binary 在就露臉;登入與否反映在 auth.connected(未登入時 turn
+        # 會給登入指引卡,不藏 —— CC/CX 同模式,使用者要看得到「去登入」)。
+        {"provider": "grok", "name": "Grok", "kind": "code_agent",
+         "status": "ready",
+         "auth": {"connected": GROK.logged_in(), "account": None},
+         "can_create": True},
+    ] if GROK.configured() else []) + ([
         # CC2 seam:旗標開才亮相(旗標關 = 對 app 完全不存在)。
         {"provider": "cc2", "name": "Claude Code (SDK)", "kind": "code_agent",
          "status": "ready", "auth": {"connected": True, "account": None}, "can_create": True},
@@ -21711,6 +21719,14 @@ async def v2_sessions(request: Request, provider: str = "", status: str = "",
             _log_event("v2_gemini_list_failed", error=type(e).__name__,
                        error_message=str(e)[:160])
             degraded.append("gemini")
+    # S6:grok sessions(名錄制,照 gemini 同款 —— 無遠端列表可壞,失敗就標)。
+    if GROK.configured():
+        try:
+            out.extend(await _grok_v2_rows())
+        except Exception as e:  # noqa: BLE001
+            _log_event("v2_grok_list_failed", error=type(e).__name__,
+                       error_message=str(e)[:160])
+            degraded.append("grok")
     # S4:openclaw sessions(SPEC §5)。未配置 → 整段缺席(零影響現有使用者);
     # 配置了但 gateway 掛 → 標 degraded,照 codex 同款不無聲吞錯。
     if OPENCLAW.configured():
@@ -21883,6 +21899,13 @@ async def v2_session_approve(session_id: str, request: Request):
         _cc2_approval_db_mark(aid, status)
         return {"ok": True, "session_id": session_id,
                 "approval_id": aid, "status": status}
+    if src[0] in ("gm", "gk"):
+        # S5/S6:gemini/grok 的決議一律走統一 body({approval_id, key}),
+        # 上面 _approval_decide_core 已經收走。走到這裡 = 舊形狀 body 沒帶
+        # approval_id —— 不准掉進下方 Codex fallback(拿 gemini/grok 的
+        # key 當 thread id 去呼,壞得安靜又離奇;cc2 2026-10-29 同族事故)。
+        raise http_err(400, "APPROVAL_ID_REQUIRED",
+                       f"{src[0]} 的審批決議要帶 approval_id")
     approved, for_session = _codex_permission_choice(body)
     thread_id = src[1]
     client = _cx_client_for_thread(thread_id)
@@ -21931,6 +21954,8 @@ async def v2_session_input(session_id: str, request: Request):
         return await _oc_input_core(src[1], session_id, body)
     if src[0] == "gm":
         return await _gm_input_core(src[1], session_id, body)
+    if src[0] == "gk":
+        return await _gk_input_core(src[1], session_id, body)
     if src[0] == "cc2":
         # CC2 seam:忙碌 → 排隊(turn end 後 drain,同 CX pending_inputs
         # 語意);turn 本體/卡片流全在 cc_sdk.py,這裡只做驗證與轉發。
@@ -22174,6 +22199,20 @@ async def v2_session_compact(session_id: str, request: Request):
         return {"ok": True, "session_id": session_id, "action": "compact",
                 "started": True,
                 "message": "已請 Gemini 壓縮脈絡,壓完就能繼續接著聊"}
+    if src[0] == "gk":
+        # S6:grok 的壓縮是 `/compact` slash 指令(initialize 的
+        # availableCommands 實測有列),走與一般送話完全相同的管線
+        # (不另開第二條送出路徑 —— gemini 那刀的教訓)。沒接這格的後果
+        # 就是 cc2 2026-10-29 稽核那顆「死鈕」。
+        key = src[1]
+        if _gk_busy(key):
+            raise http_err(409, "SESSION_BUSY",
+                           "這條 Grok 會話正在回合中,等它跑完再壓縮")
+        await _gk_input_core(key, session_id, {"content": "/compact"})
+        _log_event("grok_compact_started", session=key[:32])
+        return {"ok": True, "session_id": session_id, "action": "compact",
+                "started": True,
+                "message": "已請 Grok 壓縮脈絡,壓完就能繼續接著聊"}
     if src[0] == "cc2":
         # cc2 自己就有壓縮(SDK 送 `/compact` 斜線指令)。原本這裡與 tmux 併成
         # 一條 409,指路去 `/ccsessions/{name}/compress` —— 但那支要求 name 在
@@ -22219,6 +22258,14 @@ async def v2_session_interrupt(session_id: str, request: Request):
             raise http_err(409, "NO_ACTIVE_TURN", "no active gemini turn")
         await GEMINI.cancel(src[1])
         _log_event("gemini_interrupt", session=src[1][:32])
+        return {"ok": True, "session_id": session_id, "interrupted": True}
+    if src[0] == "gk":
+        # S6:標準 ACP session/cancel(notification)。契約同款:無活躍 turn
+        # 一律 409,不對閒置 session 發 advisory cancel 裝作有中斷。
+        if not _gk_busy(src[1]):
+            raise http_err(409, "NO_ACTIVE_TURN", "no active grok turn")
+        await GROK.cancel(src[1])
+        _log_event("grok_interrupt", session=src[1][:32])
         return {"ok": True, "session_id": session_id, "interrupted": True}
     if src[0] == "oc":
         # SPEC §4:chat.abort {sessionKey}。v2 契約「無活躍 turn 一律 409」,
@@ -23076,6 +23123,13 @@ def _v2_card_source(session_id: str) -> tuple:
             if not rest:
                 raise http_err(404, "SESSION_NOT_FOUND", "empty gemini session key")
             return ("gm", rest)
+        if prov == "grok":
+            # S6:未安裝 → 整個 id 空間不存在(404,照 gemini/openclaw 慣例)。
+            if not GROK.configured():
+                raise http_err(404, "SESSION_NOT_FOUND", "grok not installed")
+            if not rest:
+                raise http_err(404, "SESSION_NOT_FOUND", "empty grok session key")
+            return ("gk", rest)
         if prov == "openclaw":
             # S4:rest = 完整 sessionKey(本身含冒號,如 agent:main:main),
             # partition 之後整段原樣保留。未配置 → 404(對外表現同不存在)。
@@ -24664,6 +24718,70 @@ async def _cx_op_history(rest: str, request: Request):
                                        cursor=q.get("cursor"))
 
 
+async def _gk_op_rename(rest: str, request: Request):
+    body = await _json_body(request)
+    new = str(body.get("name") or body.get("title") or "").strip()
+    if not new:
+        raise http_err(400, "NAME_REQUIRED", "name 必填")
+    row = await asyncio.to_thread(grok_sdk.rename_session, rest, new)
+    if row is None:
+        raise http_err(404, "SESSION_NOT_FOUND", f"找不到 grok session {rest}")
+    _log_event("grok_renamed", session=rest[:32], title=new[:60])
+    return {"ok": True, "session_id": f"grok:{rest}", "title": row.get("title")}
+
+
+async def _gk_op_archive(rest: str, request: Request):
+    body = await _json_body(request)
+    archived = bool(body.get("archived", True))
+    row = await asyncio.to_thread(grok_sdk.set_archived, rest, archived)
+    if row is None:
+        raise http_err(404, "SESSION_NOT_FOUND", f"找不到 grok session {rest}")
+    _log_event("grok_archived", session=rest[:32], archived=archived)
+    return {"ok": True, "session_id": f"grok:{rest}", "archived": archived}
+
+
+async def _gk_op_history(rest: str, request: Request):
+    """grok 歷史:分頁權威是 bridge 逐字稿(offset 語意與其他四家一致);
+    `x.ai/session/updates` 只補「逐字稿是空的」那一格 —— 這條 session 的
+    歷史活在 CLI 端、bridge 沒看過(session 在 grok 本機開的、或逐字稿
+    搬家丟了)。兩條路回同一個形狀 `{messages, more, total}`。
+
+    為什麼原生路**不**當第一頁的預設(2026-11-16 review 抓的兩個洞):
+    1. 第一頁用原生、第二頁退逐字稿 = 兩頁取樣自**不同母體**,邊界會重複
+       或缺漏 —— 翻頁翻到一半換資料來源是騙使用者;
+    2. updates 是 chunk 流,負 offset 窗口可能從一則長回覆的中段切進去,
+       投影出來的最舊一則是**半句話** —— 所以窗口切滿時把最舊一則丟掉
+       (寧可少一則,不給斷頭訊息)。
+    原生路回的 more 恆為 False:它沒有可續的下一頁(翻頁母體是逐字稿,
+    而逐字稿是空的)—— 不假裝可以一直翻。
+    """
+    q = request.query_params
+    limit = max(1, min(int(q.get("limit") or 40), 200))
+    offset = max(0, int(q.get("offset") or 0))
+    page = await asyncio.to_thread(grok_sdk.transcript_page,
+                                   rest, limit, offset)
+    if offset != 0 or page["total"] > 0:
+        return page
+    # 逐字稿空 → 試原生尾巴(行程活著 + 方法在才有;chunk 幀多於訊息數,
+    # 多取一些再投影裁尾)。
+    window = limit * 8
+    try:
+        upd = await GROK.updates_tail(rest, limit=window)
+    except Exception as e:  # noqa: BLE001 — 原生路失敗必退,不准 500
+        _log_event("grok_updates_tail_failed", error=str(e)[:120])
+        upd = None
+    if not upd:
+        return page
+    msgs = grok_sdk.project_updates_to_messages(upd)
+    if len(upd) >= window and len(msgs) > 1:
+        msgs = msgs[1:]          # 窗口切滿:最舊一則可能是半句話,丟掉
+    msgs = msgs[-limit:]
+    if not msgs:
+        return page
+    return {"messages": msgs, "more": False, "total": len(msgs),
+            "source": "native"}
+
+
 #: 對齊矩陣。op → provider → handler(rest, request)。
 #: ⚠️ 改這張表(加 op / 加 provider / 挖格)必同步看
 #: tests/test_v2_session_ops.py 的 `_V2_OPS_KNOWN_GAPS` —— 守門會紅給你看。
@@ -24672,6 +24790,7 @@ _V2_SESSION_OPS: dict = {
         "claude_code": lambda rest, req: cc_session_rename(rest, req),
         "cc2":         lambda rest, req: v2_cc2_rename(rest, req),
         "gemini":      _gm_op_rename,
+        "grok":        _gk_op_rename,
         # codex:app-server 沒有 thread rename API(thread 標題由內容生成)。
         # openclaw:session 身分在 OpenClaw 端,bridge 無權改名。
     },
@@ -24680,12 +24799,14 @@ _V2_SESSION_OPS: dict = {
         "codex":       lambda rest, req: codex_session_archive(rest, req),
         "cc2":         lambda rest, req: v2_cc2_archive(rest, req),
         "gemini":      _gm_op_archive,
+        "grok":        _gk_op_archive,
     },
     "history": {
         "claude_code": _cc_op_history,
         "codex":       _cx_op_history,
         "cc2":         _cc2_op_history,
         "gemini":      _gm_op_history,
+        "grok":        _gk_op_history,
     },
     # config:統一控制面(SessionControlSheet)的讀/寫。codex 的實作在
     # `/app/v2/sessions/{id}/config` 的 inline 路徑(出貨已久,一個位元不動),
@@ -24739,6 +24860,20 @@ _PROVIDER_CAPS: dict = {
     },
     "gemini": {
         "interrupt": False, "queued_messages": True, "streaming": "live",
+        "terminal_status_quality": "strong", "approvals": True,
+        "approval_callbacks_live_only": True, "native_id_strength": "weak",
+    },
+    "grok": {
+        # interrupt=True:標準 ACP session/cancel 有接(v2 interrupt 路由的
+        # gk 分支),與 gemini 的差別是我們真的宣告並接了這條。
+        # terminal_status_quality=strong:session/prompt 回 stopReason。
+        # approval_callbacks_live_only=True:等待者是記憶體 Future
+        # (_GK_PERM_WAITERS),bridge 重啟即不可答 —— 同 gemini/cc2。
+        # native_id_strength=weak:v2 id 的 rest 是 bridge 名錄 key,
+        # ACP sessionId 蒸發時會換一顆續命(同 gemini 的解耦設計)。
+        # fork/rewind:x.ai/session/fork、x.ai/rewind/* 擴展存在(研究報告
+        # §2),v2 再接 —— 不在 caps 假裝已通(管線存在≠端到端通)。
+        "interrupt": True, "queued_messages": True, "streaming": "live",
         "terminal_status_quality": "strong", "approvals": True,
         "approval_callbacks_live_only": True, "native_id_strength": "weak",
     },
@@ -25101,6 +25236,11 @@ def _guest_cards_feed(session_id: str, record: dict, resolved: str = "") -> None
                 d.feed_approval(record, resolved=resolved)
         elif sid.startswith("gemini:"):
             d = _GM_CARD_DIGESTS.get(sid.split(":", 1)[1])
+            if d:
+                (d.resolve_approval(record, resolved) if resolved
+                 else d.handle_approval(record))
+        elif sid.startswith("grok:"):
+            d = _GK_CARD_DIGESTS.get(sid.split(":", 1)[1])
             if d:
                 (d.resolve_approval(record, resolved) if resolved
                  else d.handle_approval(record))
@@ -27863,6 +28003,630 @@ async def _gemini_v1_post_message(body: dict, request: Request):
         headers=SSE_HEADERS)
 
 
+# ─────────── S6:Grok Build(純 ACP)provider ──────────────────────────────
+# 傳輸層 grok_sdk.py;卡片 carddigest.GrokDigest。研究依據:pa-ship
+# docs/GROK_BUILD_RESEARCH_20261116.md「第五 provider 判決」。rail 形狀
+# 照 S5(gemini)—— grok 是標準 ACP agent,session/update 幀兩家同構,
+# 差異只在認證(ambient 憑證,無 authenticate 握手)與 x.ai/* 擴展
+# (feature-detect,不硬編)。未安裝 → 全部靜默缺席(APNs 金鑰缺席模式)。
+
+GROK = grok_sdk.make_client(log=_log_event)
+_GK_CARD_DIGESTS: dict = {}
+_GK_TURNS: dict = {}     # acp_sid -> {"cid","text","key"}(進行中 turn 的路由表)
+#: 忙碌時排隊的輸入(key -> [(content, blocks)]);上一輪收尾時 drain(C11 同款)。
+_GK_INPUT_QUEUE: dict = {}
+#: 權限請求等待者:approval id -> Future(cc2 seam:真相在等待者手上,
+#: 決定端點只叫醒;response_capability=live —— bridge 重啟即不可答)。
+_GK_PERM_WAITERS: dict = {}
+_GK_PERM_TIMEOUT = float(os.environ.get("POCKET_GROK_APPROVAL_SEC", "180"))
+
+#: 回合失敗分類 → 人話 + 下一步(S5 同構;登入是 grok 最常見的第一道牆,
+#: 指引要能照著打字 —— CC/CX 登入狀態模式)。
+_GK_FAILURE_RULES = (
+    ("auth", ("not_logged_in", "authentication required", "unauthenticated",
+              "401", "invalid credentials", "sign in", "login", "re-auth"),
+     grok_sdk.LOGIN_GUIDANCE),
+    ("quota", ("quota", "resource_exhausted", "429", "rate limit",
+               "too many requests"),
+     "Grok 的用量額度目前用完了(帳號層級限制,不是連線問題)—— 等額度"
+     "重置後再試,或改用 CC / CX 繼續這件事。"),
+    ("timeout", ("timeout", "timed out", "deadline"),
+     "Grok 這一回合等太久被中斷了。內容多的話可以拆小一點再試。"),
+    ("unavailable", ("unavailable", "503", "502", "connection refused"),
+     "Grok 服務暫時連不上。這通常是上游的事,過一下再試。"),
+    ("no_binary", ("no_binary", "不在"),
+     "這台主機還沒安裝 Grok CLI(curl -fsSL https://x.ai/cli/install.sh "
+     "| bash)。"),
+)
+
+
+def _grok_failure_kind(exc: BaseException) -> str:
+    blob = f"{type(exc).__name__} {getattr(exc, 'code', '')} {exc}".lower()
+    for kind, needles, _ in _GK_FAILURE_RULES:
+        if any(n in blob for n in needles):
+            return kind
+    return "other"
+
+
+def _grok_failure_text(exc: BaseException) -> str:
+    """認得出 → 人話 + 下一步;認不出 → 照舊附原始訊息(不吞唯一線索)。"""
+    raw = str(exc)[:160]
+    blob = f"{type(exc).__name__} {getattr(exc, 'code', '')} {exc}".lower()
+    for _kind, needles, msg in _GK_FAILURE_RULES:
+        if any(n in blob for n in needles):
+            return msg
+    return f"Grok 回合失敗：{raw}"
+
+
+def _grok_key_from_session_id(session_id: str) -> str | None:
+    sid = str(session_id or "")
+    if not sid.startswith("grok:"):
+        return None
+    rest = sid.split(":", 1)[1].strip()
+    return rest or None
+
+
+def _gk_busy(key: str) -> bool:
+    return any(t.get("key") == key for t in _GK_TURNS.values())
+
+
+def _gk_turn_hold(key: str) -> str:
+    """在 create_task 之前把佔位鍵壓進 _GK_TURNS(見 _gk_run_turn docstring),
+    回佔位鍵。呼叫點:input 的非忙碌路、queue drain。"""
+    hold = f"gk-hold-{uuid.uuid4().hex[:8]}"
+    _GK_TURNS[hold] = {"cid": "", "text": "", "key": key}
+    return hold
+
+
+async def _gk_card_digest(key: str):
+    """取得(必要時建立+seed)該 key 的 digest。seed 來源 = 自家逐字稿
+    (session/load 的 replay 刻意不用 —— 卡 id 要穩定,同 S5)。"""
+    d = _GK_CARD_DIGESTS.get(key)
+    if d is None:
+        d = _GK_CARD_DIGESTS[key] = carddigest.GrokDigest()
+        d.store.media_session_id = f"grok:{key}"
+    if not d.seeded:
+        d.seeded = True
+        try:
+            msgs = await asyncio.to_thread(grok_sdk.transcript_read, key)
+            d.seed_messages(msgs)
+            d._status()
+        except Exception as e:  # noqa: BLE001
+            d.seeded = False
+            _log_event("gk_card_seed_error", session=key[:48], error=str(e)[:200])
+            raise HTTPException(status_code=500, detail="grok card seed failed")
+    return d
+
+
+def _gk_on_update(acp_sid: str, update: dict) -> None:
+    """ACP session/update → 進行中 turn 的卡片流(milestone 蓋章照 carddigest
+    慣例:正文走 turn_delta,thought/tool/plan 走 turn_status)。沒有登記中
+    的 turn(session/load 的歷史 replay)一律忽略 —— seed 由逐字稿負責。"""
+    t = _GK_TURNS.get(acp_sid)
+    if not t:
+        return
+    # 錄製鉤(POCKET_RECORD_FIXTURE=目錄):同 S5,ACP 通知 method 固定。
+    _record_digest_fixture_frame(str(t["key"]), "session/update", update)
+    d = _GK_CARD_DIGESTS.get(t["key"])
+    if d is None:
+        return
+    kind = str(update.get("sessionUpdate") or "")
+    if kind == "agent_message_chunk":
+        content = update.get("content") or {}
+        text = (content.get("text") or "") if isinstance(content, dict) else ""
+        if text:
+            t["text"] += text
+            d.turn_delta(t["cid"], text)
+    elif kind == "agent_thought_chunk":
+        d.turn_status("思考中")
+    elif kind == "plan":
+        d.turn_status("規劃中")
+    elif kind in ("tool_call", "tool_call_update"):
+        title = str((update.get("title") or update.get("kind") or "工具"))[:40]
+        d.turn_status(f"使用工具:{title}")
+
+
+def _gk_approval_insert(record: dict) -> bool:
+    """pending approval 落 canonical approvals 表(provider='grok')——
+    審核中心/推播/過期全部沿用既有機制。"""
+    import sqlite3
+    con = sqlite3.connect(CANON_DB, timeout=30)
+    try:
+        con.execute("INSERT INTO approvals"
+                    "(id,title,source,risk,detail,created_at,expires_at,status,"
+                    "decided_at,result,callback,session_id,provider,kind,options) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (record["id"], record["title"], record["source"],
+                     record["risk"], record["detail"], record["created_at"],
+                     record["expires_at"], "pending", None, None, None,
+                     record["session_id"], "grok", "permission",
+                     json.dumps(record["options"], ensure_ascii=False)))
+        con.commit()
+        return True
+    except Exception as e:  # noqa: BLE001
+        _log_event("grok_approval_insert_failed", error=type(e).__name__,
+                   error_message=str(e)[:160])
+        return False
+    finally:
+        con.close()
+
+
+def _gk_pick_option(options: list, approve: bool) -> str | None:
+    """「核准/駁回」→ ACP optionId。**偏好 *_once**:grok 的 options 可能把
+    allow_always 排前面,拿字首第一個就是替使用者按「永久允許」—— 放行的
+    語意是這一次。沒有 *_once 才退 allow*/reject* 字首(回應永遠要對得回
+    agent 給的選項)。對不到回 None → 呼叫端退 cancelled,不瞎猜。
+
+    TODO(v2):allow_always 選項 → per-session 記憶(或 session/new 的
+    `_meta.yoloMode`)—— 讓「這條對話以後都別問」成為使用者可選項。
+    """
+    want = "allow" if approve else "reject"
+    for o in options or []:
+        if isinstance(o, dict) and o.get("optionId") \
+                and str(o.get("kind") or "") == f"{want}_once":
+            return str(o["optionId"])
+    for o in options or []:
+        if isinstance(o, dict) and o.get("optionId") \
+                and str(o.get("kind") or "").startswith(want):
+            return str(o["optionId"])
+    return None
+
+
+def _gk_approval_card(key: str, record: dict) -> None:
+    """待審 → 這條對話的卡片流(可直接按的核准卡;digest 不在 = 正常,
+    審核中心照樣有)。"""
+    d = _GK_CARD_DIGESTS.get(key)
+    if d is None:
+        return
+    try:
+        d.handle_approval(record)
+    except Exception as exc:                      # noqa: BLE001
+        _log_exc("gk_approval_card", exc, expected=False)
+        _gk_perm_card(key, f"⏳ Grok 請求使用「{record.get('title') or '工具'}」"
+                           "—— 請到審核中心放行。")
+
+
+def _gk_resolve_approval_card(key: str, record: dict, status: str) -> None:
+    d = _GK_CARD_DIGESTS.get(key)
+    if d is None:
+        return
+    try:
+        d.resolve_approval(record, status)
+    except Exception as exc:                      # noqa: BLE001
+        _log_exc("gk_resolve_approval_card", exc, expected=True)
+
+
+def _gk_perm_card(key: str, text: str) -> None:
+    d = _GK_CARD_DIGESTS.get(key)
+    if d is None:
+        return
+    d.store.upsert_card(carddigest.make_card(
+        f"card-gk-perm-{uuid.uuid4().hex[:10]}", d.store.turn_id,
+        "system", "text", {"text": text, "fallback_text": text}))
+
+
+async def _gk_on_request(req: dict):
+    """server→client 請求。`session/request_permission`(blocking reverse-
+    request,研究報告 §2「審批=活的 RPC 不是事件」)→ 我們的 approvals 管線:
+    kind 映射留在 options 原樣存(正規化成契約形狀)、回答回填 oneshot。
+
+    收尾路只有一條(在這裡):使用者決定與逾時都由本協程 mark DB + 出卡 +
+    回 ACP outcome;決定端點只叫醒(cc2 seam 同款)。
+    """
+    method = str(req.get("method") or "")
+    params = req.get("params") or {}
+    if method != "session/request_permission":
+        return None
+
+    acp_sid = str(params.get("sessionId") or "")
+    t = _GK_TURNS.get(acp_sid)
+    call = params.get("toolCall") or {}
+    tool = str(call.get("title") or call.get("kind") or "工具")[:60]
+    options = params.get("options") or []
+    _log_event("grok_permission_requested", tool=tool,
+               options=json.dumps(options, ensure_ascii=False)[:400])
+
+    key = t.get("key") if t else (GROK.acp_to_key(acp_sid) or "")
+    if not key:
+        _log_event("grok_permission_unroutable", tool=tool)
+        return {"outcome": {"outcome": "cancelled"}}
+
+    if not _gk_pick_option(options, True):
+        # 沒有可放行的選項 = 掛住等人也只能逾時 cancelled,白卡一回合。
+        _log_event("grok_permission_autodenied", tool=tool,
+                   reason="no_allow_option")
+        _gk_perm_card(key, f"⚠️ Grok 請求使用「{tool}」權限,但沒有給可放行的"
+                           "選項,已自動拒絕。")
+        return {"outcome": {"outcome": "cancelled"}}
+
+    aid = f"gk-{uuid.uuid4().hex[:12]}"
+    now = int(time.time())
+    record = {
+        "id": aid,
+        "title": f"Grok 要使用「{tool}」",
+        "source": f"grok:{key}",
+        # 走到這裡 options 一定非空(上面擋過),gemini 的
+        # `danger if not options` 在這個位置是恆假的死邏輯 —— 不抄。
+        # ACP 的 options 沒有風險語意;風險分級(dangerous tool list)是
+        # v2 的事,先誠實給 normal。
+        "risk": "normal",
+        "detail": str(call.get("rawInput") or call.get("title") or tool)[:800],
+        "created_at": now,
+        "expires_at": now + int(_GK_PERM_TIMEOUT),
+        "session_id": f"grok:{key}",
+        # 正規化成契約形狀(ACP 原形會讓 app 畫出空白按鈕 —— S5 的教訓;
+        # _gm_normalize_options 是純函式,ACP options 兩家同形,直接共用)。
+        "options": _gm_normalize_options(options),
+    }
+    if not _gk_approval_insert(record):
+        return {"outcome": {"outcome": "cancelled"}}
+
+    loop = asyncio.get_running_loop()
+    fut: asyncio.Future = loop.create_future()
+    _GK_PERM_WAITERS[aid] = fut
+    _gk_approval_card(key, record)
+    _approval_push(aid, record["title"], record["detail"], record["session_id"])
+
+    try:
+        approve = await asyncio.wait_for(fut, timeout=_GK_PERM_TIMEOUT)
+    except asyncio.TimeoutError:
+        _gk_approval_set_status(aid, "expired")
+        _gk_resolve_approval_card(key, record, "expired")
+        _gk_perm_card(key, f"⌛ 「{tool}」等不到放行({int(_GK_PERM_TIMEOUT)} 秒),"
+                           "已自動拒絕。")
+        _log_event("grok_permission_expired", approval_id=aid, tool=tool)
+        return {"outcome": {"outcome": "cancelled"}}
+    finally:
+        _GK_PERM_WAITERS.pop(aid, None)
+
+    if approve:
+        opt = _gk_pick_option(options, True) or ""
+        _gk_approval_set_status(aid, "approved")
+        _gk_resolve_approval_card(key, record, "approved")
+        _gk_perm_card(key, f"✅ 已放行「{tool}」。")
+        _log_event("grok_permission_approved", approval_id=aid, tool=tool,
+                   option=opt)
+        return {"outcome": {"outcome": "selected", "optionId": opt}}
+    _gk_approval_set_status(aid, "denied")
+    _gk_resolve_approval_card(key, record, "denied")
+    _gk_perm_card(key, f"⛔ 已駁回「{tool}」。")
+    opt = _gk_pick_option(options, False)
+    _log_event("grok_permission_denied", approval_id=aid, tool=tool,
+               option=opt or "(cancelled)")
+    if opt:
+        return {"outcome": {"outcome": "selected", "optionId": opt}}
+    return {"outcome": {"outcome": "cancelled"}}
+
+
+#: 審批狀態落 DB:直接用 provider 無關的 `_cc_approval_set_status`(同一句
+#: UPDATE + pending 競態守門,aid 全域唯一)。gemini 自己抄了一份是歷史,
+#: 不跟(review 抓的:同一句 SQL 第三份只會再多一處漂移點)。
+_gk_approval_set_status = _cc_approval_set_status
+
+
+def _gk_approval_decide(aid: str, b: dict) -> dict:
+    """決定端點的 grok 分支 —— 只叫醒等待者(收尾在 _gk_on_request)。
+    等待者不在 = 已決/逾時/bridge 重啟過 → 409,不改 DB(S5 同款語意)。
+    body 三形狀(approve / key=字面值 / key=optionId)的解析共用
+    `_gm_decision_is_approve` —— 它查的是 aid 那筆的正規化選項,與 provider
+    無關;認不出一律駁回(fail-closed)。"""
+    fut = _GK_PERM_WAITERS.get(aid)
+    if fut is None or fut.done():
+        raise HTTPException(status_code=409,
+                            detail="already decided or expired")
+    approve = _gm_decision_is_approve(aid, b)
+    fut.set_result(approve)
+    _log_event("grok_approval_decision", approval_id=aid, approve=approve)
+    return {"id": aid, "status": "approved" if approve else "denied",
+            "key": "approve" if approve else "deny"}
+
+
+GROK.on_update = _gk_on_update
+GROK.on_request = _gk_on_request
+
+
+def _gk_turn_end_push(key: str, digest, summary: str, ok: bool) -> None:
+    """回合收尾 → 沒人在看(無 SSE 訂閱者)就推播;失敗也推(⚠️)——
+    背景掛掉而使用者不知道,比成功不通知更糟(S5 同款)。"""
+    try:
+        if getattr(digest.store, "_wakers", None):
+            return
+        row = grok_sdk.get_session(key) or {}
+        display = (row.get("title") or "").strip() or f"Grok {key[:8]}"
+        _turn_end_push(f"grok:{key}", display, summary,
+                       outcome="completed" if ok else "failed")
+    except Exception as exc:            # noqa: BLE001
+        _log_exc("gk_turn_end_push", exc, expected=True)
+
+
+async def _gk_run_turn(key: str, content: str,
+                       blocks: list | None = None,
+                       hold: str = "") -> None:
+    """`hold` = 呼叫端在 create_task 前先壓進 _GK_TURNS 的佔位鍵。
+
+    為什麼要佔位(review 抓的,gemini rail 的同款窗口):真正的登記要等
+    `ensure_session` 拿到 acp_sid 之後 —— 這段 await 期間 `_gk_busy()` 看
+    不到這個 turn,第二則(不同 client_id 的)輸入會繞過排隊直接開第二輪:
+    同一 acp_sid 的登記互相覆蓋、兩輪 prompt 並發、額度雙扣。佔位鍵讓
+    busy 從 create_task 那一刻就為真;拿到 acp_sid 後換成正式登記,
+    finally 無條件把佔位收掉(turn 半路炸掉也不准把 busy 卡死)。"""
+    d = await _gk_card_digest(key)
+    cid = uuid.uuid4().hex[:10]
+    acp_sid = ""
+    try:
+        acp_sid = await GROK.ensure_session(key)
+        _GK_TURNS[acp_sid] = {"cid": cid, "text": "", "key": key}
+        if hold:
+            _GK_TURNS.pop(hold, None)
+        d.turn_begin(cid, "已送達 Grok，回覆中。")
+        grok_sdk.touch_session(key, title_hint=content)
+        res = await GROK.call(
+            "session/prompt",
+            {"sessionId": acp_sid,
+             "prompt": ([{"type": "text", "text": content}] if content else [])
+                       + (blocks or [])},
+            timeout=float(os.environ.get("GROK_TURN_TIMEOUT", "600")))
+        full = _GK_TURNS.get(acp_sid, {}).get("text", "")
+        mid = ""
+        if full:
+            mid = await asyncio.to_thread(
+                grok_sdk.transcript_append, key, "assistant", full)
+        d.turn_end(cid, full, reply_mid=mid)
+        _log_event("grok_turn_end", session=key[:32],
+                   stop=str((res or {}).get("stopReason") or ""),
+                   chars=len(full))
+        _gk_turn_end_push(key, d, full, ok=True)
+    except Exception as e:  # noqa: BLE001
+        partial = _GK_TURNS.get(acp_sid, {}).get("text", "") if acp_sid else ""
+        try:
+            d.turn_end(cid, partial, error=_grok_failure_text(e))
+        except Exception as e2:  # noqa: BLE001
+            _log_exc("gk_turn_end_error", e2, expected=True)
+        _log_event("grok_turn_failed", session=key[:32],
+                   error=type(e).__name__, error_message=str(e)[:160],
+                   kind=_grok_failure_kind(e))
+        _gk_turn_end_push(key, d, _grok_failure_text(e), ok=False)
+    finally:
+        if acp_sid:
+            _GK_TURNS.pop(acp_sid, None)
+        if hold:
+            _GK_TURNS.pop(hold, None)   # 半路炸掉也不准把 busy 卡死
+        # C11 drain:失敗也 drain,否則後送的訊息永遠卡著(S5 同款)。
+        pending = _GK_INPUT_QUEUE.get(key)
+        if pending:
+            nxt_content, nxt_blocks = pending.pop(0)
+            if not pending:
+                _GK_INPUT_QUEUE.pop(key, None)
+            _log_event("grok_queue_drain", session=key[:32],
+                       remaining=len(pending))
+            t2 = asyncio.create_task(
+                _gk_run_turn(key, nxt_content, nxt_blocks,
+                             hold=_gk_turn_hold(key)))
+            _BG_TASKS.add(t2)
+            t2.add_done_callback(_BG_TASKS.discard)
+
+
+async def _grok_v2_rows() -> list:
+    if not GROK.configured():
+        return []
+    rows = await asyncio.to_thread(grok_sdk.list_sessions)
+    out = [grok_sdk.session_v2_row(r, busy=_gk_busy(str(r.get("id"))))
+           for r in rows[:20]]
+    if not out:
+        # 新裝也要有一個入口:第一則訊息送到 grok:default 才真正開 ACP session。
+        out = [grok_sdk.session_v2_row({"id": "default", "title": "Grok"})]
+    # 待審表**一次**查完整個 provider 再逐列對(gemini 是每列掃一次 DB ——
+    # 列表熱路徑 20 列 = 20 次 expire-write + 全表掃,review 抓的;不跟)。
+    try:
+        pend = await asyncio.to_thread(_grok_pending_by_session)
+    except Exception as exc:                      # noqa: BLE001
+        _log_exc("gk_pending_scan", exc, expected=True)
+        pend = {}
+    return [_gk_row_align(r, pend) for r in out]
+
+
+def _gk_row_align(row: dict, pend: dict) -> dict:
+    """對齊 v2 契約(S5 的兩個教訓直接帶進來):
+    1. last_event_at 要 ISO8601 UTC 字串(float epoch app 解不出來);
+    2. 待審要在列表看得出來(waiting_approval + meta.approval,
+       否則 180 秒窗口等於逾時被拒)。`pend` 由呼叫端一次查好傳入。"""
+    row = dict(row)
+    row["last_event_at"] = _v2_iso_utc(row.get("last_event_at") or None)
+    hit = (pend or {}).get(str(row.get("id") or ""))
+    if hit:
+        row["status"] = "waiting_approval"
+        meta = dict(row.get("meta") or {})
+        meta["approval"] = hit
+        row["meta"] = meta
+    return row
+
+
+async def _gk_input_core(key: str, session_id: str, body: dict) -> dict:
+    """v2 統一 input(契約 §4.4)的 grok 分支:收下即回 ack,回覆走卡片
+    事件流。client_id 去重與 cc 共用同一套 TTL/鎖(S5 的教訓:沒有去重,
+    app 的每條重試路徑都是保證跑第二輪)。"""
+    if not GROK.configured():
+        raise http_err(404, "SESSION_NOT_FOUND", "grok not installed")
+    dedup, prior = await _gk_input_claim(key, body.get("client_id"))
+    if prior is not None:
+        return await _gk_input_wait_prior(prior)
+    try:
+        return await _gk_input_run(key, session_id, body, dedup)
+    except BaseException:
+        _cc_input_release(dedup)   # 失敗不留佔位,否則重試會被當成重複而卡住
+        raise
+
+
+async def _gk_input_claim(key: str, client_id):
+    return await _cc_input_claim(f"grok:{key}", client_id)
+
+
+async def _gk_input_wait_prior(prior) -> dict:
+    try:
+        await asyncio.wait_for(prior["event"].wait(), _CX_INPUT_INFLIGHT_WAIT)
+    except asyncio.TimeoutError:
+        _log_event("grok_input_dedup_wait_timeout")
+        return {"ok": True, "accepted": True, "deduplicated": True}
+    _log_event("grok_input_deduplicated")
+    return dict(prior.get("result") or
+                {"ok": True, "accepted": True, "deduplicated": True})
+
+
+async def _gk_input_run(key: str, session_id: str, body: dict,
+                        dedup) -> dict:
+    content = (body.get("content") or body.get("text") or "").strip()
+    attachments = body.get("attachments") or []
+    # 附件(S5 同款):影像 → prompt 的 image block(initialize 實測
+    # promptCapabilities.image=true);語音 → 轉寫;其他 → 存檔附路徑
+    # (CLI 跑在本機,讀得到檔)。不默吞。
+    blocks: list = []
+    note_paths: list = []
+    voice_lines: list = []
+    att_meta: list = []
+    if attachments:
+        _att_guard(attachments)
+        stt_lang = str(body.get("stt_lang") or "").strip()
+        for a in attachments:
+            path = _save_attachment(a, (a or {}).get("filename") or "file")
+            if not path:
+                continue
+            att_meta.append({"kind": (a or {}).get("kind"),
+                             "filename": (a or {}).get("filename"),
+                             "mime": (a or {}).get("mime"),
+                             "path": path})
+            if (a or {}).get("kind") == "audio":
+                t = await asyncio.to_thread(_transcribe, path, "", stt_lang)
+                if t:
+                    voice_lines.append(t)
+                else:
+                    note_paths.append(path)
+            elif (a or {}).get("kind") == "image":
+                mime = (a.get("mime") or mimetypes.guess_type(path)[0]
+                        or "image/png")
+                try:
+                    with open(path, "rb") as fh:
+                        blocks.append({"type": "image", "mimeType": mime,
+                                       "data": base64.b64encode(fh.read()).decode()})
+                except OSError as _exc:
+                    _log_exc("_gk_input_core.image", _exc, expected=True)
+                    note_paths.append(path)
+            else:
+                note_paths.append(path)
+        if voice_lines:
+            content = "\n".join(voice_lines + ([content] if content else [])).strip()
+        if note_paths:
+            content = (content + "\n\n[附件:" + " ".join(note_paths) + "]").strip()
+        _log_event("grok_attachments", session=key[:32],
+                   images=len(blocks), paths=len(note_paths),
+                   voice=len(voice_lines))
+    if not content and not blocks:
+        raise http_err(400, "EMPTY_CONTENT", "content required")
+    d = await _gk_card_digest(key)
+    mid = await asyncio.to_thread(
+        grok_sdk.transcript_append, key, "user", content)
+    if att_meta:
+        _schedule_media_capture(session_id,
+                                {"content": content, "attachments": att_meta})
+    d.message_card({"id": mid, "role": "user", "content": content,
+                    "attachments": att_meta, "ts": time.time()})
+    # 忙碌 → 排隊不 409(訊息比額度珍貴,S5/C11 同款)。
+    if _gk_busy(key):
+        _GK_INPUT_QUEUE.setdefault(key, []).append((content, blocks))
+        depth = len(_GK_INPUT_QUEUE[key])
+        _log_event("grok_input_queued", session=key[:32], depth=depth)
+        out = {"ok": True, "session_id": session_id, "accepted": True,
+               "queued": True, "queue_depth": depth, "message_id": mid}
+        _cc_input_settle(dedup, out)
+        return out
+    task = asyncio.create_task(
+        _gk_run_turn(key, content, blocks, hold=_gk_turn_hold(key)))
+    _BG_TASKS.add(task)
+    task.add_done_callback(_BG_TASKS.discard)
+    out = {"ok": True, "session_id": session_id, "accepted": True,
+           "message_id": mid}
+    _cc_input_settle(dedup, out)
+    return out
+
+
+async def _grok_v1_post_message(body: dict, request: Request):
+    """OpenAI 相容入口(Open WebUI 線)的 grok 分支 —— 與 S5 同形:
+    收下即 ack,回覆走卡片事件流。"""
+    session_id = str(body.get("session") or "grok:default")
+    key = _grok_key_from_session_id(session_id)
+    if not key:
+        raise http_err(400, "SESSION_NOT_FOUND", "unknown grok session")
+    if not GROK.configured():
+        raise http_err(404, "SESSION_NOT_FOUND", "grok not installed")
+    dry_run = bool(body.get("dry_run"))
+    cid = "gkmsg-" + uuid.uuid4().hex[:20]
+    created = int(time.time())
+    if not dry_run:
+        await _gk_input_core(key, session_id, body)
+
+    def chunk(delta, finish=None, **extra):
+        payload = {"id": cid, "object": "chat.completion.chunk",
+                   "created": created, "model": session_id,
+                   "choices": [{"index": 0, "delta": delta,
+                                "finish_reason": finish}]}
+        payload.update(extra)
+        return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+    async def agen():
+        yield chunk({"role": "assistant", "content": ""})
+        yield chunk({}, None, status={"state": "accepted",
+                                      "label": "Grok 已收到，正在回覆。"},
+                    accepted=True, dry_run=dry_run)
+        yield chunk({}, "stop", accepted=True, dry_run=dry_run)
+        yield "data: [DONE]\n\n"
+
+    return StreamingResponse(
+        agen(), media_type="text/event-stream",
+        headers=SSE_HEADERS)
+
+
+@app.get("/app/v1/grok/config")
+async def grok_config_get(request: Request):
+    """App 設定面板/登入指引的讀取端。installed/logged_in 分開報:
+    binary 不在與沒登入是兩件事,指引不同(裝 vs 登入)。"""
+    _check_auth(request)
+    cfg = grok_sdk.load_config()
+    st = grok_sdk.auth_state()
+    return {"installed": GROK.configured(),
+            "configured": GROK.configured() and GROK.logged_in(),
+            "source": cfg["source"], "key_set": st["key_set"],
+            "logged_in": st["logged_in"], "auth_method": st["method"],
+            "auth_used": GROK.auth_used,
+            "login_hint": (None if GROK.logged_in()
+                           else grok_sdk.LOGIN_GUIDANCE),
+            # 模型:spawn 參數,全域(同 gemini 的語意與唯讀規則)。
+            "model": cfg["model"], "model_source": cfg["model_source"],
+            "model_scope": "global"}
+
+
+@app.put("/app/v1/grok/config")
+async def grok_config_put(request: Request):
+    """寫入 API key / 模型(0600 落檔;env 仍優先;合併寫入)。
+    改了是 spawn 參數 → 重新握手才生效(drop proc,同 gemini 路徑)。"""
+    _check_auth(request)
+    body = await request.json()
+    has_key = "api_key" in body
+    has_model = "model" in body
+    if not has_key and not has_model:
+        raise http_err(400, "EMPTY", "api_key / model 至少要帶一個")
+    cfg = grok_sdk.save_config(
+        str(body.get("api_key") or "") if has_key else None,
+        str(body.get("model") or "") if has_model else None)
+    await GROK._drop_proc()
+    _log_event("grok_config_updated", configured=GROK.configured(),
+               source=cfg["source"], model=cfg["model"] or "(cli-default)",
+               changed=",".join(k for k, v in (("api_key", has_key),
+                                               ("model", has_model)) if v))
+    return {"ok": True, "configured": GROK.configured() and GROK.logged_in(),
+            "source": cfg["source"],
+            "model": cfg["model"], "model_source": cfg["model_source"],
+            "model_scope": "global"}
+
+
 def _tg_any_target() -> bool:
     """任一人格解得出 TG 投遞目標嗎(= 這台主機真的接了 TG bot)。
 
@@ -28234,6 +28998,8 @@ async def _v2_card_store(session_id: str):
         return (await _oc_card_digest(src[1])).store
     if src[0] == "gm":
         return (await _gm_card_digest(src[1])).store
+    if src[0] == "gk":
+        return (await _gk_card_digest(src[1])).store
     if src[0] == "cc2":
         # digest 常駐於 session 物件(不像 tmux 要每次 seed + 跟隨器)。
         # 歷史:session 建立時 `_seed_history` 會從 ~/.claude 的 transcript
@@ -29483,6 +30249,7 @@ async def capabilities(request: Request):
                         (["terminal"] if POCKET_TERMINAL_ENABLED else []) +
                         (["openclaw_provider"] if OPENCLAW.configured() else []) +
                         (["gemini_provider"] if GEMINI.configured() else []) +
+                        (["grok_provider"] if GROK.configured() else []) +
                         (["calendar_proposals"]
                          if _calendar_proposals_enabled() else []),
             "terminal": _terminal_capabilities(),
@@ -32425,6 +33192,8 @@ async def app_post_message(request: Request):
         return await _openclaw_v1_post_message(body, request)
     if _gemini_key_from_session_id(session):
         return await _gemini_v1_post_message(body, request)
+    if _grok_key_from_session_id(session):
+        return await _grok_v1_post_message(body, request)
     if session not in PERSONAS:
         raise http_err(400, "SESSION_NOT_FOUND", "unknown session")
     content = (body.get("content") or "").strip()
@@ -32679,6 +33448,14 @@ async def app_message_interrupt(request: Request):
         _log_event("gemini_interrupt", session=gm_key[:32])
         return {"ok": True, "session": session, "interrupted": True,
                 "attempts": 1}
+    gk_key = _grok_key_from_session_id(session)
+    if gk_key:
+        # S6:v1 線(Open WebUI)也要能中斷 —— v2 有、v1 沒有就是同一顆
+        # 停止鈕在兩條線上一真一假(review 抓的 gemini 沒有的不對稱)。
+        await GROK.cancel(gk_key)
+        _log_event("grok_interrupt", session=gk_key[:32])
+        return {"ok": True, "session": session, "interrupted": True,
+                "attempts": 1}
     if session not in PERSONAS:
         raise http_err(400, "SESSION_NOT_FOUND", "unknown session")
     return await _persona_interrupt_core(session)
@@ -32766,6 +33543,11 @@ def _approval_response_capability(aid: str, provider: str, src: str,
                     else "not_resumable")
         if src.startswith("gemini:"):
             fut = _GM_PERM_WAITERS.get(aid)
+            return "live" if fut is not None and not fut.done() else "not_resumable"
+        if src.startswith("grok:"):
+            # S6:同 gemini —— 等待者是記憶體 Future,bridge 重啟即不可答。
+            # 漏這格的後果:重啟後 app 的核准鈕看起來還能按,按了吃 409。
+            fut = _GK_PERM_WAITERS.get(aid)
             return "live" if fut is not None and not fut.done() else "not_resumable"
     except Exception as exc:  # noqa: BLE001
         _log_event("approval_response_capability_probe_failed",
@@ -32874,6 +33656,29 @@ def _gemini_pending_by_session() -> dict:
             con.close()
     except Exception as e:  # noqa: BLE001
         _log_event("gemini_pending_scan_failed", error=str(e)[:160])
+    return out
+
+
+def _grok_pending_by_session() -> dict:
+    """grok 的 pending 待審(session_id='grok:{key}')→ 統一物件,每 session
+    取最早一筆(S5 同款:列表看不出「它在等你」= 180 秒窗口逾時被拒)。"""
+    import sqlite3
+    out = {}
+    try:
+        con = sqlite3.connect(CANON_DB, timeout=30)
+        try:
+            _approvals_expire(con)
+            con.commit()
+            rows = con.execute(
+                f"SELECT {_APPROVAL_COLS} FROM approvals WHERE status='pending'"
+                " AND session_id LIKE 'grok:%' ORDER BY created_at ASC").fetchall()
+            for r in rows:
+                d = _approval_row(r)
+                out.setdefault(d["session_id"], d)
+        finally:
+            con.close()
+    except Exception as e:  # noqa: BLE001
+        _log_event("grok_pending_scan_failed", error=str(e)[:160])
     return out
 
 
@@ -33298,6 +34103,9 @@ async def _approval_decide_serial(aid: str, b: dict) -> dict:
     if d and src.startswith("gemini:"):
         # 真相在 _gm_on_request 的等待者手上(同 cc2 seam)——這裡只叫醒。
         return _gm_approval_decide(aid, b)
+    if d and src.startswith("grok:"):
+        # S6:同上 —— 真相在 _gk_on_request 的等待者手上,這裡只叫醒。
+        return _gk_approval_decide(aid, b)
     if d and src.startswith("openclaw"):
         # openclaw 的審批真相在 gateway 手上(bridge 只是鏡像)——一定要先
         # 打 `*.approval.resolve`,成功了才改 DB。反過來寫會出現「app 顯示
