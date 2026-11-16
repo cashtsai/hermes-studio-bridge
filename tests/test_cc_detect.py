@@ -85,6 +85,10 @@ MODEL_PICKER_MENU = """  Select Model
   Enter to set as default · Esc to cancel
 """
 
+FEEDBACK_SURVEY = """  How is Claude doing this session? (optional)
+  1: Bad    2: Fine   3: Good   0: Dismiss
+"""
+
 BUSY_SPINNER_PANE = """· Fermenting… (1m 51s · ↓ 6.5k tokens)
 """
 
@@ -166,6 +170,12 @@ Enter to select · ↑/↓ to navigate · Esc to cancel
         r = cc_detect.classify(MODEL_PICKER_MENU)
         self.assertEqual(r["rule"], "model_picker_menu")
         self.assertEqual(r["state"], "unknown")
+
+    def test_blocked_session_feedback_survey(self):
+        """回合後評分頁沒有輸入框,不可誤判成 idle。"""
+        r = cc_detect.classify(FEEDBACK_SURVEY)
+        self.assertEqual(r["state"], "blocked")
+        self.assertEqual(r["rule"], "session_feedback_survey")
 
     def test_osc_title_spinner_working_even_when_pane_idle(self):
         # braille spinner 在標題、pane 看起來待命 → 仍是 working(1100 最高)。

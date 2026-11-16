@@ -197,6 +197,16 @@ DEFAULT_MANIFEST = {
             ],
         },
         {
+            # Claude Code 回合結束後偶爾出現的可選評分頁。它沒有 ❯ 輸入框，
+            # 但舊引擎會因為沒有 spinner / permission 關鍵字而掉到 idle，
+            # 讓 Pocket 顯示「待命」並把後續輸入送進被 modal 蓋住的 pane。
+            "id": "session_feedback_survey",
+            "state": "blocked",
+            "priority": 855,
+            "region": "whole_recent",
+            "contains": ["how is claude doing this session?", "0: dismiss"],
+        },
+        {
             # Bash 權限審批選單:「Do you want to proceed?」+ ❯ Yes / 1. Yes / 2. No。
             "id": "bash_permission_prompt",
             "state": "blocked",
