@@ -1038,6 +1038,76 @@ client 對接要知道的最小集合（2026-08-01 補：Android 端曾因本節
   always-allow → per-session 記憶或 `session/new` 的 `_meta.yoloMode`；
   compact（CLI 有 `/compact` 指令與 `x.ai/compact_conversation`）。
 
+### 4.1f OpenCode（第七 provider，選配，2026-11-16）
+
+> 定位：Pocket **Build 主引擎**（MIT、75+ provider、OpenRouter 即插）。
+> 純 ACP（`opencode acp`，protocolVersion 1），rail 形狀與 §4.1e 同構 ——
+> 這是第三家純 ACP provider，JSON-RPC 泵已抽成共用層 `acp_rail.py`
+> （grok/opencode 共用；gemini 與 hermes 人格軌是 production，刻意不動）。
+> 下表每一列都是 2026-11-16 本機實測（1.19.5），wire bytes 錄在
+> `tests/fixtures/opencode/recorded-stdio-20261116.txt`。
+
+- **provider 值 = `opencode`，session id = `opencode:{key}`**。
+  ⚠️ 與 `openclaw:`（§4.1b）只差三個字母：**前綴一律整段比對**，不可用
+  `startswith("openc")` —— 搞混會把審批與 session 路由送錯家。
+- **名錄制**（同 gemini/grok）：列表走
+  `GET /app/v2/sessions?provider=opencode`；第一則訊息才建 ACP session
+  （冷啟 5~26 秒，不在列表熱路徑上付）。bridge key 與 ACP sessionId 解耦
+  → caps `native_id_strength: weak`。
+- **偵測**：`opencode` binary 不在（PATH / `~/.opencode/bin` /
+  `~/.local/bin`，`POCKET_OPENCODE_BIN` 可指定）= 整個 `opencode:` id
+  空間 404、agents 無項、caps 不宣告 —— 靜默缺席。
+- **認證：沒有登入牆（與其他家的分水嶺）**。opencode 內建免費模型池，
+  **零憑證就能跑完整回合**（實測 `auth.json` 0 credentials 下
+  `session/prompt` 照樣回 `end_turn`）。因此：
+  `/app/v2/agents` 的 `auth.connected` 恆為 `true`、
+  `GET /app/v1/opencode/config` 回 `auth_required: false`，
+  `login_hint` 是**加值說明不是錯誤**（接 `opencode auth login` 或
+  OpenRouter key 才解鎖 75+ provider）。client **不可**因為沒登入就藏入口
+  或畫登入牆。OpenRouter key 走 `PUT /app/v1/opencode/config`（0600 落檔，
+  注入子程序 `OPENROUTER_API_KEY`；模型填 `openrouter/<model-id>`）。
+- **ops**（`_V2_SESSION_OPS`）：`rename` / `archive`（名錄層）/ `history` /
+  **`config_read` / `config_write`** —— 五格全通。
+- **per-session 設定（這家獨有，codex 之外唯一）**：
+  `GET /app/v2/sessions/opencode:{key}/config` 回扁平 snake_case
+  `{model, mode, model_options:[{value,name}], mode_options:[…]}`；
+  `POST` 同路徑寫 `{model?, mode?}` → `{ok, applied, ignored, config}`。
+  底層是 ACP `session/set_config_option`（欄位名是 **`configId`**；
+  寫 `configOptionId` 回 -32602，坑錄在 fixture）。寫入前對 agent 給的
+  options 驗一次，不認得回 400 `OCE_UNKNOWN_VALUE` 並列出可用值
+  （盲寫會把 session 釘在不存在的模型上）。`model` 會存成「新 session 的
+  預設偏好」並在 `session/new` 後自動套用；`mode`（build/plan）只屬於
+  這條對話，不落全域。
+- **input**：§4.4 統一 input；client_id 去重、忙碌排隊（`queued:true` +
+  `queue_depth`）、附件（影像=ACP image block，`promptCapabilities.image`
+  feature-detect；語音=轉寫；其他=落檔附路徑）。
+- **interrupt**：標準 ACP `session/cancel`；實測 prompt 在 0.7 秒內回
+  `stopReason:"cancelled"`（真收束，非 advisory）。無活躍 turn 一律 409。
+  v1（`POST /app/v1/messages/interrupt`）與 v2 兩線都接。
+- **resume**：ACP `session/load`（`loadSession:true` 才用；載不回自動
+  `session/new` 換 acp_sid 續命）。load **會 replay 歷史逐字**，bridge 在
+  泵的旁聽掛鉤擷取 → 這就是 history 的原生來源（零額外 RPC、零冷啟）。
+- **history**：分頁權威是 bridge 逐字稿（offset 從最新往回數，形狀
+  `{messages, more, total}`）；逐字稿為空時才用 load replay 補那一格並帶
+  `source:"native"`（`more` 恆 `false`）。第二頁以後一律只看逐字稿 ——
+  單一母體紀律（混用會讓翻頁重複或缺漏）。
+- **審批**：`session/request_permission`（blocking reverse-request）→
+  canonical approvals（`provider=opencode`）+ 卡片流 approval 卡 + 推播；
+  列表同步標 `waiting_approval` + `meta.approval`。實測 options =
+  `once` / `always` / `reject`（kind `allow_once`/`allow_always`/
+  `reject_once`），放行偏好 `allow_once`（不替使用者按「永久允許」）。
+  等待者是記憶體 Future（`approval_callbacks_live_only: true`）：bridge
+  重啟後決定回 409；逾時（180s，`POCKET_OPENCODE_APPROVAL_SEC`）
+  fail-closed 回 `cancelled`。
+- **刻意不支援 compact**：`availableCommands` 實測沒有 compact，
+  `POST /app/v2/sessions/opencode:{key}/compact` 回 400
+  `UNSUPPORTED_PROVIDER`。client 要照 caps 渲染（不要畫壓縮鈕）——
+  假裝把 `/compact` 當訊息送出去只會讓 agent 回「我不懂這個指令」。
+- **限制 / 下一波**：`sessionCapabilities.fork` 存在但端到端未驗，caps
+  **不宣告** fork/rewind（管線存在≠端到端通）；`always` 選項 →
+  per-session 記憶；`session/list`（原生標題/updatedAt）目前只在
+  client 內部用，未併進列表標題。
+
 ### 4.2 Agent
 
 ```jsonc

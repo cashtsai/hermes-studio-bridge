@@ -66,6 +66,7 @@ import hermes_media
 import openclaw_provider
 import gemini_provider
 import grok_sdk
+import opencode_sdk
 import orchestrator
 import live_update_event
 import replay_fixture
@@ -21752,6 +21753,15 @@ async def v2_agents(request: Request):
          "auth": {"connected": GROK.logged_in(), "account": None},
          "can_create": True},
     ] if GROK.configured() else []) + ([
+        # S7:opencode 沒有登入牆(零認證就能跑免費模型池,2026-11-16 實測)
+        # → auth.connected 一律 True;額外憑證(opencode auth login /
+        # OpenRouter key)只影響「能用哪些模型」,不影響能不能用。報 False
+        # 會讓 app 畫出一道不存在的登入牆。
+        {"provider": "opencode", "name": "OpenCode", "kind": "code_agent",
+         "status": "ready",
+         "auth": {"connected": True, "account": None},
+         "can_create": True},
+    ] if OPENCODE.configured() else []) + ([
         # CC2 seam:旗標開才亮相(旗標關 = 對 app 完全不存在)。
         {"provider": "cc2", "name": "Claude Code (SDK)", "kind": "code_agent",
          "status": "ready", "auth": {"connected": True, "account": None}, "can_create": True},
@@ -21882,6 +21892,14 @@ async def v2_sessions(request: Request, provider: str = "", status: str = "",
             _log_event("v2_grok_list_failed", error=type(e).__name__,
                        error_message=str(e)[:160])
             degraded.append("grok")
+    # S7:opencode sessions(名錄制,同 S6 —— 失敗就標 degraded,不無聲吞)。
+    if OPENCODE.configured():
+        try:
+            out.extend(await _opencode_v2_rows())
+        except Exception as e:  # noqa: BLE001
+            _log_event("v2_opencode_list_failed", error=type(e).__name__,
+                       error_message=str(e)[:160])
+            degraded.append("opencode")
     # S4:openclaw sessions(SPEC §5)。未配置 → 整段缺席(零影響現有使用者);
     # 配置了但 gateway 掛 → 標 degraded,照 codex 同款不無聲吞錯。
     if OPENCLAW.configured():
@@ -22017,7 +22035,11 @@ def _roster_enrich(ids: list) -> dict:
                         "ORDER BY id DESC LIMIT 8", (ev,)):
                     try:
                         data = json.loads(payload or "{}")
-                    except Exception:  # noqa: BLE001
+                    except Exception as _exc:  # noqa: BLE001 — 壞行跳過
+                        # 留痕(robustness 棘輪:bridge.py 的無痕 except 上限 0)。
+                        # 這裡本來是裸 continue —— 自己寫進 event_log 的 payload
+                        # 解不開是「不該發生」的事,安靜跳過等於永遠查不到。
+                        _log_exc("roster_summary_payload", _exc, expected=True)
                         continue
                     if etype == "card.milestone":
                         body = ((data.get("card") or {}).get("body") or {})
@@ -22264,8 +22286,9 @@ async def v2_session_approve(session_id: str, request: Request):
         _cc2_approval_db_mark(aid, status)
         return {"ok": True, "session_id": session_id,
                 "approval_id": aid, "status": status}
-    if src[0] in ("gm", "gk"):
-        # S5/S6:gemini/grok 的決議一律走統一 body({approval_id, key}),
+    if src[0] in ("gm", "gk", "oce"):
+        # S5/S6/S7:gemini/grok/opencode 的決議一律走統一 body
+        # ({approval_id, key}),
         # 上面 _approval_decide_core 已經收走。走到這裡 = 舊形狀 body 沒帶
         # approval_id —— 不准掉進下方 Codex fallback(拿 gemini/grok 的
         # key 當 thread id 去呼,壞得安靜又離奇;cc2 2026-10-29 同族事故)。
@@ -22321,6 +22344,8 @@ async def v2_session_input(session_id: str, request: Request):
         return await _gm_input_core(src[1], session_id, body)
     if src[0] == "gk":
         return await _gk_input_core(src[1], session_id, body)
+    if src[0] == "oce":
+        return await _oce_input_core(src[1], session_id, body)
     if src[0] == "cc2":
         # CC2 seam:忙碌 → 排隊(turn end 後 drain,同 CX pending_inputs
         # 語意);turn 本體/卡片流全在 cc_sdk.py,這裡只做驗證與轉發。
@@ -22631,6 +22656,14 @@ async def v2_session_interrupt(session_id: str, request: Request):
             raise http_err(409, "NO_ACTIVE_TURN", "no active grok turn")
         await GROK.cancel(src[1])
         _log_event("grok_interrupt", session=src[1][:32])
+        return {"ok": True, "session_id": session_id, "interrupted": True}
+    if src[0] == "oce":
+        # S7:同款 session/cancel。實測(1.19.5):prompt 會在 0.7 秒內回
+        # `stopReason:"cancelled"` —— 這家的中斷是真的收束回合,不是 advisory。
+        if not _oce_busy(src[1]):
+            raise http_err(409, "NO_ACTIVE_TURN", "no active opencode turn")
+        await OPENCODE.cancel(src[1])
+        _log_event("opencode_interrupt", session=src[1][:32])
         return {"ok": True, "session_id": session_id, "interrupted": True}
     if src[0] == "oc":
         # SPEC §4:chat.abort {sessionKey}。v2 契約「無活躍 turn 一律 409」,
@@ -23495,6 +23528,17 @@ def _v2_card_source(session_id: str) -> tuple:
             if not rest:
                 raise http_err(404, "SESSION_NOT_FOUND", "empty grok session key")
             return ("gk", rest)
+        if prov == "opencode":
+            # S7:未安裝 → 整個 id 空間不存在(404,照 gemini/grok 慣例)。
+            # 注意與 `openclaw` 的前綴只差三個字母,所以這裡是**完整字串
+            # 比對**(partition 出來的 prov),不是 startswith。
+            if not OPENCODE.configured():
+                raise http_err(404, "SESSION_NOT_FOUND",
+                               "opencode not installed")
+            if not rest:
+                raise http_err(404, "SESSION_NOT_FOUND",
+                               "empty opencode session key")
+            return ("oce", rest)
         if prov == "openclaw":
             # S4:rest = 完整 sessionKey(本身含冒號,如 agent:main:main),
             # partition 之後整段原樣保留。未配置 → 404(對外表現同不存在)。
@@ -25168,6 +25212,131 @@ async def _gk_op_history(rest: str, request: Request):
             "source": "native"}
 
 
+async def _oce_op_rename(rest: str, request: Request):
+    body = await _json_body(request)
+    new = str(body.get("name") or body.get("title") or "").strip()
+    if not new:
+        raise http_err(400, "NAME_REQUIRED", "name 必填")
+    row = await asyncio.to_thread(opencode_sdk.rename_session, rest, new)
+    if row is None:
+        raise http_err(404, "SESSION_NOT_FOUND",
+                       f"找不到 opencode session {rest}")
+    _log_event("opencode_renamed", session=rest[:32], title=new[:60])
+    return {"ok": True, "session_id": f"opencode:{rest}",
+            "title": row.get("title")}
+
+
+async def _oce_op_archive(rest: str, request: Request):
+    body = await _json_body(request)
+    archived = bool(body.get("archived", True))
+    row = await asyncio.to_thread(opencode_sdk.set_archived, rest, archived)
+    if row is None:
+        raise http_err(404, "SESSION_NOT_FOUND",
+                       f"找不到 opencode session {rest}")
+    _log_event("opencode_archived", session=rest[:32], archived=archived)
+    return {"ok": True, "session_id": f"opencode:{rest}", "archived": archived}
+
+
+async def _oce_op_history(rest: str, request: Request):
+    """opencode 歷史:分頁權威是 bridge 逐字稿(offset 語意與其他五家一致);
+    `session/load` 的 replay 只補「逐字稿是空的」那一格。
+
+    與 S6 的差別:grok 要探一個私有擴展(x.ai/session/updates)才拿得到原生
+    歷史,opencode 的 `session/load` **本來就會把逐字 replay 回來**(實測),
+    我們在泵的旁聽掛鉤擷下來 —— 零額外 RPC、零冷啟。
+
+    單一母體的紀律照 S6 原樣:原生路**不**當第一頁預設(第一頁原生、第二頁
+    逐字稿 = 兩頁取樣自不同母體,翻頁會重複或缺漏),而且原生路的 `more`
+    恆為 False(它沒有可續的下一頁)。
+    """
+    q = request.query_params
+    limit = max(1, min(int(q.get("limit") or 40), 200))
+    offset = max(0, int(q.get("offset") or 0))
+    page = await asyncio.to_thread(opencode_sdk.transcript_page,
+                                   rest, limit, offset)
+    if offset != 0 or page["total"] > 0:
+        return page
+    try:
+        msgs = OPENCODE.replay_messages(rest)
+    except Exception as e:  # noqa: BLE001 — 原生路失敗必退,不准 500
+        _log_event("opencode_replay_read_failed", error=str(e)[:120])
+        msgs = None
+    if not msgs:
+        return page
+    msgs = msgs[-limit:]
+    return {"messages": msgs, "more": False, "total": len(msgs),
+            "source": "native"}
+
+
+async def _oce_op_config_read(rest: str, request: Request):
+    """per-session 設定讀取(model / mode + 可選值列)。
+
+    這是 codex 以外**第一家**真支援 per-session 控制面的 provider:
+    `session/new|load` 回來就帶 `configOptions`,所以不需要另開 RPC。
+    快取沒有(bridge 重啟後第一次問)→ ensure_session 把它 load 回來;
+    那是使用者主動打開控制面的路徑,不是列表熱路徑,可以付這個冷啟。
+    """
+    if not OPENCODE.configured():
+        raise http_err(404, "SESSION_NOT_FOUND", "opencode not installed")
+    row = await asyncio.to_thread(opencode_sdk.get_session, rest)
+    acp_sid = str((row or {}).get("acp_sid") or "")
+    # 判準是「這顆行程載過了嗎」而不是「快取有值嗎」—— 快取跨子程序存活
+    # (鍵是 ACP sessionId),重啟後拿它直接回答就是給過期的設定。
+    if not OPENCODE.session_loaded(acp_sid):
+        try:
+            acp_sid = await OPENCODE.ensure_session(rest)
+        except opencode_sdk.OpenCodeError as e:
+            raise http_err(503, "PROVIDER_UNAVAILABLE",
+                           _opencode_failure_text(e))
+    return OPENCODE.current_config(acp_sid)
+
+
+async def _oce_op_config_write(rest: str, request: Request):
+    """per-session 設定寫入(`session/set_config_option`)。
+
+    守門照 codex 的 `CX_UNKNOWN_MODEL` 同款:**寫入前先對 agent 給的
+    options 驗一次**,不認得就 400 並列出可用值 —— 盲寫會把 session 釘在
+    一個不存在的模型上,之後每一輪都失敗(codex 那條 session 的病史)。
+    options 是空的(agent 沒給可選值)才放行不驗,不自己發明白名單。
+    """
+    if not OPENCODE.configured():
+        raise http_err(404, "SESSION_NOT_FOUND", "opencode not installed")
+    body = await _json_body(request)
+    wants = {cid: body[cid] for cid in opencode_sdk.KNOWN_CONFIG_IDS
+             if body.get(cid) not in (None, "")}
+    if not wants:
+        raise http_err(400, "EMPTY",
+                       "要帶 " + " / ".join(opencode_sdk.KNOWN_CONFIG_IDS)
+                       + " 至少一個")
+    try:
+        acp_sid = await OPENCODE.ensure_session(rest)
+    except opencode_sdk.OpenCodeError as e:
+        raise http_err(503, "PROVIDER_UNAVAILABLE", _opencode_failure_text(e))
+    applied = {}
+    for cid, val in wants.items():
+        allowed = opencode_sdk.config_allowed_values(
+            OPENCODE.config_options(acp_sid), cid)
+        if allowed and val not in allowed:
+            raise http_err(400, "OCE_UNKNOWN_VALUE",
+                           f"opencode 不認得這個 {cid}:{val}",
+                           "可用:" + ", ".join(str(a) for a in allowed[:12]))
+        try:
+            await OPENCODE.set_config(acp_sid, cid, val)
+        except opencode_sdk.OpenCodeError as e:
+            raise http_err(502, "PROVIDER_ERROR", _opencode_failure_text(e))
+        applied[cid] = val
+    # 模型選擇要黏住(下一條新 session 也用它)—— 只有 model 進落檔偏好,
+    # mode 是這條對話的事(build/plan 是當下任務的選擇,不是全域偏好)。
+    if "model" in applied:
+        await asyncio.to_thread(opencode_sdk.save_config, None,
+                                str(applied["model"]))
+    _log_event("opencode_config_update", session=rest[:32],
+               **{k: str(v)[:60] for k, v in applied.items()})
+    return {"ok": True, "session_id": f"opencode:{rest}",
+            "applied": applied, "ignored": [],
+            "config": OPENCODE.current_config(acp_sid)}
+
+
 #: 對齊矩陣。op → provider → handler(rest, request)。
 #: ⚠️ 改這張表(加 op / 加 provider / 挖格)必同步看
 #: tests/test_v2_session_ops.py 的 `_V2_OPS_KNOWN_GAPS` —— 守門會紅給你看。
@@ -25177,6 +25346,7 @@ _V2_SESSION_OPS: dict = {
         "cc2":         lambda rest, req: v2_cc2_rename(rest, req),
         "gemini":      _gm_op_rename,
         "grok":        _gk_op_rename,
+        "opencode":    _oce_op_rename,
         # codex:app-server 沒有 thread rename API(thread 標題由內容生成)。
         # openclaw:session 身分在 OpenClaw 端,bridge 無權改名。
     },
@@ -25186,6 +25356,7 @@ _V2_SESSION_OPS: dict = {
         "cc2":         lambda rest, req: v2_cc2_archive(rest, req),
         "gemini":      _gm_op_archive,
         "grok":        _gk_op_archive,
+        "opencode":    _oce_op_archive,
     },
     "history": {
         "claude_code": _cc_op_history,
@@ -25193,6 +25364,7 @@ _V2_SESSION_OPS: dict = {
         "cc2":         _cc2_op_history,
         "gemini":      _gm_op_history,
         "grok":        _gk_op_history,
+        "opencode":    _oce_op_history,
     },
     # config:統一控制面(SessionControlSheet)的讀/寫。codex 的實作在
     # `/app/v2/sessions/{id}/config` 的 inline 路徑(出貨已久,一個位元不動),
@@ -25201,10 +25373,15 @@ _V2_SESSION_OPS: dict = {
     # 不是沒接線,是那一家的設定根本不住在 per-session 層。
     "config_read": {
         "codex": lambda rest, req: v2_session_config_read(f"codex:{rest}", req),
+        # S7:opencode 的 per-session 設定是協定一級公民
+        # (session/new|load 回 configOptions、set_config_option 可寫)——
+        # 這是 codex 之外第一家真的填得起這兩格的 provider。
+        "opencode": _oce_op_config_read,
     },
     "config_write": {
         "codex": lambda rest, req: v2_session_config_write(f"codex:{rest}", req),
         "cc2":   lambda rest, req: v2_cc2_settings(rest, req),
+        "opencode": _oce_op_config_write,
     },
 }
 
@@ -25259,6 +25436,23 @@ _PROVIDER_CAPS: dict = {
         # ACP sessionId 蒸發時會換一顆續命(同 gemini 的解耦設計)。
         # fork/rewind:x.ai/session/fork、x.ai/rewind/* 擴展存在(研究報告
         # §2),v2 再接 —— 不在 caps 假裝已通(管線存在≠端到端通)。
+        "interrupt": True, "queued_messages": True, "streaming": "live",
+        "terminal_status_quality": "strong", "approvals": True,
+        "approval_callbacks_live_only": True, "native_id_strength": "weak",
+    },
+    "opencode": {
+        # 2026-11-16 本機實測(1.19.5)逐項驗過才敢宣告:
+        # interrupt=True:session/cancel → prompt 0.7 秒內回
+        #   stopReason="cancelled"(不是 advisory;v1/v2 兩線都接了)。
+        # terminal_status_quality=strong:session/prompt 回 stopReason。
+        # approval_callbacks_live_only=True:等待者是記憶體 Future
+        #   (_OCE_PERM_WAITERS),bridge 重啟即不可答 —— 同 gemini/grok/cc2。
+        # native_id_strength=weak:v2 id 的 rest 是 bridge 名錄 key,
+        #   ACP sessionId 蒸發時換一顆續命(同 gemini/grok 的解耦設計)。
+        # **沒宣告的**:compact(availableCommands 實測沒有 compact,
+        #   所以沒接 —— 宣告了就是 app 畫出來按下去 409 的死鈕);
+        #   fork/rewind(sessionCapabilities 有 fork,但端到端沒驗過 ——
+        #   「管線存在≠端到端通」)。
         "interrupt": True, "queued_messages": True, "streaming": "live",
         "terminal_status_quality": "strong", "approvals": True,
         "approval_callbacks_live_only": True, "native_id_strength": "weak",
@@ -25627,6 +25821,11 @@ def _guest_cards_feed(session_id: str, record: dict, resolved: str = "") -> None
                  else d.handle_approval(record))
         elif sid.startswith("grok:"):
             d = _GK_CARD_DIGESTS.get(sid.split(":", 1)[1])
+            if d:
+                (d.resolve_approval(record, resolved) if resolved
+                 else d.handle_approval(record))
+        elif sid.startswith("opencode:"):
+            d = _OCE_CARD_DIGESTS.get(sid.split(":", 1)[1])
             if d:
                 (d.resolve_approval(record, resolved) if resolved
                  else d.handle_approval(record))
@@ -29022,6 +29221,642 @@ async def grok_config_put(request: Request):
             "model_scope": "global"}
 
 
+
+# ─────────── S7:OpenCode(sst/opencode,純 ACP)provider ──────────────────
+# 傳輸層 opencode_sdk.py(泵與 grok 共用 acp_rail);卡片 carddigest.
+# OpenCodeDigest。定位:Pocket **Build 主引擎**(MIT、75+ provider、
+# OpenRouter 即插、零認證就能跑)。rail 形狀照 S6(grok),三個真實差異:
+#
+# 1. **沒有登入牆**:grok 未登入就不開行程;opencode 內建免費模型池,
+#    2026-11-16 實測零認證 session/prompt 一樣回 end_turn。所以這裡**沒有**
+#    _require_login 那一層 —— 加了就是把一個本來就能用的 provider 關掉。
+# 2. **模型是 per-session**:session/set_config_option 讓 _V2_SESSION_OPS 的
+#    config_read/config_write 對這家是真支援(codex 之後第一家)。
+# 3. **沒有 compact**:availableCommands 實測沒有 compact → v2 compact 路由
+#    刻意不加 opencode 分支(宣告了就是死鈕,cc2 2026-10-29 稽核那一顆)。
+#
+# 未安裝 → 全部靜默缺席(APNs 金鑰缺席模式)。
+
+OPENCODE = opencode_sdk.make_client(log=_log_event)
+_OCE_CARD_DIGESTS: dict = {}
+_OCE_TURNS: dict = {}    # acp_sid -> {"cid","text","key"}(進行中 turn 路由表)
+#: 忙碌時排隊的輸入(key -> [(content, blocks)]);上一輪收尾時 drain。
+_OCE_INPUT_QUEUE: dict = {}
+#: 權限請求等待者:approval id -> Future(cc2 seam:真相在等待者手上,
+#: 決定端點只叫醒;response_capability=live —— bridge 重啟即不可答)。
+_OCE_PERM_WAITERS: dict = {}
+_OCE_PERM_TIMEOUT = float(os.environ.get("POCKET_OPENCODE_APPROVAL_SEC", "180"))
+
+#: 回合失敗分類 → 人話 + 下一步。與 S6 的差別:**沒有 auth 那一條**
+#: (這家沒有登入牆,把 401 翻成「去登入」只會誤導 —— 真的 401 是某個
+#: provider 的 key 壞了,指引要指向模型/憑證設定而不是登入)。
+_OCE_FAILURE_RULES = (
+    ("credential", ("401", "unauthorized", "invalid api key", "no such model",
+                    "model not found", "invalid credentials"),
+     "OpenCode 連不上那個模型的供應商(通常是 API key 或模型 id 不對)。"
+     "到設定換個模型,或接上 OpenRouter key 後再試 —— 內建的免費模型"
+     "不需要任何 key。"),
+    ("quota", ("quota", "resource_exhausted", "429", "rate limit",
+               "too many requests", "insufficient credit"),
+     "這個模型的額度用完了(帳號層級限制,不是連線問題)。換一個模型"
+     "或等額度重置。"),
+    ("timeout", ("timeout", "timed out", "deadline"),
+     "OpenCode 這一回合等太久被中斷了。內容多的話可以拆小一點再試。"),
+    ("unavailable", ("unavailable", "503", "502", "connection refused",
+                     "process lost"),
+     "OpenCode 服務暫時連不上。這通常是上游或子程序的事,過一下再試。"),
+    ("no_binary", ("no_binary", "不在這台主機"),
+     "這台主機還沒安裝 OpenCode(curl -fsSL https://opencode.ai/install "
+     "| bash)。"),
+)
+
+
+def _opencode_failure_kind(exc: BaseException) -> str:
+    blob = f"{type(exc).__name__} {getattr(exc, 'code', '')} {exc}".lower()
+    for kind, needles, _ in _OCE_FAILURE_RULES:
+        if any(n in blob for n in needles):
+            return kind
+    return "other"
+
+
+def _opencode_failure_text(exc: BaseException) -> str:
+    """認得出 → 人話 + 下一步;認不出 → 照舊附原始訊息(不吞唯一線索)。"""
+    raw = str(exc)[:160]
+    blob = f"{type(exc).__name__} {getattr(exc, 'code', '')} {exc}".lower()
+    for _kind, needles, msg in _OCE_FAILURE_RULES:
+        if any(n in blob for n in needles):
+            return msg
+    return f"OpenCode 回合失敗：{raw}"
+
+
+def _opencode_key_from_session_id(session_id: str) -> str | None:
+    """`opencode:<key>` → key。
+
+    **刻意用 split 而不是 startswith("openc")**:openclaw 的 id 前綴是
+    `openclaw:`,只差三個字母;這裡比對的是完整 provider 段。
+    """
+    sid = str(session_id or "")
+    if not sid.startswith("opencode:"):
+        return None
+    rest = sid.split(":", 1)[1].strip()
+    return rest or None
+
+
+def _oce_busy(key: str) -> bool:
+    return any(t.get("key") == key for t in _OCE_TURNS.values())
+
+
+def _oce_turn_hold(key: str) -> str:
+    """在 create_task 之前把佔位鍵壓進 _OCE_TURNS(見 _oce_run_turn
+    docstring),回佔位鍵。呼叫點:input 的非忙碌路、queue drain。"""
+    hold = f"oce-hold-{uuid.uuid4().hex[:8]}"
+    _OCE_TURNS[hold] = {"cid": "", "text": "", "key": key}
+    return hold
+
+
+async def _oce_card_digest(key: str):
+    """取得(必要時建立+seed)該 key 的 digest。seed 來源 = 自家逐字稿
+    (session/load 的 replay 刻意不用 —— 卡 id 要穩定,同 S5/S6)。"""
+    d = _OCE_CARD_DIGESTS.get(key)
+    if d is None:
+        d = _OCE_CARD_DIGESTS[key] = carddigest.OpenCodeDigest()
+        d.store.media_session_id = f"opencode:{key}"
+    if not d.seeded:
+        d.seeded = True
+        try:
+            msgs = await asyncio.to_thread(opencode_sdk.transcript_read, key)
+            d.seed_messages(msgs)
+            d._status()
+        except Exception as e:  # noqa: BLE001
+            d.seeded = False
+            _log_event("oce_card_seed_error", session=key[:48],
+                       error=str(e)[:200])
+            raise HTTPException(status_code=500,
+                                detail="opencode card seed failed")
+    return d
+
+
+def _oce_on_update(acp_sid: str, update: dict) -> None:
+    """ACP session/update → 進行中 turn 的卡片流。
+
+    幀型別以 2026-11-16 實測為準:agent_message_chunk(正文)、
+    agent_thought_chunk(思考)、tool_call/tool_call_update(工具)。
+    usage_update / config_option_update / available_commands_update 刻意
+    不蓋章 —— 它們是 metadata,蓋成「狀態」只會讓狀態欄抽動。
+    沒有登記中的 turn(session/load 的歷史 replay)一律忽略。
+    """
+    t = _OCE_TURNS.get(acp_sid)
+    if not t:
+        return
+    # 錄製鉤(POCKET_RECORD_FIXTURE=目錄):同 S5/S6,ACP 通知 method 固定。
+    _record_digest_fixture_frame(str(t["key"]), "session/update", update)
+    d = _OCE_CARD_DIGESTS.get(t["key"])
+    if d is None:
+        return
+    kind = str(update.get("sessionUpdate") or "")
+    if kind == "agent_message_chunk":
+        content = update.get("content") or {}
+        text = (content.get("text") or "") if isinstance(content, dict) else ""
+        if text:
+            t["text"] += text
+            d.turn_delta(t["cid"], text)
+    elif kind == "agent_thought_chunk":
+        d.turn_status("思考中")
+    elif kind == "plan":
+        d.turn_status("規劃中")
+    elif kind in ("tool_call", "tool_call_update"):
+        title = str((update.get("title") or update.get("kind") or "工具"))[:40]
+        d.turn_status(f"使用工具:{title}")
+
+
+def _oce_approval_insert(record: dict) -> bool:
+    """pending approval 落 canonical approvals 表(provider='opencode')——
+    審核中心/推播/過期全部沿用既有機制。"""
+    import sqlite3
+    con = sqlite3.connect(CANON_DB, timeout=30)
+    try:
+        con.execute("INSERT INTO approvals"
+                    "(id,title,source,risk,detail,created_at,expires_at,status,"
+                    "decided_at,result,callback,session_id,provider,kind,options) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (record["id"], record["title"], record["source"],
+                     record["risk"], record["detail"], record["created_at"],
+                     record["expires_at"], "pending", None, None, None,
+                     record["session_id"], "opencode", "permission",
+                     json.dumps(record["options"], ensure_ascii=False)))
+        con.commit()
+        return True
+    except Exception as e:  # noqa: BLE001
+        _log_event("opencode_approval_insert_failed", error=type(e).__name__,
+                   error_message=str(e)[:160])
+        return False
+    finally:
+        con.close()
+
+
+#: 「核准/駁回」→ ACP optionId。opencode 的 options 實測是
+#: once / always / reject(kind: allow_once / allow_always / reject_once),
+#: 與 grok 同形 → **直接共用 _gk_pick_option**(偏好 *_once:放行的語意是
+#: 這一次,不替使用者按「永久允許」)。第三份同樣的挑選邏輯只會再多一處
+#: 漂移點 —— 這是 S6 review 抓 gemini 抄 SQL 時訂的紀律。
+_oce_pick_option = _gk_pick_option
+#: 審批狀態落 DB:provider 無關的那一句 UPDATE(同 S6)。
+_oce_approval_set_status = _cc_approval_set_status
+
+
+def _oce_approval_card(key: str, record: dict) -> None:
+    """待審 → 這條對話的卡片流(可直接按的核准卡;digest 不在 = 正常,
+    審核中心照樣有)。"""
+    d = _OCE_CARD_DIGESTS.get(key)
+    if d is None:
+        return
+    try:
+        d.handle_approval(record)
+    except Exception as exc:                      # noqa: BLE001
+        _log_exc("oce_approval_card", exc, expected=False)
+        _oce_perm_card(key, f"⏳ OpenCode 請求使用「{record.get('title') or '工具'}」"
+                            "—— 請到審核中心放行。")
+
+
+def _oce_resolve_approval_card(key: str, record: dict, status: str) -> None:
+    d = _OCE_CARD_DIGESTS.get(key)
+    if d is None:
+        return
+    try:
+        d.resolve_approval(record, status)
+    except Exception as exc:                      # noqa: BLE001
+        _log_exc("oce_resolve_approval_card", exc, expected=True)
+
+
+def _oce_perm_card(key: str, text: str) -> None:
+    d = _OCE_CARD_DIGESTS.get(key)
+    if d is None:
+        return
+    d.store.upsert_card(carddigest.make_card(
+        f"card-oce-perm-{uuid.uuid4().hex[:10]}", d.store.turn_id,
+        "system", "text", {"text": text, "fallback_text": text}))
+
+
+async def _oce_on_request(req: dict):
+    """server→client 請求。`session/request_permission`(blocking reverse-
+    request)→ 我們的 approvals 管線。收尾路只有一條(在這裡):使用者決定
+    與逾時都由本協程 mark DB + 出卡 + 回 ACP outcome;決定端點只叫醒。
+    """
+    method = str(req.get("method") or "")
+    params = req.get("params") or {}
+    if method != "session/request_permission":
+        return None
+
+    acp_sid = str(params.get("sessionId") or "")
+    t = _OCE_TURNS.get(acp_sid)
+    call = params.get("toolCall") or {}
+    tool = str(call.get("title") or call.get("kind") or "工具")[:60]
+    options = params.get("options") or []
+    _log_event("opencode_permission_requested", tool=tool,
+               options=json.dumps(options, ensure_ascii=False)[:400])
+
+    key = t.get("key") if t else (OPENCODE.acp_to_key(acp_sid) or "")
+    if not key:
+        _log_event("opencode_permission_unroutable", tool=tool)
+        return {"outcome": {"outcome": "cancelled"}}
+
+    if not _oce_pick_option(options, True):
+        # 沒有可放行的選項 = 掛住等人也只能逾時 cancelled,白卡一回合。
+        _log_event("opencode_permission_autodenied", tool=tool,
+                   reason="no_allow_option")
+        _oce_perm_card(key, f"⚠️ OpenCode 請求使用「{tool}」權限,但沒有給可"
+                            "放行的選項,已自動拒絕。")
+        return {"outcome": {"outcome": "cancelled"}}
+
+    aid = f"oce-{uuid.uuid4().hex[:12]}"
+    now = int(time.time())
+    record = {
+        "id": aid,
+        "title": f"OpenCode 要使用「{tool}」",
+        "source": f"opencode:{key}",
+        # ACP 的 options 沒有風險語意;風險分級(dangerous tool list)是
+        # v2 的事,先誠實給 normal(同 S6 的判準)。
+        "risk": "normal",
+        "detail": str(call.get("rawInput") or call.get("title") or tool)[:800],
+        "created_at": now,
+        # max(1, …):逾時設成不足 1 秒時 int() 會truncate 成 0,expires_at
+        # 等於「現在」→ _approvals_expire 會在使用者看到卡片之前就把它標成
+        # expired(待審掃描回空、列表看不出在等你)。下限 1 秒。
+        "expires_at": now + max(1, int(_OCE_PERM_TIMEOUT)),
+        "session_id": f"opencode:{key}",
+        # 正規化成契約形狀(ACP 原形會讓 app 畫出空白按鈕 —— S5 的事故;
+        # _gm_normalize_options 是純函式,ACP options 三家同形,共用一份)。
+        "options": _gm_normalize_options(options),
+    }
+    if not _oce_approval_insert(record):
+        return {"outcome": {"outcome": "cancelled"}}
+
+    loop = asyncio.get_running_loop()
+    fut: asyncio.Future = loop.create_future()
+    _OCE_PERM_WAITERS[aid] = fut
+    _oce_approval_card(key, record)
+    _approval_push(aid, record["title"], record["detail"], record["session_id"])
+
+    try:
+        approve = await asyncio.wait_for(fut, timeout=_OCE_PERM_TIMEOUT)
+    except asyncio.TimeoutError:
+        _oce_approval_set_status(aid, "expired")
+        _oce_resolve_approval_card(key, record, "expired")
+        _oce_perm_card(key, f"⌛ 「{tool}」等不到放行({int(_OCE_PERM_TIMEOUT)} 秒),"
+                            "已自動拒絕。")
+        _log_event("opencode_permission_expired", approval_id=aid, tool=tool)
+        return {"outcome": {"outcome": "cancelled"}}
+    finally:
+        _OCE_PERM_WAITERS.pop(aid, None)
+
+    if approve:
+        opt = _oce_pick_option(options, True) or ""
+        _oce_approval_set_status(aid, "approved")
+        _oce_resolve_approval_card(key, record, "approved")
+        _oce_perm_card(key, f"✅ 已放行「{tool}」。")
+        _log_event("opencode_permission_approved", approval_id=aid, tool=tool,
+                   option=opt)
+        return {"outcome": {"outcome": "selected", "optionId": opt}}
+    _oce_approval_set_status(aid, "denied")
+    _oce_resolve_approval_card(key, record, "denied")
+    _oce_perm_card(key, f"⛔ 已駁回「{tool}」。")
+    opt = _oce_pick_option(options, False)
+    _log_event("opencode_permission_denied", approval_id=aid, tool=tool,
+               option=opt or "(cancelled)")
+    if opt:
+        return {"outcome": {"outcome": "selected", "optionId": opt}}
+    return {"outcome": {"outcome": "cancelled"}}
+
+
+def _oce_approval_decide(aid: str, b: dict) -> dict:
+    """決定端點的 opencode 分支 —— 只叫醒等待者(收尾在 _oce_on_request)。
+    等待者不在 = 已決/逾時/bridge 重啟過 → 409,不改 DB(S5/S6 同語意)。
+    body 三形狀的解析共用 `_gm_decision_is_approve`(查的是 aid 那筆的正規化
+    選項,與 provider 無關;認不出一律駁回 fail-closed)。"""
+    fut = _OCE_PERM_WAITERS.get(aid)
+    if fut is None or fut.done():
+        raise HTTPException(status_code=409,
+                            detail="already decided or expired")
+    approve = _gm_decision_is_approve(aid, b)
+    fut.set_result(approve)
+    _log_event("opencode_approval_decision", approval_id=aid, approve=approve)
+    return {"id": aid, "status": "approved" if approve else "denied",
+            "key": "approve" if approve else "deny"}
+
+
+OPENCODE.on_update = _oce_on_update
+OPENCODE.on_request = _oce_on_request
+
+
+def _oce_turn_end_push(key: str, digest, summary: str, ok: bool) -> None:
+    """回合收尾 → 沒人在看(無 SSE 訂閱者)就推播;失敗也推(⚠️)。"""
+    try:
+        if getattr(digest.store, "_wakers", None):
+            return
+        row = opencode_sdk.get_session(key) or {}
+        display = (row.get("title") or "").strip() or f"OpenCode {key[:8]}"
+        _turn_end_push(f"opencode:{key}", display, summary,
+                       outcome="completed" if ok else "failed")
+    except Exception as exc:            # noqa: BLE001
+        _log_exc("oce_turn_end_push", exc, expected=True)
+
+
+async def _oce_run_turn(key: str, content: str,
+                        blocks: list | None = None,
+                        hold: str = "") -> None:
+    """`hold` = 呼叫端在 create_task 前先壓進 _OCE_TURNS 的佔位鍵
+    (ensure_session 的 await 窗口裡 _oce_busy() 看不到這個 turn,第二則
+    輸入會繞過排隊開第二輪 —— S6 review 抓的同款窗口,這裡一開始就有)。
+    """
+    d = await _oce_card_digest(key)
+    cid = uuid.uuid4().hex[:10]
+    acp_sid = ""
+    try:
+        acp_sid = await OPENCODE.ensure_session(key)
+        _OCE_TURNS[acp_sid] = {"cid": cid, "text": "", "key": key}
+        if hold:
+            _OCE_TURNS.pop(hold, None)
+        d.turn_begin(cid, "已送達 OpenCode，回覆中。")
+        opencode_sdk.touch_session(key, title_hint=content)
+        res = await OPENCODE.call(
+            "session/prompt",
+            {"sessionId": acp_sid,
+             "prompt": ([{"type": "text", "text": content}] if content else [])
+                       + (blocks or [])},
+            timeout=float(os.environ.get("OPENCODE_TURN_TIMEOUT", "900")))
+        stop = str((res or {}).get("stopReason") or "")
+        full = _OCE_TURNS.get(acp_sid, {}).get("text", "")
+        mid = ""
+        if full:
+            mid = await asyncio.to_thread(
+                opencode_sdk.transcript_append, key, "assistant", full)
+        d.turn_end(cid, full, reply_mid=mid)
+        _log_event("opencode_turn_end", session=key[:32], stop=stop,
+                   chars=len(full))
+        _oce_turn_end_push(key, d, full, ok=True)
+    except Exception as e:  # noqa: BLE001
+        partial = _OCE_TURNS.get(acp_sid, {}).get("text", "") if acp_sid else ""
+        try:
+            d.turn_end(cid, partial, error=_opencode_failure_text(e))
+        except Exception as e2:  # noqa: BLE001
+            _log_exc("oce_turn_end_error", e2, expected=True)
+        _log_event("opencode_turn_failed", session=key[:32],
+                   error=type(e).__name__, error_message=str(e)[:160],
+                   kind=_opencode_failure_kind(e))
+        _oce_turn_end_push(key, d, _opencode_failure_text(e), ok=False)
+    finally:
+        if acp_sid:
+            _OCE_TURNS.pop(acp_sid, None)
+        if hold:
+            _OCE_TURNS.pop(hold, None)   # 半路炸掉也不准把 busy 卡死
+        # drain:失敗也 drain,否則後送的訊息永遠卡著(S5/S6 同款)。
+        pending = _OCE_INPUT_QUEUE.get(key)
+        if pending:
+            nxt_content, nxt_blocks = pending.pop(0)
+            if not pending:
+                _OCE_INPUT_QUEUE.pop(key, None)
+            _log_event("opencode_queue_drain", session=key[:32],
+                       remaining=len(pending))
+            t2 = asyncio.create_task(
+                _oce_run_turn(key, nxt_content, nxt_blocks,
+                              hold=_oce_turn_hold(key)))
+            _BG_TASKS.add(t2)
+            t2.add_done_callback(_BG_TASKS.discard)
+
+
+async def _opencode_v2_rows() -> list:
+    if not OPENCODE.configured():
+        return []
+    rows = await asyncio.to_thread(opencode_sdk.list_sessions)
+    out = [opencode_sdk.session_v2_row(r, busy=_oce_busy(str(r.get("id"))))
+           for r in rows[:20]]
+    if not out:
+        # 新裝也要有一個入口:第一則訊息送到 opencode:default 才真正開
+        # ACP session(冷啟 5~26 秒,不在列表熱路徑上付這個錢)。
+        out = [opencode_sdk.session_v2_row({"id": "default",
+                                            "title": "OpenCode"})]
+    # 待審表**一次**查完整個 provider 再逐列對(S6 的 review 紀律)。
+    try:
+        pend = await asyncio.to_thread(_opencode_pending_by_session)
+    except Exception as exc:                      # noqa: BLE001
+        _log_exc("oce_pending_scan", exc, expected=True)
+        pend = {}
+    return [_oce_row_align(r, pend) for r in out]
+
+
+def _oce_row_align(row: dict, pend: dict) -> dict:
+    """對齊 v2 契約(S5/S6 的兩個教訓):last_event_at 要 ISO8601 UTC 字串;
+    待審要在列表看得出來(waiting_approval + meta.approval)。"""
+    row = dict(row)
+    row["last_event_at"] = _v2_iso_utc(row.get("last_event_at") or None)
+    hit = (pend or {}).get(str(row.get("id") or ""))
+    if hit:
+        row["status"] = "waiting_approval"
+        meta = dict(row.get("meta") or {})
+        meta["approval"] = hit
+        row["meta"] = meta
+    return row
+
+
+async def _oce_input_core(key: str, session_id: str, body: dict) -> dict:
+    """v2 統一 input(契約 §4.4)的 opencode 分支:收下即回 ack,回覆走卡片
+    事件流。client_id 去重與 cc 共用同一套 TTL/鎖。
+
+    **沒有登入檢查**:這家零認證可用(見 S7 區頭註解)。"""
+    if not OPENCODE.configured():
+        raise http_err(404, "SESSION_NOT_FOUND", "opencode not installed")
+    dedup, prior = await _oce_input_claim(key, body.get("client_id"))
+    if prior is not None:
+        return await _oce_input_wait_prior(prior)
+    try:
+        return await _oce_input_run(key, session_id, body, dedup)
+    except BaseException:
+        _cc_input_release(dedup)   # 失敗不留佔位,否則重試會被當成重複而卡住
+        raise
+
+
+async def _oce_input_claim(key: str, client_id):
+    return await _cc_input_claim(f"opencode:{key}", client_id)
+
+
+async def _oce_input_wait_prior(prior) -> dict:
+    try:
+        await asyncio.wait_for(prior["event"].wait(), _CX_INPUT_INFLIGHT_WAIT)
+    except asyncio.TimeoutError:
+        _log_event("opencode_input_dedup_wait_timeout")
+        return {"ok": True, "accepted": True, "deduplicated": True}
+    _log_event("opencode_input_deduplicated")
+    return dict(prior.get("result") or
+                {"ok": True, "accepted": True, "deduplicated": True})
+
+
+async def _oce_input_run(key: str, session_id: str, body: dict,
+                         dedup) -> dict:
+    content = (body.get("content") or body.get("text") or "").strip()
+    attachments = body.get("attachments") or []
+    # 附件(S5/S6 同款):影像 → prompt 的 image block(initialize 實測
+    # promptCapabilities.image=true);語音 → 轉寫;其他 → 存檔附路徑
+    # (CLI 跑在本機,讀得到檔)。不默吞。
+    blocks: list = []
+    note_paths: list = []
+    voice_lines: list = []
+    att_meta: list = []
+    if attachments:
+        _att_guard(attachments)
+        stt_lang = str(body.get("stt_lang") or "").strip()
+        for a in attachments:
+            path = _save_attachment(a, (a or {}).get("filename") or "file")
+            if not path:
+                continue
+            att_meta.append({"kind": (a or {}).get("kind"),
+                             "filename": (a or {}).get("filename"),
+                             "mime": (a or {}).get("mime"),
+                             "path": path})
+            if (a or {}).get("kind") == "audio":
+                t = await asyncio.to_thread(_transcribe, path, "", stt_lang)
+                if t:
+                    voice_lines.append(t)
+                else:
+                    note_paths.append(path)
+            elif (a or {}).get("kind") == "image" and OPENCODE.supports_image():
+                mime = (a.get("mime") or mimetypes.guess_type(path)[0]
+                        or "image/png")
+                try:
+                    with open(path, "rb") as fh:
+                        blocks.append({"type": "image", "mimeType": mime,
+                                       "data": base64.b64encode(
+                                           fh.read()).decode()})
+                except OSError as _exc:
+                    _log_exc("_oce_input_core.image", _exc, expected=True)
+                    note_paths.append(path)
+            else:
+                note_paths.append(path)
+        if voice_lines:
+            content = "\n".join(voice_lines
+                                + ([content] if content else [])).strip()
+        if note_paths:
+            content = (content + "\n\n[附件:" + " ".join(note_paths) + "]").strip()
+        _log_event("opencode_attachments", session=key[:32],
+                   images=len(blocks), paths=len(note_paths),
+                   voice=len(voice_lines))
+    if not content and not blocks:
+        raise http_err(400, "EMPTY_CONTENT", "content required")
+    d = await _oce_card_digest(key)
+    mid = await asyncio.to_thread(
+        opencode_sdk.transcript_append, key, "user", content)
+    if att_meta:
+        _schedule_media_capture(session_id,
+                                {"content": content, "attachments": att_meta})
+    d.message_card({"id": mid, "role": "user", "content": content,
+                    "attachments": att_meta, "ts": time.time()})
+    # 忙碌 → 排隊不 409(訊息比額度珍貴,S5/S6/C11 同款)。
+    if _oce_busy(key):
+        _OCE_INPUT_QUEUE.setdefault(key, []).append((content, blocks))
+        depth = len(_OCE_INPUT_QUEUE[key])
+        _log_event("opencode_input_queued", session=key[:32], depth=depth)
+        out = {"ok": True, "session_id": session_id, "accepted": True,
+               "queued": True, "queue_depth": depth, "message_id": mid}
+        _cc_input_settle(dedup, out)
+        return out
+    task = asyncio.create_task(
+        _oce_run_turn(key, content, blocks, hold=_oce_turn_hold(key)))
+    _BG_TASKS.add(task)
+    task.add_done_callback(_BG_TASKS.discard)
+    out = {"ok": True, "session_id": session_id, "accepted": True,
+           "message_id": mid}
+    _cc_input_settle(dedup, out)
+    return out
+
+
+async def _opencode_v1_post_message(body: dict, request: Request):
+    """OpenAI 相容入口(Open WebUI 線)的 opencode 分支 —— 與 S5/S6 同形:
+    收下即 ack,回覆走卡片事件流。"""
+    session_id = str(body.get("session") or "opencode:default")
+    key = _opencode_key_from_session_id(session_id)
+    if not key:
+        raise http_err(400, "SESSION_NOT_FOUND", "unknown opencode session")
+    if not OPENCODE.configured():
+        raise http_err(404, "SESSION_NOT_FOUND", "opencode not installed")
+    dry_run = bool(body.get("dry_run"))
+    cid = "ocemsg-" + uuid.uuid4().hex[:20]
+    created = int(time.time())
+    if not dry_run:
+        await _oce_input_core(key, session_id, body)
+
+    def chunk(delta, finish=None, **extra):
+        payload = {"id": cid, "object": "chat.completion.chunk",
+                   "created": created, "model": session_id,
+                   "choices": [{"index": 0, "delta": delta,
+                                "finish_reason": finish}]}
+        payload.update(extra)
+        return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+    async def agen():
+        yield chunk({"role": "assistant", "content": ""})
+        yield chunk({}, None, status={"state": "accepted",
+                                      "label": "OpenCode 已收到，正在回覆。"},
+                    accepted=True, dry_run=dry_run)
+        yield chunk({}, "stop", accepted=True, dry_run=dry_run)
+        yield "data: [DONE]\n\n"
+
+    return StreamingResponse(
+        agen(), media_type="text/event-stream",
+        headers=SSE_HEADERS)
+
+
+@app.get("/app/v1/opencode/config")
+async def opencode_config_get(request: Request):
+    """App 設定面板的讀取端。
+
+    與 grok 那支的關鍵差別:`auth_required: False` + `configured` **不**含
+    登入條件 —— 這家裝了就能用。`login_hint` 是加值說明(解鎖 75+ provider),
+    不是阻擋原因,所以永遠給(app 可以當說明文字顯示,不要畫成錯誤)。
+    """
+    _check_auth(request)
+    cfg = opencode_sdk.load_config()
+    st = opencode_sdk.auth_state()
+    return {"installed": OPENCODE.configured(),
+            "configured": OPENCODE.configured(),
+            "auth_required": False,
+            "source": cfg["source"], "key_set": st["key_set"],
+            "logged_in": st["logged_in"], "auth_method": st["method"],
+            "login_hint": opencode_sdk.AUTH_GUIDANCE,
+            # 模型:per-session(session/set_config_option);這裡的 model 是
+            # 「新 session 的預設偏好」,per-session 現值走
+            # GET /app/v2/sessions/opencode:{key}/config。
+            "model": cfg["model"], "model_source": cfg["model_source"],
+            "model_scope": "session"}
+
+
+@app.put("/app/v1/opencode/config")
+async def opencode_config_put(request: Request):
+    """寫入 OpenRouter key / 預設模型(0600 落檔;env 仍優先;合併寫入)。
+
+    key 改了要重新握手才會進子程序 env(drop proc,同 gemini/grok 路徑);
+    **模型改了不必重啟** —— 它是 per-session 設定,下一條新 session 自動
+    套用,既有 session 走 v2 config_write 當場改。
+    """
+    _check_auth(request)
+    body = await request.json()
+    has_key = "api_key" in body
+    has_model = "model" in body
+    if not has_key and not has_model:
+        raise http_err(400, "EMPTY", "api_key / model 至少要帶一個")
+    cfg = opencode_sdk.save_config(
+        str(body.get("api_key") or "") if has_key else None,
+        str(body.get("model") or "") if has_model else None)
+    if has_key:
+        await OPENCODE._drop_proc()
+    _log_event("opencode_config_updated", configured=OPENCODE.configured(),
+               source=cfg["source"], model=cfg["model"] or "(cli-default)",
+               changed=",".join(k for k, v in (("api_key", has_key),
+                                               ("model", has_model)) if v))
+    return {"ok": True, "configured": OPENCODE.configured(),
+            "source": cfg["source"],
+            "model": cfg["model"], "model_source": cfg["model_source"],
+            "model_scope": "session"}
+
+
 def _tg_any_target() -> bool:
     """任一人格解得出 TG 投遞目標嗎(= 這台主機真的接了 TG bot)。
 
@@ -29395,6 +30230,8 @@ async def _v2_card_store(session_id: str):
         return (await _gm_card_digest(src[1])).store
     if src[0] == "gk":
         return (await _gk_card_digest(src[1])).store
+    if src[0] == "oce":
+        return (await _oce_card_digest(src[1])).store
     if src[0] == "cc2":
         # digest 常駐於 session 物件(不像 tmux 要每次 seed + 跟隨器)。
         # 歷史:session 建立時 `_seed_history` 會從 ~/.claude 的 transcript
@@ -33609,6 +34446,8 @@ async def app_post_message(request: Request):
         return await _gemini_v1_post_message(body, request)
     if _grok_key_from_session_id(session):
         return await _grok_v1_post_message(body, request)
+    if _opencode_key_from_session_id(session):
+        return await _opencode_v1_post_message(body, request)
     if session not in PERSONAS:
         raise http_err(400, "SESSION_NOT_FOUND", "unknown session")
     content = (body.get("content") or "").strip()
@@ -33871,6 +34710,13 @@ async def app_message_interrupt(request: Request):
         _log_event("grok_interrupt", session=gk_key[:32])
         return {"ok": True, "session": session, "interrupted": True,
                 "attempts": 1}
+    oce_key = _opencode_key_from_session_id(session)
+    if oce_key:
+        # S7:v1 線也要是真的停止鈕(S6 修過的不對稱,新 provider 不准重犯)。
+        await OPENCODE.cancel(oce_key)
+        _log_event("opencode_interrupt", session=oce_key[:32])
+        return {"ok": True, "session": session, "interrupted": True,
+                "attempts": 1}
     if session not in PERSONAS:
         raise http_err(400, "SESSION_NOT_FOUND", "unknown session")
     return await _persona_interrupt_core(session)
@@ -33926,6 +34772,11 @@ def _approval_provider_of(source: str) -> str:
         return "claude_code"
     if source.startswith("codex"):
         return "codex"
+    # opencode 要排在 openclaw **之前**:兩個前綴都以 "openc" 開頭,
+    # 順序寫反會把 opencode 的審批標成 openclaw(provider 欄位一錯,
+    # response_capability 與 app 的分組就跟著錯)。
+    if source.startswith("opencode"):
+        return "opencode"
     if source.startswith("openclaw"):
         return "openclaw"
     return "hermes"
@@ -33963,6 +34814,10 @@ def _approval_response_capability(aid: str, provider: str, src: str,
             # S6:同 gemini —— 等待者是記憶體 Future,bridge 重啟即不可答。
             # 漏這格的後果:重啟後 app 的核准鈕看起來還能按,按了吃 409。
             fut = _GK_PERM_WAITERS.get(aid)
+            return "live" if fut is not None and not fut.done() else "not_resumable"
+        if src.startswith("opencode:"):
+            # S7:同款記憶體 Future(_OCE_PERM_WAITERS)。
+            fut = _OCE_PERM_WAITERS.get(aid)
             return "live" if fut is not None and not fut.done() else "not_resumable"
     except Exception as exc:  # noqa: BLE001
         _log_event("approval_response_capability_probe_failed",
@@ -34129,6 +34984,31 @@ def _grok_pending_by_session() -> dict:
             con.close()
     except Exception as e:  # noqa: BLE001
         _log_event("grok_pending_scan_failed", error=str(e)[:160])
+    return out
+
+
+def _opencode_pending_by_session() -> dict:
+    """opencode 的 pending 待審(session_id='opencode:{key}')→ 統一物件,
+    每 session 取最早一筆(S5/S6 同款:列表看不出「它在等你」= 窗口逾時
+    被拒)。LIKE 'opencode:%' 不會誤收 openclaw(前綴整段比對)。"""
+    import sqlite3
+    out = {}
+    try:
+        con = sqlite3.connect(CANON_DB, timeout=30)
+        try:
+            _approvals_expire(con)
+            con.commit()
+            rows = con.execute(
+                f"SELECT {_APPROVAL_COLS} FROM approvals WHERE status='pending'"
+                " AND session_id LIKE 'opencode:%' ORDER BY created_at ASC"
+            ).fetchall()
+            for r in rows:
+                d = _approval_row(r)
+                out.setdefault(d["session_id"], d)
+        finally:
+            con.close()
+    except Exception as e:  # noqa: BLE001
+        _log_event("opencode_pending_scan_failed", error=str(e)[:160])
     return out
 
 
@@ -34563,6 +35443,11 @@ async def _approval_decide_serial(aid: str, b: dict) -> dict:
     if d and src.startswith("grok:"):
         # S6:同上 —— 真相在 _gk_on_request 的等待者手上,這裡只叫醒。
         return _gk_approval_decide(aid, b)
+    if d and src.startswith("opencode:"):
+        # S7:同上。**必須在 openclaw 分支之前** —— "opencode:" 與
+        # "openclaw" 共享 "openc" 前綴,openclaw 那條用的是 startswith
+        # ("openclaw") 所以不會誤收,但順序寫反會讓人以為可以。
+        return _oce_approval_decide(aid, b)
     if d and src.startswith("openclaw"):
         # openclaw 的審批真相在 gateway 手上(bridge 只是鏡像)——一定要先
         # 打 `*.approval.resolve`,成功了才改 DB。反過來寫會出現「app 顯示

@@ -77,6 +77,15 @@ _ENV_TMP_DEFAULTS = {
     "GROK_AUTH_FILE":         os.path.join(_TMP, "grok-auth.json"),
     "GROK_WORKDIR":           os.path.join(_TMP, "grok", "workspace"),
     "POCKET_GROK_BIN":        os.path.join(_TMP, "no-grok-bin"),
+    # opencode_sdk.py(S7)—— 同款:config/state/workspace 全走 tmp;
+    # auth 檔導開(logged_in() 不准讀開發機的 ~/.local/share/opencode/
+    # auth.json);binary 指到不存在的路徑 → configured() False,測試機裝沒裝
+    # opencode 都一樣(要測「已安裝」的檔自己 monkeypatch opencode_bin)。
+    "OPENCODE_CONFIG_FILE":   os.path.join(_TMP, "opencode.json"),
+    "OPENCODE_STATE_DIR":     os.path.join(_TMP, "opencode"),
+    "OPENCODE_AUTH_FILE":     os.path.join(_TMP, "opencode-auth.json"),
+    "OPENCODE_WORKDIR":       os.path.join(_TMP, "opencode", "workspace"),
+    "POCKET_OPENCODE_BIN":    os.path.join(_TMP, "no-opencode-bin"),
     # studio_memory_mcp.py
     "STUDIO_MEMORY_HOME":     os.path.join(_TMP, "studio-memory-home"),
     # bridge.py HOME_ROOT:persona home 一律指到 tmp。不導的話,測試打到的
