@@ -11,15 +11,19 @@ initialize → session/new|load → session/prompt,回覆經 `session/update`
 「配置 + 子程序生命週期 + JSON-RPC 呼叫/通知泵 + session 名錄持久化」;
 卡片 digest 在 carddigest.GrokDigest,v2 路由/審批接線在 bridge.py(S6 區)。
 
-## 為什麼是「最小複製」而不是與 gemini_provider 抽共用 ACP 層(2026-11-16)
+## 泵在哪:acp_rail.AcpProcessClient(2026-11-16 抽出共用層)
 
-JSON-RPC 泵(_ensure_proc/_read_loop/_call_locked)的形狀複製自
-`gemini_provider.GeminiClient` —— 那是 bridge 裡經過實戰的 ACP client。
-刻意**不**回頭把 GeminiClient 改成共用基底:gemini 是 production 在跑的
-rail,為了新 provider 去重構它,風險(回歸)大於收益(省 ~150 行)。
-兩家的差異也真實存在:gemini 要 authenticate 握手(oauth/api-key 計畫),
-grok 用 ambient 憑證(~/.grok/auth.json 或 XAI_API_KEY env),沒有
-authenticate 呼叫。等第三家純 ACP provider 出現再抽共用層(三點成線)。
+JSON-RPC 泵原本是從 `gemini_provider.GeminiClient` 最小複製來的,當時在這裡
+留了一句「等第三家純 ACP provider 出現再抽共用層(三點成線)」。opencode 就是
+第三家 —— 泵已經搬進 `acp_rail.py`(grok/opencode 共用),本檔只留「grok 怎麼
+起行程 + 名錄/逐字稿/x.ai 擴展」。`GrokClient` 的對外介面
+(configured/logged_in/ensure_session/call/cancel/updates_tail/server_info)
+一個位元都沒變 —— 這一刀的回歸網就是 S6 那 57 條測試。
+
+刻意**不**回頭改 `gemini_provider.GeminiClient`:gemini 是 production 在跑的
+rail,為了新 provider 去重構它,風險(回歸)大於收益。兩家的差異也真實存在:
+gemini 要 authenticate 握手(oauth/api-key 計畫),grok 用 ambient 憑證
+(~/.grok/auth.json 或 XAI_API_KEY env),沒有 authenticate 呼叫。
 
 設計要點:
 - 偵測照 agy 模式:binary 不在 → configured() False → bridge 全部靜默缺席
@@ -43,6 +47,8 @@ import shutil
 import time
 import uuid
 
+import acp_rail
+
 _CONFIG_FILE = os.path.expanduser(
     os.environ.get("GROK_CONFIG_FILE", "~/.pocket/grok.json"))
 _STATE_DIR = os.path.expanduser(
@@ -64,13 +70,8 @@ _AUTH_FILE = os.path.expanduser(
     os.environ.get("GROK_AUTH_FILE", "~/.grok/auth.json"))
 
 
-class GrokError(Exception):
-    """grok ACP 回的結構化錯誤或傳輸層失敗。"""
-
-    def __init__(self, message: str, code: str = "", retryable: bool = False):
-        super().__init__(message)
-        self.code = code
-        self.retryable = retryable
+class GrokError(acp_rail.AcpError):
+    """grok ACP 回的結構化錯誤或傳輸層失敗(欄位同 AcpError)。"""
 
 
 # ── 配置/偵測 ───────────────────────────────────────────────────────────────
@@ -301,272 +302,92 @@ def transcript_read(sid: str, limit: int = 200) -> list[dict]:
 
 def project_updates_to_messages(updates: list) -> list[dict]:
     """ACP update 幀(x.ai/session/updates 的 `updates` 陣列)→
-    `{id, role, content, ts}` 訊息列(舊→新)。
-
-    規則:連續的同角色 *_message_chunk 併成一則(ACP 逐字就是這樣切的);
-    thought / tool_call / plan 等非正文幀略過 —— 這條投影餵的是「訊息歷史」
-    分頁,工具過程由卡片流呈現,不混進來。認不出的幀一律跳過(x.ai 擴展
-    會長新型別,歷史分頁壞掉不值得)。
-    """
-    out: list[dict] = []
-    for fr in updates or []:
-        if not isinstance(fr, dict):
-            continue
-        upd = fr.get("update") if isinstance(fr.get("update"), dict) else (
-            (fr.get("params") or {}).get("update")
-            if isinstance(fr.get("params"), dict) else None)
-        if upd is None and fr.get("sessionUpdate"):
-            upd = fr
-        if not isinstance(upd, dict):
-            continue
-        kind = str(upd.get("sessionUpdate") or "")
-        if kind == "agent_message_chunk":
-            role = "assistant"
-        elif kind == "user_message_chunk":
-            role = "user"
-        else:
-            continue
-        content = upd.get("content")
-        text = ""
-        if isinstance(content, dict):
-            text = str(content.get("text") or "")
-        elif isinstance(content, list):
-            text = "\n".join(str((c or {}).get("text") or "") for c in content
-                             if isinstance(c, dict))
-        if not text:
-            continue
-        if out and out[-1]["role"] == role:
-            out[-1]["content"] += text
-        else:
-            out.append({"id": f"gk-h{len(out)}", "role": role,
-                        "content": text, "ts": None})
-    return out
+    `{id, role, content, ts}` 訊息列(舊→新)。投影規則與 id 前綴以外的
+    邏輯都在 `acp_rail.project_updates_to_messages`(opencode 同用一份)。"""
+    return acp_rail.project_updates_to_messages(updates, "gk-")
 
 
 # ── ACP 客戶端 ─────────────────────────────────────────────────────────────
 
-class GrokClient:
-    """單一常駐 `grok agent stdio` 子程序的 JSON-RPC 客戶端。
+class GrokClient(acp_rail.AcpProcessClient):
+    """單一常駐 `grok agent stdio` 子程序的 ACP 客戶端。
+
+    泵(spawn/read_loop/call/server→client 回覆)在 acp_rail;本類只描述
+    「grok 怎麼起行程」與 grok 專屬的 session/擴展語意。
 
     on_update(session_id:str, update:dict) — session/update 通知(bridge 掛)。
     on_request(req:dict) → awaitable|None — server→client 請求
         (session/request_permission 等)。未掛或回 None → 保守拒絕。
     """
 
+    _log_prefix = "grok"
+    _debug_env = "GROK_DEBUG"
+    _error_cls = GrokError
+
     def __init__(self, log=None):
-        self._log = log or (lambda *_a, **_k: None)
-        self.proc: asyncio.subprocess.Process | None = None
-        self._lock = asyncio.Lock()
-        self._pending: dict[int, asyncio.Future] = {}
-        self._rid = 0
-        self._reader: asyncio.Task | None = None
+        super().__init__(log=log)
         self._loaded: set[str] = set()   # 本程序已 new/load 過的 ACP session
-        self.on_update = None
-        self.on_request = None
-        #: initialize 的完整回應(capabilities / authMethods / _meta)。
-        #: `x.ai/*` 擴展要從這裡發現,不硬編(官方文件明言 non-exhaustive)。
-        self.server_info: dict = {}
         #: 跑著的行程實際用的身分("login" / "api-key";未連線 = "")。
         self.auth_used = ""
         #: x.ai/session/updates 探測結果(None=未探,True/False=探過)。
         self._updates_supported: bool | None = None
 
-    def configured(self) -> bool:
-        """「存在」= binary 在(未安裝 → bridge 全面靜默缺席,caps 不宣告)。
-        登入狀態是另一件事:binary 在而未登入 → provider 露臉,turn 時給
-        登入指引(CC/CX 同模式 —— 使用者要看得到「去登入」而不是空白)。"""
-        return bool(grok_bin())
+    # ── acp_rail 掛鉤(「grok 怎麼起行程」)──
+
+    def _bin_path(self) -> str:
+        return grok_bin()
+
+    def _no_binary_message(self) -> str:
+        return "grok CLI 不在(curl -fsSL https://x.ai/cli/install.sh | bash)"
+
+    def _spawn_argv(self, binp: str) -> list:
+        argv = [binp, "agent"]
+        model = load_config().get("model") or ""
+        if model:
+            argv += ["-m", model]          # agent 選項放 mode 名之前(官方文件)
+        return argv + ["stdio"]
+
+    def _spawn_env(self) -> dict:
+        env = dict(os.environ)
+        cfg = load_config()
+        if cfg["api_key"]:
+            # 落檔的 key 也要進 env —— CLI 的憑證解析序認 XAI_API_KEY。
+            env["XAI_API_KEY"] = cfg["api_key"]
+        # 自動更新訊息走 stderr,但 bridge 管版本的原則是「裝了什麼跑什麼」
+        # (研究報告:官方 SDK 對子 agent 也注入這個)。
+        env.setdefault("GROK_DISABLE_AUTOUPDATER", "1")
+        return env
+
+    def _spawn_cwd(self) -> str:
+        return _DEFAULT_CWD
+
+    def _stderr_log_path(self) -> str:
+        return os.environ.get("GROK_STDERR_LOG",
+                              os.path.join(_STATE_DIR, "cli-stderr.log"))
+
+    def _spawn_timeout(self) -> float:
+        return _SPAWN_TIMEOUT
+
+    def _default_call_timeout(self) -> float:
+        return _CALL_TIMEOUT
+
+    def _on_proc_reset(self) -> None:
+        self._loaded = set()
+        self._updates_supported = None
+
+    def _connected_fields(self, init: dict) -> dict:
+        # 沒有 authenticate 握手:grok 的憑證是 ambient 的
+        # (~/.grok/auth.json 或 XAI_API_KEY),session/new 時才驗。
+        cfg = load_config()
+        self.auth_used = ("login" if login_available()
+                          else "api-key" if cfg["api_key"] else "")
+        return {"agent_version": str(((init or {}).get("_meta") or {})
+                                     .get("agentVersion") or ""),
+                "model": cfg.get("model") or "(cli-default)",
+                "auth": self.auth_used or "(none)"}
 
     def logged_in(self) -> bool:
         return login_available() or bool(load_config()["api_key"])
-
-    # ── 子程序/握手 ──
-
-    async def _ensure_proc(self):
-        if self.proc is not None and self.proc.returncode is None:
-            return
-        async with self._lock:
-            if self.proc is not None and self.proc.returncode is None:
-                return
-            binp = grok_bin()
-            if not binp:
-                raise GrokError("grok CLI 不在(curl -fsSL https://x.ai/cli/"
-                                "install.sh | bash)", code="NO_BINARY")
-            cfg = load_config()
-            env = dict(os.environ)
-            if cfg["api_key"]:
-                # 落檔的 key 也要進 env —— CLI 的憑證解析序認 XAI_API_KEY。
-                env["XAI_API_KEY"] = cfg["api_key"]
-            # 自動更新訊息走 stderr,但 bridge 管版本的原則是「裝了什麼跑什麼」
-            # (研究報告:官方 SDK 對子 agent 也注入這個)。
-            env.setdefault("GROK_DISABLE_AUTOUPDATER", "1")
-            os.makedirs(_DEFAULT_CWD, exist_ok=True)
-            # stderr 落檔不丟(gemini「很慢查不到」的教訓)。
-            errlog = os.environ.get("GROK_STDERR_LOG",
-                                    os.path.join(_STATE_DIR, "cli-stderr.log"))
-            if errlog.lower() in ("off", "none", "devnull", ""):
-                stderr_to = asyncio.subprocess.DEVNULL
-            else:
-                try:
-                    os.makedirs(os.path.dirname(errlog) or ".", exist_ok=True)
-                    stderr_to = open(errlog, "ab")
-                except OSError:
-                    stderr_to = asyncio.subprocess.DEVNULL
-            argv = [binp, "agent"]
-            model = cfg.get("model") or ""
-            if model:
-                argv += ["-m", model]      # agent 選項放 mode 名之前(官方文件)
-            argv += ["stdio"]
-            try:
-                self.proc = await asyncio.create_subprocess_exec(
-                    *argv,
-                    stdin=asyncio.subprocess.PIPE,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=stderr_to,
-                    env=env, cwd=_DEFAULT_CWD)
-            except FileNotFoundError:
-                raise GrokError("grok CLI 不在(curl -fsSL https://x.ai/cli/"
-                                "install.sh | bash)", code="NO_BINARY")
-            self._loaded = set()
-            self._updates_supported = None
-            self._reader = asyncio.create_task(self._read_loop(self.proc))
-            try:
-                init = await self._call_locked(
-                    "initialize",
-                    {"protocolVersion": 1,
-                     "clientCapabilities": {"fs": {"readTextFile": False,
-                                                   "writeTextFile": False}},
-                     "clientInfo": {"name": "studio-bridge", "version": "1.0"}},
-                    timeout=_SPAWN_TIMEOUT)
-                self.server_info = init or {}
-                # 沒有 authenticate 握手:grok 的憑證是 ambient 的
-                # (~/.grok/auth.json 或 XAI_API_KEY),session/new 時才驗。
-                self.auth_used = ("login" if login_available()
-                                  else "api-key" if cfg["api_key"] else "")
-            except Exception:
-                await self._drop_proc()
-                raise
-            self._log("grok_connected",
-                      protocol=(self.server_info or {}).get("protocolVersion"),
-                      agent_version=str(((self.server_info or {}).get("_meta")
-                                         or {}).get("agentVersion") or ""),
-                      model=model or "(cli-default)",
-                      auth=self.auth_used or "(none)")
-
-    async def _drop_proc(self):
-        proc, self.proc = self.proc, None
-        if self._reader:
-            self._reader.cancel()
-            self._reader = None
-        for fut in list(self._pending.values()):
-            if not fut.done():
-                fut.set_exception(GrokError("grok process lost",
-                                            code="PROCESS_LOST", retryable=True))
-        self._pending.clear()
-        self._loaded = set()
-        if proc is not None and proc.returncode is None:
-            try:
-                proc.kill()
-            except Exception:  # noqa: BLE001
-                pass
-        self._log("grok_disconnected")
-
-    async def _read_loop(self, proc):
-        try:
-            while True:
-                raw = await proc.stdout.readline()
-                if not raw:
-                    break
-                if os.environ.get("GROK_DEBUG"):
-                    self._log("grok_rx", frame=raw.decode("utf-8", "replace")[:200])
-                try:
-                    f = json.loads(raw.decode("utf-8", "replace"))
-                except Exception:  # noqa: BLE001 — 非 JSON 行跳過
-                    continue
-                if "id" in f and ("result" in f or "error" in f):
-                    fut = self._pending.pop(int(f["id"]), None) \
-                        if str(f.get("id") or "").lstrip("-").isdigit() else None
-                    if fut and not fut.done():
-                        if "error" in f:
-                            err = f["error"] or {}
-                            msg = str(err.get("message") or "grok error")
-                            data = err.get("data")
-                            if data:
-                                msg = f"{msg}: {str(data)[:200]}"
-                            fut.set_exception(GrokError(
-                                msg, code=str(err.get("code") or "")))
-                        else:
-                            fut.set_result(f.get("result"))
-                    continue
-                method = f.get("method") or ""
-                if method == "session/update":
-                    params = f.get("params") or {}
-                    if self.on_update:
-                        try:
-                            self.on_update(str(params.get("sessionId") or ""),
-                                           params.get("update") or {})
-                        except Exception:  # noqa: BLE001 — 單筆毒丸不斷流
-                            pass
-                elif "id" in f:
-                    # server→client 請求(session/request_permission 等)。
-                    asyncio.get_running_loop().create_task(
-                        self._answer_server_request(proc, f))
-                # 其餘通知(_x.ai/session/setup 等 transient)刻意不接:
-                # 它們是進度 metadata,x.ai 擴展會長新型別,接了就有維護債。
-        except Exception:  # noqa: BLE001 — 斷線走同一條清理路
-            pass
-        finally:
-            if self.proc is proc:
-                await self._drop_proc()
-
-    async def _answer_server_request(self, proc, f: dict):
-        """server→client 請求:bridge 的 on_request 決定;沒人接=保守拒絕。
-        無論如何都要回 —— 不回 grok 的 turn 會永遠掛著(blocking request)。"""
-        rid = f.get("id")
-        result = None
-        try:
-            if self.on_request:
-                result = await self.on_request(f)
-        except Exception as e:  # noqa: BLE001
-            self._log("grok_on_request_error", error=str(e)[:160])
-        if result is None:
-            method = f.get("method") or ""
-            if method == "session/request_permission":
-                result = {"outcome": {"outcome": "cancelled"}}
-            else:
-                result = {}
-        try:
-            proc.stdin.write((json.dumps({"jsonrpc": "2.0", "id": rid,
-                                          "result": result}) + "\n").encode())
-            await proc.stdin.drain()
-        except Exception:  # noqa: BLE001 — 行程死了由 read_loop 收屍
-            pass
-
-    # ── 呼叫 ──
-
-    async def _call_locked(self, method: str, params: dict,
-                           timeout: float = _CALL_TIMEOUT):
-        self._rid += 1
-        rid = self._rid
-        fut: asyncio.Future = asyncio.get_running_loop().create_future()
-        self._pending[rid] = fut
-        line = json.dumps({"jsonrpc": "2.0", "id": rid, "method": method,
-                           "params": params}) + "\n"
-        if os.environ.get("GROK_DEBUG"):
-            self._log("grok_tx", frame=line[:200])
-        self.proc.stdin.write(line.encode())
-        await self.proc.stdin.drain()
-        try:
-            return await asyncio.wait_for(fut, timeout=timeout)
-        except asyncio.TimeoutError:
-            self._pending.pop(rid, None)
-            raise GrokError(f"grok call timeout: {method}",
-                            code="TIMEOUT", retryable=True)
-
-    async def call(self, method: str, params: dict | None = None,
-                   timeout: float = _CALL_TIMEOUT):
-        await self._ensure_proc()
-        return await self._call_locked(method, params or {}, timeout=timeout)
 
     # ── session 生命週期 ──
 
@@ -617,12 +438,9 @@ class GrokClient:
         """中斷進行中的 turn(標準 ACP `session/cancel` notification)。"""
         row = get_session(key)
         acp_sid = str((row or {}).get("acp_sid") or "")
-        if not acp_sid or self.proc is None or self.proc.returncode is not None:
+        if not acp_sid:
             return
-        line = json.dumps({"jsonrpc": "2.0", "method": "session/cancel",
-                           "params": {"sessionId": acp_sid}}) + "\n"
-        self.proc.stdin.write(line.encode())
-        await self.proc.stdin.drain()
+        await self.notify("session/cancel", {"sessionId": acp_sid})
 
     def acp_to_key(self, acp_sid: str) -> str | None:
         for k, row in _load_sessions().items():
@@ -638,7 +456,7 @@ class GrokClient:
         回 None = 用不了(行程沒活著/沒這方法/任何失敗)—— 呼叫端退回
         bridge 自己的逐字稿。**絕不為了讀歷史冷啟行程**(列表熱路徑紅線)。
         """
-        if self.proc is None or self.proc.returncode is not None:
+        if not self.alive():
             return None
         if self._updates_supported is False:
             return None

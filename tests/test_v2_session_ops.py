@@ -64,7 +64,7 @@ _V2_OPS_KNOWN_GAPS = {
 #: 表上該出現的 provider 全集 —— 新 provider 上線時加進來,守門會逼每個 op
 #: 都表態(支援或進 KNOWN_GAPS)。
 _ALL_PROVIDERS = ("claude_code", "codex", "cc2", "gemini", "openclaw", "hermes",
-                  "grok")
+                  "grok", "opencode")
 
 
 class OpsMatrixCoverageTest(unittest.TestCase):
@@ -86,6 +86,19 @@ class OpsMatrixCoverageTest(unittest.TestCase):
                  if prov in (bridge._V2_SESSION_OPS.get(op) or {})]
         self.assertEqual(stale, [],
                          f"這些缺口已經補了,KNOWN_GAPS 裡的理由該刪:{stale}")
+
+    def test_opencode_supports_all_five_ops(self):
+        """S7 的驗收條件:opencode 五個 op 全在表上。
+
+        config_read/config_write 是這家與其他五家的分水嶺 —— ACP 的
+        `session/set_config_option`(欄位 configId)實測可寫、
+        `session/new|load` 回 configOptions 可讀,所以**不是**「管線存在」
+        而是端到端通。宣告在這裡,行為釘在 test_opencode_provider.py。
+        """
+        for op in ("rename", "archive", "history",
+                   "config_read", "config_write"):
+            self.assertIn("opencode", bridge._V2_SESSION_OPS[op],
+                          f"opencode 的 {op} 不見了 —— UI 的入口會變死按鈕")
 
     def test_gemini_supports_all_three_ops(self):
         """本輪的驗收條件:Gemini 三個 op 都要在表上(2026-10-31 對齊)。"""

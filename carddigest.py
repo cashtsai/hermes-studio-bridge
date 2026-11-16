@@ -2076,6 +2076,23 @@ class GrokDigest(PersonaDigest):
     _card_prefix = "card-gk-"
 
 
+class OpenCodeDigest(PersonaDigest):
+    """S7:OpenCode(純 ACP)session 的卡片 digest。
+
+    與 GrokDigest/GeminiDigest 同構 —— 2026-11-16 實測 opencode 1.19.5 的
+    session/update 幀與 grok 完全同形(agent_message_chunk /
+    agent_thought_chunk / tool_call / tool_call_update),這正是第三家 ACP
+    provider 接入成本最低的原因:
+    - seed:opencode_sdk.transcript_read 的訊息(mid 穩定 → 卡 id)。
+    - live:bridge 把 agent_message_chunk 餵進 turn_delta,
+      session/prompt 回來時 turn_end。
+    - approval:session/request_permission → handle_approval(來源 "opencode")。
+    """
+    _appr_prefix = "card-oce-appr-"
+    _appr_source = "opencode"
+    _card_prefix = "card-oce-"
+
+
 # ───────────────────────── S4:openclaw gateway 事件 → 卡片 ───────────────────
 # 契約依據 docs/OPENCLAW_PROVIDER_SPEC.md(§2/§3)。兩個來源,一個卡片庫:
 # - seed:chat.history messages(__openclaw.id 穩定 → 卡 id,重放同 id)。
