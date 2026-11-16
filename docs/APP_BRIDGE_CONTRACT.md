@@ -997,6 +997,47 @@ client 對接要知道的最小集合（2026-08-01 補：Android 端曾因本節
   （`GeminiSurface.HIDDEN`，2026-10-11 機主拍板：quota 失敗與權限請求只能
   自動拒絕，怕稀釋信任）。契約照實記錄，與 client 要不要顯示是兩件事。
 
+### 4.1e Grok Build（第六 provider，選配，2026-11-16）
+
+> 接入依據：pa-ship `docs/GROK_BUILD_RESEARCH_20261116.md`「第五 provider
+> 判決」。純 ACP（`grok agent stdio`，protocolVersion 1）——五家 code-agent
+> 裡唯一不用自家 adapter 的，rail 形狀與 §4.1d 同構。
+
+- **provider 值 = `grok`，session id = `grok:{key}`**（同 §4.1 全寫規則）。
+- **名錄制**（同 gemini）：列表走 `GET /app/v2/sessions?provider=grok`；
+  第一則訊息才在 bridge 建 ACP session（零建立 API）。bridge key 與 ACP
+  sessionId 解耦：CLI 端 session 蒸發時換 acp_sid 續命，bridge 歷史不動
+  → caps 宣告 `native_id_strength: weak`。
+- **偵測**：`grok` binary 不在（PATH / `~/.local/bin` / `~/.grok/bin`，
+  `POCKET_GROK_BIN` 可指定）= 整個 `grok:` id 空間 404、agents 無項、
+  caps 不宣告 —— 靜默缺席。
+- **認證**：`grok login` 憑證（`~/.grok/auth.json`，CLI 自己 refresh）或
+  `XAI_API_KEY`（env 或 `PUT /app/v1/grok/config` 落檔 0600）。**未登入時
+  provider 照樣露臉**（和 gemini 的「未配置=消失」不同）：`/app/v2/agents`
+  的 `auth.connected=false`，turn 會收到登入指引卡（`grok login` /
+  `--device-auth` / XAI_API_KEY），不是空白失敗。狀態讀
+  `GET /app/v1/grok/config`（`installed` / `logged_in` 分開報）。
+- **ops**（`_V2_SESSION_OPS`）：`rename` / `archive`（名錄層）/ `history`
+  —— history 第一頁優先 `x.ai/session/updates` 負 offset 取尾（feature-
+  detect，-32601 退場；回應帶 `source:"native"`），退 bridge 逐字稿；
+  形狀一律 `{messages, more, total}`。
+- **input**：§4.4 統一 input；client_id 去重、忙碌排隊（`queued:true` +
+  `queue_depth`）、附件（影像=ACP image block、語音=轉寫、其他=落檔附路徑）。
+- **interrupt**：標準 ACP `session/cancel`；無活躍 turn 一律 409。
+- **resume**：ACP `session/load`（initialize 宣告 `loadSession:true` 才用；
+  載不回自動 `session/new` 換 acp_sid 續命）。
+- **審批**：`session/request_permission`（blocking reverse-request）→
+  canonical approvals（`provider=grok`）+ 卡片流 approval 卡 + 推播。
+  等待者是記憶體 Future（`approval_callbacks_live_only: true`）：bridge
+  重啟後決定回 409，ACP 側由逾時路（180s，`POCKET_GROK_APPROVAL_SEC`）
+  fail-closed 回 `cancelled`。放行偏好 `allow_once`（agent 把
+  `allow_always` 排前面也不替使用者按「永久允許」）。
+- **限制 / 下一波（v2）**：`x.ai/session/fork`、`x.ai/rewind/*`（caps 刻意
+  不宣告 fork/rewind —— 管線存在≠端到端通）；per-session 模型
+  （`session/set_config_option` 有，config_read/write 缺格已登記理由）；
+  always-allow → per-session 記憶或 `session/new` 的 `_meta.yoloMode`；
+  compact（CLI 有 `/compact` 指令與 `x.ai/compact_conversation`）。
+
 ### 4.2 Agent
 
 ```jsonc

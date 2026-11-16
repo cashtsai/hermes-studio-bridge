@@ -52,11 +52,19 @@ _V2_OPS_KNOWN_GAPS = {
     ("config_write", "openclaw"): "同上",
     ("config_read", "hermes"): "persona 的設定就是人格定義,不是 session 屬性",
     ("config_write", "hermes"): "同上",
+    # grok(S6,2026-11-16):ACP 有 per-session 的 session/set_config_option
+    # (model / reasoning_effort),**管線存在≠端到端通** —— app 側的
+    # SessionControlSheet 消費與實測都還沒做,接了也是死按鈕。下一波連
+    # app 檢查單一起走;全域模型先走 /app/v1/grok/config(spawn 參數)。
+    ("config_read", "grok"): "session/set_config_option 存在但未接線,"
+                             "app 消費面排下一波;全域走 /app/v1/grok/config",
+    ("config_write", "grok"): "同 config_read",
 }
 
 #: 表上該出現的 provider 全集 —— 新 provider 上線時加進來,守門會逼每個 op
 #: 都表態(支援或進 KNOWN_GAPS)。
-_ALL_PROVIDERS = ("claude_code", "codex", "cc2", "gemini", "openclaw", "hermes")
+_ALL_PROVIDERS = ("claude_code", "codex", "cc2", "gemini", "openclaw", "hermes",
+                  "grok")
 
 
 class OpsMatrixCoverageTest(unittest.TestCase):
@@ -162,6 +170,147 @@ class GeminiOpsBehaviorTest(unittest.TestCase):
     def test_history_empty_session(self):
         page = gemini_provider.transcript_page("never-spoke", limit=10)
         self.assertEqual(page, {"messages": [], "more": False, "total": 0})
+
+
+class GrokOpsBehaviorTest(unittest.TestCase):
+    """grok(S6)三個 op 的實際行為 —— 名錄層與 gemini 同形,逐條釘住,
+    不靠「同一份複製貼上應該沒壞」的信仰。"""
+
+    def setUp(self):
+        import grok_sdk
+        self.gk = grok_sdk
+        self._dir = tempfile.mkdtemp(prefix="gk-ops-")
+        self.p1 = patch.object(grok_sdk, "_STATE_DIR", self._dir)
+        self.p2 = patch.object(grok_sdk, "_SESSIONS_FILE",
+                               os.path.join(self._dir, "sessions.json"))
+        self.p1.start(); self.p2.start()
+        grok_sdk.remember_session("k1", "acp-1", title="原名")
+
+    def tearDown(self):
+        self.p1.stop(); self.p2.stop()
+
+    def test_matrix_has_grok_for_all_three_ops(self):
+        for op in ("rename", "archive", "history"):
+            self.assertIn("grok", bridge._V2_SESSION_OPS[op],
+                          f"grok 的 {op} 不見了 —— UI 的入口會變死按鈕")
+
+    def test_rename_changes_title_only(self):
+        row = self.gk.rename_session("k1", "新名字")
+        self.assertEqual(row["title"], "新名字")
+        self.assertEqual(row["id"], "k1", "grok 的身分是 key,改名不得搬鍵")
+        self.assertIsNone(self.gk.rename_session("nope", "x"))
+
+    def test_archive_hides_from_list_but_keeps_the_row(self):
+        self.gk.set_archived("k1", True)
+        self.assertEqual(self.gk.list_sessions(), [], "封存後不該列出")
+        self.assertIsNotNone(self.gk.get_session("k1"), "但名錄列要還在")
+        self.gk.set_archived("k1", False)
+        self.assertEqual(len(self.gk.list_sessions()), 1, "復原要回得來")
+
+    def test_history_page_shape_matches_cc2(self):
+        for i in range(10):
+            self.gk.transcript_append("k1", "user", f"msg-{i}")
+        page = self.gk.transcript_page("k1", limit=3, offset=0)
+        self.assertEqual(set(page), {"messages", "more", "total"})
+        self.assertEqual(page["total"], 10)
+        self.assertEqual([m["content"] for m in page["messages"]],
+                         ["msg-7", "msg-8", "msg-9"])
+        self.assertTrue(page["more"])
+        tail = self.gk.transcript_page("k1", limit=5, offset=8)
+        self.assertEqual([m["content"] for m in tail["messages"]],
+                         ["msg-0", "msg-1"])
+        self.assertFalse(tail["more"])
+
+    def test_history_op_falls_back_to_transcript_when_native_unavailable(self):
+        """`x.ai/session/updates` 用不了(行程沒活著/沒這方法)時,統一
+        history 路由必須退逐字稿 —— 不准 500、不准空手而回。"""
+        import asyncio
+        for i in range(3):
+            self.gk.transcript_append("k1", "user", f"m{i}")
+
+        class _Req:
+            headers = {"authorization": "Bearer test-unit-token"}
+            query_params = {"limit": "10", "offset": "0"}
+
+        async def _none(key, limit=40):
+            return None
+        with patch.object(bridge.GROK, "updates_tail", _none):
+            page = asyncio.run(bridge._gk_op_history("k1", _Req()))
+        self.assertEqual([m["content"] for m in page["messages"]],
+                         ["m0", "m1", "m2"])
+
+    def test_history_op_uses_native_tail_only_when_transcript_empty(self):
+        """逐字稿**空**(session 歷史活在 CLI 端)→ 第一頁用
+        x.ai/session/updates 原生尾巴,標 source=native、more=False
+        (原生路沒有可續的下一頁,不假裝可以一直翻)。"""
+        import asyncio
+
+        class _Req:
+            headers = {"authorization": "Bearer test-unit-token"}
+            query_params = {"limit": "10", "offset": "0"}
+
+        frames = [
+            {"update": {"sessionUpdate": "user_message_chunk",
+                        "content": {"type": "text", "text": "hi"}}},
+            {"update": {"sessionUpdate": "agent_message_chunk",
+                        "content": {"type": "text", "text": "hel"}}},
+            {"update": {"sessionUpdate": "agent_message_chunk",
+                        "content": {"type": "text", "text": "lo"}}},
+        ]
+
+        async def _tail(key, limit=40):
+            return frames
+        with patch.object(bridge.GROK, "updates_tail", _tail):
+            page = asyncio.run(bridge._gk_op_history("k-empty", _Req()))
+        self.assertEqual(page.get("source"), "native")
+        self.assertFalse(page["more"])
+        self.assertEqual([(m["role"], m["content"]) for m in page["messages"]],
+                         [("user", "hi"), ("assistant", "hello")],
+                         "連續同角色 chunk 要併成一則")
+
+    def test_history_op_prefers_transcript_when_present(self):
+        """逐字稿有料 → 分頁權威是逐字稿,**不碰**原生路(第一頁原生、
+        第二頁逐字稿 = 兩頁取樣不同母體,邊界會重複/缺漏 —— review 抓的)。"""
+        import asyncio
+        self.gk.transcript_append("k1", "user", "hi")
+
+        class _Req:
+            headers = {"authorization": "Bearer test-unit-token"}
+            query_params = {"limit": "10", "offset": "0"}
+
+        async def _boom(key, limit=40):
+            raise AssertionError("逐字稿有料時不准走原生路")
+        with patch.object(bridge.GROK, "updates_tail", _boom):
+            page = asyncio.run(bridge._gk_op_history("k1", _Req()))
+        self.assertNotIn("source", page)
+        self.assertEqual([m["content"] for m in page["messages"]], ["hi"])
+
+    def test_history_native_drops_possibly_clipped_oldest(self):
+        """負 offset 窗口切滿(len(updates) >= limit*8)時,最舊一則可能是
+        從長回覆中段切進去的半句話 —— 要丟掉,寧可少一則不給斷頭訊息。"""
+        import asyncio
+
+        class _Req:
+            headers = {"authorization": "Bearer test-unit-token"}
+            query_params = {"limit": "2", "offset": "0"}
+
+        # window = limit*8 = 16 幀,正好切滿 → 最舊的合併訊息要被丟
+        frames = []
+        for i in range(8):
+            frames.append({"update": {"sessionUpdate": "user_message_chunk",
+                                      "content": {"type": "text",
+                                                  "text": f"u{i}"}}})
+            frames.append({"update": {"sessionUpdate": "agent_message_chunk",
+                                      "content": {"type": "text",
+                                                  "text": f"a{i}"}}})
+
+        async def _tail(key, limit=40):
+            return frames[:limit]
+        with patch.object(bridge.GROK, "updates_tail", _tail):
+            page = asyncio.run(bridge._gk_op_history("k-clip", _Req()))
+        self.assertEqual(page.get("source"), "native")
+        self.assertNotEqual(page["messages"][0]["content"], "u0",
+                            "切滿的窗口要丟掉最舊一則(可能是半句話)")
 
 
 if __name__ == "__main__":

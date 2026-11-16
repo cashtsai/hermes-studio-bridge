@@ -67,6 +67,16 @@ _ENV_TMP_DEFAULTS = {
     # 導在這裡,每個檔案都吃得到,不必各自處理。
     "GEMINI_CONFIG_FILE":     os.path.join(_TMP, "gemini.json"),
     "GEMINI_STATE_DIR":       os.path.join(_TMP, "gemini"),
+    # grok_sdk.py(S6)—— 同 gemini 的教訓,一開始就導進表裡:
+    # config/state 走 tmp;auth 檔也要導(logged_in() 不准讀開發機的
+    # ~/.grok/auth.json,測試結果不能跟機器登入狀態綁在一起);binary 指到
+    # tmp 下不存在的路徑 → grok_bin()="" → configured() False —— 測試機有
+    # 沒有裝 grok 都一樣(要測「已安裝」的檔自己 monkeypatch grok_bin)。
+    "GROK_CONFIG_FILE":       os.path.join(_TMP, "grok.json"),
+    "GROK_STATE_DIR":         os.path.join(_TMP, "grok"),
+    "GROK_AUTH_FILE":         os.path.join(_TMP, "grok-auth.json"),
+    "GROK_WORKDIR":           os.path.join(_TMP, "grok", "workspace"),
+    "POCKET_GROK_BIN":        os.path.join(_TMP, "no-grok-bin"),
     # studio_memory_mcp.py
     "STUDIO_MEMORY_HOME":     os.path.join(_TMP, "studio-memory-home"),
     # bridge.py HOME_ROOT:persona home 一律指到 tmp。不導的話,測試打到的
