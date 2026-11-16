@@ -1844,6 +1844,66 @@ device token:
 - `/pair/devices` 上看得到(`is_remote_console: true` ＋ `scope` ＋ `expires`),
   機主可以隨時撤銷。app 的裝置清單應該把它標成「遠端瀏覽器」而不是一台裝置。
 
+## 17. Sessions Roster(`/app/v2/sessions/roster`,2026-11-16)
+
+> 動機(grok-build steal #3):列表頁/FleetView 要的是「一眼看懂每條
+> session 在幹嘛」,不是整包 provider meta。既有 `/app/v2/sessions`
+> **一個 byte 不動**(相容);roster 是疊加的瘦 facade,治「列表預覽怪/
+> 未讀不亮」—— activity 用六態說真話(`needs_input`/`dead` 是一級狀態),
+> 摘要由 bridge 生成,app 不再自己猜。
+
+### 17.1 冷載
+
+```
+GET /app/v2/sessions/roster
+→ {"sessions": [RosterRow…], "degraded_providers": ["codex", …]}
+```
+
+RosterRow:
+
+```jsonc
+{
+  "id": "claude_code:Ops",            // 同 §4.1 全寫 session id
+  "provider": "claude_code|cc2|codex|hermes|gemini|openclaw",
+  "title": "Ops",
+  "activity": "working|idle|needs_input|dormant|completed|dead",
+  "last_turn_summary": "部署腳本改好了…",   // 規則式 ≤12 字;可為 ""
+  "updated_ts": 1795000000.0           // epoch;從無活動 → null
+}
+```
+
+`activity` 六態(照 grok RosterActivity)與導出規則:
+
+| activity | 導出 | app 端建議 |
+| --- | --- | --- |
+| `needs_input` | `status==waiting_approval` 或 `meta.approval` 存在(與 pending approvals 同步導出,**優先序最高** —— 在等你的事比什麼都搶眼) | 醒目徽章,點進去可答 |
+| `working` | `status ∈ running/stalled/dispatching`(stalled 照 §4.1a 比照 running,「疑似卡住」不誤報成死) | 轉圈 |
+| `dead` | `status ∈ failed/error` 或 `meta.degraded`(persona crash-loop/連續 stall)—— **runner 死也要顯示得出來**,不是從列表消失 | 紅字 |
+| `completed` | `status ∈ done/completed` | 一般樣式 |
+| `idle` | 無上述,且 `updated_ts` 距今 < `POCKET_ROSTER_DORMANT_SECS`(預設 24h) | 一般樣式 |
+| `dormant` | 無上述且久無活動(或從無活動) | 淡化/摺疊 |
+
+`last_turn_summary`:目前規則式 —— 該 session 最後一筆持久里程碑
+(`card.milestone`/`message.upsert`)的文字壓空白截斷(≤12 字)。
+TODO:回合結束時 LLM 生成 5-12 字摘要落地,wire 欄位不變,app 零改動升級。
+
+### 17.2 差分訂閱
+
+```
+GET /app/v2/sessions/roster/events        (SSE)
+data: {"ts": …, "type": "sessions.changed",
+       "data": {"upserted": [RosterRow…], "removed": ["codex:…", …]}}
+```
+
+- **transient 事件**(B1 三分類):信封無 `seq`、不落 event_log —— roster
+  任何時刻可由 §17.1 全量重建,持久游標在這裡沒有意義。
+- 連上先推一包全量(`upserted` = 全部列):冷載與重連走同一條「以 id
+  upsert」套用路徑,client 不必分支。
+- 之後每 `POCKET_ROSTER_POLL_SECS`(預設 3s)比對一次,有差才推;
+  安靜期間每 `SSE_KEEPALIVE_SECS` 一行 `: keepalive` 註解。
+- 長時間零變化(30 分鐘)bridge 主動斷線(半死 client 不佔 task,同既有
+  follow 流);client 重連即重拿全量。
+
 ## 附註 A:pocket-id 心跳 `notices` 下行(backup orphan 提醒,2026-11-06)
 
 > 這一節描述的是 **bridge ↔ pocket-id** 的機器間契約(不是 app ↔ bridge),

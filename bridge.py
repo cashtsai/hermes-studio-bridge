@@ -21915,6 +21915,216 @@ async def v2_sessions(request: Request, provider: str = "", status: str = "",
     return {"sessions": out, **result}
 
 
+# ── C1(2026-11-16,grok steal #3):roster 契約 ───────────────────────────
+# 列表頁要的是「一眼看懂每條 session 在幹嘛」,不是整包 provider meta ——
+# /app/v2/sessions 原樣保留(相容),roster 是**疊加的瘦 facade**:
+# activity 六態(照 grok RosterActivity:working/idle/needs_input/dormant/
+# completed/dead)+ last_turn_summary(規則式,LLM 摘要留 TODO)+
+# updated_ts。差分推送走 SSE `sessions.changed`(transient,登記在
+# carddigest.RING_TRANSIENT)。契約:APP_BRIDGE_CONTRACT.md §17。
+_ROSTER_DORMANT_SECS = float(os.environ.get("POCKET_ROSTER_DORMANT_SECS",
+                                            str(24 * 3600.0)))
+_ROSTER_POLL_SECS = float(os.environ.get("POCKET_ROSTER_POLL_SECS", "3.0"))
+_ROSTER_SUMMARY_CHARS = 12   # 規則式摘要上限(grok 是 LLM 生成 5-12 字)
+
+#: v2 status → roster activity。查無的值(含新 provider 自創字串)落
+#: idle/dormant 路 —— 寬鬆降級,照契約 §4.1a「未處理的值當 idle」。
+_ROSTER_ACTIVITY_BY_STATUS = {
+    "running": "working",
+    # stalled = 回合開著但一陣子沒事件(契約 §4.1a:建議比照 running)——
+    # 它是「疑似卡住」不是「確定死了」,誤報 dead 比漏報更傷信任。
+    "stalled": "working",
+    "dispatching": "working",
+    "waiting_approval": "needs_input",
+    "failed": "dead",
+    "error": "dead",
+    "dead": "dead",
+    "done": "completed",
+    "completed": "completed",
+}
+
+
+def _roster_event_session(row_id: str) -> str:
+    """v2 session id → event_log 的 session 鍵(persona 走裸 mid,見
+    _approval_resolved_broadcast 的同款註解)。"""
+    return (row_id.split(":", 1)[1] if str(row_id).startswith("hermes:")
+            else str(row_id))
+
+
+def _roster_ts_epoch(val) -> float:
+    """last_event_at 的兩種形狀(ISO 字串 / epoch float)→ epoch;解不動 0。"""
+    if isinstance(val, (int, float)):
+        return float(val)
+    if isinstance(val, str) and val:
+        try:
+            from datetime import datetime
+            return datetime.fromisoformat(val.replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            return 0.0
+    return 0.0
+
+
+def _roster_summary_text(raw: str) -> str:
+    """原文 → 5-12 字級的規則式摘要:壓空白、去圍欄雜訊、截斷。"""
+    t = re.sub(r"\s+", " ", str(raw or "")).strip()
+    t = re.sub(r"^```[a-z-]*\s*", "", t)
+    if len(t) > _ROSTER_SUMMARY_CHARS:
+        t = t[:_ROSTER_SUMMARY_CHARS] + "…"
+    return t
+
+
+def _roster_enrich(ids: list) -> dict:
+    """一口氣撈每條 session 的 (updated_ts, last_turn_summary)。
+
+    單一 ro 連線 + 走 idx_event_session_seq,整包 roster 一次 build 只開一條
+    連線。摘要規則式:最後一筆 card.milestone / message.upsert 的文字截斷
+    (TODO:回合結束時 LLM 生成 5-12 字摘要,存起來這裡只讀 —— grok 的
+    summary.json 模式;規則式先把 wire 欄位占住,app 零改動升級)。
+    """
+    import sqlite3
+    out = {i: (0.0, "") for i in ids}
+    if not ids:
+        return out
+    try:
+        con = sqlite3.connect(f"file:{CANON_DB}?mode=ro", uri=True, timeout=5)
+        try:
+            for rid in ids:
+                ev = _roster_event_session(rid)
+                row = con.execute(
+                    "SELECT MAX(created_at) FROM event_log WHERE session=?",
+                    (ev,)).fetchone()
+                ts = float(row[0] or 0.0) if row else 0.0
+                summary = ""
+                for (etype, payload) in con.execute(
+                        "SELECT type,payload FROM event_log WHERE session=? "
+                        "AND type IN ('card.milestone','message.upsert') "
+                        "ORDER BY id DESC LIMIT 8", (ev,)):
+                    try:
+                        data = json.loads(payload or "{}")
+                    except Exception:  # noqa: BLE001
+                        continue
+                    if etype == "card.milestone":
+                        body = ((data.get("card") or {}).get("body") or {})
+                        text = body.get("text") or body.get("fallback_text") or ""
+                    else:
+                        text = (data.get("message") or {}).get("content") or ""
+                    text = _roster_summary_text(text)
+                    if text:
+                        summary = text
+                        break
+                out[rid] = (ts, summary)
+        finally:
+            con.close()
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("roster_enrich", _exc, expected=True)
+    return out
+
+
+def _roster_activity(row: dict, updated_ts: float) -> str:
+    """v2 列 → activity 六態。優先序:needs_input(待審是「在等你」,比
+    其他狀態都該搶眼)> dead > 狀態表 > idle/dormant(以最近活動分)。"""
+    meta = row.get("meta") or {}
+    status = str(row.get("status") or "")
+    if status == "waiting_approval" or meta.get("approval"):
+        return "needs_input"      # 從 pending approvals 同步導出,不另掃 DB
+    if meta.get("degraded"):
+        # 人格 crash-loop 冷卻/連續 stall → runner 實質掛了,要顯示得出來
+        # (grok:Dead 是一級狀態,actor panic 不是「不顯示」的理由)。
+        return "dead"
+    act = _ROSTER_ACTIVITY_BY_STATUS.get(status)
+    if act:
+        return act
+    ts = updated_ts or _roster_ts_epoch(row.get("last_event_at"))
+    if ts and time.time() - ts < _ROSTER_DORMANT_SECS:
+        return "idle"
+    return "dormant"
+
+
+async def _roster_build(request: Request) -> dict:
+    """roster 全量:疊在 /app/v2/sessions 之上(provider 邏輯零複製)。"""
+    base = await v2_sessions(request)
+    rows = base.get("sessions") or []
+    enrich = _roster_enrich([str(r.get("id") or "") for r in rows])
+    out = []
+    for r in rows:
+        rid = str(r.get("id") or "")
+        ts, summary = enrich.get(rid, (0.0, ""))
+        ts = max(ts, _roster_ts_epoch(r.get("last_event_at")))
+        out.append({
+            "id": rid,
+            "provider": r.get("provider"),
+            "title": r.get("title"),
+            "activity": _roster_activity(r, ts),
+            "last_turn_summary": summary,
+            "updated_ts": ts or None,
+        })
+    return {"sessions": out,
+            "degraded_providers": base.get("degraded_providers") or []}
+
+
+def _roster_diff(prev: dict, cur: dict, first: bool) -> tuple:
+    """(upserted, removed) 差分;first=True 推全量(冷載=重連同一條路)。"""
+    upserted = [r for i, r in cur.items() if first or prev.get(i) != r]
+    removed = [i for i in prev if i not in cur]
+    return upserted, removed
+
+
+@app.get("/app/v2/sessions/roster")
+async def v2_sessions_roster(request: Request):
+    """契約 §17:列表頁的瘦 facade —— activity 六態 + last_turn_summary +
+    updated_ts。既有 /app/v2/sessions 不動(相容);差分訂閱見
+    /app/v2/sessions/roster/events。"""
+    _check_auth(request)
+    return await _roster_build(request)
+
+
+@app.get("/app/v2/sessions/roster/events")
+async def v2_sessions_roster_events(request: Request):
+    """契約 §17 SSE:`sessions.changed` 差分(upserted/removed)。
+
+    transient(B1 分類):信封無 seq、不落 event_log —— roster 任何時刻可
+    由 GET 全量重建,落庫只會製造解不開的游標。連上先推一包全量 upserted
+    (client 以 id upsert,冷載/重連同一條套用路徑),之後每
+    POCKET_ROSTER_POLL_SECS 比對一次,有差才推。
+    """
+    _check_auth(request)
+
+    async def gen():
+        prev: dict = {}
+        first = True
+        last_sent = time.monotonic()
+        last_change = time.monotonic()
+        while True:
+            if await request.is_disconnected():
+                break
+            if time.monotonic() - last_change >= _STREAM_IDLE_CUTOFF_SECS:
+                # 半死 client 不准永久佔 task(issue #7 同款出口)。
+                _log_event("roster_events_idle_cutoff")
+                break
+            try:
+                cur = {r["id"]: r for r in
+                       (await _roster_build(request))["sessions"]}
+            except Exception as _exc:  # noqa: BLE001
+                # provider 清單抖一下不斷流 —— 下一輪再試。
+                _log_exc("roster_events_poll", _exc, expected=True)
+                cur = prev
+            upserted, removed = _roster_diff(prev, cur, first)
+            if upserted or removed or first:
+                ev = {"ts": time.time(), "type": "sessions.changed",
+                      "data": {"upserted": upserted, "removed": removed}}
+                yield f"data: {json.dumps(ev, ensure_ascii=False)}\n\n"
+                last_sent = time.monotonic()
+                last_change = last_sent
+            prev, first = cur, False
+            if time.monotonic() - last_sent >= SSE_KEEPALIVE_SECS:
+                yield ": keepalive\n\n"
+                last_sent = time.monotonic()
+            await asyncio.sleep(_ROSTER_POLL_SECS)
+
+    return StreamingResponse(gen(), media_type="text/event-stream",
+                             headers=SSE_HEADERS)
+
+
 def _approval_bool_from_body(body: dict) -> bool:
     if "approve" in body:
         return bool(body.get("approve"))
