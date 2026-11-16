@@ -1448,6 +1448,45 @@ class CodexThreadDigest(ApprovalCardMixin):
 #: 0/None = 去重略過或失敗 —— _push 會把它放進信封的 durable_seq。
 MILESTONE_SINK = None
 
+# ── B1(2026-11-16,grok-build steal #2):transient 事件登記表 ─────────────
+# bridge.EVENT_PERSISTED/EVENT_PERSIST_ONLY 的孿生表:那邊登記「蓋全域 seq
+# 的持久事件」,這邊登記「只走 SSE ring 的 transient 信封」。每型別標理由,
+# 新型別必須先登記 —— tests/test_event_taxonomy_b1.py 掃全部發射點,漏登記
+# 直接紅。transient 絕不蓋全域 seq(理由見 bridge.py 登記表的長註解);
+# 持久影子只能經 _mirror_milestone → MILESTONE_SINK → bridge._event_append
+# 這一條單一 chokepoint。
+RING_TRANSIENT = {
+    "card.upsert": "串流 delta 高頻 upsert — 只走 ring;final=True 那一發由 "
+                   "_mirror_milestone 鏡射成 persisted card.milestone(影子),"
+                   "ring 信封本身永不蓋全域 seq",
+    "session.status": "ring 活流版(set_status 邊緣觸發);持久影子由 "
+                      "_mirror_milestone 落同名 persisted 型別",
+    "turn": "ring 活流版(push_turn);持久影子同上",
+    "resync": "持久補洞段結尾的游標重定信封(bridge v2_session_events 手工"
+              "組裝)— 本質是指令不是事實,絕不落庫",
+    "ping": "keepalive — 不進 ring、不佔 seq(SessionCardStore.ping)",
+    "sessions.changed": "roster 差分推送(C1,bridge roster SSE 手工組裝)— "
+                        "可由 roster 全量重建,落庫只會製造解不開的游標",
+}
+#: 沒登記就 _push 的型別會被記在這裡(carddigest 無 log hook,靠 bridge /
+#: 測試讀這個集合);完整性測試才是真正的閘,這裡只是 runtime 留痕。
+UNREGISTERED_RING_TYPES: set = set()
+
+
+def emit_transient(store: "SessionCardStore", etype: str, data: dict) -> dict:
+    """transient 事件的獨立發射函式(B1 型別層分流)。
+
+    與持久軌(bridge._event_append)在**函式層**就分開:transient 走這裡
+    (或 store 的 upsert_card/set_status/push_turn 三個既有語意入口),
+    持久事件走 _event_append。想發一個「新型別」的 ring 事件時用這個,
+    未登記直接 raise —— 新增型別的人當場被迫去登記表報到,而不是上線後
+    才發現游標解不開。
+    """
+    if etype not in RING_TRANSIENT:
+        raise ValueError(
+            f"transient 事件型別未登記:{etype!r} — 先登記 carddigest.RING_TRANSIENT")
+    return store._push(etype, data)
+
 
 class SessionCardStore(ApprovalCardMixin):
     """契約 §1/§3 的 per-session 卡片庫 + 事件 ring buffer。
@@ -1515,6 +1554,8 @@ class SessionCardStore(ApprovalCardMixin):
         self._wakers: set = set()
 
     def _push(self, etype: str, data: dict) -> dict:
+        if etype not in RING_TRANSIENT:      # B1:留痕不擋路(熱路徑不准炸)
+            UNREGISTERED_RING_TYPES.add(etype)
         self.seq += 1
         ev = {"seq": self.seq, "ts": time.time(), "type": etype, "data": data}
         # durable_seq(2026-11-06,T3#1):這個事件若有對應的持久 event_log

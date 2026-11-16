@@ -2828,6 +2828,46 @@ async def _event_wait(session: str, seen_ver: int) -> None:
         await asyncio.sleep(0.2)
 
 
+# ── B1(2026-11-16,grok-build steal #2):事件三分類登記表 ────────────────
+# 每個事件型別在**定義處**標分類,治「事件副本落後」的病根:之前「哪些事件
+# 落 event_log、哪些只走 SSE ring」是散在各呼叫點的隱性知識,新事件型別加錯
+# 軌(該持久的沒持久 → 未讀不亮;不該持久的持久 → cursor 指向解不開的洞)
+# 正是那一族 bug 的誕生地。三分類對齊 grok-build updates.rs 的紀律:
+#
+#   persisted    — 進 event_log、由 _event_append(唯一 chokepoint)蓋全域
+#                  seq;client 持久游標(/app/v2/events 全域訂閱、
+#                  after_durable_seq per-session 補洞)靠它追進度。
+#   persist-only — 進 event_log 蓋 seq,但不對應任何活流推送(審計/投影
+#                  專用;目前只有 app-thread 遷移軌跡那三種)。
+#   transient    — 只進 SSE ring(per-session ring seq),**絕不蓋全域 seq**:
+#                  登記表在 carddigest.RING_TRANSIENT,發射函式是
+#                  SessionCardStore._push / carddigest.emit_transient。
+#                  transient 蓋了全域 seq 的話,client 的持久游標會推進到
+#                  一個重啟後不存在的位置,補洞永遠解不開(grok updates.rs
+#                  同一條理由:transient 通知刻意不蓋 eventId)。
+#
+# 鐵律(tests/test_event_taxonomy_b1.py 釘住):
+#   1. event_log 的唯一寫入點是 _event_append —— 全檔 grep "INTO event_log"
+#      只准命中本函式。
+#   2. 新事件型別必須先登記才可發射:漏登記 → 完整性測試紅;runtime 照寫
+#      (fail-open,event_log 故障不准拖垮熱路徑)但大聲記
+#      event_type_unregistered,絕不無聲。
+EVENT_PERSISTED = {
+    "message.upsert": "三來源訊息鏡射(app/TG/cron)— 未讀與列表預覽的事實來源",
+    "card.milestone": "卡片終態(final=True)— 重啟後補洞 / durable cursor 的脊椎",
+    "session.status": "session 狀態邊緣觸發 — 補洞時 client 要能對帳回真值",
+    "turn": "回合轉換 — 持久補洞與 roster 活動推導都要它",
+    "read_cursor.update": "已讀游標伺服器真相 — 多裝置未讀一致性",
+}
+EVENT_PERSIST_ONLY = {
+    "thread.rebound": "app thread 重綁軌跡 — 審計/除錯,不推活流",
+    "thread.transferred": "app thread 跨 provider 轉移軌跡 — 同上",
+    "thread.delegated": "thread 轉為 delegation 的軌跡 — 同上",
+}
+_EVENT_LOG_TYPES = set(EVENT_PERSISTED) | set(EVENT_PERSIST_ONLY)
+_EVENT_TYPE_WARNED: set = set()   # 每型別只警一次,不洗版
+
+
 def _event_append(session: str, etype: str, payload: dict,
                   external_id: str | None = None,
                   con=None) -> int:
@@ -2848,6 +2888,13 @@ def _event_append(session: str, etype: str, payload: dict,
     """
     import sqlite3
     try:
+        # B1 登記表守門:沒登記的型別照寫(fail-open)但大聲留痕 ——
+        # 「安靜地走錯軌」才是事件副本落後的病原,寫壞至少查得到。
+        if etype not in _EVENT_LOG_TYPES and etype not in _EVENT_TYPE_WARNED:
+            _EVENT_TYPE_WARNED.add(etype)
+            _log_event("event_type_unregistered", session=session, type=etype,
+                       hint="登記進 bridge.EVENT_PERSISTED/EVENT_PERSIST_ONLY"
+                            "(transient 請改走 carddigest.emit_transient)")
         if con is not None:
             cur = con.execute(
                 "INSERT OR IGNORE INTO event_log(session,type,external_id,payload,created_at) "
