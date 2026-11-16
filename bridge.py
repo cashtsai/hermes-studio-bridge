@@ -24933,6 +24933,12 @@ def _cc2_reconcile_orphan_approvals() -> int:
     try:
         con = sqlite3.connect(CANON_DB, timeout=30)
         try:
+            # B2 waiter RAII:這條就是「bridge 重啟 → waiter 全滅」的收尾路,
+            # 跟 TTL 過期/provider 死同級 —— 先撈受影響列,過期後逐筆廣播
+            # approval.resolved,app 端開著的舊卡才收得掉。
+            stale = [r[0] for r in con.execute(
+                "SELECT id FROM approvals WHERE status='pending' "
+                "AND (provider='cc2' OR source LIKE 'cc2:%')").fetchall()]
             cur = con.execute(
                 "UPDATE approvals SET status='expired', decided_at=?, result=? "
                 "WHERE status='pending' AND (provider='cc2' OR source LIKE 'cc2:%')",
@@ -24943,6 +24949,8 @@ def _cc2_reconcile_orphan_approvals() -> int:
             n = cur.rowcount
         finally:
             con.close()
+        for aid in stale:
+            _approval_resolved_broadcast(aid, "expired")
         if n:
             _log_event("cc2_approval_reconcile", expired=n)
         return n

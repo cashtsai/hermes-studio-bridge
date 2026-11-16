@@ -88,6 +88,15 @@ class TestResolvedBroadcast(unittest.TestCase):
         self.assertEqual(len(evs), 1)
         self.assertEqual(evs[0]["data"]["status"], "expired")
 
+    def test_cc2_restart_orphan_sweep_broadcasts(self):
+        _insert("b2-cc2-orph", "cc2:gamma", provider="cc2")
+        n = bridge._cc2_reconcile_orphan_approvals()
+        self.assertGreaterEqual(n, 1)
+        evs = [e for e in _resolved_events("cc2:gamma")
+               if e["data"]["approval_id"] == "b2-cc2-orph"]
+        self.assertEqual(len(evs), 1)
+        self.assertEqual(evs[0]["data"]["status"], "expired")
+
     def test_generic_mark_dedupes_double_terminal(self):
         _insert("b2-oc-1", "openclaw:main", provider="openclaw")
         self.assertTrue(bridge._oc_approval_mark("b2-oc-1", "expired"))
