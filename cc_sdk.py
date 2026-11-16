@@ -21,6 +21,7 @@ send-keys Esc。Agent SDK 給的是結構化管道:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import time
@@ -457,6 +458,22 @@ def _clamp_mode(mode: str) -> str:
         _log("cc2_permission_mode_unknown", requested=str(mode)[:40],
              fallback="acceptEdits")
     return "acceptEdits"
+
+
+def approval_key(name: str, tool: str, tool_input: dict) -> str:
+    """B2 waiter key 穩定性(grok steal #1:key 要 survive 重啟)。
+
+    同一個審批問題 → 同一個 id。bridge 重啟、session resume 後 CLI 重問同
+    一個工具呼叫時,對回**同一筆** approvals 列與同一張卡(DB 側由
+    `_cc2_approval_db_upsert` 復活同列、卡片流同 id 原位替換),而不是另開
+    一張新卡、留舊卡懸空到 TTL。SDK 的 can_use_tool 回呼拿不到 tool_use_id,
+    (session, tool, 正規化參數) 是拿得到的最穩定持久 key。
+    飛行中撞號(同參數同時問兩次)由呼叫端加亂數後綴讓開 —— 穩定性只為
+    「重啟後重問」服務,不犧牲活 waiter。
+    """
+    basis = f"{name}|{tool}|" + json.dumps(tool_input or {}, sort_keys=True,
+                                           ensure_ascii=False, default=str)
+    return "cc2-" + hashlib.sha1(basis.encode("utf-8", "replace")).hexdigest()[:16]
 
 
 def _tool_summary(tool: str, tool_input: dict) -> str:
@@ -1580,7 +1597,12 @@ class CCSdkSession:
             # 把提問功能永久關掉且無聲(見 _can_use_tool 尾端的說明)。
             _log("cc2_approval_auto_allow", session=self.name, tool=tool)
             return sdk.PermissionResultAllow()
-        aid = "cc2-" + uuid.uuid4().hex[:12]
+        aid = approval_key(self.name, tool, tool_input)
+        if aid in self.registry.pending_approvals:
+            # 同 session 同工具同參數「在飛行中」又問一次(合法但罕見):
+            # 穩定 key 只為「重啟後重問對回原卡」服務,活 waiter 不能被頂掉
+            # —— 頂掉 = 第一問永遠等不到決議,fail-closed 空耗整個 timeout。
+            aid = f"{aid}-{uuid.uuid4().hex[:4]}"
         ask_opts, ask_title, ask_multi, ask_meta = ([], "", False, {})
         if tool == "AskUserQuestion":
             (ask_opts, ask_title, ask_multi,
@@ -1628,6 +1650,16 @@ class CCSdkSession:
                                    timeout=approval_timeout())
         except asyncio.TimeoutError:
             pass
+        except BaseException:
+            # B2 waiter RAII:waiter 消亡(回合被取消/interrupt/provider 收攤)
+            # 絕不留懸空卡 —— 卡片收尾 + DB 標 expired(bridge 側的 mark 會
+            # 連動 approval.resolved 廣播,所有端收到即收卡),例外原樣上拋。
+            self.registry.pending_approvals.pop(aid, None)
+            self.digest.resolve_approval(record, "expired")
+            _db_hook(APPROVAL_DB_MARK, aid, "expired")
+            _log("cc2_approval_waiter_died", session=self.name,
+                 approval_id=aid, tool=tool)
+            raise
         finally:
             self.registry.pending_approvals.pop(aid, None)
         decision = waiter["decision"]

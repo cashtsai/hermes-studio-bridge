@@ -2858,6 +2858,8 @@ EVENT_PERSISTED = {
     "session.status": "session 狀態邊緣觸發 — 補洞時 client 要能對帳回真值",
     "turn": "回合轉換 — 持久補洞與 roster 活動推導都要它",
     "read_cursor.update": "已讀游標伺服器真相 — 多裝置未讀一致性",
+    "approval.resolved": "審批終局廣播(B2)— A 端答了/waiter 消亡,"
+                         "所有端收到即收卡,不留懸空",
 }
 EVENT_PERSIST_ONLY = {
     "thread.rebound": "app thread 重綁軌跡 — 審計/除錯,不推活流",
@@ -6911,6 +6913,12 @@ class CodexAppServerClient:
         try:
             con = sqlite3.connect(CANON_DB, timeout=30)
             try:
+                # B2 waiter RAII:provider 死(app-server 重啟/連線重置)時
+                # 等待者已不可能被叫醒 —— 先撈出受影響的列,過期後逐筆廣播
+                # approval.resolved(outcome=expired),app 端懸空卡收得掉。
+                stale = [r[0] for r in con.execute(
+                    "SELECT id FROM approvals WHERE status='pending' "
+                    "AND source LIKE 'codex%'").fetchall()]
                 cur = con.execute(
                     "UPDATE approvals SET status='expired', decided_at=?, result=? "
                     "WHERE status='pending' AND source LIKE 'codex%'",
@@ -6919,6 +6927,8 @@ class CodexAppServerClient:
                 con.commit()
                 changed = cur.rowcount
                 con.close()
+                for aid in stale:
+                    _approval_resolved_broadcast(aid, "expired")
                 if changed:
                     _log_event("codex_approval_stale_expired", count=changed)
             finally:
@@ -7575,6 +7585,8 @@ class CodexAppServerClient:
                         (status, time.time(), result, approval_id))
             con.commit()
             con.close()
+            # B2:終局即廣播(external_id 以 aid+status 去重,重複 mark 無害)
+            _approval_resolved_broadcast(approval_id, status)
         finally:
             con.close()
 
@@ -21052,6 +21064,8 @@ def _cc_approval_set_status(aid: str, status: str) -> bool:
                               (status, time.time(), aid))
             con.commit()
             con.close()
+            if cur.rowcount:
+                _approval_resolved_broadcast(aid, status)   # B2:終局即廣播
             return bool(cur.rowcount)
         finally:
             con.close()
@@ -24239,6 +24253,8 @@ def _oc_approval_mark(aid: str, status: str, result: str = "") -> bool:
         con.commit()
         n = cur.rowcount
         con.close()
+        if n:
+            _approval_resolved_broadcast(aid, status)   # B2:openclaw+cc2 共用
         return bool(n)
     finally:
         con.close()
@@ -24261,6 +24277,17 @@ def _cc2_approval_db_upsert(record: dict) -> None:
     try:
         row = con.execute("SELECT status FROM approvals WHERE id=?",
                           (record["id"],)).fetchone()
+        if row and row[0] != "pending":
+            # B2 waiter key 穩定性:cc2 的 aid 是 (session,tool,參數) 的持久
+            # 雜湊(cc_sdk.approval_key)。bridge 重啟→resume 後 CLI 重問同
+            # 一個工具呼叫 → 同 aid 撞上已終局(expired)的舊列 —— 這**就是
+            # 同一個審批問題回來了**,復活同列回 pending(新 TTL),對回同
+            # 一張卡;不開新列才不會留一張懸空舊卡 + 一張新卡。
+            # 若舊列不復活,決議路由的冪等收據會先攔下(status 已終局),
+            # 新 waiter 永遠等不到人 → fail-closed 空耗 110s。
+            con.execute("UPDATE approvals SET status='pending', decided_at=NULL,"
+                        " result=NULL, created_at=?, expires_at=? WHERE id=?",
+                        (record["created_at"], record["expires_at"], record["id"]))
         if not row:
             con.execute("INSERT INTO approvals"
                         "(id,title,source,risk,detail,created_at,expires_at,"
@@ -27529,6 +27556,13 @@ async def _gm_on_request(req: dict):
                            "已自動拒絕。")
         _log_event("gemini_permission_expired", approval_id=aid, tool=tool)
         return {"outcome": {"outcome": "cancelled"}}
+    except asyncio.CancelledError:
+        # B2 waiter RAII:ACP 流死亡/回合被取消 → waiter 消亡也不准留懸空卡。
+        # mark expired 會連動 approval.resolved 廣播(所有端收卡)。
+        _gm_approval_set_status(aid, "expired")
+        _gm_resolve_approval_card(key, record, "expired")
+        _log_event("gemini_permission_waiter_died", approval_id=aid, tool=tool)
+        raise
     finally:
         _GM_PERM_WAITERS.pop(aid, None)
 
@@ -27558,10 +27592,12 @@ def _gm_approval_set_status(aid: str, status: str) -> None:
     import sqlite3
     con = sqlite3.connect(CANON_DB, timeout=30)
     try:
-        con.execute("UPDATE approvals SET status=?, decided_at=? "
-                    "WHERE id=? AND status='pending'",
-                    (status, int(time.time()), aid))
+        cur = con.execute("UPDATE approvals SET status=?, decided_at=? "
+                          "WHERE id=? AND status='pending'",
+                          (status, int(time.time()), aid))
         con.commit()
+        if cur.rowcount:
+            _approval_resolved_broadcast(aid, status)   # B2:終局即廣播
     except Exception as e:  # noqa: BLE001
         _log_event("gemini_approval_status_failed", error=str(e)[:160])
     finally:
@@ -32928,6 +32964,41 @@ def _approval_get_row(aid: str):
         con.close()
 
 
+def _approval_resolved_broadcast(aid: str, status: str, *, key: str = "",
+                                 row: dict | None = None) -> None:
+    """審批終局 → persisted `approval.resolved` 事件(B2,grok steal #1)。
+
+    治兩個病:(1) 多端搶答 —— A 端答了,B 端卡片還掛著可按,按了才吃 409;
+    (2) waiter 消亡(逾時/provider 死/bridge 收攤)後 app 端懸空卡。所有把
+    approvals 列翻成終局狀態的 chokepoint(決議路由各分支、TTL 過期掃除、
+    provider 死亡掃除、waiter RAII 出口)都要經過這裡 —— client 收到事件即
+    收卡,不必輪詢猜。
+
+    external_id 以 (aid, status) 去重:同一終局被重複 mark(冪等收據、
+    多路收尾)不會灌出第二筆。絕不 raise —— 審批收尾不准被事件鏡射拖垮。
+    呼叫時機:**DB 狀態已 commit 之後**(_event_append 自開連線,夾在未
+    commit 的寫交易中間會等鎖)。
+    """
+    try:
+        d = row or _approval_get_row(aid) or {}
+        sid = str(d.get("session_id") or "")
+        payload = {"approval_id": aid, "status": status, "session_id": sid,
+                   "provider": str(d.get("provider") or ""),
+                   "kind": str(d.get("kind") or "")}
+        if key:
+            payload["key"] = key
+        # event_log 的 session 鍵:persona 走裸 mid(對齊 /app/v2/events
+        # 全域訂閱只收 PERSONAS 的過濾);其他 provider 用完整 v2 id
+        # (對齊各自 store 的 media_session_id,per-session durable 補洞
+        # 才撈得到)。session_id 缺席的舊列落 "approvals" 桶,至少可稽核。
+        ev_session = (sid.split(":", 1)[1] if sid.startswith("hermes:")
+                      else (sid or "approvals"))
+        _event_append(ev_session, "approval.resolved", payload,
+                      external_id=f"apr:{aid}:{status}")
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("approval_resolved_broadcast", _exc, expected=True)
+
+
 def _hermes_pending_by_session() -> dict:
     """hermes persona 的 pending 待審(session_id='hermes:{mid}')→ 統一物件,
     每 persona 取最早一筆。v2 sessions 補 waiting_approval 用(spec §7-5)。"""
@@ -33015,9 +33086,16 @@ def _approvals_expire(con):
         stale = []
     con.execute("UPDATE approvals SET status='expired' WHERE status='pending' "
                 "AND expires_at IS NOT NULL AND expires_at < ?", (now,))
+    if stale:
+        # B2:先 commit 再廣播 —— _approval_resolved_broadcast 的 _event_append
+        # 自開連線,夾在呼叫端未 commit 的寫交易中間會等鎖等到 timeout。
+        # 呼叫端(各 pending 掃描/清單端點)本來就在本函式返回後立刻 commit,
+        # 提前無害。
+        con.commit()
     for aid, title, sid in stale:
         rec = {"id": aid, "title": title}
         sid = str(sid or "")
+        _approval_resolved_broadcast(aid, "expired")   # waiter RAII:過期即廣播
         try:
             if sid.startswith("hermes:"):
                 _hp_cards_feed_approval(sid, rec, resolved="expired")
@@ -33493,6 +33571,9 @@ async def _approval_decide_serial(aid: str, b: dict) -> dict:
         con.close()
         if not changed:
             raise HTTPException(status_code=409, detail="already decided or expired")
+        # B2:終局即廣播(persisted approval.resolved)— 多端只有一端答得進
+        # (UPDATE … WHERE status='pending' 先到先贏),其餘端收到事件收卡。
+        _approval_resolved_broadcast(aid, status, key=key, row=d)
         try:
             # A3:hermes 決定發生時收尾卡片流(同一決定路徑,三 provider 一致)。
             # _hp_cards_feed_approval 內部會篩 session_id 前綴,非 hermes: 的列
