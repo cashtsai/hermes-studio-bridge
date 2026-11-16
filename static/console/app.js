@@ -260,8 +260,7 @@ async function loadSessions() {
   }
 }
 
-// 交付 7:組內分層排序 —— 需要你(actionable)> 執行中 > 一般。穩定排序:
-// 同層維持清單原本順序,只有狀態真的翻轉那一列才會移動。
+// 組內分層排序:需要你(actionable)> 執行中 > 一般。
 function sessionRank(s) {
   if (actionable(s)) return 0;
   return ["run", "running", "busy", "queued"].includes(s.status) ? 1 : 2;
@@ -273,20 +272,30 @@ function sessionRank(s) {
 // 同級之內按最近活動排,再用 id 墊底,讓次序完全確定(原本同級順序跟著
 // 資料到達順序飄)。
 const RANK_DEMOTE_MS = 15000;
-const rankMemo = new Map();   // id → { rank, at }
+const rankMemo = new Map();   // id → { rank, pending, since }
 
 function stickyRank(s, now) {
   const raw = sessionRank(s);
   const memo = rankMemo.get(s.id);
   if (!memo || raw < memo.rank) {           // 升級或首見:立即生效並記住
-    rankMemo.set(s.id, { rank: raw, at: now });
+    rankMemo.set(s.id, { rank: raw, pending: null, since: now });
     return raw;
   }
-  if (raw === memo.rank) { memo.at = now; return raw; }
+  if (raw === memo.rank) { memo.pending = null; return raw; }
+  if (memo.pending !== raw) { memo.pending = raw; memo.since = now; }
   // 降級:15 秒內先維持原位;過了才真的掉下去。
-  if (now - memo.at < RANK_DEMOTE_MS) return memo.rank;
-  rankMemo.set(s.id, { rank: raw, at: now });
+  if (now - memo.since < RANK_DEMOTE_MS) return memo.rank;
+  rankMemo.set(s.id, { rank: raw, pending: null, since: now });
   return raw;
+}
+
+function sortSessions(rows, now) {
+  // 每個 session 每次快照只更新一次,包括只有一列的 provider。
+  const ranks = new Map(rows.map(s => [s.id, stickyRank(s, now)]));
+  return rows.sort((a, b) =>
+    (ranks.get(a.id) - ranks.get(b.id)) ||
+    (activityTime(b.last_event_at) - activityTime(a.last_event_at)) ||
+    (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
 }
 
 function renderSessions() {
@@ -305,10 +314,7 @@ function renderSessions() {
     byProv.get(p).push(s);
   }
   const now = Date.now();
-  for (const rows of byProv.values()) rows.sort((a, b) =>
-    (stickyRank(a, now) - stickyRank(b, now)) ||
-    (activityTime(b.last_event_at) - activityTime(a.last_event_at)) ||
-    (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+  for (const rows of byProv.values()) sortSessions(rows, now);
   let html = "";
   for (const [prov, rows] of byProv) {
     const dim = state.degraded.includes(prov) || (prov === "claude_code" && state.degraded.includes("cc2")) ? " degraded" : "";
@@ -1189,7 +1195,7 @@ function showDraft(id) {
   $("delivery-text").classList.toggle("working", ["checking","sending","verifying"].includes(pending?.phase));
   $("check-delivery").hidden = !pending || pending.phase !== "unknown";
   // 自動確認(verifying)期間查詢鈕不用出(機器正在查),但「結束追蹤」要
-  // 可按 —— 不然使用者會被鎖在輸入框外最長 30 秒,沒有任何出口。
+  // 可按,讓使用者在等待間隔及網路查詢期間都能退出。
   $("forget-delivery").hidden = !pending || !["unknown", "verifying"].includes(pending.phase);
   renderAtts(); autosize();
 }
