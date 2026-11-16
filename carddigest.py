@@ -1717,7 +1717,67 @@ class SessionCardStore(ApprovalCardMixin):
                 "cards": [{**self.cards[i], "seq": self.card_seq.get(i)}
                           for i in ids if i in self.cards],
                 "latest_seq": self.seq,
+                # C2(2026-11-16):hasMore 升格為一等欄位(之前算了卻只在
+                # paged 模式以 older_cursor 間接表達)。additive,舊 client 不讀。
+                "has_more": more,
                 "status": dict(self.status or {})}
+
+    # ── C2(2026-11-16,grok steal #4):歷史拉取 — 負 offset 取尾 + 回合切片 ──
+
+    def turn_slices(self) -> list:
+        """order 裡的卡片按「使用者回合」切片 → list[list[card_id]]。
+
+        邊界 = role=="user" 的卡開新片(照 grok session_updates 的
+        turnIndex:以使用者 prompt 為回合錨點);歷史被裁掉後開頭的
+        無主卡(第一張 user 卡之前)自成第 0 片 —— 裁切是事實,不假裝
+        它們屬於某個看不見的回合。
+        """
+        slices, cur = [], []
+        for cid in self.order:
+            if (self.cards.get(cid) or {}).get("role") == "user" and cur:
+                slices.append(cur)
+                cur = []
+            cur.append(cid)
+        if cur:
+            slices.append(cur)
+        return slices
+
+    def page(self, limit: int = 100, offset: int | None = None,
+             turn_index: int | None = None) -> dict:
+        """位置視窗(offset,**負值取尾**)或回合切片(turn_index,負值
+        從最新回合倒數)。治「進場閃舊訊息」:client 要的是「最後一回合/
+        最後 N 張」,而不是冷載整包再自己丟掉前面。
+
+        turn_index 超出保留範圍 → IndexError(呼叫端回 409:卡片庫只保留
+        最近 cards_max 張,更早的回合 bridge 已經沒有)。
+        """
+        limit = max(1, limit)
+        base = {"latest_seq": self.seq, "status": dict(self.status or {})}
+        if turn_index is not None:
+            slices = self.turn_slices()
+            n = len(slices)
+            idx = turn_index if turn_index >= 0 else n + turn_index
+            if not 0 <= idx < n:
+                raise IndexError(f"turn_index {turn_index} out of range (turns={n})")
+            ids = slices[idx]
+            trimmed = len(ids) > limit
+            ids = ids[-limit:]
+            return {**base,
+                    "cards": [{**self.cards[i], "seq": self.card_seq.get(i)}
+                              for i in ids if i in self.cards],
+                    "turn_index": idx, "turn_count": n,
+                    "has_more": idx > 0 or trimmed}
+        ids = self.order
+        total = len(ids)
+        off = int(offset or 0)
+        start = max(0, total + off) if off < 0 else min(off, total)
+        window = ids[start:start + limit]
+        return {**base,
+                "cards": [{**self.cards[i], "seq": self.card_seq.get(i)}
+                          for i in window if i in self.cards],
+                "window_start": start, "total_cards": total,
+                "has_more": start > 0,                       # 往前還有歷史
+                "has_more_after": start + limit < total}     # 往後還有(正向分頁)
 
     def ping(self) -> dict:
         """keepalive 信封 — 不進 ring、不佔 seq。durable_seq 恆為 null

@@ -1222,6 +1222,36 @@ GET /app/v2/sessions/{session_id}/cards?limit=100&before_seq=M
 `limit` 上限 500。**app 本地快取＝卡片庫**（key: session_id + card.id + rev）：
 離線可讀、進場秒開；快取只是 snapshot，永不當真相。
 
+### 7.1 歷史拉取:負 offset 取尾 + 回合切片(2026-11-16,grok steal #4)
+
+> 治「進場閃舊訊息」:client 要的是「最後一回合/最後 N 張」秒開,再按需
+> 往前翻 —— 不是冷載整包再自己丟掉前面。語義照 grok `x.ai/session/updates`
+> 的 offset/turnIndex 設計。全部 additive;既有 `before_seq`/`before_id`
+> 分頁一個 byte 不動,但**與新參數互斥**(混用回 400)。
+
+```
+GET /app/v2/sessions/{id}/cards?offset=-50&limit=50      # 尾巴 50 張
+GET /app/v2/sessions/{id}/cards?turn_index=-1&limit=200  # 最新一個使用者回合
+```
+
+- `offset`:位置視窗。**負值從尾巴數**(Python slicing 語義:`-50` =
+  最後 50 張起);非負 = 從頭數。回應多帶:
+  - `window_start`(視窗落在第幾張)、`total_cards`(卡片庫現存總數)
+  - `has_more`(視窗之前還有歷史)、`has_more_after`(視窗之後還有,
+    正向分頁用)
+- `turn_index`:按**使用者回合**切片(邊界 = `role=="user"` 的卡開新回
+  合;被裁掉的歷史開頭無主卡自成第 0 片)。負值從最新回合倒數
+  (`-1` = 最新)。回應多帶 `turn_index`(正規化後的非負值)、
+  `turn_count`;超出保留範圍回 **409 `TURN_INDEX_GONE`**(卡片庫只保留
+  最近 `POCKET_CARD_STORE_MAX` 張,更早的回合 bridge 已經沒有 ——
+  client 退 `offset` 位置視窗或放棄)。
+- `has_more` 同時升格為**所有模式**的一等回應欄位(含既有
+  snapshot/`before_seq` 路徑;以前只在 paged 模式以 `older_cursor` 間接
+  表達)。
+- 兩個新參數彼此互斥、也與 `before_seq`/`before_id`/`history_page` 互斥
+  (400)。`latest_seq`/`status`/`durable_seq` 欄位照舊 —— 不論用哪種
+  視窗拿歷史,SSE 續流與持久游標語義完全不變。
+
 ### Durable session media
 
 ```

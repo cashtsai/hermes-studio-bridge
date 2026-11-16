@@ -28637,7 +28637,9 @@ async def _v2_card_store(session_id: str):
 @app.get("/app/v2/sessions/{session_id}/cards")
 async def v2_session_cards(session_id: str, request: Request, limit: int = 100,
                            before_seq: int | None = None, history_page: bool = False,
-                           before_id: str | None = None):
+                           before_id: str | None = None,
+                           offset: int | None = None,
+                           turn_index: int | None = None):
     """契約 §3 冷載 snapshot:{cards, latest_seq, status} → app 渲染後從 since_seq 接流。
 
     `status` 2026-08-14 補入契約:形狀與 `session.status` 事件的 data 完全相同
@@ -28649,11 +28651,29 @@ async def v2_session_cards(session_id: str, request: Request, limit: int = 100,
     持久 event_log 的最大全域 id(沒有里程碑 = 0)。client 冷載後同時記兩個
     游標 —— ring 的 `latest_seq` 走既有 SSE 續流;`durable_seq` 是重連保險,
     ring 斷層時帶 `after_durable_seq` 走持久補洞,不再 410 整頁重載。
+
+    C2(2026-11-16,grok steal #4,契約 §7.1):`offset`(**負值取尾**,
+    offset=-50 = 最後 50 張)與 `turn_index`(按使用者回合切片,-1 = 最新
+    回合)兩個新參數,治「進場閃舊訊息」—— client 先拿尾巴/最後一回合秒開
+    畫面,再按需往前翻。回應多 `has_more`(所有模式)與視窗欄位
+    (window_start/total_cards 或 turn_index/turn_count)。與既有游標互斥。
     """
     _check_auth(request)
     store = await _v2_card_store(session_id)
     limit = max(1, min(limit, 500))
-    if history_page or before_id is not None:
+    if offset is not None or turn_index is not None:
+        # C2(契約 §7.1):位置視窗 / 回合切片,與既有游標互斥 —— 兩套座標
+        # 混用的結果沒有定義,寧可 400 也不猜。
+        if before_seq is not None or before_id is not None or history_page:
+            raise HTTPException(400, "use only one history cursor")
+        if offset is not None and turn_index is not None:
+            raise HTTPException(400, "use only one of offset/turn_index")
+        try:
+            snap = store.page(limit=limit, offset=offset, turn_index=turn_index)
+        except IndexError:
+            raise http_err(409, "TURN_INDEX_GONE",
+                           "turn_index 超出保留範圍(卡片庫只留最近一段歷史)")
+    elif history_page or before_id is not None:
         if before_seq is not None:
             raise HTTPException(400, "use only one history cursor")
         if before_id is not None and before_id not in store.cards:
