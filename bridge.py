@@ -524,6 +524,209 @@ def _media_wire_item(item: dict) -> dict:
     return out
 
 
+# ── 卡片附件:掃卡片 → 入庫 → 掛回(2026-11-17)──────────────────────────
+#
+# 病灶(機主 2026-11-17 實錘):「CC 給我影片/檔案在 Pocket 看不到,要開
+# Claude 才看得到」。根因:「本機檔案 → 可點附件」這條管線**只接在 codex
+# seed 那一條**(`_cx_seed_card_digest` 尾端的 `attach_captured_media`)。
+# CC(tmux)有把檔案收進媒體庫(`_cc_digest_lines` 的
+# `_schedule_media_capture`)卻**把擷取結果丟掉**,沒人寫回卡片;cc2 連收
+# 都沒收(只有 base64 圖那半條)。於是 agent 產出的路徑在卡片裡只是裸文字。
+#
+# 修法:**不另造管線**。掃**卡片**(所有 provider 唯一的共同形狀)→ 既有的
+# `capture_path` 入庫 → 既有的 `attach_captured_media` 掛回。一支掃描器吃
+# 所有 provider,seed 與 live 共用:
+#   · 冷載 → `_v2_card_store_with_media`(卡片端點共用的統一入口)
+#   · live → 各 provider 回合收尾
+# 兩條都會重發 `card.upsert`(同 id、rev+1、ts 不動)—— 理由見
+# `_media_attach_cards` 的「一律發」註解:分冷載/live 會讓兩條搶同一份工。
+#
+# 安全:允許根目錄 = session 工作目錄(含子目錄)+ 暫存區,比媒體庫本身的
+# `safe_roots`(整個家目錄)窄,且 realpath 之後才比對 → 工作目錄裡的
+# symlink 逃不出去。附件只能是影音圖/PDF/文件/壓縮檔(`ATTACHABLE_KINDS`),
+# 原始碼(.py/.swift…)不會被掛成下載連結。下載仍走
+# `/app/v2/artifacts/{media_id}` + Bearer。
+_MEDIA_ATTACH_EXTRA_ROOTS = tuple(
+    p.strip() for p in (os.environ.get("POCKET_MEDIA_ATTACH_ROOTS") or "").split(":")
+    if p.strip()
+)
+
+
+# codex thread → cwd 的旁觀快取。`thread/read` 是 RPC(async、會打 codex
+# app-server),而附件掃描跑在 worker thread 裡,不能在那裡 await —— 所以
+# 改成「凡是已經讀過 thread 的地方順手記一筆」。沒記過 → 回 ""(退化成只掃
+# 暫存區,不會掛錯東西)。
+_CX_THREAD_CWD: dict = {}
+
+
+def _cx_note_thread_cwd(thread_id: str, cwd: str) -> str:
+    """順手記一筆 thread→cwd。回傳 `cwd` 原值,方便直接內嵌在既有運算式裡。"""
+    tid = str(thread_id or "")
+    cwd = str(cwd or "")
+    if tid and cwd:
+        if len(_CX_THREAD_CWD) > 2000:
+            _CX_THREAD_CWD.clear()
+        _CX_THREAD_CWD[tid] = cwd
+    return cwd
+
+
+def _cc_conf_workdir(name: str) -> str:
+    row = next((r for r in _cc_conf_rows() if r and r[0] == name), None)
+    return (row[1] if row and len(row) > 1 else "") or ""
+
+
+def _media_session_cwd(session_id: str) -> str:
+    """v2 session id → 它的工作目錄(附件掃描的允許根目錄)。查不到回 ""。
+
+    ⚠️ 這支會讀檔(sessions.conf / 各 provider 的 sessions.json),**只准在
+    worker thread 裡呼叫** —— 放在 event loop 上就是每個 /cards、每次 SSE
+    連線都同步讀一次磁碟,而這個 repo 有被 loop 阻塞整台凍結的前科。
+    """
+    prov, _, rest = str(session_id or "").partition(":")
+    try:
+        if prov == "cc2":
+            return getattr(cc_sdk.registry().get(rest), "workdir", "") or ""
+        if prov == "gemini":
+            return str((gemini_provider.get_session(rest) or {}).get("cwd") or "")
+        if prov == "grok":
+            return str((grok_sdk.get_session(rest) or {}).get("cwd") or "")
+        if prov == "opencode":
+            return str((opencode_sdk.get_session(rest) or {}).get("cwd") or "")
+        if prov == "codex":
+            return _CX_THREAD_CWD.get(rest, "")
+        if prov in ("claude_code", "cc"):
+            return _cc_conf_workdir(rest or prov)
+        if not rest:
+            return _cc_conf_workdir(prov)   # 裸 CC session 名(無前綴)
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("_media_session_cwd", _exc, expected=True)
+    return ""
+
+
+def _store_media_sid(store, fallback: str = "") -> str:
+    """store 自己宣告的媒體 session id 優先;沒有才用呼叫端給的字面值。
+
+    `media_session_id` 是媒體庫 key 的唯一真相(cc2 改名時會重寫它、
+    `delegation:{id}` 路由到的其實是 `codex:{tid}`)。各呼叫點各自拼字串的
+    話就有兩份真相,哪天格式變了附件會寫到一個 app 根本不會查的 key 底下。
+    """
+    return str(getattr(store, "media_session_id", "") or fallback or "")
+
+
+def _media_memo(store, attr: str) -> set:
+    """掛在常駐 store 上的「看過了」記憶(上限由 carddigest 那邊管)。"""
+    value = getattr(store, attr, None)
+    if value is None:
+        value = set()
+        setattr(store, attr, value)
+    return value
+
+
+def _media_capture_cards_sync(store, session_id: str) -> list:
+    """執行緒內跑:查 cwd → 掃卡片 → 過安全門 → `capture_path` 入庫 → wire。
+
+    回傳可以交給 `attach_captured_media` 的項目。**不碰卡片、不發事件** ——
+    那兩件事有 asyncio.Event 要 set,只准在 event loop 執行緒做。
+    """
+    roots = media_artifacts.attach_roots(
+        [_media_session_cwd(session_id)], _MEDIA_ATTACH_EXTRA_ROOTS)
+    refs = carddigest.media_refs_in_cards(
+        store,
+        lambda ref: media_artifacts.vet_attachable_path(ref, roots),
+        # 跨回合保留的記憶:路徑集合省掉重複 stat、卡片集合省掉重複掃描。
+        # 這支每次 /cards、每次 SSE 連線都會跑,沒有這兩層就是每次都重掃
+        # 整個卡片庫。
+        _media_memo(store, "media_scanned_refs"),
+        _media_memo(store, "media_scanned_cards"),
+    )
+    wired = []
+    for ref in refs:
+        try:
+            wired.append(_media_wire_item(
+                _media_store().capture_path(session_id, ref)))
+        except Exception as _exc:  # noqa: BLE001 — 單檔失敗不拖累其他
+            _log_exc("_media_capture_cards_sync.capture", _exc, expected=True)
+    return wired
+
+
+def _media_attach_lock(store):
+    """每個 store 一把鎖,**綁在當前 loop 上**。
+
+    為什麼要記 loop:store 活在模組層 dict 裡(跨請求常駐),而
+    `asyncio.Lock` 第一次 acquire 就綁定 loop —— 之後換一個 loop 用它會丟
+    `RuntimeError: bound to a different event loop`,而這裡外層是
+    `except Exception` → 整個附件功能**安靜地變成 no-op**,只留一行沒人在看
+    的 log。測試每個 case 一個 `asyncio.run` 就會踩到(所以漏掉這條的話,
+    真正的回歸還會一路綠燈)。
+    """
+    loop = asyncio.get_running_loop()
+    bound = getattr(store, "media_attach_lock", None)
+    if isinstance(bound, tuple) and bound[0] is loop:
+        return bound[1]
+    lock = asyncio.Lock()
+    store.media_attach_lock = (loop, lock)
+    return lock
+
+
+async def _media_attach_cards(store, session_id: str) -> int:
+    """掃該 session 的卡片、把本機產出物掛成可點附件。回傳掛上幾張卡。
+
+    整支 fail-safe:附件永遠是加分項,不准讓它弄壞冷載或回合收尾。
+
+    **一律發 `card.upsert`**(不分冷載/live)。原本冷載走 `emit=False`(想
+    省掉灌 ring),結果是一個很難查的洞:兩條路共用「看過了」記憶,所以
+    **先跑到的那條把工作吃掉**——只要任何一個 emit=False 的呼叫(媒體抽屜
+    輪詢、第二台裝置冷載、guest 頁每 5 秒刷新)搶先,附件就只寫進 store、
+    沒有事件;稍後 live 那條掃到 0 筆、什麼都不發。已連線的 app 的 rev 永遠
+    不前進 → 使用者還是看不到附件,得整個重載。發事件很便宜(同 id、rev+1、
+    ts 不動,client 本來就以最高 rev 原位替換),拿它換掉整個 bug class。
+
+    **每個 store 一把鎖**(2026-11-17 實測抓到的競態):CC 冷載會同時觸發
+    兩條 —— `_cc_digest_lines` 的背景掃描,與 `_v2_card_store` 入口的掃描。
+    兩條並行時後到的那條會看到「卡片都掃過了」而掃出 0 筆,然後**先到的那
+    條還沒把附件寫回去**就回應了 —— 實測 amulet-hunter 的附件數在 3 / 1
+    之間跳。序列化之後:誰先拿到鎖就做完整的工,另一條變成 no-op,但一定是
+    在**附件已經寫回卡片之後**才返回。
+    """
+    if store is None or not session_id:
+        return 0
+    try:
+        async with _media_attach_lock(store):
+            wired = await asyncio.to_thread(
+                _media_capture_cards_sync, store, session_id)
+            if not wired:
+                return 0
+            n = carddigest.attach_captured_media(store, wired, emit=True)
+        if n:
+            _log_event("media_cards_attached",
+                       session_hash=_short_hash(session_id),
+                       cards=n, files=len(wired))
+        return n
+    except Exception as exc:  # noqa: BLE001
+        _log_event("media_cards_attach_error",
+                   session_hash=_short_hash(session_id),
+                   error=type(exc).__name__, error_message=str(exc)[:160])
+        return 0
+
+
+def _schedule_media_attach(store, session_id: str) -> None:
+    """回合收尾用的射後不理版(不阻塞 provider 的訊息迴圈)。"""
+    if store is None or not session_id:
+        return
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        # 沒有 loop = 呼叫端不在 event loop 上(未來若有人把 digest 搬進
+        # worker thread 就會走到這)。留痕,不然「附件安靜地不存在」沒有任何
+        # 線索可查 —— 這個 repo 的頭號病原就是靜默失敗。
+        _log_event("media_attach_no_loop",
+                   session_hash=_short_hash(session_id))
+        return
+    task = loop.create_task(_media_attach_cards(store, session_id))
+    _BG_TASKS.add(task)
+    task.add_done_callback(_BG_TASKS.discard)
+
+
 # Loaded after _log_event exists so a corrupt tokens file gets logged.
 _DEVICE_TOKENS: dict = _load_device_tokens()
 
@@ -9387,7 +9590,7 @@ def _codex_session_summary(thread: dict,
         "name": name or preview[:180] or (tid[:12] or "codex"),
         "thread_id": tid,
         "session_id": thread.get("sessionId") or "",
-        "workdir": thread.get("cwd") or "",
+        "workdir": _cx_note_thread_cwd(tid, thread.get("cwd") or ""),
         "preview": preview[:180],
         "status": provider_status,
         "providerStatus": provider_status,
@@ -10399,7 +10602,9 @@ async def _codex_thread_workdir(thread_id: str) -> str:
         }, timeout=20.0)
     except Exception as e:  # noqa: BLE001
         _codex_http_error(e)
-    return ((res or {}).get("thread") or {}).get("cwd") or ""
+    # 順手餵 _CX_THREAD_CWD(附件掃描在 worker thread 裡,沒辦法 await 這支)。
+    return _cx_note_thread_cwd(
+        thread_id, ((res or {}).get("thread") or {}).get("cwd") or "")
 
 
 async def _session_git_root(wd: str, workdir: str) -> str:
@@ -23297,9 +23502,16 @@ def _cc_digest_lines(store, lines, jsonl_path: str, start_lineno: int) -> int:
                 store.saw_output = True
                 store.last_tool = ""
     if media_payloads:
-        _schedule_media_capture(
-            getattr(store, "media_session_id", ""), media_payloads
-        )
+        sid = getattr(store, "media_session_id", "")
+        # ① 既有:把逐字稿引用到的檔案收進媒體庫(`/app/v2/sessions/…/media`
+        #    的索引來源)。範圍比附件寬 —— 連 `.py` 的 `file_path` 都收,因為
+        #    媒體庫是「這條 session 碰過哪些檔」的索引,不是給卡片用的。
+        _schedule_media_capture(sid, media_payloads)
+        # ② 2026-11-17 補:擷取結果原本**整個被丟掉**,沒人寫回卡片 →
+        #    agent 產出的影片/PDF 在 Pocket 只是裸文字,點不開(機主回報
+        #    「要開 Claude 才看得到」)。這條掃剛落地的卡並掛上可點附件;
+        #    `_cc_digest_lines` 同時服務 seed 與 live tail,兩條一次到位。
+        _schedule_media_attach(store, sid)
     return n
 
 
@@ -23632,6 +23844,10 @@ def _cx_cards_feed(method: str, params: dict, *, local_error: str = "") -> None:
             # 之後又沒有新事件來觸發,就永遠不會寫進檔案。實測踩到:重啟後逐字稿
             # 只剩 🔧 指令、沒有 ↳ 結果。
             _cx_toolsteps_note(tid, force=True)
+            # 附件(2026-11-17):codex 原本只有 **seed** 會把擷取到的檔案掛回
+            # 卡片(`_cx_seed_card_digest`),live 那條只入庫、不掛 —— 同一個
+            # 回合要等下一次冷載才看得到可點附件。補上與 CC/cc2 同一支。
+            _schedule_media_attach(d.store, _store_media_sid(d.store, f"codex:{tid}"))
 
 
 def _cx_cards_feed_approval(record: dict, resolved: str = "") -> None:
@@ -24318,6 +24534,11 @@ async def _hp_canon_follower(session: str):
                 _media_capture_sync, f"hermes:{session}", messages
             )
             d.seed_messages(messages)
+            # 附件(2026-11-17):人格這條也只入庫、不掛回卡片。人格沒有工作
+            # 目錄的概念,所以允許根目錄只有暫存區(要放寬走
+            # `POCKET_MEDIA_ATTACH_ROOTS`)—— 比「掛不到」好,也不會把家目錄
+            # 任何檔案變成可下載。
+            await _media_attach_cards(d.store, f"hermes:{session}")
         except Exception as e:  # noqa: BLE001
             _log_event("hp_card_follower_error", session=session,
                        error=str(e)[:200])
@@ -24712,7 +24933,10 @@ cc_sdk.configure(log=_log_event,
                  turn_end_push=_cc2_turn_end_push,
                  # 工具回傳的圖走與 tmux CC 同一顆 sink(同一個 media store、
                  # 同一種 download_url),所以 app 零改動就看得到。
-                 media_sink=_cc_image_sink)
+                 media_sink=_cc_image_sink,
+                 # 回合收尾掃卡掛附件(agent 產的影片/PDF/圖 → 可點下載)。
+                 # 與 tmux CC 走同一支 `_media_attach_cards`。
+                 media_attach=_schedule_media_attach)
 
 
 @app.get("/app/v2/cc2/{name}/history")
@@ -28342,6 +28566,9 @@ async def _gm_run_turn(key: str, content: str,
     finally:
         if acp_sid:
             _GM_TURNS.pop(acp_sid, None)
+        # 回合收尾掃卡掛附件(2026-11-17):gemini 原本只在**使用者上傳**那條
+        # 入庫,agent 自己產的檔案一律是裸路徑。放 finally = 成功/失敗共用。
+        _schedule_media_attach(d.store, _store_media_sid(d.store, f"gemini:{key}"))
         # C11 drain:上一輪收尾(成功或失敗都算)→ 接著跑佇列裡最舊的一則。
         # 放 finally 是刻意的:失敗不 drain 的話,排在後面的訊息會永遠卡著,
         # 而使用者看到的只是「我後來送的那幾則全部沒反應」。
@@ -28985,6 +29212,8 @@ async def _gk_run_turn(key: str, content: str,
             _GK_TURNS.pop(acp_sid, None)
         if hold:
             _GK_TURNS.pop(hold, None)   # 半路炸掉也不准把 busy 卡死
+        # 回合收尾掃卡掛附件(2026-11-17,與 CC/cc2/gemini 同一支)。
+        _schedule_media_attach(d.store, _store_media_sid(d.store, f"grok:{key}"))
         # C11 drain:失敗也 drain,否則後送的訊息永遠卡著(S5 同款)。
         pending = _GK_INPUT_QUEUE.get(key)
         if pending:
@@ -29609,6 +29838,8 @@ async def _oce_run_turn(key: str, content: str,
             _OCE_TURNS.pop(acp_sid, None)
         if hold:
             _OCE_TURNS.pop(hold, None)   # 半路炸掉也不准把 busy 卡死
+        # 回合收尾掃卡掛附件(2026-11-17,與 CC/cc2/gemini/grok 同一支)。
+        _schedule_media_attach(d.store, _store_media_sid(d.store, f"opencode:{key}"))
         # drain:失敗也 drain,否則後送的訊息永遠卡著(S5/S6 同款)。
         pending = _OCE_INPUT_QUEUE.get(key)
         if pending:
@@ -30217,6 +30448,23 @@ async def openclaw_config_put(request: Request):
             "source": cfg["source"]}
 
 
+async def _v2_card_store_with_media(session_id: str):
+    """`_v2_card_store` + 補一次「卡片裡的本機產出物 → 可點附件」。
+
+    **只有「要把卡片端給使用者看」的端點該用這支**(冷載 snapshot、SSE 連線、
+    媒體索引)。刻意不塞進 `_v2_card_store` 本身:那支在這個檔裡同時扮演
+    「驗這個 session 存不存在」的角色(guest 連結建立、agent 互調的 audit 卡、
+    harness 巡邏…十幾個呼叫點),把掃檔案 + 複製 blob 的副作用加到它身上會
+    讓 **unauthenticated 的 guest 頁每 5 秒輪詢一次就驅動一輪檔案系統讀寫**。
+
+    `await`(不是射後不理)是必要的:冷載快照直接讀 `store.cards`,不等它
+    做完就會回一份沒有附件的快照。
+    """
+    store = await _v2_card_store(session_id)
+    await _media_attach_cards(store, _store_media_sid(store, session_id))
+    return store
+
+
 async def _v2_card_store(session_id: str):
     """cards/events 共用:session id → 已 seed 的 SessionCardStore。"""
     src = _v2_card_source(session_id)
@@ -30270,7 +30518,7 @@ async def v2_session_cards(session_id: str, request: Request, limit: int = 100,
     (window_start/total_cards 或 turn_index/turn_count)。與既有游標互斥。
     """
     _check_auth(request)
-    store = await _v2_card_store(session_id)
+    store = await _v2_card_store_with_media(session_id)
     limit = max(1, min(limit, 500))
     if offset is not None or turn_index is not None:
         # C2(契約 §7.1):位置視窗 / 回合切片,與既有游標互斥 —— 兩套座標
@@ -30304,7 +30552,7 @@ async def v2_session_media(session_id: str, request: Request, limit: int = 100,
     _check_auth(request)
     # Reuse the canonical session router and seed path. Besides validating the
     # id, this captures references from cold history before returning the index.
-    await _v2_card_store(session_id)
+    await _v2_card_store_with_media(session_id)
     page = await asyncio.to_thread(
         _media_store().list_session,
         session_id,
@@ -30405,7 +30653,7 @@ async def v2_session_events(session_id: str, request: Request, since_seq: int = 
     if profile != "phone":
         raise http_err(400, "UNSUPPORTED_PROFILE",
                        "只實作 profile=phone(契約 §4)與 profile=probe(選路探測)")
-    store = await _v2_card_store(session_id)
+    store = await _v2_card_store_with_media(session_id)
     backlog = store.since(since_seq)
     durable_backfill: list[dict] = []
     if backlog is None:

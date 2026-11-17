@@ -20,6 +20,7 @@ import hashlib
 import re
 import time
 
+import media_artifacts
 from visual_envelope import VisualEnvelopeError, normalize_visual_envelope
 
 
@@ -58,8 +59,116 @@ def _take_ts_default(card: dict) -> bool:
     return bool(card.pop(TS_DEFAULT_KEY, False))
 
 
-def attach_captured_media(store, captured: list) -> int:
+# 掃卡片找路徑時要看的 body 欄位。`summary` 是 tool_call 卡的指令/檔名
+# (CC 的 `Write /…/out.mp4` 就只出現在這裡),`detail` 是部分 provider 的
+# 長版輸出。刻意不掃 `patch`(那是檔案內容,不是產出物路徑)。
+_MEDIA_SCAN_TEXT_KEYS = ("text", "fallback_text", "summary", "detail")
+
+# 單次掃描的路徑上限。長 session 的卡片庫有上千張卡,每個唯一路徑要 stat
+# 一次 —— 加上限才不會讓某一輪的掃描變成幾千次 syscall。超過的下一輪再補
+# (`seen` 會記住已處理的,所以不會卡在同一批)。
+_MEDIA_SCAN_MAX_REFS = 200
+
+# 「看過了」記憶的上限(兩個集合都掛在常駐 store 上)。
+_MEDIA_MEMO_MAX = 20_000
+
+# 契約 §6 說會渲染 `attachments` 的卡種。`tool_call {tool, summary, detail?,
+# patch?}` / `tool_result` 不在其中 —— 但同一輪裡路徑**最常**出現的地方正是
+# 它們。所以分兩輪:先給會渲染的(text/markdown),工具卡只做保底。
+#
+# 為什麼必須分輪:實測的 CC 形狀是「先宣告、再動手」——
+#   markdown「我把報告寫到 /tmp/out.pdf」→ tool_call Write → tool_result
+# 由後往前掃的話 tool_result 先搶到,而「一支檔只掛一張卡」又讓那張**會
+# 渲染的** markdown 卡拿不到 → 使用者看到的還是裸路徑,而 log 卻報成功。
+_MEDIA_ATTACH_RENDERED_KINDS = ("text", "markdown")
+
+
+def media_refs_in_cards(store, vet, seen: set | None = None,
+                        scanned_cards: set | None = None) -> list[str]:
+    """卡片庫 → 「應該掛成可點附件」的本機檔案路徑(已去重、已過安全門)。
+
+    為什麼掃卡片而不是掃 provider 原始事件:每家 provider 的事件形狀都不同
+    (CC 是 jsonl、cc2 是 SDK 物件、ACP 家族是 session/update),但**卡片形狀
+    只有一種**。掃卡片 = 一份掃描器吃所有 provider,而且 seed 與 live 走的是
+    同一支(回合結束重掃該 session 的卡即可,不必各自接管線)。
+
+    `vet(ref) -> str|None` 由呼叫端注入(bridge 綁
+    `media_artifacts.vet_attachable_path` + 該 session 的允許根目錄)——
+    carddigest 不自己決定什麼路徑算安全,也不自己 import 權限政策。
+
+    `vet` 的三態回傳是這支能不能正確工作的關鍵(見
+    `media_artifacts.vet_attachable_path`):`str` = 收;`None` = 永久不合
+    (副檔名/根目錄),記進 `seen` 永不再問;`False` = **檔案還沒出現**,
+    這張卡保留重試機會(不記 `seen`、不記 `scanned_cards`)。
+
+    為什麼非得分 False 與 None:code agent 的卡片**先出現**、檔案**後產生**
+    —— `ffmpeg -i a.mov /work/out.mp4` 的工具卡在 1 秒內就落地,檔案 30 秒
+    後才寫完。早期版本把兩種拒絕都記進 `seen`,於是那支 mp4 **整個 session
+    再也不會被掛上**(後面的 tool_result 卡、最終摘要卡提到同一條路徑全被
+    `ref in seen` 擋掉)—— 正是這個功能要治的病,只是換了個地方發生。
+
+    效能(這支每次 cards/events 請求都會跑一遍,不能是 O(全部卡片)):
+      · `seen` = 呼叫端跨回合保留的**路徑**集合(已收的 + 永久不合的)→
+        同一條路徑只 vet 一次。
+      · `scanned_cards` = 跨回合保留的 `id:rev` 集合 → 掃過、沒變、且沒有
+        「等一下再看」的卡直接跳過,重掃是 O(新卡/改過的卡)。
+    卡片由**新到舊**掃,所以 `_MEDIA_SCAN_MAX_REFS` 的額度優先給最近的卡
+    (使用者要的是剛剛那支影片,不是三天前的)。
+    """
+    refs: list[str] = []
+    seen = seen if seen is not None else set()
+    # 兩個集合都掛在常駐 store 上,得有上限(長 session 會把每條路徑字串
+    # 都留著)。清掉只是多掃一輪,不會掛錯東西。
+    if len(seen) > _MEDIA_MEMO_MAX:
+        seen.clear()
+    if scanned_cards is not None and len(scanned_cards) > _MEDIA_MEMO_MAX:
+        scanned_cards.clear()
+    for card in reversed(_ordered_cards(store)):
+        body = card.get("body") or {}
+        if body.get("attachments"):
+            continue            # live 事件帶的附件優先,不重複掛
+        if card.get("kind") == "attachment" and body.get("download_url"):
+            continue            # 已經有可下載網址(base64 圖那條路)
+        stamp = f"{card.get('id')}:{card.get('rev')}"
+        if scanned_cards is not None and stamp in scanned_cards:
+            continue
+        candidates: list[str] = []
+        # `attachment` 卡的 body.path 是**結構化**欄位(CC/cc2 的「agent 看圖」
+        # 卡就只有這個),不是內文,所以直接收 —— 不必靠文字偵測。
+        explicit = body.get("path")
+        if isinstance(explicit, str) and explicit:
+            candidates.append(explicit)
+        for field in _MEDIA_SCAN_TEXT_KEYS:
+            value = body.get(field)
+            if isinstance(value, str) and value:
+                candidates.extend(media_artifacts.references_in_text(value))
+        retry_later = False
+        for ref in candidates:
+            if not ref or ref in seen:
+                continue
+            verdict = vet(ref)
+            if isinstance(verdict, str) and verdict:
+                seen.add(ref)
+                refs.append(ref)
+                if len(refs) >= _MEDIA_SCAN_MAX_REFS:
+                    # 刻意**不**標記這張卡掃過:額度用完時它可能還有沒看完的
+                    # 候選,下一輪要從它繼續。
+                    return refs
+            elif verdict is False:
+                retry_later = True      # 檔案還沒出現 → 下次再看這張卡
+            else:
+                seen.add(ref)           # 永久不合,不必再問
+        if scanned_cards is not None and not retry_later:
+            scanned_cards.add(stamp)
+    return refs
+
+
+def attach_captured_media(store, captured: list, *, emit: bool = False) -> int:
     """把媒體倉庫擷取到的檔案掛回**內文提到該路徑**的卡片上。
+
+    `emit=True`(2026-11-17,live 路徑):掛完之後重新 `upsert_card`,讓
+    已經在線的 app 收到 `card.upsert`(rev+1、原位替換)。預設 False 是
+    seed/冷載語意 —— 原地改 body 就好,快照自然帶上,不必灌 ring。
 
     為什麼需要:seed 時 bridge 會把 turns 裡引用到的本機檔案擷取進倉庫(拿得到
     media_id 與下載網址),但擷取結果原本**整個被丟掉**,沒有人寫回卡片的
@@ -69,6 +178,20 @@ def attach_captured_media(store, captured: list) -> int:
 
     比對用「卡片內文是否包含該絕對路徑」,所以同一輪多檔也能各自歸位;
     已經有 attachments 的卡不動(live 事件帶的附件優先)。回傳掛上幾張卡。
+
+    **同一輪裡一支檔案只掛一次**(2026-11-17 實測修正):同一輪裡一張圖的
+    路徑會同時出現在 `tool_call` 的 summary、`tool_result` 的輸出、以及專屬
+    的 `attachment` 卡 —— 三張卡各掛一次的話使用者會看到同一張圖連續出現
+    三遍(實測 amulet-hunter:vid-B.png 出現 3 次)。優先順序:
+      1. `attachment` 卡(它就是為這支檔存在的,也是唯一會顯示縮圖的)
+      2. `text` / `markdown` 卡 —— 契約 §6 說只有這些會渲染 `attachments`
+      3. 其餘卡種(工具卡)只做保底:該輪沒有任何會渲染的卡提到它時才掛,
+         免得「掛上了但 app 不顯示」而 log 報成功
+
+    **去重只在回合內**(`(turn_id, ref)`):跨回合刻意不去重 —— codex 常在
+    第 3 回合與第 18 回合引用同一份報告,只給最後一次的話使用者往上捲就
+    又看到裸文字(那正是 `test_cx_file_citation_attach` 要擋的病,只是換到
+    捲回去才看得到)。
     """
     if not captured:
         return 0
@@ -82,22 +205,111 @@ def attach_captured_media(store, captured: list) -> int:
              and c.get("download_url") and c.get("source_kind") != "url"]
     if not items:
         return 0
-    touched = 0
-    for card in list(getattr(store, "cards", {}).values()):
-        body = card.get("body") or {}
-        if body.get("attachments"):
-            continue
-        text = str(body.get("text") or body.get("fallback_text") or "")
-        if not text:
-            continue
-        hits = [c for c in items
-                if str(c.get("source_ref") or "") and str(c["source_ref"]) in text]
-        if not hits:
-            continue
-        body["attachments"] = [dict(h) for h in hits]
+    by_ref = {str(c["source_ref"]): c for c in items if c.get("source_ref")}
+    cards = _ordered_cards(store)
+    touched: dict[str, dict] = {}
+
+    def mark(card: dict) -> dict:
+        body = dict(card.get("body") or {})
         card["body"] = body
-        touched += 1
-    return touched
+        touched[card["id"]] = card
+        return body
+
+    # 「這支檔在這一輪已經有歸宿了」。key 含 turn_id → 跨回合各自歸位。
+    covered: set[tuple[str, str]] = set()
+
+    def turn_of(card: dict) -> str:
+        return str(card.get("turn_id") or "")
+
+    def card_text(body: dict) -> str:
+        parts = [str(body.get(field) or "") for field in _MEDIA_SCAN_TEXT_KEYS]
+        return "\n".join(p for p in parts if p)
+
+    # ① `attachment` 卡(CC/cc2 的「agent 看了一張圖」卡)只有 body.path ——
+    #    一個**本機絕對路徑**,app 根本拿不到。它不是內文,文字比對永遠對不
+    #    上,所以這類卡一路都是「看得到檔名、點不開」。補上 media_id/
+    #    download_url,它才真的變成附件。
+    for card in cards:
+        body = card.get("body") or {}
+        if card.get("kind") != "attachment" or body.get("attachments"):
+            continue
+        ref = str(body.get("path") or "")
+        hit = by_ref.get(ref)
+        if hit is None:
+            # body.path 對不上(相對路徑、`file://`、不同的 symlink 寫法)時
+            # 退回內文比對 —— 舊版就是這樣找的,別把這條退路拆掉。
+            text = card_text(body)
+            ref, hit = next(
+                ((r, c) for r, c in by_ref.items() if r and r in text),
+                ("", None))
+        if hit is None:
+            continue
+        if body.get("download_url"):
+            # 已經可下載(base64 那條)→ 這一輪別人也不用再掛。
+            covered.add((turn_of(card), ref))
+            continue
+        body = mark(card)
+        body["media_id"] = hit.get("media_id")
+        body["download_url"] = hit.get("download_url")
+        body["byte_size"] = hit.get("byte_size")
+        body["available"] = True
+        body.setdefault("kind", hit.get("kind") or "file")
+        if not body.get("mime"):
+            body["mime"] = hit.get("mime") or ""
+        if not body.get("filename"):
+            body["filename"] = hit.get("filename") or ""
+        covered.add((turn_of(card), ref))
+
+    # ②③ 內文提到該絕對路徑 → 掛 attachments。兩輪:先給會渲染的卡種
+    #     (text/markdown),工具卡只做保底。各輪都**從後往前**掃,所以同一
+    #     輪內是「最後提到它的那張」拿到(最接近「這是你要的東西」的位置)。
+    for rendered_pass in (True, False):
+        for card in reversed(cards):
+            kind = card.get("kind")
+            if kind == "attachment":
+                continue
+            if (kind in _MEDIA_ATTACH_RENDERED_KINDS) is not rendered_pass:
+                continue
+            body = card.get("body") or {}
+            if body.get("attachments"):
+                continue
+            text = card_text(body)
+            if not text:
+                continue
+            turn = turn_of(card)
+            hits = [(ref, c) for ref, c in by_ref.items()
+                    if ref and (turn, ref) not in covered and ref in text]
+            if not hits:
+                continue
+            body = mark(card)
+            body["attachments"] = [dict(c) for _ref, c in hits]
+            covered.update((turn, ref) for ref, _c in hits)
+
+    if emit:
+        for card in touched.values():
+            try:
+                store.upsert_card(card)
+            except Exception:  # noqa: BLE001 — 掛附件絕不准打斷回合
+                pass
+    return len(touched)
+
+
+def _ordered_cards(store) -> list[dict]:
+    """卡片庫 → **app 實際顯示順序**的卡片清單。
+
+    `store.order` 才是顯示順序:`chronological=True` 的 store(codex)它是
+    照 ts 排過的;其餘 provider 它是到達順序 —— 兩種都正是 app 畫出來的
+    順序,所以「最後提到」= 使用者看到的最後一張。直接用 `store.cards`
+    的 dict 順序不行:reseed 撈到的舊歷史會插在 `order` 中間、但在 dict 裡
+    接在尾端,拿它當依據會指錯卡。
+    """
+    cards = getattr(store, "cards", {}) or {}
+    order = getattr(store, "order", None)
+    if isinstance(order, list):
+        out = [cards[cid] for cid in order if cid in cards]
+        if len(out) == len(cards):
+            return out
+    return list(cards.values())
 
 
 def make_card(cid: str, turn_id: str, role: str, kind: str, body: dict,
