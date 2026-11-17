@@ -55,6 +55,24 @@ to a temp directory and installs an audit hook that **raises** on any write to a
 production path. If a new test tries to write to `~/.pocket`, you will get a loud
 failure rather than a corrupted local install. Keep that import first.
 
+### Scenarios (behaviour proofs)
+
+`scenarios/` holds a second, much smaller family: one file per **symptom a user
+actually hit**, driven only through the product's public HTTP/CLI surface. Each
+one must fail on the commit *before* its fix and pass after — otherwise it is a
+line that can never go red, which is the exact failure mode this repo keeps
+getting bitten by.
+
+```sh
+scripts/prove-scenario.sh cc_input_not_accepted_when_survey_modal 4c87829^
+```
+
+The script checks the base commit out into a throwaway worktree, runs the
+scenario there (**must fail**), then runs it on head (**must pass**), and only
+then prints `PROVEN`. Read [`docs/SCENARIOS.md`](docs/SCENARIOS.md) before
+adding one — the three rules there are what make a scenario runnable across
+commits at all.
+
 ### Where to start
 
 Two tasks with a clear boundary, both genuinely useful:
