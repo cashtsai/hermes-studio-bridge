@@ -1,0 +1,391 @@
+{
+  "schema_version": 1,
+  "hash_recipe": "sha256(rule \\0 path \\0 normalized-line)",
+  "note": "凍結清單:這裡面的違規不擋,不在這裡面的擋死。條數只准往下走 —— 變多一定要在 PR 說明裡有一句話。見 scripts/ratchet/baseline_inventory.py 的檔頭。",
+  "rules": {
+    "js-naked-truncation": {
+      "17a067ee5c281a013528cec7146136b1": {
+        "count": 1,
+        "path": "tests/browser/console-handoff.cjs",
+        "line": 327,
+        "snippet": "assert.deepEqual(cursors.slice(0,2), [\"10\",\"12\"]);"
+      },
+      "1c1bb9638fde1cf19c35525a2b9f8697": {
+        "count": 1,
+        "path": "static/console/app.js",
+        "line": 668,
+        "snippet": "opts.slice(0, 8).forEach((o) => {"
+      },
+      "1c5323ca77965f9829c22488cfa6202a": {
+        "count": 1,
+        "path": "tests/browser/console-handoff.cjs",
+        "line": 90,
+        "snippet": "return r.fulfill({json:{...snap(48,older ? rows.slice(0,24) : rows.slice(24)),older_cursor:older ? null : \"r24\"}});"
+      },
+      "1f0a9d92d38b78ab6d62b4935046d972": {
+        "count": 1,
+        "path": "tests/browser/console-handoff.cjs",
+        "line": 400,
+        "snippet": "assert.deepEqual(cursors.slice(0,2), [\"6\",\"15\"]);"
+      },
+      "27c8bdee06fcb2f379bfb46be4295d1c": {
+        "count": 1,
+        "path": "static/console/app.js",
+        "line": 1020,
+        "snippet": "const quote = text.trim().split(\"\\n\").slice(0, 6).map((l) => \"> \" + l).join(\"\\n\");"
+      },
+      "360e12a62e62679abd951e07e660051e": {
+        "count": 1,
+        "path": "static/console/app.js",
+        "line": 498,
+        "snippet": "build: \"console\", ua: navigator.userAgent.slice(0, 120) });"
+      },
+      "48de9e1d24781293770d2ee66b1bbbb9": {
+        "count": 1,
+        "path": "static/console/md.js",
+        "line": 105,
+        "snippet": "const label = esc(String(lang || \"\").trim().slice(0, 24));"
+      },
+      "4a1e4465e912184f623dbe74d227c5dd": {
+        "count": 1,
+        "path": "static/console/changes.js",
+        "line": 122,
+        "snippet": "box.innerHTML = fs.slice(0, 60).map((f) =>"
+      },
+      "966af50d5818776c937d8d569c6f5e1e": {
+        "count": 1,
+        "path": "static/console/app.js",
+        "line": 497,
+        "snippet": "detail: String(err && err.stack).slice(0, 900),"
+      },
+      "b7f14e7248922ac28bd1dd256595b76d": {
+        "count": 1,
+        "path": "static/console/filebrowser.js",
+        "line": 27,
+        "snippet": "return d.toLocaleDateString() + \" \" + d.toLocaleTimeString().slice(0, 5);"
+      },
+      "c65497b00fb319caca24b812b04ff535": {
+        "count": 1,
+        "path": "static/console/app.js",
+        "line": 491,
+        "snippet": "const key = where + \":\" + String(err && err.message).slice(0, 80);"
+      },
+      "d0f6ca5b7c60958e6c6de4b3d4bf830d": {
+        "count": 1,
+        "path": "static/console/app.js",
+        "line": 496,
+        "snippet": "msg: String(err && err.message).slice(0, 300),"
+      },
+      "d52e11e389e87f5baeadd688f80da30c": {
+        "count": 1,
+        "path": "static/console/app.js",
+        "line": 408,
+        "snippet": "rows(\"recent-list\", recent.slice(0, 5), ready && !partial ? \"尚無可確認的活動時間\" : \"尚無最近活動資料\");"
+      }
+    },
+    "py-bare-subprocess": {
+      "0add501925c6b7a0948bd0ca6c18a58b": {
+        "count": 1,
+        "path": "pocket-pair.py",
+        "line": 47,
+        "snippet": "out = subprocess.run([\"ipconfig\", \"getifaddr\", dev],"
+      },
+      "32f50b50d96d396c49d8d8e7a6de6cd2": {
+        "count": 1,
+        "path": "bridge.py",
+        "line": 14384,
+        "snippet": "proc = subprocess.Popen("
+      },
+      "3508c490150115765dc52561b51a195e": {
+        "count": 1,
+        "path": "pocket-pair.py",
+        "line": 165,
+        "snippet": "subprocess.run([\"open\", path], check=False)"
+      },
+      "50a0c1e0337d6ed506409e3bb57c8af7": {
+        "count": 1,
+        "path": "bridge.py",
+        "line": 11271,
+        "snippet": "ps = subprocess.run([\"ps\", \"-axo\", \"pid=,command=\"],"
+      },
+      "5f85465e12a02a00ceabe10a221d7c4c": {
+        "count": 1,
+        "path": "bridge.py",
+        "line": 32330,
+        "snippet": "self.proc = subprocess.Popen("
+      },
+      "61702a588bf5b1c3f47bbead25b6693c": {
+        "count": 1,
+        "path": "scripts/sentinel/corpus_sentinel.py",
+        "line": 166,
+        "snippet": "out = subprocess.run([\"git\", \"ls-files\"], cwd=root, capture_output=True,"
+      },
+      "64a8be8860aae15a176a0c5b81db047c": {
+        "count": 1,
+        "path": "codex_home.py",
+        "line": 403,
+        "snippet": "subprocess.run([\"cp\", \"-c\", src, dst], check=True,"
+      },
+      "6c522a7429d4f7cb107553d1ee8004e7": {
+        "count": 1,
+        "path": "credential_store.py",
+        "line": 45,
+        "snippet": "result = subprocess.run("
+      },
+      "736da79712bea3e625d835369dd61f98": {
+        "count": 1,
+        "path": "pocket-pair.py",
+        "line": 62,
+        "snippet": "out = subprocess.run([ts, \"status\", \"--json\"],"
+      },
+      "8528558aab8810a8e8ae78782829b69f": {
+        "count": 1,
+        "path": "bridge.py",
+        "line": 13745,
+        "snippet": "out = subprocess.run([\"pgrep\", \"-f\", _relay_conf_path()],"
+      },
+      "8d12574643ce46f151c8ae0bb55b3010": {
+        "count": 1,
+        "path": "bridge.py",
+        "line": 11290,
+        "snippet": "out = subprocess.run([\"lsof\", \"-nP\", \"-a\", \"-p\", pid, \"-iTCP\", \"-sTCP:LISTEN\"],"
+      },
+      "99308793b42b870a788d9cfe5fbf1599": {
+        "count": 1,
+        "path": "apns_key_provider.py",
+        "line": 44,
+        "snippet": "result = subprocess.run("
+      },
+      "9ad69c9c5e9652af07ee1cf246ffdf74": {
+        "count": 1,
+        "path": "scripts/ratchet/baseline_inventory.py",
+        "line": 231,
+        "snippet": "out = subprocess.run([\"git\", \"ls-files\"], cwd=root, capture_output=True,"
+      },
+      "9dfb129fdcbcd98a440bebc8dd4300ad": {
+        "count": 1,
+        "path": "codex_home.py",
+        "line": 351,
+        "snippet": "proc = subprocess.Popen("
+      },
+      "b3f75e4c15474c280d1122761876b2af": {
+        "count": 1,
+        "path": "t3code_runtime.py",
+        "line": 1003,
+        "snippet": "result = subprocess.run([\"git\", \"-C\", cwd, *args], capture_output=True,"
+      },
+      "be496991c387efddfbc55233b7b92dbb": {
+        "count": 1,
+        "path": "bridge.py",
+        "line": 11235,
+        "snippet": "out = subprocess.run([ts, \"status\", \"--json\"],"
+      },
+      "cc4dbc4fb3fc928eba970ec3be27b1ae": {
+        "count": 1,
+        "path": "bridge.py",
+        "line": 13952,
+        "snippet": "r = subprocess.run([ts, \"serve\", \"status\", \"--json\"],"
+      },
+      "f1dd474aa1566e8b02c00e040caeea8e": {
+        "count": 1,
+        "path": "t3code_runtime.py",
+        "line": 1084,
+        "snippet": "return subprocess.run([\"git\", \"-C\", cwd, *args], capture_output=True,"
+      },
+      "f32b8e5736ffa97bdd847b36ec7ac23d": {
+        "count": 1,
+        "path": "pocket-pair.py",
+        "line": 105,
+        "snippet": "subprocess.run([sys.executable, \"-m\", \"pip\", \"install\", \"-q\", \"qrcode\"], check=False)"
+      },
+      "fef7e0eee10505b59cb79b4159bd675d": {
+        "count": 1,
+        "path": "scripts/cc-stream-probe.py",
+        "line": 30,
+        "snippet": "r = subprocess.run([\"tmux\", \"capture-pane\", \"-p\", \"-t\", target],"
+      }
+    },
+    "py-silent-except": {
+      "06e209bef0c87092773a1923fb9fe6e0": {
+        "count": 10,
+        "path": "bridge.py",
+        "line": 9230,
+        "snippet": "except FileNotFoundError:"
+      },
+      "1bffdfd508d9776fd16878cb717e5757": {
+        "count": 13,
+        "path": "bridge.py",
+        "line": 10523,
+        "snippet": "except ProcessLookupError:"
+      },
+      "1f0445c56a01a73fbbc0bdeb3522246b": {
+        "count": 2,
+        "path": "bridge.py",
+        "line": 14663,
+        "snippet": "except (asyncio.TimeoutError, TimeoutError):"
+      },
+      "2639865c2f1914e9a490fac68009392d": {
+        "count": 1,
+        "path": "openclaw_provider.py",
+        "line": 282,
+        "snippet": "except RuntimeError:"
+      },
+      "2dcd2ce1e1e9088271a3acc1750dc69c": {
+        "count": 7,
+        "path": "bridge.py",
+        "line": 24738,
+        "snippet": "except asyncio.TimeoutError:"
+      },
+      "322e82c01de5c9f76fc193c09e035331": {
+        "count": 1,
+        "path": "bridge.py",
+        "line": 32349,
+        "snippet": "except (OSError, ValueError, struct.error):"
+      },
+      "42c5f7b84e2ff053a46bd9d30dff84e5": {
+        "count": 1,
+        "path": "bridge.py",
+        "line": 37761,
+        "snippet": "except (ProcessLookupError, ChildProcessError, OSError):"
+      },
+      "487417e6c26a543c20e205304737be9e": {
+        "count": 2,
+        "path": "cc_sdk.py",
+        "line": 428,
+        "snippet": "except (TypeError, ValueError):"
+      },
+      "4cc619ce13c0f80a65c15bb6bbd4a7a6": {
+        "count": 1,
+        "path": "bridge.py",
+        "line": 13754,
+        "snippet": "except (ProcessLookupError, PermissionError):"
+      },
+      "4ff2643e8b5a6f04983f22a6e20ed906": {
+        "count": 1,
+        "path": "scripts/worker-report-hook.py",
+        "line": 186,
+        "snippet": "except (urllib.error.URLError, urllib.error.HTTPError, OSError, ValueError):"
+      },
+      "551709f8496001b8a47c0adb7f7bf31c": {
+        "count": 4,
+        "path": "bridge.py",
+        "line": 32371,
+        "snippet": "except (ValueError, OSError):"
+      },
+      "55b0b9d2a31eabc6e4a0bb840ba518a7": {
+        "count": 1,
+        "path": "acp_client.py",
+        "line": 549,
+        "snippet": "except (asyncio.TimeoutError, ProcessLookupError):"
+      },
+      "586e699787b0b1e61bf7e144bf7dc025": {
+        "count": 1,
+        "path": "carddigest.py",
+        "line": 35,
+        "snippet": "except ValueError:"
+      },
+      "5ad32947220438783f2a7ab8a51a596b": {
+        "count": 1,
+        "path": "bridge.py",
+        "line": 35124,
+        "snippet": "except (OSError, UnicodeError):"
+      },
+      "5edce41be8da691df9975ea97466797b": {
+        "count": 1,
+        "path": "bridge.py",
+        "line": 14452,
+        "snippet": "except (OSError, ValueError, TypeError):"
+      },
+      "6af29d1640e9348900f43fbf668813ac": {
+        "count": 1,
+        "path": "bridge.py",
+        "line": 37812,
+        "snippet": "except (OSError, ValueError):"
+      },
+      "6cffdb0ac671777d3ab035e59652c80c": {
+        "count": 1,
+        "path": "scripts/worker-report-hook.py",
+        "line": 138,
+        "snippet": "except (TypeError, ValueError):"
+      },
+      "6fa66cda8584d96a1107042fd560f0a0": {
+        "count": 1,
+        "path": "tg_outbound.py",
+        "line": 156,
+        "snippet": "except Exception:"
+      },
+      "754c4500debfd74c7fd898fc0edc846b": {
+        "count": 1,
+        "path": "hermes_media.py",
+        "line": 331,
+        "snippet": "except Exception:"
+      },
+      "89cb0bf06027dae159f217982176c167": {
+        "count": 2,
+        "path": "acp_client.py",
+        "line": 538,
+        "snippet": "except ProcessLookupError:"
+      },
+      "8d12d6590e13f8b58db05aa81144312a": {
+        "count": 4,
+        "path": "acp_client.py",
+        "line": 136,
+        "snippet": "except Exception:"
+      },
+      "9a5752854fe0f4d81e27e6d6757e32e0": {
+        "count": 1,
+        "path": "media_artifacts.py",
+        "line": 398,
+        "snippet": "except FileNotFoundError:"
+      },
+      "a9b4d509aa4526b6ba265bf957c1fccc": {
+        "count": 12,
+        "path": "bridge.py",
+        "line": 13896,
+        "snippet": "except OSError:"
+      },
+      "b20c1db184f098fc97b3cf0cd64a5f8d": {
+        "count": 1,
+        "path": "cc_sdk.py",
+        "line": 1665,
+        "snippet": "except asyncio.TimeoutError:"
+      },
+      "be9a60338c8ec178ad5a55c89473cb6b": {
+        "count": 11,
+        "path": "bridge.py",
+        "line": 7021,
+        "snippet": "except RuntimeError:"
+      },
+      "d9b4091feb22d2dbbe81819c651dfa89": {
+        "count": 1,
+        "path": "pocket-pair.py",
+        "line": 167,
+        "snippet": "except Exception:"
+      },
+      "e0d36e0bf6470ea40a71bfacb5cc4613": {
+        "count": 2,
+        "path": "bridge.py",
+        "line": 32405,
+        "snippet": "except (ProcessLookupError, OSError):"
+      },
+      "f30a7622420e3522ce73bb118786a39c": {
+        "count": 1,
+        "path": "acp_client.py",
+        "line": 557,
+        "snippet": "except asyncio.CancelledError:"
+      },
+      "f948dcc30c13208e18fa4493c939e6af": {
+        "count": 1,
+        "path": "bridge.py",
+        "line": 5699,
+        "snippet": "except asyncio.CancelledError:"
+      },
+      "fd4e1a6fce43a63fb0f0c21a067bf1ff": {
+        "count": 3,
+        "path": "bridge.py",
+        "line": 5173,
+        "snippet": "except (TypeError, ValueError):"
+      }
+    }
+  }
+}

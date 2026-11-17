@@ -16,11 +16,15 @@
 import _isolation  # noqa: F401  # 測試隔離閂:必須是第一個 import
 import os
 import re
+import sys
 import unittest
 
 import bridge
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(ROOT, "scripts"))
+from sentinel import corpus_sentinel  # noqa: E402
+
 SRC = os.path.join(ROOT, "bridge.py")
 
 
@@ -39,10 +43,19 @@ class SSEAntiBufferingTests(unittest.TestCase):
         with open(SRC, encoding="utf-8") as f:
             lines = f.read().split("\n")
 
+        # 語料下限哨兵:這條的綠色有兩種來源 —— 「每條 SSE 路由都帶標頭」與
+        # 「`media_type="text/event-stream"` 這個字面樣式配不到了」
+        # (改成單引號、拉成變數、用 StreamingResponse 的別名都會這樣)。
+        # 後者是整條守門安靜地退場,必須紅。見 scripts/sentinel/corpus_sentinel.py。
+        sites = [i for i, line in enumerate(lines)
+                 if 'media_type="text/event-stream"' in line]
+        corpus_sentinel.require("sse_headers.response_sites", len(sites),
+                                detail="(SSE 回應的寫法改了?掃不到路由 ⇒ "
+                                       "0 個漏標頭 ⇒ 這支會「全部都帶了」地綠)")
+
         misses = []
-        for i, line in enumerate(lines):
-            if 'media_type="text/event-stream"' not in line:
-                continue
+        for i in sites:
+            line = lines[i]
             window = "\n".join(lines[max(0, i - 3):i + 4])
             if "headers=SSE_HEADERS" not in window:
                 misses.append(f"bridge.py:{i + 1}: {line.strip()[:90]}")

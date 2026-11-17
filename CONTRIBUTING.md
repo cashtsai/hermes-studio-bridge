@@ -89,6 +89,111 @@ list, not an exemption**: the right fix is for those files to `SkipTest`
 themselves when the dependency is absent. A PR that converts one of them is a
 genuinely useful first contribution.
 
+## Post-mortems
+
+[`docs/POSTMORTEMS/`](docs/POSTMORTEMS/) holds a deliberately small set of
+backward-looking failure records: what broke, the mechanism, **why every existing
+safety net missed it**, and the guardrails that were committed so the same class
+of bug fails loudly next time. The format spec is
+[`docs/POSTMORTEMS/README.md`](docs/POSTMORTEMS/README.md); copy
+[`TEMPLATE.md`](docs/POSTMORTEMS/TEMPLATE.md) and fill in every section.
+`tests/test_postmortem_format.py` enforces the structure in CI.
+
+### When to write one
+
+Only when all three conditions hold **at the same time**:
+
+1. **Subtle** — the mechanism is not obvious; a careful engineer would hit it again.
+2. **Systemic** — it escaped because of a gap in tests/tooling/conventions, not a
+   one-off typo. Test: "if it were a different person and a different module,
+   would the same path still be open?" Yes → qualifies.
+3. **Costly to rediscover** — hours or days to diagnose, or it lived quietly in
+   production for a while.
+
+**If one of the three fails, do not write one.** A folder of flat incident logs is
+worse than three documents people actually read. Anything below the bar belongs in
+the commit message (long commit messages are normal here) or in the zh-Hant comment
+next to the code.
+
+### Who writes it
+
+Whoever fixed the bug, **in the same PR as the fix** — not later. The fix is what
+supplies the one thing the document cannot be written without: the list of
+guardrails that are already committed. A post-mortem promised for "after we ship"
+never gets its guardrails section.
+
+### What review must check
+
+Four things, in this order. The first two are what the machine cannot check.
+
+1. **Does `## Why every safety net missed it` list every line of defence, one per
+   line?** Unit tests, scenarios, scan-style gates, types/contracts, post-deploy
+   smoke, manual use. A defence that structurally cannot see this bug still gets a
+   line saying *why* — that sentence is usually the most valuable one in the
+   document. A missing line is almost always the defence the author did not want to
+   think about.
+2. **Is every entry under `## Guardrails added` a committed gate?** Ask the one
+   hard question: *"if I revert the fix, does this one go red?"* If the answer is
+   not a plain yes, it is not a guardrail. "Will be careful next time", "added to
+   the backlog" and "documented it" do not count — a doc only counts if a
+   mechanical gate verifies it, and then you cite the gate.
+   `scripts/prove-scenario.sh <name> <base>` mechanises exactly this question; use
+   it when the guardrail is a scenario.
+3. **Is the root cause structural rather than human?** "Someone forgot" is a
+   symptom. Push one layer down: *what made forgetting possible, and invisible to
+   every mechanism we have?* Reject a root cause that ends at a person.
+4. **Is anything in it forward-looking?** Proposals, plans and acceptance criteria
+   belong in a separate document that this one links to. A post-mortem that mixes in
+   a proposal makes it impossible to tell which paragraphs are facts.
+
+Adding a post-mortem also means checking whether an existing one is superseded, and
+adding your row to the index table in `docs/POSTMORTEMS/README.md`.
+
+## Engineering gates you have to keep green
+
+Beyond the test suite, two mechanisms will block a PR. Both exist because a gate
+that can silently stop working is worse than no gate at all.
+
+### Corpus sentinels — a gate must not pass by scanning nothing
+
+`scripts/sentinel/corpus_sentinel.py`. Every scan-style gate here (private
+identifier leak scan, event taxonomy registry, the session-ops and media-hook
+alignment matrices, replay fixture coverage, the post-mortem format gate, the
+ratchet itself) first asserts a **minimum corpus size**. A gate's green has two
+possible causes — "scanned everything, found nothing wrong" and "scanned almost
+nothing, so found nothing wrong" — and the second happens whenever a glob, a regex
+or a `git ls-files` call quietly stops matching.
+
+If you add a scan-style gate, register its corpus in `MINIMUMS` with a floor of
+**90% of the value you measured**. Run `python scripts/sentinel/corpus_sentinel.py`
+to see current values and headroom. **Lowering a floor requires a reason written on
+that line** — "the test went red so I made the number smaller" is the exact move the
+table exists to prevent. `tests/test_corpus_sentinel.py` proves the sentinels work by
+breaking each gate's discovery on purpose and requiring it to go red.
+
+### The ratchet — old debt is frozen, new debt is blocked
+
+`scripts/ratchet/check.py` (engine and rationale in `baseline_inventory.py`). Three
+patterns are known debt in this repo and recorded in `scripts/ratchet/baseline.json`:
+silent `except …: pass`, bare `subprocess.*` in product code, and naked
+`.slice(0, N)` text truncation in JS. The existing occurrences block nothing;
+**a new one does.**
+
+```sh
+scripts/ratchet/check.py                      # the gate
+scripts/ratchet/check.py --rules              # why each pattern is debt, and the way out
+scripts/ratchet/check.py --list py-silent-except
+```
+
+A violation's identity is a content hash (`sha256(rule \0 path \0 normalized line)`),
+so reformatting and re-indenting are free while changing the code is not. Moving a
+file changes the key on purpose — that is the moment to look at the debt again.
+
+`--update` is **not** how you fix a failure. It has two legitimate uses: rewriting
+keys after a file move, and letting the baseline converge after you actually removed
+debt. Using it to launder a new violation into old debt is visible in review — the
+baseline gets longer, and a longer baseline needs a sentence in the PR description.
+
 ## Submitting a change
 
 - Branch from `main`. Feature branches are named `feat/*`, `fix/*`, `chore/*`,

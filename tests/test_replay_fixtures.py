@@ -23,12 +23,15 @@ from pathlib import Path
 _TMP = tempfile.mkdtemp(prefix="replay-")
 os.environ.setdefault("POCKET_CANON_DB", os.path.join(_TMP, "canonical.db"))
 os.environ.setdefault("BRIDGE_TOKEN", "test-unit-token")
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, _ROOT)
+sys.path.insert(0, os.path.join(_ROOT, "scripts"))
 
 import carddigest  # noqa: E402
 from live_update_event import LiveUpdateCursor  # noqa: E402
 from replay_fixture import (ReplayFixtureError, fixture_digest, load_jsonl,
                             validate_manifest)  # noqa: E402
+from sentinel import corpus_sentinel  # noqa: E402
 
 
 FIXTURE_DIR = Path(__file__).parent / "fixtures" / "replay"
@@ -36,11 +39,19 @@ MANIFEST_PATH = FIXTURE_DIR / "manifest.json"
 
 
 def load_manifest() -> dict:
-    """Load the reviewed provider/scenario coverage manifest."""
+    """Load the reviewed provider/scenario coverage manifest.
+
+    語料下限哨兵:manifest 被改瘦時,「fixture 全綠 = 端到端通」這個制度會
+    安靜地縮水 —— 只剩一筆 fixture 也是全綠。
+    見 scripts/sentinel/corpus_sentinel.py。
+    """
     with MANIFEST_PATH.open(encoding="utf-8") as fh:
         manifest = json.load(fh)
     if manifest.get("schema_version") != 1:
         raise AssertionError("unsupported replay fixture manifest schema")
+    corpus_sentinel.require("replay_fixtures.fixture_digests",
+                            len(manifest.get("fixture_digests") or {}),
+                            detail="(manifest 的 fixture_digests 少了幾筆?)")
     validate_manifest(manifest, FIXTURE_DIR)
     return manifest
 
