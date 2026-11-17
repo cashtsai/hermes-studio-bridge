@@ -2102,9 +2102,30 @@ RosterRow:
 | `idle` | 無上述,且 `updated_ts` 距今 < `POCKET_ROSTER_DORMANT_SECS`(預設 24h) | 一般樣式 |
 | `dormant` | 無上述且久無活動(或從無活動) | 淡化/摺疊 |
 
-`last_turn_summary`:目前規則式 —— 該 session 最後一筆持久里程碑
-(`card.milestone`/`message.upsert`)的文字壓空白截斷(≤12 字)。
-TODO:回合結束時 LLM 生成 5-12 字摘要落地,wire 欄位不變,app 零改動升級。
+`last_turn_summary`:素材 = 該 session 最後一筆持久里程碑
+(`card.milestone`/`message.upsert`)的文字。兩段式(S3,2026-11-17 起 ——
+原本這裡寫著「TODO:LLM 生成」,已做掉):
+
+1. **LLM 版已在快取** → 用它。快取在 `POCKET_TURN_SUMMARY_CACHE`
+   (預設 `~/.pocket/turn-summaries.json`),鍵 = session + **素材指紋**
+   (素材沒變就不重算,重算是純燒錢;素材變了舊摘要立刻失效,列表不會
+   顯示上一回合的事)。
+2. 沒有 → **立刻**回規則式(壓空白截斷 ≤12 字,= 舊行為、零延遲),
+   同時丟背景任務生成;下一輪輪詢(§17.2 的 `POCKET_ROSTER_POLL_SECS`,
+   預設 3s)自動換成 LLM 版。
+
+**wire 欄位一個 byte 不變,app 零改動升級。** 兩個刻意的設計:
+
+- 讀路徑**永不等 LLM** —— roster 是 3 秒心跳的 SSE 來源,在讀路徑 await
+  網路會讓整條訂閱抖。
+- 同一筆素材**只嘗試一次**(成功或失敗都不重試)—— 否則沒設定 textgen 的
+  機器會每 3 秒丟一個註定失敗的任務 + 寫一行用量 log,直接洗版。
+  改了 §18 的設定會清掉這個記錄(不然使用者設好 key 還要等素材變才看得到
+  效果,體感是「設了沒用」)。
+
+長度上限是**後置硬閘**:prompt 要求 ≤12 字只是請求,小模型不一定聽,
+所以超了就截斷加 `…` —— 與規則式同一個形狀。生成走 §18 的管線;§18 沒設定
+= 永遠停在規則式(**功能不會消失**)。
 
 ### 17.2 差分訂閱
 
@@ -2229,6 +2250,235 @@ HTTP 碼:
 
 排查「為什麼沒開 agent」看這裡:簽錯、被去重、filter 沒過、被歸併、超速,
 每一種都有 `reason`。保留 7 天。
+
+## 19. 小任務文字生成(`/app/v1/textgen/config`,S3,2026-11-17)
+
+> 動機:標題、回合摘要、commit 訊息、逐字稿清理這些雜務,**不該燒 coding
+> agent 的訂閱額度**(CC/CX 的額度撞到就整條線停擺,而摘要一點都不值得
+> 佔用它),也不該硬綁本機 Ollama(大多數機器沒有 → 功能靜默缺席)。
+> 這一節給它一條**便宜 model API** 的路。
+
+### 19.1 lane 順序
+
+    便宜 API(設定了才有) → 本機 Ollama → 放棄
+
+第一條能用的就用;**它壞掉才往下掉**(上游 500 時「安靜地沒摘要」比
+「多花 200ms 用本機生一個」糟得多)。全掉光 → 呼叫端退回原本行為
+(規則式截斷 / 原始逐字稿 / 抽取式摘要)。
+
+**靜默失敗紅線:功能不准因為沒設定 textgen 而消失。** 所以
+`configured=false` 時 app **不要**顯示「未啟用」——顯示的是「目前走本機/
+規則式」。回應裡的 `fallback_note` 就是給 UI 直接用的那句話。
+
+### 19.2 設定
+
+```
+GET /app/v1/textgen/config
+→ {"configured": false,
+   "base_url": "", "base_url_source": "none",
+   "model": "",    "model_source": "none",
+   "key_set": false, "key_source": "none",
+   "local_enabled": true,
+   "suggested_models": [{"model": …, "label": …, "hint": …}, …],
+   "fallback_note": "未設定時各呼叫點退回原本行為(規則式/agent),功能不會消失。"}
+
+PUT /app/v1/textgen/config   {"base_url"?, "api_key"?, "model"?}
+→ {"ok": true, …同上…}
+```
+
+- **端點是 OpenAI 相容的 `POST {base_url}/chat/completions`** —— OpenAI /
+  Anthropic 的 OpenAI 相容層 / OpenRouter / Ollama / LM Studio 都講同一套,
+  所以一個客戶端全涵蓋,不必為每家寫 adapter。
+- `configured` = **`base_url` 與 `model` 兩個都有**。`api_key` 刻意不列入:
+  Ollama / LM Studio 不需要 key,設成必填就是把一個本來能用的路徑關掉
+  (同 opencode「沒有登入牆」那條)。key 為空時**不送** `Authorization` 標頭。
+- **`api_key` 永遠不回傳**,只回 `key_set`(同 openclaw 的 `token_set`)。
+- env 優先(`POCKET_TEXTGEN_BASE_URL` / `_KEY` / `_MODEL`),三個欄位的
+  `*_source ∈ {env,file,none}` **各自獨立判定** —— 只設 env model 不會讓
+  檔裡的 key 消失。`source == "env"` 時 app 應把該欄畫成唯讀
+  (否則就是「我改了但沒反應」)。
+- PUT 是**合併寫入**(只帶 `model` 不會洗掉 `api_key`);傳**空字串**=
+  明確清掉該欄(使用者要有辦法關掉);三個都不帶 → `400 EMPTY`。
+- `model` **沒有預設值**:猜一個端點不認得的 id 只會換來 404(靜默失敗的
+  親戚)。`suggested_models` 是給設定面板 picker 的**建議清單**,選型依據
+  見 `pid-subsync/docs/LLM_PRICING_REFERENCE_20261117.md` 的便宜檔
+  (Haiku / gpt-6-luna 級);價格會變,那份文件才是真相來源。
+- `POCKET_TEXTGEN_LOCAL=0` 關掉本機 lane(例如不想讓雜務去搶顯卡)。
+  本機 lane 連不上會**冷卻** `POCKET_TEXTGEN_LOCAL_COOLDOWN`(預設 600s)
+  —— 沒裝 Ollama 的機器不會每回合都撞一次 connection refused;但**絕不
+  永久放棄**,使用者中途把 Ollama 開起來會自己恢復。
+
+### 19.3 任務分類與呼叫點
+
+`task` 是對帳用的穩定分類鍵。目前已接的呼叫點:
+
+| task | 呼叫點 | 沒設定時的退路 |
+| --- | --- | --- |
+| `roster.summary` | §17 的 `last_turn_summary` | 規則式截斷(≤12 字) |
+| `transcript.cleanup` | 會議錄音清稿 | 本機 Ollama → 原始逐字稿 |
+| `agent_context.summary` | `/app/v2/agent_context` 的交接簡報 | 本機 Ollama → 抽取式摘要 |
+
+`session.title` / `commit.message` 的 prompt 包裝已在 `text_gen.py` 備好,
+但**刻意還沒接呼叫點**:現有的標題來源(`_cc_session_head` 的 jsonl 掃描、
+gemini 的「第一句話截 48 字」)都是**同步且有快取**的,改成非同步 LLM 會
+動到列表頁的渲染路徑,風險與這一刀不同量級 —— 留下一刀,連同它自己的
+列表回歸測試一起做。宣告了卻不能落地就是死鈕,所以這裡誠實標註未接。
+
+**review / coding 類絕不走這條** —— 那本來就該走 coding agent。
+
+### 19.4 成本留痕
+
+每次呼叫(**含失敗**)記一筆:
+
+- 結構化 log `[bridge-event] {"event":"textgen_usage", …}`:`task`、`ok`、
+  `reason`、`model`、`elapsed_ms`、`lanes`(實際試過哪幾條)、`usage_*`。
+- `session` 有值時**另外**落一筆 `event_log` 事件 `textgen.usage`
+  (B1 分類 = **persist-only**:進 event_log 蓋 seq 供審計,但**不推任何
+  活流** —— 使用者不需要看到「剛剛花了 37 個 token」,對帳的人需要)。
+  `session` 為空的全域雜務只留 log:為沒有歸屬的呼叫在 event_log 開一個
+  假 session 鍵,之後查帳的人會被那個不存在的 session 騙一次。
+
+端點不回 `usage` 時(很多本機 server 不回)記 `usage_reported=false`,
+**不寫 0** —— 寫 0 等於謊報「這次花了 0」。拿到空字串但連線成功的情況
+**照樣記用量**(錢真的花了)。
+
+## 19. 額度耗盡自動切 provider(`/app/v1/failover/config`,S4,2026-11-17)
+
+> 動機:E3 早就認得出「撞限額」(`status.phase == "usage_limited"` +
+> `usage_limit_reset_at`),但**到今天沒有任何人消費那個訊號** —— 使用者
+> 看到「CC 額度用完,X 點重置」,然後只能自己去開另一家。我們接了八個
+> provider,撞牆時卻還是手動換,**接八家的紅利沒拿到**。這一節是那顆缺掉
+> 的消費者。
+
+### 19.1 政策設定
+
+```
+GET /app/v1/failover/config
+→ {"mode": "suggest", "mode_source": "default",
+   "order": ["cc2","codex","gemini","grok","opencode"], "order_source": "default",
+   "modes": ["suggest","auto"],
+   "default_order": [...],
+   "handoff_targets": ["codex","cc2"],
+   "available": ["cc2","codex", …],
+   "availability": {"codex": {"installed": true, "logged_in": null}, …}}
+
+PUT /app/v1/failover/config   {"mode"?: "suggest"|"auto", "order"?: [...] | "a,b"}
+→ {"ok": true, …}
+```
+
+- **兩種模式**:
+  - `suggest`(**預設**)—— 出一張有按鈕的卡片問使用者,不自己切。
+  - `auto` —— 直接切,**卡片明示已經換成誰、為什麼、失去什麼**。
+- 預設是 `suggest` 不是 `auto`,照 house precedent(`orchestrator.py`:
+  *failover requires explicit approval and checkpoint*)。
+- 讀取端寬鬆(`mode` 認不出來一律退 `suggest` —— fail-safe 的方向是
+  「寧可多問一次」);**寫入端嚴格**(打錯字 → `400 FAILOVER_BAD_MODE`,
+  默默改掉會讓使用者以為自己開了 auto)。
+- env 優先:`POCKET_FAILOVER_MODE` / `POCKET_FAILOVER_ORDER`。
+- `order` 的語意是「我比較想用誰」,不是「誰比較強」。接受 list 或
+  逗號字串;去重;**不驗 provider 名**(亂打的會在選擇時被 caps 過濾掉,
+  比在設定端點拒絕整份順序好 —— 某家暫時沒裝不該讓設定存不進去)。
+- `availability` / `available` 一起回,因為「我順序裡那家為什麼沒被選」
+  是這個功能最常被問的問題,設定面板要能**當場**答得出來。
+
+### 19.2 預覽與執行
+
+```
+GET  /app/v2/threads/{thread_id}/failover      ← 唯讀,不切任何東西
+POST /app/v2/threads/{thread_id}/failover      {"to_provider"?, "force"?}
+```
+
+GET 回:
+
+```jsonc
+{"ok": true,
+ "thread_id": "…", "current": "claude_code",
+ "session_id": "claude_code:Ops",
+ "limited": true,
+ "mode": "suggest",
+ "action": "suggest",            // none | suggest | auto | blocked
+ "reset_at": 1795000000.0,       // 解不出來 = null,不編一個時間
+ "plan": {"provider": "codex", "reason": "ok",
+          "order": ["cc2","codex"],
+          "rejected": [{"provider":"cc2","why":"unavailable"}],
+          "caps_gap": ["改名","封存"]},
+ "handoff_targets": ["codex","cc2"],
+ "card": { …§6 卡片 body… }}
+```
+
+`action` 四態:`none`(沒撞限額)/ `suggest` / `auto` / `blocked`
+(撞了但沒有可用備援 —— **也要出卡片**,沒有它使用者會以為 failover 壞了
+或根本沒裝)。
+
+選擇的過濾順序,每一層都留在 `rejected` 裡:
+
+| `why` | 意思 |
+| --- | --- |
+| `same_provider` | 就是目前這家 |
+| `no_caps_declared` | 沒在 `_PROVIDER_CAPS` 宣告能力 —— 宣告是入場券 |
+| `no_handoff_target` | 還沒有交棒落地實作(見 `handoff_targets`) |
+| `unavailable` | 未安裝,或**明確**未登入 |
+
+`logged_in == null`(登入狀態還在探,冷啟要 10s+)**當成可用** —— 當成
+沒登入會讓剛開機的機器一律沒有備援;真的沒登入的話切過去時 spawn 會失敗
+並明確回報,比「安靜地不給備援」好查。opencode 沒有登入牆,一律 `true`
+(報 false 會憑空造出一道不存在的登入牆)。
+
+### 19.3 切換語義
+
+**切換 = 新 session + 帶上下文交棒,不是假裝同一條對話。** 直接復用
+§ContextTransfer v1(`POST /app/v2/threads/{id}/transfer`)的 milestone
+摘要管線:萃取來源的持久里程碑 → 組交接 prompt → 在目標 provider 開新
+session(首訊 = 交接 prompt)→ rebind(舊綁定標 `detached`,不是 `dead`
+—— 來源原生會話還在,這是刻意交棒)→ 落 `thread.transferred`。
+
+回應 = transfer 的完整結果**外加**:
+
+```jsonc
+{"failover": {"from": "claude_code", "to": "codex", "mode": "suggest",
+              "limited": true, "forced": false,
+              "reset_at": …, "caps_gap": ["改名","封存"]},
+ "card": { …auto 模式的明示卡片 body… }}
+```
+
+錯誤面:
+- 沒撞限額且 `force != true` → `409 FAILOVER_NOT_LIMITED`。這支是
+  **「額度耗盡」的出口,不是通用搬家鍵**(通用搬家請用 `/transfer`,
+  語意清楚)。
+- 算不出目標 → `409 FAILOVER_NO_TARGET`(理由在 GET 的 `rejected`)。
+- `to_provider` 不在 `handoff_targets` → `400 FAILOVER_BAD_PROVIDER`。
+- 目標建立失敗 / rebind 撞綁定 → 原封不動由 transfer 回報(502 / 409),
+  **不在這裡包第二層** —— 兩層錯誤碼會把「為什麼切失敗」蓋掉。
+
+### 19.4 卡片(走既有 `kind: "choices"`,§6)
+
+不需要新端點、也不需要改 app 才看得到;Telegram 上自動退化成純文字。
+
+| `action` | 卡片 | `options` |
+| --- | --- | --- |
+| `suggest` | 「額度用完 —— 可以切到 X 繼續」+ 要打哪支端點 | **空** |
+| `auto` | 「已自動切到 X(原因:Y 額度用完)」+ 新 session id | **空**(已成事實) |
+| `blocked` | 「額度用完,且沒有可用備援」+ 考慮過誰、為什麼都不行 | 空 |
+
+**三種卡片的 `options` 都是空的 —— 這是刻意的。** 第一版把 suggest 做成
+兩顆 `choices` 的 `send` 按鈕(`/failover codex` / `/failover wait`),查下去
+發現 **bridge 沒有任何地方在解析斜線指令**:按下去只會把那串文字原封不動
+送進一條**正卡在限額上**的 session,然後什麼都不會發生 —— 標準的死鈕。
+
+所以分工是:**卡片負責告知,控制面在 §19.2 的端點上。** app 要畫按鈕就用
+預覽回應裡結構化的 `plan`(`provider` / `caps_gap` / `rejected`),按下去打
+`POST /app/v2/threads/{id}/failover`。按鈕的 wiring 歸 app 那一波。
+哪天真的有了指令解析層,再把 `options` 補回來 —— **連同它的端到端測試**
+(`tests/test_failover_s4.py` 有一條守門測試會在有人加回 `send:` 按鈕時變紅)。
+
+**誠實邊界**:`caps_gap` 把「切過去會失去什麼」寫進卡片 `detail`
+(中斷回合 / 排隊送訊息 / 審批卡片 / 改名 / 封存 / 歷史 / 讀寫設定 /
+即時串流降為輪詢)。只報「有 → 沒有」的方向 —— 目標多出來的能力不報,
+卡片講的是邊界不是推銷。
+
+**`auto` 不得靜默**:自動切一定伴隨那張明示卡片。安靜地換掉使用者的
+provider 會讓他以為還在 CC 上,然後困惑為什麼風格變了 —— 那正是這個 repo
+最忌諱的那種病。
 
 ## 附註 A:pocket-id 心跳 `notices` 下行(backup orphan 提醒,2026-11-06)
 
