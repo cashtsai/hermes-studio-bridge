@@ -72,6 +72,7 @@ import live_update_event
 import replay_fixture
 import t3code_runtime
 import text_gen            # S3:小任務文字生成(便宜 API → 本機 → 放棄)
+import usage_limits        # S4:額度耗盡時的 failover 政策(純函式)
 import cc_detect            # CC TUI 狀態偵測(manifest 引擎;herdr 設計移植)
 import cc_sdk               # CC provider v2(Agent SDK;模組內 lazy-import SDK)
 import tg_outbound
@@ -26776,6 +26777,223 @@ async def v2_app_thread_transfer(thread_id: str, request: Request):
             "new_session_id": new_session_id, "binding": new_binding,
             "previous": result.get("previous"), "transfer": transfer_meta}
 
+
+# ───────── S4(2026-11-17):額度耗盡自動切 provider ─────────────────────────
+#
+# E3 早就認得出「撞限額」(carddigest.classify_error → status.phase =
+# "usage_limited" + usage_limit_reset_at),但**到今天沒有任何人消費那個
+# 訊號** —— 使用者看到「CC 額度用完」,然後自己去開另一家。接了八家的
+# 紅利沒拿到。這一段是那顆缺掉的消費者。
+#
+# 政策邏輯全在 usage_limits.py(純函式、可獨立測);這裡只負責三件 bridge
+# 才知道的事:
+#   1. **availability** —— 哪家裝了/登入了(provider 單例的 configured()
+#      與 _agent_auth_status(),見 /app/v2/agents 的同款 gating)。
+#   2. **caps** —— _provider_caps_payload()(含從 _V2_SESSION_OPS 推導的 ops),
+#      給誠實邊界文案用。
+#   3. **落地** —— 切換 = 新 session + 帶上下文交棒,直接復用 ContextTransfer
+#      v1(上面那支 v2_app_thread_transfer),不另寫一套搬家邏輯。
+#
+# 為什麼預設 suggest 不是 auto:house precedent 在 orchestrator.py ——
+# 「failover requires explicit approval and checkpoint」。auto 模式照樣支援,
+# 但卡片一定明示已經換了誰、為什麼(自動切不得靜默)。
+
+#: provider 名 → 「這家現在能用嗎」。`logged_in=None` = 還在探(見
+#: usage_limits.available_providers 的註解:當可用,比安靜地沒備援好查)。
+def _failover_availability() -> dict:
+    auth = _AGENT_AUTH_CACHE.get("data") or {}
+
+    def _li(key: str):
+        ent = auth.get(key)
+        return ent.get("logged_in") if isinstance(ent, dict) else None
+
+    return {
+        # CC 的兩條線共用同一份 claude 登入狀態(同一個 CLI 憑證)。
+        "claude_code": {"installed": True, "logged_in": _li("claude")},
+        "cc2": {"installed": cc_sdk.enabled(), "logged_in": _li("claude")},
+        "codex": {"installed": True, "logged_in": _li("codex")},
+        "gemini": {"installed": GEMINI.configured(),
+                   "logged_in": _li("gemini")},
+        # grok 有明確的 logged_in 判準(憑證檔在不在),不必靠探測快取。
+        "grok": {"installed": GROK.configured(),
+                 "logged_in": GROK.logged_in()},
+        # opencode 沒有登入牆(零認證就能跑免費模型池)—— 報 False 會憑空
+        # 造出一道登入牆,把一個本來能用的備援關掉。
+        "opencode": {"installed": OPENCODE.configured(), "logged_in": True},
+        "openclaw": {"installed": OPENCLAW.configured(), "logged_in": True},
+        "hermes": {"installed": True, "logged_in": True},
+    }
+
+
+async def _failover_status_for(session_id: str) -> dict:
+    """session id → card store 的 status(限額判定的輸入)。
+
+    拿不到就回 `{}` —— `is_usage_limited({})` 是 False,所以「讀不到狀態」
+    自然退化成「不觸發 failover」。這是對的方向:寧可不切,不要因為讀不到
+    狀態就擅自搬家。
+    """
+    try:
+        store = await _v2_card_store(session_id)
+        return dict(getattr(store, "status", None) or {})
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("failover_status_for", _exc, expected=True)
+        return {}
+
+
+async def _failover_plan_for_thread(thread_id: str) -> dict:
+    """一條 app thread 的 failover 計畫(唯讀,不切)。
+
+    回 `{thread_id, current, session_id, ...usage_limits.plan_for 的欄位,
+        card}`;`card` 是**該出的那張卡片的 body**(suggest/auto/blocked
+        三種),bridge 只要把它丟進 card store 就有 UI。
+    """
+    binding = t3code_runtime.current_binding(CANON_DB, thread_id)
+    if binding is None:
+        raise http_err(404, "APP_THREAD_NO_BINDING",
+                       "app thread 沒有 active binding,無從判斷額度狀態")
+    current = binding["provider"]
+    # binding 的 provider_thread_id **已經是**完整的 bridge session id
+    # (codex:xxx / claude_code:name —— 見 §app_thread 的相容紅線註解),
+    # 不要再補一次 provider 前綴:那會變成 "codex:codex:xxx",card store
+    # 查不到 → status 永遠是 {} → failover 永遠不觸發(靜默失效)。
+    session_id = str(binding["provider_thread_id"] or "")
+    status = await _failover_status_for(session_id)
+    plan = usage_limits.plan_for(
+        current, status,
+        availability=_failover_availability(),
+        caps=_provider_caps_payload(),
+        # 交棒只能落在有 spawn helper 的那幾家 —— 宣告了卻不能落地就是死鈕。
+        targets=_TRANSFER_TARGETS)
+    card = {}
+    if plan["action"] == "suggest":
+        card = usage_limits.suggest_card_body(
+            current, plan["plan"], thread_id=thread_id,
+            reset_at=plan["reset_at"])
+    elif plan["action"] == "blocked":
+        card = usage_limits.blocked_card_body(
+            current, plan["plan"], thread_id=thread_id,
+            reset_at=plan["reset_at"])
+    return {"thread_id": thread_id, "current": current,
+            "session_id": session_id, "card": card,
+            "handoff_targets": list(_TRANSFER_TARGETS), **plan}
+
+
+@app.get("/app/v1/failover/config")
+async def failover_config_get(request: Request):
+    """failover 政策讀取端(模式 + 備援順序 + 當下誰可用)。
+
+    `available` 一起回,因為「我的順序裡那家為什麼沒被選」是這個功能最常
+    被問的問題 —— 要讓設定面板當場答得出來,不要讓使用者去猜。
+    """
+    _check_auth(request)
+    cfg = usage_limits.load_config()
+    avail = _failover_availability()
+    return {**cfg,
+            "modes": list(usage_limits.MODES),
+            "default_order": list(usage_limits.DEFAULT_ORDER),
+            "handoff_targets": list(_TRANSFER_TARGETS),
+            "available": sorted(usage_limits.available_providers(avail)),
+            "availability": avail}
+
+
+@app.put("/app/v1/failover/config")
+async def failover_config_put(request: Request):
+    """寫入 mode / order(0600 落檔;env 仍優先;合併寫入)。
+
+    mode 打錯字 → 400(不像讀取端那樣寬鬆退 suggest:寫入時默默改掉會讓
+    使用者以為自己開了 auto)。
+    """
+    _check_auth(request)
+    body = await _json_body(request)
+    has_mode, has_order = "mode" in body, "order" in body
+    if not has_mode and not has_order:
+        raise http_err(400, "EMPTY", "mode / order 至少要帶一個")
+    try:
+        cfg = usage_limits.save_config(
+            mode=str(body.get("mode")) if has_mode else None,
+            order=body.get("order") if has_order else None)
+    except ValueError as exc:
+        raise http_err(400, "FAILOVER_BAD_MODE", str(exc))
+    _log_event("failover_config_updated", mode=cfg["mode"],
+               order=",".join(cfg["order"]),
+               changed=",".join(k for k, v in (("mode", has_mode),
+                                               ("order", has_order)) if v))
+    return {"ok": True, **cfg,
+            "handoff_targets": list(_TRANSFER_TARGETS),
+            "available": sorted(usage_limits.available_providers(
+                _failover_availability()))}
+
+
+@app.get("/app/v2/threads/{thread_id}/failover")
+async def v2_thread_failover_preview(thread_id: str, request: Request):
+    """唯讀預覽:這條 thread 現在撞限額了嗎?會切到誰?會失去什麼能力?
+
+    **不切任何東西**,所以 app/CLI 可以隨便打。`action` 四態:
+    `none`(沒撞限額)/ `suggest` / `auto` / `blocked`(撞了但沒備援)。
+    """
+    _check_auth(request)
+    if t3code_runtime.get_app_thread(CANON_DB, thread_id) is None:
+        raise http_err(404, "APP_THREAD_NOT_FOUND", "unknown app thread")
+    return {"ok": True, **(await _failover_plan_for_thread(thread_id))}
+
+
+@app.post("/app/v2/threads/{thread_id}/failover")
+async def v2_thread_failover(thread_id: str, request: Request):
+    """執行切換:新 session + 帶上下文交棒(復用 ContextTransfer v1)。
+
+    body:`{to_provider?: str, force?: bool}`。
+      · `to_provider` 省略 → 用政策算出來的那家(使用者按下卡片按鈕的路徑)。
+      · `force` 預設 False —— **沒撞限額就不准切**,回 409。理由:這支是
+        「額度耗盡」的出口,不是通用搬家鍵(那是 /transfer)。要在沒撞限額
+        時搬家請直接用 /transfer,語意清楚。
+
+    回 transfer 的結果 + `failover`(切了誰、為什麼、失去什麼)+ `card`
+    (auto 模式的明示卡片 body)。
+    """
+    _check_auth(request)
+    if t3code_runtime.get_app_thread(CANON_DB, thread_id) is None:
+        raise http_err(404, "APP_THREAD_NOT_FOUND", "unknown app thread")
+    body = await _json_body(request)
+    plan = await _failover_plan_for_thread(thread_id)
+    force = bool(body.get("force"))
+    if not plan["limited"] and not force:
+        raise http_err(409, "FAILOVER_NOT_LIMITED",
+                       f"{plan['current']} 目前沒有撞限額;"
+                       "要單純換 provider 請用 /app/v2/threads/{id}/transfer")
+
+    target = str(body.get("to_provider") or "").strip().lower()
+    if not target:
+        target = str((plan.get("plan") or {}).get("provider") or "")
+    if not target:
+        raise http_err(409, "FAILOVER_NO_TARGET",
+                       "沒有可用的備援 provider(見 GET …/failover 的 rejected)")
+    if target not in _TRANSFER_TARGETS:
+        raise http_err(400, "FAILOVER_BAD_PROVIDER",
+                       f"to_provider 必須是 {list(_TRANSFER_TARGETS)} 之一"
+                       "(其他 provider 還沒有交棒落地實作)")
+
+    # 落地走既有交棒管線:milestone 摘要 → 目標開新 session → rebind。
+    # 失敗面(502/409)原封不動由 transfer 回報 —— 不在這裡包一層,
+    # 不然「為什麼切失敗」會被兩層錯誤碼蓋住。
+    res = await v2_app_thread_transfer(
+        thread_id, _BodyShim(request, {"to_provider": target,
+                                       "mode": "summary"}))
+    caps_lost = usage_limits.caps_gap(plan["current"], target,
+                                      _provider_caps_payload())
+    new_sid = str((res or {}).get("new_session_id") or "")
+    card = usage_limits.auto_card_body(
+        plan["current"], {"provider": target, "caps_gap": caps_lost},
+        thread_id=thread_id, new_session_id=new_sid,
+        reset_at=plan["reset_at"])
+    _log_event("failover_switched", session=thread_id,
+               from_provider=plan["current"], to_provider=target,
+               mode=plan["mode"], limited=plan["limited"], forced=force,
+               caps_lost=",".join(caps_lost), to_session=new_sid)
+    return {**res, "failover": {
+        "from": plan["current"], "to": target, "mode": plan["mode"],
+        "limited": plan["limited"], "forced": force,
+        "reset_at": plan["reset_at"], "caps_gap": caps_lost,
+    }, "card": card}
 
 
 @app.post("/app/v3/threads/{thread_id}/context-transfers")

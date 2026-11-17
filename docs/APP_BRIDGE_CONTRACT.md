@@ -2211,6 +2211,144 @@ gemini 的「第一句話截 48 字」)都是**同步且有快取**的,改成非
 **不寫 0** —— 寫 0 等於謊報「這次花了 0」。拿到空字串但連線成功的情況
 **照樣記用量**(錢真的花了)。
 
+## 19. 額度耗盡自動切 provider(`/app/v1/failover/config`,S4,2026-11-17)
+
+> 動機:E3 早就認得出「撞限額」(`status.phase == "usage_limited"` +
+> `usage_limit_reset_at`),但**到今天沒有任何人消費那個訊號** —— 使用者
+> 看到「CC 額度用完,X 點重置」,然後只能自己去開另一家。我們接了八個
+> provider,撞牆時卻還是手動換,**接八家的紅利沒拿到**。這一節是那顆缺掉
+> 的消費者。
+
+### 19.1 政策設定
+
+```
+GET /app/v1/failover/config
+→ {"mode": "suggest", "mode_source": "default",
+   "order": ["cc2","codex","gemini","grok","opencode"], "order_source": "default",
+   "modes": ["suggest","auto"],
+   "default_order": [...],
+   "handoff_targets": ["codex","cc2"],
+   "available": ["cc2","codex", …],
+   "availability": {"codex": {"installed": true, "logged_in": null}, …}}
+
+PUT /app/v1/failover/config   {"mode"?: "suggest"|"auto", "order"?: [...] | "a,b"}
+→ {"ok": true, …}
+```
+
+- **兩種模式**:
+  - `suggest`(**預設**)—— 出一張有按鈕的卡片問使用者,不自己切。
+  - `auto` —— 直接切,**卡片明示已經換成誰、為什麼、失去什麼**。
+- 預設是 `suggest` 不是 `auto`,照 house precedent(`orchestrator.py`:
+  *failover requires explicit approval and checkpoint*)。
+- 讀取端寬鬆(`mode` 認不出來一律退 `suggest` —— fail-safe 的方向是
+  「寧可多問一次」);**寫入端嚴格**(打錯字 → `400 FAILOVER_BAD_MODE`,
+  默默改掉會讓使用者以為自己開了 auto)。
+- env 優先:`POCKET_FAILOVER_MODE` / `POCKET_FAILOVER_ORDER`。
+- `order` 的語意是「我比較想用誰」,不是「誰比較強」。接受 list 或
+  逗號字串;去重;**不驗 provider 名**(亂打的會在選擇時被 caps 過濾掉,
+  比在設定端點拒絕整份順序好 —— 某家暫時沒裝不該讓設定存不進去)。
+- `availability` / `available` 一起回,因為「我順序裡那家為什麼沒被選」
+  是這個功能最常被問的問題,設定面板要能**當場**答得出來。
+
+### 19.2 預覽與執行
+
+```
+GET  /app/v2/threads/{thread_id}/failover      ← 唯讀,不切任何東西
+POST /app/v2/threads/{thread_id}/failover      {"to_provider"?, "force"?}
+```
+
+GET 回:
+
+```jsonc
+{"ok": true,
+ "thread_id": "…", "current": "claude_code",
+ "session_id": "claude_code:Ops",
+ "limited": true,
+ "mode": "suggest",
+ "action": "suggest",            // none | suggest | auto | blocked
+ "reset_at": 1795000000.0,       // 解不出來 = null,不編一個時間
+ "plan": {"provider": "codex", "reason": "ok",
+          "order": ["cc2","codex"],
+          "rejected": [{"provider":"cc2","why":"unavailable"}],
+          "caps_gap": ["改名","封存"]},
+ "handoff_targets": ["codex","cc2"],
+ "card": { …§6 卡片 body… }}
+```
+
+`action` 四態:`none`(沒撞限額)/ `suggest` / `auto` / `blocked`
+(撞了但沒有可用備援 —— **也要出卡片**,沒有它使用者會以為 failover 壞了
+或根本沒裝)。
+
+選擇的過濾順序,每一層都留在 `rejected` 裡:
+
+| `why` | 意思 |
+| --- | --- |
+| `same_provider` | 就是目前這家 |
+| `no_caps_declared` | 沒在 `_PROVIDER_CAPS` 宣告能力 —— 宣告是入場券 |
+| `no_handoff_target` | 還沒有交棒落地實作(見 `handoff_targets`) |
+| `unavailable` | 未安裝,或**明確**未登入 |
+
+`logged_in == null`(登入狀態還在探,冷啟要 10s+)**當成可用** —— 當成
+沒登入會讓剛開機的機器一律沒有備援;真的沒登入的話切過去時 spawn 會失敗
+並明確回報,比「安靜地不給備援」好查。opencode 沒有登入牆,一律 `true`
+(報 false 會憑空造出一道不存在的登入牆)。
+
+### 19.3 切換語義
+
+**切換 = 新 session + 帶上下文交棒,不是假裝同一條對話。** 直接復用
+§ContextTransfer v1(`POST /app/v2/threads/{id}/transfer`)的 milestone
+摘要管線:萃取來源的持久里程碑 → 組交接 prompt → 在目標 provider 開新
+session(首訊 = 交接 prompt)→ rebind(舊綁定標 `detached`,不是 `dead`
+—— 來源原生會話還在,這是刻意交棒)→ 落 `thread.transferred`。
+
+回應 = transfer 的完整結果**外加**:
+
+```jsonc
+{"failover": {"from": "claude_code", "to": "codex", "mode": "suggest",
+              "limited": true, "forced": false,
+              "reset_at": …, "caps_gap": ["改名","封存"]},
+ "card": { …auto 模式的明示卡片 body… }}
+```
+
+錯誤面:
+- 沒撞限額且 `force != true` → `409 FAILOVER_NOT_LIMITED`。這支是
+  **「額度耗盡」的出口,不是通用搬家鍵**(通用搬家請用 `/transfer`,
+  語意清楚)。
+- 算不出目標 → `409 FAILOVER_NO_TARGET`(理由在 GET 的 `rejected`)。
+- `to_provider` 不在 `handoff_targets` → `400 FAILOVER_BAD_PROVIDER`。
+- 目標建立失敗 / rebind 撞綁定 → 原封不動由 transfer 回報(502 / 409),
+  **不在這裡包第二層** —— 兩層錯誤碼會把「為什麼切失敗」蓋掉。
+
+### 19.4 卡片(走既有 `kind: "choices"`,§6)
+
+不需要新端點、也不需要改 app 才看得到;Telegram 上自動退化成純文字。
+
+| `action` | 卡片 | `options` |
+| --- | --- | --- |
+| `suggest` | 「額度用完 —— 可以切到 X 繼續」+ 要打哪支端點 | **空** |
+| `auto` | 「已自動切到 X(原因:Y 額度用完)」+ 新 session id | **空**(已成事實) |
+| `blocked` | 「額度用完,且沒有可用備援」+ 考慮過誰、為什麼都不行 | 空 |
+
+**三種卡片的 `options` 都是空的 —— 這是刻意的。** 第一版把 suggest 做成
+兩顆 `choices` 的 `send` 按鈕(`/failover codex` / `/failover wait`),查下去
+發現 **bridge 沒有任何地方在解析斜線指令**:按下去只會把那串文字原封不動
+送進一條**正卡在限額上**的 session,然後什麼都不會發生 —— 標準的死鈕。
+
+所以分工是:**卡片負責告知,控制面在 §19.2 的端點上。** app 要畫按鈕就用
+預覽回應裡結構化的 `plan`(`provider` / `caps_gap` / `rejected`),按下去打
+`POST /app/v2/threads/{id}/failover`。按鈕的 wiring 歸 app 那一波。
+哪天真的有了指令解析層,再把 `options` 補回來 —— **連同它的端到端測試**
+(`tests/test_failover_s4.py` 有一條守門測試會在有人加回 `send:` 按鈕時變紅)。
+
+**誠實邊界**:`caps_gap` 把「切過去會失去什麼」寫進卡片 `detail`
+(中斷回合 / 排隊送訊息 / 審批卡片 / 改名 / 封存 / 歷史 / 讀寫設定 /
+即時串流降為輪詢)。只報「有 → 沒有」的方向 —— 目標多出來的能力不報,
+卡片講的是邊界不是推銷。
+
+**`auto` 不得靜默**:自動切一定伴隨那張明示卡片。安靜地換掉使用者的
+provider 會讓他以為還在 CC 上,然後困惑為什麼風格變了 —— 那正是這個 repo
+最忌諱的那種病。
+
 ## 附註 A:pocket-id 心跳 `notices` 下行(backup orphan 提醒,2026-11-06)
 
 > 這一節描述的是 **bridge ↔ pocket-id** 的機器間契約(不是 app ↔ bridge),
