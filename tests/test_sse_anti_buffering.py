@@ -57,7 +57,11 @@ class SSEAntiBufferingTests(unittest.TestCase):
         for i in sites:
             line = lines[i]
             window = "\n".join(lines[max(0, i - 3):i + 4])
-            if "headers=SSE_HEADERS" not in window:
+            # 接受兩種寫法:`headers=SSE_HEADERS`,以及需要再加欄位時的
+            # `headers={**SSE_HEADERS, ...}`。只認前者會逼人為了過閘而放棄
+            # 合法的展開寫法 —— 閘門要擋的是「忘了帶」,不是「寫法不同」。
+            if not re.search(r"headers\s*=\s*(SSE_HEADERS\b|\{\s*\*\*\s*SSE_HEADERS\b)",
+                             window):
                 misses.append(f"bridge.py:{i + 1}: {line.strip()[:90]}")
 
         self.assertEqual(
