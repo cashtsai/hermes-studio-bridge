@@ -20,6 +20,7 @@ import hashlib
 import re
 import time
 
+import cjk_text
 import media_artifacts
 from visual_envelope import VisualEnvelopeError, normalize_visual_envelope
 
@@ -673,13 +674,15 @@ def cc_event_to_cards(d: dict, uid: str, turn_id: str = "",
                                     ts))
                     txt = _blocks_text(b.get("content"))
                     if txt:
-                        short = txt[:_TOOL_RESULT_MAX]
-                        if len(txt) > _TOOL_RESULT_MAX:
-                            short += "\n…(截斷)"
+                        # grapheme 邊界截斷(見 cjk_text):卡片是使用者直接
+                        # 看的文字,裸 [:n] 會留半個 emoji/落單的變體選擇器。
+                        short = cjk_text.clip(txt, _TOOL_RESULT_MAX,
+                                              suffix="\n…(截斷)")
                         cards.append(make_card(
                             cid(i), turn_id, "assistant", "tool_result",
                             {"text": short,
-                             "fallback_text": f"↳ 結果\n{short[:1000]}"}, ts))
+                             "fallback_text": "↳ 結果\n"
+                                              + cjk_text.clip(short, 1000, suffix="")}, ts))
         return cards
 
     if t == "assistant":
@@ -985,13 +988,12 @@ def _codex_item_to_cards_raw(item: dict, turn_id: str = "",
                                 "fallback_text": fb}, final=final))
         out = (item.get("aggregatedOutput") or "").strip()
         if final and out:
-            short = out[:_TOOL_RESULT_MAX]
-            if len(out) > _TOOL_RESULT_MAX:
-                short += "\n…(截斷)"
+            short = cjk_text.clip(out, _TOOL_RESULT_MAX, suffix="\n…(截斷)")
             cards.append(make_card(f"{cid}-r", turn_id, "assistant",
                                    "tool_result",
                                    {"text": short,
-                                    "fallback_text": f"↳ 結果\n{short[:1000]}"}))
+                                    "fallback_text": "↳ 結果\n"
+                                    + cjk_text.clip(short, 1000, suffix="")}))
         return cards
 
     if t == "fileChange":
@@ -1611,7 +1613,10 @@ class CodexThreadDigest(ApprovalCardMixin):
             chunk = params.get("chunk") or params.get("delta") or ""
             if not iid or not chunk:
                 return
-            text = (self.exec_text.get(iid, "") + chunk)[-_TOOL_RESULT_MAX:]
+            # 尾端滾動視窗也走 grapheme 邊界:`[-n:]` 會從視窗頭部切進一個
+            # 字的中間,串流每收一塊重算一次 → 頭部長期掛著半個字。
+            text = cjk_text.clip_tail(self.exec_text.get(iid, "") + chunk,
+                                      _TOOL_RESULT_MAX)
             self.exec_text[iid] = text
             self.store.saw_output = True
             self.store.upsert_card(make_card(
@@ -2688,14 +2693,13 @@ class OpenClawDigest(ApprovalCardMixin):
                 text = str(data.get("toolErrorSummary") or data.get("meta") or "")
             if not text:
                 text = "(工具無輸出)" if not is_err else "(工具失敗,無訊息)"
-            short = text[:_TOOL_RESULT_MAX]
-            if len(text) > _TOOL_RESULT_MAX:
-                short += "\n…(截斷)"
+            short = cjk_text.clip(text, _TOOL_RESULT_MAX, suffix="\n…(截斷)")
             mark = "⚠️ " if is_err else ""
             self.store.upsert_card(make_card(
                 f"{cid}-r", self.store.turn_id, "assistant", "tool_result",
                 {"text": short, "tool": name, "is_error": is_err,
-                 "fallback_text": f"↳ {mark}{name}\n{short[:1000]}"}))
+                 "fallback_text": f"↳ {mark}{name}\n"
+                                  + cjk_text.clip(short, 1000, suffix="")}))
             self.store.saw_output = True
             self.store.last_tool = ""
             self._status()

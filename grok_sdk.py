@@ -48,6 +48,7 @@ import time
 import uuid
 
 import acp_rail
+import cjk_text
 
 _CONFIG_FILE = os.path.expanduser(
     os.environ.get("GROK_CONFIG_FILE", "~/.pocket/grok.json"))
@@ -195,7 +196,7 @@ def remember_session(key: str, acp_sid: str, title: str = "",
     row = d.get(key) or {"id": key, "created": time.time()}
     row["acp_sid"] = acp_sid
     if title and not row.get("title"):
-        row["title"] = title[:60]
+        row["title"] = cjk_text.clip(title, 60, suffix="")   # grapheme 邊界
     if cwd:
         row["cwd"] = cwd
     row["last"] = time.time()
@@ -211,7 +212,7 @@ def touch_session(key: str, title_hint: str = "") -> None:
         return
     row["last"] = time.time()
     if title_hint and not row.get("title"):
-        row["title"] = title_hint[:60]
+        row["title"] = cjk_text.clip(title_hint, 60, suffix="")
     _save_sessions(d)
 
 
@@ -220,7 +221,7 @@ def rename_session(key: str, title: str) -> dict | None:
     row = d.get(key)
     if not row:
         return None
-    row["title"] = (title or "").strip()[:60]
+    row["title"] = cjk_text.clip((title or "").strip(), 60, suffix="")
     _save_sessions(d)
     return row
 
@@ -504,12 +505,13 @@ def _last_preview(sid: str) -> str | None:
         return None
     text = " ".join(text.split())
     prefix = "你:" if last.get("role") == "user" else ""
-    return (prefix + text)[:120]
+    return cjk_text.clip(prefix + text, 120, suffix="")
 
 
 def session_v2_row(row: dict, busy: bool = False) -> dict:
     sid = str(row.get("id") or "")
-    title = " ".join(str(row.get("title") or "Grok").split())[:48] or "Grok"
+    title = cjk_text.clip(" ".join(str(row.get("title") or "Grok").split()),
+                          48, suffix="") or "Grok"
     return {"id": session_v2_id(sid), "provider": "grok",
             "title": title,
             "subtitle": _last_preview(sid),

@@ -350,11 +350,29 @@ function activityTime(value) {
   return ms > 0 && Number.isFinite(new Date(ms).getTime()) ? ms : 0;
 }
 
+// 搜尋字串正規化(⌘K 面板 / 工作清單過濾)。照 dsh 的 text-search:
+//   NFKD → 去組合記號 → NFKC → lowercase
+// 一次解掉三類中日文搜尋落空:
+//   ‧ 全形/半形不摺疊 ——「ＣＣ」搜不到 "CC"、「ｐｏｃｋｅｔ」搜不到 "pocket"
+//   ‧ 相容字形 ——「㈱」「㎝」「①」與其展開形搜不到彼此
+//   ‧ 組合記號 —— 片假名濁音(か+゙ vs が)、拉丁變音(é vs e)兩種寫法互搜
+// 中文**不用**切詞:漢字之間沒有空白,每個漢字自己就是詞邊界,所以
+// 子字串比對(includes)本來就是對的做法 —— 真正缺的只有上面這層摺疊。
+const COMBINING_MARKS = /\p{M}+/gu;
+function foldSearchText(value) {
+  const s = String(value == null ? "" : value);
+  try {
+    return s.normalize("NFKD").replace(COMBINING_MARKS, "").normalize("NFKC").toLowerCase();
+  } catch (_) {           // normalize 不可用/輸入含孤立 surrogate → 至少別炸
+    return s.toLowerCase();
+  }
+}
 function workMatches(s, query) {
   const fields = [s.title, s.id, s.provider, PROVIDER_LABEL[s.provider], s.subtitle, s.meta?.workdir,
-    s.provider === "claude_code" || s.provider === "cc2" ? "Claude Code" : ""];
-  return query.toLowerCase().trim().split(/\s+/).every(term =>
-    fields.some(field => String(field || "").toLowerCase().includes(term)));
+    s.provider === "claude_code" || s.provider === "cc2" ? "Claude Code" : ""].map(foldSearchText);
+  // 全形空白(U+3000)也算詞間空白 —— \s 在 JS 已涵蓋,摺疊後更穩。
+  return foldSearchText(query).trim().split(/\s+/).filter(Boolean)
+    .every(term => fields.some(field => field.includes(term)));
 }
 
 const PHASE_LABEL = { idle: "閒置", done: "已完成", running: "執行中", run: "執行中",
@@ -1440,12 +1458,32 @@ function firstApprovalButton(wantYes) {
   const hit = btns.find((b) => b.classList.contains(wantYes ? "ap-yes" : "ap-no"));
   return hit || (wantYes ? btns[0] : btns[btns.length - 1]);
 }
+// ── IME 三重判準(中文/日文選字按 Enter 不准送出)────────────────────────
+// 1. `event.isComposing` —— 多數引擎在組字期間的標準訊號。
+// 2. `keyCode === 229` —— 舊引擎(含部分 Safari/Android IME)不給 isComposing
+//    時唯一的線索。
+// 3. `recentlyComposing()` —— **Safari 的「選字確認」keydown 比 compositionend
+//    晚到**,只看前兩條會在 compositionend 之後收到一顆乾淨的 Enter,把半成品
+//    直接送出去(機主打中文最常踩的那一下)。compositionend 後再守 10ms。
+//
+// 三條缺一不可:只有 (1)+(2) 的版本在 Safari/iPad 上會誤送;只有 (3) 的版本
+// 在組字途中按 Enter(engine 不發 compositionend)會放行。
+const IME_TAIL_MS = 10;
 let composing = false;
-const imeKey = e => composing || e.isComposing || e.keyCode === 229;
+let composingUntil = 0;
+const nowMs = () => Date.now();
+const recentlyComposing = () => composing || nowMs() < composingUntil;
+const imeKey = e => e?.isComposing === true || e?.keyCode === 229 || recentlyComposing();
+function imeCompositionStart() { composing = true; composingUntil = 0; }
+function imeCompositionEnd() { composing = false; composingUntil = nowMs() + IME_TAIL_MS; }
+function imeReset() { composing = false; composingUntil = 0; }
+// terminal.js / memory.js 的輸入框共用同一顆守衛(app.js 先載,見 index.html)。
+if (typeof window !== "undefined")
+  window.PocketIME = { imeKey, recentlyComposing, TAIL_MS: IME_TAIL_MS };
 function wireKeys() {
-  document.addEventListener("compositionstart", () => { composing = true; });
-  document.addEventListener("compositionend", () => { composing = false; });
-  window.addEventListener("blur", () => { composing = false; });
+  document.addEventListener("compositionstart", imeCompositionStart);
+  document.addEventListener("compositionend", imeCompositionEnd);
+  window.addEventListener("blur", imeReset);
   document.addEventListener("keydown", (e) => {
     if (imeKey(e)) return;
     if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {

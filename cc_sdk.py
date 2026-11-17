@@ -28,6 +28,7 @@ import time
 import uuid
 
 import carddigest
+import cjk_text
 
 # ── bridge 注入面(configure)────────────────────────────────────────────────
 # 預設全 no-op:單測可以不接 bridge 直接驅動本模組。
@@ -496,7 +497,8 @@ def _tool_summary(tool: str, tool_input: dict) -> str:
         except Exception:  # noqa: BLE001
             txt = str(tool_input)
     txt = " ".join(txt.split())
-    return txt[:117] + "…" if len(txt) > 120 else txt
+    # grapheme 邊界(見 cjk_text):120 字的一行摘要被切出半個 emoji 特別醜。
+    return cjk_text.clip(txt, 117) if len(txt) > 120 else txt
 
 
 # ── 歷史種子(transcript jsonl → 卡片)────────────────────────────────────────

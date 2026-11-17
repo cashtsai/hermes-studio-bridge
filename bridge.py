@@ -14,6 +14,7 @@ Run:  uvicorn bridge:app --host 0.0.0.0 --port 8081
 import asyncio
 import base64
 import carddigest
+import cjk_text
 import codecs
 import collections
 import contextlib
@@ -4188,7 +4189,7 @@ async def _delegation_app_sessions() -> list:
             "name": d["display_title"],
             "parent": d.get("parent_persona"),
             "tool": d.get("provider"),
-            "preview": (d.get("objective") or "")[:160],
+            "preview": cjk_text.clip(d.get("objective") or "", 160, suffix=""),
             "lastAt": d.get("updated_at"),
             "status": st,
             "runtime_status": st,
@@ -4735,10 +4736,13 @@ def _persona_tool_error_reports(persona: str, limit: int = 20) -> list[dict]:
 
 
 def _clip_text(text: str, max_chars: int) -> str:
+    # grapheme 邊界截斷(見 cjk_text):裸 [:n] 會把旗幟/ZWJ emoji/漢字異體字
+    # 選擇器切成半個字,報告裡就多一個豆腐方塊。
     text = (text or "").strip()
-    if len(text) <= max_chars:
+    body, cut = cjk_text.clip_marked(text, max_chars, mark="")
+    if not cut:
         return text
-    return text[:max_chars].rstrip() + "\n...[截斷，完整內容保存在 report_events]"
+    return body.rstrip() + "\n...[截斷，完整內容保存在 report_events]"
 
 
 def _fmt_ts(ts) -> str:
@@ -5591,7 +5595,7 @@ def _cx_thread_display(tid: str) -> str:
             name = str(t.get("name") or "").strip()
             preview = str(t.get("preview") or "").strip()
             if name or preview:
-                return (name or preview)[:40]
+                return cjk_text.clip(name or preview, 40, suffix="")
             break
     return f"Codex {tid[:8]}" if tid else "Codex"
 
@@ -8924,8 +8928,8 @@ def _cx_byok_register(thread_id: str, api_key: str, text: str,
         "slot": slot,
         "home": home,
         "secret": secret,
-        "name": (text or thread_id)[:80],
-        "preview": (text or "")[:180],
+        "name": cjk_text.clip(text or thread_id, 80, suffix=""),
+        "preview": cjk_text.clip(text or "", 180, suffix=""),
         "workdir": cwd,
         "createdAt": time.time(),
         "updatedAt": time.time(),
@@ -9619,11 +9623,11 @@ def _codex_session_summary(thread: dict,
     # runtime_status 自己知道要忽略它。
     client.note_provider_status(tid, thread.get("status"))
     out = {
-        "name": name or preview[:180] or (tid[:12] or "codex"),
+        "name": name or cjk_text.clip(preview, 180, suffix="") or (tid[:12] or "codex"),
         "thread_id": tid,
         "session_id": thread.get("sessionId") or "",
         "workdir": _cx_note_thread_cwd(tid, thread.get("cwd") or ""),
-        "preview": preview[:180],
+        "preview": cjk_text.clip(preview, 180, suffix=""),
         "status": provider_status,
         "providerStatus": provider_status,
         "source": _codex_source_label(thread.get("source")),
@@ -22415,9 +22419,8 @@ def _roster_summary_text(raw: str) -> str:
     """原文 → 5-12 字級的規則式摘要:壓空白、去圍欄雜訊、截斷。"""
     t = re.sub(r"\s+", " ", str(raw or "")).strip()
     t = re.sub(r"^```[a-z-]*\s*", "", t)
-    if len(t) > _ROSTER_SUMMARY_CHARS:
-        t = t[:_ROSTER_SUMMARY_CHARS] + "…"
-    return t
+    # 12 字的摘要裡一個 emoji 就佔掉一格,切一半特別明顯 → grapheme 邊界。
+    return cjk_text.clip(t, _ROSTER_SUMMARY_CHARS)
 
 
 def _roster_enrich(ids: list) -> dict:
@@ -24448,7 +24451,7 @@ def _cx_feed_queue_drop(thread_id: str, item: dict, exc: BaseException) -> None:
         return
     try:
         text = str((item or {}).get("text") or "").strip()
-        preview = (text[:60] + "…") if len(text) > 60 else text
+        preview = cjk_text.clip(text, 60)
         # 被桌面版 Codex 鎖住是**可行動**的原因,不能只丟一個 exception 名字。
         cause = (f"({type(exc).__name__})"
                  if _codex_thread_lock_conflict(exc) is None
@@ -32319,6 +32322,16 @@ class _TerminalSession:
         self.master_fd: int | None = None
         self.proc: subprocess.Popen | None = None
         self._write_buf = bytearray()
+        # 一次 PTY read 可以停在一個 code point 的中間(漢字 UTF-8 是 3 bytes,
+        # 讀取邊界完全看 kernel 給多少),所以**每條 socket 一個有狀態 decoder**。
+        # 之前是對每塊 bytes 各自 `decode("utf-8", "replace")` —— 被切開的漢字
+        # 兩側各吐一個 U+FFFD,終端機裡 `ls` 一個中文檔名就可能變「」。
+        # 另一條終端機路徑(app_v1_terminal)早就這麼做了,這裡是漏的那條。
+        self._decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+
+    def decode(self, chunk: bytes, *, final: bool = False) -> str:
+        """PTY bytes → 文字,跨 chunk 保留未完成的多位元組序列。"""
+        return self._decoder.decode(chunk or b"", final)
 
     def start(self) -> None:
         shell = os.environ.get("SHELL") or "/bin/zsh"
@@ -32521,10 +32534,22 @@ async def terminal_ws(websocket: WebSocket) -> None:
         while True:
             item = await output_q.get()
             if item is _EOF:
+                # 收尾:若最後一塊停在半個字上(shell 被砍),把殘餘沖出成
+                # 一個 U+FFFD,不要無聲吞掉。
+                try:
+                    tail = session.decode(b"", final=True)
+                    if tail:
+                        await websocket.send_json({"type": "output", "data": tail})
+                except Exception as _exc:  # noqa: BLE001
+                    _log_exc("terminal_ws._writer_loop.flush", _exc, expected=True)
                 return
             try:
-                await websocket.send_json({"type": "output",
-                                           "data": item.decode("utf-8", "replace")})
+                # 有狀態解碼:被 chunk 邊界切開的漢字要等下一塊才補完,
+                # 不能每塊各自 decode(見 _TerminalSession.__init__ 的註解)。
+                text = session.decode(item)
+                if not text:
+                    continue
+                await websocket.send_json({"type": "output", "data": text})
             except Exception as _exc:  # noqa: BLE001 — client gone; recv/exit path cleans up
                 _log_exc("terminal_ws._writer_loop", _exc, expected=True)
                 return
