@@ -23,9 +23,11 @@ _TMP = tempfile.mkdtemp(prefix="b1-taxonomy-")
 os.environ["POCKET_CANON_DB"] = os.path.join(_TMP, "canonical.db")
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _ROOT)
+sys.path.insert(0, os.path.join(_ROOT, "scripts"))
 
 import bridge      # noqa: E402  (import 觸發 _canon_init → 建表)
 import carddigest  # noqa: E402
+from sentinel import corpus_sentinel  # noqa: E402
 
 
 def _src(name: str) -> str:
@@ -34,13 +36,21 @@ def _src(name: str) -> str:
 
 
 class TestRegistryCompleteness(unittest.TestCase):
-    """掃源碼發射點 → 型別必須登記。新事件型別漏登記在這裡紅。"""
+    """掃源碼發射點 → 型別必須登記。新事件型別漏登記在這裡紅。
+
+    ⚠️ 這一類「掃源碼比對登記表」的守門有一個共同弱點:**掃不到東西的時候
+    它會報綠**(0 個發射點 ⇒ 0 個未登記型別 ⇒ 綠)。原版只有
+    `assertTrue(types)`(≥1 就過),所以 regex 退化成只配到一種型別時仍然綠
+    —— 那是最常見的 regex 腐化形狀,不是歸零。
+    每個掃描點現在都先過語料下限哨兵,見 scripts/sentinel/corpus_sentinel.py。
+    """
 
     def test_event_append_literals_registered(self):
         # _event_append(session, "literal", …) 的字面型別
         types = set(re.findall(
             r"_event_append\(\s*[^,]+,\s*\"([a-z_.]+)\"", _src("bridge.py")))
-        self.assertTrue(types, "找不到任何 _event_append 字面型別(regex 壞了?)")
+        corpus_sentinel.require("event_taxonomy.event_append_literals", len(types),
+                                detail="(regex 還配得到 _event_append 的字面型別嗎?)")
         allowed = set(bridge.EVENT_PERSISTED) | set(bridge.EVENT_PERSIST_ONLY)
         self.assertLessEqual(
             types, allowed,
@@ -51,7 +61,8 @@ class TestRegistryCompleteness(unittest.TestCase):
         # _mirror_milestone 經 MILESTONE_SINK 落地的型別(sink(sid, "literal", …))
         types = set(re.findall(
             r"sink\(\s*sid,\s*\"([a-z_.]+)\"", _src("carddigest.py")))
-        self.assertTrue(types)
+        corpus_sentinel.require("event_taxonomy.milestone_sink_literals", len(types),
+                                detail="(_mirror_milestone 的 sink 呼叫改寫法了?)")
         self.assertLessEqual(
             types, set(bridge.EVENT_PERSISTED),
             f"里程碑鏡射出現未登記 persisted 型別:{types - set(bridge.EVENT_PERSISTED)}")
@@ -59,7 +70,8 @@ class TestRegistryCompleteness(unittest.TestCase):
     def test_ring_push_literals_registered(self):
         types = set(re.findall(
             r"_push\(\s*\"([a-z_.]+)\"", _src("carddigest.py")))
-        self.assertTrue(types)
+        corpus_sentinel.require("event_taxonomy.ring_push_literals", len(types),
+                                detail="(SessionCardStore._push 的呼叫改寫法了?)")
         self.assertLessEqual(
             types, set(carddigest.RING_TRANSIENT),
             f"未登記的 ring transient 型別:{types - set(carddigest.RING_TRANSIENT)}")
@@ -84,7 +96,9 @@ class TestSingleChokepoint(unittest.TestCase):
         hits = [m.start() for m in re.finditer(r"INTO event_log", src)]
         # CREATE TABLE 那句不算寫入
         writes = [i for i in hits if "INSERT" in src[max(0, i - 40):i]]
-        self.assertTrue(writes, "event_log 寫入點消失了?")
+        corpus_sentinel.require("event_taxonomy.event_log_writes", len(writes),
+                                detail="(event_log 的 INSERT 改寫法/搬家了?"
+                                       "掃不到寫入點時這條會『沒有違規』地綠)")
         fn = src.index("def _event_append(")
         # _event_append 函式結束 = 下一個模組層 def
         fn_end = src.index("\ndef ", fn + 10)

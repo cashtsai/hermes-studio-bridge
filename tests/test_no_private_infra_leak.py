@@ -19,9 +19,12 @@ import hashlib
 import os
 import re
 import subprocess
+import sys
 import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(ROOT, "scripts"))
+from sentinel import corpus_sentinel  # noqa: E402
 
 # 要擋的形狀。用組字避免這支測試自己命中自己(與 opensource-check.sh 同手法)。
 # ── 守門分兩層 ────────────────────────────────────────────────────────────
@@ -120,9 +123,19 @@ def _domain_hits(text):
 
 
 def tracked_files():
+    """掃描語料 = git 追蹤的全部檔案。
+
+    ⚠️ 這支的綠色有兩種來源:「掃過了,沒有洩漏」與「`git ls-files` 回空,
+    所以沒有洩漏」。第二種在淺 clone、非 repo 目錄、cwd 跑錯的時候會發生,
+    **而且完全安靜** —— 一個只掃到 3 個檔的洩漏守門會興高采烈地報綠。
+    所以掃之前先過語料下限哨兵(見 scripts/sentinel/corpus_sentinel.py)。
+    """
     out = subprocess.run(["git", "ls-files"], cwd=ROOT, capture_output=True,
                          text=True, check=True).stdout
-    return [p for p in out.splitlines() if p and p not in ALLOW]
+    files = [p for p in out.splitlines() if p and p not in ALLOW]
+    corpus_sentinel.require("private_leak.tracked_files", len(files),
+                            detail="(`git ls-files` 在 ROOT 下回了幾筆?)")
+    return files
 
 
 class NoPrivateInfraLeak(unittest.TestCase):

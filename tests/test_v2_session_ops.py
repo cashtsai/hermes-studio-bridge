@@ -21,10 +21,13 @@ from unittest.mock import patch
 _TMP = tempfile.mkdtemp(prefix="v2-ops-")
 os.environ.setdefault("POCKET_CANON_DB", os.path.join(_TMP, "canonical.db"))
 os.environ.setdefault("BRIDGE_TOKEN", "test-unit-token")
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, _ROOT)
+sys.path.insert(0, os.path.join(_ROOT, "scripts"))
 
 import bridge  # noqa: E402
 import gemini_provider  # noqa: E402
+from sentinel import corpus_sentinel  # noqa: E402
 
 #: 已知且有理由的缺格。每一筆都要有「為什麼」—— 沒理由的缺格是債,不是決定。
 #: 格式:(op, provider): "理由"
@@ -71,6 +74,16 @@ class OpsMatrixCoverageTest(unittest.TestCase):
     """矩陣完整性:每個 (op, provider) 要嘛有 handler,要嘛有理由。"""
 
     def test_every_cell_is_accounted_for(self):
+        # 語料下限哨兵:這條的綠色有兩種來源 —— 「每個格子都有著落」與
+        # 「表被改瘦 / `_ALL_PROVIDERS` 被砍,所以沒有格子可以缺」。
+        # 後者是制度安靜地鬆掉,必須紅。見 scripts/sentinel/corpus_sentinel.py。
+        corpus_sentinel.require("v2_session_ops.ops",
+                                len(bridge._V2_SESSION_OPS))
+        corpus_sentinel.require(
+            "v2_session_ops.cells",
+            len(bridge._V2_SESSION_OPS) * len(_ALL_PROVIDERS),
+            detail="(是 op 少了還是 _ALL_PROVIDERS 少了?兩種都代表"
+                   "『每個格子都要表態』這件事被縮小了)")
         missing = []
         for op, table in bridge._V2_SESSION_OPS.items():
             for prov in _ALL_PROVIDERS:

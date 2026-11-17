@@ -21,15 +21,31 @@ import _isolation  # noqa: F401  # 測試隔離閂:必須是第一個 import
 
 import os
 import re
+import sys
 import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(ROOT, "scripts"))
+from sentinel import corpus_sentinel  # noqa: E402
+
 INSTALLER = os.path.join(ROOT, "deploy", "install-local-bridge.sh")
 
 
 def installer_src():
+    """安裝器原始碼。
+
+    語料下限哨兵:本檔全部的斷言都是「不准出現 X」,所以安裝器**變短**的時候
+    它們會一起自動通過 —— 極端情況是安裝器被改成一行 `exec other.sh`,
+    守門照樣全綠而實際行為整個搬到別處去了。
+    見 scripts/sentinel/corpus_sentinel.py。
+    """
     with open(INSTALLER, encoding="utf-8") as f:
-        return f.read()
+        src = f.read()
+    corpus_sentinel.require("installer_neutral.installer_lines",
+                            len(src.splitlines()),
+                            detail="(安裝器的內容是不是被搬到別的腳本了?"
+                                   "搬走的話這支守門要跟著搬)")
+    return src
 
 
 class InstallerIsNeutral(unittest.TestCase):
