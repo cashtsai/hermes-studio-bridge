@@ -2123,6 +2123,113 @@ data: {"ts": …, "type": "sessions.changed",
 - 長時間零變化(30 分鐘)bridge 主動斷線(半死 client 不佔 task,同既有
   follow 流);client 重連即重拿全量。
 
+## 18. Webhook automations(入站簽章觸發 agent,2026-11-17)
+
+> 讓外部事件(GitHub PR/CI、告警…)自動開一條 agent 工作。設計照 t3code 的
+> webhook automations 搬。實作在 `webhooks.py`(純邏輯 + SQLite 落庫),路由與
+> 「真的開 session」在 `bridge.py`。完整操作指南見 `docs/WEBHOOKS.md`。
+
+### 18.1 兩個面:入站(無 bearer)與管理(需認證)
+
+| 面 | 端點 | 認證 |
+|----|------|------|
+| 入站 | `POST /webhook/{hook_id}` | **無 bearer**,靠每 hook 獨立 secret 的 HMAC-SHA256 簽章 |
+| 管理 | `POST/GET/PATCH/DELETE /app/v1/webhooks[/{id}]` | `Authorization: Bearer <bridge token>`(§1) |
+| 日誌 | `GET /app/v1/webhooks/{id}/deliveries` | 同上 |
+
+入站不可能帶我們的 device token(送方是 GitHub/CI),所以**唯一**的身分證明
+是簽章。管理面沿用既有 bearer。
+
+### 18.2 建立 hook
+
+`POST /app/v1/webhooks`,body:
+
+```jsonc
+{
+  "name": "github-pr",
+  "provider": "codex",            // codex | cc2
+  "cwd": "/Users/you/apps/repo",  // session 的工作目錄
+  "prompt_template": "審一下這個 PR:{{pull_request.title}}\n{{pull_request.html_url}}",
+  "filters": [                     // 全部皆過(AND)才觸發;空陣列=無條件
+    {"op": "equals", "path": "action", "value": "opened"},
+    {"op": "is-one-of", "path": "pull_request.base.ref", "value": ["main", "dev"]}
+  ],
+  "coalesce": {"key": "{{repository.full_name}}", "window_seconds": 60},  // 可省
+  "dedup_source": "x-github-delivery",  // 去重用的 header;省略則用 payload 雜湊
+  "rate_per_minute": 60,
+  "enabled": true
+}
+```
+
+回應**唯一一次**帶明文 `secret` 與 `inbound_url`/`signature_header`:
+
+```jsonc
+{ "id": "wh_ab12…", "secret": "…once-only…",
+  "inbound_url": "https://…/webhook/wh_ab12…",
+  "signature_header": "x-hub-signature-256", "has_secret": true, … }
+```
+
+之後任何 GET/LIST 都 **redact**(只回 `has_secret: true`)。要換 secret:
+`PATCH …/{id}` 帶 `{"rotate_secret": true}` —— 舊 secret **當場失效**,新明文也
+只在該次回應回一次。
+
+### 18.3 入站處理順序(每一步都落庫)
+
+`存在/啟用 → 簽章 → 去重 → 速率 → filters → coalesce → 觸發`。各結果對應的
+HTTP 碼:
+
+| 結果 | 碼 | `action` | 說明 |
+|------|----|----------|------|
+| 觸發 | 200 | `triggered` | 回 `session_id` |
+| 已歸併 | 202 | `coalesced` | 進 coalesce 視窗,視窗到期才開一條 |
+| 重複 | 200 | `duplicate` | delivery id / payload 雜湊 7 天內見過 |
+| filter 沒過 | 200 | `filtered` | `reason` 標哪條 filter |
+| 簽章缺/錯 | 401 | `missing_signature` / `bad_signature` | **仍記一筆** deliveries |
+| 超速 | 429 | `rate_limited` | 每 hook 每分鐘上限;不佔去重格,重投可過 |
+| 停用/不存在 | 404 | `disabled` / `not_found` | 不洩漏細節 |
+| 開 session 失敗 | 502 | `trigger_error` | delivery 記 `error` |
+
+### 18.4 Filters(JSON path)
+
+- `path` 走 dot 記法;`[]` 通配展開陣列,**任一**命中即算該條過:
+  `commits[].author.name`。
+- `op`:`equals`(等值)、`is-one-of`(`value` 為陣列,屬於即過)、
+  `exists`(路徑解得出值即過;`value: false` 反向斷言「不存在」)。
+
+### 18.5 去重與 coalesce(皆落庫,重啟仍有效)
+
+- **去重**:鍵優先取 `dedup_source` 指定的 header(如 `x-github-delivery`),
+  沒有就用 payload SHA-256。保留 7 天。
+- **coalesce**:同 `key`(可用 `{{path}}`)的連續投遞併進一個視窗,視窗
+  `window_seconds`(10~3600)到期**只開一條** session,用併攏後最新的 payload。
+  視窗在庫裡,bridge 重啟後由背景 reaper 接著燒。
+
+### 18.6 外部資料硬化(安全關鍵)
+
+入站 payload 的**每個欄位值都是不可信輸入**。進 prompt 前:
+
+1. 一律包 `<webhook-data>…</webhook-data>` 標記(模板本身可信,不包);
+2. 在 `$`、`@`、**行首** `/` 後插零寬字元,使 `$skill`、`@file`、
+   `/command`、`//command` 這類會被 agent runtime 特別解讀的前綴**當場失效**;
+3. 欄位值裡夾帶的 `</webhook-data>` 收尾標籤會被打斷,擋 tag breakout。
+
+即使攻擊者能發出通過簽章的 payload,也無法用欄位內容把 agent 導去跑別的
+技能、讀別的檔或下控制指令。
+
+### 18.7 投遞日誌
+
+`GET /app/v1/webhooks/{id}/deliveries?limit=100`:
+
+```jsonc
+{ "ok": true, "hook_id": "wh_…", "deliveries": [
+  { "id": "dl_…", "received_at": 1800000000.0, "source": "140.82.x.x",
+    "delivery_key": "id:…", "triggered": true, "reason": "triggered",
+    "session_id": "codex:…", "error": "" }, … ] }
+```
+
+排查「為什麼沒開 agent」看這裡:簽錯、被去重、filter 沒過、被歸併、超速,
+每一種都有 `reason`。保留 7 天。
+
 ## 附註 A:pocket-id 心跳 `notices` 下行(backup orphan 提醒,2026-11-06)
 
 > 這一節描述的是 **bridge ↔ pocket-id** 的機器間契約(不是 app ↔ bridge),

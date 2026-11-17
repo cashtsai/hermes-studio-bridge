@@ -74,6 +74,7 @@ import t3code_runtime
 import cc_detect            # CC TUI 狀態偵測(manifest 引擎;herdr 設計移植)
 import cc_sdk               # CC provider v2(Agent SDK;模組內 lazy-import SDK)
 import tg_outbound
+import webhooks as webhooks_mod   # Webhook automations(入站簽章觸發 agent)
 import workers as workers_store
 from fastapi import (FastAPI, Request, HTTPException, WebSocket, WebSocketDisconnect,
                      File, Form, UploadFile)
@@ -26150,6 +26151,203 @@ async def _guest_forward_to_session(session_id: str, text: str,
     if client_id:
         body["client_id"] = client_id
     return await v2_session_input(session_id, _InternalRequest(body))
+
+
+# ═══════════════ Webhook automations(入站簽章觸發 agent)═════════════════════
+# 設計照 t3code webhook automations 搬。模組邊界:webhooks.py 管資料庫 + 純邏輯
+# (簽章/filters/去重/coalesce/速率/硬化/模板),bridge 只負責 HTTP 面與「真的
+# 開 session 送 prompt」。入站 POST /webhook/{id} **不走 bearer**,靠每 hook
+# 獨立 secret 的 HMAC-SHA256 簽章把關;管理面 /app/v1/webhooks 走既有 _check_auth。
+_WEBHOOK_STORE = None
+
+
+def _webhooks() -> "webhooks_mod.WebhookStore":
+    """延遲建立(同 agent_registry 的教訓:別在 import 當下就建 production DB
+    的連線 —— 測試隔離閂靠 POCKET_WEBHOOKS_DB 導到 tmp,但第一次觸碰要在
+    env 就位之後)。"""
+    global _WEBHOOK_STORE
+    if _WEBHOOK_STORE is None:
+        _WEBHOOK_STORE = webhooks_mod.WebhookStore()
+    return _WEBHOOK_STORE
+
+
+async def _webhook_spawn_session(provider: str, cwd: str, prompt: str) -> str:
+    """用設定的 provider + cwd 開一條 session 並送 prompt(規格第 9 點)。
+
+    走**既有**的建立路徑(內部轉發,同 guest 擬稿核准那套),不另開一條:
+    codex 的 /codexsessions 一次就建好 thread 並起 turn;cc2 要先 create 再
+    走統一 input。回傳 session_id(`codex:<thread>` / `cc2:<name>`)。
+    """
+    if provider == "codex":
+        res = await codex_session_create(_InternalRequest(
+            {"text": prompt, "cwd": cwd, "purpose": "webhook",
+             "created_via": "webhook"}))
+        tid = (res or {}).get("thread_id")
+        if not tid:
+            raise RuntimeError("codex thread/start 沒有回 thread id")
+        return f"codex:{tid}"
+    if provider == "cc2":
+        if not cc_sdk.enabled():
+            raise RuntimeError("cc2 provider 未啟用(需 CC_SDK_PROVIDER=1)")
+        name = "wh-" + uuid.uuid4().hex[:10]
+        await v2_cc2_create(name, _InternalRequest(
+            {"workdir": cwd, "purpose": "webhook"}))
+        sid = f"cc2:{name}"
+        await v2_session_input(sid, _InternalRequest({"text": prompt}))
+        return sid
+    raise RuntimeError(f"unsupported webhook provider: {provider}")
+
+
+def _webhook_public_url(hook_id: str) -> str:
+    base = (os.environ.get("POCKET_PUBLIC_BASE_URL") or "").rstrip("/")
+    return (base + f"/webhook/{hook_id}") if base else f"/webhook/{hook_id}"
+
+
+@app.post("/app/v1/webhooks")
+async def webhooks_create(request: Request):
+    """建立一條 hook(需認證)。回應**唯一一次**帶明文 `secret` 與簽章設定說明
+    —— 之後任何讀取都 redact。把 secret 設進送方(GitHub repo 的 webhook 設定、
+    CI 的 secret)就能開始投遞。"""
+    _check_auth(request)
+    body = await _json_body(request)
+    try:
+        hook = _webhooks().create_hook(body)
+    except webhooks_mod.WebhookError as e:
+        raise http_err(400, e.code, e.message)
+    _log_event("webhook_created", hook=hook["id"], provider=hook["provider"],
+               name=hook["name"])
+    hook["inbound_url"] = _webhook_public_url(hook["id"])
+    hook["signature_header"] = webhooks_mod.SIGNATURE_HEADER
+    return hook
+
+
+@app.get("/app/v1/webhooks")
+async def webhooks_list(request: Request):
+    _check_auth(request)
+    return {"ok": True, "webhooks": _webhooks().list_hooks()}
+
+
+@app.get("/app/v1/webhooks/{hook_id}")
+async def webhooks_get(hook_id: str, request: Request):
+    _check_auth(request)
+    store = _webhooks()
+    row = store.get_hook(hook_id)
+    if row is None:
+        raise http_err(404, "WEBHOOK_NOT_FOUND", "找不到這條 webhook")
+    public = store._public(row)
+    public["inbound_url"] = _webhook_public_url(hook_id)
+    return public
+
+
+@app.patch("/app/v1/webhooks/{hook_id}")
+async def webhooks_update(hook_id: str, request: Request):
+    """更新設定(需認證)。body 可帶 `rotate_secret: true` 換一把新 secret ——
+    換發會**當場讓舊 secret 失效**(用它簽的入站之後一律 401),所以也只在這次
+    回應回一次明文新 secret。"""
+    _check_auth(request)
+    body = await _json_body(request)
+    rotate = bool(body.pop("rotate_secret", False))
+    try:
+        hook = _webhooks().update_hook(hook_id, body, rotate_secret=rotate)
+    except webhooks_mod.WebhookError as e:
+        raise http_err(400, e.code, e.message)
+    if hook is None:
+        raise http_err(404, "WEBHOOK_NOT_FOUND", "找不到這條 webhook")
+    _log_event("webhook_updated", hook=hook_id, rotated=rotate)
+    hook["inbound_url"] = _webhook_public_url(hook_id)
+    return hook
+
+
+@app.delete("/app/v1/webhooks/{hook_id}")
+async def webhooks_delete(hook_id: str, request: Request):
+    _check_auth(request)
+    if not _webhooks().delete_hook(hook_id):
+        raise http_err(404, "WEBHOOK_NOT_FOUND", "找不到這條 webhook")
+    _log_event("webhook_deleted", hook=hook_id)
+    return {"ok": True, "deleted": hook_id}
+
+
+@app.get("/app/v1/webhooks/{hook_id}/deliveries")
+async def webhooks_deliveries(hook_id: str, request: Request):
+    """投遞日誌(規格第 7 點):時間 / 來源 / 是否觸發 / 未觸發原因 / session。
+    排查「為什麼沒開 agent」就看這裡 —— 簽錯、被去重、filter 沒過、被歸併、
+    超速,每一種都有 reason。"""
+    _check_auth(request)
+    store = _webhooks()
+    if store.get_hook(hook_id) is None:
+        raise http_err(404, "WEBHOOK_NOT_FOUND", "找不到這條 webhook")
+    try:
+        limit = max(1, min(500, int(request.query_params.get("limit") or 100)))
+    except ValueError:
+        limit = 100
+    return {"ok": True, "hook_id": hook_id,
+            "deliveries": store.list_deliveries(hook_id, limit=limit)}
+
+
+@app.post("/webhook/{hook_id}")
+async def webhook_inbound(hook_id: str, request: Request):
+    """入站(**無 bearer**,靠簽章)。順序:存在 → 簽章 → 去重 → 速率 → filters
+    → coalesce → 觸發。每一步都落庫。回應的 HTTP 碼對應結果:401 簽章、
+    429 超速、202 已歸併、200 其餘(含觸發/去重/filter 沒過)。"""
+    raw = await request.body()
+    headers = {k.lower(): v for k, v in request.headers.items()}
+    source = request.client.host if request.client else ""
+    store = _webhooks()
+    decision = store.evaluate(hook_id, raw, headers, source)
+    if decision.action == "trigger":
+        try:
+            sid = await _webhook_spawn_session(decision.provider, decision.cwd,
+                                               decision.prompt)
+            store.complete_delivery(decision.delivery_id, session_id=sid)
+            _log_event("webhook_triggered", hook=hook_id, session=sid,
+                       provider=decision.provider)
+            return JSONResponse(status_code=200,
+                                content={"ok": True, "action": "triggered",
+                                         "session_id": sid,
+                                         "delivery_id": decision.delivery_id})
+        except Exception as exc:  # noqa: BLE001
+            store.complete_delivery(decision.delivery_id, error=str(exc)[:200])
+            _log_exc("webhook_spawn", exc)
+            _log_event("webhook_trigger_failed", hook=hook_id,
+                       error=str(exc)[:160])
+            return JSONResponse(status_code=502,
+                                content={"ok": False, "action": "trigger_error",
+                                         "error": "failed to spawn session",
+                                         "delivery_id": decision.delivery_id})
+    if decision.action in ("bad_signature", "missing_signature"):
+        _log_event("webhook_signature_rejected", hook=hook_id,
+                   reason=decision.reason, source=source)
+    return JSONResponse(status_code=decision.status, content=decision.response())
+
+
+async def _webhook_coalesce_reaper() -> None:
+    """到期的 coalesce 視窗 → 觸發一次。視窗落在庫裡,所以重啟後這個迴圈接著
+    跑就會把累積的視窗燒掉(規格第 5 點「重啟仍有效」)。"""
+    while True:
+        try:
+            due = await asyncio.to_thread(_webhooks().pop_due_windows)
+            for win in due:
+                try:
+                    sid = await _webhook_spawn_session(
+                        win["provider"], win["cwd"], win["prompt"])
+                    _webhooks().record_coalesce_fire(
+                        win["hook_id"], source=win["source"], session_id=sid,
+                        count=win["count"])
+                    _log_event("webhook_coalesce_fired", hook=win["hook_id"],
+                               session=sid, count=win["count"])
+                except Exception as exc:  # noqa: BLE001
+                    _webhooks().record_coalesce_fire(
+                        win["hook_id"], source=win["source"],
+                        error=str(exc)[:200], count=win["count"])
+                    _log_exc("webhook_coalesce_spawn", exc)
+        except Exception as _exc:  # noqa: BLE001
+            _log_exc("webhook_coalesce_reaper", _exc, expected=True)
+        await asyncio.sleep(float(os.environ.get("POCKET_WEBHOOK_REAP_SECS", "5")))
+
+
+@app.on_event("startup")
+async def _webhook_reaper_startup():
+    asyncio.create_task(_webhook_coalesce_reaper())
 
 
 async def _guest_message_decide(aid: str, d: dict, b: dict) -> dict:

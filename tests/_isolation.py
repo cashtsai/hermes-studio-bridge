@@ -35,6 +35,7 @@ _ENV_TMP_DEFAULTS = {
     "POCKET_CANON_DB":        os.path.join(_TMP, "canonical.db"),
     "POCKET_ACCOUNTS_DB":     os.path.join(_TMP, "accounts.db"),
     "POCKET_KANBAN_DB":       os.path.join(_TMP, "kanban.db"),
+    "POCKET_WEBHOOKS_DB":     os.path.join(_TMP, "webhooks.db"),
     "POCKET_MEDIA_DIR":       os.path.join(_TMP, "media-artifacts"),
     "POCKET_CX_PREVIEW_CACHE": os.path.join(_TMP, "cx-previews.json"),
     "POCKET_TUNNEL_URL_FILE": os.path.join(_TMP, "tunnel-url"),
