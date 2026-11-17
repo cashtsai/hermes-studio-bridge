@@ -27709,8 +27709,13 @@ def _orch_mcp_sse_or_json(request, payload: dict):
     body = "".join(
         f"event: message\ndata: {json.dumps(m, ensure_ascii=False)}\n\n"
         for m in (note, payload))
+    # SSE_HEADERS 是「每一條 SSE 回應都要帶」的反緩衝標頭(見其定義處記的
+    # 2026-10-26 事故:漏一條就是「HTTP 200 但 SSE 零 byte」)。這條 /mcp 的
+    # 一次性串流原本只手寫 Cache-Control,少了 X-Accel-Buffering —— 經中介
+    # 代理時 list_changed 通知可能被緩衝住。2026-11-17 由新上線的
+    # test_sse_anti_buffering + corpus sentinel 抓出。
     return Response(content=body, media_type="text/event-stream",
-                    headers={"Cache-Control": "no-store"})
+                    headers={**SSE_HEADERS, "Cache-Control": "no-store"})
 
 
 class _OrchInternalRequest:
