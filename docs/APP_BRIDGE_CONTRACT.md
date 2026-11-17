@@ -1299,7 +1299,7 @@ GET /app/v2/sessions/{session_id}/events?since_seq=N&profile=phone&after_durable
 - text/markdown 可帶
   `attachments[{kind,filename,mime,path?,url?,media_id?,download_url?,source_url?,byte_size?,available?}]`；
   attachment-only 訊息不得被 digest 丟棄。`attachment` kind 的 body 使用同組
-  欄位（單一附件）。
+  欄位（單一附件）。**附件從哪來、哪些 provider 會帶 → §6.1**。
 - `tool_call.patch`（選配，2026-07-04 diff 卡缺口）：`{path, text, adds, dels}`
   — **該步驟自身**的變更內容，由 digest 從工具輸入（Edit old/new、Write
   content…）合成，不依賴 worktree 事後狀態——步驟過後再 commit 也能回看單步
@@ -1319,6 +1319,60 @@ GET /app/v2/sessions/{session_id}/events?since_seq=N&profile=phone&after_durable
 - **fallback 原則**：不認得的 kind 一律渲染 `fallback_text`——舊 client 永不壞。
 - **digest 責任在 bridge**：CC jsonl、codex app-server 事件、persona stream →
   統一 parser（`carddigest.py`）產卡片。**一份 parser，伺服器端，所有終端共享**。
+
+### 6.1 附件來源:哪些 provider 會帶 attachments(2026-11-17)
+
+> 治「CC 給我影片/檔案在 Pocket 看不到,要開 Claude 才看得到」(機主
+> 2026-11-17 實錘)。根因:「本機檔案 → 可點附件」這條管線**只接在 codex 的
+> seed 一條**;CC 把檔案收進了媒體庫卻把擷取結果丟掉、cc2 連收都沒收 ——
+> 於是 agent 產出的路徑在卡片裡只是裸文字。現在所有 provider 共用同一支
+> 掃描器(掃**卡片**,不是掃各家 provider 的原始事件)。
+
+**client 唯一該信的欄位是 `download_url`**(`/app/v2/artifacts/{media_id}`,
+Bearer 認證)。`path` 是本機絕對路徑,只是出處標示,裝置上永遠拿不到;沒有
+`download_url` 的附件 = 沒封存成功,照 `fallback_text` 渲染。
+
+| provider | 使用者上傳的附件 | agent 產出物 → 可點附件 | live(回合中) | 冷載(進場) |
+|---|---|---|---|---|
+| `codex:` (cx) | ✅ | ✅ | ✅ `turn/completed` | ✅ |
+| `claude_code:` (cc, tmux) | ✅ | ✅ | ✅ 逐字稿 tail 落卡時 | ✅ |
+| `cc2:` (Claude Code SDK) | ✅ | ✅ | ✅ 回合收尾 | ✅ |
+| `gemini:` | ✅ | ✅ | ✅ 回合收尾 | ✅ |
+| `grok:` | ✅ | ✅ | ✅ 回合收尾 | ✅ |
+| `opencode:` | ✅ | ✅ | ✅ 回合收尾 | ✅ |
+| `openclaw:` | ✅(訊息體) | ⚠️ 只有冷載 | — | ✅ |
+| `hermes:` (人格) | ✅ | ⚠️ 只限 `/tmp` | ✅ follower | ✅ |
+
+- `openclaw` 是**遠端** agent:它產的檔案不在這台機器上,本機路徑偵測結構上
+  就查不到(`isfile` 永遠 false),所以只掛共用的冷載掃描、不另接 live。
+- `hermes` 人格沒有工作目錄的概念 → 允許根目錄只有 `/tmp`;要放寬走
+  `POCKET_MEDIA_ATTACH_ROOTS`(冒號分隔)。
+- base64 直回的圖(MCP 截圖之類,**沒有檔案路徑**)另有一條既有管線:
+  cc/cc2 的 `media_sink` → `capture_bytes` → `attachment` 卡,不經路徑偵測。
+- `GET /app/v2/sessions/{id}/media` 的索引範圍**比附件寬**:那是「這條
+  session 碰過哪些檔」,連 `.py` 都收。附件是其中「適合當媒體呈現」的子集。
+
+**哪些檔案會被掛**(白名單 `media_artifacts.ATTACHABLE_KINDS`):
+`image` / `video` / `audio` / `pdf` / `document` / `archive`。
+**刻意排除** `text`(`.md` `.json` `.log` `.txt` `.yaml` `.csv`…)與原始碼
+(`.py` `.swift`…)—— code agent 每一步都在講這些檔名,全掛上去的結果是每張
+卡底下一排垃圾附件(2026-10-29 發生過一次:一個 pptx 旁邊掛了 15 個碎片)。
+程式碼變更走 `tool_call.patch` / diff 卡,不走附件。
+
+**哪些路徑會被掛**(安全邊界,三道門全部要過):
+1. realpath 之後落在 **session 工作目錄(含子目錄)或 `/tmp`** 之內 ——
+   **解完符號連結才比對**,所以工作目錄裡指向外部的 symlink、`..` 穿越都
+   過不了。這比媒體庫自己的封存範圍(整個家目錄)**窄**:能封存 ≠ 能變成
+   下載連結。macOS 的 `/var/folders`(per-user TMPDIR,住著每個 app 的快取)
+   **不在**允許範圍內。
+2. 檔案真的存在、是一般檔案(不 stat 就不算偵測到)。
+3. 大小在媒體庫上限之內;超過的只進 `/media` 索引
+   (`available:false`、`unavailable_reason:"too_large"`),**不**掛成附件。
+
+**冪等與事件**:同一支檔案在同一張卡只掛一次;已經有 `attachments` 的卡不
+覆寫(live 事件帶的附件優先)。live 掛上附件會**重發 `card.upsert`**(同
+id、`rev` +1、`ts` 不變),client 照既有的「以最高 rev 原位替換」處理即可,
+不需要任何改動。冷載則直接寫進快照,不灌 ring。
 
 ## 7. 冷載 snapshot（本地快取契約）
 

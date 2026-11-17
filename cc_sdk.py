@@ -36,14 +36,18 @@ APPROVAL_DB_UPSERT = None  # callable(record) — pending 落 canonical approval
 APPROVAL_DB_MARK = None    # callable(aid, status) — 決議/逾時收尾 DB 列
 TURN_END_PUSH = None       # callable(session_name, summary) — 回合完成推播
 MEDIA_SINK = None          # callable(session_id) -> sink(mime, b64) -> dict|None
+MEDIA_ATTACH = None        # callable(store, session_id) — 掃卡掛附件(射後不理)
 
 
 def configure(log=None, approval_db_upsert=None, approval_db_mark=None,
-              turn_end_push=None, media_sink=None) -> None:
+              turn_end_push=None, media_sink=None, media_attach=None) -> None:
     """bridge 開機時接線。掛鉤保存在模組層,session 物件不各自持有。"""
     global LOG, APPROVAL_DB_UPSERT, APPROVAL_DB_MARK, TURN_END_PUSH, MEDIA_SINK
+    global MEDIA_ATTACH
     if media_sink is not None:
         MEDIA_SINK = media_sink
+    if media_attach is not None:
+        MEDIA_ATTACH = media_attach
     if log is not None:
         LOG = log
     if approval_db_upsert is not None:
@@ -827,6 +831,16 @@ class CC2Digest(carddigest.ApprovalCardMixin):
         self._draft_text = ""
         self._tool_cards.clear()   # 不跨回合累積(長 session 會無上限長大)
         self._status()
+        # 2026-11-17:回合收尾掃一次「這輪的卡裡有沒有本機產出物」→ 掛成可點
+        # 附件。cc2 原本**完全沒接**這條管線(只有 base64 圖那半條),所以
+        # agent 產的影片/PDF 在 Pocket 只是一行裸路徑。射後不理、整段 fail-safe。
+        if MEDIA_ATTACH is not None:
+            try:
+                MEDIA_ATTACH(self.store,
+                             getattr(self.store, "media_session_id", ""))
+            except Exception as e:  # noqa: BLE001 — 附件絕不准弄壞回合收尾
+                _log("cc2_media_attach_failed", session=self.name,
+                     error=type(e).__name__, error_message=str(e)[:120])
 
 
 # ── session 本體 ────────────────────────────────────────────────────────────

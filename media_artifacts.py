@@ -61,6 +61,141 @@ def default_safe_roots() -> tuple[str, ...]:
     return tuple(roots)
 
 
+def temp_roots() -> tuple[str, ...]:
+    """Agent 產出物的慣常落腳處 —— 只有**共用** scratch,`/tmp` 這一支。
+
+    刻意**不含** `/var/folders`(macOS 的 per-user TMPDIR),儘管
+    `default_safe_roots()` 有收它:那底下住的是整台機器每個 app 的快取與暫存
+    (Mail 的下載、瀏覽器的中繼檔…),把它整個列為「可以變成下載連結」太寬。
+    `/tmp` 不一樣 —— 它是 agent 自己放產出物的慣例位置。
+
+    代價講明:macOS 上 `mkstemp`/`mktemp` 落在 `/var/folders`,那些檔案不會
+    被掛成附件。要放寬請用 `POCKET_MEDIA_ATTACH_ROOTS`(冒號分隔)。
+    """
+    roots: list[str] = []
+    for raw in ("/tmp", "/private/tmp"):
+        root = os.path.realpath(raw)
+        if root not in roots:
+            roots.append(root)
+    return tuple(roots)
+
+
+# 可以掛成「可點附件」的媒體類別(= `media_kind()` 的輸出)。
+#
+# 刻意**排除** `text` 與 `file`:code agent 的逐字稿裡每一步都在講
+# `.py` / `.swift` / `.md` / `.json` / `.log` —— 全掛上去的結果是每張卡
+# 底下一排垃圾附件(2026-10-29 已經發生過一次:一個 pptx 旁邊掛了 15 個
+# 網址碎片)。使用者要的是「影片/圖/PDF/試算表/壓縮檔點得開」,不是
+# 「原始碼變成下載連結」。
+ATTACHABLE_KINDS = frozenset({
+    "image", "video", "audio", "pdf", "document", "archive",
+})
+
+
+def _too_broad_roots() -> frozenset:
+    """不准當附件根目錄的「太大」目錄 —— 收了它等於沒有邊界。
+
+    `~` 在列表裡的理由(2026-11-17 複查抓到):cc2 的 session 沒給 workdir
+    時 `CCSdkSession.__init__` 會把 cwd 設成 `os.path.expanduser("~")`,於是
+    「允許根目錄 = 工作目錄」一路推導成**整個家目錄可下載** —— agent 只要
+    在逐字稿裡提到 `~/Downloads/某份合約.pdf`,那份 PDF 就會被複製進
+    artifact 庫並長出一個 Bearer 可取的網址。工作目錄是「專案資料夾」的意思,
+    家目錄不是專案資料夾。
+    """
+    broad = {"/", ""}
+    for raw in ("~", "/Users", "/home", "/var", "/etc", "/opt", "/usr"):
+        broad.add(os.path.realpath(os.path.expanduser(raw)))
+    return frozenset(broad)
+
+
+def attach_roots(cwds=(), extra=()) -> tuple[str, ...]:
+    """卡片附件掃描的允許根目錄:session 工作目錄(含子目錄)+ 暫存區。
+
+    這比 `MediaArtifactStore.safe_roots`(整個家目錄)**窄**,是刻意的:
+    逐字稿文字裡的絕對路徑是啟發式偵測,不能讓它把家目錄任何檔案變成
+    可下載的 URL。真正的權限檢查仍在 `capture_path` → `_safe_local_path`,
+    這裡是第二道、更緊的門。太大的目錄(家目錄、`/Users`…)直接丟掉,
+    見 `_too_broad_roots`。
+    """
+    broad = _too_broad_roots()
+    roots: list[str] = []
+    for raw in list(cwds) + list(extra) + list(temp_roots()):
+        raw = str(raw or "").strip()
+        if not raw:
+            continue
+        root = os.path.realpath(os.path.expanduser(raw))
+        if root in broad or root in roots:
+            continue
+        roots.append(root)
+    return tuple(roots)
+
+
+def local_path_of(ref: str, *, require_absolute: bool = True) -> str:
+    """`file://` / `~` / 裸路徑 → 絕對實路徑(未做任何授權判斷)。
+
+    `require_absolute=False` 時相對路徑會照 process cwd 解析 —— 那是
+    `MediaArtifactStore._safe_local_path` 的既有語意,不能改(它的 source_ref
+    來自 provider 事件,歷史上就收相對路徑)。卡片附件偵測那條要
+    `True`:逐字稿裡的相對路徑無從判斷基準目錄,猜了就是亂掛。
+    """
+    raw = str(ref or "")
+    if raw.startswith("file://"):
+        raw = urllib.parse.unquote(urllib.parse.urlparse(raw).path)
+    if require_absolute and not raw.startswith(("/", "~")):
+        return ""
+    return os.path.realpath(os.path.expanduser(raw))
+
+
+def within_roots(path: str, roots: Iterable[str]) -> bool:
+    """`path`(**必須是 realpath 過的**)落在某個根目錄之內?
+
+    授權判斷只有這一份(`_safe_local_path` 與 `vet_attachable_path` 共用)——
+    兩份複製品是遲早會分岔的安全邏輯。比對用「等於根目錄,或以根目錄 +
+    分隔符開頭」,所以 `/tmp-evil` 不會被 `/tmp` 當成自己人。
+    """
+    if not path:
+        return False
+    return any(path == root or path.startswith(root + os.sep)
+               for root in roots)
+
+
+def vet_attachable_path(ref: str, roots: Iterable[str]):
+    """`ref` 可以變成卡片附件嗎?**三態**回傳:
+
+      · `str`(實路徑)= 可以掛
+      · `False` = **現在**不行,但可能等一下就行(路徑合法、副檔名合格、在
+        允許範圍內,**只是檔案還沒出現**)→ 呼叫端該保留重試機會
+      · `None` = 永久不合(不是本機絕對路徑 / 不在允許根目錄 / 副檔名不是
+        媒體類)→ 呼叫端可以記下來永遠不必再問
+
+    三態是必要的,不是潔癖:code agent 的卡片**先出現**(`ffmpeg -i a.mov
+    /work/out.mp4` 的工具卡)、檔案**後產生**。把這種 miss 當永久失敗記進
+    「看過了」集合,那支影片就再也不會被掛上 —— 正是這個功能要治的病。
+
+    四道門照「不用 syscall 的先擋」排序,所以永久性拒絕一次 stat 都不花:
+      1. 看得出是本機絕對路徑(`/…` / `~/…` / `file://…`)
+      2. realpath 之後落在 `roots` 之內 —— **解完符號連結才比對**,所以
+         工作目錄裡指向 `/etc/passwd` 的 symlink 過不了(路徑逃逸)
+      3. 副檔名/MIME 屬於 `ATTACHABLE_KINDS`(影音圖、PDF、文件、壓縮檔)
+      4. 真的存在、是一般檔案(不 stat 不算偵測到)—— 只有這一關會回 False
+    """
+    path = local_path_of(_clean_reference(str(ref or "")))
+    if not path:
+        return None
+    roots = tuple(roots or ())
+    if not roots or not within_roots(path, roots):
+        return None
+    guessed = mimetypes.guess_type(path)[0] or ""
+    if media_kind(path, guessed) not in ATTACHABLE_KINDS:
+        return None
+    try:
+        if not os.path.isfile(path):
+            return False        # 還沒產生 → 保留重試機會
+    except OSError:
+        return None
+    return path
+
+
 def media_kind(filename: str = "", mime: str = "") -> str:
     mime = (mime or "").lower()
     suffix = Path(filename or "").suffix.lower()
@@ -223,14 +358,10 @@ class MediaArtifactStore:
         return f"med_{digest[:32]}"
 
     def _safe_local_path(self, source_ref: str) -> str | None:
-        raw = source_ref
-        if raw.startswith("file://"):
-            raw = urllib.parse.unquote(urllib.parse.urlparse(raw).path)
-        raw = os.path.expanduser(raw)
-        path = os.path.realpath(raw)
-        if any(path == root or path.startswith(root + os.sep) for root in self.safe_roots):
-            return path
-        return None
+        # 相對路徑照舊用 process cwd 解析(require_absolute=False)—— 既有語意,
+        # source_ref 歷史上就收得到相對路徑。授權判斷走共用的 within_roots。
+        path = local_path_of(source_ref, require_absolute=False)
+        return path if within_roots(path, self.safe_roots) else None
 
     def _snapshot_file(self, path: str) -> tuple[int, str, str]:
         """Copy and hash one immutable snapshot, avoiding hash/copy races."""
