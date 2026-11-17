@@ -98,6 +98,19 @@ _ENV_TMP_DEFAULTS = {
     # managed-connect 失敗的路徑時,絕不能真的去 spawn
     # `codex app-server daemon start`(機器上有真 codex,會啟動真 daemon)。
     "CODEX_DAEMON_AUTOSTART_COOLDOWN_SECS": "0",
+    # text_gen.py / usage_limits.py(S3+S4,2026-11-17)—— 同 gemini/grok 的
+    # 教訓,一開始就進表:兩支都在 import 時把 env 讀成模組常數,不導的話
+    # 測試會改到開發機真正的 ~/.pocket/{textgen,failover}.json(= 覆蓋掉
+    # 使用者真的 API key 設定,而且落在 guard 層的 ~/.pocket 紅線內)。
+    "POCKET_TEXTGEN_CONFIG_FILE":  os.path.join(_TMP, "textgen.json"),
+    "POCKET_FAILOVER_CONFIG_FILE": os.path.join(_TMP, "failover.json"),
+    # 回合摘要快取(bridge 寫、roster 讀)
+    "POCKET_TURN_SUMMARY_CACHE":   os.path.join(_TMP, "turn-summaries.json"),
+    # 本機 Ollama lane:測試一律**關掉**。不關的話每個走到 text_gen 的測試
+    # 都會真的去打 127.0.0.1:11434 —— 開發機有跑 Ollama 就變成「測試偷偷用
+    # 了真模型」(慢、結果不可重現),沒跑就是每次白等一輪 connection
+    # refused。要測本機 lane 的檔自己打開它 + mock ollama_text。
+    "POCKET_TEXTGEN_LOCAL":        "0",
 }
 for _k, _v in _ENV_TMP_DEFAULTS.items():
     os.environ.setdefault(_k, _v)

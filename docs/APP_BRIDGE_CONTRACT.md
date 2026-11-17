@@ -2078,9 +2078,30 @@ RosterRow:
 | `idle` | 無上述,且 `updated_ts` 距今 < `POCKET_ROSTER_DORMANT_SECS`(預設 24h) | 一般樣式 |
 | `dormant` | 無上述且久無活動(或從無活動) | 淡化/摺疊 |
 
-`last_turn_summary`:目前規則式 —— 該 session 最後一筆持久里程碑
-(`card.milestone`/`message.upsert`)的文字壓空白截斷(≤12 字)。
-TODO:回合結束時 LLM 生成 5-12 字摘要落地,wire 欄位不變,app 零改動升級。
+`last_turn_summary`:素材 = 該 session 最後一筆持久里程碑
+(`card.milestone`/`message.upsert`)的文字。兩段式(S3,2026-11-17 起 ——
+原本這裡寫著「TODO:LLM 生成」,已做掉):
+
+1. **LLM 版已在快取** → 用它。快取在 `POCKET_TURN_SUMMARY_CACHE`
+   (預設 `~/.pocket/turn-summaries.json`),鍵 = session + **素材指紋**
+   (素材沒變就不重算,重算是純燒錢;素材變了舊摘要立刻失效,列表不會
+   顯示上一回合的事)。
+2. 沒有 → **立刻**回規則式(壓空白截斷 ≤12 字,= 舊行為、零延遲),
+   同時丟背景任務生成;下一輪輪詢(§17.2 的 `POCKET_ROSTER_POLL_SECS`,
+   預設 3s)自動換成 LLM 版。
+
+**wire 欄位一個 byte 不變,app 零改動升級。** 兩個刻意的設計:
+
+- 讀路徑**永不等 LLM** —— roster 是 3 秒心跳的 SSE 來源,在讀路徑 await
+  網路會讓整條訂閱抖。
+- 同一筆素材**只嘗試一次**(成功或失敗都不重試)—— 否則沒設定 textgen 的
+  機器會每 3 秒丟一個註定失敗的任務 + 寫一行用量 log,直接洗版。
+  改了 §18 的設定會清掉這個記錄(不然使用者設好 key 還要等素材變才看得到
+  效果,體感是「設了沒用」)。
+
+長度上限是**後置硬閘**:prompt 要求 ≤12 字只是請求,小模型不一定聽,
+所以超了就截斷加 `…` —— 與規則式同一個形狀。生成走 §18 的管線;§18 沒設定
+= 永遠停在規則式(**功能不會消失**)。
 
 ### 17.2 差分訂閱
 
@@ -2098,6 +2119,97 @@ data: {"ts": …, "type": "sessions.changed",
   安靜期間每 `SSE_KEEPALIVE_SECS` 一行 `: keepalive` 註解。
 - 長時間零變化(30 分鐘)bridge 主動斷線(半死 client 不佔 task,同既有
   follow 流);client 重連即重拿全量。
+
+## 18. 小任務文字生成(`/app/v1/textgen/config`,S3,2026-11-17)
+
+> 動機:標題、回合摘要、commit 訊息、逐字稿清理這些雜務,**不該燒 coding
+> agent 的訂閱額度**(CC/CX 的額度撞到就整條線停擺,而摘要一點都不值得
+> 佔用它),也不該硬綁本機 Ollama(大多數機器沒有 → 功能靜默缺席)。
+> 這一節給它一條**便宜 model API** 的路。
+
+### 18.1 lane 順序
+
+    便宜 API(設定了才有) → 本機 Ollama → 放棄
+
+第一條能用的就用;**它壞掉才往下掉**(上游 500 時「安靜地沒摘要」比
+「多花 200ms 用本機生一個」糟得多)。全掉光 → 呼叫端退回原本行為
+(規則式截斷 / 原始逐字稿 / 抽取式摘要)。
+
+**靜默失敗紅線:功能不准因為沒設定 textgen 而消失。** 所以
+`configured=false` 時 app **不要**顯示「未啟用」——顯示的是「目前走本機/
+規則式」。回應裡的 `fallback_note` 就是給 UI 直接用的那句話。
+
+### 18.2 設定
+
+```
+GET /app/v1/textgen/config
+→ {"configured": false,
+   "base_url": "", "base_url_source": "none",
+   "model": "",    "model_source": "none",
+   "key_set": false, "key_source": "none",
+   "local_enabled": true,
+   "suggested_models": [{"model": …, "label": …, "hint": …}, …],
+   "fallback_note": "未設定時各呼叫點退回原本行為(規則式/agent),功能不會消失。"}
+
+PUT /app/v1/textgen/config   {"base_url"?, "api_key"?, "model"?}
+→ {"ok": true, …同上…}
+```
+
+- **端點是 OpenAI 相容的 `POST {base_url}/chat/completions`** —— OpenAI /
+  Anthropic 的 OpenAI 相容層 / OpenRouter / Ollama / LM Studio 都講同一套,
+  所以一個客戶端全涵蓋,不必為每家寫 adapter。
+- `configured` = **`base_url` 與 `model` 兩個都有**。`api_key` 刻意不列入:
+  Ollama / LM Studio 不需要 key,設成必填就是把一個本來能用的路徑關掉
+  (同 opencode「沒有登入牆」那條)。key 為空時**不送** `Authorization` 標頭。
+- **`api_key` 永遠不回傳**,只回 `key_set`(同 openclaw 的 `token_set`)。
+- env 優先(`POCKET_TEXTGEN_BASE_URL` / `_KEY` / `_MODEL`),三個欄位的
+  `*_source ∈ {env,file,none}` **各自獨立判定** —— 只設 env model 不會讓
+  檔裡的 key 消失。`source == "env"` 時 app 應把該欄畫成唯讀
+  (否則就是「我改了但沒反應」)。
+- PUT 是**合併寫入**(只帶 `model` 不會洗掉 `api_key`);傳**空字串**=
+  明確清掉該欄(使用者要有辦法關掉);三個都不帶 → `400 EMPTY`。
+- `model` **沒有預設值**:猜一個端點不認得的 id 只會換來 404(靜默失敗的
+  親戚)。`suggested_models` 是給設定面板 picker 的**建議清單**,選型依據
+  見 `pid-subsync/docs/LLM_PRICING_REFERENCE_20261117.md` 的便宜檔
+  (Haiku / gpt-6-luna 級);價格會變,那份文件才是真相來源。
+- `POCKET_TEXTGEN_LOCAL=0` 關掉本機 lane(例如不想讓雜務去搶顯卡)。
+  本機 lane 連不上會**冷卻** `POCKET_TEXTGEN_LOCAL_COOLDOWN`(預設 600s)
+  —— 沒裝 Ollama 的機器不會每回合都撞一次 connection refused;但**絕不
+  永久放棄**,使用者中途把 Ollama 開起來會自己恢復。
+
+### 18.3 任務分類與呼叫點
+
+`task` 是對帳用的穩定分類鍵。目前已接的呼叫點:
+
+| task | 呼叫點 | 沒設定時的退路 |
+| --- | --- | --- |
+| `roster.summary` | §17 的 `last_turn_summary` | 規則式截斷(≤12 字) |
+| `transcript.cleanup` | 會議錄音清稿 | 本機 Ollama → 原始逐字稿 |
+| `agent_context.summary` | `/app/v2/agent_context` 的交接簡報 | 本機 Ollama → 抽取式摘要 |
+
+`session.title` / `commit.message` 的 prompt 包裝已在 `text_gen.py` 備好,
+但**刻意還沒接呼叫點**:現有的標題來源(`_cc_session_head` 的 jsonl 掃描、
+gemini 的「第一句話截 48 字」)都是**同步且有快取**的,改成非同步 LLM 會
+動到列表頁的渲染路徑,風險與這一刀不同量級 —— 留下一刀,連同它自己的
+列表回歸測試一起做。宣告了卻不能落地就是死鈕,所以這裡誠實標註未接。
+
+**review / coding 類絕不走這條** —— 那本來就該走 coding agent。
+
+### 18.4 成本留痕
+
+每次呼叫(**含失敗**)記一筆:
+
+- 結構化 log `[bridge-event] {"event":"textgen_usage", …}`:`task`、`ok`、
+  `reason`、`model`、`elapsed_ms`、`lanes`(實際試過哪幾條)、`usage_*`。
+- `session` 有值時**另外**落一筆 `event_log` 事件 `textgen.usage`
+  (B1 分類 = **persist-only**:進 event_log 蓋 seq 供審計,但**不推任何
+  活流** —— 使用者不需要看到「剛剛花了 37 個 token」,對帳的人需要)。
+  `session` 為空的全域雜務只留 log:為沒有歸屬的呼叫在 event_log 開一個
+  假 session 鍵,之後查帳的人會被那個不存在的 session 騙一次。
+
+端點不回 `usage` 時(很多本機 server 不回)記 `usage_reported=false`,
+**不寫 0** —— 寫 0 等於謊報「這次花了 0」。拿到空字串但連線成功的情況
+**照樣記用量**(錢真的花了)。
 
 ## 附註 A:pocket-id 心跳 `notices` 下行(backup orphan 提醒,2026-11-06)
 

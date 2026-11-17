@@ -71,6 +71,7 @@ import orchestrator
 import live_update_event
 import replay_fixture
 import t3code_runtime
+import text_gen            # S3:小任務文字生成(便宜 API → 本機 → 放棄)
 import cc_detect            # CC TUI 狀態偵測(manifest 引擎;herdr 設計移植)
 import cc_sdk               # CC provider v2(Agent SDK;模組內 lazy-import SDK)
 import tg_outbound
@@ -1719,6 +1720,11 @@ _MEETING_POLISH_PROMPT = (
     "袁方、潘天晴、水鏡先生、XCash、善彰\n"
     "只輸出修飾後的逐字稿,不要任何說明。\n\n逐字稿:\n"
 )
+#: 同一份指示,但去掉尾端那個「逐字稿:」標籤 —— 本機 Ollama 那條是把原稿
+#: **接在 prompt 後面**(所以需要標籤),走 chat API 時原稿是獨立的 user
+#: 訊息,標籤留著會變成一句沒有下文的殘句。切在 `\n\n` 上,不用 rstrip
+#: 字元集(那會把句尾的標點一起吃掉,而且下次有人改文案就靜默壞掉)。
+_MEETING_POLISH_SYSTEM = _MEETING_POLISH_PROMPT.rsplit("\n\n", 1)[0]
 
 
 async def _polish_transcript(text: str) -> str:
@@ -1732,6 +1738,25 @@ async def _polish_transcript(text: str) -> str:
     """
     if not text.strip():
         return text
+
+    # S3(2026-11-17):先給**便宜 model API** 一次機會 —— 清稿是典型的雜務,
+    # 不值得佔著本機顯卡(錄音常和回合同時發生,兩邊搶 GPU 時使用者等的是
+    # 回合)。沿用下面那份調過的 prompt(專有名詞清單是實測累積的資產,
+    # 不要為了搬家重寫一份),`allow_local=False` 讓本機 lane 留給下面那條
+    # 既有路徑處理 —— 它的 num_ctx/逾時/fail-soft 都是調過的,不要繞過。
+    if text_gen.configured():
+        res = await text_gen.clean_transcript(
+            text, system=_MEETING_POLISH_SYSTEM, allow_local=False)
+        if res.ok and res.text:
+            _log_event("meeting_polish_textgen", chars=len(text),
+                       out_chars=len(res.text), model=res.model,
+                       elapsed_ms=res.elapsed_ms)
+            return res.text
+        # 失敗就往下走本機那條 —— **不是**直接回原稿。少一段清稿是最後手段,
+        # 不是「雲端掛了就放棄」的第一反應。
+        _log_event("meeting_polish_textgen_miss", reason=res.reason,
+                   chars=len(text))
+
     # 中文 1 字約 1.2~1.5 token;輸入+輸出約 3x。夾在 8192~40960。
     num_ctx = min(40960, max(8192, len(text) * 3 + 2048))
 
@@ -3070,6 +3095,11 @@ EVENT_PERSIST_ONLY = {
     "thread.rebound": "app thread 重綁軌跡 — 審計/除錯,不推活流",
     "thread.transferred": "app thread 跨 provider 轉移軌跡 — 同上",
     "thread.delegated": "thread 轉為 delegation 的軌跡 — 同上",
+    # S3:雜務走便宜 model API 的 token 用量留痕(成本對帳)。
+    # 歸 persist-only 是刻意的:這是**審計軌跡**,沒有任何活流該被它叫醒。
+    # 蓋全域 seq 沒問題(它進 event_log),但不推 SSE —— 使用者不需要看到
+    # 「剛剛花了 37 個 token 生摘要」,對帳的人需要。
+    "textgen.usage": "小任務文字生成的 token 用量 — 成本對帳,不推活流",
 }
 _EVENT_LOG_TYPES = set(EVENT_PERSISTED) | set(EVENT_PERSIST_ONLY)
 _EVENT_TYPE_WARNED: set = set()   # 每型別只警一次,不洗版
@@ -22154,6 +22184,182 @@ async def v2_sessions(request: Request, provider: str = "", status: str = "",
     return {"sessions": out, **result}
 
 
+# ── S3(2026-11-17):小任務文字生成的 bridge 側接線 ─────────────────────
+#
+# text_gen.py 是純模組(不 import bridge);這一段是它與 bridge 的兩個接點:
+#   1. **用量 sink** —— 把每次呼叫的 token 用量也落進 event_log
+#      (`textgen.usage`,persist-only:審計用,不推活流)。
+#   2. **回合摘要存放處** —— 契約 §17 的 TODO 寫得很明確:「回合結束時 LLM
+#      生成 5-12 字摘要,**存起來這裡只讀**」。照做:roster 的讀路徑永遠
+#      只讀快取,生成是背景的事。
+#
+# 為什麼不是「在回合結束時同步生成」:
+#   · `_turn_end_push` 看起來像回合結束鉤子,但它**有節流、而且只在沒人
+#     在看的時候才跑**(subscribers==0)—— 拿它當生成鉤子會漏掉一大半回合。
+#   · roster 本身每 3s 被 SSE 輪詢一次。在**讀路徑**上同步呼叫 LLM 等於
+#     把一條 3 秒心跳變成「每 3 秒等一次網路」,SSE 會開始抖。
+# 所以採惰性生成:讀路徑拿不到快取就**立刻回規則式**(現狀行為,零延遲),
+# 同時丟一個背景任務去生成;下一次輪詢(3s 後)就換成 LLM 版。app 零改動。
+
+_TURN_SUMMARY_FILE = os.path.expanduser(os.environ.get(
+    "POCKET_TURN_SUMMARY_CACHE", "~/.pocket/turn-summaries.json"))
+#: session → {"hash": <素材指紋>, "text": <摘要>, "ts": epoch}
+_TURN_SUMMARY: dict = {}
+_TURN_SUMMARY_LOADED = False
+_TURN_SUMMARY_CAP = 500          # 粗略上限,超過丟最舊的(這是快取不是真相)
+#: 已經試過的 (session, hash) —— **成功或失敗都記**。沒有這個集合,沒設定
+#: textgen 的機器會每 3 秒丟一個註定失敗的任務 + 寫一行用量 log,直接洗版。
+_TURN_SUMMARY_TRIED: set = set()
+
+
+def _turn_summary_load() -> None:
+    global _TURN_SUMMARY_LOADED
+    if _TURN_SUMMARY_LOADED:
+        return
+    _TURN_SUMMARY_LOADED = True
+    try:
+        with open(_TURN_SUMMARY_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            _TURN_SUMMARY.update(
+                {k: v for k, v in data.items() if isinstance(v, dict)})
+    except FileNotFoundError:
+        pass
+    except Exception as _exc:  # noqa: BLE001 — 壞快取檔不該讓 roster 掛掉
+        _log_exc("turn_summary_load", _exc, expected=True)
+
+
+def _turn_summary_save() -> None:
+    try:
+        if len(_TURN_SUMMARY) > _TURN_SUMMARY_CAP:
+            for k in sorted(_TURN_SUMMARY,
+                            key=lambda k: _TURN_SUMMARY[k].get("ts") or 0.0
+                            )[:len(_TURN_SUMMARY) - _TURN_SUMMARY_CAP]:
+                _TURN_SUMMARY.pop(k, None)
+        os.makedirs(os.path.dirname(_TURN_SUMMARY_FILE), exist_ok=True)
+        tmp = _TURN_SUMMARY_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(_TURN_SUMMARY, f, ensure_ascii=False)
+        os.replace(tmp, _TURN_SUMMARY_FILE)
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("turn_summary_save", _exc, expected=True)
+
+
+def _turn_summary_key(raw: str) -> str:
+    """素材指紋。摘要只在**素材變了**才該重生 —— 同一筆里程碑重算是純燒錢。"""
+    return hashlib.sha1((raw or "").encode("utf-8")).hexdigest()[:16]
+
+
+def _turn_summary_cached(session: str, raw: str) -> str:
+    """快取命中的 LLM 摘要;沒有就回空字串(呼叫端用規則式)。"""
+    _turn_summary_load()
+    rec = _TURN_SUMMARY.get(session) or {}
+    if rec.get("hash") == _turn_summary_key(raw):
+        return str(rec.get("text") or "")
+    return ""
+
+
+async def _turn_summary_generate(session: str, raw: str, digest: str) -> None:
+    """背景生成一筆摘要並落檔。**吞所有例外** —— 這是錦上添花的路徑,
+    壞掉只該讓摘要留在規則式,不准影響 roster。"""
+    try:
+        res = await text_gen.summarize_turn(
+            raw, session=session, max_chars=_ROSTER_SUMMARY_CHARS)
+        if not res.ok or not res.text:
+            return
+        _TURN_SUMMARY[session] = {"hash": digest, "text": res.text,
+                                  "ts": time.time()}
+        _turn_summary_save()
+        _log_event("turn_summary_generated", session=session,
+                   chars=len(res.text), model=res.model,
+                   elapsed_ms=res.elapsed_ms)
+    except Exception as _exc:  # noqa: BLE001
+        _log_exc("turn_summary_generate", _exc, expected=True)
+
+
+def _turn_summary_schedule(session: str, raw: str) -> None:
+    """惰性排程:同一筆素材只試一次(成功或失敗都不再試)。
+
+    不在讀路徑上 await —— roster 是 3 秒心跳,等 LLM 會讓 SSE 抖。
+    """
+    digest = _turn_summary_key(raw)
+    mark = (session, digest)
+    if mark in _TURN_SUMMARY_TRIED:
+        return
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return      # 不在事件迴圈裡(測試直呼)—— 安靜跳過,規則式照走
+    _TURN_SUMMARY_TRIED.add(mark)
+    if len(_TURN_SUMMARY_TRIED) > _TURN_SUMMARY_CAP * 4:
+        _TURN_SUMMARY_TRIED.clear()     # 粗略上限,清空後重試一輪無妨
+    t = loop.create_task(_turn_summary_generate(session, raw, digest))
+    _BG_TASKS.add(t)
+    t.add_done_callback(_BG_TASKS.discard)
+
+
+def _textgen_usage_sink(record: dict) -> None:
+    """text_gen 的用量 sink:照舊印結構化 log,**另外**落一筆 event_log。
+
+    session 有值才落庫(event_log 的 session 是必填鍵);全域雜務只留 log ——
+    為一筆沒有歸屬的摘要在 event_log 開一個假 session 鍵,之後查帳的人會
+    被那個不存在的 session 騙一次。
+    """
+    _log_event("textgen_usage", **{k: v for k, v in record.items()})
+    session = str(record.get("session") or "")
+    if not session:
+        return
+    try:
+        _event_append(session, "textgen.usage", dict(record))
+    except Exception as _exc:  # noqa: BLE001 — 對帳壞掉不准拖垮生成
+        _log_exc("textgen_usage_event", _exc, expected=True)
+
+
+text_gen.set_usage_sink(_textgen_usage_sink)
+
+
+@app.get("/app/v1/textgen/config")
+async def textgen_config_get(request: Request):
+    """小任務文字生成的設定讀取端。**不回 key 本體**,只回 key_set。
+
+    `configured=False` 不代表功能壞掉 —— 代表雜務會走本機 Ollama 或退回
+    規則式(見 `fallback_note`)。app 要照這個語意畫 UI,不要寫「未啟用」。
+    """
+    _check_auth(request)
+    return {**text_gen.config_public(),
+            "local_enabled": text_gen.local_enabled()}
+
+
+@app.put("/app/v1/textgen/config")
+async def textgen_config_put(request: Request):
+    """寫入 base_url / api_key / model(0600 落檔;env 仍優先;合併寫入)。
+
+    傳空字串 = 明確清掉該欄(使用者要有辦法關掉);三個都不帶 → 400。
+    """
+    _check_auth(request)
+    body = await _json_body(request)
+    fields = {k: body[k] for k in ("base_url", "api_key", "model")
+              if k in body}
+    if not fields:
+        raise http_err(400, "EMPTY",
+                       "base_url / api_key / model 至少要帶一個")
+    cfg = text_gen.save_config(
+        base_url=str(fields["base_url"]) if "base_url" in fields else None,
+        api_key=str(fields["api_key"]) if "api_key" in fields else None,
+        model=str(fields["model"]) if "model" in fields else None)
+    # 設定一改,本機 lane 的冷卻與「這筆素材試過了」的記錄都該失效 ——
+    # 不然使用者設好 key 之後還要等 10 分鐘/等素材變才看得到效果,
+    # 體感就是「設了沒用」。
+    text_gen.reset_local_cooldown()
+    _TURN_SUMMARY_TRIED.clear()
+    _log_event("textgen_config_updated", configured=text_gen.configured(),
+               base_url_source=cfg["base_url_source"],
+               model=cfg["model"] or "(unset)",
+               changed=",".join(sorted(fields)))
+    return {"ok": True, **text_gen.config_public(),
+            "local_enabled": text_gen.local_enabled()}
+
+
 # ── C1(2026-11-16,grok steal #3):roster 契約 ───────────────────────────
 # 列表頁要的是「一眼看懂每條 session 在幹嘛」,不是整包 provider meta ——
 # /app/v2/sessions 原樣保留(相容),roster 是**疊加的瘦 facade**:
@@ -22216,9 +22422,16 @@ def _roster_enrich(ids: list) -> dict:
     """一口氣撈每條 session 的 (updated_ts, last_turn_summary)。
 
     單一 ro 連線 + 走 idx_event_session_seq,整包 roster 一次 build 只開一條
-    連線。摘要規則式:最後一筆 card.milestone / message.upsert 的文字截斷
-    (TODO:回合結束時 LLM 生成 5-12 字摘要,存起來這裡只讀 —— grok 的
-    summary.json 模式;規則式先把 wire 欄位占住,app 零改動升級)。
+    連線。摘要兩段式(S3,2026-11-17 把上面那行 TODO 做掉了):
+
+      1. 先拿最後一筆 card.milestone / message.upsert 的**原文**當素材。
+      2. 素材的 LLM 摘要**已經在快取裡** → 用它(這就是 TODO 說的
+         「存起來這裡只讀」,grok 的 summary.json 模式)。
+         不在 → **立刻**回規則式截斷(零延遲、等於舊行為),同時丟背景任務
+         去生成,下一輪輪詢(3s)自動升級。
+
+    讀路徑永遠不等 LLM —— roster 是 3 秒心跳的 SSE 來源,在這裡 await 網路
+    會讓整條訂閱抖(而且 textgen 沒設定時每一輪都白等)。
     """
     import sqlite3
     out = {i: (0.0, "") for i in ids}
@@ -22251,9 +22464,14 @@ def _roster_enrich(ids: list) -> dict:
                         text = body.get("text") or body.get("fallback_text") or ""
                     else:
                         text = (data.get("message") or {}).get("content") or ""
+                    raw_material = re.sub(r"\s+", " ", str(text or "")).strip()
                     text = _roster_summary_text(text)
                     if text:
-                        summary = text
+                        # LLM 版在快取裡就用它,否則規則式先頂著 + 背景生成。
+                        better = _turn_summary_cached(rid, raw_material)
+                        summary = better or text
+                        if not better:
+                            _turn_summary_schedule(rid, raw_material)
                         break
                 out[rid] = (ts, summary)
         finally:
@@ -26557,6 +26775,7 @@ async def v2_app_thread_transfer(thread_id: str, request: Request):
     return {"ok": True, "thread_id": thread_id,
             "new_session_id": new_session_id, "binding": new_binding,
             "previous": result.get("previous"), "transfer": transfer_meta}
+
 
 
 @app.post("/app/v3/threads/{thread_id}/context-transfers")
@@ -40236,9 +40455,26 @@ def _agent_context_model_timeout() -> float:
 
 
 async def _agent_context_summarize(material: str) -> str:
-    """一發式本機蒸餾。**失敗一律回空字串**,由呼叫端 fail-soft 退成抽取式
+    """一發式蒸餾。**失敗一律回空字串**,由呼叫端 fail-soft 退成抽取式
     摘要 —— 模型掛了不該讓「讀不到隊友在幹嘛」變成硬錯誤。"""
     prompt = agent_context_policy.SUMMARY_PROMPT + material
+
+    # S3(2026-11-17):設了便宜 API 就先走它。這份摘要是「隊友在幹嘛」的
+    # 交接簡報 —— 典型雜務,而且它跑在**別人要讀上下文的時候**,搶本機
+    # 顯卡會直接拖慢對方的回合。失敗照樣往下掉本機那條(下面的 fail-soft
+    # 語意與抽取式退路一個 byte 都不動)。
+    if text_gen.configured():
+        res = await text_gen.generate(
+            "agent_context.summary", material,
+            system=agent_context_policy.SUMMARY_PROMPT,
+            max_tokens=600, timeout=_agent_context_model_timeout(),
+            allow_local=False,
+            max_input_chars=text_gen.TRANSCRIPT_MAX_INPUT_CHARS)
+        if res.ok and res.text:
+            return res.text
+        _log_event("agent_context_summary_textgen_miss", reason=res.reason,
+                   chars=len(material))
+
     num_ctx = min(40960, max(8192, len(prompt) * 2 + 2048))
 
     async def _run() -> str:
