@@ -143,12 +143,12 @@ class MediaAttachEndToEndTests(unittest.IsolatedAsyncioTestCase):
         「可以掛成下載連結」的範圍。兩者刻意不同。
         """
         per_user_tmp = os.path.realpath("/var/folders")
-        roots = bridge.media_artifacts.attach_roots(["/Users/x/apps/repo"])
+        roots = bridge.media_artifacts.attach_roots(["/Users/you/apps/repo"])
         self.assertNotIn(per_user_tmp, roots)
         self.assertIn(per_user_tmp, bridge.media_artifacts.default_safe_roots())
         # /tmp 是 agent 放產出物的慣例位置,刻意保留。
         self.assertIn(os.path.realpath("/tmp"), roots)
-        self.assertIn(os.path.realpath("/Users/x/apps/repo"), roots)
+        self.assertIn(os.path.realpath("/Users/you/apps/repo"), roots)
 
     async def test_source_code_not_attached(self):
         src = self.cwd / "pipeline.py"
@@ -326,16 +326,16 @@ class MediaSessionCwdTests(unittest.TestCase):
 
     def test_claude_code_prefix_reads_sessions_conf(self):
         with patch.object(bridge, "_cc_conf_rows",
-                          lambda: [("flip", "/Users/x/apps/fliper")]):
+                          lambda: [("flip", "/Users/you/apps/fliper")]):
             self.assertEqual(bridge._media_session_cwd("claude_code:flip"),
-                             "/Users/x/apps/fliper")
+                             "/Users/you/apps/fliper")
             self.assertEqual(bridge._media_session_cwd("flip"),
-                             "/Users/x/apps/fliper")
+                             "/Users/you/apps/fliper")
             self.assertEqual(bridge._media_session_cwd("claude_code:nope"), "")
 
     def test_cc2_reads_registry_workdir(self):
         class _S:
-            workdir = "/Users/x/apps/pocket-cis"
+            workdir = "/Users/you/apps/pocket-cis"
 
         class _R:
             def get(self, name):
@@ -343,7 +343,7 @@ class MediaSessionCwdTests(unittest.TestCase):
 
         with patch.object(bridge.cc_sdk, "registry", lambda: _R()):
             self.assertEqual(bridge._media_session_cwd("cc2:live"),
-                             "/Users/x/apps/pocket-cis")
+                             "/Users/you/apps/pocket-cis")
             self.assertEqual(bridge._media_session_cwd("cc2:ghost"), "")
 
     def test_acp_providers_read_session_row(self):
