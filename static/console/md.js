@@ -40,13 +40,24 @@
       esc(clipLabel(label)) + "</a>";
   }
 
-  // 裸網址自動連結。結尾的標點(中英文)不吃進網址;右括號只有在網址內
-  // 左括號較多時才保留(維基式 …_(x) 連結)。
+  // 裸網址自動連結。中文不在詞間放空白,所以「空白為界」這條規則在中文句子
+  // 裡失效:`https://x.com/a。下一句` 整句都會被吃進 href(連結點開是 404、
+  // 後半句也從句子裡消失)。
+  //
+  // 作法照 dsh 的 autolink patch:**非 ASCII 標點是網址的終止符**,出現在
+  // 哪裡就在那裡斷;但漢字本身不是標點,所以 `/wiki/中文` 這種路徑完整保留。
+  // ASCII 尾端標點仍沿用原本的逐字剝除(右括號只有在網址內左括號較多時才
+  // 保留,維基式 …_(x) 連結)。
   const URL_RE = /https?:\/\/[^\s<>"']+/gi;
+  // 位置上的下一個字元**不是 ASCII** 且屬於 Unicode 標點 → 句讀,不是網址。
+  // `u` flag 下 \p{P} 連 astral 標點(surrogate pair)都涵蓋。
+  const NON_ASCII_PUNCT = /(?![\x00-\x7F])\p{P}/u;
   function trimUrl(m) {
-    let url = m;
+    let url = String(m);
+    const cut = url.search(NON_ASCII_PUNCT);
+    if (cut > 0) url = url.slice(0, cut);
     for (;;) {
-      const tail = /[),.;:!?\]'"」』】》〉、，。；：！？…]$/.exec(url);
+      const tail = /[),.;:!?\]'"]$/.exec(url);
       if (!tail) break;
       if (tail[0] === ")" &&
           (url.match(/\(/g) || []).length >= (url.match(/\)/g) || []).length) break;

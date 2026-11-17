@@ -48,7 +48,12 @@
 
   function wire() {
     $("mem-go").addEventListener("click", run);
-    $("mem-q").addEventListener("keydown", (e) => { if (e.key === "Enter") run(); });
+    // 選字的確認 Enter 不送查詢(見 app.js 的 IME 三重判準)—— 中文搜尋
+    // 每打一個詞都要按 Enter 選字,沒守衛會送出一串注音/拼音半成品。
+    $("mem-q").addEventListener("keydown", (e) => {
+      if (window.PocketIME && window.PocketIME.imeKey(e)) return;
+      if (e.key === "Enter") run();
+    });
     if (window.PocketConsoleMode) {
       const prev = window.PocketConsoleMode.onMode;
       window.PocketConsoleMode.onMode = (m) => {

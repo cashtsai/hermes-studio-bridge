@@ -123,6 +123,72 @@ FEATURE_CASES = [
      "contains": ["**raw**"], "not": ["<strong>"]},
 ]
 
+# ── CJK 樣本(主場是台灣,這些是每天都會打出來的句子)──────────────────────
+#
+# 兩類題目:
+#
+# (1) **CJK 粗體**。CommonMark 的 flanking-run 規則會讓 `**注意：**內容` 不變
+#     粗體(右側 marker 前面是全角標點、後面是漢字 → 判不出 closing run),
+#     dsh 得自己寫 micromark 擴充 cjkFriendlyStrong 來補。我們的 md.js 是
+#     自寫的逐段 regex,**不走 flanking run**,所以本來就對 —— 下面這組樣本
+#     是把這件事釘住,避免哪天有人「順手改成標準實作」把它弄壞。
+#
+# (2) **裸網址的中文邊界**。中文不在詞間放空白,所以「空白為界」在中文句子
+#     裡失效:`https://x.com/a。下一句` 整句會被吃進 href。修法是把非 ASCII
+#     標點當終止符,同時 `/wiki/中文` 的漢字路徑必須完整保留。
+CJK_CASES = [
+    # (1) 粗體:marker 兩側是「全角標點 + 漢字」的四種組合
+    {"name": "cjk strong before fullwidth colon", "src": "**注意：**內容要看清楚",
+     "contains": ["<strong>注意：</strong>內容"]},
+    {"name": "cjk strong after fullwidth punct", "src": "前文。**重點**後文",
+     "contains": ["<strong>重點</strong>"]},
+    {"name": "cjk strong glued both sides", "src": "這是**重點**啊",
+     "contains": ["這是<strong>重點</strong>啊"]},
+    {"name": "cjk strong then ideographic comma", "src": "文字**強調**、下一項",
+     "contains": ["<strong>強調</strong>、"]},
+    {"name": "cjk strong inside fullwidth parens", "src": "這是（**重點**）喔",
+     "contains": ["（<strong>重點</strong>）"]},
+    {"name": "cjk strong with trailing fullwidth period", "src": "**結論。**就這樣",
+     "contains": ["<strong>結論。</strong>就這樣"]},
+    {"name": "japanese strong", "src": "**注意：**ここが大事",
+     "contains": ["<strong>注意：</strong>ここが"]},
+    {"name": "cjk em glued", "src": "請看*這裡*喔", "contains": ["<em>這裡</em>"]},
+    # (2) autolink 邊界
+    {"name": "cjk period does not eat the rest of the sentence",
+     "src": "看 https://example.com/x。下一句也在這裡",
+     "contains": ['href="https://example.com/x"', "。下一句也在這裡</p>"],
+     "not": ['href="https://example.com/x。']},
+    {"name": "cjk comma terminates url",
+     "src": "看 https://example.com/x，然後呢",
+     "contains": ['href="https://example.com/x"', "，然後呢"]},
+    {"name": "ideographic comma terminates url",
+     "src": "見 https://example.com/x、再看別的",
+     "contains": ['href="https://example.com/x"', "、再看別的"]},
+    {"name": "fullwidth parens terminate url",
+     "src": "全形括號 https://example.com/a（註)",
+     "contains": ['href="https://example.com/a"', "（註"]},
+    {"name": "cjk quote marks terminate url",
+     "src": "https://example.com/x「引用」",
+     "contains": ['href="https://example.com/x"', "「引用」"]},
+    {"name": "han characters in path are kept",
+     "src": "參考 https://zh.wikipedia.org/wiki/中文 這篇",
+     "contains": ['href="https://zh.wikipedia.org/wiki/中文"']},
+    {"name": "han in path with ascii parens kept",
+     "src": "見 https://zh.wikipedia.org/wiki/臺灣_(消歧義) 吧",
+     "contains": ['href="https://zh.wikipedia.org/wiki/臺灣_(消歧義)"']},
+    {"name": "ascii trailing punct still trimmed",
+     "src": "see https://example.com/a?b=1.",
+     "contains": ['href="https://example.com/a?b=1"']},
+    {"name": "ascii wiki parens still balanced",
+     "src": "wiki https://en.wikipedia.org/wiki/Foo_(bar) ok",
+     "contains": ['href="https://en.wikipedia.org/wiki/Foo_(bar)"']},
+    # renderText(使用者訊息/等寬卡片)走同一個 trimUrl,邊界必須一致
+    {"name": "renderText cjk url boundary", "api": "text",
+     "src": "看 https://example.com/x。下一句",
+     "contains": ['href="https://example.com/x"', "。下一句"],
+     "not": ['href="https://example.com/x。']},
+]
+
 
 def _redlines(case):
     """全域紅線:套用到每一條樣本,不留白名單例外。"""
@@ -157,6 +223,9 @@ class ConsoleMdNodeTest(unittest.TestCase):
 
     def test_feature_corpus(self):
         self._run(FEATURE_CASES)
+
+    def test_cjk_corpus(self):
+        self._run(CJK_CASES)
 
 
 class ConsoleMdStaticTest(unittest.TestCase):

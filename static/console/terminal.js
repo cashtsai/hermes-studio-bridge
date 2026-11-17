@@ -92,6 +92,10 @@ function wireTerminal() {
   });
   const input = document.getElementById("tm-in");
   input.addEventListener("keydown", (e) => {
+    // 中文/日文選字的確認鍵不是「送指令」,也不是 Tab 補全(見 app.js 的
+    // IME 三重判準)。少了這道守衛,在終端機輸入框打中文按 Enter 會把
+    // 半成品指令直接丟進 shell。
+    if (window.PocketIME && window.PocketIME.imeKey(e)) return;
     if (e.key === "Enter") { e.preventDefault(); termSend(input.value + "\n"); input.value = ""; }
     else if (e.key === "Tab") { e.preventDefault(); termSend(input.value + "\t"); }
     else if (e.ctrlKey && e.key.toLowerCase() === "c") { e.preventDefault(); termSend("\x03"); }
