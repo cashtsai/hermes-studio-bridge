@@ -26894,6 +26894,186 @@ _ORCH_MCP_TOOLS = [
          "required": ["session_id"]}},
 ]
 
+# ── 工具延遲載入(抄 t3code 的 McpToolExposure / toolSearch)────────────────
+# 問題:工具表只會越長,而 tools/list 一次全列 = 每個掛上來的 agent 每回合都
+# 付全表的 token,而且選項越多選錯越多(「工具太多反而降正確率」)。
+# 做法:對外初始只列「常駐工具」+ 一顆 `tool_search`;其餘工具要被 search 到
+# 才載入,載入後在該連線生命週期內保持可見(不要查一次掉一次)。
+# 常駐 = 編排迴圈的起點與唯讀查詢(開單 + 看狀態),其餘是動作面,要時再取。
+_ORCH_MCP_RESIDENT_TOOLS = ("pocket_open_thread", "pocket_status")
+# t3code 原法的打分:name 完全命中 100 / name 含查詢詞 3 / description 含 1。
+_ORCH_MCP_SCORE_NAME_EXACT = 100
+_ORCH_MCP_SCORE_NAME_PARTIAL = 3
+_ORCH_MCP_SCORE_DESC_PARTIAL = 1
+_ORCH_MCP_SEARCH_MAX_RESULTS = 10
+# 已載入工具的保留時間(同一 session key 閒置超過就回到只剩常駐)。
+_ORCH_MCP_LOADED_TTL = float(os.environ.get("ORCH_MCP_LOADED_TTL", "3600"))
+_ORCH_MCP_LOADED: dict = {}          # session key → {"tools": set, "ts": float}
+_ORCH_MCP_LOADED_LOCK = threading.Lock()
+
+
+def _orch_mcp_eager_tools() -> bool:
+    """`POCKET_MCP_EAGER_TOOLS=1` → 回到 v1 的「一次全列」(預設關)。
+    向後相容閥:客戶端不支援 `notifications/tools/list_changed` 時(抓一次
+    tools/list 就永久快取),延遲載入會讓它永遠看不到動作工具 —— 這個環境
+    變數讓它原地退回舊行為,不必改碼。"""
+    return os.environ.get("POCKET_MCP_EAGER_TOOLS", "").strip().lower() in (
+        "1", "true", "on", "yes")
+
+
+def _orch_mcp_header(request, name: str) -> str:
+    """headers 取值(`name` 傳小寫):Starlette 的 Headers 不分大小寫,
+    內部/測試用的純 dict 會分 —— 兩種 key 寫法都試一次。"""
+    getter = getattr(getattr(request, "headers", None) or {}, "get", None)
+    if not callable(getter):
+        return ""
+    for key in (name, name.title()):
+        val = getter(key)
+        if val:
+            return str(val)
+    return ""
+
+
+def _orch_mcp_session_key(request) -> str:
+    """延遲載入狀態的歸屬鍵。
+
+    MCP streamable HTTP 的連線身分是 `Mcp-Session-Id`(initialize 之後客戶端
+    每個 request 都帶);沒帶的客戶端(含 curl 冒煙)全部歸到 `default` 這一
+    桶 —— /mcp 只收 master token、是單機機器對機器面,共用一桶不會跨租戶
+    洩漏可見性,只會讓「別人搜過的工具我也看得到」,對 token 預算無害。"""
+    sid = (_orch_mcp_header(request, "mcp-session-id")
+           or _orch_mcp_header(request, "x-mcp-session-id")).strip()
+    return sid or "default"
+
+
+def _orch_mcp_loaded_tools(key: str) -> set:
+    now = time.time()
+    with _ORCH_MCP_LOADED_LOCK:
+        for k in [k for k, v in _ORCH_MCP_LOADED.items()
+                  if now - float(v.get("ts") or 0) > _ORCH_MCP_LOADED_TTL]:
+            _ORCH_MCP_LOADED.pop(k, None)
+        slot = _ORCH_MCP_LOADED.get(key)
+        if not slot:
+            return set()
+        slot["ts"] = now
+        return set(slot.get("tools") or ())
+
+
+def _orch_mcp_mark_loaded(key: str, names) -> list:
+    """把工具標成「這條連線已載入」,回傳**這次新載入的**名字(有新載入才
+    需要發 list_changed —— 重複 search 同一顆不該一直騷擾對面重抓)。"""
+    now = time.time()
+    fresh = []
+    with _ORCH_MCP_LOADED_LOCK:
+        slot = _ORCH_MCP_LOADED.setdefault(key, {"tools": set(), "ts": now})
+        slot["ts"] = now
+        for name in names:
+            if name in _ORCH_MCP_RESIDENT_TOOLS or name == "tool_search":
+                continue
+            if name not in slot["tools"]:
+                slot["tools"].add(name)
+                fresh.append(name)
+    return fresh
+
+
+def _orch_mcp_deferred_names() -> list:
+    return [t["name"] for t in _ORCH_MCP_TOOLS
+            if t["name"] not in _ORCH_MCP_RESIDENT_TOOLS]
+
+
+def _orch_mcp_tool_search_def() -> dict:
+    """`tool_search` 的工具定義。description 動態列出**未載入工具的名字**
+    (只有名字,沒有 schema):讓對面知道有什麼可以找,又不用付全表 schema
+    的 token —— 這是 t3code 「deferred tool 名單提示」的同一招。"""
+    deferred = _orch_mcp_deferred_names()
+    return {
+        "name": "tool_search",
+        "description": (
+            "搜尋這台 orchestrator 上**尚未載入**的工具並載入它們。"
+            "初始 tools/list 只列常駐工具(省 token、也少選錯);其餘工具"
+            "要先用本工具按關鍵字找出來,回傳的 schema 可以直接照著呼叫,"
+            "同時 server 會發 notifications/tools/list_changed —— 若你的"
+            "客戶端支援,重抓 tools/list 就會看到它們。"
+            "可搜(尚未載入)的工具:" + (", ".join(deferred) or "(無)")),
+        "inputSchema": {"type": "object", "properties": {
+            "query": {"type": "string",
+                      "description": "關鍵字(工具名或用途,可多個詞以空白分隔)"}},
+            "required": ["query"]}}
+
+
+def _orch_mcp_visible_tools(request) -> list:
+    """這條連線現在看得到的工具 = 常駐 + 已載入 + tool_search。
+    eager 模式直接回全表(且不含 tool_search —— 全都看得到就沒東西可搜)。"""
+    if _orch_mcp_eager_tools():
+        return list(_ORCH_MCP_TOOLS)
+    loaded = _orch_mcp_loaded_tools(_orch_mcp_session_key(request))
+    out = [t for t in _ORCH_MCP_TOOLS
+           if t["name"] in _ORCH_MCP_RESIDENT_TOOLS or t["name"] in loaded]
+    out.append(_orch_mcp_tool_search_def())
+    return out
+
+
+def _orch_mcp_score(tool: dict, terms: list) -> int:
+    name = str(tool.get("name") or "").lower()
+    desc = str(tool.get("description") or "").lower()
+    score = 0
+    for term in terms:
+        if term == name:
+            score += _ORCH_MCP_SCORE_NAME_EXACT
+        elif term in name:
+            score += _ORCH_MCP_SCORE_NAME_PARTIAL
+        if term in desc:
+            score += _ORCH_MCP_SCORE_DESC_PARTIAL
+    return score
+
+
+async def _orch_tool_search(request, args: dict) -> dict:
+    query = str(args.get("query") or "").strip()
+    if not query:
+        raise http_err(400, "ORCH_MCP_BAD_REQUEST", "query required")
+    terms = [t for t in re.split(r"[\s,;/]+", query.lower()) if t]
+    scored = []
+    for tool in _ORCH_MCP_TOOLS:
+        score = _orch_mcp_score(tool, terms)
+        if score > 0:
+            scored.append((score, tool))
+    # 排序:分數高的先;同分用名字排(穩定輸出,測試與人眼都能預期)。
+    scored.sort(key=lambda it: (-it[0], str(it[1].get("name") or "")))
+    total = len(scored)
+    top = scored[:_ORCH_MCP_SEARCH_MAX_RESULTS]
+    key = _orch_mcp_session_key(request)
+    fresh = _orch_mcp_mark_loaded(key, [t["name"] for _s, t in top])
+    _log_event("orch_mcp_tool_search", query=query, matches=str(total),
+               loaded=",".join(fresh))
+    return {"ok": True, "query": query,
+            "tools": [dict(t, _score=s) for s, t in top],
+            "matches": total, "returned": len(top),
+            "truncated": total > len(top),
+            "newly_loaded": fresh,
+            # schema 已經在上面回給你了 —— 客戶端沒收到 list_changed 也能
+            # 直接照著呼叫,不會卡在「看不到所以不敢叫」。
+            "tools_list_changed": bool(fresh),
+            "note": ("工具已載入;若你的客戶端沒收到 "
+                     "notifications/tools/list_changed,請再呼叫一次 "
+                     "tools/list(或直接照上面的 inputSchema 呼叫)")}
+
+
+def _orch_mcp_sse_or_json(request, payload: dict):
+    """工具表變動後的回覆:能推 SSE 就把 `notifications/tools/list_changed`
+    夾在回應前面一起送(MCP streamable HTTP 的標準做法 —— 同一個 POST 的
+    回應體是一條 SSE 串流,server 可以在真正的 result 之前先塞通知);
+    客戶端沒宣告收 SSE 就退回普通 JSON(通知推不出去,但結果裡已經有
+    schema 與「請重抓 tools/list」的提示,不會有人卡住)。"""
+    accept = _orch_mcp_header(request, "accept").lower()
+    if "text/event-stream" not in accept:
+        return payload
+    note = {"jsonrpc": "2.0", "method": "notifications/tools/list_changed"}
+    body = "".join(
+        f"event: message\ndata: {json.dumps(m, ensure_ascii=False)}\n\n"
+        for m in (note, payload))
+    return Response(content=body, media_type="text/event-stream",
+                    headers={"Cache-Control": "no-store"})
+
 
 class _OrchInternalRequest:
     """內部轉發用的最小 request:只支撐 `_check_auth`(headers)與
@@ -27063,6 +27243,8 @@ async def _orch_tool_wait_idle(args: dict) -> dict:
 
 
 async def _orch_mcp_tool_call(request: Request, name: str, args: dict) -> dict:
+    if name == "tool_search":
+        return await _orch_tool_search(request, args)
     if name == "pocket_open_thread":
         return await _orch_tool_open_thread(request, args)
     if name == "pocket_send":
@@ -27076,12 +27258,18 @@ async def _orch_mcp_tool_call(request: Request, name: str, args: dict) -> dict:
 
 @app.post("/mcp")
 async def orchestrator_mcp_rpc(request: Request):
-    """Orchestrator MCP server(JSON-RPC over HTTP,無 SSE 的最小面)。
+    """Orchestrator MCP server(JSON-RPC over HTTP)。
 
     只收 master BRIDGE_TOKEN(_require_master_auth):這是機器對機器的
     編排面,device token(手機配對出來的)拿到 403 —— 權限只縮不放。
     支援 initialize / tools/list / tools/call / ping;notifications 回 202。
-    工具執行失敗走 MCP 的 isError(result 層),協定錯誤才用 JSON-RPC error。"""
+    工具執行失敗走 MCP 的 isError(result 層),協定錯誤才用 JSON-RPC error。
+
+    `tools/list` 預設只列常駐工具 + `tool_search`(延遲載入,見
+    docs/ORCHESTRATOR_MCP.md);`tool_search` 載到新工具時會補發
+    `notifications/tools/list_changed` —— 只有在客戶端的 Accept 含
+    `text/event-stream`(MCP streamable HTTP 的標準協商)時才推得出去,
+    否則退化成「schema 直接回在結果裡 + note 叫對面重抓」。"""
     _require_master_auth(request)
     msg = await _json_body(request)
     mid = msg.get("id")
@@ -27091,15 +27279,18 @@ async def orchestrator_mcp_rpc(request: Request):
     if method == "initialize":
         requested = str(((msg.get("params") or {}).get("protocolVersion")) or "")
         proto = requested if requested in _ORCH_MCP_PROTOCOLS else _ORCH_MCP_PROTOCOL
+        # listChanged 只在延遲載入模式宣告 —— eager 模式的工具表不會變,
+        # 宣告了反而是在對客戶端說謊。
+        caps = {} if _orch_mcp_eager_tools() else {"listChanged": True}
         return {"jsonrpc": "2.0", "id": mid, "result": {
             "protocolVersion": proto,
-            "capabilities": {"tools": {}},
+            "capabilities": {"tools": caps},
             "serverInfo": {"name": "pocket-orchestrator", "version": "1.0.0"}}}
     if method == "ping":
         return {"jsonrpc": "2.0", "id": mid, "result": {}}
     if method == "tools/list":
         return {"jsonrpc": "2.0", "id": mid,
-                "result": {"tools": _ORCH_MCP_TOOLS}}
+                "result": {"tools": _orch_mcp_visible_tools(request)}}
     if method == "tools/call":
         params = msg.get("params") or {}
         name = str(params.get("name") or "")
@@ -27108,6 +27299,10 @@ async def orchestrator_mcp_rpc(request: Request):
             out = await _orch_mcp_tool_call(
                 request, name, args if isinstance(args, dict) else {})
             is_err = False
+            # 直接點名呼叫未載入的工具 → 照做並把它標成已載入(隱藏只為省
+            # token,不是授權邊界;不准讓「看不到」變成「叫不動」)。
+            if name != "tool_search" and not _orch_mcp_eager_tools():
+                _orch_mcp_mark_loaded(_orch_mcp_session_key(request), [name])
         except HTTPException as exc:
             code = (getattr(exc, "code", "")
                     or _GENERIC_ERROR_CODES.get(exc.status_code, "HTTP_ERROR"))
@@ -27120,10 +27315,14 @@ async def orchestrator_mcp_rpc(request: Request):
             out = {"error": {"code": "ORCH_MCP_TOOL_FAILED",
                              "message": f"{type(exc).__name__}: {exc}"}}
             is_err = True
-        return {"jsonrpc": "2.0", "id": mid, "result": {
+        payload = {"jsonrpc": "2.0", "id": mid, "result": {
             "content": [{"type": "text",
                          "text": json.dumps(out, ensure_ascii=False)}],
             "isError": is_err}}
+        if (not is_err and isinstance(out, dict)
+                and out.get("tools_list_changed")):
+            return _orch_mcp_sse_or_json(request, payload)
+        return payload
     if mid is None:
         return Response(status_code=202)
     return {"jsonrpc": "2.0", "id": mid,
