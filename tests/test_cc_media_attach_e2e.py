@@ -143,12 +143,12 @@ class MediaAttachEndToEndTests(unittest.IsolatedAsyncioTestCase):
         「可以掛成下載連結」的範圍。兩者刻意不同。
         """
         per_user_tmp = os.path.realpath("/var/folders")
-        roots = bridge.media_artifacts.attach_roots(["/Users/x/apps/repo"])
+        roots = bridge.media_artifacts.attach_roots(["/Users/you/apps/repo"])
         self.assertNotIn(per_user_tmp, roots)
         self.assertIn(per_user_tmp, bridge.media_artifacts.default_safe_roots())
         # /tmp 是 agent 放產出物的慣例位置,刻意保留。
         self.assertIn(os.path.realpath("/tmp"), roots)
-        self.assertIn(os.path.realpath("/Users/x/apps/repo"), roots)
+        self.assertIn(os.path.realpath("/Users/you/apps/repo"), roots)
 
     async def test_source_code_not_attached(self):
         src = self.cwd / "pipeline.py"
@@ -326,16 +326,16 @@ class MediaSessionCwdTests(unittest.TestCase):
 
     def test_claude_code_prefix_reads_sessions_conf(self):
         with patch.object(bridge, "_cc_conf_rows",
-                          lambda: [("flip", "/Users/x/apps/fliper")]):
+                          lambda: [("flip", "/Users/you/apps/fliper")]):
             self.assertEqual(bridge._media_session_cwd("claude_code:flip"),
-                             "/Users/x/apps/fliper")
+                             "/Users/you/apps/fliper")
             self.assertEqual(bridge._media_session_cwd("flip"),
-                             "/Users/x/apps/fliper")
+                             "/Users/you/apps/fliper")
             self.assertEqual(bridge._media_session_cwd("claude_code:nope"), "")
 
     def test_cc2_reads_registry_workdir(self):
         class _S:
-            workdir = "/Users/x/apps/pocket-cis"
+            workdir = "/Users/you/apps/pocket-cis"
 
         class _R:
             def get(self, name):
@@ -343,7 +343,7 @@ class MediaSessionCwdTests(unittest.TestCase):
 
         with patch.object(bridge.cc_sdk, "registry", lambda: _R()):
             self.assertEqual(bridge._media_session_cwd("cc2:live"),
-                             "/Users/x/apps/pocket-cis")
+                             "/Users/you/apps/pocket-cis")
             self.assertEqual(bridge._media_session_cwd("cc2:ghost"), "")
 
     def test_acp_providers_read_session_row(self):
@@ -355,8 +355,29 @@ class MediaSessionCwdTests(unittest.TestCase):
                 self.assertEqual(bridge._media_session_cwd(f"{prov}:k1"),
                                  "/w/k1")
 
+    def test_codex_uses_the_thread_cwd_cache(self):
+        """codex 的 cwd 要靠旁觀快取 —— `thread/read` 是 async RPC,而附件掃描
+        跑在 worker thread 裡沒辦法 await 它。沒快取過就退化成只掃暫存區
+        (不會掛錯東西,只是掛不到),所以「有快取就要用」必須釘住。"""
+        bridge._CX_THREAD_CWD.pop("tid-1", None)
+        self.assertEqual(bridge._media_session_cwd("codex:tid-1"), "")
+        bridge._cx_note_thread_cwd("tid-1", "/Users/you/apps/foo")
+        try:
+            self.assertEqual(bridge._media_session_cwd("codex:tid-1"),
+                             "/Users/you/apps/foo")
+        finally:
+            bridge._CX_THREAD_CWD.pop("tid-1", None)
+
+    def test_thread_cwd_cache_is_bounded(self):
+        bridge._CX_THREAD_CWD.clear()
+        for i in range(2100):
+            bridge._cx_note_thread_cwd(f"t{i}", f"/w/{i}")
+        self.assertLessEqual(len(bridge._CX_THREAD_CWD), 2100)
+        self.assertLess(len(bridge._CX_THREAD_CWD), 2500)
+        bridge._CX_THREAD_CWD.clear()
+
     def test_unknown_providers_have_no_cwd(self):
-        for sid in ("hermes:cash", "openclaw:agent:main:main", "codex:abc123"):
+        for sid in ("hermes:cash", "openclaw:agent:main:main"):
             self.assertEqual(bridge._media_session_cwd(sid), "")
 
     def test_resolution_is_failsafe(self):

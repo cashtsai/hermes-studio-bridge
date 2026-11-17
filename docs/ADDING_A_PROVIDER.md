@@ -79,6 +79,30 @@ tone we want.
 4. **Missing dependency ≠ failure.** If your tests need a CLI that not every machine
    has, use `tests/_requires.py` so they skip honestly instead of going red.
 
+## Card attachments (2026-11-17)
+
+Cold load is covered for free: every provider's card store goes through
+`_v2_card_store_with_media`, which scans the cards for agent-produced local files
+and attaches them (see APP_BRIDGE_CONTRACT §6.1).
+
+Two things you still have to add by hand:
+
+1. **One line at turn end** —
+   `_schedule_media_attach(d.store, _store_media_sid(d.store, f"<prov>:{key}"))`
+   in the turn runner's `finally`. Without it the file only becomes clickable on
+   the *next* cold load, which reads as "it works sometimes". Copy from
+   `_gm_run_turn` / `_gk_run_turn` / `_oce_run_turn` — they are identical.
+2. **A `_media_session_cwd` branch** returning the session's working directory.
+   Without it `attach_roots` collapses to `/tmp` only, so anything the agent
+   writes into the project directory stays an unclickable bare path — and it
+   fails *silently* (`media_cards_attached cards=0`). It must stay cheap: that
+   function runs inside the scan worker, so a dict/cached lookup or a small file
+   read is fine, an RPC is not (`codex` needs one, hence the `_CX_THREAD_CWD`
+   side cache).
+
+Then add your row to the provider table in APP_BRIDGE_CONTRACT §6.1 — that table
+is the contract, and a ✅ there which the code does not deliver is worse than a ⚠️.
+
 ## Checklist
 
 - [ ] `<name>_provider.py` imports nothing from `bridge.py`
@@ -86,6 +110,8 @@ tone we want.
 - [ ] `./scripts/run-tests.sh` green (skips are fine, reds are not)
 - [ ] Errors carry a hint that names the next action
 - [ ] No new unauthenticated endpoint
+- [ ] Turn-end `_schedule_media_attach` hook + `_media_session_cwd` branch
+      + APP_BRIDGE_CONTRACT §6.1 table row (see "Card attachments" above)
 
 ---
 
