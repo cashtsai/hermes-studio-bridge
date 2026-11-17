@@ -1,6 +1,6 @@
 # Orchestrator MCP 工具面 v1(`POST /mcp`)
 
-更新日期:2026-11-06
+更新日期:2026-11-17(新增:工具延遲載入 / `tool_search`)
 
 把 bridge 的編排能力做成 agent 可呼叫的 MCP 工具 —— **agent 編排 agent**。
 一個已經在跑的 CC/CX session 掛上這個 server 之後,可以自己開子會話、
@@ -17,11 +17,16 @@
 
 ## 傳輸與認證
 
-- 端點:`POST http://127.0.0.1:8081/mcp`(JSON-RPC over HTTP;無 SSE,
-  每個 request 一問一答)。
+- 端點:`POST http://127.0.0.1:8081/mcp`(JSON-RPC over HTTP;每個 request
+  一問一答。唯一的例外是 `tool_search` 載到新工具時 —— 回應體會是一條
+  SSE 串流,把 `notifications/tools/list_changed` 夾在 result 前面送,
+  見下面「工具延遲載入」)。
 - 支援方法:`initialize`、`tools/list`、`tools/call`、`ping`;
   `notifications/*` 回 202。協定版本收 `2024-11-05 / 2025-03-26 / 2025-06-18`,
   其他值回 server 預設 `2025-06-18`。
+- `initialize` 的 capabilities 在延遲載入模式回
+  `{"tools":{"listChanged":true}}`;eager 模式(工具表不會變)回
+  `{"tools":{}}` —— 不宣告自己做不到的事。
 - **認證:只收 master `BRIDGE_TOKEN`**(launchd plist 裡那把)。
   手機配對出來的 device token 會被 `_require_master_auth` 擋成 403 ——
   這是機器對機器的編排面,v1 一刀切,不給裝置級憑證任何編排權。
@@ -44,7 +49,76 @@
 registry 靜態 status 欄位 —— 靜態欄位不保證回寫,拿它記帳會把做完的舊單
 永久算成活的,配額就鎖死了。
 
+## 工具延遲載入(`tool_search`,2026-11-17)
+
+抄 t3code 的 `McpToolExposure` / `toolSearch`。**預設開啟**。
+
+### 為什麼
+
+工具表只會越長,而一次全列有兩個代價:
+
+1. **token**:每個掛上來的 agent、每一回合都在付全表 schema 的錢。
+   實測(`tools/list` 回應位元組,粗估 4 bytes ≈ 1 token):
+
+   | 工具表大小 | 全列(eager) | 延遲載入(初始) | 省 |
+   |---|---|---|---|
+   | 今天的 4 顆 | 1950 B(~487 tok) | 1634 B(~408 tok) | 17% |
+   | 模擬 16 顆 | 7683 B(~1920 tok) | 1850 B(~462 tok) | **76%** |
+
+   注意形狀:延遲載入的初始清單**幾乎不隨工具表長大**(多出來的只有
+   `tool_search` 說明裡的工具名字),所以越往後加工具越划算。
+2. **正確率**:選項越多選錯越多。少數常駐工具 + 「要用再搜」比把 20 顆
+   並排在眼前更不容易挑錯 —— 這是 token 與正確率的雙贏,不是單純省錢。
+
+### 怎麼運作
+
+- **常駐工具**(`_ORCH_MCP_RESIDENT_TOOLS`):`pocket_open_thread`(編排
+  迴圈的起點)+ `pocket_status`(唯讀查狀態)。再加一顆 `tool_search`。
+- 其餘工具(今天是 `pocket_send`、`pocket_wait_idle`)**不在初始
+  `tools/list`**;`tool_search` 的 description 會列出它們的**名字**
+  (只有名字、沒有 schema)—— agent 才知道有什麼可以搜。
+- `tool_search {query}` → 回符合的工具(**含完整 inputSchema,可直接照著
+  呼叫**)並把它們標成「這條連線已載入」;之後的 `tools/list` 就看得到。
+- 打分(t3code 原法):查詢字串切詞(空白/逗號/分號/斜線),每個詞
+  **name 完全命中 +100、name 含該詞 +3、description 含該詞 +1**;0 分不回。
+  排序:分數高者先,同分按名字(輸出穩定)。上限 **10 顆**
+  (`_ORCH_MCP_SEARCH_MAX_RESULTS`),超過回 `truncated: true` 與 `matches` 總數。
+- **載入是黏的**:已載入的工具在該連線的生命週期內保持可見(不是查一次
+  掉一次);閒置超過 `ORCH_MCP_LOADED_TTL`(預設 3600 秒)才回到只剩常駐。
+- 連線身分 = `Mcp-Session-Id` header(MCP streamable HTTP 在 initialize
+  之後每個 request 都會帶);沒帶的客戶端(含 curl 冒煙)共用 `default`
+  那一桶 —— /mcp 只收 master token,共用一桶不會跨租戶洩漏。
+
+### `notifications/tools/list_changed`
+
+載到**新**工具時(重複搜同一顆不會重發)server 要通知對面重抓 ——
+MCP 協定的標準做法。我們沒有常駐 SSE 通道,所以走 streamable HTTP 的
+標準協商:
+
+- 客戶端的 `Accept` 含 `text/event-stream`(MCP 客戶端的標準送法)→
+  這個 POST 的回應體是一條 SSE 串流,先一則 `notifications/tools/list_changed`
+  通知,再一則真正的 JSON-RPC result,然後關閉。
+- 沒宣告收 SSE → 退回普通 JSON。通知推不出去,但**不會有人卡住**:
+  schema 已經在結果裡,`note` 也會叫對面自己再 `tools/list` 一次。
+
+### 向後相容:`POCKET_MCP_EAGER_TOOLS=1`
+
+客戶端不支援 `list_changed`、又把 `tools/list` 永久快取的話,延遲載入會讓
+它永遠看不到動作工具。這時在服務環境變數加 `POCKET_MCP_EAGER_TOOLS=1`
+就原地退回 v1 行為:`tools/list` 一次全列四顆(且不含 `tool_search` ——
+全都看得到就沒東西可搜)、`initialize` 不宣告 `listChanged`。不必改碼。
+
+### 一條紅線:隱藏不是授權邊界
+
+沒載入的工具**照樣叫得動**(直接 `tools/call` 會執行,並順手標成已載入)。
+隱藏只為省 token 與減少誤選;授權邊界只有一條:master `BRIDGE_TOKEN`。
+不准讓「看不到」變成「叫不動」—— 那會讓舊客戶端安靜地壞掉。
+
 ## 工具(四顆,全部復用既有能力)
+
+> 下面四顆是**能力全表**(eager 模式的 `tools/list`)。延遲載入模式下
+> 初始只看得到 `pocket_open_thread` / `pocket_status` / `tool_search`,
+> 其餘要 `tool_search` 一下(或直接呼叫)。
 
 ### `pocket_open_thread` → 開新會話
 
@@ -158,19 +232,31 @@ TOKEN=$(/usr/libexec/PlistBuddy -c \
 curl -s http://127.0.0.1:8081/mcp \
   -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | python3 -m json.tool
+# → 延遲載入模式只會看到 pocket_open_thread / pocket_status / tool_search
+
+# 搜出動作工具(帶 Accept: text/event-stream 才看得到 list_changed 通知)
+curl -sN http://127.0.0.1:8081/mcp \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -H 'Accept: application/json, text/event-stream' \
+  -H 'Mcp-Session-Id: smoke-1' \
+  -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":
+       {"name":"tool_search","arguments":{"query":"send wait"}}}'
 ```
 
 ## 典型編排迴圈(給掛上來的 agent 看)
 
 1. `pocket_open_thread {provider:"codex", prompt:"<工單>", cwd:"~/apps/x"}`
    → 記下 `session_id`。
-2. `pocket_wait_idle {session_id, timeout_secs: 600}` → 看
+2. 需要送訊息/等回合而工具不在清單上 → `tool_search {query:"send wait"}`
+   一次把 `pocket_send`、`pocket_wait_idle` 載進來(之後整條連線都看得到;
+   急的話也可以直接呼叫,不必先搜)。
+3. `pocket_wait_idle {session_id, timeout_secs: 600}` → 看
    `last_assistant_milestone.text`。
-3. `timed_out=true` → 對方還在跑,過一陣子再 wait 一次(**不要**重複開單)。
+4. `timed_out=true` → 對方還在跑,過一陣子再 wait 一次(**不要**重複開單)。
    `phase=blocked` → 對方在等輸入:用 `pocket_status` 看 label,該補資訊就
    `pocket_send`,該人工核准就回報使用者。
-4. 要追加指示/追問 → `pocket_send`(重試帶同一個 `client_id`)。
-5. 開新單撞到 429 `ORCH_MCP_DELEGATION_LIMIT` → 先收割(wait/status)
+5. 要追加指示/追問 → `pocket_send`(重試帶同一個 `client_id`)。
+6. 開新單撞到 429 `ORCH_MCP_DELEGATION_LIMIT` → 先收割(wait/status)
    既有會話;上限 3 是故意的,別繞。
 
 ## 測試與驗證
@@ -180,6 +266,10 @@ curl -s http://127.0.0.1:8081/mcp \
   tests/test_orchestrator_mcp.py -q
 ```
 
-涵蓋:協定三式與 tools/list 形狀、四工具 happy path(monkeypatch
+涵蓋(41 測):協定三式與 tools/list 形狀、四工具 happy path(monkeypatch
 create/input,status/wait 走真 event_log)、並行上限 3(含「終態不佔額」)、
-auth(401/裝置 token 403)、wait 逾時語意。
+auth(401/裝置 token 403)、wait 逾時語意,以及**延遲載入**(`LazyToolExposure`
+15 測):初始清單只含常駐 + `tool_search`、打分與排序(100/3/1)、
+MAX_RESULTS 上限 10、SSE 的 `list_changed` 有發且工具載入後可呼叫、
+重複搜不重發通知、沒 Accept SSE 時退回 JSON、per-session 可見性與 TTL 過期、
+eager 模式回退、未載入工具直接呼叫仍可用。
