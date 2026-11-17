@@ -1347,10 +1347,24 @@ Bearer 認證)。`path` 是本機絕對路徑,只是出處標示,裝置上永遠
   就查不到(`isfile` 永遠 false),所以只掛共用的冷載掃描、不另接 live。
 - `hermes` 人格沒有工作目錄的概念 → 允許根目錄只有 `/tmp`;要放寬走
   `POCKET_MEDIA_ATTACH_ROOTS`(冒號分隔)。
+- `codex` 的工作目錄來自旁觀快取(列過 thread / 查過 workdir 就會記下)。
+  **冷啟後第一次**還沒快取到時只掃暫存區 —— 掛不到不會掛錯,列一次
+  session 清單就補上。
 - base64 直回的圖(MCP 截圖之類,**沒有檔案路徑**)另有一條既有管線:
   cc/cc2 的 `media_sink` → `capture_bytes` → `attachment` 卡,不經路徑偵測。
 - `GET /app/v2/sessions/{id}/media` 的索引範圍**比附件寬**:那是「這條
   session 碰過哪些檔」,連 `.py` 都收。附件是其中「適合當媒體呈現」的子集。
+
+**掛在哪張卡**(優先序,契約 §6 只保證前兩類會渲染 `attachments`):
+1. `attachment` 卡 —— 專為那支檔存在的那張(CC/cc2「agent 看了一張圖」)
+2. `text` / `markdown` 卡 —— 回合尾的文字摘要,「這是你要的東西」的位置
+3. `tool_call` / `tool_result` 只做**保底**:該回合沒有任何上面兩類提到它時
+   才掛(additive;不認得的 client 照 fallback 原則忽略)
+
+為什麼要有優先序:實測的 CC 形狀是「先宣告、再動手」—— markdown
+「我把報告寫到 /x.pdf」→ `tool_call Write` → `tool_result`。單純取「最後
+提到的那張」會讓 `tool_result` 搶到,而**會渲染的** markdown 卡拿不到 →
+使用者看到的還是裸路徑,bridge 的 log 卻報成功。
 
 **哪些檔案會被掛**(白名單 `media_artifacts.ATTACHABLE_KINDS`):
 `image` / `video` / `audio` / `pdf` / `document` / `archive`。
@@ -1363,16 +1377,26 @@ Bearer 認證)。`path` 是本機絕對路徑,只是出處標示,裝置上永遠
 1. realpath 之後落在 **session 工作目錄(含子目錄)或 `/tmp`** 之內 ——
    **解完符號連結才比對**,所以工作目錄裡指向外部的 symlink、`..` 穿越都
    過不了。這比媒體庫自己的封存範圍(整個家目錄)**窄**:能封存 ≠ 能變成
-   下載連結。macOS 的 `/var/folders`(per-user TMPDIR,住著每個 app 的快取)
-   **不在**允許範圍內。
+   下載連結。另外兩個刻意的排除:
+   - macOS 的 `/var/folders`(per-user TMPDIR,住著每個 app 的快取)
+   - **太大的工作目錄**:家目錄、`/Users`、`/home`、`/var`、`/etc`…
+     (cc2 沒給 workdir 時 cwd 會是 `~`,不擋就等於整個家目錄可下載)
 2. 檔案真的存在、是一般檔案(不 stat 就不算偵測到)。
 3. 大小在媒體庫上限之內;超過的只進 `/media` 索引
    (`available:false`、`unavailable_reason:"too_large"`),**不**掛成附件。
 
-**冪等與事件**:同一支檔案在同一張卡只掛一次;已經有 `attachments` 的卡不
-覆寫(live 事件帶的附件優先)。live 掛上附件會**重發 `card.upsert`**(同
-id、`rev` +1、`ts` 不變),client 照既有的「以最高 rev 原位替換」處理即可,
-不需要任何改動。冷載則直接寫進快照,不灌 ring。
+**冪等與事件**:已經有 `attachments` 的卡不覆寫(live 事件帶的附件優先)。
+同一支檔案在**同一回合**只掛一張卡;**跨回合刻意不去重** —— codex 常在第 3
+回合與第 18 回合引用同一份報告,只給最後一次的話使用者往上捲就又看到裸文字。
+
+掛上附件**一律重發 `card.upsert`**(同 id、`rev` +1、`ts` 不變),冷載與 live
+都一樣;client 照既有的「以最高 rev 原位替換」處理即可,不需要任何改動。
+(不分冷載/live 是刻意的:兩條路共用「掃過了」記憶,若其中一條不發事件,
+先跑到的那條就會把工作吃掉而讓在線的 client 永遠收不到更新。)
+
+**先提到、後產生**:`ffmpeg … out.mp4` 的工具卡會在檔案寫完前就落地。這種
+「還沒出現」與「永久不合」在 bridge 內部是兩種不同的拒絕 —— 前者保留重試,
+所以檔案寫完後的下一次掃描會補掛上。
 
 ## 7. 冷載 snapshot（本地快取契約）
 
