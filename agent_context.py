@@ -67,6 +67,7 @@ import os
 import re
 
 import agent_call
+import cjk_text
 
 MODES = ("summary", "recent", "search")
 #: 會把**原文片段**送出去的模式(相對於 summary 的蒸餾產物)。
@@ -145,11 +146,12 @@ TRUNC_MARK = "\n…(上下文過長,已截斷)"
 
 
 def clip(s: str, limit: int) -> tuple[str, bool]:
-    """封頂並回報有沒有截斷(回應的 `truncated` 欄就是這個布林)。"""
-    s = s or ""
-    if len(s) <= limit:
-        return (s, False)
-    return (s[:limit] + TRUNC_MARK, True)
+    """封頂並回報有沒有截斷(回應的 `truncated` 欄就是這個布林)。
+
+    走 `cjk_text` 的 grapheme 邊界 —— 裸 `s[:limit]` 會把旗幟/膚色/ZWJ 家庭
+    emoji 與漢字異體字選擇器切成半個字,在對方的上下文裡留一個豆腐方塊。
+    """
+    return cjk_text.clip_marked(s, limit, mark=TRUNC_MARK)
 
 
 # ── env 旋鈕 ────────────────────────────────────────────────────────────
@@ -353,8 +355,7 @@ def card_line(role: str, text: str, ts: float | None = None,
     """一張卡 → 一行 `[hh:mm:ss role] text`(已遮罩、單卡封頂)。"""
     import time as _time
     text = redact_text(str(text or "")).strip().replace("\r", "")
-    if len(text) > max_len:
-        text = text[:max_len] + "…"
+    text = cjk_text.clip(text, max_len)      # grapheme 邊界,見 cjk_text 的理由
     stamp = ""
     if ts:
         try:
@@ -372,8 +373,9 @@ def match_snippet(text: str, query: str, *, width: int = 160) -> str | None:
     i = hay.find(query.lower())
     if i < 0:
         return None
-    start = max(0, i - width // 2)
-    end = min(len(text), i + len(query) + width // 2)
+    # 兩端推到 grapheme 邊界:裸切會在片段頭尾留半個 emoji/落單的變體選擇器。
+    start, end = cjk_text.snap_bounds(text, max(0, i - width // 2),
+                                      min(len(text), i + len(query) + width // 2))
     frag = text[start:end].replace("\n", " ").strip()
     if start > 0:
         frag = "…" + frag
