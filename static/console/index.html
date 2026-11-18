@@ -45,6 +45,7 @@
     <p id="hub-status" role="status"></p><div id="hub-list"></div>
     <button id="hub-more" class="btn-ghost" hidden>更多待審項目</button>
   </section>
+  <div id="toast" class="toast hidden" role="status" aria-live="polite" aria-relevant="additions"></div>
 
   <main id="main" class="at-home">
     <!-- 左:session 列表 -->
@@ -187,7 +188,7 @@
   </section>
 
   <!-- ⌘K 快速切換 -->
-  <div id="palette" class="palette hidden">
+  <div id="palette" class="palette hidden" role="dialog" aria-modal="true" aria-label="切換對話">
     <div class="pal-box">
       <input id="pal-q" class="pal-q" placeholder="切換 session…（↑↓ 選，Enter 開，Esc 關）" autocomplete="off">
       <div id="pal-list" class="pal-list"></div>
@@ -219,7 +220,6 @@
     </div>
   </div>
 
-  <div id="toast" class="toast hidden"></div>
   <dialog id="session-ops" aria-labelledby="op-title" aria-describedby="op-session">
     <header><h2 id="op-title"></h2><button id="op-close" class="icon-btn" title="關閉" aria-label="關閉對話操作">×</button></header>
     <p id="op-session"></p><div id="op-content"></div><p id="op-status" role="status"></p>
