@@ -13,7 +13,11 @@ Date: 2026-11-18. User authorized integration, merge, restart and release.
 - Pocket ID PR #7 merged as `0e5aa11`: common QR entry and same-phone deep link.
 - iOS PR #294 merged as `1800fa0`: dashboard scanner, Console settings order,
   removal of obsolete common-entry six-digit display. Pocket 1.0.0 (234) was
-  archived, exported and successfully uploaded to Apple; processing is pending.
+  archived, exported and successfully uploaded to Apple. Apple confirms `VALID`,
+  `internalBuildState=IN_BETA_TESTING`, `expired=false`, and encryption compliance.
+  The existing internal group `CT` has `hasAccessToAllBuilds=true`; Apple rejects
+  redundant manual assignment to this internal group, and no new group is needed.
+  External testing and App Store review were not submitted.
 
 The CC iOS working diff was copied into an isolated integration worktree, reviewed
 and committed as `0f88d30` / `f5f4f23`. The original `pa-dash-scan` tree is preserved.
@@ -36,6 +40,9 @@ and committed as `0f88d30` / `f5f4f23`. The original `pa-dash-scan` tree is pres
   passed all 7 Codex files plus `test_cx_transport_upgrade`.
 - Remaining `test_persona_description` is the unchanged baseline failure explicitly
   documented in both task briefs. It was not suppressed or rewritten.
+- GitHub CI for PR #134 later completed with 210 passing files, 1 failure and 7
+  skips. The sole failure is the same `test_persona_description` baseline, not a
+  new integration failure (run `44278544679`). CI is therefore not wholly green.
 - Ratchet gate, Python compile, JS syntax and diff whitespace checks passed.
 - iOS: 53 XCTest + 1237 Swift Testing cases passed; localization gate clean.
 - Pocket ID: 479 tests passed. Public HTML/JS/CSS SHA-256 matches local files.
