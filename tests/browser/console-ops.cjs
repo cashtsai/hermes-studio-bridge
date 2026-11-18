@@ -113,6 +113,8 @@ async function shot(page,name) {
 
 test("capability menus, rename identity, archive undo and retry",async t=>{
   const {page,data}=await fixture(t,{data:{renameMoves:true}});
+  assert.equal(await page.locator(".session-row > button.sess").count(),jobs().length);
+  assert.equal(await page.locator("button.sess button").count(),0,"menu must be a sibling, never a nested button");
   await select(page,"cc2:beta");await page.locator("#input").fill("尚未送出的草稿");
   await menu(page,"cc2:beta");await shot(page,"menu-supported");
   await action(page,"重新命名");await page.locator("#op-content input").fill("new-name");await action(page,"儲存");
@@ -237,10 +239,14 @@ test("hub has multiple approvals per session, reuses P0 detail/risk, writes sele
 
 test("read cursor only at visible bottom, deduplicates render/focus and uses message time, not ring seq",async t=>{
   const {page,data}=await fixture(t);
+  async function received(count) {
+    // Wait for the HTTP receipt, not a 150ms scheduling margin over debounce.
+    for (let n=0; n<100 && posts(data,"/app/v2/read").length<count; n++) await page.waitForTimeout(30);
+    assert.equal(posts(data,"/app/v2/read").length,count);
+  }
   await select(page,"hermes:reader");
   await page.waitForFunction(()=>document.getElementById("cards").textContent.includes("驗收訊息 59"));
-  await page.waitForTimeout(650);
-  assert.equal(posts(data,"/app/v2/read").length,1);
+  await received(1);
   const first=posts(data,"/app/v2/read")[0].body;
   assert.equal(first.session,"reader");assert.equal(first.last_read_ts,1700000059);
   assert.equal(first.last_read_seq,undefined);assert.equal(first.message_id,"msg59");assert.ok(first.device_id);
@@ -250,7 +256,7 @@ test("read cursor only at visible bottom, deduplicates render/focus and uses mes
   await page.evaluate(()=>{state.cards.push({id:"later",ts:1700000100,kind:"text",role:"agent",body:{text:"新訊息"}});renderCards();});
   await page.waitForTimeout(550);assert.equal(posts(data,"/app/v2/read").length,1);
   await page.locator("#cards").evaluate(el=>{el.scrollTop=el.scrollHeight;el.dispatchEvent(new Event("scroll"));});
-  await page.waitForTimeout(550);assert.equal(posts(data,"/app/v2/read").length,2);
+  await received(2);
   assert.equal(posts(data,"/app/v2/read")[1].body.last_read_ts,1700000100);
   await page.evaluate(()=>{
     PocketSessionOps.onEvent({type:"read_cursor.update",session:"reader",data:{global:{last_read_ts:1700000200}}});
@@ -263,7 +269,7 @@ test("read cursor only at visible bottom, deduplicates render/focus and uses mes
   await page.evaluate(()=>{
     Object.defineProperty(document,"hidden",{configurable:true,value:false});
     document.dispatchEvent(new Event("visibilitychange"));
-  });await page.waitForTimeout(550);assert.equal(posts(data,"/app/v2/read").length,3);
+  });await received(3);
 });
 
 test("questionnaire keeps one approval ID across questions with expected_q_index on each answer",async t=>{

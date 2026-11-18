@@ -4,7 +4,7 @@ const fs = require("node:fs/promises");
 const path = require("node:path");
 const {workstation} = require("./fixtures/workstation.cjs");
 
-const previews = path.resolve(__dirname, "../../docs/console-w3-preview");
+const previews = process.env.POCKET_QA_SCREENSHOTS || path.resolve(__dirname, "../../docs/console-w3-preview");
 const job = {id:"hermes:yuanfang", provider:"hermes", title:"袁方", status:"idle", subtitle:"/fixture/workspace"};
 async function until(check) {
   for (let n=0; n<100; n++) { if (await check()) return; await new Promise(r=>setTimeout(r,20)); }
