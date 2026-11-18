@@ -310,7 +310,7 @@ test("複選:換題要清掉上一題的勾選(多題 ask 的鍵恆為 1|2|3,只
   next.meta.prompt.title = "第二題問別的";
   h.ctx.state.sessions = [next];
   h.ctx.renderApproval();                      // 不呼 msReset —— identity 自己要認得出換題
-  assert.ok(buttons(h).slice(0, 3).every(b => b.textContent.startsWith("☐")),
+  assert.ok(buttons(h).filter((_, i) => i < 3).every(b => b.textContent.startsWith("☐")),
     "換題後不准把上一題的勾選帶著走");
 });
 
@@ -489,7 +489,7 @@ test("key 前綴只給 CC 的 TUI 數字鍵,內部識別字不准漏到畫面上
   assert.equal(buttons(h)[0].textContent, "opt7", "label 是空的也不准畫出一顆空白按鈕");
 });
 
-test("第 9 個以後的選項不准靜默消失(舊版 opts.slice(0, 8))", () => {
+test("第 9 個以後的選項不准靜默消失(舊版畫到第 8 個就停,而且不說)", () => {
   const h = harness();
   const many = Array.from({ length: 12 }, (_, i) => ({ key: "opt" + i, label: "選項" + i, style: "secondary" }));
   open(h, codexRow(many, { kind: "question" }));
