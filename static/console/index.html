@@ -75,12 +75,20 @@
           <button id="interrupt" class="btn btn-danger" title="中斷目前回合">■ 中斷</button>
         </div>
       </div>
+      <!-- 待審核。detail / risk 是 docs/APPROVAL_HUB_SPEC.md §1 的欄位,bridge
+           每家都填 —— 少了這兩個節點等於要人盲簽(codex 的 patch 審批、
+           openclaw 的 plugin 審批全靠 detail 才看得出要放行什麼)。 -->
       <div id="approval" class="approval hidden">
         <div class="ap-head">
-          <span class="ap-icon">🔐</span>
+          <span id="ap-icon" class="ap-icon">🔐</span>
           <span id="ap-title" class="ap-title"></span>
+          <span id="ap-risk" class="ap-risk hidden"></span>
+          <span id="ap-progress" class="ap-progress hidden"></span>
         </div>
+        <pre id="ap-detail" class="ap-detail hidden"></pre>
+        <p id="ap-hint" class="ap-hint hidden"></p>
         <div id="ap-actions" class="ap-actions"></div>
+        <p id="ap-more" class="ap-more hidden"></p>
       </div>
       <div id="cards" class="hidden" tabindex="0" aria-label="對話紀錄"></div>
       <div class="reply-jump"><button type="button" id="new-reply" class="btn-ghost" aria-controls="cards" hidden>有新回覆 ↓</button></div>
