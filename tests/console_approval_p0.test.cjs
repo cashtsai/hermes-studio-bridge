@@ -441,6 +441,8 @@ function eventsCtx() {
   Object.assign(h.ctx, {
     renderApproval: h.ctx.renderApproval,
     loadSessions: () => log.push("loadSessions"),
+    // W3 owns message/read deltas; this harness isolates the P0 approval path.
+    applyListEvent: () => false,
     setTimeout: (fn, ms) => { log.push("debounce:" + ms); return 1; },
     clearTimeout: () => {},
   });
