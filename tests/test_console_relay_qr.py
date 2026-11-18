@@ -129,7 +129,12 @@ class RelayQRTest(unittest.TestCase):
             direct = TestClient(bridge.app, client=("127.0.0.1", 1234))
             self.addCleanup(direct.close)
             self.assertEqual(direct.get("/console", headers={"Host": "other.example"}).status_code, 403)
-            self.assertEqual(direct.get("/console", headers={"Host": "localhost:8081"}).status_code, 401)
+            # 401 = 登入挑戰(配對碼頁或 QR 頁,兩者 2026-11-18 起統一成 401);
+            # 要釘的是「直連本機拿不到 console 本體」,不是拿到哪一種登入頁。
+            direct_r = direct.get("/console", headers={"Host": "localhost:8081"})
+            self.assertEqual(direct_r.status_code, 401)
+            self.assertNotIn("id=\"app\"", direct_r.text,
+                             "直連本機竟然拿到 console 本體")
             r = self.web.get("/console?boot=123456")
             self.assertIn("pocket://console-login", r.text)
             self.assertNotIn('action="/console/auth"', r.text)
@@ -184,7 +189,11 @@ class RelayQRTest(unittest.TestCase):
         self.assertEqual(self.web.post(lookup,json=proof).status_code,401)
         self.assertEqual(self.web.post(lookup,json=proof,headers=self.phone).status_code,202)
         r = self.web.post(page,data=form,headers=origin)
-        self.assertEqual(r.status_code,200)
+        # 401:這一步回的是「等待手機批准」那張頁,跟 QR 頁、配對碼頁同一類
+        # —— 都是登入挑戰。2026-11-18 起三條路統一成 401(原本這裡是 200),
+        # 理由見 `_console_qr_login_response`:同一張頁按呼叫端分岔狀態碼,
+        # 監控與探活會各讀各的。
+        self.assertEqual(r.status_code,401)
         self.assertNotIn("pocket://console-login", r.text)
         self.assertNotIn(verifier, r.text)
         self.assertEqual(self.web.post(page,data=form,headers=origin).status_code,409)

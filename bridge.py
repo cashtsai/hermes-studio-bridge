@@ -12214,7 +12214,20 @@ async def console_page(request: Request):
         if request.query_params.get("signin") == "1" or not _pair_boot_ok(request, allow_cookie=True):
             if web and boot_supplied:
                 _console_auth_note_failure(request)
-            # 沒碼/碼錯/cookie 過期 → 輸入頁(web 面的頁尾說明對齊 session cookie)
+            # 沒碼/碼錯/cookie 過期 → **掃碼頁**(2026-11-18)。
+            #
+            # 方向原本是反的:公開面給 QR,自己家的機器反而只能手打配對碼。
+            # 同一個產品的同一件事,在信任度高的那條路上反而比較難用 ——
+            # 所以這裡改成跟公開面同一個範式,掃碼是所有入口的主路徑。
+            #
+            # `?code=1` 是逃生門,仍回配對碼輸入頁。**這條不能拿掉**:
+            #   · 手機不在手邊時的長碼救援路徑(見 `_CONSOLE_CODE_TTL` 上方
+            #     那段註解:「手機不在手邊時不會被鎖在門外」);
+            #   · QR 沒開(`POCKET_CONSOLE_QR_LOGIN=0` 是預設)或中繼沒活著時,
+            #     `_console_qr_enabled()` 回 False,這裡也必須落回輸入頁,
+            #     否則本機 console 會變成完全進不去。
+            if _console_qr_enabled() and request.query_params.get("code") != "1":
+                return _console_qr_login_response(request)
             return _console_login_response(request, persistent=local)
     elif request.query_params.get("signin") == "1" or not _console_cookie_ok(request):
         if not (relay or POCKET_CONSOLE_QR_LOGIN):
@@ -12791,12 +12804,18 @@ p{margin:0;line-height:1.6}.sub{color:var(--muted);font-size:.93rem}
 code{font-size:.74rem;word-break:break-all;color:var(--muted)}
 .st{margin-top:14px;font-size:.95rem;font-weight:600}
 .bad{color:var(--bad)}
+/* 逃生門那行(手機不在手邊 → 配對碼)。掃碼成了主路徑之後,這是唯一的備援,
+   所以要看得見、可鍵盤聚焦,不是視覺上的裝飾。 */
+.note{margin:16px 0 0;font-size:.82rem;color:var(--muted);text-align:center;line-height:1.7}
+.note a{color:var(--accent);text-decoration:underline;text-underline-offset:3px}
+.note a:focus-visible{outline:2px solid var(--accent);outline-offset:3px;border-radius:4px}
 </style></head><body><main>
 <h1>用手機批准這次登入</h1>
 %(instruction)s
 <p class="st" id="st">等待手機批准…（<span id="t">%(ttl)d</span> 秒內有效）</p>
 <p class="sub" id="hint" style="margin-top:8px">
   如果這不是你現在面前的電腦，請在手機上按「不是我」。</p>
+%(escape)s
 <script>
 // 輪詢:2 秒一次。state=approved 時伺服器已種好 cookie,直接進 console。
 var left = %(ttl)d, st = document.getElementById('st'), t = document.getElementById('t');
@@ -12823,6 +12842,13 @@ setTimeout(poll, 2000);
                         '<p class="sub">打開 Pocket 掃這個 QR，在手機上按「批准」。</p>'
                         '<div class="card"><div class="qr">' + svg + '</div>'
                         '<p class="sub">掃不到？用 Pocket 開這個連結：</p><code>' + payload + '</code></div>'),
+        # 逃生門一定要看得見:掃碼成為主路徑之後(2026-11-18,見 console_page
+        # 的分流註解),手機不在手邊的人只剩這條路進得來 —— 藏在 `?code=1`
+        # 而頁面上不明說,等於把人鎖在門外。放在倒數,讓「等待批准」的狀態
+        # 緊跟著 QR(那是主流程),逃生門收在最後。
+        "escape": ('<p class="note"><a href="/console?code=1">手機不在手邊？改用配對碼登入</a>'
+                   '<br><span class="en"><a href="/console?code=1">'
+                   'No phone handy? Sign in with a pairing code</a></span></p>'),
         "ttl": int(_CONSOLE_LOGIN_TTL),
     }
 
@@ -12848,8 +12874,15 @@ def _console_qr_login_response(request: Request, entry_key=None) -> Response:
             status_code=503,
             detail="這台主機同時進行的登入請求太多,請過一分鐘再試一次",
             headers={"Retry-After": "60"})
+    # 401 而不是 200(2026-11-18 統一):這頁是**登入挑戰**,跟
+    # `_console_login_response` 同一種東西,語意就是「還沒認證」。
+    # 兩頁原本一個 200 一個 401;掃碼成為所有入口的主路徑之後,同一頁會同時
+    # 服務本機與遠端,狀態碼再按呼叫端分岔就是個遲早咬人的接縫
+    # (監控抓 401、探活判 200,兩邊都會讀錯)。
+    # 快取不是考量點:service worker 本來就明寫「/console 的導覽永不快取」
+    # (`static/console/sw.js`),因為同一個 URL 可能回登入頁也可能回工作台。
     resp = HTMLResponse(_console_qr_login_html(rid, routed=bool(entry_key)),
-                        headers=_CONSOLE_SECURITY_HEADERS)
+                        status_code=401, headers=_CONSOLE_SECURITY_HEADERS)
     resp.set_cookie(
         _CONSOLE_LOGIN_SID_COOKIE, sid,
         httponly=True, samesite="strict",
