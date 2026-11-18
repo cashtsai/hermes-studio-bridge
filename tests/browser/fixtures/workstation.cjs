@@ -15,6 +15,7 @@ async function workstation(t, standalone = false, options = {}) {
       res.writeHead(status, {"Content-Type":type,"Cache-Control":"no-store"}); res.end(body);
     };
     const json = data => send("application/json",JSON.stringify(data));
+    if (options.handle && await options.handle(req,res,url,model)) return;
     if (url.pathname === "/setup" || url.searchParams.has("signin")) return send("text/html","<title>Fixture</title>");
     if (url.pathname === "/console/logout") return json({revoked:true});
     if (url.pathname === "/app/v2/sessions") return json({sessions:model.jobs,

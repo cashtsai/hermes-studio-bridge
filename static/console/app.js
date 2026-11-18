@@ -148,6 +148,7 @@ let leaveRequest = false;
 async function leaveConsole(broadcast = false) {
   if (leaveRequest) return;
   signingOut = true;
+  window.PocketSessionOps?.leave();
   forgetWork();
   writeHash(null);
   leaveRequest = true;
@@ -323,10 +324,11 @@ function renderSessions() {
     for (const s of rows) {
       const active = s.id === state.current ? " active" : "";
       const locked = s.meta && s.meta.locked ? ' 🔒' : "";
-      html += '<div class="sess' + active + '" data-id="' + esc(s.id) + '">' +
+      html += '<div class="session-row"><div class="sess' + active + '" data-id="' + esc(s.id) + '">' +
               '<div class="sess-name">' + esc(s.title || s.id) + locked + "</div>" +
               '<div class="sess-sub"><span class="st st-' + esc(s.status || "idle") + '">' +
-              esc(workPhase(s)) + "</span> " + esc(s.subtitle || "") + "</div></div>";
+              esc(workPhase(s)) + "</span> " + esc(s.subtitle || "") + "</div></div>" +
+              (window.PocketSessionOps?.menuButton(s) || "") + "</div>";
     }
     if (!rows.length) html += '<div class="provider-empty">' + (dim ? "暫時無法讀取" : "無對話") + '</div>';
     html += "</div>";
@@ -457,9 +459,9 @@ function resetHistory() {
 }
 function updateOlderButton() {
   const b = $("earlier-cards");
-  b.hidden = !olderCursor;
+  b.hidden = !olderCursor && !(state.current && canUse("history"));
   b.disabled = loadingOlder;
-  b.textContent = loadingOlder ? "載入中…" : "更早訊息";
+  b.textContent = loadingOlder ? "載入中…" : olderCursor ? "更早訊息" : "更早訊息（逐字稿）";
   b.classList.toggle("working", loadingOlder);
 }
 function openSession(id, preserveMode = false) {
@@ -568,6 +570,7 @@ async function loadCardSnapshot(id, view, delay = 1000) {
     if (snap.status && snap.status.phase) updateStatusChip(snap.status.phase, snap.status);
     confirmEcho(id, state.cards);
     state.snapshotView = view;
+    window.PocketSessionOps?.scheduleRead();
     if (canUse("follow")) subscribeCards(id, view);
     else setStreamHealth("對話快照");
   } catch (err) {
@@ -594,7 +597,8 @@ async function loadCardSnapshot(id, view, delay = 1000) {
 //   ‧ 有 approval_id 時一律帶上 —— bridge 會走統一的 _approval_decide_core
 async function loadOlderCards() {
   const { current: id, view } = state, cursor = olderCursor;
-  if (!cursor || loadingOlder || !canUse("replay")) return;
+  if (loadingOlder || !canUse("replay")) return;
+  if (!cursor) { if (canUse("history")) window.PocketSessionOps?.history(currentSession()); return; }
   loadingOlder = true; updateOlderButton();
   try {
     const page = await apiJSON("/app/v2/sessions/" + encodeURIComponent(id) +
@@ -609,8 +613,9 @@ async function loadOlderCards() {
     renderCards(true); // Paging never advances the live SSE cursor.
   } catch (err) {
     if (!currentView(view) || olderCursor !== cursor) return;
-    if (err.status === 409) olderCursor = null;
-    toast(err.status === 409 ? "這段歷史已超出主機保留範圍" : "更早訊息讀取失敗");
+    if (err.status === 409 && canUse("history")) {
+      olderCursor = null; window.PocketSessionOps?.history(currentSession());
+    } else toast(err.status === 409 ? "主機沒有可接續的逐字稿" : "更早訊息讀取失敗");
   } finally {
     if (currentView(view)) { loadingOlder = false; updateOlderButton(); }
   }
@@ -620,25 +625,66 @@ function currentSession() {
 }
 
 function borrowed() { return document.body.dataset.consoleAccess === "remote"; }
-function canUse(cap) {
-  return !borrowed() || !!(state.listHealth === "ready" && currentSession()?.capabilities?.includes(cap));
+
+// ── 能力驅動(fail-open + hide-only,抄 iOS `ProviderCapsStore`)──────────
+//
+// 舊版 `canUse` 的第一個條件是 `!borrowed()` → 在自己家的 console 上**無條件
+// 放行**,bridge 每列都給的 per-session `capabilities` 完全沒作用(宣告了
+// 也沒人讀)。改成兩種語意分開:
+//
+//   · 借用的電腦(console-remote):`capabilities` 是**授權**白名單 ——
+//     沒宣告 = 不准。這條不動(安全面,fail-closed 是對的)。
+//   · 自己的電腦:`capabilities` 是**能力**宣告 —— fail-open + hide-only。
+//     不知道(清單還沒就緒 / 這一列沒帶 capabilities)→ 放行,行為與今天
+//     一個像素不差;只有「明確宣告了、而且就是沒有這一項」才隱藏。
+//
+// `CAP_VOCAB` 是「缺席才有意義」的詞彙白名單 —— **不在表內的能力一律放行**。
+// 為什麼需要這張表:per-session `capabilities` 的缺席不是每個詞都代表
+// 「不支援」。
+//   · `changes` 只有 `_console_remote_list()` 會加(借用機的檔案授權旗標),
+//     本機清單永遠不帶 → 放進表內等於把本機的「變更」檢視整個藏掉。
+//   · `interrupt` 在 hermes 人格列沒宣告(bridge.py:22067),但
+//     `/app/v2/sessions/{id}/interrupt` 的 `hp` 分支是**真的通**的
+//     (bridge.py:23066)→ 放進表內會藏掉一個現在就能用的功能。
+// 兩個都是「本機模式不該突然藏掉原本能用的東西」的實例,所以刻意缺席。
+const CAP_VOCAB = new Set(["input", "attachments", "replay", "follow", "approve",
+  "rename", "archive", "history", "config_read", "config_write", "compact", "read_cursor"]);
+const OP_CAP_VOCAB = new Set(["rename", "archive", "history", "config_read", "config_write", "compact", "read_cursor"]);
+function canUse(cap, session = currentSession()) {
+  const caps = session?.capabilities;
+  if (borrowed()) return !!(state.listHealth === "ready" && caps?.includes(cap));
+  if (state.listHealth !== "ready" || !CAP_VOCAB.has(cap)) return true;   // 不知道 → 不藏
+  if (OP_CAP_VOCAB.has(cap)) {
+    // Session capabilities predate these ops; only the provider matrix can deny them.
+    const declared = typeof window === "undefined" ? undefined : window.PocketSessionOps?.capability(cap, session);
+    return declared !== false;
+  }
+  return !Array.isArray(caps) || caps.includes(cap);
 }
 function syncControls() {
+  window.PocketSessionOps?.syncControls();
+  updateOlderButton();
   $("personal-work").hidden = !personalDevice();
   $("remember-work").checked = !!resumePreference();
-  if (!borrowed()) return;
-  const changes = canUse("changes");
-  if (!changes && document.body.classList.contains("can-view-changes")) {
-    for (const id of ["rail-list","ch-list","ch-diff"]) $(id).replaceChildren();
+  // 變更檢視的收斂只在借用機上做 —— `changes` 是 console-remote 專屬的授權
+  // 旗標(見 CAP_VOCAB 註解),本機沒有「被收回」這回事。
+  if (borrowed()) {
+    const changes = canUse("changes");
+    if (!changes && document.body.classList.contains("can-view-changes")) {
+      for (const id of ["rail-list","ch-list","ch-diff"]) $(id).replaceChildren();
+    }
+    document.body.classList.toggle("can-view-changes", changes);
+    if (!changes && !$("changes-view").classList.contains("hidden")) window.PocketConsoleMode?.set("agents");
   }
-  document.body.classList.toggle("can-view-changes", changes);
-  if (!changes && !$("changes-view").classList.contains("hidden")) window.PocketConsoleMode?.set("agents");
   if (state.current) {
     $("composer").classList.toggle("hidden", !canUse("input"));
     $("attach").classList.toggle("hidden", !canUse("attachments"));
     $("interrupt").classList.toggle("hidden", !(canUse("interrupt") && state.busy));
     $("read-only").classList.toggle("hidden", canUse("input"));
-    $("read-only").textContent = state.listHealth === "failed" ? "清單未更新，暫停操作" : "這台電腦只能閱讀此對話";
+    // 同一個節點現在兩種模式共用 —— 本機看到它代表「這個 provider 沒宣告
+    // input」,講成「這台電腦只能閱讀」會把人帶到錯的方向。
+    $("read-only").textContent = state.listHealth === "failed" ? "清單未更新，暫停操作"
+      : borrowed() ? "這台電腦只能閱讀此對話" : "這個對話目前不接受輸入";
   } else $("read-only").classList.add("hidden");
 }
 
@@ -650,60 +696,271 @@ function approvalIdOf(meta) {
 
 const deciding = new Set();
 const handledApproval = new Map();
+// approval.resolved(bridge.py:3093)收到即收卡 —— 不留懸空:別的端答掉了,
+// 這裡不該還掛著一顆按下去吃 409 的按鈕。只存 aid,上限防無限長大。
+const resolvedApprovals = new Set();
+function noteApprovalResolved(aid) {
+  if (!aid) return;
+  if (resolvedApprovals.size > 400) resolvedApprovals.clear();
+  resolvedApprovals.add(String(aid));
+}
 let approvalExpiry;
 function actionable(s) {
   if (!s || state.listHealth !== "ready" || state.degraded.includes(s.provider)) return false;
-  if ((borrowed() || Array.isArray(s.capabilities)) && !s.capabilities?.includes("approve")) return false;
   const a = s.meta?.approval, aid = approvalIdOf(s.meta);
+  // 借用機:白名單(沒宣告=不准)。本機:宣告了卻沒 approve 才擋(見 canUse)。
+  if ((borrowed() || Array.isArray(s.capabilities)) && !s.capabilities?.includes("approve")) return false;
   if (a?.status && a.status !== "pending") return false;
+  if (aid && resolvedApprovals.has(String(aid))) return false;
   const exp = activityTime(a?.expires_at);
   if (exp && exp <= Date.now()) return false;
   if (aid) return handledApproval.get(s.id) !== JSON.stringify([aid, s.meta.approval?.q_index ?? null]);
   return document.body.dataset.consoleAccess !== "remote" && !!s.meta?.prompt?.options?.length;
 }
+
+// ── 審批的單一讀取點 ───────────────────────────────────────────────────
+// 三個資料源(CC 的 `meta.prompt`、統一物件 `meta.approval`、借用機的
+// `meta.console_options`)在這裡收斂成一個形狀,下游只讀這一份,不再各自長 if。
+//
+// options 以 prompt 為主(直接解 pane,比 watcher 寫的 DB 列新鮮),但**把統一
+// 物件的 style/description 依 key 疊回去**:`style` 只有統一物件有
+// (`_cc_approval_payload` 標的),丟掉它就等於丟掉「哪顆是拒絕」——
+// 那正是鍵盤 `d` 會按到選單最後一項的真兇。
+const APPROVAL_RISK = {
+  low: ["低風險", "low"], medium: ["中風險", "medium"], high: ["高風險", "high"],
+  normal: ["一般", "low"], danger: ["高風險", "high"],   // gemini 用的字彙
+};
+const APPROVAL_ICON = { question: "❓", notice: "🔔" };
+const APPROVAL_MAX_OPTS = 24;   // 防爆上限;超過的部分**明示**,不靜默吃掉
+
+function approvalView(s) {
+  const meta = (s && s.meta) || {};
+  const prompt = meta.prompt || null;
+  const a = meta.approval || null;
+  const am = (a && a.meta) || {};
+  const base = borrowed() ? meta.console_options
+    : (prompt?.options?.length ? prompt.options : a?.options);
+  const styled = new Map((a?.options || []).map(o => [String(o.key), o]));
+  const options = (Array.isArray(base) ? base : [])
+    .filter(o => o && o.key !== undefined && o.key !== null && String(o.key) !== "")
+    .map(o => {
+      const ref = styled.get(String(o.key)) || {};
+      const checked = o.checked !== undefined ? o.checked : ref.checked;
+      return {
+        key: String(o.key),
+        label: String(o.label == null || o.label === "" ? o.key : o.label),
+        style: String(o.style || ref.style || ""),
+        description: String(o.description || ref.description || ""),
+        checked: checked === undefined || checked === null ? null : !!checked,
+      };
+    });
+  const int = v => (Number.isInteger(v) ? v : null);
+  const firstBool = (...xs) => { for (const x of xs) if (typeof x === "boolean") return x; return false; };
+  return {
+    identity: [s?.id, approvalIdOf(meta)],
+    title: String(prompt?.title || a?.title || "等待你放行"),
+    detail: String(a?.detail || ""),
+    risk: String(a?.risk || "").toLowerCase(),
+    kind: String(a?.kind || (prompt?.semantic === "question" ? "question" : prompt ? "permission" : "")),
+    options,
+    multiselect: firstBool(prompt?.multiselect, am.multiselect, a?.multiselect),
+    qIndex: int(prompt?.q_index ?? am.q_index ?? a?.q_index),
+    qTotal: int(prompt?.q_total ?? am.q_total ?? a?.q_total),
+    submitLabel: String(prompt?.submit_label || ""),
+    // ⚠️ wire 用的 q_index **只認統一物件頂層那顆**(codex question 專屬)。
+    // 借用機的授權守門比對 body 欄位集合(bridge.py:22647),對 CC 多送一個
+    // expected_q_index 會直接 403 —— 顯示用的 qIndex 不准流到線上。
+    wireQIndex: int(a?.q_index),
+  };
+}
+
+// 只有 CC 的 TUI 數字鍵該顯示前綴。`approve_for_session`/`allow-always`/`ack`
+// 這類內部識別字印在按鈕上只是雜訊(「ack. 知道了」)。
+function approvalOptionLabel(o) {
+  return (/^[0-9]$/.test(o.key) ? o.key + ". " : "") + o.label;
+}
+// bridge 產 options 時就標好語意(APPROVAL_HUB_SPEC §1:`style: danger` =
+// 否決類)。這裡只做映射,**不猜 label**。`deny` 是舊字彙,等同 danger。
+function approvalStyleClass(style) {
+  if (style === "primary" || style === "success") return "ap-yes";
+  if (style === "danger" || style === "deny") return "ap-no ap-danger";
+  return "ap-neutral";
+}
+
+// 複選的勾選狀態。identity 必須含題目/題號 —— 多題 ask 的選項鍵恆為 1|2|3,
+// 只看鍵會偵測不到換題、把上一題的勾選帶著送出(iOS 同款教訓)。
+let msIdentity = null, msSelected = null;
+function msReset() { msIdentity = null; msSelected = null; }
+function msState(view) {
+  const id = JSON.stringify([view.identity, view.qIndex, view.title, view.options.map(o => o.key)]);
+  if (msIdentity !== id || !msSelected) {
+    msIdentity = id;
+    // 用終端當下的勾選播種:使用者可能已在 tmux 裡勾過幾個,從空集合開始送出
+    // 會把那些 toggle 掉(/answer 收的是「作答後應該被勾選的完整集合」)。
+    msSelected = new Set(view.options.filter(o => o.checked === true).map(o => o.key));
+  }
+  return msSelected;
+}
+
 function renderApproval() {
   clearTimeout(approvalExpiry);
   const bar = $("approval");
-  const s = currentSession();
-  const meta = (s && s.meta) || {};
-  const prompt = meta.prompt;
+  const s = window.PocketSessionOps?.approvalSession() || currentSession();
+  if (!actionable(s)) { bar.classList.add("hidden"); msReset(); return; }
+  const meta = s.meta || {};
   const aid = approvalIdOf(meta);
-  const index = meta.approval?.q_index;
-  const choices = borrowed() ? meta.console_options : (prompt?.options?.length ? prompt.options : meta.approval?.options);
-  const opts = Array.isArray(choices) && choices.length ? choices : null;
+  const view = approvalView(s);
+  const index = view.wireQIndex;
 
   const expires = activityTime(meta.approval?.expires_at);
-  if (!actionable(s)) { bar.classList.add("hidden"); return; }
   if (expires) approvalExpiry = setTimeout(() => { renderApproval(); renderAwaiting(); renderHome(); }, Math.min(Math.max(1, expires - Date.now() + 1), 2147483647));
   bar.classList.remove("hidden");
-  $("ap-title").textContent =
-    (prompt && prompt.title) || (meta.approval && meta.approval.title) || "等待你放行";
+  $("ap-icon").textContent = APPROVAL_ICON[view.kind] || "🔐";
+  $("ap-title").textContent = view.title;
+
+  // risk / detail:規範欄位,bridge 每家都填 —— 不顯示就是盲簽。
+  const risk = APPROVAL_RISK[view.risk];
+  const riskEl = $("ap-risk");
+  riskEl.className = "ap-risk" + (risk ? " ap-risk-" + risk[1] : "");
+  riskEl.textContent = risk ? risk[0] : "";
+  riskEl.classList.toggle("hidden", !risk);
+
+  const detailEl = $("ap-detail");
+  detailEl.textContent = view.detail;
+  detailEl.classList.toggle("hidden", !view.detail);
+
+  // 「第 2/3 題」—— 使用者唯一能知道「還有幾題」的地方。
+  const prog = $("ap-progress");
+  prog.textContent = !(view.qTotal > 1) ? ""
+    : view.qIndex === null ? "共 " + view.qTotal + " 題"
+    : "第 " + (view.qIndex + 1) + "/" + view.qTotal + " 題";
+  prog.classList.toggle("hidden", !prog.textContent);
 
   const box = $("ap-actions");
-  box.innerHTML = "";
-  if (opts) {
-    // 有選項就照選項畫(CC 的數字選單/權限提示;label 可能是任何語言)
-    opts.slice(0, 8).forEach((o) => {
-      const b = document.createElement("button");
-      b.className = "ap-btn";
-      b.textContent = (o.key ? o.key + ". " : "") + (o.label || "");
-      b.addEventListener("click", () => decide(s.id, aid, index, { key: String(o.key) }, b));
-      box.appendChild(b);
-    });
-  } else {
+  box.replaceChildren();
+  const shown = view.options.slice(0, APPROVAL_MAX_OPTS);
+  const hidden = view.options.length - shown.length;
+  $("ap-more").textContent = hidden > 0 ? "還有 " + hidden + " 個選項沒顯示，請在終端機或 App 作答" : "";
+  $("ap-more").classList.toggle("hidden", hidden <= 0);
+
+  let hint = "";
+  if (!view.options.length) {
+    // 沒有 options 的審批(codex 二元核准)才用寫死的兩鍵。
     const yes = document.createElement("button");
     yes.className = "ap-btn ap-yes"; yes.textContent = "核准";
     yes.addEventListener("click", () => decide(s.id, aid, index, { approve: true }, yes));
     const no = document.createElement("button");
-    no.className = "ap-btn ap-no"; no.textContent = "否決";
+    no.className = "ap-btn ap-no ap-danger"; no.textContent = "否決";
     no.addEventListener("click", () => decide(s.id, aid, index, { approve: false }, no));
     box.append(yes, no);
+  } else if (view.multiselect) {
+    // ── P0-1:AskUserQuestion 複選 ──
+    // 舊版把每個選項當「點了就送」→ 送 {key:"3"} 走 `_cc_key_core`,那是
+    // **只按一個數字鍵 = 只 toggle 一個框、永遠不按送出**:畫面完全沒變,
+    // 再點一次還把前一次取消。正解是 bridge 早就備好的
+    // `POST /ccsessions/{name}/answer`(keys = 作答後應被勾選的完整集合)。
+    const picked = msState(view);
+    const anyBox = view.options.some(o => o.checked !== null);
+    const isBox = o => !anyBox || o.checked !== null;   // 一列 checked 都沒送 → 全部可勾
+    const ccName = s.provider === "claude_code" ? s.id.slice(s.id.indexOf(":") + 1) : "";
+    const canAnswer = !borrowed() && !!ccName && (!s._hub || s._hubPromptCurrent);
+    for (const o of shown) {
+      const b = document.createElement("button");
+      if (!isBox(o)) {
+        // 純動作列(「自行輸入…」/「與 Claude 討論」):TUI 語意就是單鍵即送。
+        b.className = "ap-btn ap-neutral";
+        b.textContent = approvalOptionLabel(o);
+        b.addEventListener("click", () => decide(s.id, aid, index, { key: o.key }, b));
+      } else {
+        const on = picked.has(o.key);
+        b.className = "ap-btn ap-check" + (on ? " on" : "");
+        b.setAttribute("aria-pressed", on ? "true" : "false");
+        b.textContent = (on ? "☑ " : "☐ ") + approvalOptionLabel(o);
+        b.disabled = !canAnswer;
+        b.addEventListener("click", () => {        // 純前端 toggle,不打網路
+          if (picked.has(o.key)) picked.delete(o.key); else picked.add(o.key);
+          renderApproval();
+        });
+      }
+      if (o.description) b.title = o.description;
+      box.appendChild(b);
+    }
+    const keys = view.options.filter(o => isBox(o) && picked.has(o.key)).map(o => o.key);
+    const sub = document.createElement("button");
+    sub.className = "ap-btn ap-submit";
+    sub.textContent = (view.submitLabel || "送出") + (keys.length ? "（已選 " + keys.length + " 項）" : "");
+    sub.disabled = !keys.length || !canAnswer;
+    sub.addEventListener("click", () => answerMulti(s.id, ccName, keys, sub));
+    box.appendChild(sub);
+    hint = s._hub && !s._hubPromptCurrent ? "此待審項目不是終端目前的題目，請重新整理清單確認"
+      : canAnswer ? "可複選 —— 勾好後按送出"
+      : "這張是複選題，請在本機 console、App 或終端機作答";
+  } else {
+    for (const o of shown) {
+      const b = document.createElement("button");
+      b.className = "ap-btn " + approvalStyleClass(o.style);
+      b.textContent = approvalOptionLabel(o);
+      if (o.description) b.title = o.description;
+      b.addEventListener("click", () => decide(s.id, aid, index, { key: o.key }, b));
+      box.appendChild(b);
+    }
+  }
+  $("ap-hint").textContent = hint;
+  $("ap-hint").classList.toggle("hidden", !hint);
+  if (["not_resumable", "none"].includes(meta.approval?.response_capability)) {
+    box.querySelectorAll("button").forEach(b => b.disabled = true);
+    $("ap-hint").textContent = "主機已無等待中的請求，無法作答";
+    $("ap-hint").classList.remove("hidden");
   }
   if (deciding.has(s.id)) box.querySelectorAll("button").forEach(b => b.disabled = true);
 }
 
+// P0-1 的送出路徑。body 的 `keys` 是**作答後應該被勾選的完整集合**
+// (bridge.py:20971 的 docstring:TUI 數字是 toggle,盲送會把使用者已勾的
+// 切掉),`submit=true` 讓 bridge 走到內嵌送出鈕按下去。
+// 這條路只有本機 console 走得到 —— console-remote 的路徑白名單只開
+// `/app/v2/sessions/{id}/{op}`(bridge.py:947),所以借用機不畫送出鈕。
+async function answerMulti(id, name, keys, btn) {
+  if (!id || id !== state.current || deciding.has(id) || signingOut) return;
+  const session = window.PocketSessionOps?.approvalSession() || currentSession();
+  if (!name || !keys.length || borrowed() || !actionable(session) || (session._hub && !session._hubPromptCurrent) ||
+      ["not_resumable", "none"].includes(session.meta?.approval?.response_capability)) return;
+  deciding.add(id);
+  const box = $("ap-actions");
+  box.querySelectorAll("button").forEach((b) => (b.disabled = true));
+  if (btn) btn.classList.add("ap-busy");
+  try {
+    const r = await api("/ccsessions/" + encodeURIComponent(name) + "/answer", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ keys, submit: true }),
+    });
+    if (!r.ok) {
+      const e = await r.json().catch(() => ({}));
+      const code = (e.error && e.error.code) || "";
+      if (r.status === 409 && ["PROMPT_STALE", "STALE_QUESTION"].includes(code))
+        throw new Error("這個問題已經換頁或結束，請看最新訊息");
+      // 老 bridge 沒鋪這條路 → **老實說**,不降級送單鍵(送了就是在複選選單
+      // 裡亂 toggle,還回報成功 —— app 側同一個拍板,見 CCCardSessionView)。
+      if ([404, 405].includes(r.status) && code !== "SESSION_NOT_FOUND")
+        throw new Error("這台 bridge 還沒支援複選作答，請更新 bridge 或改在終端機作答");
+      throw new Error((e.error && e.error.message) || ("HTTP " + r.status));
+    }
+    const receipt = await r.json().catch(() => ({}));
+    if (!signingOut && state.current === id)
+      toast(receipt.submitted === false ? "已送出，請接著答下一題" : "已送出選擇");
+  } catch (err) {
+    if (!signingOut && state.current === id) toast("無法送出選擇：" + err.message);
+  } finally {
+    deciding.delete(id);
+    msReset();            // 下一輪照終端現況重新播種
+    if (!signingOut) { renderApproval(); renderAwaiting(); renderHome(); loadSessions(); }
+  }
+}
+
 async function decide(id, aid, index, choice, btn) {
-  if (!id || id !== state.current || deciding.has(id) || signingOut || !actionable(currentSession())) return;
+  const session = window.PocketSessionOps?.approvalSession() || currentSession();
+  if (!id || id !== state.current || deciding.has(id) || signingOut || !actionable(session)) return;
+  if (["not_resumable", "none"].includes(session.meta?.approval?.response_capability)) return;
   if (!aid && document.body.dataset.consoleAccess === "remote") return;
   deciding.add(id);
   const body = Object.assign({}, choice, aid ? { approval_id: aid } : {});
@@ -714,7 +971,9 @@ async function decide(id, aid, index, choice, btn) {
   box.querySelectorAll("button").forEach((b) => (b.disabled = true));
   if (btn) btn.classList.add("ap-busy");
   try {
-    const r = await api("/app/v2/sessions/" + encodeURIComponent(id) + "/approve", {
+    const path = session?._hub ? "/app/v1/approvals/" + encodeURIComponent(aid) + "/decision"
+      : "/app/v2/sessions/" + encodeURIComponent(id) + "/approve";
+    const r = await api(path, {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
     });
@@ -726,18 +985,21 @@ async function decide(id, aid, index, choice, btn) {
     }
     const receipt = await r.json();
     if (aid) handledApproval.set(id, step);
-    if (!signingOut && state.current === id) toast(receipt.idempotent ? "這項核准已處理" : "已送出決定");
+    if (session?._hub && aid) window.PocketSessionOps?.resolved(aid, receipt);
+    if (!signingOut && state.current === id) toast(receipt.status === "next_question" ? "已送出，請接著答下一題"
+      : receipt.idempotent ? "這項核准已處理" : "已送出決定");
   } catch (err) {
     if (!signingOut && state.current === id) toast("無法確認決定：" + err.message);
   } finally {
     deciding.delete(id);
+    msReset();
     if (!signingOut) { renderApproval(); renderAwaiting(); renderHome(); loadSessions(); }
   }
 }
 
-// 跨 session 彙總:有幾件在等你。資料來源同上(sessions 的 meta/status),
-// 不必另外打 /app/v1/approvals —— 列表本來就每次都抓。
+// 跨 session 彙總:本機從 hub 計算 approval 數;借用機僅看授權 session,不讀全域 hub。
 function renderAwaiting() {
+  if (window.PocketSessionOps?.renderAwaiting()) return;
   const n = state.sessions.filter(actionable).length;
   const el = $("awaiting");
   $("awaiting-n").textContent = String(n);
@@ -747,6 +1009,7 @@ function renderAwaiting() {
 
 // 點徽章 → 跳到第一條在等的 session
 function jumpToAwaiting() {
+  if (window.PocketSessionOps?.toggleHub()) return;
   const s = state.sessions.find(actionable);
   if (s) openSession(s.id);
 }
@@ -1111,6 +1374,7 @@ function trackCardScroll(el) {
   // scrollTop can be fractional; this is rounding tolerance, not a follow zone.
   cardScroll.follow = el.scrollHeight - el.clientHeight - el.scrollTop <= 1;
   if (cardScroll.follow) $("new-reply").hidden = true;
+  window.PocketSessionOps?.scheduleRead();
 }
 
 function renderCards(prepending = false) {
@@ -1145,6 +1409,7 @@ function renderCards(prepending = false) {
   else if (prepending) el.scrollTop = oldTop + el.scrollHeight - oldHeight;
   cardScroll.top = el.scrollTop; // Our anchor correction is not a reader gesture.
   hydrateCardMedia();
+  window.PocketSessionOps?.scheduleRead();
 }
 
 function setStreamHealth(label, working = false) {
@@ -1330,6 +1595,7 @@ function autosize() {
 
 // ───────────────────────── 綁定 + 啟動 ─────────────────────────
 function wire() {
+  window.PocketSessionOps?.init();
   $("new-reply").addEventListener("click", () => {
     const el = $("cards");
     el.scrollTop = el.scrollHeight;
@@ -1451,12 +1717,18 @@ function moveSelection(delta) {
   const next = ids[Math.max(0, Math.min(ids.length - 1, (i < 0 ? 0 : i + delta)))];
   if (next && next !== state.current) openSession(next);
 }
+// 鍵盤 `a`(核准)/ `d`(否決)要按到哪一顆。
+//
+// ⚠️ **查不到就回 null,不猜。** 舊版找不到 `.ap-yes`/`.ap-no` 就退回
+// `btns[btns.length - 1]`,而資料驅動的按鈕以前根本沒掛這兩個 class ——
+// 於是 `d` 按的是選單最後一項,那可能是「本次全允許」之類的破壞性選項:
+// 想否決的人反而一次放行到底。語意只認 bridge 標在 option 上的 `style`
+// (APPROVAL_HUB_SPEC §1),沒標語意的選單(question / 複選)就沒有快捷鍵。
 function firstApprovalButton(wantYes) {
-  if ($("approval").classList.contains("hidden") || !actionable(currentSession())) return null;
-  const btns = Array.from($("ap-actions").querySelectorAll("button"));
-  if (!btns.length) return null;
-  const hit = btns.find((b) => b.classList.contains(wantYes ? "ap-yes" : "ap-no"));
-  return hit || (wantYes ? btns[0] : btns[btns.length - 1]);
+  if ($("approval").classList.contains("hidden") ||
+      !actionable(window.PocketSessionOps?.approvalSession() || currentSession())) return null;
+  const sel = wantYes ? "button.ap-yes" : "button.ap-no";
+  return $("ap-actions").querySelector(sel + ":not(:disabled)") || null;
 }
 // ── IME 三重判準(中文/日文選字按 Enter 不准送出)────────────────────────
 // 1. `event.isComposing` —— 多數引擎在組字期間的標準訊號。
@@ -1486,6 +1758,7 @@ function wireKeys() {
   window.addEventListener("blur", imeReset);
   document.addEventListener("keydown", (e) => {
     if (imeKey(e)) return;
+    if ($("session-ops")?.open) return; // Native dialog owns focus and Escape.
     if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
       e.preventDefault(); openPalette(); return;
     }
@@ -1496,7 +1769,7 @@ function wireKeys() {
       if (rows.length && ["ArrowDown", "ArrowUp"].includes(e.key)) {
         e.preventDefault();
         rows[Math.max(0, Math.min(rows.length - 1, i + (e.key === "ArrowDown" ? 1 : -1)))].focus();
-      } else if (e.key === "Enter" && document.activeElement === $("pal-q") && rows.length) {
+      } else if (!imeKey(e) && e.key === "Enter" && document.activeElement === $("pal-q") && rows.length) {
         e.preventDefault(); rows[0].click();
       }
       return;
@@ -1658,6 +1931,8 @@ async function main() {
   await identifyPersonalLogin();
   if (sessionStorage.getItem(LOGOUT_EVENT)) { await leaveConsole(); return; }
   await loadSessions();
+  void window.PocketSessionOps?.loadCapabilities();
+  void window.PocketSessionOps?.loadHub();
   if (signingOut) return;
   if (document.body.dataset.consoleAccess !== "remote") {
     loadUsage(); setInterval(() => { if (!signingOut) loadUsage(); }, 120000);
@@ -1680,7 +1955,7 @@ async function main() {
     onEvent: ({data}) => {
       if (!Number.isSafeInteger(data?.seq) || data.seq <= listCursor) return;
       listCursor = data.seq;
-      scheduleListRefresh();
+      handleListEvent(data);
     },
     onError: () => setConn(false, "事件流斷線,重連中…"),
     onOpen: () => {},
@@ -1689,5 +1964,23 @@ async function main() {
 }
 let listTimer = null;
 function scheduleListRefresh() { clearTimeout(listTimer); listTimer = setTimeout(loadSessions, 800); }
+
+// 全域事件分派。舊版**連 `data.type` 都沒讀**,每一種型別都塌縮成同一個
+// 800ms debounce 重抓 —— `approval.resolved`(bridge.py:3093)就是為了
+// 「所有端收到即收卡,不留懸空」才加的 persisted 事件,被當成刷新鈴等於
+// 把它的意義丟掉:別的端答掉之後,這裡還掛著一顆按下去吃 409 的按鈕。
+//
+// 刻意只特判這一個型別,其餘維持現狀(debounce 重抓)—— 不擴大戰線。
+function handleListEvent(ev) {
+  window.PocketSessionOps?.onEvent(ev);
+  if (ev?.type === "approval.resolved") {
+    noteApprovalResolved(ev.data?.approval_id);
+    renderApproval(); renderAwaiting(); renderHome(); renderSessions();
+    clearTimeout(listTimer); listTimer = null;
+    loadSessions();          // 立即對帳,不等 debounce
+    return;
+  }
+  scheduleListRefresh();
+}
 
 main();

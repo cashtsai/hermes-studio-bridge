@@ -159,6 +159,47 @@ body{background:var(--bg);color:var(--text);font-family:var(--sans);
 .sess{padding:8px 10px;border-radius:var(--field-radius);cursor:pointer;margin-bottom:2px;}
 .sess:hover{background:var(--surface-hover);}
 .sess.active{background:var(--surface-selected);box-shadow:inset 3px 0 0 var(--accent);}
+.session-row{display:flex;align-items:center;min-width:0;}
+.session-row .sess{flex:1;min-width:0;}
+.sess-more{flex:none;min-width:44px;min-height:44px;}
+.sh-actions{flex-wrap:wrap;}
+.sh-actions .icon-btn{min-width:44px;min-height:44px;font-size:20px;}
+#ops-notices:empty{display:none;}
+#ops-notices{max-height:24dvh;overflow:auto;flex:none;background:var(--panel);}
+.op-notice{display:flex;align-items:center;gap:8px;padding:8px 16px;border-bottom:1px solid var(--line);font-size:14px;}
+.op-notice span{flex:1;min-width:0;overflow-wrap:anywhere;}
+.op-error{color:var(--bad);}
+#session-ops{width:min(680px,calc(100% - 24px));max-height:calc(100dvh - 32px);box-sizing:border-box;
+  padding:20px;border:1px solid var(--line);border-radius:8px;background:var(--panel);color:var(--text);}
+#session-ops::backdrop{background:rgb(0 0 0 / .4);}
+#session-ops header,#approval-hub header{display:flex;align-items:center;gap:12px;}
+#session-ops h2,#approval-hub h2{font-size:18px;line-height:1.4;margin:0;flex:1;}
+#op-close,#hub-close,#hub-refresh{min-width:44px;min-height:44px;}
+#op-session{font-size:14px;color:var(--dim);overflow-wrap:anywhere;}
+#op-status{font-size:14px;white-space:pre-wrap;overflow-wrap:anywhere;}
+#op-content form{display:grid;gap:16px;}
+#op-content label{display:grid;gap:6px;font-size:14px;}
+#op-content input,#op-content select{width:100%;min-width:0;box-sizing:border-box;min-height:44px;
+  padding:8px;border:1px solid var(--line);border-radius:6px;background:var(--panel-2);color:var(--text);font:inherit;}
+#op-content input:disabled{color:var(--dim);}
+#op-content button{min-height:44px;}
+#op-content .btn-ghost,.op-notice .btn-ghost,#hub-more{width:auto;height:auto;min-height:44px;
+  padding:8px 14px;white-space:normal;overflow-wrap:anywhere;}
+.op-menu-item{display:block;width:100%;text-align:start;padding:12px;background:none;color:var(--text);
+  border:0;border-bottom:1px solid var(--line);cursor:pointer;font:inherit;}
+.op-menu-item:hover{background:var(--surface-hover);}
+.op-history{max-height:55dvh;overflow:auto;overflow-anchor:none;overscroll-behavior:contain;}
+.op-history article,.op-history pre{padding:16px 0;margin:0;border-bottom:1px solid var(--line);}
+.op-history pre,.history-text{white-space:pre-wrap;overflow-wrap:anywhere;font-size:14px;line-height:1.6;}
+#approval-hub{flex:none;max-height:36dvh;overflow:auto;padding:12px 16px;background:var(--panel);border-bottom:1px solid var(--line);}
+#approval-hub[hidden]{display:none;}
+#hub-status:empty{display:none;}
+#hub-list{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,320px),1fr));gap:0 16px;}
+.hub-row{min-width:0;min-height:60px;text-align:start;background:none;color:var(--text);border:0;
+  border-bottom:1px solid var(--line);padding:10px 0;cursor:pointer;}
+.hub-row strong,.hub-row small{display:block;overflow-wrap:anywhere;}
+.hub-row small{color:var(--dim);margin-top:4px;max-height:3.2em;overflow:hidden;line-height:1.6;}
+.hub-row:hover{background:var(--surface-hover);}
 .sess-name{font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
 .sess-sub{font-size:13px;line-height:1.6;color:var(--dim);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
 .st{padding:0 8px;border-radius:var(--field-radius);font-size:13px;line-height:1.6;background:var(--panel-2);}
@@ -394,9 +435,34 @@ body[data-console-access="remote"] [data-mode="memory"]{display:none;}
   background:color-mix(in srgb,var(--accent) 10%,transparent);
   display:flex;flex-direction:column;gap:9px;box-shadow:var(--shadow-1);
 }
-.ap-head{display:flex;align-items:center;gap:7px;font-size:16px;font-weight:600;}
+.ap-head{display:flex;align-items:center;gap:7px;font-size:16px;font-weight:600;flex-wrap:wrap;}
 .ap-icon{flex:none;}
 .ap-title{min-width:0;overflow-wrap:anywhere;}
+
+/* risk / 題號:head 右側的小籤。規範欄位(APPROVAL_HUB_SPEC §1),bridge
+   每家都填 —— 不顯示就是盲簽。 */
+.ap-risk,.ap-progress{
+  flex:none;font-size:11.5px;font-weight:700;line-height:1.6;
+  padding:1px 8px;border-radius:9999px;white-space:nowrap;
+}
+.ap-risk-low{color:var(--good);background:color-mix(in srgb,var(--good) 16%,transparent);}
+.ap-risk-medium{color:var(--warn);background:color-mix(in srgb,var(--warn) 20%,transparent);}
+.ap-risk-high{color:var(--bad);background:color-mix(in srgb,var(--bad) 18%,transparent);
+              box-shadow:inset 0 0 0 1px color-mix(in srgb,var(--bad) 45%,transparent);}
+.ap-progress{color:var(--warn);background:color-mix(in srgb,var(--warn) 16%,transparent);}
+
+/* detail:人話多行上下文(codex 的 patch、openclaw 的 plugin 全靠這段)。
+   長的要能滾,不准撐爆版面,也不准被截斷到看不見。 */
+.ap-detail{
+  margin:0;max-height:168px;overflow:auto;
+  font-family:var(--mono);font-size:12.5px;line-height:1.7;
+  white-space:pre-wrap;overflow-wrap:anywhere;color:var(--dim);
+  padding:8px 10px;border-radius:var(--field-radius);
+  background:color-mix(in srgb,var(--panel-2) 70%,transparent);
+}
+.ap-hint,.ap-more{margin:0;font-size:12px;line-height:1.7;color:var(--dim);}
+.ap-more{color:var(--warn);font-weight:600;}
+
 .ap-actions{display:flex;flex-wrap:wrap;gap:7px;}
 .ap-btn{
   font:inherit;font-size:13px;padding:6px 15px;border-radius:var(--btn-radius);cursor:pointer;
@@ -411,6 +477,23 @@ body[data-console-access="remote"] [data-mode="memory"]{display:none;}
         background:color-mix(in srgb,var(--good) 16%,transparent);}
 .ap-no{border-color:color-mix(in srgb,var(--bad) 55%,transparent);
        background:color-mix(in srgb,var(--bad) 16%,transparent);}
+/* 危險鍵要**一眼認得出來**:否決/拒絕是不可逆的那一邊,不能跟「允許」
+   只差一點色溫。粗框 + 紅字 + 字重,連色盲也還有形狀線索。 */
+.ap-danger{
+  border-width:2px;padding:5px 14px;font-weight:700;
+  border-color:color-mix(in srgb,var(--bad) 80%,transparent);
+  color:var(--bad);
+}
+.ap-neutral{color:inherit;}
+
+/* 複選(AskUserQuestion multiselect):勾選不打網路,底下一顆送出才成交。 */
+.ap-check{border-radius:var(--field-radius);font-variant-numeric:tabular-nums;}
+.ap-check.on{border-color:color-mix(in srgb,var(--accent) 60%,transparent);
+             background:color-mix(in srgb,var(--accent) 18%,transparent);font-weight:600;}
+.ap-submit{
+  border-color:color-mix(in srgb,var(--accent) 65%,transparent);
+  background:color-mix(in srgb,var(--accent) 22%,transparent);font-weight:700;
+}
 
 /* ───── 變更檢視(P0-3)───── */
 #changes-view{display:flex;flex-direction:column;min-height:0;flex:1;}

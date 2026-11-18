@@ -37,6 +37,14 @@
     <div id="conn" class="conn" title="連線狀態"><span class="dot"></span><span id="conn-text">連線中…</span></div>
     <button type="button" id="logout" class="btn-ghost">登出這台電腦</button>
   </header>
+  <div id="ops-notices" aria-live="polite" aria-relevant="additions"></div>
+  <section id="approval-hub" hidden aria-labelledby="hub-title">
+    <header><h2 id="hub-title">待審清單</h2>
+      <button id="hub-refresh" class="icon-btn" title="重新整理待審清單" aria-label="重新整理待審清單">↻</button>
+      <button id="hub-close" class="icon-btn" title="收起待審清單" aria-label="收起待審清單">×</button></header>
+    <p id="hub-status" role="status"></p><div id="hub-list"></div>
+    <button id="hub-more" class="btn-ghost" hidden>更多待審項目</button>
+  </section>
 
   <main id="main" class="at-home">
     <!-- 左:session 列表 -->
@@ -69,18 +77,29 @@
       <div id="stream-head" class="stream-head hidden">
         <div class="sh-title"><button type="button" id="back-home" class="icon-btn" aria-label="回到工作接力" title="回到工作接力">←</button><span id="sh-provider" class="pill"></span><span id="sh-name"></span></div>
         <div class="sh-actions">
+          <button id="session-settings" class="icon-btn" title="對話設定" aria-label="對話設定" hidden>⚙</button>
+          <button id="session-compact" class="icon-btn" title="壓縮脈絡" aria-label="壓縮脈絡" hidden>⇣</button>
+          <button id="session-more" class="icon-btn" title="對話操作" aria-label="對話操作" hidden>⋯</button>
           <span id="sh-status" class="status-chip" role="status"></span>
           <span id="stream-health" role="status"></span>
           <button id="earlier-cards" type="button" hidden>更早訊息</button>
           <button id="interrupt" class="btn btn-danger" title="中斷目前回合">■ 中斷</button>
         </div>
       </div>
+      <!-- 待審核。detail / risk 是 docs/APPROVAL_HUB_SPEC.md §1 的欄位,bridge
+           每家都填 —— 少了這兩個節點等於要人盲簽(codex 的 patch 審批、
+           openclaw 的 plugin 審批全靠 detail 才看得出要放行什麼)。 -->
       <div id="approval" class="approval hidden">
         <div class="ap-head">
-          <span class="ap-icon">🔐</span>
+          <span id="ap-icon" class="ap-icon">🔐</span>
           <span id="ap-title" class="ap-title"></span>
+          <span id="ap-risk" class="ap-risk hidden"></span>
+          <span id="ap-progress" class="ap-progress hidden"></span>
         </div>
+        <pre id="ap-detail" class="ap-detail hidden"></pre>
+        <p id="ap-hint" class="ap-hint hidden"></p>
         <div id="ap-actions" class="ap-actions"></div>
+        <p id="ap-more" class="ap-more hidden"></p>
       </div>
       <div id="cards" class="hidden" tabindex="0" aria-label="對話紀錄"></div>
       <div class="reply-jump"><button type="button" id="new-reply" class="btn-ghost" aria-controls="cards" hidden>有新回覆 ↓</button></div>
@@ -201,6 +220,10 @@
   </div>
 
   <div id="toast" class="toast hidden"></div>
+  <dialog id="session-ops" aria-labelledby="op-title" aria-describedby="op-session">
+    <header><h2 id="op-title"></h2><button id="op-close" class="icon-btn" title="關閉" aria-label="關閉對話操作">×</button></header>
+    <p id="op-session"></p><div id="op-content"></div><p id="op-status" role="status"></p>
+  </dialog>
 </div>
 <section id="logout-screen" class="hidden" aria-live="polite">
   <p id="logout-state"></p>
@@ -209,6 +232,7 @@
 <script src="/console/static/sse.js"></script>
 <script src="/console/static/md.js"></script>
 <script src="/console/static/transcript.js"></script>
+<script src="/console/static/ops.js"></script>
 <script src="/console/static/app.js"></script>
 <script src="/console/static/filebrowser.js"></script>
 <script src="/console/static/changes.js"></script>
