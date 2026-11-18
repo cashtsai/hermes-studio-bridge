@@ -19,6 +19,65 @@ const state = {
   view: 0,            // A -> B -> A must invalidate the first A response too.
 };
 const drafts = new Map();  // Page memory only, never persisted on a borrowed device.
+// Only the newest preview/incoming message and monotonic read cursor per session.
+// Keep these separate from list snapshots: an older HTTP response must not undo SSE.
+const listActivity = new Map();
+const previewSegmenter = typeof Intl.Segmenter === "function" ? new Intl.Segmenter(undefined, {granularity:"grapheme"}) : null;
+let listActivityFrame = null;
+function clipPreview(text) {
+  let result = "", count = 0;
+  for (const part of previewSegmenter ? previewSegmenter.segment(text) : text) {
+    if (count++ === 140) return result + "…";
+    result += part.segment ?? part;
+  }
+  return result;
+}
+function listActivityFor(id) {
+  if (!listActivity.has(id)) listActivity.set(id, {readSeq:0, readAt:0});
+  return listActivity.get(id);
+}
+function sessionPreview(s) {
+  return listActivity.get(s.id)?.latest?.text || s.last_turn_summary || s.subtitle || "";
+}
+function sessionUnread(s) {
+  const a = listActivity.get(s.id), m = a?.incoming;
+  return !!m && m.seq > a.readSeq && (!m.at || m.at > a.readAt);
+}
+function unreadMark(s) {
+  return sessionUnread(s) ? '<span class="unread-mark">未讀</span>' : "";
+}
+function applyListEvent(event) {
+  if (!["message.upsert", "read_cursor.update"].includes(event.type)) return false;
+  const data = event.data || {}, key = event.session || data.session;
+  if (typeof key !== "string" || !key) return false;
+  const id = key.includes(":") ? key : "hermes:" + key;
+  const a = listActivityFor(id);
+  if (event.type === "read_cursor.update") {
+    const cursor = data.global || data;
+    const seq = Number(cursor.last_read_seq);
+    if (Number.isSafeInteger(seq) && seq > a.readSeq) a.readSeq = seq;
+    a.readAt = Math.max(a.readAt, activityTime(cursor.last_read_ts));
+  } else {
+    const m = data.message;
+    if (!m || !["user", "assistant", "agent"].includes(m.role)) return true;
+    const raw = typeof m.content === "string" ? m.content : "";
+    const text = (m.role === "user" ? raw : visibleReplyText({role:"agent", kind:"text", body:{text:raw}}))
+      .replace(/\s+/g, " ").trim();
+    if (!text && !m.attachments?.length) return true;
+    const next = {id:m.id, at:activityTime(m.ts), seq:event.seq,
+      text:clipPreview(text || "附件")};
+    // A late edit of yesterday's message must not displace today's preview.
+    const newer = previous => !previous || next.at > previous.at ||
+      (next.at === previous.at && next.seq > previous.seq) || (next.id && next.id === previous.id);
+    if (newer(a.latest)) a.latest = next;
+    if (m.role !== "user" && newer(a.incoming)) a.incoming = next;
+  }
+  if (listActivityFrame === null) listActivityFrame = requestAnimationFrame(() => {
+    listActivityFrame = null;
+    if (!signingOut) { renderSessions(); renderHome(); }
+  });
+  return true;
+}
 function draftFor(id) {
   if (!drafts.has(id)) drafts.set(id, { text: "", atts: [], reading: 0, pending: null, notice: "" });
   return drafts.get(id);
@@ -161,6 +220,9 @@ async function leaveConsole(broadcast = false) {
   if (state.stopStream) state.stopStream();
   clearTimeout(snapshotRetry);
   if (state.stopList) state.stopList();
+  syncBusyBar(false);
+  listActivity.clear();
+  cancelAnimationFrame(listActivityFrame); listActivityFrame = null;
   stopBlink();
   try {
     if (state.token) {
@@ -205,6 +267,7 @@ const PROVIDER_LABEL = { claude_code: "CC", codex: "CX", hermes: "人格", gemin
 let listRequest = 0;
 async function loadSessions() {
   const request = ++listRequest;
+  const statusRevision = state.statusRevision;
   try {
     const d = await apiJSON("/app/v2/sessions");
     if (request !== listRequest || signingOut) return;
@@ -217,7 +280,12 @@ async function loadSessions() {
         localStorage.removeItem(TOKEN_KEY);
       }
     }
-    state.sessions = d.sessions;
+    const liveRows = new Map(state.sessions.map(s => [s.id, s]));
+    state.sessions = d.sessions.map(s => {
+      const live = liveRows.get(s.id);
+      return live?._statusRevision > (statusRevision || 0)
+        ? {...s, status:live.status, meta:{...s.meta, ...live.meta}, _statusRevision:live._statusRevision} : s;
+    });
     state.host = d.host_name || location.hostname;
     state.listHealth = "ready";
     const degraded = state.degraded = d.degraded_providers || [];
@@ -239,12 +307,12 @@ async function loadSessions() {
     // 交付 4 實錘修法:開著的對話,標頭狀態要跟著「清單的」狀態走 ——
     // 手機那頭發起的回合,有些 provider 的忙/閒只反映在列表 status,
     // per-session 事件沒跟上時,這裡就是唯一會把「閒置」翻成「執行中」的路。
-    // 以顯示文案比對(run/running 同文案)避免把事件流帶來的細 label 洗掉。
+    // An in-flight list snapshot must not undo a newer status event.
+    // Equivalent phases (run/running) retain details omitted by the thin list.
     const cur = currentSession();
-    if (cur && state.snapshotView === state.view && !cur.meta?.locked) {
-      const listLabel = PHASE_LABEL[cur.status] || cur.status || "";
-      const chipLabel = PHASE_LABEL[state.phase] || state.phase || "";
-      if (listLabel && listLabel !== chipLabel) updateStatusChip(cur.status, cur.meta || {});
+    if (cur && state.snapshotView === state.view && statusRevision === state.statusRevision) {
+      const samePhase = (PHASE_LABEL[cur.status] || cur.status) === (PHASE_LABEL[state.phase] || state.phase);
+      updateStatusChip(cur.status, {...(samePhase ? state.statusMeta : {}), ...cur.meta});
     }
     setConn(true, degraded.length ? ("降級:" + degraded.join(",")) : "已連線");
     const pref = resumePreference();
@@ -263,7 +331,8 @@ async function loadSessions() {
 // 組內分層排序:需要你(actionable)> 執行中 > 一般。
 function sessionRank(s) {
   if (actionable(s)) return 0;
-  return ["run", "running", "busy", "queued"].includes(s.status) ? 1 : 2;
+  if (s.status === "needs_input") return 0;
+  return ["run", "running", "busy", "queued", "dispatching"].includes(s.status) ? 1 : 2;
 }
 
 // 列表位置的「降級遲滯」。CC 在工具步驟之間會短暫回 idle,排序立刻把那列
@@ -294,7 +363,8 @@ function sortSessions(rows, now) {
   const ranks = new Map(rows.map(s => [s.id, stickyRank(s, now)]));
   return rows.sort((a, b) =>
     (ranks.get(a.id) - ranks.get(b.id)) ||
-    (activityTime(b.last_event_at) - activityTime(a.last_event_at)) ||
+    (Math.max(activityTime(b.last_event_at), listActivity.get(b.id)?.latest?.at || 0) -
+      Math.max(activityTime(a.last_event_at), listActivity.get(a.id)?.latest?.at || 0)) ||
     (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
 }
 
@@ -324,9 +394,9 @@ function renderSessions() {
       const active = s.id === state.current ? " active" : "";
       const locked = s.meta && s.meta.locked ? ' 🔒' : "";
       html += '<div class="sess' + active + '" data-id="' + esc(s.id) + '">' +
-              '<div class="sess-name">' + esc(s.title || s.id) + locked + "</div>" +
+              '<div class="sess-name">' + esc(s.title || s.id) + locked + unreadMark(s) + "</div>" +
               '<div class="sess-sub"><span class="st st-' + esc(s.status || "idle") + '">' +
-              esc(workPhase(s)) + "</span> " + esc(s.subtitle || "") + "</div></div>";
+              esc(workPhase(s)) + "</span> " + esc(sessionPreview(s)) + "</div></div>";
     }
     if (!rows.length) html += '<div class="provider-empty">' + (dim ? "暫時無法讀取" : "無對話") + '</div>';
     html += "</div>";
@@ -377,7 +447,8 @@ function workMatches(s, query) {
 
 const PHASE_LABEL = { idle: "閒置", done: "已完成", running: "執行中", run: "執行中",
   busy: "執行中", failed: "失敗", stalled: "停滯", waiting_approval: "等待核准", queued: "排隊中",
-  usage_limited: "用量受限", error: "錯誤", waiting: "等待中" };
+  usage_limited: "用量受限", error: "錯誤", waiting: "等待中", needs_input: "需要你",
+  dead: "已停止", completed: "已完成", dispatching: "派送中", dormant: "暫無活動" };
 const activityFormat = new Intl.DateTimeFormat("zh-TW",
   { year:"numeric", month:"numeric", day:"numeric", hour:"2-digit", minute:"2-digit", hour12:false });
 function workPhase(s) {
@@ -391,13 +462,13 @@ function workPhase(s) {
   return PHASE_LABEL[s.status] || s.status || "狀態未知";
 }
 function workRow(s) {
-  const time = activityTime(s.last_event_at);
-  const detail = [s.meta?.workdir || s.subtitle, s.id].filter(Boolean).join(" · ");
+  const time = Math.max(activityTime(s.last_event_at), listActivity.get(s.id)?.latest?.at || 0);
+  const detail = [sessionPreview(s) || s.meta?.workdir, s.id].filter(Boolean).join(" · ");
   const phase = workPhase(s);
   return '<button type="button" class="work-row" data-id="' + esc(s.id) + '">' +
     '<span class="work-provider">' + esc(PROVIDER_LABEL[s.provider] || s.provider) + '</span>' +
-    '<span class="work-text"><strong>' + esc(s.title || s.id) + '</strong><small>' + esc(detail) +
-    '</small></span><span class="work-state">' + esc(phase) +
+    '<span class="work-text"><strong>' + esc(s.title || s.id) + unreadMark(s) + '</strong><small>' + esc(detail) +
+    '</small></span><span class="work-state st-' + esc(s.status || "idle") + '">' + esc(phase) +
     (time ? '<small>' + esc(activityFormat.format(time)) + '</small>' : '') + '</span></button>';
 }
 
@@ -785,7 +856,7 @@ function subscribeCards(id, view) {
         confirmEcho(id, [payload.card]);
       } else if (envelope.type === "session.status") {
         updateStatusChip(payload.phase, payload);
-        reflectSessionStatus(id, payload.phase);
+        reflectSessionStatus(id, payload.phase, payload);
         scheduleListRefresh();
       } else if (envelope.type === "turn") {
         // turn begin/end 是最早的忙/閒轉場訊號(session.status 是輪詢巡出來
@@ -1151,19 +1222,33 @@ function setStreamHealth(label, working = false) {
   const el = $("stream-health");
   el.textContent = label; el.classList.toggle("working", working);
 }
-function updateStatusChip(phase, meta) {
+function statusText(phase, meta = {}) {
+  const queue = Number.isSafeInteger(meta.queue_depth) && meta.queue_depth > 0 ? meta.queue_depth : 0;
+  if (meta.locked) return meta.lock_message || ("被佔用" + (queue ? " · " + queue + " 則訊息排隊中" : ""));
+  let text = PHASE_LABEL[phase] || phase || "狀態未知";
+  if (queue) text += " · " + queue + " 則訊息排隊中";
+  const reset = activityTime(meta.usage_limit_reset_at);
+  if (phase === "usage_limited" && reset) text += " · " + activityFormat.format(reset) + " 重置";
+  return text;
+}
+function updateStatusChip(phase, meta = {}) {
+  meta = meta || {};
   const chip = $("sh-status");
-  const locked = meta && meta.locked;
-  const label = locked ? "🔒 被佔用" : (PHASE_LABEL[phase] || phase || "狀態未知");
+  const locked = !!meta.locked;
+  const label = statusText(phase, meta);
   chip.textContent = label;
-  chip.className = "status-chip st-" + esc(phase || "idle");
+  chip.className = "status-chip st-" + (locked ? "locked" : phase || "idle");
+  state.statusRevision = (state.statusRevision || 0) + 1;
+  state.statusMeta = meta;
   state.phase = phase || "idle";
-  state.busy = ["run", "running", "busy"].includes(phase);
+  state.busy = ["run", "running", "busy", "dispatching"].includes(phase);
   chip.classList.toggle("working", state.busy && !locked);
   $("interrupt").classList.toggle("hidden", !state.busy || !canUse("interrupt"));
   // 交付 4:輕量活動列。busy / 排隊中都算「在忙」;phase label(bridge 的
   // 人話 label,例如「正在執行 Read…」)有就用,elapsed 以 busy_since 起算。
-  state.statusLabel = (meta && typeof meta.label === "string" && meta.label) || "";
+  state.statusLabel = (typeof meta.label === "string" && meta.label) || "";
+  state.statusDetail = label;
+  state.activityShimmer = !!state.statusLabel && state.busy && !locked;
   const working = !locked && (state.busy || phase === "queued");
   if (working) {
     const since = activityTime(meta && meta.busy_since);
@@ -1173,30 +1258,57 @@ function updateStatusChip(phase, meta) {
   syncBusyBar(working);
 }
 
-let busyTimer = null, busyStartAt = 0;
+let busyTimer = null, busyStartAt = 0, busyShowTimer = null, busyHideTimer = null, busySession = null;
 function syncBusyBar(on) {
   const bar = $("workbar");
   on = !!on && !!state.current && !signingOut;
-  clearInterval(busyTimer); busyTimer = null;
-  bar.classList.toggle("hidden", !on);
-  if (!on) return;
+  const hide = () => {
+    clearInterval(busyTimer); busyTimer = null;
+    bar.classList.add("hidden");
+    $("workbar-label").classList.remove("activity-shimmer");
+  };
+  if (busySession !== state.current || signingOut) {
+    clearTimeout(busyShowTimer); busyShowTimer = null;
+    clearTimeout(busyHideTimer); busyHideTimer = null;
+    hide(); busySession = state.current;
+  }
+  if (!on) {
+    clearTimeout(busyShowTimer); busyShowTimer = null;
+    clearInterval(busyTimer); busyTimer = null;
+    $("workbar-label").classList.remove("activity-shimmer");
+    if (!bar.classList.contains("hidden") && !busyHideTimer) {
+      busyHideTimer = setTimeout(() => { busyHideTimer = null; hide(); }, 300);
+    }
+    return;
+  }
+  clearTimeout(busyHideTimer); busyHideTimer = null;
   const tick = () => {
-    $("workbar-label").textContent = state.statusLabel ||
+    const detail = state.statusMeta?.queue_depth > 0 ? state.statusDetail : "";
+    $("workbar-label").textContent = [state.statusLabel, detail].filter(Boolean).join(" · ") ||
       (state.phase === "queued" ? "已排入佇列…" : "Agent 工作中…");
+    $("workbar-label").classList.toggle("activity-shimmer", state.activityShimmer);
     const secs = Math.max(0, Math.round((Date.now() - busyStartAt) / 1000));
     $("workbar-elapsed").textContent = secs >= 60
       ? Math.floor(secs / 60) + " 分 " + (secs % 60) + " 秒" : secs + " 秒";
   };
-  tick();
-  busyTimer = setInterval(tick, 1000); // 只動兩個文字節點,不重畫訊息
+  const show = () => {
+    busyShowTimer = null;
+    bar.classList.remove("hidden"); tick();
+    if (!busyTimer) busyTimer = setInterval(tick, 1000);
+  };
+  if (!bar.classList.contains("hidden")) show();
+  else if (!busyShowTimer) busyShowTimer = setTimeout(show, 1500);
 }
 
 // 別的客戶端(手機)發起的回合也要亮:per-session 事件一到,先就地改掉
 // 列表裡那一列的狀態再排程抓清單,不等 800ms debounce。
-function reflectSessionStatus(id, phase) {
+function reflectSessionStatus(id, phase, meta) {
   const s = state.sessions.find((x) => x.id === id);
-  if (!s || !phase || s.status === phase) return;
+  if (!s || !phase) return;
+  if (meta) s.meta = {...s.meta, ...meta};
+  else if (s.status === phase) return;
   s.status = phase;
+  s._statusRevision = state.statusRevision;
   renderSessions(); renderHome();
 }
 
@@ -1680,7 +1792,7 @@ async function main() {
     onEvent: ({data}) => {
       if (!Number.isSafeInteger(data?.seq) || data.seq <= listCursor) return;
       listCursor = data.seq;
-      scheduleListRefresh();
+      if (!applyListEvent(data)) scheduleListRefresh();
     },
     onError: () => setConn(false, "事件流斷線,重連中…"),
     onOpen: () => {},

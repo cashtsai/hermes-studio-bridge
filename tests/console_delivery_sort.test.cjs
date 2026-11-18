@@ -14,6 +14,7 @@ function ranking() {
   const c = vm.createContext({
     actionable: s => s.status === 'awaiting',
     activityTime: n => Number(n) || 0,
+    listActivity: new Map(),
   });
   vm.runInContext(section('function sessionRank(', 'function renderSessions('), c);
   return c;
@@ -43,6 +44,14 @@ test('single-row groups retain their history, with deterministic activity/id ord
     row('running', 'running'), row('urgent', 'awaiting')];
   assert.deepEqual(Array.from(c.sortSessions(items, 0), s => s.id),
     ['urgent', 'running', 'recent', 'a', 'b']);
+});
+test('needs_input and dispatching have priority, and mirrored messages update recency', () => {
+  const c = ranking();
+  c.listActivity.set('mirrored', {latest:{at:10}});
+  const items = [row('old', 'idle', 9), row('mirrored', 'idle', 1),
+    row('dispatch', 'dispatching'), row('input', 'needs_input')];
+  assert.deepEqual(Array.from(c.sortSessions(items, 0), s => s.id),
+    ['input', 'dispatch', 'mirrored', 'old']);
 });
 
 function delivery(responses = []) {
