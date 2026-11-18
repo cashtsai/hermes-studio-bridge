@@ -148,6 +148,7 @@ let leaveRequest = false;
 async function leaveConsole(broadcast = false) {
   if (leaveRequest) return;
   signingOut = true;
+  window.PocketSessionOps?.leave();
   forgetWork();
   writeHash(null);
   leaveRequest = true;
@@ -323,10 +324,11 @@ function renderSessions() {
     for (const s of rows) {
       const active = s.id === state.current ? " active" : "";
       const locked = s.meta && s.meta.locked ? ' 🔒' : "";
-      html += '<div class="sess' + active + '" data-id="' + esc(s.id) + '">' +
+      html += '<div class="session-row"><div class="sess' + active + '" data-id="' + esc(s.id) + '">' +
               '<div class="sess-name">' + esc(s.title || s.id) + locked + "</div>" +
               '<div class="sess-sub"><span class="st st-' + esc(s.status || "idle") + '">' +
-              esc(workPhase(s)) + "</span> " + esc(s.subtitle || "") + "</div></div>";
+              esc(workPhase(s)) + "</span> " + esc(s.subtitle || "") + "</div></div>" +
+              (window.PocketSessionOps?.menuButton(s) || "") + "</div>";
     }
     if (!rows.length) html += '<div class="provider-empty">' + (dim ? "暫時無法讀取" : "無對話") + '</div>';
     html += "</div>";
@@ -457,9 +459,9 @@ function resetHistory() {
 }
 function updateOlderButton() {
   const b = $("earlier-cards");
-  b.hidden = !olderCursor;
+  b.hidden = !olderCursor && !(state.current && canUse("history"));
   b.disabled = loadingOlder;
-  b.textContent = loadingOlder ? "載入中…" : "更早訊息";
+  b.textContent = loadingOlder ? "載入中…" : olderCursor ? "更早訊息" : "更早訊息（逐字稿）";
   b.classList.toggle("working", loadingOlder);
 }
 function openSession(id, preserveMode = false) {
@@ -568,6 +570,7 @@ async function loadCardSnapshot(id, view, delay = 1000) {
     if (snap.status && snap.status.phase) updateStatusChip(snap.status.phase, snap.status);
     confirmEcho(id, state.cards);
     state.snapshotView = view;
+    window.PocketSessionOps?.scheduleRead();
     if (canUse("follow")) subscribeCards(id, view);
     else setStreamHealth("對話快照");
   } catch (err) {
@@ -594,7 +597,8 @@ async function loadCardSnapshot(id, view, delay = 1000) {
 //   ‧ 有 approval_id 時一律帶上 —— bridge 會走統一的 _approval_decide_core
 async function loadOlderCards() {
   const { current: id, view } = state, cursor = olderCursor;
-  if (!cursor || loadingOlder || !canUse("replay")) return;
+  if (loadingOlder || !canUse("replay")) return;
+  if (!cursor) { if (canUse("history")) window.PocketSessionOps?.history(currentSession()); return; }
   loadingOlder = true; updateOlderButton();
   try {
     const page = await apiJSON("/app/v2/sessions/" + encodeURIComponent(id) +
@@ -609,8 +613,9 @@ async function loadOlderCards() {
     renderCards(true); // Paging never advances the live SSE cursor.
   } catch (err) {
     if (!currentView(view) || olderCursor !== cursor) return;
-    if (err.status === 409) olderCursor = null;
-    toast(err.status === 409 ? "這段歷史已超出主機保留範圍" : "更早訊息讀取失敗");
+    if (err.status === 409 && canUse("history")) {
+      olderCursor = null; window.PocketSessionOps?.history(currentSession());
+    } else toast(err.status === 409 ? "主機沒有可接續的逐字稿" : "更早訊息讀取失敗");
   } finally {
     if (currentView(view)) { loadingOlder = false; updateOlderButton(); }
   }
@@ -642,14 +647,23 @@ function borrowed() { return document.body.dataset.consoleAccess === "remote"; }
 //     `/app/v2/sessions/{id}/interrupt` 的 `hp` 分支是**真的通**的
 //     (bridge.py:23066)→ 放進表內會藏掉一個現在就能用的功能。
 // 兩個都是「本機模式不該突然藏掉原本能用的東西」的實例,所以刻意缺席。
-const CAP_VOCAB = new Set(["input", "attachments", "replay", "follow", "approve"]);
-function canUse(cap) {
-  const caps = currentSession()?.capabilities;
+const CAP_VOCAB = new Set(["input", "attachments", "replay", "follow", "approve",
+  "rename", "archive", "history", "config_read", "config_write", "compact", "read_cursor"]);
+const OP_CAP_VOCAB = new Set(["rename", "archive", "history", "config_read", "config_write", "compact", "read_cursor"]);
+function canUse(cap, session = currentSession()) {
+  const caps = session?.capabilities;
   if (borrowed()) return !!(state.listHealth === "ready" && caps?.includes(cap));
   if (state.listHealth !== "ready" || !CAP_VOCAB.has(cap)) return true;   // 不知道 → 不藏
+  if (OP_CAP_VOCAB.has(cap)) {
+    // Session capabilities predate these ops; only the provider matrix can deny them.
+    const declared = typeof window === "undefined" ? undefined : window.PocketSessionOps?.capability(cap, session);
+    return declared !== false;
+  }
   return !Array.isArray(caps) || caps.includes(cap);
 }
 function syncControls() {
+  window.PocketSessionOps?.syncControls();
+  updateOlderButton();
   $("personal-work").hidden = !personalDevice();
   $("remember-work").checked = !!resumePreference();
   // 變更檢視的收斂只在借用機上做 —— `changes` 是 console-remote 專屬的授權
@@ -743,6 +757,7 @@ function approvalView(s) {
   const int = v => (Number.isInteger(v) ? v : null);
   const firstBool = (...xs) => { for (const x of xs) if (typeof x === "boolean") return x; return false; };
   return {
+    identity: [s?.id, approvalIdOf(meta)],
     title: String(prompt?.title || a?.title || "等待你放行"),
     detail: String(a?.detail || ""),
     risk: String(a?.risk || "").toLowerCase(),
@@ -777,7 +792,7 @@ function approvalStyleClass(style) {
 let msIdentity = null, msSelected = null;
 function msReset() { msIdentity = null; msSelected = null; }
 function msState(view) {
-  const id = JSON.stringify([view.qIndex, view.title, view.options.map(o => o.key)]);
+  const id = JSON.stringify([view.identity, view.qIndex, view.title, view.options.map(o => o.key)]);
   if (msIdentity !== id || !msSelected) {
     msIdentity = id;
     // 用終端當下的勾選播種:使用者可能已在 tmux 裡勾過幾個,從空集合開始送出
@@ -790,7 +805,7 @@ function msState(view) {
 function renderApproval() {
   clearTimeout(approvalExpiry);
   const bar = $("approval");
-  const s = currentSession();
+  const s = window.PocketSessionOps?.approvalSession() || currentSession();
   if (!actionable(s)) { bar.classList.add("hidden"); msReset(); return; }
   const meta = s.meta || {};
   const aid = approvalIdOf(meta);
@@ -848,7 +863,7 @@ function renderApproval() {
     const anyBox = view.options.some(o => o.checked !== null);
     const isBox = o => !anyBox || o.checked !== null;   // 一列 checked 都沒送 → 全部可勾
     const ccName = s.provider === "claude_code" ? s.id.slice(s.id.indexOf(":") + 1) : "";
-    const canAnswer = !borrowed() && !!ccName;
+    const canAnswer = !borrowed() && !!ccName && (!s._hub || s._hubPromptCurrent);
     for (const o of shown) {
       const b = document.createElement("button");
       if (!isBox(o)) {
@@ -877,7 +892,8 @@ function renderApproval() {
     sub.disabled = !keys.length || !canAnswer;
     sub.addEventListener("click", () => answerMulti(s.id, ccName, keys, sub));
     box.appendChild(sub);
-    hint = canAnswer ? "可複選 —— 勾好後按送出"
+    hint = s._hub && !s._hubPromptCurrent ? "此待審項目不是終端目前的題目，請重新整理清單確認"
+      : canAnswer ? "可複選 —— 勾好後按送出"
       : "這張是複選題，請在本機 console、App 或終端機作答";
   } else {
     for (const o of shown) {
@@ -891,6 +907,11 @@ function renderApproval() {
   }
   $("ap-hint").textContent = hint;
   $("ap-hint").classList.toggle("hidden", !hint);
+  if (["not_resumable", "none"].includes(meta.approval?.response_capability)) {
+    box.querySelectorAll("button").forEach(b => b.disabled = true);
+    $("ap-hint").textContent = "主機已無等待中的請求，無法作答";
+    $("ap-hint").classList.remove("hidden");
+  }
   if (deciding.has(s.id)) box.querySelectorAll("button").forEach(b => b.disabled = true);
 }
 
@@ -901,7 +922,9 @@ function renderApproval() {
 // `/app/v2/sessions/{id}/{op}`(bridge.py:947),所以借用機不畫送出鈕。
 async function answerMulti(id, name, keys, btn) {
   if (!id || id !== state.current || deciding.has(id) || signingOut) return;
-  if (!name || !keys.length || borrowed() || !actionable(currentSession())) return;
+  const session = window.PocketSessionOps?.approvalSession() || currentSession();
+  if (!name || !keys.length || borrowed() || !actionable(session) || (session._hub && !session._hubPromptCurrent) ||
+      ["not_resumable", "none"].includes(session.meta?.approval?.response_capability)) return;
   deciding.add(id);
   const box = $("ap-actions");
   box.querySelectorAll("button").forEach((b) => (b.disabled = true));
@@ -935,7 +958,9 @@ async function answerMulti(id, name, keys, btn) {
 }
 
 async function decide(id, aid, index, choice, btn) {
-  if (!id || id !== state.current || deciding.has(id) || signingOut || !actionable(currentSession())) return;
+  const session = window.PocketSessionOps?.approvalSession() || currentSession();
+  if (!id || id !== state.current || deciding.has(id) || signingOut || !actionable(session)) return;
+  if (["not_resumable", "none"].includes(session.meta?.approval?.response_capability)) return;
   if (!aid && document.body.dataset.consoleAccess === "remote") return;
   deciding.add(id);
   const body = Object.assign({}, choice, aid ? { approval_id: aid } : {});
@@ -946,7 +971,9 @@ async function decide(id, aid, index, choice, btn) {
   box.querySelectorAll("button").forEach((b) => (b.disabled = true));
   if (btn) btn.classList.add("ap-busy");
   try {
-    const r = await api("/app/v2/sessions/" + encodeURIComponent(id) + "/approve", {
+    const path = session?._hub ? "/app/v1/approvals/" + encodeURIComponent(aid) + "/decision"
+      : "/app/v2/sessions/" + encodeURIComponent(id) + "/approve";
+    const r = await api(path, {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
     });
@@ -958,7 +985,9 @@ async function decide(id, aid, index, choice, btn) {
     }
     const receipt = await r.json();
     if (aid) handledApproval.set(id, step);
-    if (!signingOut && state.current === id) toast(receipt.idempotent ? "這項核准已處理" : "已送出決定");
+    if (session?._hub && aid) window.PocketSessionOps?.resolved(aid, receipt);
+    if (!signingOut && state.current === id) toast(receipt.status === "next_question" ? "已送出，請接著答下一題"
+      : receipt.idempotent ? "這項核准已處理" : "已送出決定");
   } catch (err) {
     if (!signingOut && state.current === id) toast("無法確認決定：" + err.message);
   } finally {
@@ -968,9 +997,9 @@ async function decide(id, aid, index, choice, btn) {
   }
 }
 
-// 跨 session 彙總:有幾件在等你。資料來源同上(sessions 的 meta/status),
-// 不必另外打 /app/v1/approvals —— 列表本來就每次都抓。
+// 跨 session 彙總:本機從 hub 計算 approval 數;借用機僅看授權 session,不讀全域 hub。
 function renderAwaiting() {
+  if (window.PocketSessionOps?.renderAwaiting()) return;
   const n = state.sessions.filter(actionable).length;
   const el = $("awaiting");
   $("awaiting-n").textContent = String(n);
@@ -980,6 +1009,7 @@ function renderAwaiting() {
 
 // 點徽章 → 跳到第一條在等的 session
 function jumpToAwaiting() {
+  if (window.PocketSessionOps?.toggleHub()) return;
   const s = state.sessions.find(actionable);
   if (s) openSession(s.id);
 }
@@ -1344,6 +1374,7 @@ function trackCardScroll(el) {
   // scrollTop can be fractional; this is rounding tolerance, not a follow zone.
   cardScroll.follow = el.scrollHeight - el.clientHeight - el.scrollTop <= 1;
   if (cardScroll.follow) $("new-reply").hidden = true;
+  window.PocketSessionOps?.scheduleRead();
 }
 
 function renderCards(prepending = false) {
@@ -1378,6 +1409,7 @@ function renderCards(prepending = false) {
   else if (prepending) el.scrollTop = oldTop + el.scrollHeight - oldHeight;
   cardScroll.top = el.scrollTop; // Our anchor correction is not a reader gesture.
   hydrateCardMedia();
+  window.PocketSessionOps?.scheduleRead();
 }
 
 function setStreamHealth(label, working = false) {
@@ -1563,6 +1595,7 @@ function autosize() {
 
 // ───────────────────────── 綁定 + 啟動 ─────────────────────────
 function wire() {
+  window.PocketSessionOps?.init();
   $("new-reply").addEventListener("click", () => {
     const el = $("cards");
     el.scrollTop = el.scrollHeight;
@@ -1692,7 +1725,8 @@ function moveSelection(delta) {
 // 想否決的人反而一次放行到底。語意只認 bridge 標在 option 上的 `style`
 // (APPROVAL_HUB_SPEC §1),沒標語意的選單(question / 複選)就沒有快捷鍵。
 function firstApprovalButton(wantYes) {
-  if ($("approval").classList.contains("hidden") || !actionable(currentSession())) return null;
+  if ($("approval").classList.contains("hidden") ||
+      !actionable(window.PocketSessionOps?.approvalSession() || currentSession())) return null;
   const sel = wantYes ? "button.ap-yes" : "button.ap-no";
   return $("ap-actions").querySelector(sel + ":not(:disabled)") || null;
 }
@@ -1724,6 +1758,7 @@ function wireKeys() {
   window.addEventListener("blur", imeReset);
   document.addEventListener("keydown", (e) => {
     if (imeKey(e)) return;
+    if ($("session-ops")?.open) return; // Native dialog owns focus and Escape.
     if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
       e.preventDefault(); openPalette(); return;
     }
@@ -1734,7 +1769,7 @@ function wireKeys() {
       if (rows.length && ["ArrowDown", "ArrowUp"].includes(e.key)) {
         e.preventDefault();
         rows[Math.max(0, Math.min(rows.length - 1, i + (e.key === "ArrowDown" ? 1 : -1)))].focus();
-      } else if (e.key === "Enter" && document.activeElement === $("pal-q") && rows.length) {
+      } else if (!imeKey(e) && e.key === "Enter" && document.activeElement === $("pal-q") && rows.length) {
         e.preventDefault(); rows[0].click();
       }
       return;
@@ -1896,6 +1931,8 @@ async function main() {
   await identifyPersonalLogin();
   if (sessionStorage.getItem(LOGOUT_EVENT)) { await leaveConsole(); return; }
   await loadSessions();
+  void window.PocketSessionOps?.loadCapabilities();
+  void window.PocketSessionOps?.loadHub();
   if (signingOut) return;
   if (document.body.dataset.consoleAccess !== "remote") {
     loadUsage(); setInterval(() => { if (!signingOut) loadUsage(); }, 120000);
@@ -1935,6 +1972,7 @@ function scheduleListRefresh() { clearTimeout(listTimer); listTimer = setTimeout
 //
 // 刻意只特判這一個型別,其餘維持現狀(debounce 重抓)—— 不擴大戰線。
 function handleListEvent(ev) {
+  window.PocketSessionOps?.onEvent(ev);
   if (ev?.type === "approval.resolved") {
     noteApprovalResolved(ev.data?.approval_id);
     renderApproval(); renderAwaiting(); renderHome(); renderSessions();

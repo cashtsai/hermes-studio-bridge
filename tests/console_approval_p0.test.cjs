@@ -23,7 +23,7 @@ function section(start, end) {
   assert.ok(a >= 0 && b > a, `source section: ${start}`);
   return source.slice(a, b);
 }
-const APPROVAL_SRC = section("function approvalIdOf(meta) {", "// 跨 session 彙總");
+const APPROVAL_SRC = section("function approvalIdOf(meta) {", "function renderAwaiting()");
 const KEYS_SRC = section("function firstApprovalButton(", "// ── IME 三重判準");
 const CAPS_SRC = section("function borrowed() {", "function syncControls(");
 const EVENTS_SRC = section("let listTimer = null;", "main();");
@@ -106,6 +106,7 @@ function harness(opts = {}) {
   const responses = opts.responses ? opts.responses.slice() : [];
   const ctx = {
     document,
+    window: {},
     console,
     state: { sessions: [], current: null, listHealth: "ready", degraded: [], view: 0 },
     signingOut: false,
@@ -189,7 +190,7 @@ const labels = h => buttons(h).map(b => b.textContent);
 
 // ═════════════ 1. 能力驅動:fail-open + hide-only,舊行為不准退化 ═════════
 function capsCtx() {
-  const ctx = { document: { body: { dataset: { consoleAccess: "local" } } },
+  const ctx = { window: {}, document: { body: { dataset: { consoleAccess: "local" } } },
                 state: { sessions: [], current: null, listHealth: "ready" },
                 currentSession() { return ctx.state.sessions.find(x => x.id === ctx.state.current) || null; } };
   vm.createContext(ctx);

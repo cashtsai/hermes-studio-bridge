@@ -97,7 +97,7 @@ class ConsoleApprovalStructureTests(unittest.TestCase):
 
     # ── 前置:能力驅動 ───────────────────────────────────────────────
     def test_capability_gating_is_live_on_the_local_console(self):
-        fn = self.app[self.app.index("function canUse(cap)"):][:400]
+        fn = self.app[self.app.index("function canUse("):][:400]
         self.assertNotIn("return !borrowed() ||", fn,
                          "本機無條件放行 = bridge 宣告的 capabilities 完全沒作用")
         self.assertIn("CAP_VOCAB", fn)

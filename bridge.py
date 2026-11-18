@@ -25854,26 +25854,39 @@ _V2_SESSION_OPS: dict = {
 #:   native_id_strength  strong=provider 原生穩定 id;weak=名字/路徑類
 _PROVIDER_CAPS: dict = {
     "claude_code": {
+        "compact": True,
         "interrupt": True, "queued_messages": True, "streaming": "live",
         "terminal_status_quality": "weak", "approvals": True,
         "approval_callbacks_live_only": True, "native_id_strength": "weak",
     },
     "cc2": {
+        "compact": True,
+        "config_fields": {"model": {"editable": True},
+                          "permission_mode": {"editable": True,
+                                              "options": list(cc_sdk.PERMISSION_MODES)}},
         "interrupt": True, "queued_messages": True, "streaming": "live",
         "terminal_status_quality": "strong", "approvals": True,
         "approval_callbacks_live_only": True, "native_id_strength": "strong",
     },
     "codex": {
+        "compact": True,
+        "config_fields": {"model": {"editable": True},
+                          "approval_policy": {"editable": True,
+                                              "options": list(_CODEX_APPROVAL_POLICIES)},
+                          "effort": {"editable": False},
+                          "sandbox": {"editable": False}},
         "interrupt": True, "queued_messages": True, "streaming": "live",
         "terminal_status_quality": "strong", "approvals": True,
         "approval_callbacks_live_only": True, "native_id_strength": "strong",
     },
     "gemini": {
+        "compact": True,
         "interrupt": False, "queued_messages": True, "streaming": "live",
         "terminal_status_quality": "strong", "approvals": True,
         "approval_callbacks_live_only": True, "native_id_strength": "weak",
     },
     "grok": {
+        "compact": True,
         # interrupt=True:標準 ACP session/cancel 有接(v2 interrupt 路由的
         # gk 分支),與 gemini 的差別是我們真的宣告並接了這條。
         # terminal_status_quality=strong:session/prompt 回 stopReason。
@@ -25888,6 +25901,7 @@ _PROVIDER_CAPS: dict = {
         "approval_callbacks_live_only": True, "native_id_strength": "weak",
     },
     "opencode": {
+        "config_fields": {cid: {"editable": True} for cid in opencode_sdk.KNOWN_CONFIG_IDS},
         # 2026-11-16 本機實測(1.19.5)逐項驗過才敢宣告:
         # interrupt=True:session/cancel → prompt 0.7 秒內回
         #   stopReason="cancelled"(不是 advisory;v1/v2 兩線都接了)。
@@ -25911,6 +25925,7 @@ _PROVIDER_CAPS: dict = {
         "approval_callbacks_live_only": False, "native_id_strength": "strong",
     },
     "hermes": {
+        "read_cursor": True,
         "interrupt": False, "queued_messages": True, "streaming": "live",
         "terminal_status_quality": "strong", "approvals": True,
         "approval_callbacks_live_only": False, "native_id_strength": "strong",
@@ -25970,6 +25985,8 @@ def _provider_caps_payload() -> dict:
     for prov, caps in _PROVIDER_CAPS.items():
         ops = sorted(op for op, tbl in _V2_SESSION_OPS.items() if prov in tbl)
         out[prov] = {**caps, "ops": ops,
+                     "compact": bool(caps.get("compact")),
+                     "read_cursor": bool(caps.get("read_cursor")),
                      "replay": dict(replay.get(prov) or {})}
     return out
 
@@ -36021,6 +36038,16 @@ def _approval_row(r):
             out["id"], out["provider"], src, str(out["status"] or ""))
     if isinstance(meta, dict) and meta:
         out["meta"] = meta
+    # A questionnaire reuses one ID. Its DB row can still describe the first
+    # question; the hub needs the live fields and index for stale-answer checks.
+    if out["provider"] == "codex" and kind == "question" and out["status"] == "pending":
+        live = getattr(CODEX_APP, "pending_approvals", {}).get(out["id"]) or {}
+        for key in ("title", "detail", "q_index", "q_total"):
+            if key in live:
+                out[key] = live[key]
+        if live.get("options"):
+            out["options"] = [({**o, "style": "danger"} if o.get("style") == "deny" else dict(o))
+                              for o in live["options"]]
     return out
 
 
