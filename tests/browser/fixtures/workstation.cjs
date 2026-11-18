@@ -15,8 +15,12 @@ async function workstation(t, standalone = false, options = {}) {
       res.writeHead(status, {"Content-Type":type,"Cache-Control":"no-store"}); res.end(body);
     };
     const json = data => send("application/json",JSON.stringify(data));
+    if (options.handle && await options.handle(req,res,url,model)) return;
     if (url.pathname === "/setup" || url.searchParams.has("signin")) return send("text/html","<title>Fixture</title>");
     if (url.pathname === "/console/logout") return json({revoked:true});
+    if (url.pathname === "/app/v2/providers/capabilities") return json({providers:
+      Object.fromEntries(model.jobs.map(job => [job.provider, {ops:[], compact:false, read_cursor:false}]))});
+    if (url.pathname === "/app/v1/approvals") return json({approvals:[],total:0,next_offset:null});
     if (url.pathname === "/app/v2/sessions") return json({sessions:model.jobs,
       ...(model.remote ? {console_scope:"console-remote"} : {})});
     if (url.pathname.endsWith("/cards")) return json({latest_seq:historySize, cards:Array.from({length:historySize},(_,i) => ({

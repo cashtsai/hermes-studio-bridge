@@ -19,6 +19,65 @@ const state = {
   view: 0,            // A -> B -> A must invalidate the first A response too.
 };
 const drafts = new Map();  // Page memory only, never persisted on a borrowed device.
+// Only the newest preview/incoming message and monotonic read cursor per session.
+// Keep these separate from list snapshots: an older HTTP response must not undo SSE.
+const listActivity = new Map();
+const previewSegmenter = typeof Intl.Segmenter === "function" ? new Intl.Segmenter(undefined, {granularity:"grapheme"}) : null;
+let listActivityFrame = null;
+function clipPreview(text) {
+  let result = "", count = 0;
+  for (const part of previewSegmenter ? previewSegmenter.segment(text) : text) {
+    if (count++ === 140) return result + "…";
+    result += part.segment ?? part;
+  }
+  return result;
+}
+function listActivityFor(id) {
+  if (!listActivity.has(id)) listActivity.set(id, {readSeq:0, readAt:0});
+  return listActivity.get(id);
+}
+function sessionPreview(s) {
+  return listActivity.get(s.id)?.latest?.text || s.last_turn_summary || s.subtitle || "";
+}
+function sessionUnread(s) {
+  const a = listActivity.get(s.id), m = a?.incoming;
+  return !!m && m.seq > a.readSeq && (!m.at || m.at > a.readAt);
+}
+function unreadMark(s) {
+  return sessionUnread(s) ? '<span class="unread-mark">未讀</span>' : "";
+}
+function applyListEvent(event) {
+  if (!["message.upsert", "read_cursor.update"].includes(event.type)) return false;
+  const data = event.data || {}, key = event.session || data.session;
+  if (typeof key !== "string" || !key) return false;
+  const id = key.includes(":") ? key : "hermes:" + key;
+  const a = listActivityFor(id);
+  if (event.type === "read_cursor.update") {
+    const cursor = data.global || data;
+    const seq = Number(cursor.last_read_seq);
+    if (Number.isSafeInteger(seq) && seq > a.readSeq) a.readSeq = seq;
+    a.readAt = Math.max(a.readAt, activityTime(cursor.last_read_ts));
+  } else {
+    const m = data.message;
+    if (!m || !["user", "assistant", "agent"].includes(m.role)) return true;
+    const raw = typeof m.content === "string" ? m.content : "";
+    const text = (m.role === "user" ? raw : visibleReplyText({role:"agent", kind:"text", body:{text:raw}}))
+      .replace(/\s+/g, " ").trim();
+    if (!text && !m.attachments?.length) return true;
+    const next = {id:m.id, at:activityTime(m.ts), seq:event.seq,
+      text:clipPreview(text || "附件")};
+    // A late edit of yesterday's message must not displace today's preview.
+    const newer = previous => !previous || next.at > previous.at ||
+      (next.at === previous.at && next.seq > previous.seq) || (next.id && next.id === previous.id);
+    if (newer(a.latest)) a.latest = next;
+    if (m.role !== "user" && newer(a.incoming)) a.incoming = next;
+  }
+  if (listActivityFrame === null) listActivityFrame = requestAnimationFrame(() => {
+    listActivityFrame = null;
+    if (!signingOut) { renderSessions(); renderHome(); }
+  });
+  return true;
+}
 function draftFor(id) {
   if (!drafts.has(id)) drafts.set(id, { text: "", atts: [], reading: 0, pending: null, notice: "" });
   return drafts.get(id);
@@ -45,7 +104,7 @@ function resumePreference() {
 function rememberWork(id) {
   if (!personalDevice()) return;
   try { localStorage.setItem(RESUME_KEY, JSON.stringify({owner:ownerFingerprint, id})); }
-  catch (_) { toast("這個瀏覽器無法記住工作"); }
+  catch (_) { toast("這個瀏覽器無法記住工作", true); }
 }
 async function identifyPersonalLogin() {
   try {
@@ -148,6 +207,7 @@ let leaveRequest = false;
 async function leaveConsole(broadcast = false) {
   if (leaveRequest) return;
   signingOut = true;
+  window.PocketSessionOps?.leave();
   forgetWork();
   writeHash(null);
   leaveRequest = true;
@@ -161,6 +221,9 @@ async function leaveConsole(broadcast = false) {
   if (state.stopStream) state.stopStream();
   clearTimeout(snapshotRetry);
   if (state.stopList) state.stopList();
+  syncBusyBar(false);
+  listActivity.clear();
+  cancelAnimationFrame(listActivityFrame); listActivityFrame = null;
   stopBlink();
   try {
     if (state.token) {
@@ -205,6 +268,7 @@ const PROVIDER_LABEL = { claude_code: "CC", codex: "CX", hermes: "人格", gemin
 let listRequest = 0;
 async function loadSessions() {
   const request = ++listRequest;
+  const statusRevision = state.statusRevision;
   try {
     const d = await apiJSON("/app/v2/sessions");
     if (request !== listRequest || signingOut) return;
@@ -217,7 +281,12 @@ async function loadSessions() {
         localStorage.removeItem(TOKEN_KEY);
       }
     }
-    state.sessions = d.sessions;
+    const liveRows = new Map(state.sessions.map(s => [s.id, s]));
+    state.sessions = d.sessions.map(s => {
+      const live = liveRows.get(s.id);
+      return live?._statusRevision > (statusRevision || 0)
+        ? {...s, status:live.status, meta:{...s.meta, ...live.meta}, _statusRevision:live._statusRevision} : s;
+    });
     state.host = d.host_name || location.hostname;
     state.listHealth = "ready";
     const degraded = state.degraded = d.degraded_providers || [];
@@ -239,12 +308,12 @@ async function loadSessions() {
     // 交付 4 實錘修法:開著的對話,標頭狀態要跟著「清單的」狀態走 ——
     // 手機那頭發起的回合,有些 provider 的忙/閒只反映在列表 status,
     // per-session 事件沒跟上時,這裡就是唯一會把「閒置」翻成「執行中」的路。
-    // 以顯示文案比對(run/running 同文案)避免把事件流帶來的細 label 洗掉。
+    // An in-flight list snapshot must not undo a newer status event.
+    // Equivalent phases (run/running) retain details omitted by the thin list.
     const cur = currentSession();
-    if (cur && state.snapshotView === state.view && !cur.meta?.locked) {
-      const listLabel = PHASE_LABEL[cur.status] || cur.status || "";
-      const chipLabel = PHASE_LABEL[state.phase] || state.phase || "";
-      if (listLabel && listLabel !== chipLabel) updateStatusChip(cur.status, cur.meta || {});
+    if (cur && state.snapshotView === state.view && statusRevision === state.statusRevision) {
+      const samePhase = (PHASE_LABEL[cur.status] || cur.status) === (PHASE_LABEL[state.phase] || state.phase);
+      updateStatusChip(cur.status, {...(samePhase ? state.statusMeta : {}), ...cur.meta});
     }
     setConn(true, degraded.length ? ("降級:" + degraded.join(",")) : "已連線");
     const pref = resumePreference();
@@ -263,7 +332,8 @@ async function loadSessions() {
 // 組內分層排序:需要你(actionable)> 執行中 > 一般。
 function sessionRank(s) {
   if (actionable(s)) return 0;
-  return ["run", "running", "busy", "queued"].includes(s.status) ? 1 : 2;
+  if (s.status === "needs_input") return 0;
+  return ["run", "running", "busy", "queued", "dispatching"].includes(s.status) ? 1 : 2;
 }
 
 // 列表位置的「降級遲滯」。CC 在工具步驟之間會短暫回 idle,排序立刻把那列
@@ -294,12 +364,14 @@ function sortSessions(rows, now) {
   const ranks = new Map(rows.map(s => [s.id, stickyRank(s, now)]));
   return rows.sort((a, b) =>
     (ranks.get(a.id) - ranks.get(b.id)) ||
-    (activityTime(b.last_event_at) - activityTime(a.last_event_at)) ||
+    (Math.max(activityTime(b.last_event_at), listActivity.get(b.id)?.latest?.at || 0) -
+      Math.max(activityTime(a.last_event_at), listActivity.get(a.id)?.latest?.at || 0)) ||
     (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
 }
 
 function renderSessions() {
   const el = $("session-list");
+  const focusedId = el.contains(document.activeElement) ? document.activeElement.dataset.id : null;
   if (!state.sessions.length) {
     el.textContent = state.listHealth === "failed" || state.degraded.length ? "清單暫時不完整" : "沒有 session";
     return;
@@ -323,10 +395,11 @@ function renderSessions() {
     for (const s of rows) {
       const active = s.id === state.current ? " active" : "";
       const locked = s.meta && s.meta.locked ? ' 🔒' : "";
-      html += '<div class="sess' + active + '" data-id="' + esc(s.id) + '">' +
-              '<div class="sess-name">' + esc(s.title || s.id) + locked + "</div>" +
-              '<div class="sess-sub"><span class="st st-' + esc(s.status || "idle") + '">' +
-              esc(workPhase(s)) + "</span> " + esc(s.subtitle || "") + "</div></div>";
+      html += '<div class="session-row"><button type="button" class="sess' + active + '" data-id="' + esc(s.id) + '" aria-current="' + (active ? "true" : "false") + '">' +
+              '<span class="sess-name">' + esc(s.title || s.id) + locked + unreadMark(s) + "</span>" +
+              '<span class="sess-sub"><span class="st st-' + esc(s.status || "idle") + '">' +
+              esc(workPhase(s)) + "</span> " + esc(sessionPreview(s)) + "</span></button>" +
+              (window.PocketSessionOps?.menuButton(s) || "") + "</div>";
     }
     if (!rows.length) html += '<div class="provider-empty">' + (dim ? "暫時無法讀取" : "無對話") + '</div>';
     html += "</div>";
@@ -334,6 +407,7 @@ function renderSessions() {
   el.innerHTML = html;
   el.querySelectorAll(".sess").forEach((n) => {
     n.addEventListener("click", () => openSession(n.dataset.id));
+    if (n.dataset.id === focusedId) n.focus({preventScroll:true});
     const was = oldTops.get(n.dataset.id);
     if (was === undefined || !n.animate ||
         window.matchMedia?.("(prefers-reduced-motion: reduce)").matches) return;
@@ -377,7 +451,8 @@ function workMatches(s, query) {
 
 const PHASE_LABEL = { idle: "閒置", done: "已完成", running: "執行中", run: "執行中",
   busy: "執行中", failed: "失敗", stalled: "停滯", waiting_approval: "等待核准", queued: "排隊中",
-  usage_limited: "用量受限", error: "錯誤", waiting: "等待中" };
+  usage_limited: "用量受限", error: "錯誤", waiting: "等待中", needs_input: "需要你",
+  dead: "已停止", completed: "已完成", dispatching: "派送中", dormant: "暫無活動" };
 const activityFormat = new Intl.DateTimeFormat("zh-TW",
   { year:"numeric", month:"numeric", day:"numeric", hour:"2-digit", minute:"2-digit", hour12:false });
 function workPhase(s) {
@@ -391,13 +466,13 @@ function workPhase(s) {
   return PHASE_LABEL[s.status] || s.status || "狀態未知";
 }
 function workRow(s) {
-  const time = activityTime(s.last_event_at);
-  const detail = [s.meta?.workdir || s.subtitle, s.id].filter(Boolean).join(" · ");
+  const time = Math.max(activityTime(s.last_event_at), listActivity.get(s.id)?.latest?.at || 0);
+  const detail = [sessionPreview(s) || s.meta?.workdir, s.id].filter(Boolean).join(" · ");
   const phase = workPhase(s);
   return '<button type="button" class="work-row" data-id="' + esc(s.id) + '">' +
     '<span class="work-provider">' + esc(PROVIDER_LABEL[s.provider] || s.provider) + '</span>' +
-    '<span class="work-text"><strong>' + esc(s.title || s.id) + '</strong><small>' + esc(detail) +
-    '</small></span><span class="work-state">' + esc(phase) +
+    '<span class="work-text"><strong>' + esc(s.title || s.id) + unreadMark(s) + '</strong><small>' + esc(detail) +
+    '</small></span><span class="work-state st-' + esc(s.status || "idle") + '">' + esc(phase) +
     (time ? '<small>' + esc(activityFormat.format(time)) + '</small>' : '') + '</span></button>';
 }
 
@@ -440,7 +515,8 @@ function showHome() {
   $("cards").replaceChildren();
   $("main").classList.add("at-home");
   $("handoff").classList.remove("hidden");
-  renderSessions(); renderHome(); $("home-q").focus();
+  renderSessions(); renderHome();
+  if (!mobileConsole()) $("home-q").focus({preventScroll:true});
 }
 
 // ───────────────────────── 卡片流 ─────────────────────────
@@ -457,18 +533,23 @@ function resetHistory() {
 }
 function updateOlderButton() {
   const b = $("earlier-cards");
-  b.hidden = !olderCursor;
+  b.hidden = !olderCursor && !(state.current && canUse("history"));
   b.disabled = loadingOlder;
-  b.textContent = loadingOlder ? "載入中…" : "更早訊息";
+  b.textContent = loadingOlder ? "載入中…" : olderCursor ? "更早訊息" : "更早訊息（逐字稿）";
   b.classList.toggle("working", loadingOlder);
 }
-function openSession(id, preserveMode = false) {
+function mobileConsole() { return window.matchMedia("(max-width:760px)").matches; }
+function focusComposer() {
+  if (!$("composer").classList.contains("hidden") && !mobileConsole())
+    $("input").focus({preventScroll:true});
+}
+function openSession(id, preserveMode = false, focusInput = true) {
   if (signingOut) return;
   if (borrowed() && !state.sessions.find(s => s.id === id)?.capabilities?.includes("replay")) {
-    toast("這台電腦無權讀取此對話"); return;
+    toast("這台電腦無權讀取此對話", true); return;
   }
   if (state.current === id && state.snapshotView === state.view && !preserveMode) {
-    window.PocketConsoleMode?.set("agents"); return;
+    window.PocketConsoleMode?.set("agents"); if (focusInput) focusComposer(); return;
   }
   const view = ++state.view;
   resetHistory();
@@ -492,6 +573,7 @@ function openSession(id, preserveMode = false) {
   $("sh-name").textContent = s.title || id;
   updateStatusChip(s.status, s.meta);
   syncControls();
+  if (focusInput && !preserveMode) focusComposer();
   renderApproval();
   $("cards").innerHTML = '<div class="placeholder working" role="status">讀取最近訊息…</div>';
   cardScroll.follow = true;
@@ -568,6 +650,7 @@ async function loadCardSnapshot(id, view, delay = 1000) {
     if (snap.status && snap.status.phase) updateStatusChip(snap.status.phase, snap.status);
     confirmEcho(id, state.cards);
     state.snapshotView = view;
+    window.PocketSessionOps?.scheduleRead();
     if (canUse("follow")) subscribeCards(id, view);
     else setStreamHealth("對話快照");
   } catch (err) {
@@ -594,7 +677,8 @@ async function loadCardSnapshot(id, view, delay = 1000) {
 //   ‧ 有 approval_id 時一律帶上 —— bridge 會走統一的 _approval_decide_core
 async function loadOlderCards() {
   const { current: id, view } = state, cursor = olderCursor;
-  if (!cursor || loadingOlder || !canUse("replay")) return;
+  if (loadingOlder || !canUse("replay")) return;
+  if (!cursor) { if (canUse("history")) window.PocketSessionOps?.history(currentSession()); return; }
   loadingOlder = true; updateOlderButton();
   try {
     const page = await apiJSON("/app/v2/sessions/" + encodeURIComponent(id) +
@@ -609,8 +693,12 @@ async function loadOlderCards() {
     renderCards(true); // Paging never advances the live SSE cursor.
   } catch (err) {
     if (!currentView(view) || olderCursor !== cursor) return;
-    if (err.status === 409) olderCursor = null;
-    toast(err.status === 409 ? "這段歷史已超出主機保留範圍" : "更早訊息讀取失敗");
+    if (err.status === 409 && canUse("history")) {
+      olderCursor = null; window.PocketSessionOps?.history(currentSession());
+    } else {
+      if (err.status === 409) olderCursor = null;
+      toast(err.status === 409 ? "主機沒有可接續的逐字稿" : "更早訊息讀取失敗", true);
+    }
   } finally {
     if (currentView(view)) { loadingOlder = false; updateOlderButton(); }
   }
@@ -620,25 +708,66 @@ function currentSession() {
 }
 
 function borrowed() { return document.body.dataset.consoleAccess === "remote"; }
-function canUse(cap) {
-  return !borrowed() || !!(state.listHealth === "ready" && currentSession()?.capabilities?.includes(cap));
+
+// ── 能力驅動(fail-open + hide-only,抄 iOS `ProviderCapsStore`)──────────
+//
+// 舊版 `canUse` 的第一個條件是 `!borrowed()` → 在自己家的 console 上**無條件
+// 放行**,bridge 每列都給的 per-session `capabilities` 完全沒作用(宣告了
+// 也沒人讀)。改成兩種語意分開:
+//
+//   · 借用的電腦(console-remote):`capabilities` 是**授權**白名單 ——
+//     沒宣告 = 不准。這條不動(安全面,fail-closed 是對的)。
+//   · 自己的電腦:`capabilities` 是**能力**宣告 —— fail-open + hide-only。
+//     不知道(清單還沒就緒 / 這一列沒帶 capabilities)→ 放行,行為與今天
+//     一個像素不差;只有「明確宣告了、而且就是沒有這一項」才隱藏。
+//
+// `CAP_VOCAB` 是「缺席才有意義」的詞彙白名單 —— **不在表內的能力一律放行**。
+// 為什麼需要這張表:per-session `capabilities` 的缺席不是每個詞都代表
+// 「不支援」。
+//   · `changes` 只有 `_console_remote_list()` 會加(借用機的檔案授權旗標),
+//     本機清單永遠不帶 → 放進表內等於把本機的「變更」檢視整個藏掉。
+//   · `interrupt` 在 hermes 人格列沒宣告(bridge.py:22067),但
+//     `/app/v2/sessions/{id}/interrupt` 的 `hp` 分支是**真的通**的
+//     (bridge.py:23066)→ 放進表內會藏掉一個現在就能用的功能。
+// 兩個都是「本機模式不該突然藏掉原本能用的東西」的實例,所以刻意缺席。
+const CAP_VOCAB = new Set(["input", "attachments", "replay", "follow", "approve",
+  "rename", "archive", "history", "config_read", "config_write", "compact", "read_cursor"]);
+const OP_CAP_VOCAB = new Set(["rename", "archive", "history", "config_read", "config_write", "compact", "read_cursor"]);
+function canUse(cap, session = currentSession()) {
+  const caps = session?.capabilities;
+  if (borrowed()) return !!(state.listHealth === "ready" && caps?.includes(cap));
+  if (state.listHealth !== "ready" || !CAP_VOCAB.has(cap)) return true;   // 不知道 → 不藏
+  if (OP_CAP_VOCAB.has(cap)) {
+    // Session capabilities predate these ops; only the provider matrix can deny them.
+    const declared = typeof window === "undefined" ? undefined : window.PocketSessionOps?.capability(cap, session);
+    return declared !== false;
+  }
+  return !Array.isArray(caps) || caps.includes(cap);
 }
 function syncControls() {
+  window.PocketSessionOps?.syncControls();
+  updateOlderButton();
   $("personal-work").hidden = !personalDevice();
   $("remember-work").checked = !!resumePreference();
-  if (!borrowed()) return;
-  const changes = canUse("changes");
-  if (!changes && document.body.classList.contains("can-view-changes")) {
-    for (const id of ["rail-list","ch-list","ch-diff"]) $(id).replaceChildren();
+  // 變更檢視的收斂只在借用機上做 —— `changes` 是 console-remote 專屬的授權
+  // 旗標(見 CAP_VOCAB 註解),本機沒有「被收回」這回事。
+  if (borrowed()) {
+    const changes = canUse("changes");
+    if (!changes && document.body.classList.contains("can-view-changes")) {
+      for (const id of ["rail-list","ch-list","ch-diff"]) $(id).replaceChildren();
+    }
+    document.body.classList.toggle("can-view-changes", changes);
+    if (!changes && !$("changes-view").classList.contains("hidden")) window.PocketConsoleMode?.set("agents");
   }
-  document.body.classList.toggle("can-view-changes", changes);
-  if (!changes && !$("changes-view").classList.contains("hidden")) window.PocketConsoleMode?.set("agents");
   if (state.current) {
     $("composer").classList.toggle("hidden", !canUse("input"));
     $("attach").classList.toggle("hidden", !canUse("attachments"));
     $("interrupt").classList.toggle("hidden", !(canUse("interrupt") && state.busy));
     $("read-only").classList.toggle("hidden", canUse("input"));
-    $("read-only").textContent = state.listHealth === "failed" ? "清單未更新，暫停操作" : "這台電腦只能閱讀此對話";
+    // 同一個節點現在兩種模式共用 —— 本機看到它代表「這個 provider 沒宣告
+    // input」,講成「這台電腦只能閱讀」會把人帶到錯的方向。
+    $("read-only").textContent = state.listHealth === "failed" ? "清單未更新，暫停操作"
+      : borrowed() ? "這台電腦只能閱讀此對話" : "這個對話目前不接受輸入";
   } else $("read-only").classList.add("hidden");
 }
 
@@ -650,60 +779,271 @@ function approvalIdOf(meta) {
 
 const deciding = new Set();
 const handledApproval = new Map();
+// approval.resolved(bridge.py:3093)收到即收卡 —— 不留懸空:別的端答掉了,
+// 這裡不該還掛著一顆按下去吃 409 的按鈕。只存 aid,上限防無限長大。
+const resolvedApprovals = new Set();
+function noteApprovalResolved(aid) {
+  if (!aid) return;
+  if (resolvedApprovals.size > 400) resolvedApprovals.clear();
+  resolvedApprovals.add(String(aid));
+}
 let approvalExpiry;
 function actionable(s) {
   if (!s || state.listHealth !== "ready" || state.degraded.includes(s.provider)) return false;
-  if ((borrowed() || Array.isArray(s.capabilities)) && !s.capabilities?.includes("approve")) return false;
   const a = s.meta?.approval, aid = approvalIdOf(s.meta);
+  // 借用機:白名單(沒宣告=不准)。本機:宣告了卻沒 approve 才擋(見 canUse)。
+  if ((borrowed() || Array.isArray(s.capabilities)) && !s.capabilities?.includes("approve")) return false;
   if (a?.status && a.status !== "pending") return false;
+  if (aid && resolvedApprovals.has(String(aid))) return false;
   const exp = activityTime(a?.expires_at);
   if (exp && exp <= Date.now()) return false;
   if (aid) return handledApproval.get(s.id) !== JSON.stringify([aid, s.meta.approval?.q_index ?? null]);
   return document.body.dataset.consoleAccess !== "remote" && !!s.meta?.prompt?.options?.length;
 }
+
+// ── 審批的單一讀取點 ───────────────────────────────────────────────────
+// 三個資料源(CC 的 `meta.prompt`、統一物件 `meta.approval`、借用機的
+// `meta.console_options`)在這裡收斂成一個形狀,下游只讀這一份,不再各自長 if。
+//
+// options 以 prompt 為主(直接解 pane,比 watcher 寫的 DB 列新鮮),但**把統一
+// 物件的 style/description 依 key 疊回去**:`style` 只有統一物件有
+// (`_cc_approval_payload` 標的),丟掉它就等於丟掉「哪顆是拒絕」——
+// 那正是鍵盤 `d` 會按到選單最後一項的真兇。
+const APPROVAL_RISK = {
+  low: ["低風險", "low"], medium: ["中風險", "medium"], high: ["高風險", "high"],
+  normal: ["一般", "low"], danger: ["高風險", "high"],   // gemini 用的字彙
+};
+const APPROVAL_ICON = { question: "❓", notice: "🔔" };
+const APPROVAL_MAX_OPTS = 24;   // 防爆上限;超過的部分**明示**,不靜默吃掉
+
+function approvalView(s) {
+  const meta = (s && s.meta) || {};
+  const prompt = meta.prompt || null;
+  const a = meta.approval || null;
+  const am = (a && a.meta) || {};
+  const base = borrowed() ? meta.console_options
+    : (prompt?.options?.length ? prompt.options : a?.options);
+  const styled = new Map((a?.options || []).map(o => [String(o.key), o]));
+  const options = (Array.isArray(base) ? base : [])
+    .filter(o => o && o.key !== undefined && o.key !== null && String(o.key) !== "")
+    .map(o => {
+      const ref = styled.get(String(o.key)) || {};
+      const checked = o.checked !== undefined ? o.checked : ref.checked;
+      return {
+        key: String(o.key),
+        label: String(o.label == null || o.label === "" ? o.key : o.label),
+        style: String(o.style || ref.style || ""),
+        description: String(o.description || ref.description || ""),
+        checked: checked === undefined || checked === null ? null : !!checked,
+      };
+    });
+  const int = v => (Number.isInteger(v) ? v : null);
+  const firstBool = (...xs) => { for (const x of xs) if (typeof x === "boolean") return x; return false; };
+  return {
+    identity: [s?.id, approvalIdOf(meta)],
+    title: String(prompt?.title || a?.title || "等待你放行"),
+    detail: String(a?.detail || ""),
+    risk: String(a?.risk || "").toLowerCase(),
+    kind: String(a?.kind || (prompt?.semantic === "question" ? "question" : prompt ? "permission" : "")),
+    options,
+    multiselect: firstBool(prompt?.multiselect, am.multiselect, a?.multiselect),
+    qIndex: int(prompt?.q_index ?? am.q_index ?? a?.q_index),
+    qTotal: int(prompt?.q_total ?? am.q_total ?? a?.q_total),
+    submitLabel: String(prompt?.submit_label || ""),
+    // ⚠️ wire 用的 q_index **只認統一物件頂層那顆**(codex question 專屬)。
+    // 借用機的授權守門比對 body 欄位集合(bridge.py:22647),對 CC 多送一個
+    // expected_q_index 會直接 403 —— 顯示用的 qIndex 不准流到線上。
+    wireQIndex: int(a?.q_index),
+  };
+}
+
+// 只有 CC 的 TUI 數字鍵該顯示前綴。`approve_for_session`/`allow-always`/`ack`
+// 這類內部識別字印在按鈕上只是雜訊(「ack. 知道了」)。
+function approvalOptionLabel(o) {
+  return (/^[0-9]$/.test(o.key) ? o.key + ". " : "") + o.label;
+}
+// bridge 產 options 時就標好語意(APPROVAL_HUB_SPEC §1:`style: danger` =
+// 否決類)。這裡只做映射,**不猜 label**。`deny` 是舊字彙,等同 danger。
+function approvalStyleClass(style) {
+  if (style === "primary" || style === "success") return "ap-yes";
+  if (style === "danger" || style === "deny") return "ap-no ap-danger";
+  return "ap-neutral";
+}
+
+// 複選的勾選狀態。identity 必須含題目/題號 —— 多題 ask 的選項鍵恆為 1|2|3,
+// 只看鍵會偵測不到換題、把上一題的勾選帶著送出(iOS 同款教訓)。
+let msIdentity = null, msSelected = null;
+function msReset() { msIdentity = null; msSelected = null; }
+function msState(view) {
+  const id = JSON.stringify([view.identity, view.qIndex, view.title, view.options.map(o => o.key)]);
+  if (msIdentity !== id || !msSelected) {
+    msIdentity = id;
+    // 用終端當下的勾選播種:使用者可能已在 tmux 裡勾過幾個,從空集合開始送出
+    // 會把那些 toggle 掉(/answer 收的是「作答後應該被勾選的完整集合」)。
+    msSelected = new Set(view.options.filter(o => o.checked === true).map(o => o.key));
+  }
+  return msSelected;
+}
+
 function renderApproval() {
   clearTimeout(approvalExpiry);
   const bar = $("approval");
-  const s = currentSession();
-  const meta = (s && s.meta) || {};
-  const prompt = meta.prompt;
+  const s = window.PocketSessionOps?.approvalSession() || currentSession();
+  if (!actionable(s)) { bar.classList.add("hidden"); msReset(); return; }
+  const meta = s.meta || {};
   const aid = approvalIdOf(meta);
-  const index = meta.approval?.q_index;
-  const choices = borrowed() ? meta.console_options : (prompt?.options?.length ? prompt.options : meta.approval?.options);
-  const opts = Array.isArray(choices) && choices.length ? choices : null;
+  const view = approvalView(s);
+  const index = view.wireQIndex;
 
   const expires = activityTime(meta.approval?.expires_at);
-  if (!actionable(s)) { bar.classList.add("hidden"); return; }
   if (expires) approvalExpiry = setTimeout(() => { renderApproval(); renderAwaiting(); renderHome(); }, Math.min(Math.max(1, expires - Date.now() + 1), 2147483647));
   bar.classList.remove("hidden");
-  $("ap-title").textContent =
-    (prompt && prompt.title) || (meta.approval && meta.approval.title) || "等待你放行";
+  $("ap-icon").textContent = APPROVAL_ICON[view.kind] || "🔐";
+  $("ap-title").textContent = view.title;
+
+  // risk / detail:規範欄位,bridge 每家都填 —— 不顯示就是盲簽。
+  const risk = APPROVAL_RISK[view.risk];
+  const riskEl = $("ap-risk");
+  riskEl.className = "ap-risk" + (risk ? " ap-risk-" + risk[1] : "");
+  riskEl.textContent = risk ? risk[0] : "";
+  riskEl.classList.toggle("hidden", !risk);
+
+  const detailEl = $("ap-detail");
+  detailEl.textContent = view.detail;
+  detailEl.classList.toggle("hidden", !view.detail);
+
+  // 「第 2/3 題」—— 使用者唯一能知道「還有幾題」的地方。
+  const prog = $("ap-progress");
+  prog.textContent = !(view.qTotal > 1) ? ""
+    : view.qIndex === null ? "共 " + view.qTotal + " 題"
+    : "第 " + (view.qIndex + 1) + "/" + view.qTotal + " 題";
+  prog.classList.toggle("hidden", !prog.textContent);
 
   const box = $("ap-actions");
-  box.innerHTML = "";
-  if (opts) {
-    // 有選項就照選項畫(CC 的數字選單/權限提示;label 可能是任何語言)
-    opts.slice(0, 8).forEach((o) => {
-      const b = document.createElement("button");
-      b.className = "ap-btn";
-      b.textContent = (o.key ? o.key + ". " : "") + (o.label || "");
-      b.addEventListener("click", () => decide(s.id, aid, index, { key: String(o.key) }, b));
-      box.appendChild(b);
-    });
-  } else {
+  box.replaceChildren();
+  const shown = view.options.slice(0, APPROVAL_MAX_OPTS);
+  const hidden = view.options.length - shown.length;
+  $("ap-more").textContent = hidden > 0 ? "還有 " + hidden + " 個選項沒顯示，請在終端機或 App 作答" : "";
+  $("ap-more").classList.toggle("hidden", hidden <= 0);
+
+  let hint = "";
+  if (!view.options.length) {
+    // 沒有 options 的審批(codex 二元核准)才用寫死的兩鍵。
     const yes = document.createElement("button");
     yes.className = "ap-btn ap-yes"; yes.textContent = "核准";
     yes.addEventListener("click", () => decide(s.id, aid, index, { approve: true }, yes));
     const no = document.createElement("button");
-    no.className = "ap-btn ap-no"; no.textContent = "否決";
+    no.className = "ap-btn ap-no ap-danger"; no.textContent = "否決";
     no.addEventListener("click", () => decide(s.id, aid, index, { approve: false }, no));
     box.append(yes, no);
+  } else if (view.multiselect) {
+    // ── P0-1:AskUserQuestion 複選 ──
+    // 舊版把每個選項當「點了就送」→ 送 {key:"3"} 走 `_cc_key_core`,那是
+    // **只按一個數字鍵 = 只 toggle 一個框、永遠不按送出**:畫面完全沒變,
+    // 再點一次還把前一次取消。正解是 bridge 早就備好的
+    // `POST /ccsessions/{name}/answer`(keys = 作答後應被勾選的完整集合)。
+    const picked = msState(view);
+    const anyBox = view.options.some(o => o.checked !== null);
+    const isBox = o => !anyBox || o.checked !== null;   // 一列 checked 都沒送 → 全部可勾
+    const ccName = s.provider === "claude_code" ? s.id.slice(s.id.indexOf(":") + 1) : "";
+    const canAnswer = !borrowed() && !!ccName && (!s._hub || s._hubPromptCurrent);
+    for (const o of shown) {
+      const b = document.createElement("button");
+      if (!isBox(o)) {
+        // 純動作列(「自行輸入…」/「與 Claude 討論」):TUI 語意就是單鍵即送。
+        b.className = "ap-btn ap-neutral";
+        b.textContent = approvalOptionLabel(o);
+        b.addEventListener("click", () => decide(s.id, aid, index, { key: o.key }, b));
+      } else {
+        const on = picked.has(o.key);
+        b.className = "ap-btn ap-check" + (on ? " on" : "");
+        b.setAttribute("aria-pressed", on ? "true" : "false");
+        b.textContent = (on ? "☑ " : "☐ ") + approvalOptionLabel(o);
+        b.disabled = !canAnswer;
+        b.addEventListener("click", () => {        // 純前端 toggle,不打網路
+          if (picked.has(o.key)) picked.delete(o.key); else picked.add(o.key);
+          renderApproval();
+        });
+      }
+      if (o.description) b.title = o.description;
+      box.appendChild(b);
+    }
+    const keys = view.options.filter(o => isBox(o) && picked.has(o.key)).map(o => o.key);
+    const sub = document.createElement("button");
+    sub.className = "ap-btn ap-submit";
+    sub.textContent = (view.submitLabel || "送出") + (keys.length ? "（已選 " + keys.length + " 項）" : "");
+    sub.disabled = !keys.length || !canAnswer;
+    sub.addEventListener("click", () => answerMulti(s.id, ccName, keys, sub));
+    box.appendChild(sub);
+    hint = s._hub && !s._hubPromptCurrent ? "此待審項目不是終端目前的題目，請重新整理清單確認"
+      : canAnswer ? "可複選 —— 勾好後按送出"
+      : "這張是複選題，請在本機 console、App 或終端機作答";
+  } else {
+    for (const o of shown) {
+      const b = document.createElement("button");
+      b.className = "ap-btn " + approvalStyleClass(o.style);
+      b.textContent = approvalOptionLabel(o);
+      if (o.description) b.title = o.description;
+      b.addEventListener("click", () => decide(s.id, aid, index, { key: o.key }, b));
+      box.appendChild(b);
+    }
+  }
+  $("ap-hint").textContent = hint;
+  $("ap-hint").classList.toggle("hidden", !hint);
+  if (["not_resumable", "none"].includes(meta.approval?.response_capability)) {
+    box.querySelectorAll("button").forEach(b => b.disabled = true);
+    $("ap-hint").textContent = "主機已無等待中的請求，無法作答";
+    $("ap-hint").classList.remove("hidden");
   }
   if (deciding.has(s.id)) box.querySelectorAll("button").forEach(b => b.disabled = true);
 }
 
+// P0-1 的送出路徑。body 的 `keys` 是**作答後應該被勾選的完整集合**
+// (bridge.py:20971 的 docstring:TUI 數字是 toggle,盲送會把使用者已勾的
+// 切掉),`submit=true` 讓 bridge 走到內嵌送出鈕按下去。
+// 這條路只有本機 console 走得到 —— console-remote 的路徑白名單只開
+// `/app/v2/sessions/{id}/{op}`(bridge.py:947),所以借用機不畫送出鈕。
+async function answerMulti(id, name, keys, btn) {
+  if (!id || id !== state.current || deciding.has(id) || signingOut) return;
+  const session = window.PocketSessionOps?.approvalSession() || currentSession();
+  if (!name || !keys.length || borrowed() || !actionable(session) || (session._hub && !session._hubPromptCurrent) ||
+      ["not_resumable", "none"].includes(session.meta?.approval?.response_capability)) return;
+  deciding.add(id);
+  const box = $("ap-actions");
+  box.querySelectorAll("button").forEach((b) => (b.disabled = true));
+  if (btn) btn.classList.add("ap-busy");
+  try {
+    const r = await api("/ccsessions/" + encodeURIComponent(name) + "/answer", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ keys, submit: true }),
+    });
+    if (!r.ok) {
+      const e = await r.json().catch(() => ({}));
+      const code = (e.error && e.error.code) || "";
+      if (r.status === 409 && ["PROMPT_STALE", "STALE_QUESTION"].includes(code))
+        throw new Error("這個問題已經換頁或結束，請看最新訊息");
+      // 老 bridge 沒鋪這條路 → **老實說**,不降級送單鍵(送了就是在複選選單
+      // 裡亂 toggle,還回報成功 —— app 側同一個拍板,見 CCCardSessionView)。
+      if ([404, 405].includes(r.status) && code !== "SESSION_NOT_FOUND")
+        throw new Error("這台 bridge 還沒支援複選作答，請更新 bridge 或改在終端機作答");
+      throw new Error((e.error && e.error.message) || ("HTTP " + r.status));
+    }
+    const receipt = await r.json().catch(() => ({}));
+    if (!signingOut && state.current === id)
+      toast(receipt.submitted === false ? "已送出，請接著答下一題" : "已送出選擇");
+  } catch (err) {
+    if (!signingOut && state.current === id) toast("無法送出選擇：" + err.message);
+  } finally {
+    deciding.delete(id);
+    msReset();            // 下一輪照終端現況重新播種
+    if (!signingOut) { renderApproval(); renderAwaiting(); renderHome(); loadSessions(); }
+  }
+}
+
 async function decide(id, aid, index, choice, btn) {
-  if (!id || id !== state.current || deciding.has(id) || signingOut || !actionable(currentSession())) return;
+  const session = window.PocketSessionOps?.approvalSession() || currentSession();
+  if (!id || id !== state.current || deciding.has(id) || signingOut || !actionable(session)) return;
+  if (["not_resumable", "none"].includes(session.meta?.approval?.response_capability)) return;
   if (!aid && document.body.dataset.consoleAccess === "remote") return;
   deciding.add(id);
   const body = Object.assign({}, choice, aid ? { approval_id: aid } : {});
@@ -714,7 +1054,9 @@ async function decide(id, aid, index, choice, btn) {
   box.querySelectorAll("button").forEach((b) => (b.disabled = true));
   if (btn) btn.classList.add("ap-busy");
   try {
-    const r = await api("/app/v2/sessions/" + encodeURIComponent(id) + "/approve", {
+    const path = session?._hub ? "/app/v1/approvals/" + encodeURIComponent(aid) + "/decision"
+      : "/app/v2/sessions/" + encodeURIComponent(id) + "/approve";
+    const r = await api(path, {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
     });
@@ -726,18 +1068,21 @@ async function decide(id, aid, index, choice, btn) {
     }
     const receipt = await r.json();
     if (aid) handledApproval.set(id, step);
-    if (!signingOut && state.current === id) toast(receipt.idempotent ? "這項核准已處理" : "已送出決定");
+    if (session?._hub && aid) window.PocketSessionOps?.resolved(aid, receipt);
+    if (!signingOut && state.current === id) toast(receipt.status === "next_question" ? "已送出，請接著答下一題"
+      : receipt.idempotent ? "這項核准已處理" : "已送出決定");
   } catch (err) {
-    if (!signingOut && state.current === id) toast("無法確認決定：" + err.message);
+    if (!signingOut && state.current === id) toast("無法確認決定：" + err.message, true);
   } finally {
     deciding.delete(id);
+    msReset();
     if (!signingOut) { renderApproval(); renderAwaiting(); renderHome(); loadSessions(); }
   }
 }
 
-// 跨 session 彙總:有幾件在等你。資料來源同上(sessions 的 meta/status),
-// 不必另外打 /app/v1/approvals —— 列表本來就每次都抓。
+// 跨 session 彙總:本機從 hub 計算 approval 數;借用機僅看授權 session,不讀全域 hub。
 function renderAwaiting() {
+  if (window.PocketSessionOps?.renderAwaiting()) return;
   const n = state.sessions.filter(actionable).length;
   const el = $("awaiting");
   $("awaiting-n").textContent = String(n);
@@ -747,6 +1092,7 @@ function renderAwaiting() {
 
 // 點徽章 → 跳到第一條在等的 session
 function jumpToAwaiting() {
+  if (window.PocketSessionOps?.toggleHub()) return;
   const s = state.sessions.find(actionable);
   if (s) openSession(s.id);
 }
@@ -785,7 +1131,7 @@ function subscribeCards(id, view) {
         confirmEcho(id, [payload.card]);
       } else if (envelope.type === "session.status") {
         updateStatusChip(payload.phase, payload);
-        reflectSessionStatus(id, payload.phase);
+        reflectSessionStatus(id, payload.phase, payload);
         scheduleListRefresh();
       } else if (envelope.type === "turn") {
         // turn begin/end 是最早的忙/閒轉場訊號(session.status 是輪詢巡出來
@@ -1009,7 +1355,7 @@ async function downloadAttachment(url, name) {
     const a = document.createElement("a");
     a.href = blobUrl; a.download = name || "attachment";
     document.body.append(a); a.click(); a.remove();
-  } catch (err) { toast("下載失敗:" + err.message); }
+  } catch (err) { toast("下載失敗:" + err.message, true); }
 }
 
 async function copyText(text, doneMsg) {
@@ -1022,7 +1368,7 @@ async function copyText(text, doneMsg) {
       document.body.append(ta); ta.select(); document.execCommand("copy"); ta.remove();
     }
     toast(doneMsg || "已複製");
-  } catch (_) { toast("無法複製(瀏覽器不允許)"); }
+  } catch (_) { toast("無法複製(瀏覽器不允許)", true); }
 }
 
 // 訊息動作列(交付 6):回覆=引用塞進輸入框;複製=原始文字;分享=系統分享
@@ -1030,11 +1376,11 @@ async function copyText(text, doneMsg) {
 // 援,先不硬造。
 function handleMessageAction(act, cardId) {
   const card = state.cards.find((c) => c.id === cardId);
-  if (!card) { toast("這則訊息已不在目前視窗"); return; }
+  if (!card) { toast("這則訊息已不在目前視窗", true); return; }
   const text = cardText(card);
   if (act === "copy") { void copyText(text); return; }
   if (act === "reply") {
-    if (!canUse("input")) { toast("這台電腦無法在此對話輸入"); return; }
+    if (!canUse("input")) { toast("這台電腦無法在此對話輸入", true); return; }
     const quote = text.trim().split("\n").slice(0, 6).map((l) => "> " + l).join("\n");
     const input = $("input");
     const d = draftFor(state.current);
@@ -1111,6 +1457,7 @@ function trackCardScroll(el) {
   // scrollTop can be fractional; this is rounding tolerance, not a follow zone.
   cardScroll.follow = el.scrollHeight - el.clientHeight - el.scrollTop <= 1;
   if (cardScroll.follow) $("new-reply").hidden = true;
+  window.PocketSessionOps?.scheduleRead();
 }
 
 function renderCards(prepending = false) {
@@ -1145,25 +1492,40 @@ function renderCards(prepending = false) {
   else if (prepending) el.scrollTop = oldTop + el.scrollHeight - oldHeight;
   cardScroll.top = el.scrollTop; // Our anchor correction is not a reader gesture.
   hydrateCardMedia();
+  window.PocketSessionOps?.scheduleRead();
 }
 
 function setStreamHealth(label, working = false) {
   const el = $("stream-health");
   el.textContent = label; el.classList.toggle("working", working);
 }
-function updateStatusChip(phase, meta) {
+function statusText(phase, meta = {}) {
+  const queue = Number.isSafeInteger(meta.queue_depth) && meta.queue_depth > 0 ? meta.queue_depth : 0;
+  if (meta.locked) return meta.lock_message || ("被佔用" + (queue ? " · " + queue + " 則訊息排隊中" : ""));
+  let text = PHASE_LABEL[phase] || phase || "狀態未知";
+  if (queue) text += " · " + queue + " 則訊息排隊中";
+  const reset = activityTime(meta.usage_limit_reset_at);
+  if (phase === "usage_limited" && reset) text += " · " + activityFormat.format(reset) + " 重置";
+  return text;
+}
+function updateStatusChip(phase, meta = {}) {
+  meta = meta || {};
   const chip = $("sh-status");
-  const locked = meta && meta.locked;
-  const label = locked ? "🔒 被佔用" : (PHASE_LABEL[phase] || phase || "狀態未知");
+  const locked = !!meta.locked;
+  const label = statusText(phase, meta);
   chip.textContent = label;
-  chip.className = "status-chip st-" + esc(phase || "idle");
+  chip.className = "status-chip st-" + (locked ? "locked" : phase || "idle");
+  state.statusRevision = (state.statusRevision || 0) + 1;
+  state.statusMeta = meta;
   state.phase = phase || "idle";
-  state.busy = ["run", "running", "busy"].includes(phase);
+  state.busy = ["run", "running", "busy", "dispatching"].includes(phase);
   chip.classList.toggle("working", state.busy && !locked);
   $("interrupt").classList.toggle("hidden", !state.busy || !canUse("interrupt"));
   // 交付 4:輕量活動列。busy / 排隊中都算「在忙」;phase label(bridge 的
   // 人話 label,例如「正在執行 Read…」)有就用,elapsed 以 busy_since 起算。
-  state.statusLabel = (meta && typeof meta.label === "string" && meta.label) || "";
+  state.statusLabel = (typeof meta.label === "string" && meta.label) || "";
+  state.statusDetail = label;
+  state.activityShimmer = !!state.statusLabel && state.busy && !locked;
   const working = !locked && (state.busy || phase === "queued");
   if (working) {
     const since = activityTime(meta && meta.busy_since);
@@ -1173,30 +1535,57 @@ function updateStatusChip(phase, meta) {
   syncBusyBar(working);
 }
 
-let busyTimer = null, busyStartAt = 0;
+let busyTimer = null, busyStartAt = 0, busyShowTimer = null, busyHideTimer = null, busySession = null;
 function syncBusyBar(on) {
   const bar = $("workbar");
   on = !!on && !!state.current && !signingOut;
-  clearInterval(busyTimer); busyTimer = null;
-  bar.classList.toggle("hidden", !on);
-  if (!on) return;
+  const hide = () => {
+    clearInterval(busyTimer); busyTimer = null;
+    bar.classList.add("hidden");
+    $("workbar-label").classList.remove("activity-shimmer");
+  };
+  if (busySession !== state.current || signingOut) {
+    clearTimeout(busyShowTimer); busyShowTimer = null;
+    clearTimeout(busyHideTimer); busyHideTimer = null;
+    hide(); busySession = state.current;
+  }
+  if (!on) {
+    clearTimeout(busyShowTimer); busyShowTimer = null;
+    clearInterval(busyTimer); busyTimer = null;
+    $("workbar-label").classList.remove("activity-shimmer");
+    if (!bar.classList.contains("hidden") && !busyHideTimer) {
+      busyHideTimer = setTimeout(() => { busyHideTimer = null; hide(); }, 300);
+    }
+    return;
+  }
+  clearTimeout(busyHideTimer); busyHideTimer = null;
   const tick = () => {
-    $("workbar-label").textContent = state.statusLabel ||
+    const detail = state.statusMeta?.queue_depth > 0 ? state.statusDetail : "";
+    $("workbar-label").textContent = [state.statusLabel, detail].filter(Boolean).join(" · ") ||
       (state.phase === "queued" ? "已排入佇列…" : "Agent 工作中…");
+    $("workbar-label").classList.toggle("activity-shimmer", state.activityShimmer);
     const secs = Math.max(0, Math.round((Date.now() - busyStartAt) / 1000));
     $("workbar-elapsed").textContent = secs >= 60
       ? Math.floor(secs / 60) + " 分 " + (secs % 60) + " 秒" : secs + " 秒";
   };
-  tick();
-  busyTimer = setInterval(tick, 1000); // 只動兩個文字節點,不重畫訊息
+  const show = () => {
+    busyShowTimer = null;
+    bar.classList.remove("hidden"); tick();
+    if (!busyTimer) busyTimer = setInterval(tick, 1000);
+  };
+  if (!bar.classList.contains("hidden")) show();
+  else if (!busyShowTimer) busyShowTimer = setTimeout(show, 1500);
 }
 
 // 別的客戶端(手機)發起的回合也要亮:per-session 事件一到,先就地改掉
 // 列表裡那一列的狀態再排程抓清單,不等 800ms debounce。
-function reflectSessionStatus(id, phase) {
+function reflectSessionStatus(id, phase, meta) {
   const s = state.sessions.find((x) => x.id === id);
-  if (!s || !phase || s.status === phase) return;
+  if (!s || !phase) return;
+  if (meta) s.meta = {...s.meta, ...meta};
+  else if (s.status === phase) return;
   s.status = phase;
+  s._statusRevision = state.statusRevision;
   renderSessions(); renderHome();
 }
 
@@ -1252,7 +1641,7 @@ async function sendInput(text) {
   const id = state.current;
   if (!id || signingOut || !canUse("input")) return;
   const d = draftFor(id);
-  if (d.atts.length && !canUse("attachments")) { toast("這條對話不允許附件，請先移除"); return; }
+  if (d.atts.length && !canUse("attachments")) { toast("這條對話不允許附件，請先移除", true); return; }
   if (d.pending || d.reading || (!text.trim() && !d.atts.length)) return;
   d.text = text;
   if (!navigator.onLine) { d.notice = "目前離線，訊息尚未送出"; showDraft(id); return; }
@@ -1308,7 +1697,7 @@ async function interrupt() {
     if (r.status === 409) { toast("目前沒有進行中的回合"); return; }
     if (!r.ok) throw new Error("HTTP " + r.status);
     toast("已送出中斷");
-  } catch (err) { toast("中斷失敗:" + err.message); }
+  } catch (err) { toast("中斷失敗:" + err.message, true); }
 }
 
 // ───────────────────────── UI 小工具 ─────────────────────────
@@ -1318,10 +1707,28 @@ function setConn(ok, text) {
 }
 function esc(s) { return String(s == null ? "" : s).replace(/[&<>"']/g, (c) =>
   ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])); }
-let toastTimer = null;
-function toast(msg) {
-  const t = $("toast"); t.textContent = msg; t.classList.remove("hidden");
-  clearTimeout(toastTimer); toastTimer = setTimeout(() => t.classList.add("hidden"), 3000);
+function toast(msg, error = false) {
+  const t = $("toast");
+  // Keep failures until dismissed; a later success must not erase them.
+  if ([...t.children].some(n => n.dataset.message === msg)) return;
+  const row = document.createElement("div");
+  row.className = "toast-item" + (error ? " toast-error" : "");
+  row.dataset.message = msg;
+  const text = document.createElement("span"); text.textContent = msg;
+  const close = document.createElement("button");
+  close.type = "button"; close.className = "icon-btn"; close.textContent = "×";
+  close.setAttribute("aria-label", "關閉通知"); close.title = "關閉通知";
+  const dismiss = () => {
+    const hadFocus = row.contains(document.activeElement);
+    row.remove(); t.classList.toggle("hidden", !t.children.length);
+    if (hadFocus) {
+      const next = t.querySelector("button");
+      if (next) next.focus(); else if (state.current) focusComposer(); else $("home-q").focus({preventScroll:true});
+    }
+  };
+  close.addEventListener("click", dismiss);
+  row.append(text, close); t.append(row); t.classList.remove("hidden");
+  if (!error) setTimeout(dismiss, 3000);
 }
 function autosize() {
   const ta = $("input"); ta.style.height = "auto";
@@ -1330,6 +1737,15 @@ function autosize() {
 
 // ───────────────────────── 綁定 + 啟動 ─────────────────────────
 function wire() {
+  window.PocketSessionOps?.init();
+  // Safari's software keyboard shrinks the visual, not the layout viewport.
+  const fitViewport = () => {
+    if (mobileConsole() && window.visualViewport?.scale === 1)
+      $("app").style.setProperty("--app-height", window.visualViewport.height + "px");
+    else $("app").style.removeProperty("--app-height");
+  };
+  window.visualViewport?.addEventListener("resize", fitViewport);
+  window.addEventListener("resize", fitViewport); fitViewport();
   $("new-reply").addEventListener("click", () => {
     const el = $("cards");
     el.scrollTop = el.scrollHeight;
@@ -1445,18 +1861,28 @@ function typingNow() {
   return t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable);
 }
 function moveSelection(delta) {
-  const ids = state.sessions.map((s) => s.id);
+  const ids = Array.from($("session-list").querySelectorAll(".sess"), n => n.dataset.id);
   if (!ids.length) return;
   const i = ids.indexOf(state.current);
   const next = ids[Math.max(0, Math.min(ids.length - 1, (i < 0 ? 0 : i + delta)))];
-  if (next && next !== state.current) openSession(next);
+  if (next && next !== state.current) {
+    openSession(next, false, false);
+    const row = Array.from($("session-list").querySelectorAll(".sess")).find(n => n.dataset.id === next);
+    row?.focus({preventScroll:true}); row?.scrollIntoView({block:"nearest"});
+  }
 }
+// 鍵盤 `a`(核准)/ `d`(否決)要按到哪一顆。
+//
+// ⚠️ **查不到就回 null,不猜。** 舊版找不到 `.ap-yes`/`.ap-no` 就退回
+// `btns[btns.length - 1]`,而資料驅動的按鈕以前根本沒掛這兩個 class ——
+// 於是 `d` 按的是選單最後一項,那可能是「本次全允許」之類的破壞性選項:
+// 想否決的人反而一次放行到底。語意只認 bridge 標在 option 上的 `style`
+// (APPROVAL_HUB_SPEC §1),沒標語意的選單(question / 複選)就沒有快捷鍵。
 function firstApprovalButton(wantYes) {
-  if ($("approval").classList.contains("hidden") || !actionable(currentSession())) return null;
-  const btns = Array.from($("ap-actions").querySelectorAll("button"));
-  if (!btns.length) return null;
-  const hit = btns.find((b) => b.classList.contains(wantYes ? "ap-yes" : "ap-no"));
-  return hit || (wantYes ? btns[0] : btns[btns.length - 1]);
+  if ($("approval").classList.contains("hidden") ||
+      !actionable(window.PocketSessionOps?.approvalSession() || currentSession())) return null;
+  const sel = wantYes ? "button.ap-yes" : "button.ap-no";
+  return $("ap-actions").querySelector(sel + ":not(:disabled)") || null;
 }
 // ── IME 三重判準(中文/日文選字按 Enter 不准送出)────────────────────────
 // 1. `event.isComposing` —— 多數引擎在組字期間的標準訊號。
@@ -1486,6 +1912,7 @@ function wireKeys() {
   window.addEventListener("blur", imeReset);
   document.addEventListener("keydown", (e) => {
     if (imeKey(e)) return;
+    if ($("session-ops")?.open) return; // Native dialog owns focus and Escape.
     if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
       e.preventDefault(); openPalette(); return;
     }
@@ -1496,8 +1923,11 @@ function wireKeys() {
       if (rows.length && ["ArrowDown", "ArrowUp"].includes(e.key)) {
         e.preventDefault();
         rows[Math.max(0, Math.min(rows.length - 1, i + (e.key === "ArrowDown" ? 1 : -1)))].focus();
-      } else if (e.key === "Enter" && document.activeElement === $("pal-q") && rows.length) {
+      } else if (!imeKey(e) && e.key === "Enter" && document.activeElement === $("pal-q") && rows.length) {
         e.preventDefault(); rows[0].click();
+      } else if (e.key === "Tab") {
+        const stops = [$("pal-q"), ...rows], at = stops.indexOf(document.activeElement);
+        e.preventDefault(); stops[(at + (e.shiftKey ? -1 : 1) + stops.length) % stops.length].focus();
       }
       return;
     }
@@ -1512,12 +1942,19 @@ function wireKeys() {
 }
 
 // ⌘K 快速切換面板
+let paletteFocus = null;
 function openPalette() {
   const p = $("palette");
+  if (p.classList.contains("hidden")) paletteFocus = document.activeElement;
   p.classList.remove("hidden");
   const q = $("pal-q"); q.value = ""; renderPalette(""); q.focus();
 }
-function closePalette() { $("palette").classList.add("hidden"); }
+function closePalette(restore = true) {
+  if ($("palette").classList.contains("hidden")) return;
+  $("palette").classList.add("hidden");
+  if (restore && paletteFocus?.isConnected) paletteFocus.focus({preventScroll:true});
+  paletteFocus = null;
+}
 function renderPalette(q) {
   const needle = q.trim().toLowerCase();
   const hits = state.sessions.filter(s => workMatches(s, needle));
@@ -1525,7 +1962,7 @@ function renderPalette(q) {
     ? hits.map(workRow).join("")
     : '<div class="empty">沒有符合的 session</div>';
   $("pal-list").querySelectorAll(".work-row").forEach((n) =>
-    n.addEventListener("click", () => { closePalette(); openSession(n.dataset.id); }));
+    n.addEventListener("click", () => { closePalette(false); openSession(n.dataset.id); }));
 }
 
 // ───────────────────────── P1:開新工作 ─────────────────────────
@@ -1534,7 +1971,7 @@ async function createSession() {
   const kind = $("new-kind").value;
   const name = $("new-name").value.trim();
   const wd = $("new-dir").value.trim();
-  if (kind === "cc" && !name) { toast("CC 需要 session 名稱"); return; }
+  if (kind === "cc" && !name) { toast("CC 需要 session 名稱", true); return; }
   try {
     if (kind === "cc") {
       const r = await api("/ccsessions", {
@@ -1553,7 +1990,7 @@ async function createSession() {
     $("newsess").classList.add("hidden");
     $("new-name").value = ""; $("new-dir").value = "";
     setTimeout(loadSessions, 600);     // 給 bridge 一點時間把它登記進列表
-  } catch (err) { toast("開新工作失敗:" + err.message); }
+  } catch (err) { toast("開新工作失敗:" + err.message, true); }
 }
 
 
@@ -1577,7 +2014,7 @@ function addFiles(files) {
   const d = draftFor(id);
   if (d.pending) return;
   Array.from(files || []).forEach((f) => {
-    if (f.size > ATT_MAX_BYTES) { toast(f.name + " 超過 8MB,改用檔案路徑引用"); return; }
+    if (f.size > ATT_MAX_BYTES) { toast(f.name + " 超過 8MB,改用檔案路徑引用", true); return; }
     const fr = new FileReader();
     d.reading++;
     fr.onload = () => {
@@ -1658,6 +2095,8 @@ async function main() {
   await identifyPersonalLogin();
   if (sessionStorage.getItem(LOGOUT_EVENT)) { await leaveConsole(); return; }
   await loadSessions();
+  void window.PocketSessionOps?.loadCapabilities();
+  void window.PocketSessionOps?.loadHub();
   if (signingOut) return;
   if (document.body.dataset.consoleAccess !== "remote") {
     loadUsage(); setInterval(() => { if (!signingOut) loadUsage(); }, 120000);
@@ -1680,7 +2119,7 @@ async function main() {
     onEvent: ({data}) => {
       if (!Number.isSafeInteger(data?.seq) || data.seq <= listCursor) return;
       listCursor = data.seq;
-      scheduleListRefresh();
+      handleListEvent(data);
     },
     onError: () => setConn(false, "事件流斷線,重連中…"),
     onOpen: () => {},
@@ -1689,5 +2128,23 @@ async function main() {
 }
 let listTimer = null;
 function scheduleListRefresh() { clearTimeout(listTimer); listTimer = setTimeout(loadSessions, 800); }
+
+// 全域事件分派。舊版**連 `data.type` 都沒讀**,每一種型別都塌縮成同一個
+// 800ms debounce 重抓 —— `approval.resolved`(bridge.py:3093)就是為了
+// 「所有端收到即收卡,不留懸空」才加的 persisted 事件,被當成刷新鈴等於
+// 把它的意義丟掉:別的端答掉之後,這裡還掛著一顆按下去吃 409 的按鈕。
+//
+// Message/read deltas update in place; approvals still reconcile immediately.
+function handleListEvent(ev) {
+  window.PocketSessionOps?.onEvent(ev);
+  if (ev?.type === "approval.resolved") {
+    noteApprovalResolved(ev.data?.approval_id);
+    renderApproval(); renderAwaiting(); renderHome(); renderSessions();
+    clearTimeout(listTimer); listTimer = null;
+    loadSessions();          // 立即對帳,不等 debounce
+    return;
+  }
+  if (!applyListEvent(ev)) scheduleListRefresh();
+}
 
 main();

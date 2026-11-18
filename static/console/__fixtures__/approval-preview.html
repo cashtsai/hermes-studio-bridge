@@ -1,0 +1,343 @@
+<!doctype html>
+<html lang="zh-Hant" data-theme="pocket">
+<head>
+<meta charset="utf-8">
+<title>Console 待審核 — 離線預覽 harness</title>
+<!--
+  離線 harness:**不跑 bridge、不連網**,拿假的 approval payload 直接餵進出貨
+  那份 `app.js` 的 `renderApproval()` 渲染路徑,把每個情境各畫一張出來。
+
+  為什麼要它:這個 repo 的教訓是「靜默失敗是最大病原」「驗行為不驗存活」——
+  審批 UI 改完只看程式碼等於沒驗。這頁可以用 headless Chrome 算圖,PNG 進
+  docs/console-p0-preview/ 當證據。
+
+  怎麼跑(repo 根目錄):
+      python3 -m http.server 8777 &
+      /Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome --headless \
+        --disable-gpu --hide-scrollbars --screenshot=out.png --window-size=1200,2600 \
+        'http://127.0.0.1:8777/static/console/__fixtures__/approval-preview.html'
+
+  必須用 http(不是 file://):這頁刻意用 `fetch` 讀**出貨檔本身**
+  (`../app.js` 的審批區塊 + `../index.html` 的 `#approval` 標記),才不會另外
+  抄一份而跟實作漂開。file:// 下瀏覽器不給 fetch,頁面會印出這段說明。
+-->
+<link rel="stylesheet" href="../style.css">
+<style>
+  /* 出貨的 style.css 把 html,body 釘成 height:100%(主控台是滿版版面)——
+     harness 是一張會長的長頁,要放掉那個限制,否則算圖只會拿到第一屏。 */
+  html,body{height:auto;min-height:100%;}
+  body{padding:18px 20px 40px;}
+  h1{font-size:19px;margin:0 0 4px;}
+  .lead{color:var(--dim);font-size:13px;margin:0 0 18px;max-width:72ch;line-height:1.8;}
+  .case{margin:0 0 20px;border:1px solid var(--line);border-radius:14px;overflow:hidden;
+        background:var(--panel);}
+  .case > h2{font-size:14px;margin:0;padding:9px 13px;background:var(--panel-2);
+             border-bottom:1px solid var(--line);}
+  .case > p{margin:0;padding:8px 13px 0;font-size:12.5px;color:var(--dim);line-height:1.8;}
+  .case > p b{color:var(--bad);}
+  .case .approval{margin:11px 13px 13px;}
+  .probe{font-size:12px;padding:0 13px 11px;color:var(--dim);line-height:1.8;}
+  .probe code{font-family:var(--mono);}
+  .probe-d{outline:3px dashed var(--bad);outline-offset:3px;}
+  .probe-a{outline:3px dashed var(--good);outline-offset:3px;}
+  #fail{color:var(--bad);font-size:14px;line-height:1.9;white-space:pre-wrap;}
+  #stage{position:absolute;left:-10000px;top:0;width:900px;}
+</style>
+</head>
+<body data-console-access="local">
+<h1>Console 待審核 — 離線預覽</h1>
+<p class="lead">每一格都是出貨 <code>app.js</code> 的 <code>renderApproval()</code>
+真的跑出來的 DOM(假 payload、零網路)。虛線框 = 鍵盤 <code>a</code>/<code>d</code>
+實際會按到的那一顆,由 <code>firstApprovalButton()</code> 當場問出來的。</p>
+<div id="fail" hidden></div>
+<div id="gallery"></div>
+<div id="stage"></div>
+
+<script>
+(async function () {
+  const fail = (msg) => {
+    const el = document.getElementById("fail");
+    el.hidden = false;
+    el.textContent = "harness 起不來:" + msg +
+      "\n\n這頁必須用 http 開(瀏覽器不讓 file:// 讀同目錄的檔)。repo 根目錄跑:" +
+      "\n    python3 -m http.server 8777" +
+      "\n再開 http://127.0.0.1:8777/static/console/__fixtures__/approval-preview.html";
+  };
+
+  let appSrc, indexSrc;
+  try {
+    [appSrc, indexSrc] = await Promise.all([
+      fetch("../app.js").then(r => r.text()),
+      fetch("../index.html").then(r => r.text()),
+    ]);
+  } catch (e) { return fail(String(e)); }
+
+  // ── 從出貨檔抽段(同 tests/console_*.test.cjs 的做法:不抄第二份)──────
+  function section(start, end) {
+    const a = appSrc.indexOf(start), b = appSrc.indexOf(end, a);
+    if (!(a >= 0 && b > a)) throw new Error("app.js 抽不到區塊:" + start);
+    return appSrc.slice(a, b);
+  }
+  const markup = (indexSrc.match(/<div id="approval"[\s\S]*?\n      <\/div>/) || [])[0];
+  if (!markup || !markup.includes("ap-actions")) return fail("index.html 抽不到 #approval 標記");
+
+  // ── 審批區塊以外的依賴一律樁掉(都是與渲染無關的周邊)────────────────
+  const noop = () => {};
+  Object.assign(window, {
+    state: { sessions: [], current: null, listHealth: "ready", degraded: [], view: 0 },
+    signingOut: false,
+    borrowed: () => document.body.dataset.consoleAccess === "remote",
+    currentSession: () => window.state.sessions.find(x => x.id === window.state.current) || null,
+    activityTime: (v) => {
+      const ms = typeof v === "number" ? (v < 1e12 ? v * 1000 : v) : NaN;
+      return ms > 0 ? ms : 0;
+    },
+    renderAwaiting: noop, renderHome: noop, renderSessions: noop, loadSessions: noop,
+    toast: noop,
+    api: () => { throw new Error("harness 不打網路"); },
+    $: (id) => document.getElementById(id),
+  });
+
+  const EXPORTS = ["renderApproval", "actionable", "approvalView", "approvalStyleClass",
+    "approvalOptionLabel", "noteApprovalResolved", "msReset", "firstApprovalButton"];
+  try {
+    (0, eval)(section("function approvalIdOf(meta) {", "// 跨 session 彙總")
+      + "\n" + section("function firstApprovalButton(", "// ── IME 三重判準")
+      + "\n" + EXPORTS.map(n => `globalThis.${n}=${n};`).join(""));
+  } catch (e) { return fail("eval 失敗:" + e); }
+
+  // ── 假 payload:每一條都對著稽核裡的一個病 ─────────────────────────
+  const future = Date.now() / 1000 + 600;
+  const CASES = [
+    {
+      title: "P0-1 · CC AskUserQuestion 複選(multiselect)",
+      note: "舊版:<b>點了選項畫面完全沒變</b>,再點一次還把前一次取消 —— " +
+        "送的是 {key:\"3\"} 走 _cc_key_core,只按一個數字鍵 = 只勾一個框、永遠不按送出。" +
+        "新版:checkbox 多選(勾選不打網路)+ 一顆送出,走 /ccsessions/{name}/answer " +
+        "的完整集合語意;「第 2/3 題」也看得到了。",
+      row: {
+        id: "claude_code:Ops", provider: "claude_code", title: "Ops",
+        capabilities: ["input", "interrupt", "keys", "attachments", "replay", "follow", "approve"],
+        meta: {
+          prompt: {
+            kind: "menu", semantic: "question", multiselect: true,
+            title: "這一輪要先處理哪幾件?(可複選)",
+            submit_label: "Submit", q_index: 1, q_total: 3,
+            options: [
+              { key: "1", label: "補上 SSE 反緩衝標頭", description: "新守門抓到的真缺陷", checked: true },
+              { key: "2", label: "收斂審批 options 的 style 語意", description: "鍵盤 d 的根因", checked: false },
+              { key: "3", label: "把 detail/risk 接上 console", checked: false },
+              { key: "4", label: "Type something else", description: "動作列,不是核取方塊" },
+            ],
+          },
+          approval: {
+            id: "cc-9f1c2b7a", status: "pending", kind: "question", risk: "low",
+            session_id: "claude_code:Ops", provider: "claude_code", expires_at: future,
+            detail: "session: Ops\n這一輪要先處理哪幾件?(可複選)\n選項: 補上 SSE 反緩衝標頭 / 收斂審批 options 的 style 語意 / 把 detail/risk 接上 console",
+            meta: { multiselect: true, q_index: 1, q_total: 3 },
+            options: [
+              { key: "1", label: "補上 SSE 反緩衝標頭", checked: true },
+              { key: "2", label: "收斂審批 options 的 style 語意" },
+              { key: "3", label: "把 detail/risk 接上 console", checked: false },
+              { key: "4", label: "Type something else" },
+            ],
+          },
+        },
+      },
+    },
+    {
+      title: "P0-2 · codex 三鍵(primary / secondary / danger)",
+      note: "舊版:資料驅動的按鈕沒掛 .ap-yes/.ap-no,<b>鍵盤 d 退回 btns[last]</b> —— " +
+        "這張選單的最後一顆就是「拒絕」還算運氣好,換成「本次全允許」在前就是幫你放行。" +
+        "新版只認 bridge 標的 style,且 o.key 前綴不再印內部識別字" +
+        "(舊版長成「approve_for_session. 本次全允許」)。",
+      probe: true,
+      row: {
+        id: "codex:01JD", provider: "codex", title: "codex · bridge.py",
+        capabilities: ["input", "interrupt", "attachments", "replay", "follow", "approve"],
+        meta: {
+          approval: {
+            id: "codex-3a7f", status: "pending", kind: "permission", risk: "high",
+            session_id: "codex:01JD", provider: "codex", expires_at: future,
+            title: "Codex 要套用這個 patch",
+            detail: "applyPatch · 3 檔變更\n  M bridge.py            +142 −38\n  M static/console/app.js  +96 −21\n  A tests/test_console_approval_p0.py +210 −0\n\n這一輪的 patch 會動到 production 服務讀的 bridge.py。",
+            options: [
+              { key: "approve", label: "允許修改", style: "primary" },
+              { key: "approve_for_session", label: "本次全允許", style: "secondary" },
+              { key: "deny", label: "停止這一輪", style: "deny" },
+            ],
+          },
+        },
+      },
+    },
+    {
+      title: "P0-3 · openclaw plugin 審批:長 detail + risk=high",
+      note: "舊版審批區只有 icon + #ap-title 兩個節點,<b>detail 連容器都沒有</b> —— " +
+        "規範欄位 detail/risk 每家 bridge 都填,卻一路到不了畫面,等於盲簽。",
+      probe: true,
+      row: {
+        id: "openclaw:agent:main:main", provider: "openclaw", title: "OpenClaw",
+        capabilities: ["input", "interrupt", "attachments", "replay", "follow", "approve"],
+        meta: {
+          approval: {
+            id: "oc-55e1", status: "pending", kind: "permission", risk: "high",
+            session_id: "openclaw:agent:main:main", provider: "openclaw", expires_at: future,
+            title: "外掛 fs-write 要求核准",
+            detail: "plugin: fs-write@0.4.2\ntool: write_file\npath: ~/Library/LaunchAgents/ai.studio.hermes-bridge.plist\nbytes: 2,184\n\n這個路徑是 production 服務的 launchd 設定檔。\n核准後外掛可在本回合內重複寫入,直到你撤回授權。",
+            options: [
+              { key: "allow-once", label: "允許一次", style: "primary" },
+              { key: "allow-always", label: "永遠允許", style: "primary" },
+              { key: "deny", label: "拒絕", style: "danger" },
+            ],
+          },
+        },
+      },
+    },
+    {
+      title: "順手修 · 12 個選項(舊版第 9 個以後靜默消失)",
+      note: "舊版 opts.slice(0, 8):<b>第 9 個以後沒有任何痕跡</b> —— " +
+        "使用者看不到自己要的那個答案,也不知道它被吃掉了。新版全部畫出來。",
+      row: {
+        id: "codex:01JE", provider: "codex", title: "codex · 問卷",
+        capabilities: ["input", "interrupt", "attachments", "replay", "follow", "approve"],
+        meta: {
+          approval: {
+            id: "codex-91bb", status: "pending", kind: "question", risk: "medium",
+            session_id: "codex:01JE", provider: "codex", expires_at: future,
+            q_index: 0, q_total: 2,
+            title: "這次要先補哪個 provider 的 replay fixture?(第 1/2 題)",
+            detail: "回答後才會進下一題;答錯可在終端機改。",
+            options: [
+              ...["claude_code", "cc2", "codex", "gemini", "grok", "opencode",
+                "openclaw", "hermes", "delegation", "guest", "notice", "全部"]
+                .map((n, i) => ({ key: "opt" + i, label: n, style: i === 0 ? "primary" : "secondary" })),
+            ],
+          },
+        },
+      },
+    },
+    {
+      title: "kind=notice · 單鍵「知道了」",
+      note: "舊版印成「<b>ack. 知道了</b>」(key 前綴把內部識別字漏到畫面上)。" +
+        "新版只有 CC 的 TUI 數字鍵才顯示前綴;icon 也跟著 kind 換成 🔔。",
+      probe: true,
+      row: {
+        id: "hermes:cash", provider: "hermes", title: "善彰",
+        capabilities: ["input", "attachments", "replay", "follow", "approve"],
+        meta: {
+          approval: {
+            id: "hp-ack01", status: "pending", kind: "notice", risk: "low",
+            session_id: "hermes:cash", provider: "hermes", expires_at: future,
+            title: "晨報已產出(11/18)",
+            detail: "今天 3 件待辦、2 件逾期。\n報告已寫進 report_events,App 首頁會帶。",
+            options: [{ key: "ack", label: "知道了", style: "primary" }],
+          },
+        },
+      },
+    },
+    {
+      title: "CC 權限提示:style 從統一物件疊回 meta.prompt",
+      note: "meta.prompt 的 options <b>沒有 style</b>(直接解 pane),統一物件才有。" +
+        "舊版偏好 prompt.options 就把語意丟了 → 鍵盤 a/d 全失效。" +
+        "新版依 key 疊回去,下面虛線框證明 a/d 現在找得到正確的那一顆。",
+      probe: true,
+      row: {
+        id: "claude_code:Build", provider: "claude_code", title: "Build",
+        capabilities: ["input", "interrupt", "keys", "attachments", "replay", "follow", "approve"],
+        meta: {
+          prompt: {
+            kind: "permission", title: "Bash command: rm -rf build/",
+            options: [
+              { key: "1", label: "Yes", description: "" },
+              { key: "2", label: "Yes, and don't ask again this session" },
+              { key: "3", label: "No, and tell Claude what to do differently" },
+            ],
+          },
+          approval: {
+            id: "cc-77aa12", status: "pending", kind: "permission", risk: "medium",
+            session_id: "claude_code:Build", provider: "claude_code", expires_at: future,
+            detail: "session: Build\nBash command: rm -rf build/\ncwd: ~/apps/hermes-openwebui-bridge",
+            options: [
+              { key: "1", label: "Yes", style: "primary" },
+              { key: "2", label: "Yes, and don't ask again this session", style: "secondary" },
+              { key: "3", label: "No, and tell Claude what to do differently", style: "danger" },
+            ],
+          },
+        },
+      },
+    },
+    {
+      title: "順手修 · 28 個選項:超過防爆上限就明示「還有 N 個」",
+      note: "不截就是不截;真的多到會把版面炸掉(> 24)才收,而且<b>明說還有幾個</b>," +
+        "絕不像舊版那樣靜默吃掉。",
+      row: {
+        id: "codex:01JF", provider: "codex", title: "codex · 長問卷",
+        capabilities: ["input", "interrupt", "attachments", "replay", "follow", "approve"],
+        meta: {
+          approval: {
+            id: "codex-c0de", status: "pending", kind: "question", risk: "low",
+            session_id: "codex:01JF", provider: "codex", expires_at: future,
+            title: "挑一個 scenario 當 baseline",
+            options: Array.from({ length: 28 }, (_, i) => ({
+              key: "opt" + i, label: "scenario-" + String(i + 1).padStart(2, "0"),
+              style: i === 0 ? "primary" : "secondary",
+            })),
+          },
+        },
+      },
+    },
+  ];
+
+  // ?case=N 只畫第 N 格(逐格算圖用);?theme=dark|white 換主題。
+  const qs = new URLSearchParams(location.search);
+  const theme = qs.get("theme");
+  if (theme) document.documentElement.dataset.theme = theme;
+  const only = qs.has("case") ? Number(qs.get("case")) : null;
+  const picked = only === null ? CASES : CASES.filter((_, i) => i === only);
+  if (only !== null) document.querySelector(".lead").hidden = true;
+
+  const stage = document.getElementById("stage");
+  const gallery = document.getElementById("gallery");
+  for (const c of picked) {
+    window.state.sessions = [c.row];
+    window.state.current = c.row.id;
+    window.msReset();
+    stage.innerHTML = markup;
+    window.renderApproval();
+
+    const live = document.getElementById("approval");
+    let probe = "";
+    if (c.probe) {
+      const yes = window.firstApprovalButton(true), no = window.firstApprovalButton(false);
+      if (yes) yes.classList.add("probe-a");
+      if (no) no.classList.add("probe-d");
+      probe = "鍵盤 a → " + (yes ? "「" + yes.textContent + "」" : "不動作") +
+              "　／　鍵盤 d → " + (no ? "「" + no.textContent + "」" : "不動作");
+    } else {
+      const no = window.firstApprovalButton(false);
+      probe = "鍵盤 d → " + (no ? "「" + no.textContent + "」" : "不動作(沒有 danger 語意的選單不給快捷鍵)");
+    }
+
+    const card = document.createElement("section");
+    card.className = "case";
+    const h = document.createElement("h2"); h.textContent = c.title;
+    const p = document.createElement("p"); p.innerHTML = c.note;
+    const clone = live.cloneNode(true);
+    clone.removeAttribute("id");
+    for (const n of clone.querySelectorAll("[id]")) n.removeAttribute("id");
+    const pr = document.createElement("div"); pr.className = "probe";
+    const code = document.createElement("code"); code.textContent = "firstApprovalButton()";
+    pr.append(code, document.createTextNode(" 實測:" + probe));
+    card.append(h, p, clone, pr);
+    gallery.appendChild(card);
+  }
+  stage.innerHTML = "";
+  // 算圖腳本用:--dump-dom 撈這個屬性就知道要開多高的視窗(免得每張圖都
+  // 拖一大片空白)。
+  document.documentElement.dataset.harnessReady = "1";
+  document.documentElement.dataset.harnessHeight =
+    String(Math.ceil(document.body.getBoundingClientRect().height) + 36);
+})();
+</script>
+</body>
+</html>

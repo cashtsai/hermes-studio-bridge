@@ -87,14 +87,62 @@ class _Base(unittest.TestCase):
                                      bridge._console_cookie_value())}
 
 
-class LocalPathUnchangedTest(_Base):
-    """規矩 1:QR 登入是加法,可信來源那條路一字不變。"""
+class LocalPathTest(_Base):
+    """可信來源那條路。
 
-    def test_local_without_code_still_gets_form(self):
+    **2026-11-18 這個類別的前提變了,原名是 `LocalPathUnchangedTest`。**
+    原本的規矩是「QR 登入是加法,可信來源一字不變」。那條規矩當時對(功能
+    剛上線,不該順手動既有路徑),但它固化出來的結果是反的:**公開面給
+    QR、自己家的機器反而只能手打配對碼** —— 同一件事在信任度高的那條路
+    上比較難用。所以現在掃碼是所有入口的主路徑,`?code=1` 是逃生門。
+
+    這個類別從「釘住不變」改成「釘住新分流」,但有一條沒變、也不准變:
+    **QR 關掉時本機一定要落回配對碼頁**,否則本機 console 直接進不去。
+    """
+
+    def test_local_without_code_gets_qr_page(self):
+        """本機沒帶碼 → **掃碼頁**(2026-11-18 起的主路徑)。"""
         r = self.http.get("/console")
         self.assertEqual(r.status_code, 401, r.text[:200])
+        self.assertIn("pocket://console-login", r.text,
+                      "本機也該走掃碼 —— 自己家的機器不該比公網難用")
+        self.assertNotIn(_CONSOLE_MARK, r.text, "不准漏出 console 本體")
+
+    def test_qr_page_always_offers_the_pairing_code_escape(self):
+        """逃生門必須**看得見**,不是只藏在 `?code=1`。
+
+        掃碼成了唯一主路徑之後,手機不在手邊的人就只剩這條路。頁面上
+        不明說 = 把人鎖在門外,而且他不會知道還有別條路。
+        """
+        r = self.http.get("/console")
+        self.assertIn("/console?code=1", r.text,
+                      "掃碼頁沒有「改用配對碼」的出口 —— 沒手機就進不來了")
+
+    def test_code_query_forces_the_pairing_form_even_when_qr_is_on(self):
+        """`?code=1` → 配對碼頁(長碼救援路徑走這裡)。"""
+        r = self.http.get("/console", params={"code": "1"})
+        self.assertEqual(r.status_code, 401, r.text[:200])
         for m in _FORM_MARKS:
-            self.assertIn(m, r.text, f"本機沒帶碼應該拿到輸入頁,少了 {m!r}")
+            self.assertIn(m, r.text, f"?code=1 應該拿到輸入頁,少了 {m!r}")
+
+    def test_local_falls_back_to_form_when_qr_is_unavailable(self):
+        """**鎖死防線。** QR 關掉(旗標預設 0)或中繼沒活著時,
+        `_console_qr_enabled()` 回 False → 本機必須落回配對碼頁。
+
+        少了這條退路,把 QR 一關,本機 console 就完全進不去,而且
+        不會有任何錯誤訊息說明原因。
+        """
+        with patch.object(bridge, "_console_qr_enabled", return_value=False):
+            r = self.http.get("/console")
+        self.assertEqual(r.status_code, 401, r.text[:200])
+        for m in _FORM_MARKS:
+            self.assertIn(m, r.text, f"QR 不可用時本機該拿到輸入頁,少了 {m!r}")
+
+    def test_local_with_correct_code_still_opens_console(self):
+        """掃碼成為主路徑不影響既有的 `?boot=` 直通 —— 這條沒變。"""
+        r = self.http.get("/console", params={"boot": self.boot})
+        self.assertEqual(r.status_code, 200, r.text[:200])
+        self.assertIn(_CONSOLE_MARK, r.text)
 
     def test_local_with_correct_code_gets_console(self):
         r = self.http.get("/console", params={"boot": self.boot})
@@ -140,7 +188,9 @@ class RemoteQrPathTest(_Base):
 
     def test_remote_gets_qr_page(self):
         r = self.http.get("/console", headers=_REMOTE)
-        self.assertEqual(r.status_code, 200, r.text[:200])
+        # 401:QR 頁跟配對碼頁一樣是**登入挑戰**。2026-11-18 之前這頁回 200,
+        # 兩頁狀態碼分岔;掃碼變成共用頁之後那個接縫必須收掉。
+        self.assertEqual(r.status_code, 401, r.text[:200])
         self.assertIn("pocket://console-login", r.text,
                       "QR 頁應該含 payload(沒 qrcode 套件時也有可複製連結)")
         self.assertNotIn(_CONSOLE_MARK, r.text, "不准漏出 console 本體")
@@ -155,7 +205,7 @@ class RemoteQrPathTest(_Base):
         r = self.http.get("/console", params={"boot": self.boot}, headers=_REMOTE)
         self.assertNotIn(_CONSOLE_MARK, r.text,
                          "公網帶正確六碼竟然進了 console —— local-only 被拆掉了")
-        self.assertEqual(r.status_code, 200)     # 旗標開 → QR 頁
+        self.assertEqual(r.status_code, 401)     # 旗標開 → QR 頁(登入挑戰)
         self.assertIn("pocket://console-login", r.text)
 
     def test_sid_cookie_is_httponly_strict_and_session(self):
