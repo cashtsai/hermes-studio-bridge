@@ -32,6 +32,63 @@ internals.
   commit real tokens to git.
 - `/health` may be used as a lightweight reachability check.
 
+### Console W2 Operations (2026-11-18, Additive)
+
+`GET /app/v2/providers/capabilities` returns `{providers: {provider: caps}}`.
+`caps.ops` remains derived from `_V2_SESSION_OPS`, not duplicated in clients.
+The following optional metadata is additive; older clients can ignore it:
+
+- `compact: bool`: the unified compact route is implemented. CC may respond
+  `409 USE_CC_COMPRESS`; only the local owner console can follow that explicit
+  response to `POST /ccsessions/{name}/compress`. A receipt means requested,
+  not completed. Console-remote must not fall back to a legacy endpoint.
+- `read_cursor: bool`: this provider can report to `POST /app/v2/read`.
+  Currently true only for Hermes personas. This is not a claim that coding
+  sessions have server-backed unread state.
+- `config_fields: {field: {editable: bool, options?: [string]}}`: field-level
+  support for the existing GET/POST session config endpoints. Current values
+  remain in the config response. If that response supplies `field_options`
+  (`[{value,name}]`), those options take precedence. Missing schema means
+  read-only display, never guessed write support.
+
+Codex exposes model and approval_policy as editable; effort and sandbox are
+spawn-only/read-only. CC2 exposes model and permission_mode, with current
+values from the session's meta (it has config_write, not config_read).
+OpenCode exposes its known model/mode fields. No existing config route or
+authorization behavior changed.
+
+The owner console hides an operation only when the provider matrix explicitly
+excludes it. It does not treat absence from a legacy per-session capability
+list as an operation denial. Console-remote still uses its per-session strict
+allowlist and does not fetch the global capability matrix or approval hub.
+
+Rename receipts may change identity (`session_id`, or legacy `session.name`).
+Archive uses `{archived: true}` and undo uses `{archived: false}`. The console
+keeps the undo action until dismissed, including after a failed undo attempt.
+
+When the card ring cursor is exhausted or returns 409, `/sessions/{id}/history`
+is an independent transcript view. Its text/cursor and messages/offset shapes
+are not converted into live cards. Pagination never changes the card stream's
+latest_seq, IDs, or loaded history. Offset-based providers advance by the
+requested limit; cursor-based providers must supply a progressing nextCursor.
+
+Read reports use a stable device_id, bare persona session name, and the latest
+visible final prose card's last_read_ts/message_id. Card-ring sequence numbers
+are NOT global event-log sequence numbers and must never be sent as
+last_read_seq. Only the focused visible tab, valid snapshot and bottom-follow
+position may report. Repeated renders/focus events are deduplicated; incoming
+read_cursor.update.global advances the same high-water mark.
+
+The owner approval hub reads all pending approval objects (including multiple
+objects per session), with next_offset pagination. Decision writes use the
+selected `/app/v1/approvals/{aid}/decision` and the existing P0 renderer.
+For live Codex questionnaires the hub serializer overlays title, detail,
+options, q_index and q_total from the active request. The DB row can describe
+an older question. Clients send expected_q_index; a next_question receipt
+must NOT mark the entire approval resolved. response_capability values
+not_resumable/none disable responses. Existing CC multiselect continues using
+the P0 answer route only when the selected approval matches the current prompt.
+
 ## 1.1 Typed visual reply envelope (additive)
 
 Cards may include an optional `body.visual` envelope. It is versioned and must
