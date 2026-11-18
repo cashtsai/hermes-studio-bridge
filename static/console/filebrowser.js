@@ -8,6 +8,7 @@
   const esc = (s) => String(s == null ? "" : s).replace(/[&<>"']/g, (c) =>
     ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
   let token = null, curPath = "", curParent = null, booted = false;
+  let listRequest = 0;
 
   function tok() { return token || (token = localStorage.getItem(TOKEN_KEY)); }
   function fileURL(path) { return "/file?path=" + encodeURIComponent(path) + "&token=" + encodeURIComponent(tok()); }
@@ -30,20 +31,31 @@
   async function fsList(path) {
     const url = "/app/v2/fs/list" + (path ? ("?path=" + encodeURIComponent(path)) : "");
     const r = await fetch(url, { headers: { "Authorization": "Bearer " + tok() } });
-    if (r.status === 401) { $("fb-list").innerHTML = '<div class="placeholder err">token 失效</div>'; throw new Error("401"); }
-    if (r.status === 404) { $("fb-list").innerHTML = '<div class="placeholder err">檔案瀏覽未啟用（POCKET_FILEBROWSER_ENABLED=0）</div>'; throw new Error("404"); }
+    if (r.status === 401) throw new Error("token 失效，請重新登入");
+    if (r.status === 404) throw new Error("檔案瀏覽未啟用（POCKET_FILEBROWSER_ENABLED=0）");
     if (!r.ok) throw new Error("HTTP " + r.status);
     return r.json();
   }
 
   async function navigate(path) {
+    const request = ++listRequest;
+    $("fb-list").innerHTML = '<div class="placeholder" role="status">讀取目錄中…</div>';
+    $("fb-up").disabled = true;
     try {
       const d = await fsList(path);
+      if (request !== listRequest) return;
       curPath = d.path; curParent = d.parent;
       renderCrumb(d.path);
       renderList(d.entries, d.truncated);
       $("fb-up").disabled = !d.parent;
-    } catch (e) { /* 訊息已寫進 list */ }
+    } catch (e) {
+      if (request !== listRequest) return;
+      $("fb-list").innerHTML = '<div class="placeholder err" role="status">' +
+        esc("無法讀取目錄：" + (e.message || "連線失敗")) +
+        '</div><button type="button" class="btn-ghost fb-retry">重試</button>';
+      $("fb-list").querySelector(".fb-retry").addEventListener("click", () => navigate(path));
+      $("fb-up").disabled = !curParent;
+    }
   }
 
   function renderCrumb(path) {

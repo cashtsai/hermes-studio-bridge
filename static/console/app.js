@@ -45,7 +45,7 @@ function resumePreference() {
 function rememberWork(id) {
   if (!personalDevice()) return;
   try { localStorage.setItem(RESUME_KEY, JSON.stringify({owner:ownerFingerprint, id})); }
-  catch (_) { toast("這個瀏覽器無法記住工作"); }
+  catch (_) { toast("這個瀏覽器無法記住工作", true); }
 }
 async function identifyPersonalLogin() {
   try {
@@ -300,6 +300,7 @@ function sortSessions(rows, now) {
 
 function renderSessions() {
   const el = $("session-list");
+  const focusedId = el.contains(document.activeElement) ? document.activeElement.dataset.id : null;
   if (!state.sessions.length) {
     el.textContent = state.listHealth === "failed" || state.degraded.length ? "清單暫時不完整" : "沒有 session";
     return;
@@ -323,10 +324,10 @@ function renderSessions() {
     for (const s of rows) {
       const active = s.id === state.current ? " active" : "";
       const locked = s.meta && s.meta.locked ? ' 🔒' : "";
-      html += '<div class="sess' + active + '" data-id="' + esc(s.id) + '">' +
-              '<div class="sess-name">' + esc(s.title || s.id) + locked + "</div>" +
-              '<div class="sess-sub"><span class="st st-' + esc(s.status || "idle") + '">' +
-              esc(workPhase(s)) + "</span> " + esc(s.subtitle || "") + "</div></div>";
+      html += '<button type="button" class="sess' + active + '" data-id="' + esc(s.id) + '" aria-current="' + (active ? "true" : "false") + '">' +
+              '<span class="sess-name">' + esc(s.title || s.id) + locked + "</span>" +
+              '<span class="sess-sub"><span class="st st-' + esc(s.status || "idle") + '">' +
+              esc(workPhase(s)) + "</span> " + esc(s.subtitle || "") + "</span></button>";
     }
     if (!rows.length) html += '<div class="provider-empty">' + (dim ? "暫時無法讀取" : "無對話") + '</div>';
     html += "</div>";
@@ -334,6 +335,7 @@ function renderSessions() {
   el.innerHTML = html;
   el.querySelectorAll(".sess").forEach((n) => {
     n.addEventListener("click", () => openSession(n.dataset.id));
+    if (n.dataset.id === focusedId) n.focus({preventScroll:true});
     const was = oldTops.get(n.dataset.id);
     if (was === undefined || !n.animate ||
         window.matchMedia?.("(prefers-reduced-motion: reduce)").matches) return;
@@ -440,7 +442,8 @@ function showHome() {
   $("cards").replaceChildren();
   $("main").classList.add("at-home");
   $("handoff").classList.remove("hidden");
-  renderSessions(); renderHome(); $("home-q").focus();
+  renderSessions(); renderHome();
+  if (!mobileConsole()) $("home-q").focus({preventScroll:true});
 }
 
 // ───────────────────────── 卡片流 ─────────────────────────
@@ -462,13 +465,18 @@ function updateOlderButton() {
   b.textContent = loadingOlder ? "載入中…" : "更早訊息";
   b.classList.toggle("working", loadingOlder);
 }
-function openSession(id, preserveMode = false) {
+function mobileConsole() { return window.matchMedia("(max-width:760px)").matches; }
+function focusComposer() {
+  if (!$("composer").classList.contains("hidden") && !mobileConsole())
+    $("input").focus({preventScroll:true});
+}
+function openSession(id, preserveMode = false, focusInput = true) {
   if (signingOut) return;
   if (borrowed() && !state.sessions.find(s => s.id === id)?.capabilities?.includes("replay")) {
-    toast("這台電腦無權讀取此對話"); return;
+    toast("這台電腦無權讀取此對話", true); return;
   }
   if (state.current === id && state.snapshotView === state.view && !preserveMode) {
-    window.PocketConsoleMode?.set("agents"); return;
+    window.PocketConsoleMode?.set("agents"); if (focusInput) focusComposer(); return;
   }
   const view = ++state.view;
   resetHistory();
@@ -492,6 +500,7 @@ function openSession(id, preserveMode = false) {
   $("sh-name").textContent = s.title || id;
   updateStatusChip(s.status, s.meta);
   syncControls();
+  if (focusInput && !preserveMode) focusComposer();
   renderApproval();
   $("cards").innerHTML = '<div class="placeholder working" role="status">讀取最近訊息…</div>';
   cardScroll.follow = true;
@@ -610,7 +619,7 @@ async function loadOlderCards() {
   } catch (err) {
     if (!currentView(view) || olderCursor !== cursor) return;
     if (err.status === 409) olderCursor = null;
-    toast(err.status === 409 ? "這段歷史已超出主機保留範圍" : "更早訊息讀取失敗");
+    toast(err.status === 409 ? "這段歷史已超出主機保留範圍" : "更早訊息讀取失敗", true);
   } finally {
     if (currentView(view)) { loadingOlder = false; updateOlderButton(); }
   }
@@ -728,7 +737,7 @@ async function decide(id, aid, index, choice, btn) {
     if (aid) handledApproval.set(id, step);
     if (!signingOut && state.current === id) toast(receipt.idempotent ? "這項核准已處理" : "已送出決定");
   } catch (err) {
-    if (!signingOut && state.current === id) toast("無法確認決定：" + err.message);
+    if (!signingOut && state.current === id) toast("無法確認決定：" + err.message, true);
   } finally {
     deciding.delete(id);
     if (!signingOut) { renderApproval(); renderAwaiting(); renderHome(); loadSessions(); }
@@ -1009,7 +1018,7 @@ async function downloadAttachment(url, name) {
     const a = document.createElement("a");
     a.href = blobUrl; a.download = name || "attachment";
     document.body.append(a); a.click(); a.remove();
-  } catch (err) { toast("下載失敗:" + err.message); }
+  } catch (err) { toast("下載失敗:" + err.message, true); }
 }
 
 async function copyText(text, doneMsg) {
@@ -1022,7 +1031,7 @@ async function copyText(text, doneMsg) {
       document.body.append(ta); ta.select(); document.execCommand("copy"); ta.remove();
     }
     toast(doneMsg || "已複製");
-  } catch (_) { toast("無法複製(瀏覽器不允許)"); }
+  } catch (_) { toast("無法複製(瀏覽器不允許)", true); }
 }
 
 // 訊息動作列(交付 6):回覆=引用塞進輸入框;複製=原始文字;分享=系統分享
@@ -1030,11 +1039,11 @@ async function copyText(text, doneMsg) {
 // 援,先不硬造。
 function handleMessageAction(act, cardId) {
   const card = state.cards.find((c) => c.id === cardId);
-  if (!card) { toast("這則訊息已不在目前視窗"); return; }
+  if (!card) { toast("這則訊息已不在目前視窗", true); return; }
   const text = cardText(card);
   if (act === "copy") { void copyText(text); return; }
   if (act === "reply") {
-    if (!canUse("input")) { toast("這台電腦無法在此對話輸入"); return; }
+    if (!canUse("input")) { toast("這台電腦無法在此對話輸入", true); return; }
     const quote = text.trim().split("\n").slice(0, 6).map((l) => "> " + l).join("\n");
     const input = $("input");
     const d = draftFor(state.current);
@@ -1252,7 +1261,7 @@ async function sendInput(text) {
   const id = state.current;
   if (!id || signingOut || !canUse("input")) return;
   const d = draftFor(id);
-  if (d.atts.length && !canUse("attachments")) { toast("這條對話不允許附件，請先移除"); return; }
+  if (d.atts.length && !canUse("attachments")) { toast("這條對話不允許附件，請先移除", true); return; }
   if (d.pending || d.reading || (!text.trim() && !d.atts.length)) return;
   d.text = text;
   if (!navigator.onLine) { d.notice = "目前離線，訊息尚未送出"; showDraft(id); return; }
@@ -1308,7 +1317,7 @@ async function interrupt() {
     if (r.status === 409) { toast("目前沒有進行中的回合"); return; }
     if (!r.ok) throw new Error("HTTP " + r.status);
     toast("已送出中斷");
-  } catch (err) { toast("中斷失敗:" + err.message); }
+  } catch (err) { toast("中斷失敗:" + err.message, true); }
 }
 
 // ───────────────────────── UI 小工具 ─────────────────────────
@@ -1318,10 +1327,28 @@ function setConn(ok, text) {
 }
 function esc(s) { return String(s == null ? "" : s).replace(/[&<>"']/g, (c) =>
   ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])); }
-let toastTimer = null;
-function toast(msg) {
-  const t = $("toast"); t.textContent = msg; t.classList.remove("hidden");
-  clearTimeout(toastTimer); toastTimer = setTimeout(() => t.classList.add("hidden"), 3000);
+function toast(msg, error = false) {
+  const t = $("toast");
+  // Keep failures until dismissed; a later success must not erase them.
+  if ([...t.children].some(n => n.dataset.message === msg)) return;
+  const row = document.createElement("div");
+  row.className = "toast-item" + (error ? " toast-error" : "");
+  row.dataset.message = msg;
+  const text = document.createElement("span"); text.textContent = msg;
+  const close = document.createElement("button");
+  close.type = "button"; close.className = "icon-btn"; close.textContent = "×";
+  close.setAttribute("aria-label", "關閉通知"); close.title = "關閉通知";
+  const dismiss = () => {
+    const hadFocus = row.contains(document.activeElement);
+    row.remove(); t.classList.toggle("hidden", !t.children.length);
+    if (hadFocus) {
+      const next = t.querySelector("button");
+      if (next) next.focus(); else if (state.current) focusComposer(); else $("home-q").focus({preventScroll:true});
+    }
+  };
+  close.addEventListener("click", dismiss);
+  row.append(text, close); t.append(row); t.classList.remove("hidden");
+  if (!error) setTimeout(dismiss, 3000);
 }
 function autosize() {
   const ta = $("input"); ta.style.height = "auto";
@@ -1330,6 +1357,14 @@ function autosize() {
 
 // ───────────────────────── 綁定 + 啟動 ─────────────────────────
 function wire() {
+  // Safari's software keyboard shrinks the visual, not the layout viewport.
+  const fitViewport = () => {
+    if (mobileConsole() && window.visualViewport?.scale === 1)
+      $("app").style.setProperty("--app-height", window.visualViewport.height + "px");
+    else $("app").style.removeProperty("--app-height");
+  };
+  window.visualViewport?.addEventListener("resize", fitViewport);
+  window.addEventListener("resize", fitViewport); fitViewport();
   $("new-reply").addEventListener("click", () => {
     const el = $("cards");
     el.scrollTop = el.scrollHeight;
@@ -1445,11 +1480,15 @@ function typingNow() {
   return t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable);
 }
 function moveSelection(delta) {
-  const ids = state.sessions.map((s) => s.id);
+  const ids = Array.from($("session-list").querySelectorAll(".sess"), n => n.dataset.id);
   if (!ids.length) return;
   const i = ids.indexOf(state.current);
   const next = ids[Math.max(0, Math.min(ids.length - 1, (i < 0 ? 0 : i + delta)))];
-  if (next && next !== state.current) openSession(next);
+  if (next && next !== state.current) {
+    openSession(next, false, false);
+    const row = Array.from($("session-list").querySelectorAll(".sess")).find(n => n.dataset.id === next);
+    row?.focus({preventScroll:true}); row?.scrollIntoView({block:"nearest"});
+  }
 }
 function firstApprovalButton(wantYes) {
   if ($("approval").classList.contains("hidden") || !actionable(currentSession())) return null;
@@ -1498,6 +1537,9 @@ function wireKeys() {
         rows[Math.max(0, Math.min(rows.length - 1, i + (e.key === "ArrowDown" ? 1 : -1)))].focus();
       } else if (e.key === "Enter" && document.activeElement === $("pal-q") && rows.length) {
         e.preventDefault(); rows[0].click();
+      } else if (e.key === "Tab") {
+        const stops = [$("pal-q"), ...rows], at = stops.indexOf(document.activeElement);
+        e.preventDefault(); stops[(at + (e.shiftKey ? -1 : 1) + stops.length) % stops.length].focus();
       }
       return;
     }
@@ -1512,12 +1554,19 @@ function wireKeys() {
 }
 
 // ⌘K 快速切換面板
+let paletteFocus = null;
 function openPalette() {
   const p = $("palette");
+  if (p.classList.contains("hidden")) paletteFocus = document.activeElement;
   p.classList.remove("hidden");
   const q = $("pal-q"); q.value = ""; renderPalette(""); q.focus();
 }
-function closePalette() { $("palette").classList.add("hidden"); }
+function closePalette(restore = true) {
+  if ($("palette").classList.contains("hidden")) return;
+  $("palette").classList.add("hidden");
+  if (restore && paletteFocus?.isConnected) paletteFocus.focus({preventScroll:true});
+  paletteFocus = null;
+}
 function renderPalette(q) {
   const needle = q.trim().toLowerCase();
   const hits = state.sessions.filter(s => workMatches(s, needle));
@@ -1525,7 +1574,7 @@ function renderPalette(q) {
     ? hits.map(workRow).join("")
     : '<div class="empty">沒有符合的 session</div>';
   $("pal-list").querySelectorAll(".work-row").forEach((n) =>
-    n.addEventListener("click", () => { closePalette(); openSession(n.dataset.id); }));
+    n.addEventListener("click", () => { closePalette(false); openSession(n.dataset.id); }));
 }
 
 // ───────────────────────── P1:開新工作 ─────────────────────────
@@ -1534,7 +1583,7 @@ async function createSession() {
   const kind = $("new-kind").value;
   const name = $("new-name").value.trim();
   const wd = $("new-dir").value.trim();
-  if (kind === "cc" && !name) { toast("CC 需要 session 名稱"); return; }
+  if (kind === "cc" && !name) { toast("CC 需要 session 名稱", true); return; }
   try {
     if (kind === "cc") {
       const r = await api("/ccsessions", {
@@ -1553,7 +1602,7 @@ async function createSession() {
     $("newsess").classList.add("hidden");
     $("new-name").value = ""; $("new-dir").value = "";
     setTimeout(loadSessions, 600);     // 給 bridge 一點時間把它登記進列表
-  } catch (err) { toast("開新工作失敗:" + err.message); }
+  } catch (err) { toast("開新工作失敗:" + err.message, true); }
 }
 
 
@@ -1577,7 +1626,7 @@ function addFiles(files) {
   const d = draftFor(id);
   if (d.pending) return;
   Array.from(files || []).forEach((f) => {
-    if (f.size > ATT_MAX_BYTES) { toast(f.name + " 超過 8MB,改用檔案路徑引用"); return; }
+    if (f.size > ATT_MAX_BYTES) { toast(f.name + " 超過 8MB,改用檔案路徑引用", true); return; }
     const fr = new FileReader();
     d.reading++;
     fr.onload = () => {

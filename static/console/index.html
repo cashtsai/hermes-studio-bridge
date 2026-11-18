@@ -37,6 +37,7 @@
     <div id="conn" class="conn" title="連線狀態"><span class="dot"></span><span id="conn-text">連線中…</span></div>
     <button type="button" id="logout" class="btn-ghost">登出這台電腦</button>
   </header>
+  <div id="toast" class="toast hidden" role="status" aria-live="polite" aria-relevant="additions"></div>
 
   <main id="main" class="at-home">
     <!-- 左:session 列表 -->
@@ -168,7 +169,7 @@
   </section>
 
   <!-- ⌘K 快速切換 -->
-  <div id="palette" class="palette hidden">
+  <div id="palette" class="palette hidden" role="dialog" aria-modal="true" aria-label="切換對話">
     <div class="pal-box">
       <input id="pal-q" class="pal-q" placeholder="切換 session…（↑↓ 選，Enter 開，Esc 關）" autocomplete="off">
       <div id="pal-list" class="pal-list"></div>
@@ -200,7 +201,6 @@
     </div>
   </div>
 
-  <div id="toast" class="toast hidden"></div>
 </div>
 <section id="logout-screen" class="hidden" aria-live="polite">
   <p id="logout-state"></p>
