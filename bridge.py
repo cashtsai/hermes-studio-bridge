@@ -11741,7 +11741,7 @@ _CONSOLE_SECURITY_HEADERS = {
     "Content-Security-Policy": (
         "default-src 'none'; "
         "script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; "
-        "img-src 'self' data: blob:; media-src 'self' blob:; "
+        "img-src 'self' data: blob:; media-src 'self' blob:; font-src 'self'; "
         # form-action **不會** fallback 到 default-src(CSP 規格),所以要明寫 ——
         # 輸入頁是個 <form>,少了這條就等於沒限制它能 POST 去哪。
         "connect-src 'self'; form-action 'self'; "

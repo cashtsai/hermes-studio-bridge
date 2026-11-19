@@ -47,7 +47,8 @@ test("borrowed browser locks on failure, revokes on retry, and caches no work", 
   });
   t.after(() => { server.closeAllConnections(); server.close(); });
   const origin = "http://127.0.0.1:" + server.address().port;
-  const browser = await chromium.launch({ channel: "chrome" });
+  const browser = await chromium.launch({ channel: "chrome",
+    ...(process.env.POCKET_QA_CHROMIUM ? {executablePath:process.env.POCKET_QA_CHROMIUM} : {}) });
   t.after(() => browser.close());
   const ctx = await browser.newContext();
   await ctx.addCookies([{name: "pocket_console_claim", value: "test-code", url: origin + "/console"}]);

@@ -1,0 +1,95 @@
+/* Pocket CIS web-interaction layer; additive to the 53-role theme.
+   Reference: pocket-cis/cis/WEB_INTERACTIONS.md. No transcript/layout state. */
+@font-face {
+  font-family:"JetBrains Mono";font-style:normal;font-weight:400;font-display:optional;
+  src:url("./JetBrainsMono-Regular.woff2") format("woff2");
+}
+@font-face {
+  font-family:"JetBrains Mono";font-style:normal;font-weight:600;font-display:optional;
+  src:url("./JetBrainsMono-SemiBold.woff2") format("woff2");
+}
+:root {
+  --web-fill-mint:#E7F3EB;--web-fill-sky:#E7F1FA;
+  --web-fill-peach:#FCE8E2;--web-fill-amber:#FFF3CC;
+  --web-control-edge:#323238;--web-control-shadow:0 2px 0 #323238;
+  --web-control-shadow-hover:0 3px 0 #323238;
+  --web-action-fill:#D92926;--web-action-ink:#FFFFFF;
+  --mono:"JetBrains Mono",ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",
+    "PingFang TC","Microsoft JhengHei","Noto Sans Mono CJK TC","PingFang SC";
+}
+:root[data-theme="dark"] {
+  --web-fill-mint:#193629;--web-fill-sky:#183144;
+  --web-fill-peach:#402820;--web-fill-amber:#3D3218;
+  --web-control-edge:#A8A8B1;--web-control-shadow:0 2px 0 #000;
+  --web-control-shadow-hover:0 3px 0 #000;
+}
+.brand,.side-head,.prov-head,.turn-meta {letter-spacing:0;}
+.brand-dim {font-size:14px;}
+.prov-head {font-weight:600;}
+.pill {color:var(--info);background:var(--web-fill-sky);font-weight:600;}
+.mode-btn.active {background:var(--web-action-fill);color:var(--web-action-ink);border-color:var(--web-action-fill);}
+
+/* Command buttons only. Navigation, links, ghost buttons and row actions stay flat. */
+.btn-primary,.btn-danger,.ap-btn:not(.ap-check) {
+  min-height:44px;border:1px solid var(--web-control-edge);
+  box-shadow:var(--web-control-shadow);
+  transition:transform 120ms ease-out,box-shadow 120ms ease-out,background-color 120ms ease-out;
+}
+.btn-primary {background:var(--web-action-fill);color:var(--web-action-ink);}
+.btn-danger,.ap-no {background:var(--web-fill-peach);color:var(--bad);}
+.ap-yes {background:var(--web-fill-mint);color:var(--good);}
+.ap-submit {background:var(--web-fill-sky);color:var(--info);}
+/* Preserve the existing stronger outline on irreversible actions. */
+.ap-btn.ap-danger {border:2px solid var(--bad);font-weight:700;}
+.btn:hover,.ap-btn:hover:not(:disabled) {filter:none;}
+@media(hover:hover) {
+  :is(.btn-primary,.btn-danger,.ap-btn:not(.ap-check)):not(:disabled):hover {
+    transform:translateY(-1px);box-shadow:var(--web-control-shadow-hover);
+  }
+}
+:is(.btn-primary,.btn-danger,.ap-btn:not(.ap-check)):not(:disabled):active {
+  transform:translateY(2px);box-shadow:none;
+}
+:is(.btn-primary,.btn-danger,.ap-btn):disabled {
+  box-shadow:none;transform:none;opacity:.45;cursor:not-allowed;
+}
+:is(button,a,input,textarea,select,summary):focus-visible {
+  outline:2px solid var(--info);outline-offset:3px;
+}
+#input:focus-visible {outline:2px solid var(--info);outline-offset:2px;}
+
+/* A label/icon carries every state; color and the 8px lamp are supplementary. */
+.conn {padding:4px 8px;border:1px solid var(--line);border-radius:8px;}
+.conn .dot {flex:none;box-shadow:0 0 0 3px color-mix(in srgb,currentColor 10%,transparent);}
+.conn.ok {color:var(--good);background:var(--web-fill-mint);}
+.conn.bad {color:var(--bad);background:var(--web-fill-peach);}
+.st,.status-chip {border:1px solid transparent;border-radius:6px;}
+:is(.st,.status-chip):is(.st-running,.st-run,.st-busy,.st-dispatching,.st-done,.st-completed) {
+  background:var(--web-fill-mint);color:var(--good);
+}
+:is(.st,.status-chip):is(.st-waiting_approval,.st-queued,.st-usage_limited,.st-locked) {
+  background:var(--web-fill-amber);color:var(--warn);
+}
+:is(.st,.status-chip).st-needs_input {background:var(--web-fill-sky);color:var(--info);}
+:is(.st,.status-chip):is(.st-failed,.st-stalled,.st-error,.st-dead) {
+  background:var(--web-fill-peach);color:var(--bad);
+}
+.workbar {min-height:36px;background:var(--web-fill-mint);color:var(--good);}
+.working::before {
+  width:8px;height:8px;border:0;background:currentColor;vertical-align:middle;
+  box-shadow:0 0 0 3px color-mix(in srgb,currentColor 12%,transparent);
+  animation:pocket-work-light 1.8s ease-in-out infinite;
+}
+@keyframes pocket-work-light {0%,100%{opacity:1;}50%{opacity:.4;}}
+#workbar-elapsed,.msg-time {font-family:var(--mono);font-size:12px;}
+.trace summary {border:1px solid var(--line);}
+
+@media(prefers-reduced-motion:reduce) {
+  :is(.btn-primary,.btn-danger,.ap-btn:not(.ap-check)):not(:disabled):is(:hover,:active) {transform:none;}
+  .btn-primary,.btn-danger,.ap-btn {transition:none;}
+  .working::before {animation:none;}
+}
+@media(forced-colors:active) {
+  .btn-primary,.btn-danger,.ap-btn {box-shadow:none;}
+  .working::before,.conn .dot {background:CanvasText;box-shadow:none;animation:none;}
+}
