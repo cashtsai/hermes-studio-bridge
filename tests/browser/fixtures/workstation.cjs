@@ -12,7 +12,7 @@ async function workstation(t, standalone = false, options = {}) {
   const server = http.createServer(async (req,res) => {
     const url = new URL(req.url,"http://localhost");
     const send = (type,body,status=200) => {
-      res.writeHead(status, {"Content-Type":type,"Cache-Control":"no-store"}); res.end(body);
+      res.writeHead(status, {"Content-Type":type,"Cache-Control":"no-store",...options.headers}); res.end(body);
     };
     const json = data => send("application/json",JSON.stringify(data));
     if (options.handle && await options.handle(req,res,url,model)) return;
@@ -42,7 +42,7 @@ async function workstation(t, standalone = false, options = {}) {
     if (url.pathname === "/console" || url.pathname.startsWith("/console/")) {
       const name=url.pathname === "/console" ? "index.html" : path.basename(url.pathname);
       const type={".html":"text/html",".css":"text/css",".js":"text/javascript",".json":"application/json",
-        ".png":"image/png"}[path.extname(name)];
+        ".png":"image/png", ".woff2":"font/woff2", ".txt":"text/plain"}[path.extname(name)];
       if (type) {
         try { return send(type, await fs.readFile(path.join(assets,name))); } catch (_) {}
       }
@@ -53,6 +53,7 @@ async function workstation(t, standalone = false, options = {}) {
   t.after(() => {server.closeAllConnections(); server.close();});
   const origin = "http://127.0.0.1:"+server.address().port;
   const context = await chromium.launchPersistentContext("", {channel:"chrome", headless:!standalone,
+    ...(process.env.POCKET_QA_CHROMIUM ? {executablePath:process.env.POCKET_QA_CHROMIUM} : {}),
     viewport:options.viewport || {width:1366,height:768}, ...(options.isolated ? {serviceWorkers:"block"} : {})});
   t.after(() => context.close());
   if (options.isolated) await context.route("**/*", route => new URL(route.request().url()).origin === origin

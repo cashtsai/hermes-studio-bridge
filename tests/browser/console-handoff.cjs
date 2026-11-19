@@ -16,7 +16,8 @@ const row = (id, text, cid) => ({ id, kind: "text", role: cid ? "user" : "agent"
   body: { text, ...(cid ? { client_id: cid } : {}) } });
 const snap = (seq, cards) => ({ latest_seq: seq, cards, status: {phase:"idle"} });
 async function fixture(t, handle, list, viewport, sessionMeta = () => ({})) {
-  const browser = await chromium.launch({channel:"chrome"});
+  const browser = await chromium.launch({channel:"chrome",
+    ...(process.env.POCKET_QA_CHROMIUM ? {executablePath:process.env.POCKET_QA_CHROMIUM} : {})});
   t.after(() => browser.close());
   const page = await browser.newPage({serviceWorkers:"block", viewport});
   page.setDefaultTimeout(6000);
