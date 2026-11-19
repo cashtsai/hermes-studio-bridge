@@ -222,7 +222,8 @@ class MediaArtifactEndpointTests(unittest.IsolatedAsyncioTestCase):
         item = self.store.capture_path("codex:abc", str(path))
 
         with patch.object(bridge, "_MEDIA_ARTIFACT_STORE", self.store), \
-             patch.object(bridge, "_v2_card_store", AsyncMock(return_value=object())):
+             patch.object(bridge, "_v2_card_store", AsyncMock(
+                 return_value=carddigest.SessionCardStore())):
             page = await bridge.v2_session_media(
                 "codex:abc", self.request(), limit=20
             )

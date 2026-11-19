@@ -24549,6 +24549,30 @@ def _cx_feed_input_accepted(thread_id: str, client_id: str | None, text: str,
     _cx_preview_cache_note(thread_id)   # 修 ②:使用者剛送的話也算最新預覽
 
 
+def _cx_schedule_seed_media(thread_id: str, d, turns: list) -> None:
+    """Enrich seeded text asynchronously; coalesce a stalled file scan per digest."""
+    pending = getattr(d, "seed_media_task", None)
+    if not turns or (pending is not None and not pending.done()):
+        return
+
+    async def capture():
+        try:
+            captured = await asyncio.to_thread(
+                _media_capture_sync, f"codex:{thread_id}", turns)
+            wired = [_media_wire_item(c) for c in (captured or [])]
+            n = carddigest.attach_captured_media(d.store, wired, emit=True)
+            if n:
+                _log_event("cx_media_attached", thread=thread_id[:16], cards=n)
+        except Exception as exc:  # noqa: BLE001
+            _log_event("cx_media_attach_error", thread=thread_id[:16],
+                       error=type(exc).__name__)
+
+    task = asyncio.create_task(capture())
+    d.seed_media_task = task
+    _BG_TASKS.add(task)
+    task.add_done_callback(_BG_TASKS.discard)
+
+
 async def _cx_seed_card_digest(thread_id: str, d, required: bool = False) -> None:
     """Seed/catch-up from canonical turns without resuming the thread.
 
@@ -24574,21 +24598,7 @@ async def _cx_seed_card_digest(thread_id: str, d, required: bool = False) -> Non
             "itemsView": "full", "sortDirection": "desc"}, timeout=45.0)
         turns = list((res or {}).get("data", []))
         turns.reverse()
-        captured = await asyncio.to_thread(
-            _media_capture_sync, f"codex:{thread_id}", turns
-        )
         d.seed_turns(turns, emit_unchanged=required)
-        # 擷取結果原本被丟掉 → 卡片沒有 attachments,app 只看得到一行裸的
-        # `:codex-file-citation{path=…}`,點不開(機主 2026-10-28)。
-        # 這裡把倉庫產出的 media_id/下載網址掛回內文提到該路徑的卡片。
-        try:
-            wired = [_media_wire_item(c) for c in (captured or [])]
-            n = carddigest.attach_captured_media(d.store, wired)
-            if n:
-                _log_event("cx_media_attached", thread=thread_id[:16], cards=n)
-        except Exception as _exc:  # noqa: BLE001
-            _log_event("cx_media_attach_error", thread=thread_id[:16],
-                       error=str(_exc)[:120])
         # Seed 期間先收到的 live notification 必須在 canonical 舊→新卡片
         # 落地後重播，否則 live 卡會先佔住 order 尾端，舊歷史反而接在今天後面。
         d.finish_seed()
@@ -24615,6 +24625,9 @@ async def _cx_seed_card_digest(thread_id: str, d, required: bool = False) -> Non
         # 修 ②:seed 完(= 剛把桌面端進度補齊)也刷新持久快取,重啟後只要
         # 有人開過一次 session,之後的列表預覽就不再依賴記憶體。
         _cx_preview_cache_note(thread_id)
+        # File I/O can block indefinitely on a disconnected volume. Text and
+        # buffered live events must be published before optional attachments.
+        _cx_schedule_seed_media(thread_id, d, turns)
     except Exception as e:  # noqa: BLE001
         # 即使 canonical seed 失敗，也不能丟掉等待中的 live 事件；讓事件先
         # 正常落地，下一次 request 再重試 seed。
@@ -31349,11 +31362,29 @@ async def _v2_card_store_with_media(session_id: str):
     harness 巡邏…十幾個呼叫點),把掃檔案 + 複製 blob 的副作用加到它身上會
     讓 **unauthenticated 的 guest 頁每 5 秒輪詢一次就驅動一輪檔案系統讀寫**。
 
-    `await`(不是射後不理)是必要的:冷載快照直接讀 `store.cards`,不等它
-    做完就會回一份沒有附件的快照。
+    CX gives fast attachments a short snapshot budget, then streams late
+    enrichment in place. A slow filesystem must not hold text or SSE open.
+    Other providers retain their existing attachment ordering.
     """
     store = await _v2_card_store(session_id)
-    await _media_attach_cards(store, _store_media_sid(store, session_id))
+    sid = _store_media_sid(store, session_id)
+    if sid.startswith("codex:"):
+        task = getattr(store, "snapshot_media_task", None)
+        if task is None or task.done():
+            task = asyncio.create_task(_media_attach_cards(store, sid))
+            store.snapshot_media_task = task
+            store.snapshot_media_deferred_logged = False
+            _BG_TASKS.add(task)
+            task.add_done_callback(_BG_TASKS.discard)
+        try:
+            await asyncio.wait_for(asyncio.shield(task), timeout=0.15)
+        except asyncio.TimeoutError:
+            if not store.snapshot_media_deferred_logged:
+                store.snapshot_media_deferred_logged = True
+                _log_event("cx_snapshot_media_deferred", thread=sid[6:22],
+                           budget_ms=150)
+    else:
+        await _media_attach_cards(store, sid)
     return store
 
 
