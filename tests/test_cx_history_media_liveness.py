@@ -103,12 +103,15 @@ class CXHistoryMediaLivenessTests(unittest.IsolatedAsyncioTestCase):
             await self.gate.wait()
             return 0
         with patch.object(bridge, "_v2_card_store", AsyncMock(return_value=store)), \
-                patch.object(bridge, "_media_attach_cards", side_effect=attach) as scan:
+                patch.object(bridge, "_media_attach_cards", side_effect=attach) as scan, \
+                patch.object(bridge, "_log_event") as log:
             for _ in range(3):
                 result = await asyncio.wait_for(
                     bridge._v2_card_store_with_media("codex:" + THREAD), .5)
                 self.assertIs(result, store)
             self.assertEqual(scan.call_count, 1)
+            log.assert_called_once_with(
+                "cx_snapshot_media_deferred", thread=THREAD[:16], budget_ms=150)
             self.assertFalse(store.snapshot_media_task.done())
             self.gate.set()
             await store.snapshot_media_task

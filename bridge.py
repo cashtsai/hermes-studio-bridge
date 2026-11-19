@@ -31373,12 +31373,16 @@ async def _v2_card_store_with_media(session_id: str):
         if task is None or task.done():
             task = asyncio.create_task(_media_attach_cards(store, sid))
             store.snapshot_media_task = task
+            store.snapshot_media_deferred_logged = False
             _BG_TASKS.add(task)
             task.add_done_callback(_BG_TASKS.discard)
         try:
             await asyncio.wait_for(asyncio.shield(task), timeout=0.15)
         except asyncio.TimeoutError:
-            pass
+            if not store.snapshot_media_deferred_logged:
+                store.snapshot_media_deferred_logged = True
+                _log_event("cx_snapshot_media_deferred", thread=sid[6:22],
+                           budget_ms=150)
     else:
         await _media_attach_cards(store, sid)
     return store
