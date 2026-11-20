@@ -167,32 +167,48 @@ def archive_orphans(args) -> int:
               file=sys.stderr)
         return 1
 
-    # **對帳了才刪。** 遠端檔數與總位元組都要對得上,否則一個都不刪。
-    probe = ssh(f"find {shlex.quote(dest)} -type f | wc -l; "
-                f"find {shlex.quote(dest)} -type f -print0 "
-                f"| xargs -0 stat -c %s 2>/dev/null "
-                f"| awk '{{s+=$1}} END{{print s+0}}'")
-    nums = [int(x) for x in probe.stdout.split() if x.strip().isdigit()]
-    if len(nums) < 2 or nums[0] != len(items) or nums[1] != total:
-        print(f"遠端對帳不符(遠端 {nums};本機 {len(items)} 檔 {total} bytes)"
-              f" —— 本機一個檔都不刪", file=sys.stderr)
-        return 1
-    print(f"遠端對帳通過:{nums[0]} 檔 {human(nums[1])}")
+    # **對帳了才刪 —— 逐檔對,不是整個目錄統計。** `dest` 是共用的
+    # `orphans/<date>/`,同一天多跑幾次會把累積的檔都算進去,拿整目錄的
+    # 檔數/總量跟「這次的 items」比一定對不上(2026-11-20 首跑實測:遠端
+    # 目錄 4,783 檔 vs 這次 45 檔)。正解是只驗這次送的每一個檔的大小。
+    #
+    # 一次把本次要對帳的相對路徑丟上去、遠端逐檔 stat 回傳 "rel size"。
+    rels = [str(p.relative_to(ROOT)) for p, _ in items]
+    want = {str(p.relative_to(ROOT)): size for p, size in items}
+    import shlex as _shlex
+    remote_cmd = (f"cd {_shlex.quote(dest)} && while IFS= read -r f; do "
+                  f"s=$(stat -c %s \"$f\" 2>/dev/null || echo MISSING); "
+                  f"printf '%s\\t%s\\n' \"$f\" \"$s\"; done")
+    probe = subprocess.run(
+        ["ssh", f"{NAS_USER}@{NAS_HOST}", remote_cmd],
+        input="\n".join(rels) + "\n", capture_output=True, text=True, timeout=600)
+    remote_size = {}
+    for line in probe.stdout.splitlines():
+        rel, _, s = line.rpartition("\t")
+        if rel and s.isdigit():
+            remote_size[rel] = int(s)
 
     with sqlite3.connect(f"file:{INDEX}?mode=ro", uri=True) as conn:
         refs_now = {r[0] for r in conn.execute(
             "SELECT DISTINCT stored_relpath FROM artifacts"
             " WHERE stored_relpath IS NOT NULL")}
-    deleted = freed = 0
+    deleted = freed = kept = 0
     for path, size in items:
-        if str(path.relative_to(ROOT)) in refs_now:
-            continue                      # 傳輸期間被索引認領了 → 放過
+        rel = str(path.relative_to(ROOT))
+        if rel in refs_now:
+            kept += 1                      # 傳輸期間被索引認領了 → 放過
+            continue
+        if remote_size.get(rel) != size:   # 這一個檔沒對上 → 不刪它
+            kept += 1
+            continue
         try:
             path.unlink()
         except OSError:
             continue
         deleted += 1
         freed += size
+    if kept:
+        print(f"（{kept} 個未通過逐檔對帳或已被重新認領,保留不刪）")
     print(f"本機刪除 {deleted} 檔,釋出 {human(freed)}")
     return 0
 
