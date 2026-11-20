@@ -229,28 +229,35 @@ def main() -> int:
     if args.limit:
         rows = rows[:args.limit]
 
-    # bridge 是 24×7 在跑的,讀索引(candidates)與讀磁碟之間有 TOCTOU 窗口:
-    # 某個 blob 可能在這兩步之間被重新擷取/取代掉。所以一次 stat 把「存在 +
-    # 大小」一起拿定,存進 present;stat 噴 OSError 的就當它已經不在、跳過。
-    # (2026-11-20 排程首跑實際撞到:FileNotFoundError on path.stat()。)
-    present = []
-    total = 0
+    # **依 blob 去重。** blob 是內容定址,多個索引列會共用同一個
+    # stored_relpath(光是空內容的 e3b0c442… 就有上千列)。原本逐列跑:第一列
+    # 刪了檔,後面指同一 blob 的列 unlink 失敗算「略過」,而且那些列的
+    # available 沒改 → 指向已刪的檔 = 新的死連結。2026-11-20 一次跑就製造了
+    # 12,553 筆。改成:一個 blob 搬一次、刪一次,收齊所有指它的 media_id,
+    # 成功後一起把它們的 available 設 0。
+    #
+    # 一次 stat 把「存在 + 大小」拿定(bridge 24×7 在跑,讀索引與讀磁碟之間
+    # 有 TOCTOU 窗口,OSError 就當它不在、跳過)。
+    blobs: dict = {}        # rel -> {"path", "size", "ids": [media_id,...]}
     for r in rows:
-        p = ROOT / r["stored_relpath"]
-        try:
-            size = p.stat().st_size
-        except OSError:
-            continue
-        present.append((r, p, size))
-        total += size
+        rel = r["stored_relpath"]
+        ent = blobs.get(rel)
+        if ent is None:
+            p = ROOT / rel
+            try:
+                size = p.stat().st_size
+            except OSError:
+                continue
+            ent = blobs[rel] = {"path": p, "size": size, "ids": []}
+        ent["ids"].append(r["media_id"])
+    present = [(rel, e["path"], e["size"], e["ids"]) for rel, e in blobs.items()]
+    total = sum(e["size"] for e in blobs.values())
 
     print(f"保留 {args.days} 天 → 可歸檔 {len(present)} 檔,{human(total)}")
     print(f"目的地 {NAS_USER}@{NAS_HOST}:{NAS_BASE}/")
     if not args.apply:
-        for r, p, size in present[:5]:
-            age = (time.time() - r["created_at"]) / 86400
-            print(f"  例:{r['filename'][:40]:<42} {human(size):>10}"
-                  f"  {age:.0f} 天前")
+        for rel, p, size, ids in present[:5]:
+            print(f"  例:{rel[-16:]:<18} {human(size):>10}  {len(ids)} 列指向")
         print("\n(dry-run。加 --apply 才會真的搬)")
         return 0
 
@@ -265,7 +272,7 @@ def main() -> int:
     import tempfile
     listing = Path(tempfile.gettempdir()) / f"pocket-retention-archive.{os.getpid()}"
     listing.write_text(
-        "\n".join(r["stored_relpath"] for r, _, _ in present) + "\n",
+        "\n".join(rel for rel, _, _, _ in present) + "\n",
         encoding="utf-8")
     send = subprocess.run(
         ["rsync", "-a", "--partial", "--files-from", str(listing),
@@ -276,43 +283,49 @@ def main() -> int:
         print(f"rsync 失敗,本機一個檔都沒動:\n{send.stderr[-500:]}", file=sys.stderr)
         return 1
 
-    # 遠端逐檔對帳(一次 ssh 把清單丟上去、回傳每檔大小),對上才刪。
-    rels = [r["stored_relpath"] for r, _, _ in present]
-    remote_cmd = (f"cd {shlex.quote(NAS_BASE)} && while IFS= read -r f; do "
-                  f"s=$(stat -c %s \"$f\" 2>/dev/null || echo 0); "
-                  f"printf '%s\\t%s\\n' \"$f\" \"$s\"; done")
+    # 遠端對帳:一次 ssh 把清單丟上去,批次 stat 回傳每檔大小。
+    # **cashbox 是 QNAP / BusyBox**(2026-11-20 實測):`xargs -d`、
+    # `stat --printf` 都不支援,但 `stat -c '%n %s'` 支援且一次吃多個檔。
+    # blob 路徑是 `blobs/xx/<hex>`,沒有空白,所以空白分隔解析安全。
+    # xargs 預設會把 stdin 依空白/換行切成參數、自動分批,BusyBox 也通。
+    rels = [rel for rel, _, _, _ in present]
+    remote_cmd = (f"cd {shlex.quote(NAS_BASE)} && "
+                  f"xargs stat -c '%n %s' 2>/dev/null")
     probe = subprocess.run(
         ["ssh", f"{NAS_USER}@{NAS_HOST}", remote_cmd],
         input="\n".join(rels) + "\n", capture_output=True, text=True, timeout=1200)
     got = {}
     for line in probe.stdout.splitlines():
-        rel, _, s = line.rpartition("\t")
+        rel, _, s = line.rpartition(" ")
         if rel and s.isdigit():
             got[rel] = int(s)
 
-    moved = freed = failed = 0
+    # blob 對上就刪一次,並把**所有**指向它的列一起標 unavailable ——
+    # 一個 blob 多列共用,漏改任何一列就是一條指向已刪檔的死連結。
+    moved = freed = skipped = 0
     now = time.time()
     with sqlite3.connect(INDEX) as conn:
-        for r, path, size in present:
-            rel = r["stored_relpath"]
-            if got.get(rel) != size:        # 這一個沒對上 → 不刪它
-                failed += 1
+        for rel, path, size, ids in present:
+            if got.get(rel) != size:        # 沒對上 → 不刪、不改索引
+                skipped += 1
                 continue
             try:
                 path.unlink()
+            except FileNotFoundError:
+                pass                        # 已經不在 → 仍要把索引列標掉
             except OSError:
-                failed += 1
+                skipped += 1
                 continue
-            conn.execute(
+            conn.executemany(
                 "UPDATE artifacts SET available = 0, unavailable_reason = ?,"
                 "       updated_at = ? WHERE media_id = ?",
-                (f"archived:cashbox:{NAS_BASE}/{rel}", now, r["media_id"]))
+                [(f"archived:cashbox:{NAS_BASE}/{rel}", now, mid) for mid in ids])
             moved += 1
             freed += size
 
-    print(f"\n完成:搬了 {moved} 檔,本機釋出 {human(freed)};未對上/略過 {failed}")
-    if failed:
-        print("沒對上的檔案**本機都還在**,索引也沒改 —— 再跑一次即可續傳。")
+    print(f"\n完成:搬了 {moved} 個 blob,本機釋出 {human(freed)};未對上 {skipped}")
+    if skipped:
+        print("沒對上的**本機都還在**,索引也沒改 —— 再跑一次即可續傳。")
     return 0
 
 
