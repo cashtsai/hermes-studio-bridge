@@ -10790,6 +10790,9 @@ async def v2_session_changes(session_id: str, request: Request):
 # the moment it happens. We append to ONE file on the Mac so Claude can fetch +
 # review client-side bugs each session and confirm whether they're resolved.
 CLIENT_LOG = os.path.expanduser("~/.pocket/pocket-client.jsonl")
+#: 超過這個大小才去讀整個檔來修剪(見 `client_log_write`)。3000 行 × 約 1 KB
+#: 的欄位上限 ≈ 3 MB,抓兩倍餘裕 —— 平常這支端點一個 byte 都不用讀。
+_CLIENT_LOG_TRIM_BYTES = 6 * 1024 * 1024
 
 
 def _pair_code_meta(value):
@@ -14542,15 +14545,24 @@ async def client_log_write(request: Request):
     }
     with open(CLIENT_LOG, "a", encoding="utf-8") as f:
         f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-    # Cap the file so it can't grow unbounded (keep newest ~3000 lines).
+    # 修剪成最新約 3000 行。**先看大小再決定要不要讀整個檔**(2026-11-20):
+    #
+    # 原本每一筆 `/clientlog` 都無條件 `open(...).read()` 把整個檔案拉進
+    # 記憶體再數行數 —— 而這是 app 最高頻的 POST 之一(事故那段三小時內
+    # 20 筆)。檔案愈大愈慢,而且這段跑在 async handler 裡會擋住事件迴圈;
+    # 2026-11-20 那次卡死就是 20 條檔案 I/O 執行緒全部停在 `open()`。
+    #
+    # 用 `os.path.getsize` 當前置門檻:3000 行 × 約 1 KB 上限(上面每個欄位
+    # 都夾過長度)≈ 3 MB,留兩倍餘裕。沒超過就一個 byte 都不讀。
     try:
-        lines = open(CLIENT_LOG, encoding="utf-8").read().splitlines()
-        if len(lines) > 3000:
-            with open(CLIENT_LOG, "w", encoding="utf-8") as f:
-                f.write("\n".join(lines[-3000:]) + "\n")
+        if os.path.getsize(CLIENT_LOG) > _CLIENT_LOG_TRIM_BYTES:
+            with open(CLIENT_LOG, encoding="utf-8") as f:
+                lines = f.read().splitlines()
+            if len(lines) > 3000:
+                with open(CLIENT_LOG, "w", encoding="utf-8") as f:
+                    f.write("\n".join(lines[-3000:]) + "\n")
     except Exception as _exc:  # noqa: BLE001
         _log_exc("client_log_write", _exc, expected=True)
-        pass
     return {"ok": True}
 
 

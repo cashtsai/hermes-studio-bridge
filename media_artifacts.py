@@ -52,6 +52,31 @@ _FILENAME_KEYS = {"filename", "file_name", "name"}
 _MIME_KEYS = {"mime", "mime_type", "content_type"}
 
 
+#: 允許範圍內、但**絕對不可以去 open() 的掛載點**。
+#:
+#: 2026-11-20 事故背景:bridge 卡死 17.5 小時,20 條檔案 I/O 執行緒全部停在
+#: `open()` 這個 syscall 上。`/healthz` 之類不碰檔案的路由照樣 3 毫秒回 404,
+#: 所以所有存活指標都說健康(見 docs/incidents/20261120-*)。
+#:
+#: `default_safe_roots()` 收**整個家目錄**,而家目錄底下有
+#: `~/Library/Developer/CoreDevice/DeviceFS` —— 那不是一般目錄,是 fskit 的
+#: `devicefs` 掛載點,背後是 `CoreDeviceService`,內容是**實際連著的 iPhone 的
+#: 檔案系統**(`du` 爬它會算出 93 GB 的假數字)。使用者空間檔案系統在裝置拔掉
+#: 或背後服務卡住時,`open()` 會**無限期阻塞**,而且行程停在可中斷睡眠(`S`)
+#: 不是 `U`,所以連「卡在 I/O」都看不出來。
+#:
+#: 只要逐字稿裡出現一個這底下的路徑,`capture_path` 就會去開它。這條防線
+#: 比逾時更前面:**根本不要去碰**。
+_VIRTUAL_MOUNT_MARKERS = (
+    "/Library/Developer/CoreDevice/DeviceFS",
+)
+
+
+def _is_virtual_mount(path: str) -> bool:
+    """`path` 落在已知的虛擬/裝置掛載點底下?(比對用 realpath 過的路徑)"""
+    return any(marker in path for marker in _VIRTUAL_MOUNT_MARKERS)
+
+
 def default_safe_roots() -> tuple[str, ...]:
     roots = [os.path.realpath(os.path.expanduser("~"))]
     for raw in ("/tmp", "/private/tmp", "/var/folders"):
@@ -278,6 +303,33 @@ def references_in_text(text: str) -> list[str]:
     return refs
 
 
+def _file_changed(local_path, previous: dict) -> bool:
+    """磁碟上的檔案跟上次入庫時相比有沒有變。問不到時一律回 True(重抓)。
+
+    ## 為什麼需要這支(2026-11-20)
+
+    `capture_path` 原本的短路是「已經有可用的列 + 呼叫端沒給 metadata 提示
+    → 直接回舊資料」,**連檔案都不看**。那表示同一個路徑的檔案內容改了之後,
+    Pocket 永遠拿得到的是**第一次擷取的版本** —— CC/CX 把報告重新產生一次,
+    手機上看到的還是舊的那份。(機主 2026-11-20 回報的預覽不一致,CX 也從
+    app 端獨立查到同一個現象。)
+
+    用 size + mtime 而不是重算雜湊:短路的全部意義就是省掉讀檔,再去 hash
+    等於沒省。size 變了或 mtime 比上次入庫晚,就當作變了 —— 寧可多抓一次,
+    不可以給舊內容。
+    """
+    if local_path is None:
+        return False
+    try:
+        st = os.stat(local_path)
+    except OSError:
+        return True
+    if previous.get("byte_size") not in (None, st.st_size):
+        return True
+    recorded = previous.get("updated_at") or previous.get("created_at") or 0
+    return st.st_mtime > float(recorded)
+
+
 class MediaArtifactStore:
     def __init__(
         self,
@@ -361,6 +413,10 @@ class MediaArtifactStore:
         # 相對路徑照舊用 process cwd 解析(require_absolute=False)—— 既有語意,
         # source_ref 歷史上就收得到相對路徑。授權判斷走共用的 within_roots。
         path = local_path_of(source_ref, require_absolute=False)
+        # 虛擬/裝置掛載點一律不碰 —— 見 `_VIRTUAL_MOUNT_MARKERS` 的事故說明。
+        # 擋在這裡而不是靠逾時:逾時只能讓你**晚一點**失敗,這條是根本不去開。
+        if _is_virtual_mount(path):
+            return None
         return path if within_roots(path, self.safe_roots) else None
 
     def _snapshot_file(self, path: str) -> tuple[int, str, str]:
@@ -462,7 +518,7 @@ class MediaArtifactStore:
         local_path = self._safe_local_path(source_ref)
         previous = self._existing_available(session_id, source_ref)
         if previous and (
-            not any((filename, mime, kind))
+            (not any((filename, mime, kind)) and not _file_changed(local_path, previous))
             or local_path is None
             or not os.path.isfile(local_path)
         ):
@@ -596,9 +652,19 @@ class MediaArtifactStore:
                     mime, media_kind, byte_size, sha256, stored_relpath,
                     available, unavailable_reason, created_at, updated_at
                 ) VALUES (?, ?, ?, 'bytes', ?, ?, ?, ?, ?, ?, 1, NULL, ?, ?)
+                -- 這支是 content-addressed(`source_ref = bytes:sha256:<digest>`,
+                -- 見上方 docstring),所以衝突**只發生在內容完全相同**時 ——
+                -- sha256/stored_relpath 本來就一樣,寫不寫都一樣。
+                --
+                -- 真正要補的是 `available` 復位(2026-11-20):同一份內容若曾被
+                -- 歸檔腳本標成 `available=0`,之後又重新入庫時檔案其實回來了,
+                -- 不復位的話 `_media_wire_item()` 永遠不給 download_url
+                -- (bridge.py:521),卡片就卡在「有附件但點不開」。
                 ON CONFLICT(session_id, source_ref) DO UPDATE SET
                     filename = excluded.filename,
                     mime = excluded.mime,
+                    available = 1,
+                    unavailable_reason = NULL,
                     updated_at = excluded.updated_at
                 """,
                 (
