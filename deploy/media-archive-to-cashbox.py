@@ -221,16 +221,27 @@ def main() -> int:
     if args.limit:
         rows = rows[:args.limit]
 
-    present = [(r, ROOT / r["stored_relpath"]) for r in rows]
-    present = [(r, p) for r, p in present if p.exists()]
-    total = sum(p.stat().st_size for _, p in present)
+    # bridge 是 24×7 在跑的,讀索引(candidates)與讀磁碟之間有 TOCTOU 窗口:
+    # 某個 blob 可能在這兩步之間被重新擷取/取代掉。所以一次 stat 把「存在 +
+    # 大小」一起拿定,存進 present;stat 噴 OSError 的就當它已經不在、跳過。
+    # (2026-11-20 排程首跑實際撞到:FileNotFoundError on path.stat()。)
+    present = []
+    total = 0
+    for r in rows:
+        p = ROOT / r["stored_relpath"]
+        try:
+            size = p.stat().st_size
+        except OSError:
+            continue
+        present.append((r, p, size))
+        total += size
 
     print(f"保留 {args.days} 天 → 可歸檔 {len(present)} 檔,{human(total)}")
     print(f"目的地 {NAS_USER}@{NAS_HOST}:{NAS_BASE}/")
     if not args.apply:
-        for r, p in present[:5]:
+        for r, p, size in present[:5]:
             age = (time.time() - r["created_at"]) / 86400
-            print(f"  例:{r['filename'][:40]:<42} {human(p.stat().st_size):>10}"
+            print(f"  例:{r['filename'][:40]:<42} {human(size):>10}"
                   f"  {age:.0f} 天前")
         print("\n(dry-run。加 --apply 才會真的搬)")
         return 0
@@ -240,10 +251,9 @@ def main() -> int:
         return 1
 
     moved = freed = failed = 0
-    for r, path in present:
+    for r, path, size in present:
         rel = r["stored_relpath"]
         remote = f"{NAS_BASE}/{rel}"
-        size = path.stat().st_size
         if ssh(f"mkdir -p {shlex.quote(str(Path(remote).parent))}").returncode != 0:
             failed += 1
             continue
