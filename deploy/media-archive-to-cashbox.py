@@ -68,14 +68,6 @@ def ssh(*args: str) -> subprocess.CompletedProcess:
                           capture_output=True, text=True, timeout=120)
 
 
-def remote_size(remote_path: str) -> int | None:
-    """遠端檔案大小;不存在或問不到回 None(= 不可以刪本機)。"""
-    res = ssh(f"stat -c %s {shlex.quote(remote_path)} 2>/dev/null"
-              f" || stat -f %z {shlex.quote(remote_path)} 2>/dev/null")
-    out = (res.stdout or "").strip()
-    return int(out) if out.isdigit() else None
-
-
 def candidates(conn: sqlite3.Connection, cutoff: float) -> list[sqlite3.Row]:
     conn.row_factory = sqlite3.Row
     return conn.execute(
@@ -266,35 +258,61 @@ def main() -> int:
         print(f"連不上 {NAS_HOST} —— 不動任何東西", file=sys.stderr)
         return 1
 
+    # **一次批次傳,不要逐檔開連線。** 原本每個檔開一條 rsync+ssh —— 2026-11-20
+    # 實測 21,598 個檔只搬了 1,105 個就花 43 分鐘(全是 SSH 握手),照這速度要
+    # 十幾小時。孤兒段早就用 --files-from 批次,7 天段漏抄。rsync 會自己依
+    # 相對路徑在遠端建目錄(-R / --files-from 的相對結構),不必逐檔 mkdir。
+    import tempfile
+    listing = Path(tempfile.gettempdir()) / f"pocket-retention-archive.{os.getpid()}"
+    listing.write_text(
+        "\n".join(r["stored_relpath"] for r, _, _ in present) + "\n",
+        encoding="utf-8")
+    send = subprocess.run(
+        ["rsync", "-a", "--partial", "--files-from", str(listing),
+         str(ROOT), f"{NAS_USER}@{NAS_HOST}:{NAS_BASE}/"],
+        capture_output=True, text=True, timeout=14400)
+    listing.unlink(missing_ok=True)
+    if send.returncode != 0:
+        print(f"rsync 失敗,本機一個檔都沒動:\n{send.stderr[-500:]}", file=sys.stderr)
+        return 1
+
+    # 遠端逐檔對帳(一次 ssh 把清單丟上去、回傳每檔大小),對上才刪。
+    rels = [r["stored_relpath"] for r, _, _ in present]
+    remote_cmd = (f"cd {shlex.quote(NAS_BASE)} && while IFS= read -r f; do "
+                  f"s=$(stat -c %s \"$f\" 2>/dev/null || echo 0); "
+                  f"printf '%s\\t%s\\n' \"$f\" \"$s\"; done")
+    probe = subprocess.run(
+        ["ssh", f"{NAS_USER}@{NAS_HOST}", remote_cmd],
+        input="\n".join(rels) + "\n", capture_output=True, text=True, timeout=1200)
+    got = {}
+    for line in probe.stdout.splitlines():
+        rel, _, s = line.rpartition("\t")
+        if rel and s.isdigit():
+            got[rel] = int(s)
+
     moved = freed = failed = 0
-    for r, path, size in present:
-        rel = r["stored_relpath"]
-        remote = f"{NAS_BASE}/{rel}"
-        if ssh(f"mkdir -p {shlex.quote(str(Path(remote).parent))}").returncode != 0:
-            failed += 1
-            continue
-        send = subprocess.run(
-            ["rsync", "-a", "--partial", str(path),
-             f"{NAS_USER}@{NAS_HOST}:{remote}"],
-            capture_output=True, text=True, timeout=600)
-        # **驗了才刪。** 遠端大小對不上就當作沒搬成功,本機檔原封不動。
-        if send.returncode != 0 or remote_size(remote) != size:
-            failed += 1
-            continue
-        path.unlink()
-        with sqlite3.connect(INDEX) as conn:
+    now = time.time()
+    with sqlite3.connect(INDEX) as conn:
+        for r, path, size in present:
+            rel = r["stored_relpath"]
+            if got.get(rel) != size:        # 這一個沒對上 → 不刪它
+                failed += 1
+                continue
+            try:
+                path.unlink()
+            except OSError:
+                failed += 1
+                continue
             conn.execute(
                 "UPDATE artifacts SET available = 0, unavailable_reason = ?,"
                 "       updated_at = ? WHERE media_id = ?",
-                (f"archived:cashbox:{remote}", time.time(), r["media_id"]))
-        moved += 1
-        freed += size
-        if moved % 200 == 0:
-            print(f"  …已搬 {moved} 檔,釋出 {human(freed)}")
+                (f"archived:cashbox:{NAS_BASE}/{rel}", now, r["media_id"]))
+            moved += 1
+            freed += size
 
-    print(f"\n完成:搬了 {moved} 檔,本機釋出 {human(freed)};失敗 {failed}")
+    print(f"\n完成:搬了 {moved} 檔,本機釋出 {human(freed)};未對上/略過 {failed}")
     if failed:
-        print("失敗的檔案**本機都還在**,索引也沒改 —— 再跑一次即可續傳。")
+        print("沒對上的檔案**本機都還在**,索引也沒改 —— 再跑一次即可續傳。")
     return 0
 
 
