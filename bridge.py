@@ -37362,6 +37362,7 @@ async def _dashboard_sessions():
     out = {"cc": {"working": cc_w, "idle": cc_i},
            "cx": {"working": cx_w, "idle": cx_i},
            "persona": {"working": p_w, "idle": p_i},
+           "active_provider": _dashboard_active_provider(),
            "degraded": degraded}
     # S4:openclaw 未配置 → 鍵缺席(app 端 optional decode 自動不畫那一行);
     # 配置了但掛 → 鍵缺席 + degraded 標記,同 codex 精神。
@@ -37403,6 +37404,17 @@ async def _dashboard_sessions():
             _log_event("dashboard_gemini_failed", error=type(e).__name__,
                        error_message=str(e)[:160])
             degraded.append("gemini")
+    if GROK.configured():
+        try:
+            # Same roster/state alignment as the Grok tab; no model calls or turns.
+            rows = await asyncio.wait_for(_grok_v2_rows(), timeout=5.0)
+            waiting = sum(r.get("status") == "waiting_approval" for r in rows)
+            working = sum(r.get("status") == "running" for r in rows)
+            out["grok"] = {"working": working, "idle": len(rows) - waiting - working,
+                           "needs_you": waiting}
+        except Exception as e:  # noqa: BLE001
+            _log_event("dashboard_grok_failed", error=type(e).__name__)
+            degraded.append("grok")
     return out
 
 
