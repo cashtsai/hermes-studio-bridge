@@ -85,7 +85,7 @@ Live acceptance after restart:
 Build 234 initially stalled in Xcode's `IDEArchiveManager.refreshArchives`, opening
 the default Archives symlink into `/Volumes/WorkSSD/Build/Xcode/Archives`. Only our
 stalled xcodebuild process was terminated. The recovery invocation uses
-`-IDECustomDistributionArchivesLocation=/Users/xcash/BuildLocal/pocketagent/XcodeArchives`
+`-IDECustomDistributionArchivesLocation=$HOME/BuildLocal/pocketagent/XcodeArchives`
 for archive/export, without changing global Xcode preferences or moving old archives.
 The original archive log is retained; recovery has separate build/export/upload logs.
 Release guards remain enabled: clean/current main, localization, bundle/build identity,
