@@ -62,13 +62,69 @@ def referenced() -> set[str]:
             " WHERE stored_relpath IS NOT NULL")}
 
 
+def reconcile(args) -> int:
+    """**反方向**的失聯:列說 `available=1`,但磁碟上那個檔案不在了。
+
+    ## 這是使用者看得到的 bug
+
+    `bridge._media_wire_item()` 只看 `available` 旗標就給 `download_url`
+    (bridge.py:521-527),不會去 stat 檔案。所以這種列在 app 上長成
+    **「可以下載的附件」,點下去卻拿不到東西**。
+
+    2026-11-20 在 production 實測到 **15,450 筆**這種列(9,607 個不重複
+    blob)。**不是歸檔腳本造成的** —— 跟當天搬去 cashbox 的 4,738 個檔案
+    交集是 **0**,也就是說在任何清理動作之前就已經是這樣了。成因未明
+    (可能是過去的手動清理、磁碟壓力下的寫入失敗、或 `.incoming.` 暫存檔
+    改名失敗),但不必查出成因才能止血。
+
+    ## 止血方式
+
+    標成 `available=0` + `unavailable_reason='missing:blob-gone'`。
+    卡片照樣看得到檔名與大小,只是不再給一條會 404 的下載連結 ——
+    誠實的降級勝過假裝可用。日後檔案若重新擷取回來,`capture_path` 的
+    upsert 會把 `available` 復位(那條路徑本來就會寫 excluded.available)。
+    """
+    cutoff = time.time() - args.min_age_hours * 3600
+    with sqlite3.connect(f"file:{INDEX}?mode=ro", uri=True) as conn:
+        rows = conn.execute(
+            "SELECT media_id, stored_relpath, updated_at FROM artifacts"
+            " WHERE available = 1 AND stored_relpath IS NOT NULL").fetchall()
+
+    gone = []
+    for media_id, rel, updated in rows:
+        if (ROOT / rel).exists():
+            continue
+        # 年齡護欄同 GC:剛寫入的列,blob 可能還在落盤途中。
+        if (updated or 0) > cutoff:
+            continue
+        gone.append(media_id)
+
+    print(f"available 的列 {len(rows)} 筆,其中檔案不存在的 {len(gone)} 筆")
+    if not args.apply:
+        print("\n(dry-run。加 --apply 才會標記)")
+        return 0
+    with sqlite3.connect(INDEX) as conn:
+        conn.executemany(
+            "UPDATE artifacts SET available = 0,"
+            " unavailable_reason = 'missing:blob-gone', updated_at = ?"
+            " WHERE media_id = ? AND available = 1",
+            [(time.time(), m) for m in gone])
+    print(f"已標記 {len(gone)} 筆為不可用(不再給會 404 的下載連結)")
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--apply", action="store_true")
     ap.add_argument("--min-age-hours", type=int, default=24,
                     help="只動比這更舊的檔(避開『已落盤、尚未入索引』的競態)")
+    ap.add_argument("--reconcile", action="store_true",
+                    help="反向對帳:列說 available 但檔案不在 → 標成不可用")
     args = ap.parse_args()
+
+    if args.reconcile:
+        return reconcile(args)
 
     if not INDEX.exists():
         print(f"找不到索引:{INDEX}", file=sys.stderr)
