@@ -339,3 +339,110 @@ class Base64FreezeRegressionTests(unittest.TestCase):
         from media_artifacts import references_in_text
         refs = references_in_text("hash abc123def456 檔案 /var/log/x.pdf")
         self.assertIn("/var/log/x.pdf", refs)
+
+
+class SupersededBlobsLeakTests(unittest.TestCase):
+    """`capture_path` 換指新 blob 之後,**舊那顆沒有任何機制回收**。
+
+    2026-11-20 查 production:媒體庫 31.7 GB 裡有 4,651 個孤兒 blob、23 GB
+    (86% 的空間)。一開始我以為是 upsert 漏更新 `stored_relpath` 造成「列指著
+    舊版、新 blob 變孤兒」—— **錯的**,`capture_path` 本來就有更新(見該處
+    ON CONFLICT 子句)。真相相反:列正確地換指新 blob,**被取代的舊 blob
+    從此沒人引用,而 media_artifacts 沒有任何 GC**。
+
+    所以這一組釘的不是「指對了沒」,而是**「被取代的舊 blob 會變成孤兒」這件事
+    確實存在**,因此 `deploy/media-gc-orphans.py` 這類回收是必需品而不是選配。
+    哪天有人在 store 裡加了自動回收,這支測試會紅 —— 那時請改成驗回收行為,
+    不要直接刪掉它。
+    """
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp(prefix="media-superseded-"))
+        self.store = MediaArtifactStore(self.root)
+        self.src = self.root / "src.txt"
+
+    def _blobs(self):
+        return {str(p.relative_to(self.root))
+                for p in (self.root / "blobs").rglob("*") if p.is_file()}
+
+    def _refs(self):
+        import sqlite3
+        with sqlite3.connect(self.root / "index.sqlite3") as conn:
+            return {r[0] for r in conn.execute(
+                "SELECT DISTINCT stored_relpath FROM artifacts"
+                " WHERE stored_relpath IS NOT NULL")}
+
+    def _relpath(self, media_id):
+        """`public_item()` 刻意不回 `stored_relpath`(不把伺服器路徑交給
+        客戶端),所以測試要從索引讀。"""
+        import sqlite3
+        with sqlite3.connect(self.root / "index.sqlite3") as conn:
+            row = conn.execute(
+                "SELECT stored_relpath FROM artifacts WHERE media_id = ?",
+                (media_id,)).fetchone()
+        return row[0] if row else None
+
+    def test_row_follows_the_new_content(self):
+        """先確認好的那一半:列**有**換指新內容,使用者不會下載到舊版。"""
+        self.src.write_bytes(b"version one")
+        first = self.store.capture_path("sess-1", str(self.src))
+        self.src.write_bytes(b"version two is longer")
+        second = self.store.capture_path("sess-1", str(self.src))
+
+        self.assertEqual(first["media_id"], second["media_id"])
+        new_rel = self._relpath(second["media_id"])
+        self.assertIsNotNone(new_rel)
+        self.assertEqual((self.root / new_rel).read_bytes(),
+                         b"version two is longer")
+
+    def test_the_superseded_blob_becomes_an_orphan(self):
+        """壞的那一半:舊 blob 留在磁碟上、沒有任何列引用。"""
+        self.src.write_bytes(b"version one")
+        first = self.store.capture_path("sess-1", str(self.src))
+        old_rel = self._relpath(first["media_id"])
+        self.src.write_bytes(b"version two")
+        self.store.capture_path("sess-1", str(self.src))
+
+        orphans = self._blobs() - self._refs()
+        self.assertIn(old_rel, orphans,
+                      "舊 blob 竟然不見了?那代表 store 已經會自動回收 —— "
+                      "請把這支測試改成驗回收行為,不要直接刪掉")
+
+
+class VirtualMountIsNeverOpenedTests(unittest.TestCase):
+    """`~/Library/Developer/CoreDevice/DeviceFS` 底下的路徑一律不碰。
+
+    2026-11-20:bridge 卡死 17.5 小時,20 條檔案 I/O 執行緒全停在 `open()`,
+    而不碰檔案的路由照樣 3 毫秒回應 —— 所有存活指標都說健康。
+
+    `default_safe_roots()` 收整個家目錄,而家目錄底下的 `CoreDevice/DeviceFS`
+    是 fskit 的 `devicefs` 掛載點(背後 `CoreDeviceService`,內容是實際連著的
+    iPhone)。使用者空間檔案系統在裝置拔掉時 `open()` 會**無限期阻塞**,
+    而且行程停在可中斷睡眠,連「卡在 I/O」都看不出來。
+
+    逐字稿裡出現一個這種路徑就足以讓整台 bridge 停擺,所以擋在授權層 ——
+    **根本不要去開**,而不是開了再等逾時。
+    """
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp(prefix="media-virtmount-"))
+        self.store = MediaArtifactStore(self.root)
+
+    def test_devicefs_path_is_rejected(self):
+        ref = os.path.expanduser(
+            "~/Library/Developer/CoreDevice/DeviceFS/device-X/report.pdf")
+        self.assertIsNone(self.store._safe_local_path(ref))
+
+    def test_capture_marks_it_unavailable_instead_of_hanging(self):
+        ref = os.path.expanduser(
+            "~/Library/Developer/CoreDevice/DeviceFS/device-X/clip.mp4")
+        item = self.store.capture_path("sess-1", ref)
+        self.assertFalse(item.get("available"))
+
+    def test_ordinary_home_paths_still_work(self):
+        """護欄不可以順手把家目錄整個擋掉 —— 那是正常的工作範圍。"""
+        from media_artifacts import _is_virtual_mount
+        self.assertFalse(_is_virtual_mount(
+            os.path.expanduser("~/apps/project/out.pdf")))
+        self.assertTrue(_is_virtual_mount(os.path.expanduser(
+            "~/Library/Developer/CoreDevice/DeviceFS/d/a.pdf")))

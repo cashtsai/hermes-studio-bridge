@@ -10790,6 +10790,9 @@ async def v2_session_changes(session_id: str, request: Request):
 # the moment it happens. We append to ONE file on the Mac so Claude can fetch +
 # review client-side bugs each session and confirm whether they're resolved.
 CLIENT_LOG = os.path.expanduser("~/.pocket/pocket-client.jsonl")
+#: 超過這個大小才去讀整個檔來修剪(見 `client_log_write`)。3000 行 × 約 1 KB
+#: 的欄位上限 ≈ 3 MB,抓兩倍餘裕 —— 平常這支端點一個 byte 都不用讀。
+_CLIENT_LOG_TRIM_BYTES = 6 * 1024 * 1024
 
 
 def _pair_code_meta(value):
@@ -14542,15 +14545,24 @@ async def client_log_write(request: Request):
     }
     with open(CLIENT_LOG, "a", encoding="utf-8") as f:
         f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-    # Cap the file so it can't grow unbounded (keep newest ~3000 lines).
+    # 修剪成最新約 3000 行。**先看大小再決定要不要讀整個檔**(2026-11-20):
+    #
+    # 原本每一筆 `/clientlog` 都無條件 `open(...).read()` 把整個檔案拉進
+    # 記憶體再數行數 —— 而這是 app 最高頻的 POST 之一(事故那段三小時內
+    # 20 筆)。檔案愈大愈慢,而且這段跑在 async handler 裡會擋住事件迴圈;
+    # 2026-11-20 那次卡死就是 20 條檔案 I/O 執行緒全部停在 `open()`。
+    #
+    # 用 `os.path.getsize` 當前置門檻:3000 行 × 約 1 KB 上限(上面每個欄位
+    # 都夾過長度)≈ 3 MB,留兩倍餘裕。沒超過就一個 byte 都不讀。
     try:
-        lines = open(CLIENT_LOG, encoding="utf-8").read().splitlines()
-        if len(lines) > 3000:
-            with open(CLIENT_LOG, "w", encoding="utf-8") as f:
-                f.write("\n".join(lines[-3000:]) + "\n")
+        if os.path.getsize(CLIENT_LOG) > _CLIENT_LOG_TRIM_BYTES:
+            with open(CLIENT_LOG, encoding="utf-8") as f:
+                lines = f.read().splitlines()
+            if len(lines) > 3000:
+                with open(CLIENT_LOG, "w", encoding="utf-8") as f:
+                    f.write("\n".join(lines[-3000:]) + "\n")
     except Exception as _exc:  # noqa: BLE001
         _log_exc("client_log_write", _exc, expected=True)
-        pass
     return {"ok": True}
 
 
@@ -35221,22 +35233,6 @@ def _persona_meta_api(home: str):
         pass  # Standalone bridge without the Hermes runtime: legacy API.
     return None
 
-def _persona_description_of(home: str) -> str:
-    """Read the user-authored Hermes profile description, if present."""
-    path = os.path.join(home, "profile.yaml")
-    try:
-        with open(path, encoding="utf-8") as f:
-            for line in f:
-                if line.startswith("description:"):
-                    value = line.split(":", 1)[1].strip()
-                    if value.startswith(('"', "'")) and value[-1:] == value[0]:
-                        value = value[1:-1]
-                    return value
-    except (OSError, UnicodeError):
-        pass
-    return ""
-
-
 async def _provision_persona_profile(pid: str, description: str) -> str:
     """Create a real Hermes profile before registering its bridge route."""
     env = os.environ.copy()
@@ -35244,8 +35240,6 @@ async def _provision_persona_profile(pid: str, description: str) -> str:
     proc = await asyncio.create_subprocess_exec(
         HERMES_BIN, "profile", "create", pid,
         "--no-alias", f"--description={description}",
-
-        "--clone", "--no-alias", "--description", description,
         env=env, stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
@@ -35260,9 +35254,6 @@ async def _provision_persona_profile(pid: str, description: str) -> str:
         raise http_err(502, "PROFILE_CREATE_FAILED",
                        "Hermes profile creation failed")
 
-        detail = (stderr or stdout).decode("utf-8", errors="replace").strip()
-        raise http_err(502, "PROFILE_CREATE_FAILED",
-                       detail[-300:] or "Hermes profile creation failed")
     home = os.path.realpath(os.path.join(HOME_ROOT, "profiles", pid))
     if not os.path.isdir(home):
         raise http_err(502, "PROFILE_CREATE_INCOMPLETE",
@@ -35289,8 +35280,6 @@ def _persona_public(pid: str, name: str, home: str, enabled: bool,
     return {"id": pid, "name": ent.get("name") or name,
             "profile": _persona_profile_of(home),
             **({"description": meta.read_profile_meta(Path(home))["description"]} if meta else {}),
-
-            "description": _persona_description_of(home),
             "home": home, "enabled": enabled, "deleted": deleted,
             "builtin": pid in _PERSONAS_BUILTIN,
             # TG 同源身分:@username(manifest.tg,可後補)與頭像版本
@@ -35382,15 +35371,6 @@ async def personas_create(request: Request):
     if not name:
         raise HTTPException(status_code=400, detail="name required")
 
-    home = None if description else _persona_home_from_body(body)
-    if description:
-        home = await _provision_persona_profile(pid, description)
-    if not home:
-        raise HTTPException(status_code=400,
-                            detail="description, profile or home required")
-    if not os.path.isdir(home):
-        raise HTTPException(status_code=400,
-                            detail=f"persona home not found: {home}")
     existing = _persona_row_get(pid)
     if pid in PERSONAS or (existing and not existing[4]):
         raise http_err(409, "PERSONA_EXISTS", "persona id already in use")
@@ -35440,19 +35420,6 @@ async def personas_patch(pid: str, request: Request):
         # supports clearing text; the CLI treats --text "" as read-only.
         await asyncio.to_thread(meta.write_profile_meta, Path(cur_home),
                                 description=description, description_auto=False)
-
-        env = os.environ.copy()
-        env["HERMES_HOME"] = HOME_ROOT
-        proc = await asyncio.create_subprocess_exec(
-            HERMES_BIN, "profile", "describe", pid, "--text", description,
-            env=env, stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=60)
-        if proc.returncode != 0:
-            detail = (stderr or stdout).decode("utf-8", errors="replace").strip()
-            raise http_err(502, "PROFILE_DESCRIBE_FAILED",
-                           detail[-300:] or "Hermes profile description failed")
     if "enabled" in body:
         enabled = bool(body.get("enabled"))
         deleted = False if enabled else cur_deleted
@@ -37362,6 +37329,7 @@ async def _dashboard_sessions():
     out = {"cc": {"working": cc_w, "idle": cc_i},
            "cx": {"working": cx_w, "idle": cx_i},
            "persona": {"working": p_w, "idle": p_i},
+           "active_provider": _dashboard_active_provider(),
            "degraded": degraded}
     # S4:openclaw 未配置 → 鍵缺席(app 端 optional decode 自動不畫那一行);
     # 配置了但掛 → 鍵缺席 + degraded 標記,同 codex 精神。
@@ -37403,6 +37371,17 @@ async def _dashboard_sessions():
             _log_event("dashboard_gemini_failed", error=type(e).__name__,
                        error_message=str(e)[:160])
             degraded.append("gemini")
+    if GROK.configured():
+        try:
+            # Same roster/state alignment as the Grok tab; no model calls or turns.
+            rows = await asyncio.wait_for(_grok_v2_rows(), timeout=5.0)
+            waiting = sum(r.get("status") == "waiting_approval" for r in rows)
+            working = sum(r.get("status") == "running" for r in rows)
+            out["grok"] = {"working": working, "idle": len(rows) - waiting - working,
+                           "needs_you": waiting}
+        except Exception as e:  # noqa: BLE001
+            _log_event("dashboard_grok_failed", error=type(e).__name__)
+            degraded.append("grok")
     return out
 
 
