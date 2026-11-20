@@ -1060,6 +1060,21 @@ client 對接要知道的最小集合（2026-08-01 補：Android 端曾因本節
 > 判決」。純 ACP（`grok agent stdio`，protocolVersion 1）——五家 code-agent
 > 裡唯一不用自家 adapter 的，rail 形狀與 §4.1d 同構。
 
+Dashboard additive extension (2026-11-20):
+`GET /app/v1/dashboard` adds `sessions.grok` when the Grok binary is configured.
+Counts come from the same roster as the Grok tab: `working` excludes approvals,
+`needs_you` counts `waiting_approval`, and `idle` is the remainder. The default
+entry follows that roster; no synthetic extra session is added. A failed/timeout
+read omits the key and adds `grok` to `sessions.degraded`, not a false zero.
+Clients must still honor the host's Grok capability declaration.
+
+The same extension adds `sessions.active_provider` (`hermes`, `openclaw`, `none`,
+or `auto`) from the existing host runtime selection. Clients show only the
+selected persona runtime. `none` hides both; `auto` or a missing legacy field
+uses existing persona availability, preferring Hermes when both are present.
+An explicit selection must not fall back to the other runtime while loading.
+These fields are additive; existing runtime processes and settings are untouched.
+
 - **provider 值 = `grok`，session id = `grok:{key}`**（同 §4.1 全寫規則）。
 - **名錄制**（同 gemini）：列表走 `GET /app/v2/sessions?provider=grok`；
   第一則訊息才在 bridge 建 ACP session（零建立 API）。bridge key 與 ACP

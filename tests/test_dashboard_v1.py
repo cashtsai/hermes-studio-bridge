@@ -14,6 +14,7 @@ import tempfile
 import time
 import unittest
 from datetime import datetime
+from unittest.mock import AsyncMock, patch
 
 _TMP = tempfile.mkdtemp(prefix="dash-canon-")
 os.environ["POCKET_CANON_DB"] = os.path.join(_TMP, "canonical.db")
@@ -55,7 +56,8 @@ def _stub_light(monkey_self):
     便宜假件,只留 approvals/oracle 真路徑。回傳 restore closure。"""
     orig = (bridge._cc_sessions, bridge._dashboard_weather,
             bridge._dashboard_gateways, bridge.CODEX_APP.call,
-            bridge._agent_auth_status, bridge.GEMINI.configured)
+            bridge._agent_auth_status, bridge.GEMINI.configured,
+            bridge.GROK.configured, bridge.OPENCLAW.configured)
 
     async def no_cc():
         return []
@@ -90,11 +92,14 @@ def _stub_light(monkey_self):
     # 只要有 GEMINI_API_KEY 或 ~/.pocket/gemini.json,基準形狀就會多一鍵。
     # 基準一律當未配置,要驗那一列的測試自己開(見 TestGeminiLane)。
     bridge.GEMINI.configured = lambda: False
+    bridge.GROK.configured = lambda: False
+    bridge.OPENCLAW.configured = lambda: False
 
     def restore():
         (bridge._cc_sessions, bridge._dashboard_weather,
          bridge._dashboard_gateways, bridge.CODEX_APP.call,
-         bridge._agent_auth_status, bridge.GEMINI.configured) = orig
+         bridge._agent_auth_status, bridge.GEMINI.configured,
+         bridge.GROK.configured, bridge.OPENCLAW.configured) = orig
     return restore
 
 
@@ -132,7 +137,7 @@ class TestAuth(unittest.TestCase):
                     "sessions", "health"):
             self.assertIn(key, out)
         self.assertEqual(
-            set(out["sessions"]) - {"degraded"}, {"cc", "cx", "persona"})
+            set(out["sessions"]) - {"degraded", "active_provider"}, {"cc", "cx", "persona"})
         for kind in ("cc", "cx", "persona"):
             self.assertEqual(set(out["sessions"][kind]), {"working", "idle"})
         self.assertEqual(len(out["health"]["gateways"]), 4)
@@ -465,6 +470,52 @@ class TestGeminiLane(unittest.TestCase):
             restore()
         self.assertNotIn("gemini", out)
         self.assertIn("gemini", out["degraded"])
+
+
+class TestDashboardProviders(unittest.TestCase):
+    def setUp(self):
+        self.addCleanup(_stub_light(self))
+
+    def test_runtime_declaration_is_not_inferred_from_leftover_installs(self):
+        for provider in ("hermes", "openclaw", "none", "auto"):
+            with patch.dict(os.environ, {"POCKET_ACTIVE_PROVIDER": provider, "POCKET_PROVIDER": ""}):
+                self.assertEqual(asyncio.run(bridge._dashboard_sessions())["active_provider"], provider)
+
+    def test_grok_absent_without_binary(self):
+        with patch.object(bridge, "_grok_v2_rows", new_callable=AsyncMock) as rows:
+            self.assertNotIn("grok", asyncio.run(bridge._dashboard_sessions()))
+            rows.assert_not_awaited()
+
+    def test_grok_uses_the_canonical_roster_and_keeps_approvals_separate(self):
+        samples = [{"status": "running"}, {"status": "waiting_approval"},
+                   {"status": "idle"}, {"status": "done"}]
+        with patch.object(bridge.GROK, "configured", return_value=True), \
+             patch.object(bridge, "_grok_v2_rows", new=AsyncMock(return_value=samples)):
+            out = asyncio.run(bridge._dashboard_sessions())
+        self.assertEqual(out["grok"], {"working": 1, "idle": 2, "needs_you": 1})
+
+    def test_grok_failure_omits_counts_instead_of_claiming_zero(self):
+        with patch.object(bridge.GROK, "configured", return_value=True), \
+             patch.object(bridge, "_grok_v2_rows", new=AsyncMock(side_effect=RuntimeError("fixture"))):
+            out = asyncio.run(bridge._dashboard_sessions())
+        self.assertNotIn("grok", out)
+        self.assertIn("grok", out["degraded"])
+
+    def test_grok_empty_registry_matches_the_tab_default_entry(self):
+        with patch.object(bridge.GROK, "configured", return_value=True), \
+             patch.object(bridge.grok_sdk, "list_sessions", return_value=[]), \
+             patch.object(bridge, "_grok_pending_by_session", return_value={}):
+            out = asyncio.run(bridge._dashboard_sessions())
+        self.assertEqual(out["grok"], {"working": 0, "idle": 1, "needs_you": 0})
+
+    def test_grok_timeout_does_not_remove_other_providers(self):
+        with patch.object(bridge.GROK, "configured", return_value=True), \
+             patch.object(bridge, "_grok_v2_rows", new=AsyncMock(side_effect=asyncio.TimeoutError)):
+            out = asyncio.run(bridge._dashboard_sessions())
+        self.assertNotIn("grok", out)
+        self.assertIn("grok", out["degraded"])
+        self.assertIn("cc", out)
+        self.assertIn("cx", out)
 
 
 class TestDashboardCcTimeout(unittest.TestCase):

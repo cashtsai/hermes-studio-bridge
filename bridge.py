@@ -35233,22 +35233,6 @@ def _persona_meta_api(home: str):
         pass  # Standalone bridge without the Hermes runtime: legacy API.
     return None
 
-def _persona_description_of(home: str) -> str:
-    """Read the user-authored Hermes profile description, if present."""
-    path = os.path.join(home, "profile.yaml")
-    try:
-        with open(path, encoding="utf-8") as f:
-            for line in f:
-                if line.startswith("description:"):
-                    value = line.split(":", 1)[1].strip()
-                    if value.startswith(('"', "'")) and value[-1:] == value[0]:
-                        value = value[1:-1]
-                    return value
-    except (OSError, UnicodeError):
-        pass
-    return ""
-
-
 async def _provision_persona_profile(pid: str, description: str) -> str:
     """Create a real Hermes profile before registering its bridge route."""
     env = os.environ.copy()
@@ -35256,8 +35240,6 @@ async def _provision_persona_profile(pid: str, description: str) -> str:
     proc = await asyncio.create_subprocess_exec(
         HERMES_BIN, "profile", "create", pid,
         "--no-alias", f"--description={description}",
-
-        "--clone", "--no-alias", "--description", description,
         env=env, stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
@@ -35272,9 +35254,6 @@ async def _provision_persona_profile(pid: str, description: str) -> str:
         raise http_err(502, "PROFILE_CREATE_FAILED",
                        "Hermes profile creation failed")
 
-        detail = (stderr or stdout).decode("utf-8", errors="replace").strip()
-        raise http_err(502, "PROFILE_CREATE_FAILED",
-                       detail[-300:] or "Hermes profile creation failed")
     home = os.path.realpath(os.path.join(HOME_ROOT, "profiles", pid))
     if not os.path.isdir(home):
         raise http_err(502, "PROFILE_CREATE_INCOMPLETE",
@@ -35301,8 +35280,6 @@ def _persona_public(pid: str, name: str, home: str, enabled: bool,
     return {"id": pid, "name": ent.get("name") or name,
             "profile": _persona_profile_of(home),
             **({"description": meta.read_profile_meta(Path(home))["description"]} if meta else {}),
-
-            "description": _persona_description_of(home),
             "home": home, "enabled": enabled, "deleted": deleted,
             "builtin": pid in _PERSONAS_BUILTIN,
             # TG 同源身分:@username(manifest.tg,可後補)與頭像版本
@@ -35394,15 +35371,6 @@ async def personas_create(request: Request):
     if not name:
         raise HTTPException(status_code=400, detail="name required")
 
-    home = None if description else _persona_home_from_body(body)
-    if description:
-        home = await _provision_persona_profile(pid, description)
-    if not home:
-        raise HTTPException(status_code=400,
-                            detail="description, profile or home required")
-    if not os.path.isdir(home):
-        raise HTTPException(status_code=400,
-                            detail=f"persona home not found: {home}")
     existing = _persona_row_get(pid)
     if pid in PERSONAS or (existing and not existing[4]):
         raise http_err(409, "PERSONA_EXISTS", "persona id already in use")
@@ -35452,19 +35420,6 @@ async def personas_patch(pid: str, request: Request):
         # supports clearing text; the CLI treats --text "" as read-only.
         await asyncio.to_thread(meta.write_profile_meta, Path(cur_home),
                                 description=description, description_auto=False)
-
-        env = os.environ.copy()
-        env["HERMES_HOME"] = HOME_ROOT
-        proc = await asyncio.create_subprocess_exec(
-            HERMES_BIN, "profile", "describe", pid, "--text", description,
-            env=env, stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=60)
-        if proc.returncode != 0:
-            detail = (stderr or stdout).decode("utf-8", errors="replace").strip()
-            raise http_err(502, "PROFILE_DESCRIBE_FAILED",
-                           detail[-300:] or "Hermes profile description failed")
     if "enabled" in body:
         enabled = bool(body.get("enabled"))
         deleted = False if enabled else cur_deleted
@@ -37374,6 +37329,7 @@ async def _dashboard_sessions():
     out = {"cc": {"working": cc_w, "idle": cc_i},
            "cx": {"working": cx_w, "idle": cx_i},
            "persona": {"working": p_w, "idle": p_i},
+           "active_provider": _dashboard_active_provider(),
            "degraded": degraded}
     # S4:openclaw 未配置 → 鍵缺席(app 端 optional decode 自動不畫那一行);
     # 配置了但掛 → 鍵缺席 + degraded 標記,同 codex 精神。
@@ -37415,6 +37371,17 @@ async def _dashboard_sessions():
             _log_event("dashboard_gemini_failed", error=type(e).__name__,
                        error_message=str(e)[:160])
             degraded.append("gemini")
+    if GROK.configured():
+        try:
+            # Same roster/state alignment as the Grok tab; no model calls or turns.
+            rows = await asyncio.wait_for(_grok_v2_rows(), timeout=5.0)
+            waiting = sum(r.get("status") == "waiting_approval" for r in rows)
+            working = sum(r.get("status") == "running" for r in rows)
+            out["grok"] = {"working": working, "idle": len(rows) - waiting - working,
+                           "needs_you": waiting}
+        except Exception as e:  # noqa: BLE001
+            _log_event("dashboard_grok_failed", error=type(e).__name__)
+            degraded.append("grok")
     return out
 
 
