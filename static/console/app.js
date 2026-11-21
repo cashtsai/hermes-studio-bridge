@@ -2313,8 +2313,18 @@ async function main() {
   }
   // 全域 SSE:任何 session 狀態變動都刷新列表(無 410 問題,見規格)
   if (document.body.dataset.consoleAccess === "remote") {
-    // The scoped session list is allowed; the cross-session event log is not.
-    setInterval(() => { if (!document.hidden && !signingOut) loadSessions(); }, 10000);
+    // 2026-11-21(W1-⑤):從常駐 10s 輪詢改訂閱 roster 差分 SSE(已進遠端白名單,
+    // bridge 端已把 last_turn_summary 消毒掉 —— 遠端不會收到真實訊息內容,
+    // 只有「有變化了」這個信號)。收到 sessions.changed 就照舊整包重抓
+    // /app/v2/sessions(本來就有完整的遠端授權投影,不改資料形狀依賴)。
+    // 斷線時 sseStream 自己指數退避重連;visibilitychange 保留當補漏安全網
+    // (分頁被瀏覽器凍結太久,回來時連線可能早就斷了卻還沒偵測到)。
+    state.stopList = sseStream("/app/v2/sessions/roster/events", state.token, {
+      onEvent: ({data}) => { if (data?.type === "sessions.changed") scheduleListRefresh(); },
+      onError: () => setConn(false, "清單即時連線斷線,重連中…"),
+      onOpen: () => {},
+      onDenied: code => { if (code === 401) void leaveConsole(); else setConn(false, "無權讀取清單更新"); },
+    });
     document.addEventListener("visibilitychange", () => { if (!document.hidden && !signingOut) loadSessions(); });
     return;
   }
