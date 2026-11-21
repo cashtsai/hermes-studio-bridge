@@ -46,6 +46,24 @@
   但不要退回常駐輪詢。
 - borrowed/console-remote 仍**唯讀**:這條只是「更快看到狀態」,不新增任何可寫動作。
 
+## 2026-11-21 精確安全缺口(實查，照這個做就安全)
+- roster SSE 端點**已存在**:`GET /app/v2/sessions/roster/events`(`bridge.py:22640`
+  `v2_sessions_roster_events`),poll `_roster_build` → diff → 推 `sessions.changed`
+  {upserted, removed}。transient、不落 event_log。**這就是清單即時流的現成骨架。**
+- **但它沒套遠端過濾**:`_console_remote_list`(遠端授權投影)**只在
+  `/app/v2/sessions` 的 22281 被呼叫**,roster SSE 完全沒有。直接把遠端接上去 =
+  **把全部未授權 session 串給借用裝置**(session 外洩)。這是這條的頭號風險。
+- **安全修法(最小、對稱)**:在 `v2_sessions_roster_events` 的 gen 裡,當
+  `request.state.console_remote is True` 時,對每輪 `_roster_build` 產出的 rows
+  **套用 `_console_remote_list`**(跟 `/app/v2/sessions` 同一把尺、同樣每輪套),
+  再 diff/推。等於把輪詢既有的過濾原封搬到串流。
+- 把 `/app/v2/sessions/roster/events` 加進遠端白名單(`_CONSOLE_GET`,`bridge.py:819`)
+  —— 現在不在白名單(fail-closed),所以遠端目前根本打不到它(這也是為何沒出事)。
+- app.js:遠端分流(`app.js:2315` 的 `setInterval(loadSessions,10000)`)改訂閱
+  roster SSE,事件進 handleListEvent;斷線退回一次 loadSessions,不退回常駐輪詢。
+- **必測安全性質**:一個 workdir 不在白名單的 session,其列**不得**出現在遠端
+  roster SSE 的輸出(仿 `test_console_remote_scope.py`)。這條測試是這刀的門檻。
+
 ## 驗收
 - 遠端 scope 下,某 session 狀態/預覽變動 → 清單**秒級**更新（非 10s）。
 - 遠端**看不到**未授權 session 的任何事件（拿一個 workdir 不在白名單的 session 驗:
