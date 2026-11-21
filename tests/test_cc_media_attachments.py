@@ -170,6 +170,10 @@ class CardScanTest(unittest.TestCase):
         self.calls.append(ref)
         return media_artifacts.vet_attachable_path(ref, self.roots)
 
+    def _vet_explicit(self, ref):
+        self.calls.append(ref)
+        return media_artifacts.vet_attachable_path(ref, self.roots, allow_any_kind=True)
+
     def _text_card(self, cid, text, kind="markdown", **body):
         self.store.upsert_card(carddigest.make_card(
             cid, "t1", "assistant", kind,
@@ -201,6 +205,43 @@ class CardScanTest(unittest.TestCase):
              "fallback_text": "🖼 shot.png"}))
         self.assertEqual(carddigest.media_refs_in_cards(self.store, self._vet),
                          [png])
+
+    # ── W1-③ A 案:明確附檔([[attach:…]])放行任何類型,但守住 root ──────────
+    def test_explicit_marker_attaches_non_media_file(self):
+        """agent 用 [[attach:/路徑]] 明確附一個 .txt → 掛得上(走寬鬆 vet)。"""
+        txt = _mkfile(os.path.join(self.cwd, "secret.txt"))
+        self._text_card("c1", f"密碼檔給你 [[attach:{txt}]]")
+        self.assertEqual(
+            carddigest.media_refs_in_cards(
+                self.store, self._vet, vet_explicit=self._vet_explicit),
+            [txt])
+
+    def test_heuristic_text_file_mention_not_attached(self):
+        """只是在內文提到 .txt(沒有 [[attach:]])→ 嚴格 vet 丟掉,不洗版。"""
+        txt = _mkfile(os.path.join(self.cwd, "notes.txt"))
+        self._text_card("c1", f"我改了 {txt}")
+        self.assertEqual(
+            carddigest.media_refs_in_cards(
+                self.store, self._vet, vet_explicit=self._vet_explicit),
+            [])
+
+    def test_explicit_vet_allows_text_but_still_enforces_roots(self):
+        txt = _mkfile(os.path.join(self.cwd, "a.txt"))
+        self.assertEqual(
+            media_artifacts.vet_attachable_path(txt, self.roots, allow_any_kind=True),
+            os.path.realpath(txt))
+        self.assertIsNone(
+            media_artifacts.vet_attachable_path(txt, self.roots),
+            ".txt 走嚴格 vet 仍被類型擋")
+        outside = os.path.join(os.path.expanduser("~"), "pocket-test-nonexist-xyz.txt")
+        self.assertIsNone(
+            media_artifacts.vet_attachable_path(outside, self.roots, allow_any_kind=True),
+            "明確附檔仍不能逃出允許 root")
+
+    def test_explicit_attach_refs_extraction(self):
+        self.assertIn("/a/b.txt",
+                      media_artifacts.explicit_attach_refs("foo [[attach:/a/b.txt]] bar"))
+        self.assertEqual(media_artifacts.explicit_attach_refs("沒有標記"), [])
 
     def test_dedupe_same_path_across_cards(self):
         mp4 = _mkfile(os.path.join(self.cwd, "demo.mp4"))

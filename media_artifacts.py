@@ -184,8 +184,15 @@ def within_roots(path: str, roots: Iterable[str]) -> bool:
                for root in roots)
 
 
-def vet_attachable_path(ref: str, roots: Iterable[str]):
+def vet_attachable_path(ref: str, roots: Iterable[str], allow_any_kind: bool = False):
     """`ref` 可以變成卡片附件嗎?**三態**回傳:
+
+    `allow_any_kind=True`(= agent 用 `[[attach:…]]` **明確**附的檔)時,跳過
+    ATTACHABLE_KINDS 類型檢查 —— 放行 .txt/.md/任何類型。類型限制存在只是為了
+    擋「啟發式亂掃原始碼變下載連結」的洗版;明確附檔沒有這個問題。**其餘所有
+    邊界照守**:仍必須是本機絕對路徑、仍必須在允許 root 內、仍解 symlink 防逃逸、
+    仍必須真的存在。所以明確附檔也絕不能掛 /etc/passwd 或 root 外的檔。
+
 
       · `str`(實路徑)= 可以掛
       · `False` = **現在**不行,但可能等一下就行(路徑合法、副檔名合格、在
@@ -210,9 +217,10 @@ def vet_attachable_path(ref: str, roots: Iterable[str]):
     roots = tuple(roots or ())
     if not roots or not within_roots(path, roots):
         return None
-    guessed = mimetypes.guess_type(path)[0] or ""
-    if media_kind(path, guessed) not in ATTACHABLE_KINDS:
-        return None
+    if not allow_any_kind:
+        guessed = mimetypes.guess_type(path)[0] or ""
+        if media_kind(path, guessed) not in ATTACHABLE_KINDS:
+            return None
     try:
         if not os.path.isfile(path):
             return False        # 還沒產生 → 保留重試機會
@@ -300,6 +308,25 @@ def references_in_text(text: str) -> list[str]:
         if any(start < match.end() and match.start() < end for start, end in url_spans):
             continue
         add(match.group("path"))
+    return refs
+
+
+# 「明確附檔」標記:agent 在訊息裡寫 `[[attach:/abs/path]]` 表示**刻意**要把這個檔
+# 給使用者。明確附檔走寬鬆 vet(放行任何類型,見 vet_attachable_path 的
+# allow_any_kind)—— 因為「洗版」只在啟發式亂掃時才是問題;使用者要的 .txt/密碼檔/
+# 報告,agent 標明了就該掛得上。路徑邊界(root/逃逸/存在性)仍然照守。
+_EXPLICIT_ATTACH_RE = re.compile(r"\[\[attach:\s*(?P<path>[^\]\n]+?)\s*\]\]")
+
+
+def explicit_attach_refs(text: str) -> list[str]:
+    """抽出 `[[attach:/路徑]]` 標記裡的路徑(= agent 明確要附的檔)。"""
+    if not text or len(text) > 2_000_000:
+        return []
+    refs: list[str] = []
+    for match in _EXPLICIT_ATTACH_RE.finditer(text):
+        value = _clean_reference(match.group("path"))
+        if value and value not in refs:
+            refs.append(value)
     return refs
 
 

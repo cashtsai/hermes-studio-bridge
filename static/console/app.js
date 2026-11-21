@@ -1392,7 +1392,12 @@ function visualReplyHtml(c) {
 // 散文(agent 的 text/markdown 卡)走 md.js 全功能渲染;使用者訊息與等寬卡
 // 只做「轉義 + 裸網址連結化 + 換行」—— 打什麼看到什麼,與手機版一致。
 // md.js 沒載成功時退回舊的純轉義路徑,訊息永遠不會變成 HTML 水槽。
+// agent 的明確附檔標記 [[attach:/路徑]] 只是給 bridge 看的信號,顯示時濾掉
+// (檔案已另外掛成附件泡泡)——不然使用者會看到一串生的標記文字。媒體掃描讀的
+// 是 body 原文、不經這裡,所以濾掉只影響「人看的」那層。
+const ATTACH_MARKER_RE = /\[\[attach:[^\]\n]+\]\]/g;
 function proseHtml(c, text) {
+  text = String(text == null ? "" : text).replace(ATTACH_MARKER_RE, "").replace(/[ \t]+\n/g, "\n").trim();
   const md = window.PocketMarkdown;
   if (!md) return esc(text).replace(/\n/g, "<br>");
   if (c.role !== "user" && PROSE_KINDS.has(c.kind || "text"))

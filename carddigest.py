@@ -85,7 +85,7 @@ _MEDIA_ATTACH_RENDERED_KINDS = ("text", "markdown")
 
 
 def media_refs_in_cards(store, vet, seen: set | None = None,
-                        scanned_cards: set | None = None) -> list[str]:
+                        scanned_cards: set | None = None, vet_explicit=None) -> list[str]:
     """卡片庫 → 「應該掛成可點附件」的本機檔案路徑(已去重、已過安全門)。
 
     為什麼掃卡片而不是掃 provider 原始事件:每家 provider 的事件形狀都不同
@@ -117,6 +117,7 @@ def media_refs_in_cards(store, vet, seen: set | None = None,
     (使用者要的是剛剛那支影片,不是三天前的)。
     """
     refs: list[str] = []
+    vet_explicit = vet_explicit or vet   # 沒給 → 明確附檔與啟發式走同一把 vet(舊行為)
     seen = seen if seen is not None else set()
     # 兩個集合都掛在常駐 store 上,得有上限(長 session 會把每條路徑字串
     # 都留著)。清掉只是多掃一輪,不會掛錯東西。
@@ -133,21 +134,29 @@ def media_refs_in_cards(store, vet, seen: set | None = None,
         stamp = f"{card.get('id')}:{card.get('rev')}"
         if scanned_cards is not None and stamp in scanned_cards:
             continue
-        candidates: list[str] = []
+        # ref → 是否「明確附檔」(True=agent 用 body.path 或 [[attach:…]] 標明,
+        # 走寬鬆 vet 放行任何類型;False=啟發式從內文掃到的路徑,走嚴格 vet)。
+        cand: dict = {}
         # `attachment` 卡的 body.path 是**結構化**欄位(CC/cc2 的「agent 看圖」
-        # 卡就只有這個),不是內文,所以直接收 —— 不必靠文字偵測。
+        # 卡就只有這個),不是內文,所以直接收 —— 不必靠文字偵測,且算明確附檔。
         explicit = body.get("path")
         if isinstance(explicit, str) and explicit:
-            candidates.append(explicit)
+            cand[explicit] = True
         for field in _MEDIA_SCAN_TEXT_KEYS:
             value = body.get(field)
-            if isinstance(value, str) and value:
-                candidates.extend(media_artifacts.references_in_text(value))
-        retry_later = False
-        for ref in candidates:
-            if not ref or ref in seen:
+            if not isinstance(value, str) or not value:
                 continue
-            verdict = vet(ref)
+            for m in media_artifacts.explicit_attach_refs(value):   # [[attach:…]] = 明確
+                if m:
+                    cand[m] = True
+            for r in media_artifacts.references_in_text(value):     # 內文路徑 = 啟發式
+                if r and r not in cand:
+                    cand[r] = False
+        retry_later = False
+        for ref, is_explicit in cand.items():
+            if ref in seen:
+                continue
+            verdict = (vet_explicit if is_explicit else vet)(ref)
             if isinstance(verdict, str) and verdict:
                 seen.add(ref)
                 refs.append(ref)
