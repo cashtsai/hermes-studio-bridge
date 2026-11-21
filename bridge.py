@@ -21842,6 +21842,68 @@ _CC_MODEL_RE = re.compile(r"^[A-Za-z0-9 ._/-]{1,60}$")
 # app 以為成功、而且留下一個卡住的確認框(就是 Pocket-Main「換了模型卻叫不起來、
 # 卡 2.5 小時」那個框 —— 選模型這動作本身在製造它)。
 _CC_MODEL_CONFIRM_POLL_SECS = 3.0
+
+# ── /model 的全域持久化外溢防護(2026-11-21,機主回報)────────────────────
+# 近版 Claude Code 的 `/model` 不只切當前 session,還會把選擇**寫進全域設定**
+# (~/.claude.json 頂層 "model" 與 ~/.claude/settings.json 的 "model")。
+# Pocket 的語意是「切這條 session 的模型」,結果卻改掉機主整台機器的預設 ——
+# 回官方 CLI/桌面發現模型被換成 opus 系(機主 2026-11-21 回報,實錄:
+# 11-13 FLiPER 切 opus → 全域變 claude-opus-5-5)。
+# 對策:送 /model 前快照兩個檔的 model 欄位,確認成交後還原 —— 活著的
+# session 模型在行程記憶體裡,檔案還原不影響它;全域預設則保持機主自己的。
+_CC_GLOBAL_MODEL_FILES = (
+    os.path.expanduser("~/.claude.json"),
+    os.path.expanduser("~/.claude/settings.json"),
+)
+
+
+def _cc_snapshot_global_model() -> dict:
+    """記下兩個設定檔頂層 "model" 的現值(檔案不存在/無欄位記 None)。"""
+    snap = {}
+    for path in _CC_GLOBAL_MODEL_FILES:
+        try:
+            with open(path, encoding="utf-8") as f:
+                snap[path] = json.load(f).get("model")
+        except FileNotFoundError:
+            snap[path] = None
+        except Exception as _exc:  # noqa: BLE001
+            _log_exc("cc_model_snapshot", _exc, expected=True)
+            snap[path] = Ellipsis   # 讀不懂 → 還原時跳過,別把壞檔越改越壞
+    return snap
+
+
+def _cc_restore_global_model(snap: dict) -> None:
+    """把被 /model 外溢改掉的全域 "model" 還原成快照值。
+
+    只在「現值 ≠ 快照值」時動檔案;快照時就沒有欄位的(None)→ 刪掉外溢寫入
+    的欄位。整段 best-effort:還原失敗留痕不炸(切換本身已成功)。"""
+    for path, want in snap.items():
+        if want is Ellipsis:
+            continue
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+        except FileNotFoundError:
+            continue
+        except Exception as _exc:  # noqa: BLE001
+            _log_exc("cc_model_restore_read", _exc, expected=True)
+            continue
+        cur = data.get("model")
+        if cur == want:
+            continue
+        if want is None:
+            data.pop("model", None)
+        else:
+            data["model"] = want
+        try:
+            tmp = path + ".tmp-modelpin"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, path)
+            _log_event("cc_model_global_restored", file=os.path.basename(path),
+                       spilled=str(cur), restored=str(want))
+        except Exception as _exc:  # noqa: BLE001
+            _log_exc("cc_model_restore_write", _exc, expected=True)
 _CC_MODEL_YES_RE = re.compile(r"\b(yes|switch|confirm)\b|\buse\b", re.IGNORECASE)
 _CC_MODEL_NO_RE = re.compile(r"\b(no|keep|cancel|stay)\b|don.?t", re.IGNORECASE)
 _CC_MODEL_ERR_RE = re.compile(
@@ -21920,6 +21982,8 @@ async def cc_session_model(name: str, request: Request):
         raise http_err(409, "CC_BUSY", "turn running; model switch needs an idle prompt")
     # 序列化:同一個 session 的 /model 不要跟 answer/key 交錯送鍵。
     async with _cc_seq_guard(name, "model"):
+        # 全域外溢防護:見 _cc_snapshot_global_model。
+        global_snap = _cc_snapshot_global_model()
         # 1) 打 /model <name> 送出。expect_dialog=True:/model 一送出就跳確認框、
         #    吃掉輸入框的字,通用貼字驗證會誤判成「沒送進去」—— 旗標讓它看到確認框
         #    就當成功,交棒給下面的輪詢去按(2026-10-25 修「模型選了沒反應」)。
@@ -21968,7 +22032,10 @@ async def cc_session_model(name: str, request: Request):
             raise http_err(502, "MODEL_CONFIRM_UNRESOLVED",
                            "sent /model but a prompt is still on screen — not switched",
                            tail[-200:])
-        # 切成功 → 落 pin。status 下次回讀即反映現用模型(picker 會亮),
+        # 切成功 → 把 /model 外溢寫進全域設定的 "model" 還原(活 session 不受
+        # 影響 —— 它的模型在行程裡;機主的全域預設不該被一條 session 的選擇改走)。
+        _cc_restore_global_model(global_snap)
+        # 落 pin。status 下次回讀即反映現用模型(picker 會亮),
         # 且 session 重啟沿用。
         _cc_write_model_pin(name, model)
         return {"ok": True, "model": model, "confirmed": True,
