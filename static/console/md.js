@@ -27,6 +27,13 @@
     return /^(?:https?|mailto):/i.test(cleaned) ? cleaned : null;
   }
 
+  // Console 自家、需 Bearer 的本地資產路徑(圖走 authed blob、檔走 authed 下載)。
+  // 只認 artifact 庫這一支;不放行任意本地路徑(那會變成讀任意檔的洞)。
+  function localAsset(raw) {
+    const u = String(raw || "").trim();
+    return /^\/app\/v2\/artifacts\/[\w./-]+$/.test(u) ? u : null;
+  }
+
   const LABEL_MAX = 64;
   function clipLabel(label) {
     // 只截「本身就是一坨 URL/長 token」的顯示文字;一般句子不動。
@@ -48,7 +55,10 @@
   // 哪裡就在那裡斷;但漢字本身不是標點,所以 `/wiki/中文` 這種路徑完整保留。
   // ASCII 尾端標點仍沿用原本的逐字剝除(右括號只有在網址內左括號較多時才
   // 保留,維基式 …_(x) 連結)。
-  const URL_RE = /https?:\/\/[^\s<>"']+/gi;
+  // 排除 markdown 行內符號 * 與反引號:`**https://x.com**` 以前會把尾巴的 **
+  // 一起吃進 href(點過去 404);真實網址幾乎不含這兩個字元,排掉後 **url**
+  // 會正確斷在網址尾、外層 ** 再包成粗體連結。
+  const URL_RE = /https?:\/\/[^\s<>"'`*]+/gi;
   // 位置上的下一個字元**不是 ASCII** 且屬於 Unicode 標點 → 句讀,不是網址。
   // `u` flag 下 \p{P} 連 astral 標點(surrogate pair)都涵蓋。
   const NON_ASCII_PUNCT = /(?![\x00-\x7F])\p{P}/u;
@@ -82,9 +92,22 @@
     // [文字](url) 與 ![alt](url)。圖片語法降級成連結 —— Console 的 CSP 只准
     // 'self'/blob 圖,外部圖直接 <img> 既載不出來也不該去打。
     s = s.replace(/(!?)\[([^\]\n]*)\]\(([^()\s]+)\)/g, (m, bang, label, url) => {
+      const name = esc(label.trim() || url.split(/[?#]/)[0].split("/").pop() || "附件");
+      const asset = localAsset(url);
+      // 自家 artifact(圖或檔):走 authed 下載 chip(#cards 既有 handler 用 Bearer 抓)。
+      // 刻意**不**吐 <img>:md.js 渲染任意 agent 文字,維持「永不產生 <img>」的 XSS
+      // 紅線;真正的內嵌圖預覽由附件管線(attachmentsHtml)負責,不走這裡。
+      if (asset)
+        return stash('<button type="button" class="att-chip" data-dl="' + esc(asset) +
+          '" data-name="' + name + '" title="' + (bang === "!" ? "開啟圖片" : "下載") +
+          '">' + (bang === "!" ? "🖼️ " : "📄 ") + name + "</button>");
       const href = safeHref(url);
-      if (!href) return m;             // 危險/怪 scheme:整段留作純文字
-      return stash(anchor(href, label.trim() || url));
+      if (bang === "!") {               // 外部圖:CSP 不給內嵌 → 降連結;其餘降乾淨標籤
+        if (href) return stash(anchor(href, label.trim() || url));
+        return stash('<span class="att-chip att-dead" title="附件尚未就緒(未被附件管線擷取)">🖼️ ' + name + "</span>");
+      }
+      if (href) return stash(anchor(href, label.trim() || url));
+      return stash(name);               // 怪 scheme/本地路徑:只留乾淨檔名,不露原始 markdown
     });
 
     // 裸網址
