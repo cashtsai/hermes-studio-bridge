@@ -361,23 +361,52 @@ function stickyRank(s, now) {
 
 function sortSessions(rows, now) {
   // 每個 session 每次快照只更新一次,包括只有一列的 provider。
+  // 2026-11-21:**同 rank 之內不再按活動時間重排**。原本的次層
+  // `max(last_event_at, latest.at)` 會在每一則訊息到達時把列往上搬,就是
+  // 「跑上跑下」的真因(遲滯只擋住 rank 層的彈跳,擋不住這層)。改成:只有
+  // rank(需要你 > 執行中 > 一般,已含 15s 降級遲滯)決定位置,同 rank 用 id
+  // 墊底 → 位置完全確定、不隨活動漂移。活動/未讀改由列上的狀態晶片與未讀標
+  // 表達(renderSessions 就地更新那一列),不靠「整列跳位」。
   const ranks = new Map(rows.map(s => [s.id, stickyRank(s, now)]));
   return rows.sort((a, b) =>
     (ranks.get(a.id) - ranks.get(b.id)) ||
-    (Math.max(activityTime(b.last_event_at), listActivity.get(b.id)?.latest?.at || 0) -
-      Math.max(activityTime(a.last_event_at), listActivity.get(a.id)?.latest?.at || 0)) ||
     (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+}
+
+// 一列的內容 HTML(.session-row 的內部)。當這串與上次相同 → 完全不碰 DOM。
+function sessionRowHTML(s) {
+  const active = s.id === state.current;
+  const locked = s.meta && s.meta.locked ? ' 🔒' : "";
+  return '<button type="button" class="sess' + (active ? " active" : "") +
+    '" data-id="' + esc(s.id) + '" aria-current="' + (active ? "true" : "false") + '">' +
+    '<span class="sess-name">' + esc(s.title || s.id) + locked + unreadMark(s) + "</span>" +
+    '<span class="sess-sub"><span class="st st-' + esc(s.status || "idle") + '">' +
+    esc(workPhase(s)) + "</span> " + esc(sessionPreview(s)) + "</span></button>" +
+    (window.PocketSessionOps?.menuButton(s) || "");
+}
+
+// 清單點選改用「事件委派」:一個掛在容器上的 listener,不再逐列掛/重掛 ——
+// keyed diff 會重用列節點,逐列掛 handler 會在就地更新時連同按鈕一起丟掉。
+function bindSessionListClicks(el) {
+  if (el._clickBound) return;
+  el._clickBound = true;
+  el.addEventListener("click", (ev) => {
+    const btn = ev.target.closest(".sess");   // ops 選單鈕是 .session-row 的兄弟,不在 .sess 內 → 不會誤觸
+    if (btn && el.contains(btn)) openSession(btn.dataset.id);
+  });
 }
 
 function renderSessions() {
   const el = $("session-list");
+  bindSessionListClicks(el);
   const focusedId = el.contains(document.activeElement) ? document.activeElement.dataset.id : null;
   if (!state.sessions.length) {
+    el._provGroups = null;        // 下次有 session 時重建群組結構
     el.textContent = state.listHealth === "failed" || state.degraded.length ? "清單暫時不完整" : "沒有 session";
     return;
   }
   // FLIP 前置:記住每列現在的位置,重畫後只對「真的移動了」的列補一段位移動畫。
-  const oldTops = new Map(Array.from(el.querySelectorAll(".sess"),
+  const oldTops = new Map(Array.from(el.querySelectorAll(".session-row"),
     (n) => [n.dataset.id, n.getBoundingClientRect().top]));
   const byProv = new Map(["hermes", "claude_code", "codex", "gemini"].map(p => [p, []]));
   for (const s of state.sessions) {
@@ -387,35 +416,96 @@ function renderSessions() {
   }
   const now = Date.now();
   for (const rows of byProv.values()) sortSessions(rows, now);
-  let html = "";
-  for (const [prov, rows] of byProv) {
-    const dim = state.degraded.includes(prov) || (prov === "claude_code" && state.degraded.includes("cc2")) ? " degraded" : "";
-    html += '<div class="prov-group"><div class="prov-head' + dim + '">' +
-            esc(PROVIDER_LABEL[prov] || prov) + (dim ? " ⚠" : "") + "</div>";
-    for (const s of rows) {
-      const active = s.id === state.current ? " active" : "";
-      const locked = s.meta && s.meta.locked ? ' 🔒' : "";
-      html += '<div class="session-row"><button type="button" class="sess' + active + '" data-id="' + esc(s.id) + '" aria-current="' + (active ? "true" : "false") + '">' +
-              '<span class="sess-name">' + esc(s.title || s.id) + locked + unreadMark(s) + "</span>" +
-              '<span class="sess-sub"><span class="st st-' + esc(s.status || "idle") + '">' +
-              esc(workPhase(s)) + "</span> " + esc(sessionPreview(s)) + "</span></button>" +
-              (window.PocketSessionOps?.menuButton(s) || "") + "</div>";
-    }
-    if (!rows.length) html += '<div class="provider-empty">' + (dim ? "暫時無法讀取" : "無對話") + '</div>';
-    html += "</div>";
+
+  reconcileSessionList(el, byProv);
+
+  // FLIP:只有「真的換了位置」的列(= rank 變動,已稀有)會動;就地更新內容的
+  // 列節點不動 → 不閃、不丟 scroll、不播無謂動畫。
+  if (!window.matchMedia?.("(prefers-reduced-motion: reduce)").matches) {
+    el.querySelectorAll(".session-row").forEach((n) => {
+      const was = oldTops.get(n.dataset.id);
+      if (was === undefined || !n.animate) return;
+      const delta = was - n.getBoundingClientRect().top;
+      if (Math.abs(delta) > 1) n.animate(
+        [{ transform: "translateY(" + delta + "px)" }, { transform: "none" }],
+        { duration: 180, easing: "ease-out" });
+    });
   }
-  el.innerHTML = html;
-  el.querySelectorAll(".sess").forEach((n) => {
-    n.addEventListener("click", () => openSession(n.dataset.id));
-    if (n.dataset.id === focusedId) n.focus({preventScroll:true});
-    const was = oldTops.get(n.dataset.id);
-    if (was === undefined || !n.animate ||
-        window.matchMedia?.("(prefers-reduced-motion: reduce)").matches) return;
-    const delta = was - n.getBoundingClientRect().top;
-    if (Math.abs(delta) > 1) n.animate(
-      [{ transform: "translateY(" + delta + "px)" }, { transform: "none" }],
-      { duration: 180, easing: "ease-out" });
-  });
+  // 焦點復原:只有被「就地重建內容」的那一列才會掉焦點(重用+移動的不會)。
+  if (focusedId && !el.contains(document.activeElement)) {
+    for (const b of el.querySelectorAll(".sess")) {
+      if (b.dataset.id === focusedId) { b.focus({ preventScroll: true }); break; }
+    }
+  }
+}
+
+// keyed diff:容器內一個 provider 一個 .prov-group;群組內一列一個 .session-row
+// (以 session id 為 key)。只對「內容真的變了」的列改 innerHTML、只移動「真的
+// 換位」的列,其餘完全不碰 DOM —— 這是消除閃爍/頭暈/丟 scroll 的關鍵。
+function reconcileSessionList(el, byProv) {
+  let groupEls = el._provGroups;
+  if (!groupEls) { el.innerHTML = ""; el._provGroups = groupEls = new Map(); }
+  // 移除已不存在的 provider 群組
+  for (const [prov, g] of groupEls) {
+    if (!byProv.has(prov)) { g.remove(); groupEls.delete(prov); }
+  }
+  let prevGroup = null;
+  for (const [prov, rows] of byProv) {
+    let g = groupEls.get(prov);
+    if (!g) {
+      g = document.createElement("div");
+      g.className = "prov-group";
+      g._head = document.createElement("div");
+      g.appendChild(g._head);
+      g._rows = new Map();   // id → .session-row
+      g._empty = null;
+      groupEls.set(prov, g);
+    }
+    // 把群組排到正確位置(順序固定,幾乎不會動)
+    const want = prevGroup ? prevGroup.nextSibling : el.firstChild;
+    if (want !== g) el.insertBefore(g, want);
+    prevGroup = g;
+    // 群組標頭(降級態)
+    const dim = state.degraded.includes(prov) || (prov === "claude_code" && state.degraded.includes("cc2"));
+    const headText = (PROVIDER_LABEL[prov] || prov) + (dim ? " ⚠" : "");
+    const headCls = "prov-head" + (dim ? " degraded" : "");
+    if (g._head.className !== headCls) g._head.className = headCls;
+    if (g._head.textContent !== headText) g._head.textContent = headText;
+    reconcileRows(g, rows, dim);
+  }
+}
+
+function reconcileRows(g, rows, dim) {
+  const rowMap = g._rows, desired = new Set(rows.map(s => s.id));
+  for (const [id, node] of rowMap) {
+    if (!desired.has(id)) { node.remove(); rowMap.delete(id); }
+  }
+  if (g._empty) { g._empty.remove(); g._empty = null; }
+  if (!rows.length) {
+    g._empty = document.createElement("div");
+    g._empty.className = "provider-empty";
+    g._empty.textContent = dim ? "暫時無法讀取" : "無對話";
+    g.appendChild(g._empty);
+    return;
+  }
+  let prev = g._head;
+  for (const s of rows) {
+    const html = sessionRowHTML(s);
+    let node = rowMap.get(s.id);
+    if (!node) {
+      node = document.createElement("div");
+      node.className = "session-row";
+      node.dataset.id = s.id;
+      node.innerHTML = html;
+      node._sig = html;
+      rowMap.set(s.id, node);
+    } else if (node._sig !== html) {   // 內容變了才就地重建這一列
+      node.innerHTML = html;
+      node._sig = html;
+    }
+    if (prev.nextSibling !== node) g.insertBefore(node, prev.nextSibling);
+    prev = node;
+  }
 }
 
 function activityTime(value) {
@@ -1186,9 +1276,28 @@ function upsertCard(card) {
   });
 }
 
+// 視覺卡(body.visual.blocks)的純文字萃取:複製/回覆/分享要的是「可貼走的文字」,
+// 不是 HTML。人格(hermes)的回覆多是視覺卡 —— 文字住在 blocks / visual.fallback_text,
+// 不在 body.text。少了這條,cardText 對人格訊息回空字串,三個動作全拿到空的 → 看似壞掉。
+function visualText(visual) {
+  if (!visual || typeof visual !== "object") return "";
+  const fromBlocks = Array.isArray(visual.blocks) ? visual.blocks.map((b) => {
+    if (!b || typeof b !== "object") return "";
+    const type = String(b.type || "").toLowerCase();
+    if (type === "text" || type === "markdown") return b.text || "";
+    if (type === "html") return b.fallback_text || b.text || "";
+    if (type === "link" || type === "file") return b.label || b.filename || b.url || b.download_url || "";
+    if (type === "image") return b.alt || "";
+    return "";
+  }).filter(Boolean).join("\n").trim() : "";
+  return fromBlocks || String(visual.fallback_text || "").trim();
+}
+
 function cardText(c) {
   const b = c.body || {};
-  return b.text || b.fallback_text || b.typed_text || (typeof c.body === "string" ? c.body : "");
+  return b.text || b.fallback_text || b.typed_text ||
+    (b.visual ? visualText(b.visual) : "") ||
+    (typeof c.body === "string" ? c.body : "");
 }
 
 function safeHttpUrl(value) {
