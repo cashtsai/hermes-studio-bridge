@@ -56,6 +56,14 @@
         <button id="newsess-open" class="icon-btn" title="開新工作">＋</button>
         <button id="refresh" class="icon-btn" title="重新整理">↻</button>
       </div>
+      <div class="side-filter">
+        <input id="sess-q" type="search" placeholder="搜尋 session…" aria-label="搜尋 session" autocomplete="off">
+        <div id="sess-filters" class="sess-filters" role="tablist" aria-label="清單篩選">
+          <button type="button" class="sf-chip active" data-filter="all">全部</button>
+          <button type="button" class="sf-chip" data-filter="attn">需要我</button>
+          <button type="button" class="sf-chip" data-filter="unread">未讀</button>
+        </div>
+      </div>
       <div id="session-list"><div class="empty">載入中…</div></div>
     </aside>
 
@@ -230,6 +238,20 @@
   <p id="logout-state"></p>
   <button type="button" class="btn" id="retry-logout">重試登出</button>
 </section>
+<div id="shortcuts" class="hidden" role="dialog" aria-modal="true" aria-label="鍵盤快捷鍵">
+  <div class="sc-card">
+    <h3>鍵盤快捷鍵</h3>
+    <dl>
+      <dt>⌘K</dt><dd>快速切換 / 搜尋 session</dd>
+      <dt>j / k</dt><dd>在 session 間上下移動</dd>
+      <dt>a / d</dt><dd>核准 / 否決當前審批</dd>
+      <dt>Enter</dt><dd>送出訊息（Shift+Enter 換行）</dd>
+      <dt>?</dt><dd>開關這張說明</dd>
+      <dt>Esc</dt><dd>關閉浮層</dd>
+    </dl>
+    <button type="button" class="sc-close" id="sc-close">知道了</button>
+  </div>
+</div>
 <script src="/console/static/sse.js"></script>
 <script src="/console/static/md.js"></script>
 <script src="/console/static/transcript.js"></script>

@@ -377,8 +377,15 @@ class MediaSessionCwdTests(unittest.TestCase):
         bridge._CX_THREAD_CWD.clear()
 
     def test_unknown_providers_have_no_cwd(self):
-        for sid in ("hermes:cash", "openclaw:agent:main:main"):
-            self.assertEqual(bridge._media_session_cwd(sid), "")
+        # openclaw 仍無附件 root;hermes 改成有專屬 outbox(2026-11-21 W1-③ A 案),
+        # 見 test_persona_sessions_resolve_to_outbox。
+        self.assertEqual(bridge._media_session_cwd("openclaw:agent:main:main"), "")
+
+    def test_persona_sessions_resolve_to_outbox(self):
+        # 人格的附件 root = 人格 home 下的 outbox 子目錄(不是整個 home)。
+        cwd = bridge._media_session_cwd("hermes:cash")
+        self.assertTrue(cwd.endswith(os.sep + "outbox"), cwd)
+        self.assertNotEqual(cwd, "")
 
     def test_resolution_is_failsafe(self):
         with patch.object(bridge, "_cc_conf_rows",

@@ -17,6 +17,8 @@ const state = {
   latestSeq: 0,
   stopStream: null,   // 當前 session SSE 的中止函式
   view: 0,            // A -> B -> A must invalidate the first A response too.
+  listFilter: "all",  // 清單篩選:all / attn(需要我) / unread
+  listQuery: "",      // 清單搜尋字串
 };
 const drafts = new Map();  // Page memory only, never persisted on a borrowed device.
 // Only the newest preview/incoming message and monotonic read cursor per session.
@@ -359,16 +361,45 @@ function stickyRank(s, now) {
   return raw;
 }
 
+// 釘選:存 localStorage,置頂於所屬 provider 群組。手機沒有「釘選」概念,這是
+// 桌面大螢幕的便利——常盯的那幾條固定在上面,不被其他列推走。
+const PIN_KEY = "pocket-console-pins";
+let pinnedIds = null;
+function pins() {
+  if (pinnedIds) return pinnedIds;
+  try { pinnedIds = new Set(JSON.parse(localStorage.getItem(PIN_KEY)) || []); }
+  catch (_) { pinnedIds = new Set(); }
+  return pinnedIds;
+}
+function isPinned(id) { return pins().has(id); }
+function togglePin(id) {
+  const p = pins();
+  if (p.has(id)) p.delete(id); else p.add(id);
+  try { localStorage.setItem(PIN_KEY, JSON.stringify(Array.from(p))); } catch (_) {}
+  renderSessions();
+}
+
+// 清單篩選/搜尋:all=全部、attn=需要我(actionable/needs_input=rank 0)、unread=未讀。
+// 搜尋沿用 ⌘K 的 workMatches(含 CJK 摺疊),比對 title/id/provider/workdir。
+function sessionVisible(s) {
+  const f = state.listFilter;
+  if (f === "attn" && sessionRank(s) !== 0) return false;
+  if (f === "unread" && !sessionUnread(s)) return false;
+  if (state.listQuery && !workMatches(s, state.listQuery)) return false;
+  return true;
+}
+
 function sortSessions(rows, now) {
   // 每個 session 每次快照只更新一次,包括只有一列的 provider。
   // 2026-11-21:**同 rank 之內不再按活動時間重排**。原本的次層
   // `max(last_event_at, latest.at)` 會在每一則訊息到達時把列往上搬,就是
-  // 「跑上跑下」的真因(遲滯只擋住 rank 層的彈跳,擋不住這層)。改成:只有
-  // rank(需要你 > 執行中 > 一般,已含 15s 降級遲滯)決定位置,同 rank 用 id
-  // 墊底 → 位置完全確定、不隨活動漂移。活動/未讀改由列上的狀態晶片與未讀標
-  // 表達(renderSessions 就地更新那一列),不靠「整列跳位」。
+  // 「跑上跑下」的真因(遲滯只擋住 rank 層的彈跳,擋不住這層)。改成:釘選優先、
+  // 再 rank(需要你 > 執行中 > 一般,已含 15s 降級遲滯),同 rank 用 id 墊底 →
+  // 位置完全確定、不隨活動漂移。活動/未讀改由列上的狀態晶片與未讀標表達
+  // (renderSessions 就地更新那一列),不靠「整列跳位」。
   const ranks = new Map(rows.map(s => [s.id, stickyRank(s, now)]));
   return rows.sort((a, b) =>
+    ((isPinned(b.id) ? 1 : 0) - (isPinned(a.id) ? 1 : 0)) ||
     (ranks.get(a.id) - ranks.get(b.id)) ||
     (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
 }
@@ -377,12 +408,24 @@ function sortSessions(rows, now) {
 function sessionRowHTML(s) {
   const active = s.id === state.current;
   const locked = s.meta && s.meta.locked ? ' 🔒' : "";
-  return '<button type="button" class="sess' + (active ? " active" : "") +
+  const pinned = isPinned(s.id);
+  return '<button type="button" class="sess' + (active ? " active" : "") + (pinned ? " pinned" : "") +
     '" data-id="' + esc(s.id) + '" aria-current="' + (active ? "true" : "false") + '">' +
     '<span class="sess-name">' + esc(s.title || s.id) + locked + unreadMark(s) + "</span>" +
     '<span class="sess-sub"><span class="st st-' + esc(s.status || "idle") + '">' +
     esc(workPhase(s)) + "</span> " + esc(sessionPreview(s)) + "</span></button>" +
+    '<button type="button" class="sess-pin' + (pinned ? " on" : "") + '" data-id="' + esc(s.id) +
+    '" title="' + (pinned ? "取消釘選" : "釘選到頂") + '" aria-label="' + (pinned ? "取消釘選" : "釘選") +
+    '">' + (pinned ? "★" : "☆") + "</button>" +
     (window.PocketSessionOps?.menuButton(s) || "");
+}
+
+// 有引導的空狀態(對齊手機/商業級產品):圖示 + 人話標題 + 下一步,必要時給動作鈕。
+// 取代原本一行乾字的「沒有 session」。
+function listEmptyHTML(icon, title, hint, action = "") {
+  return '<div class="list-empty"><div class="list-empty-ic" aria-hidden="true">' + icon + "</div>" +
+    '<div class="list-empty-title">' + esc(title) + "</div>" +
+    '<div class="list-empty-hint">' + esc(hint) + "</div>" + action + "</div>";
 }
 
 // 清單點選改用「事件委派」:一個掛在容器上的 listener,不再逐列掛/重掛 ——
@@ -391,6 +434,16 @@ function bindSessionListClicks(el) {
   if (el._clickBound) return;
   el._clickBound = true;
   el.addEventListener("click", (ev) => {
+    if (ev.target.closest(".list-empty-new")) { $("newsess").classList.remove("hidden"); return; }
+    if (ev.target.closest(".list-empty-clear")) {   // 清除篩選 → 回全部
+      state.listQuery = ""; state.listFilter = "all";
+      const q = $("sess-q"); if (q) q.value = "";
+      $("sess-filters")?.querySelectorAll(".sf-chip").forEach((c) =>
+        c.classList.toggle("active", (c.dataset.filter || "all") === "all"));
+      renderSessions(); return;
+    }
+    const pin = ev.target.closest(".sess-pin");   // 釘選鈕也是 .session-row 的兄弟,先攔
+    if (pin && el.contains(pin)) { ev.preventDefault(); ev.stopPropagation(); togglePin(pin.dataset.id); return; }
     const btn = ev.target.closest(".sess");   // ops 選單鈕是 .session-row 的兄弟,不在 .sess 內 → 不會誤觸
     if (btn && el.contains(btn)) openSession(btn.dataset.id);
   });
@@ -402,14 +455,33 @@ function renderSessions() {
   const focusedId = el.contains(document.activeElement) ? document.activeElement.dataset.id : null;
   if (!state.sessions.length) {
     el._provGroups = null;        // 下次有 session 時重建群組結構
-    el.textContent = state.listHealth === "failed" || state.degraded.length ? "清單暫時不完整" : "沒有 session";
+    el.innerHTML = (state.listHealth === "failed" || state.degraded.length)
+      ? listEmptyHTML("⚠️", "清單暫時不完整",
+          "部分服務連不上。按 ↻ 重新整理,或檢查橋接是否在線。")
+      : listEmptyHTML("✦", "還沒有 session",
+          "按 ＋ 開第一條工作,或用右上角掃碼把手機上的工作接過來。",
+          '<button type="button" class="list-empty-btn list-empty-new">＋ 開第一條工作</button>');
+    return;
+  }
+  // 篩選/搜尋。有在篩時,只顯示有命中的 provider 群組(空群組不顯示「無對話」,
+  // 否則一篩就滿屏空群組);零命中給明確訊息 + 清除鈕,不是一片空白。
+  const filtering = !!(state.listQuery || (state.listFilter && state.listFilter !== "all"));
+  const visible = filtering ? state.sessions.filter(sessionVisible) : state.sessions;
+  if (!visible.length) {
+    el._provGroups = null;
+    const what = state.listQuery ? ('「' + esc(state.listQuery) + '」')
+      : (state.listFilter === "attn" ? "「需要我」" : "「未讀」");
+    el.innerHTML = listEmptyHTML("⌕", "找不到符合的 session",
+      "目前的篩選 " + what + " 沒有命中任何工作。",
+      '<button type="button" class="list-empty-btn list-empty-clear">清除篩選</button>');
     return;
   }
   // FLIP 前置:記住每列現在的位置,重畫後只對「真的移動了」的列補一段位移動畫。
   const oldTops = new Map(Array.from(el.querySelectorAll(".session-row"),
     (n) => [n.dataset.id, n.getBoundingClientRect().top]));
-  const byProv = new Map(["hermes", "claude_code", "codex", "gemini"].map(p => [p, []]));
-  for (const s of state.sessions) {
+  const byProv = filtering ? new Map()
+    : new Map(["hermes", "claude_code", "codex", "gemini"].map(p => [p, []]));
+  for (const s of visible) {
     const p = s.provider === "cc2" ? "claude_code" : s.provider;
     if (!byProv.has(p)) byProv.set(p, []);
     byProv.get(p).push(s);
@@ -1345,7 +1417,12 @@ function visualReplyHtml(c) {
 // 散文(agent 的 text/markdown 卡)走 md.js 全功能渲染;使用者訊息與等寬卡
 // 只做「轉義 + 裸網址連結化 + 換行」—— 打什麼看到什麼,與手機版一致。
 // md.js 沒載成功時退回舊的純轉義路徑,訊息永遠不會變成 HTML 水槽。
+// agent 的明確附檔標記 [[attach:/路徑]] 只是給 bridge 看的信號,顯示時濾掉
+// (檔案已另外掛成附件泡泡)——不然使用者會看到一串生的標記文字。媒體掃描讀的
+// 是 body 原文、不經這裡,所以濾掉只影響「人看的」那層。
+const ATTACH_MARKER_RE = /\[\[attach:[^\]\n]+\]\]/g;
 function proseHtml(c, text) {
+  text = String(text == null ? "" : text).replace(ATTACH_MARKER_RE, "").replace(/[ \t]+\n/g, "\n").trim();
   const md = window.PocketMarkdown;
   if (!md) return esc(text).replace(/\n/g, "<br>");
   if (c.role !== "user" && PROSE_KINDS.has(c.kind || "text"))
@@ -1906,6 +1983,17 @@ function wire() {
   window.addEventListener("pagehide", e => { if (e.persisted) $("app").classList.add("hidden"); });
   window.addEventListener("pageshow", e => { if (e.persisted) location.reload(); });
   $("refresh").addEventListener("click", loadSessions);
+  $("sess-q").addEventListener("input", (e) => { state.listQuery = e.target.value.trim(); renderSessions(); });
+  $("sess-filters").addEventListener("click", (e) => {
+    const chip = e.target.closest(".sf-chip");
+    if (!chip) return;
+    state.listFilter = chip.dataset.filter || "all";
+    $("sess-filters").querySelectorAll(".sf-chip").forEach((c) =>
+      c.classList.toggle("active", c === chip));
+    renderSessions();
+  });
+  $("sc-close").addEventListener("click", hideShortcuts);
+  $("shortcuts").addEventListener("click", (e) => { if (e.target.id === "shortcuts") hideShortcuts(); });
   $("awaiting").addEventListener("click", jumpToAwaiting);
   $("theme-btn").addEventListener("click", cycleTheme);
   $("newsess-open").addEventListener("click", () => $("newsess").classList.remove("hidden"));
@@ -2025,7 +2113,10 @@ function wireKeys() {
     if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
       e.preventDefault(); openPalette(); return;
     }
-    if (e.key === "Escape") { closePalette(); return; }
+    if (e.key === "Escape") {
+      if (!$("shortcuts").classList.contains("hidden")) { hideShortcuts(); return; }
+      closePalette(); return;
+    }
     if (!$("palette").classList.contains("hidden")) {
       const rows = Array.from($("pal-list").querySelectorAll(".work-row"));
       const i = rows.indexOf(document.activeElement);
@@ -2041,6 +2132,7 @@ function wireKeys() {
       return;
     }
     if (typingNow()) return;
+    if (e.key === "?") { e.preventDefault(); toggleShortcuts(); return; }
     if (e.key === "j") { e.preventDefault(); moveSelection(1); }
     else if (e.key === "k") { e.preventDefault(); moveSelection(-1); }
     else if (e.key === "a" || e.key === "d") {
@@ -2052,6 +2144,9 @@ function wireKeys() {
 
 // ⌘K 快速切換面板
 let paletteFocus = null;
+function hideShortcuts() { $("shortcuts").classList.add("hidden"); }
+function toggleShortcuts() { $("shortcuts").classList.toggle("hidden"); }
+
 function openPalette() {
   const p = $("palette");
   if (p.classList.contains("hidden")) paletteFocus = document.activeElement;
