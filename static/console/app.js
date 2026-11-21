@@ -420,12 +420,28 @@ function sessionRowHTML(s) {
     (window.PocketSessionOps?.menuButton(s) || "");
 }
 
+// 有引導的空狀態(對齊手機/商業級產品):圖示 + 人話標題 + 下一步,必要時給動作鈕。
+// 取代原本一行乾字的「沒有 session」。
+function listEmptyHTML(icon, title, hint, action = "") {
+  return '<div class="list-empty"><div class="list-empty-ic" aria-hidden="true">' + icon + "</div>" +
+    '<div class="list-empty-title">' + esc(title) + "</div>" +
+    '<div class="list-empty-hint">' + esc(hint) + "</div>" + action + "</div>";
+}
+
 // 清單點選改用「事件委派」:一個掛在容器上的 listener,不再逐列掛/重掛 ——
 // keyed diff 會重用列節點,逐列掛 handler 會在就地更新時連同按鈕一起丟掉。
 function bindSessionListClicks(el) {
   if (el._clickBound) return;
   el._clickBound = true;
   el.addEventListener("click", (ev) => {
+    if (ev.target.closest(".list-empty-new")) { $("newsess").classList.remove("hidden"); return; }
+    if (ev.target.closest(".list-empty-clear")) {   // 清除篩選 → 回全部
+      state.listQuery = ""; state.listFilter = "all";
+      const q = $("sess-q"); if (q) q.value = "";
+      $("sess-filters")?.querySelectorAll(".sf-chip").forEach((c) =>
+        c.classList.toggle("active", (c.dataset.filter || "all") === "all"));
+      renderSessions(); return;
+    }
     const pin = ev.target.closest(".sess-pin");   // 釘選鈕也是 .session-row 的兄弟,先攔
     if (pin && el.contains(pin)) { ev.preventDefault(); ev.stopPropagation(); togglePin(pin.dataset.id); return; }
     const btn = ev.target.closest(".sess");   // ops 選單鈕是 .session-row 的兄弟,不在 .sess 內 → 不會誤觸
@@ -439,16 +455,25 @@ function renderSessions() {
   const focusedId = el.contains(document.activeElement) ? document.activeElement.dataset.id : null;
   if (!state.sessions.length) {
     el._provGroups = null;        // 下次有 session 時重建群組結構
-    el.textContent = state.listHealth === "failed" || state.degraded.length ? "清單暫時不完整" : "沒有 session";
+    el.innerHTML = (state.listHealth === "failed" || state.degraded.length)
+      ? listEmptyHTML("⚠️", "清單暫時不完整",
+          "部分服務連不上。按 ↻ 重新整理,或檢查橋接是否在線。")
+      : listEmptyHTML("✦", "還沒有 session",
+          "按 ＋ 開第一條工作,或用右上角掃碼把手機上的工作接過來。",
+          '<button type="button" class="list-empty-btn list-empty-new">＋ 開第一條工作</button>');
     return;
   }
   // 篩選/搜尋。有在篩時,只顯示有命中的 provider 群組(空群組不顯示「無對話」,
-  // 否則一篩就滿屏空群組);零命中給一句明確訊息,不是一片空白。
+  // 否則一篩就滿屏空群組);零命中給明確訊息 + 清除鈕,不是一片空白。
   const filtering = !!(state.listQuery || (state.listFilter && state.listFilter !== "all"));
   const visible = filtering ? state.sessions.filter(sessionVisible) : state.sessions;
   if (!visible.length) {
     el._provGroups = null;
-    el.textContent = "找不到符合的 session";
+    const what = state.listQuery ? ('「' + esc(state.listQuery) + '」')
+      : (state.listFilter === "attn" ? "「需要我」" : "「未讀」");
+    el.innerHTML = listEmptyHTML("⌕", "找不到符合的 session",
+      "目前的篩選 " + what + " 沒有命中任何工作。",
+      '<button type="button" class="list-empty-btn list-empty-clear">清除篩選</button>');
     return;
   }
   // FLIP 前置:記住每列現在的位置,重畫後只對「真的移動了」的列補一段位移動畫。
@@ -1967,6 +1992,8 @@ function wire() {
       c.classList.toggle("active", c === chip));
     renderSessions();
   });
+  $("sc-close").addEventListener("click", hideShortcuts);
+  $("shortcuts").addEventListener("click", (e) => { if (e.target.id === "shortcuts") hideShortcuts(); });
   $("awaiting").addEventListener("click", jumpToAwaiting);
   $("theme-btn").addEventListener("click", cycleTheme);
   $("newsess-open").addEventListener("click", () => $("newsess").classList.remove("hidden"));
@@ -2086,7 +2113,10 @@ function wireKeys() {
     if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
       e.preventDefault(); openPalette(); return;
     }
-    if (e.key === "Escape") { closePalette(); return; }
+    if (e.key === "Escape") {
+      if (!$("shortcuts").classList.contains("hidden")) { hideShortcuts(); return; }
+      closePalette(); return;
+    }
     if (!$("palette").classList.contains("hidden")) {
       const rows = Array.from($("pal-list").querySelectorAll(".work-row"));
       const i = rows.indexOf(document.activeElement);
@@ -2102,6 +2132,7 @@ function wireKeys() {
       return;
     }
     if (typingNow()) return;
+    if (e.key === "?") { e.preventDefault(); toggleShortcuts(); return; }
     if (e.key === "j") { e.preventDefault(); moveSelection(1); }
     else if (e.key === "k") { e.preventDefault(); moveSelection(-1); }
     else if (e.key === "a" || e.key === "d") {
@@ -2113,6 +2144,9 @@ function wireKeys() {
 
 // ⌘K 快速切換面板
 let paletteFocus = null;
+function hideShortcuts() { $("shortcuts").classList.add("hidden"); }
+function toggleShortcuts() { $("shortcuts").classList.toggle("hidden"); }
+
 function openPalette() {
   const p = $("palette");
   if (p.classList.contains("hidden")) paletteFocus = document.activeElement;

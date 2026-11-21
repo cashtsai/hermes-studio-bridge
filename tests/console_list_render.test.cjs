@@ -22,7 +22,7 @@ function makeNode(tag) {
     tagName: tag, children: [], parentNode: null, className: '', _text: '', _html: '', dataset: {},
     set textContent(v) { this._text = String(v); this.children = []; },
     get textContent() { return this._text; },
-    set innerHTML(v) { this._html = String(v); if (v === '') this.children = []; },
+    set innerHTML(v) { this._html = String(v); this.children = []; },  // 設 innerHTML(空或非空)都換掉子節點(同瀏覽器)
     get innerHTML() { return this._html; },
     appendChild(c) { c.parentNode = this; this.children.push(c); return c; },
     insertBefore(c, ref) {
@@ -153,7 +153,7 @@ test('search query filters the list to matching sessions only', () => {
   h.state.listQuery = 'zzz';
   h.render();
   assert.equal(h.rows().length, 0, 'no matches → zero rows (shows 找不到 message)');
-  assert.ok(h.listEl.textContent.includes('找不到'), 'zero-match message shown');
+  assert.ok(h.listEl.innerHTML.includes('找不到'), 'zero-match guided empty state shown');
 });
 
 test('filter=unread shows only unread sessions', () => {

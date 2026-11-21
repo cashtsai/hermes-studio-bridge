@@ -238,6 +238,20 @@
   <p id="logout-state"></p>
   <button type="button" class="btn" id="retry-logout">重試登出</button>
 </section>
+<div id="shortcuts" class="hidden" role="dialog" aria-modal="true" aria-label="鍵盤快捷鍵">
+  <div class="sc-card">
+    <h3>鍵盤快捷鍵</h3>
+    <dl>
+      <dt>⌘K</dt><dd>快速切換 / 搜尋 session</dd>
+      <dt>j / k</dt><dd>在 session 間上下移動</dd>
+      <dt>a / d</dt><dd>核准 / 否決當前審批</dd>
+      <dt>Enter</dt><dd>送出訊息（Shift+Enter 換行）</dd>
+      <dt>?</dt><dd>開關這張說明</dd>
+      <dt>Esc</dt><dd>關閉浮層</dd>
+    </dl>
+    <button type="button" class="sc-close" id="sc-close">知道了</button>
+  </div>
+</div>
 <script src="/console/static/sse.js"></script>
 <script src="/console/static/md.js"></script>
 <script src="/console/static/transcript.js"></script>

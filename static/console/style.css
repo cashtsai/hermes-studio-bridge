@@ -733,3 +733,29 @@ body[data-console-access="remote"] [data-mode="memory"]{display:none;}
 .sess-pin:hover{color:var(--text);}
 .sess.pinned{box-shadow:inset 3px 0 0 var(--star-yellow);}
 .sess.active.pinned{box-shadow:inset 3px 0 0 var(--accent);}
+
+/* ── W1-⑥ 有引導的空狀態(2026-11-21)─────────────────────────── */
+.list-empty{display:flex;flex-direction:column;align-items:center;text-align:center;
+  gap:8px;padding:40px 20px;color:var(--dim);}
+.list-empty-ic{font-size:30px;line-height:1;opacity:.8;}
+.list-empty-title{font-size:15px;font-weight:700;color:var(--text);}
+.list-empty-hint{font-size:13px;line-height:1.6;max-width:30ch;}
+.list-empty-btn{margin-top:8px;border:1px solid var(--line);background:var(--accent);
+  color:#fff;font:inherit;font-size:13px;font-weight:600;padding:7px 14px;
+  border-radius:var(--btn-radius);cursor:pointer;}
+.list-empty-btn.list-empty-clear{background:transparent;color:var(--accent);border-color:var(--accent);}
+.list-empty-btn:hover{filter:brightness(1.05);}
+
+/* 快捷鍵說明浮層 */
+#shortcuts.hidden{display:none;}
+#shortcuts{position:fixed;inset:0;z-index:60;display:flex;align-items:center;justify-content:center;
+  background:rgba(23,23,26,.45);}
+#shortcuts .sc-card{background:var(--panel);border:1px solid var(--line);border-radius:14px;
+  padding:22px 26px;max-width:360px;width:calc(100% - 40px);box-shadow:0 20px 60px rgba(0,0,0,.3);}
+#shortcuts h3{margin:0 0 14px;font-size:16px;color:var(--text);}
+#shortcuts dl{display:grid;grid-template-columns:auto 1fr;gap:9px 16px;margin:0;}
+#shortcuts dt{font-family:var(--mono,ui-monospace,monospace);font-size:12px;color:var(--text);
+  background:var(--panel-2);border:1px solid var(--line);border-radius:6px;padding:2px 8px;justify-self:start;}
+#shortcuts dd{margin:0;font-size:13px;color:var(--dim);align-self:center;}
+#shortcuts .sc-close{margin-top:16px;width:100%;border:1px solid var(--line);background:transparent;
+  color:var(--text);font:inherit;padding:8px;border-radius:var(--btn-radius);cursor:pointer;}
