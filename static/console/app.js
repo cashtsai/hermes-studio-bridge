@@ -413,7 +413,8 @@ function sessionRowHTML(s) {
     '" data-id="' + esc(s.id) + '" aria-current="' + (active ? "true" : "false") + '">' +
     '<span class="sess-name">' + esc(s.title || s.id) + locked + unreadMark(s) + "</span>" +
     '<span class="sess-sub"><span class="st st-' + esc(s.status || "idle") + '">' +
-    esc(workPhase(s)) + "</span> " + esc(sessionPreview(s)) + "</span></button>" +
+    (phaseGlyph(s) ? esc(phaseGlyph(s)) + " " : "") + esc(workPhase(s)) +
+    "</span> " + esc(sessionPreview(s)) + "</span></button>" +
     '<button type="button" class="sess-pin' + (pinned ? " on" : "") + '" data-id="' + esc(s.id) +
     '" title="' + (pinned ? "取消釘選" : "釘選到頂") + '" aria-label="' + (pinned ? "取消釘選" : "釘選") +
     '">' + (pinned ? "★" : "☆") + "</button>" +
@@ -615,6 +616,19 @@ const PHASE_LABEL = { idle: "閒置", done: "已完成", running: "執行中", r
   busy: "執行中", failed: "失敗", stalled: "停滯", waiting_approval: "等待核准", queued: "排隊中",
   usage_limited: "用量受限", error: "錯誤", waiting: "等待中", needs_input: "需要你",
   dead: "已停止", completed: "已完成", dispatching: "派送中", dormant: "暫無活動" };
+// phase → 符號(對齊手機/t3code:色由 st-<phase> CSS 給,符號由這張表給,兩者合成
+// 「一眼辨狀態」)。閒置/等待類刻意無符號 —— 沒消息就別畫,安靜是好事。
+const PHASE_GLYPH = {
+  needs_input: "✋", waiting_approval: "✋",
+  running: "●", run: "●", busy: "●", dispatching: "●", queued: "⋯",
+  usage_limited: "⏳", done: "✓", completed: "✓",
+  failed: "✕", error: "✕", dead: "✕", stalled: "⚠",
+};
+function phaseGlyph(statusOrSession, locked) {
+  const s = typeof statusOrSession === "string" ? null : statusOrSession;
+  if (s ? s.meta?.locked : locked) return "🔒";
+  return PHASE_GLYPH[s ? s.status : statusOrSession] || "";
+}
 const activityFormat = new Intl.DateTimeFormat("zh-TW",
   { year:"numeric", month:"numeric", day:"numeric", hour:"2-digit", minute:"2-digit", hour12:false });
 function workPhase(s) {
@@ -1702,7 +1716,8 @@ function updateStatusChip(phase, meta = {}) {
   const chip = $("sh-status");
   const locked = !!meta.locked;
   const label = statusText(phase, meta);
-  chip.textContent = label;
+  const g = phaseGlyph(phase, locked);
+  chip.textContent = (g ? g + " " : "") + label;
   chip.className = "status-chip st-" + (locked ? "locked" : phase || "idle");
   state.statusRevision = (state.statusRevision || 0) + 1;
   state.statusMeta = meta;

@@ -60,6 +60,7 @@ function harness() {
     PROVIDER_LABEL: { claude_code: 'CC', codex: 'CX', hermes: '人格', gemini: 'Gemini' },
     actionable: s => s.status === 'awaiting',
     workPhase: s => s.status || 'idle',
+    phaseGlyph: s => (s && s.status === 'needs_input' ? '✋' : ''),
     sessionPreview: s => s._preview || '',
     unreadMark: s => (s._unread ? '<u>未讀</u>' : ''),
     sessionUnread: s => !!s._unread,
