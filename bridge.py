@@ -38057,6 +38057,158 @@ async def _agent_agy_logged_in() -> bool:
         return False
 
 
+# ══════════ 階段 5:Grok device-auth(x.ai device-code,不靠 localhost)══════════
+#
+# 實機實測(grok 1.0.77)`grok login --device-auth` 的輸出(ANSI 色碼已標示):
+#   (空行)
+#   To sign in, open this URL in your browser:
+#
+#     https://accounts.x.ai/oauth2/device?user_code=7SGZ-4NKX
+#
+#   Confirm this code in your browser:
+#
+#     7SGZ-4NKX
+#
+#   \x1b[90mOnly continue with a code you requested. Don't share it with anyone.\x1b[0m
+#
+#   Waiting for authorization...
+# 行程會**等**到使用者在網頁授權完成才退出,成功後 ~/.grok/auth.json 落檔
+# (grok_sdk 自管;`GROK.logged_in()` 隨即轉 True,failover availability 自動反映)。
+#
+# 與 codex 的差異(brief 要求實際確認,不照抄):
+#   · URL 網域是 accounts.x.ai(非 auth.openai.com),且 code 以 ?user_code= 夾在
+#     URL query 裡,另有一行獨立印出 —— URL regex 要換成 x.ai 的。
+#   · code 格式 4-4(XXXX-XXXX),codex 的 code regex `{4}-{4,6}` 剛好涵蓋,共用。
+#   · 流程與 codex 同:spawn 背景行程、撈 URL+code、讓行程續跑、status 端點輪詢。
+#     **不需要使用者貼 code 回來** —— 授權在 x.ai 那邊完成。
+#
+# login_id → 那顆背景行程。短 TTL(device code 有時限,給 15 分鐘對齊 codex)。
+_GROK_LOGIN: dict = {}             # login_id -> {proc, url, user_code, created, done}
+_GROK_LOGIN_LOCK = threading.Lock()
+_GROK_LOGIN_TTL = 900.0
+_GROK_DEVICE_URL_RE = re.compile(r"https://accounts\.x\.ai/\S+")
+_GROK_DEVICE_CODE_RE = re.compile(r"\b([A-Z0-9]{4}-[A-Z0-9]{4,6})\b")
+
+
+def _grok_login_gc_locked(now: float) -> None:
+    for lid in [k for k, v in _GROK_LOGIN.items()
+                if now - v["created"] > _GROK_LOGIN_TTL]:
+        v = _GROK_LOGIN.pop(lid, None)
+        if v and v.get("proc") and v["proc"].returncode is None:
+            try:
+                v["proc"].kill()
+            except ProcessLookupError:
+                pass
+
+
+@app.post("/app/v1/agents/grok/login/start")
+async def app_grok_login_start(request: Request):
+    """啟動 Grok device-auth,回 app 要顯示的 URL + 一次性 code。
+
+    行程留在背景跑(等使用者在 x.ai 授權),用 login_id 追蹤;app 之後輪詢
+    `/app/v1/agents/grok/login/status?login_id=…`。
+    """
+    if not POCKET_AGENT_LOGIN_IN_APP:
+        raise HTTPException(status_code=404, detail="not found")
+    _check_auth(request)
+    # console-remote 的遠端瀏覽器不准碰登入(等同機主權限,同 codex/claude/gemini)。
+    if _token_scope(_request_token(request)) == CONSOLE_REMOTE_SCOPE:
+        raise http_err(403, "SCOPE_FORBIDDEN",
+                       "遠端控制台不能設定帳號憑證,請用已配對的手機")
+    grok_bin = grok_sdk.grok_bin()
+    if not grok_bin:
+        raise http_err(503, "GROK_MISSING", "這台主機沒有安裝 Grok CLI")
+    # autoupdater 訊息會混進 stderr(我們把 stderr 併進 stdout),關掉以免污染刮取。
+    env = dict(os.environ)
+    env.setdefault("GROK_DISABLE_AUTOUPDATER", "1")
+    try:
+        # cwd 用家目錄(保證存在);登入不需要特定 cwd,同 codex 的取捨。
+        proc = await asyncio.create_subprocess_exec(
+            grok_bin, "login", "--device-auth",
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+            stdin=asyncio.subprocess.DEVNULL, cwd=os.path.expanduser("~"),
+            env=env)
+    except (FileNotFoundError, PermissionError) as e:
+        _log_event("grok_login_spawn_failed", error=type(e).__name__)
+        raise http_err(503, "GROK_SPAWN_FAILED", "啟動 Grok 登入失敗")
+    # 讀開頭幾行把 URL + code 撈出來(ANSI 色碼要剝掉)。
+    url = user_code = None
+    deadline = time.time() + 20
+    buf = b""
+    while time.time() < deadline and (url is None or user_code is None):
+        try:
+            chunk = await asyncio.wait_for(proc.stdout.read(512), timeout=3)
+        except asyncio.TimeoutError:
+            continue
+        if not chunk:
+            break
+        buf += chunk
+        text = re.sub(r"\x1b\[[0-9;]*m", "", buf.decode("utf-8", "ignore"))
+        if url is None:
+            m = _GROK_DEVICE_URL_RE.search(text)
+            if m:
+                url = m.group(0)
+        if user_code is None:
+            m = _GROK_DEVICE_CODE_RE.search(text)
+            if m:
+                user_code = m.group(1)
+    if url is None:
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+        raise http_err(502, "GROK_LOGIN_NO_URL", "沒能從 Grok 取得登入連結")
+    lid = secrets.token_urlsafe(18)
+    now = time.time()
+    with _GROK_LOGIN_LOCK:
+        _grok_login_gc_locked(now)
+        _GROK_LOGIN[lid] = {"proc": proc, "url": url, "user_code": user_code,
+                            "created": now, "done": None}
+    # 背景等行程結束 → 標記完成(auth.json 落檔與否由 returncode 判斷)。
+    async def _wait():
+        rc = await proc.wait()
+        with _GROK_LOGIN_LOCK:
+            e = _GROK_LOGIN.get(lid)
+            if e is not None:
+                e["done"] = (rc == 0)
+        _log_event("grok_login_finished", ok=(rc == 0))
+    t = asyncio.create_task(_wait())
+    _BG_TASKS.add(t)
+    t.add_done_callback(_BG_TASKS.discard)
+    _log_event("grok_login_started")   # 不記 url/code
+    return {"ok": True, "provider": "grok", "mode": "device_code",
+            "login_id": lid, "url": url, "user_code": user_code}
+
+
+@app.get("/app/v1/agents/grok/login/status")
+async def app_grok_login_status(request: Request, login_id: str = ""):
+    """app 輪詢:這次 device-auth 完成了沒。
+
+    `state`:`pending`(還在等授權)| `done`(登入成功)| `failed`(行程非 0 退出)
+    | `expired`(login_id 不存在/已過期)。
+    """
+    if not POCKET_AGENT_LOGIN_IN_APP:
+        raise HTTPException(status_code=404, detail="not found")
+    _check_auth(request)
+    now = time.time()
+    with _GROK_LOGIN_LOCK:
+        _grok_login_gc_locked(now)
+        e = _GROK_LOGIN.get(login_id)
+        if e is None:
+            return {"ok": True, "state": "expired"}
+        done = e["done"]
+    if done is True:
+        # 清 auth 快取(同 codex 的教訓):app 一看到 done 就立刻回頭打
+        # /app/v1/agents/auth,不清的話拿到的還是快取裡「未登入」那份。
+        # grok 的 failover availability 走 GROK.logged_in() 讀檔、不吃這份快取,
+        # 但 agents/auth 吃,統一清一次最省心。
+        _AGENT_AUTH_CACHE["data"] = None
+        return {"ok": True, "state": "done"}
+    if done is False:
+        return {"ok": True, "state": "failed"}
+    return {"ok": True, "state": "pending"}
+
+
 def _lobster_release() -> str:
     """這份部署的 release tag(lobster-update.sh 寫的 .lobster-release)。
     非釘版(開發機/舊佈局)回空字串 —— 誠實說「沒釘」,不編版本號。"""
