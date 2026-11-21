@@ -1276,9 +1276,28 @@ function upsertCard(card) {
   });
 }
 
+// 視覺卡(body.visual.blocks)的純文字萃取:複製/回覆/分享要的是「可貼走的文字」,
+// 不是 HTML。人格(hermes)的回覆多是視覺卡 —— 文字住在 blocks / visual.fallback_text,
+// 不在 body.text。少了這條,cardText 對人格訊息回空字串,三個動作全拿到空的 → 看似壞掉。
+function visualText(visual) {
+  if (!visual || typeof visual !== "object") return "";
+  const fromBlocks = Array.isArray(visual.blocks) ? visual.blocks.map((b) => {
+    if (!b || typeof b !== "object") return "";
+    const type = String(b.type || "").toLowerCase();
+    if (type === "text" || type === "markdown") return b.text || "";
+    if (type === "html") return b.fallback_text || b.text || "";
+    if (type === "link" || type === "file") return b.label || b.filename || b.url || b.download_url || "";
+    if (type === "image") return b.alt || "";
+    return "";
+  }).filter(Boolean).join("\n").trim() : "";
+  return fromBlocks || String(visual.fallback_text || "").trim();
+}
+
 function cardText(c) {
   const b = c.body || {};
-  return b.text || b.fallback_text || b.typed_text || (typeof c.body === "string" ? c.body : "");
+  return b.text || b.fallback_text || b.typed_text ||
+    (b.visual ? visualText(b.visual) : "") ||
+    (typeof c.body === "string" ? c.body : "");
 }
 
 function safeHttpUrl(value) {
