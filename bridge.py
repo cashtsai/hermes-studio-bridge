@@ -626,6 +626,34 @@ def _media_memo(store, attr: str) -> set:
     return value
 
 
+def _media_vet_logged(ref, roots, session_id: str):
+    """`vet_attachable_path` 的包裝:把「看起來是本機絕對路徑、卻被永久拒絕」
+    這件事**記一行 log**。
+
+    這條路本來完全靜默(見這 repo 的頭號病原:附件靜默失敗)—— agent 說
+    「檔案傳給你了」、檔案卻沒掛上,過去查不出是哪一關擋的。現在至少在
+    log 裡看得到原因:`outside_roots`(多半是人格/hermes 沒有工作目錄 root、
+    或檔案落在家目錄)或 `non_attachable_kind`(.txt/.md/.env 這類文字檔被
+    `ATTACHABLE_KINDS` 排除)。
+
+    **刻意不記路徑本身**:被拒的檔很可能就是敏感檔(密碼、憑證),路徑字串
+    也不該進 log。只記原因 + 根目錄數,夠診斷、不外洩。`None`(不是本機絕對
+    路徑,例如一般網址/字詞)不記 —— 那是雜訊、不是「想傳檔卻失敗」。
+    """
+    verdict = media_artifacts.vet_attachable_path(ref, roots)
+    if verdict is None:
+        try:
+            path = media_artifacts.local_path_of(ref)
+            if path:   # 像本機絕對路徑、卻被丟 → 才是「想傳檔卻失敗」的訊號
+                reason = "outside_roots" if not media_artifacts.within_roots(path, roots) \
+                    else "non_attachable_kind"
+                _log_event("media_ref_rejected", session=session_id,
+                           reason=reason, roots=len(roots))
+        except Exception:  # noqa: BLE001 — 診斷用,絕不能反過來弄壞附件流程
+            pass
+    return verdict
+
+
 def _media_capture_cards_sync(store, session_id: str) -> list:
     """執行緒內跑:查 cwd → 掃卡片 → 過安全門 → `capture_path` 入庫 → wire。
 
@@ -636,7 +664,7 @@ def _media_capture_cards_sync(store, session_id: str) -> list:
         [_media_session_cwd(session_id)], _MEDIA_ATTACH_EXTRA_ROOTS)
     refs = carddigest.media_refs_in_cards(
         store,
-        lambda ref: media_artifacts.vet_attachable_path(ref, roots),
+        lambda ref: _media_vet_logged(ref, roots, session_id),
         # 跨回合保留的記憶:路徑集合省掉重複 stat、卡片集合省掉重複掃描。
         # 這支每次 /cards、每次 SSE 連線都會跑,沒有這兩層就是每次都重掃
         # 整個卡片庫。
