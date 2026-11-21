@@ -707,6 +707,8 @@ function focusComposer() {
 }
 function openSession(id, preserveMode = false, focusInput = true) {
   if (signingOut) return;
+  ensureNotifyPermission();                   // 開對話是使用者手勢 → 這時才問通知權限
+  resetForceStop();                           // 換對話,收掉上一條的強制停止升級
   if (borrowed() && !state.sessions.find(s => s.id === id)?.capabilities?.includes("replay")) {
     toast("這台電腦無權讀取此對話", true); return;
   }
@@ -1696,6 +1698,7 @@ function statusText(phase, meta = {}) {
 }
 function updateStatusChip(phase, meta = {}) {
   meta = meta || {};
+  const wasBusy = state.busy;                 // 完成偵測:忙 → 不忙 = 這回合做完了
   const chip = $("sh-status");
   const locked = !!meta.locked;
   const label = statusText(phase, meta);
@@ -1719,7 +1722,27 @@ function updateStatusChip(phase, meta = {}) {
     else if (!busyStartAt) busyStartAt = Date.now();
   } else busyStartAt = 0;
   syncBusyBar(working);
+  // 回合完成(忙→不忙、非鎖定、非需你處理):完成音＋通知(分頁隱藏才發通知)。
+  if (wasBusy && !state.busy && !locked && phase !== "needs_input" && phase !== "waiting_approval") {
+    resetForceStop();                         // 停止已自然達成,收掉強制停止升級
+    soundDone();
+    maybeNotify("回合完成", currentSession()?.title ? (currentSession().title + " 已完成") : "工作已完成");
+  }
+  // 限額:排一個「重置時提醒可以繼續了」(對齊手機的 Resume;真正自動續跑需後端)。
+  if (phase === "usage_limited") {
+    const reset = activityTime(meta.usage_limit_reset_at);
+    if (reset && reset !== usageResumeAt) {
+      usageResumeAt = reset;
+      clearTimeout(usageResumeTimer);
+      const ms = reset - Date.now();
+      if (ms > 0 && ms < 6 * 3600 * 1000) usageResumeTimer = setTimeout(() => {
+        soundNeedsInput();
+        maybeNotify("可以繼續了", "用量限額已重置,這條可以恢復執行");
+      }, ms);
+    }
+  } else if (usageResumeAt) { usageResumeAt = 0; clearTimeout(usageResumeTimer); usageResumeTimer = null; }
 }
+let usageResumeTimer = null, usageResumeAt = 0;
 
 let busyTimer = null, busyStartAt = 0, busyShowTimer = null, busyHideTimer = null, busySession = null;
 function syncBusyBar(on) {
@@ -1876,13 +1899,35 @@ async function autoVerifyDelivery(id, d, p) {
   p.phase = "unknown"; d.notice = "送達狀態不明，請先確認。未重新送出。"; showDraft(id);
 }
 
+// 「停止沒反應」的沉默失敗現形(t3code #1 病:silent failure):按了中斷後若 6 秒
+// 仍在忙 → 把按鈕升級成「強制停止」,讓使用者看得到「剛剛那下沒生效」,再按一次
+// 會再送一次中斷(目前沒有獨立 force 端點,重送是 best-effort,但至少不再靜默)。
+let forceStopTimer = null, interruptBaseText = "";
+function armForceStop() {
+  const btn = $("interrupt"); if (!btn) return;
+  if (!interruptBaseText) interruptBaseText = btn.textContent || "中斷";
+  clearTimeout(forceStopTimer);
+  forceStopTimer = setTimeout(() => {
+    if (!state.busy) return;                 // 已經停了 → 不升級
+    btn.classList.add("force");
+    btn.textContent = "強制停止";
+    toast("停止沒反應?再按一次強制停止", true);
+  }, 6000);
+}
+function resetForceStop() {
+  clearTimeout(forceStopTimer); forceStopTimer = null;
+  const btn = $("interrupt");
+  if (btn && interruptBaseText) { btn.classList.remove("force"); btn.textContent = interruptBaseText; }
+}
+
 async function interrupt() {
   if (!state.current || !canUse("interrupt")) return;
   try {
     const r = await api("/app/v2/sessions/" + encodeURIComponent(state.current) + "/interrupt", { method: "POST" });
-    if (r.status === 409) { toast("目前沒有進行中的回合"); return; }
+    if (r.status === 409) { toast("目前沒有進行中的回合"); resetForceStop(); return; }
     if (!r.ok) throw new Error("HTTP " + r.status);
-    toast("已送出中斷");
+    toast($("interrupt").classList.contains("force") ? "已再送出強制中斷" : "已送出中斷");
+    armForceStop();                          // 盯 6 秒,沒停下來就現形
   } catch (err) { toast("中斷失敗:" + err.message, true); }
 }
 
@@ -2269,8 +2314,9 @@ function notifyAwaiting(n) {
   const rose = n > lastAwaiting;
   lastAwaiting = n;
   if (!rose) { stopBlink(); return; }
-  if (!document.hidden) return;              // 人就在看,不用吵他
-  beep();
+  soundNeedsInput();                         // 需要你:促請音(即使在看也響一聲,like 手機)
+  maybeNotify("有 " + n + " 件需要你", "Pocket 有對話等你處理");
+  if (!document.hidden) return;              // 人就在看 → 不閃標題
   clearInterval(titleTimer);
   let on = false;
   titleTimer = setInterval(() => {
@@ -2280,17 +2326,40 @@ function notifyAwaiting(n) {
 }
 function stopBlink() { clearInterval(titleTimer); titleTimer = null; document.title = baseTitle; }
 document.addEventListener("visibilitychange", () => { if (!document.hidden) stopBlink(); });
-function beep() {
+// 單音(WebAudio 合成,不帶資產檔,CSP 安全)。
+function playTone(freq, start = 0, dur = 0.3, peak = 0.08) {
   try {
-    const ac = new (window.AudioContext || window.webkitAudioContext)();
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (!playTone._ac) playTone._ac = new AC();
+    const ac = playTone._ac, t0 = ac.currentTime + start;
     const o = ac.createOscillator(), g = ac.createGain();
-    o.type = "sine"; o.frequency.value = 880;
-    g.gain.setValueAtTime(0.0001, ac.currentTime);
-    g.gain.exponentialRampToValueAtTime(0.08, ac.currentTime + 0.02);
-    g.gain.exponentialRampToValueAtTime(0.0001, ac.currentTime + 0.32);
-    o.connect(g).connect(ac.destination); o.start(); o.stop(ac.currentTime + 0.34);
-    setTimeout(() => ac.close(), 600);
-  } catch (e) { /* 瀏覽器不給音訊就算了,標題還是會閃 */ }
+    o.type = "sine"; o.frequency.value = freq;
+    g.gain.setValueAtTime(0.0001, t0);
+    g.gain.exponentialRampToValueAtTime(peak, t0 + 0.02);
+    g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+    o.connect(g).connect(ac.destination); o.start(t0); o.stop(t0 + dur + 0.02);
+  } catch (e) { /* 瀏覽器不給音訊就算了,標題/通知仍在 */ }
+}
+// 兩種語意音效(對齊手機):需要你 = 單高音促請;完成 = 柔和上行兩音。
+function soundNeedsInput() { playTone(880, 0, 0.32); }
+function soundDone() { playTone(660, 0, 0.16, 0.06); playTone(990, 0.14, 0.26, 0.06); }
+function beep() { soundNeedsInput(); }   // 相容舊呼叫
+
+// 系統通知(對齊手機推播的桌面版)。權限在使用者手勢時才要(ensureNotifyPermission),
+// 只在分頁隱藏時發 —— 人就在看就別吵。拿不到權限就退回音效＋標題閃。
+function ensureNotifyPermission() {
+  try {
+    if (borrowed() || !("Notification" in window)) return;   // 借用裝置不打擾
+    if (Notification.permission === "default") Notification.requestPermission().catch(() => {});
+  } catch (_) {}
+}
+function maybeNotify(title, body) {
+  try {
+    if (!document.hidden || borrowed()) return;              // 在看 or 借用機 → 不發
+    if (!("Notification" in window) || Notification.permission !== "granted") return;
+    const n = new Notification(title, { body: body || "", tag: "pocket-console", renotify: true });
+    n.onclick = () => { try { window.focus(); n.close(); } catch (_) {} };
+  } catch (_) {}
 }
 
 async function main() {

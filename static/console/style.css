@@ -759,3 +759,9 @@ body[data-console-access="remote"] [data-mode="memory"]{display:none;}
 #shortcuts dd{margin:0;font-size:13px;color:var(--dim);align-self:center;}
 #shortcuts .sc-close{margin-top:16px;width:100%;border:1px solid var(--line);background:transparent;
   color:var(--text);font:inherit;padding:8px;border-radius:var(--btn-radius);cursor:pointer;}
+
+/* ── Wave2 跟上手機:強制停止升級態(2026-11-21)─────────────────── */
+#interrupt.force{background:var(--bad,#C8402E);color:#fff;border-color:var(--bad,#C8402E);
+  font-weight:700;animation:force-pulse 1s ease-in-out infinite;}
+@keyframes force-pulse{0%,100%{opacity:1}50%{opacity:.6}}
+@media (prefers-reduced-motion: reduce){#interrupt.force{animation:none}}

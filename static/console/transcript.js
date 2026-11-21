@@ -43,6 +43,19 @@ function messageActionsHtml(c) {
     '<button type="button" class="msg-act" data-act="share" title="分享/複製全文">分享</button></div>';
 }
 
+// 一張步驟卡 → 語意圖示:讀=👁 改=✎ 跑=▸ 查網=🌐 思考=🧠 其他工具=🔧。
+function stepIcon(c) {
+  const k = String(c.kind || "");
+  if (k === "thinking" || k === "reasoning" || k === "text") return "🧠";
+  const b = c.body || {};
+  const tool = String(b.tool || b.name || b.tool_name || "").toLowerCase();
+  if (/web|fetch|http|browser|url|curl|google/.test(tool)) return "🌐";  // 先於 read:WebSearch 含 "search"
+  if (/read|view|cat|grep|glob|\bls\b|find|search/.test(tool)) return "👁";
+  if (/write|edit|apply|create|patch|update|mkdir|rm\b|mv\b/.test(tool)) return "✎";
+  if (/bash|shell|run|exec|command|terminal|sh\b/.test(tool)) return "▸";
+  return "🔧";
+}
+
 function renderTurnContent(turn, node) {
   const wasOpen = new Set(Array.from(node.querySelectorAll("details[open]"), d => d.dataset.key));
   const body = document.createDocumentFragment();
@@ -61,7 +74,9 @@ function renderTurnContent(turn, node) {
   function flush() {
     if (!steps.length) return;
     const group = steps; steps = [];
-    details(group[0].id + ":steps", "執行步驟 · " + group.length,
+    // 工具語意圖示(對齊手機/t3code):一眼看出這組步驟在讀/改/跑/查,不只是「N 步」。
+    const icons = Array.from(new Set(group.map(stepIcon))).join(" ");
+    details(group[0].id + ":steps", (icons ? icons + "  " : "") + "執行步驟 · " + group.length,
       () => group.map(c => cardText(c)).join("\n\n"));
   }
   function bubble(c, html, actions = true) {
