@@ -1890,6 +1890,31 @@ async def _ocr_image(path: str, home: str) -> str:
     return str(result.get("text") or "").strip()
 
 
+def _persona_attach_hint(home: str) -> str:
+    """教人格「怎麼把檔案傳回給使用者」的慣例(2026-11-21,W1-③ A 案配套)。
+
+    bridge 的附件管線分兩軌:啟發式掃描卡片文字找路徑(嚴格,只收影音圖/PDF/
+    文件/壓縮)、以及**明確附檔**標記 `[[attach:/路徑]]`(放行任何類型,包括
+    .txt/.md/密碼檔,但仍守 root/逃逸/存在性)。人格(hermes)沒有工作目錄,
+    只有專屬 `outbox/` 子目錄是允許根 —— 這段提示把兩件事一起教給模型:
+    往哪寫、怎麼標。順手確保目錄存在,免得第一次用就因為資料夾不存在而寫檔失敗。
+    """
+    outbox = os.path.join(home, "outbox") if home else ""
+    if not outbox:
+        return ""
+    try:
+        os.makedirs(outbox, exist_ok=True)
+    except OSError:
+        return ""   # 建不起來就不教這招,不讓提示跟實際能力對不上
+    return (
+        "\n\n[傳檔給使用者的慣例]\n"
+        f"要把檔案(報告/截圖/產出物,任何格式)傳給使用者時:先把檔案存進 "
+        f"{outbox}/,再在回覆文字裡明確標記 `[[attach:{outbox}/檔名]]`。"
+        "只有這個資料夾底下、且有標記的檔案才會變成可點的附件 —— 只是在文字裡"
+        "提到路徑不會自動掛上。"
+    )
+
+
 async def _resolve_persona_prompt(messages: list, home: str) -> str:
     """Build a persona prompt with Hermes OCR and local attachment paths."""
     text, images, files = _extract_user_parts(messages)
@@ -1905,7 +1930,7 @@ async def _resolve_persona_prompt(messages: list, home: str) -> str:
             )
     if notes:
         text = (text + "\n\n[使用者附件]\n" + "\n".join(notes)).strip()
-    return text
+    return (text + _persona_attach_hint(home)).strip()
 
 
 # ───────────────────────── canonical store (M20) ───────────────────────────
