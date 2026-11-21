@@ -56,6 +56,14 @@
         <button id="newsess-open" class="icon-btn" title="開新工作">＋</button>
         <button id="refresh" class="icon-btn" title="重新整理">↻</button>
       </div>
+      <div class="side-filter">
+        <input id="sess-q" type="search" placeholder="搜尋 session…" aria-label="搜尋 session" autocomplete="off">
+        <div id="sess-filters" class="sess-filters" role="tablist" aria-label="清單篩選">
+          <button type="button" class="sf-chip active" data-filter="all">全部</button>
+          <button type="button" class="sf-chip" data-filter="attn">需要我</button>
+          <button type="button" class="sf-chip" data-filter="unread">未讀</button>
+        </div>
+      </div>
       <div id="session-list"><div class="empty">載入中…</div></div>
     </aside>
 

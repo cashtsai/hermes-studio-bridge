@@ -17,6 +17,8 @@ const state = {
   latestSeq: 0,
   stopStream: null,   // 當前 session SSE 的中止函式
   view: 0,            // A -> B -> A must invalidate the first A response too.
+  listFilter: "all",  // 清單篩選:all / attn(需要我) / unread
+  listQuery: "",      // 清單搜尋字串
 };
 const drafts = new Map();  // Page memory only, never persisted on a borrowed device.
 // Only the newest preview/incoming message and monotonic read cursor per session.
@@ -359,16 +361,45 @@ function stickyRank(s, now) {
   return raw;
 }
 
+// 釘選:存 localStorage,置頂於所屬 provider 群組。手機沒有「釘選」概念,這是
+// 桌面大螢幕的便利——常盯的那幾條固定在上面,不被其他列推走。
+const PIN_KEY = "pocket-console-pins";
+let pinnedIds = null;
+function pins() {
+  if (pinnedIds) return pinnedIds;
+  try { pinnedIds = new Set(JSON.parse(localStorage.getItem(PIN_KEY)) || []); }
+  catch (_) { pinnedIds = new Set(); }
+  return pinnedIds;
+}
+function isPinned(id) { return pins().has(id); }
+function togglePin(id) {
+  const p = pins();
+  if (p.has(id)) p.delete(id); else p.add(id);
+  try { localStorage.setItem(PIN_KEY, JSON.stringify(Array.from(p))); } catch (_) {}
+  renderSessions();
+}
+
+// 清單篩選/搜尋:all=全部、attn=需要我(actionable/needs_input=rank 0)、unread=未讀。
+// 搜尋沿用 ⌘K 的 workMatches(含 CJK 摺疊),比對 title/id/provider/workdir。
+function sessionVisible(s) {
+  const f = state.listFilter;
+  if (f === "attn" && sessionRank(s) !== 0) return false;
+  if (f === "unread" && !sessionUnread(s)) return false;
+  if (state.listQuery && !workMatches(s, state.listQuery)) return false;
+  return true;
+}
+
 function sortSessions(rows, now) {
   // 每個 session 每次快照只更新一次,包括只有一列的 provider。
   // 2026-11-21:**同 rank 之內不再按活動時間重排**。原本的次層
   // `max(last_event_at, latest.at)` 會在每一則訊息到達時把列往上搬,就是
-  // 「跑上跑下」的真因(遲滯只擋住 rank 層的彈跳,擋不住這層)。改成:只有
-  // rank(需要你 > 執行中 > 一般,已含 15s 降級遲滯)決定位置,同 rank 用 id
-  // 墊底 → 位置完全確定、不隨活動漂移。活動/未讀改由列上的狀態晶片與未讀標
-  // 表達(renderSessions 就地更新那一列),不靠「整列跳位」。
+  // 「跑上跑下」的真因(遲滯只擋住 rank 層的彈跳,擋不住這層)。改成:釘選優先、
+  // 再 rank(需要你 > 執行中 > 一般,已含 15s 降級遲滯),同 rank 用 id 墊底 →
+  // 位置完全確定、不隨活動漂移。活動/未讀改由列上的狀態晶片與未讀標表達
+  // (renderSessions 就地更新那一列),不靠「整列跳位」。
   const ranks = new Map(rows.map(s => [s.id, stickyRank(s, now)]));
   return rows.sort((a, b) =>
+    ((isPinned(b.id) ? 1 : 0) - (isPinned(a.id) ? 1 : 0)) ||
     (ranks.get(a.id) - ranks.get(b.id)) ||
     (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
 }
@@ -377,11 +408,15 @@ function sortSessions(rows, now) {
 function sessionRowHTML(s) {
   const active = s.id === state.current;
   const locked = s.meta && s.meta.locked ? ' 🔒' : "";
-  return '<button type="button" class="sess' + (active ? " active" : "") +
+  const pinned = isPinned(s.id);
+  return '<button type="button" class="sess' + (active ? " active" : "") + (pinned ? " pinned" : "") +
     '" data-id="' + esc(s.id) + '" aria-current="' + (active ? "true" : "false") + '">' +
     '<span class="sess-name">' + esc(s.title || s.id) + locked + unreadMark(s) + "</span>" +
     '<span class="sess-sub"><span class="st st-' + esc(s.status || "idle") + '">' +
     esc(workPhase(s)) + "</span> " + esc(sessionPreview(s)) + "</span></button>" +
+    '<button type="button" class="sess-pin' + (pinned ? " on" : "") + '" data-id="' + esc(s.id) +
+    '" title="' + (pinned ? "取消釘選" : "釘選到頂") + '" aria-label="' + (pinned ? "取消釘選" : "釘選") +
+    '">' + (pinned ? "★" : "☆") + "</button>" +
     (window.PocketSessionOps?.menuButton(s) || "");
 }
 
@@ -391,6 +426,8 @@ function bindSessionListClicks(el) {
   if (el._clickBound) return;
   el._clickBound = true;
   el.addEventListener("click", (ev) => {
+    const pin = ev.target.closest(".sess-pin");   // 釘選鈕也是 .session-row 的兄弟,先攔
+    if (pin && el.contains(pin)) { ev.preventDefault(); ev.stopPropagation(); togglePin(pin.dataset.id); return; }
     const btn = ev.target.closest(".sess");   // ops 選單鈕是 .session-row 的兄弟,不在 .sess 內 → 不會誤觸
     if (btn && el.contains(btn)) openSession(btn.dataset.id);
   });
@@ -405,11 +442,21 @@ function renderSessions() {
     el.textContent = state.listHealth === "failed" || state.degraded.length ? "清單暫時不完整" : "沒有 session";
     return;
   }
+  // 篩選/搜尋。有在篩時,只顯示有命中的 provider 群組(空群組不顯示「無對話」,
+  // 否則一篩就滿屏空群組);零命中給一句明確訊息,不是一片空白。
+  const filtering = !!(state.listQuery || (state.listFilter && state.listFilter !== "all"));
+  const visible = filtering ? state.sessions.filter(sessionVisible) : state.sessions;
+  if (!visible.length) {
+    el._provGroups = null;
+    el.textContent = "找不到符合的 session";
+    return;
+  }
   // FLIP 前置:記住每列現在的位置,重畫後只對「真的移動了」的列補一段位移動畫。
   const oldTops = new Map(Array.from(el.querySelectorAll(".session-row"),
     (n) => [n.dataset.id, n.getBoundingClientRect().top]));
-  const byProv = new Map(["hermes", "claude_code", "codex", "gemini"].map(p => [p, []]));
-  for (const s of state.sessions) {
+  const byProv = filtering ? new Map()
+    : new Map(["hermes", "claude_code", "codex", "gemini"].map(p => [p, []]));
+  for (const s of visible) {
     const p = s.provider === "cc2" ? "claude_code" : s.provider;
     if (!byProv.has(p)) byProv.set(p, []);
     byProv.get(p).push(s);
@@ -1906,6 +1953,15 @@ function wire() {
   window.addEventListener("pagehide", e => { if (e.persisted) $("app").classList.add("hidden"); });
   window.addEventListener("pageshow", e => { if (e.persisted) location.reload(); });
   $("refresh").addEventListener("click", loadSessions);
+  $("sess-q").addEventListener("input", (e) => { state.listQuery = e.target.value.trim(); renderSessions(); });
+  $("sess-filters").addEventListener("click", (e) => {
+    const chip = e.target.closest(".sf-chip");
+    if (!chip) return;
+    state.listFilter = chip.dataset.filter || "all";
+    $("sess-filters").querySelectorAll(".sf-chip").forEach((c) =>
+      c.classList.toggle("active", c === chip));
+    renderSessions();
+  });
   $("awaiting").addEventListener("click", jumpToAwaiting);
   $("theme-btn").addEventListener("click", cycleTheme);
   $("newsess-open").addEventListener("click", () => $("newsess").classList.remove("hidden"));

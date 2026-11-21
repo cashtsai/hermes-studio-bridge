@@ -714,3 +714,22 @@ body[data-console-access="remote"] [data-mode="memory"]{display:none;}
   .work-state small{white-space:normal;}
   .work-row{grid-template-columns:2.3em minmax(0,1fr) minmax(4em,7.3em);gap:6px;}
 }
+
+/* ── W1-④ 清單篩選 / 搜尋 / 釘選(2026-11-21)──────────────────── */
+.side-filter{display:flex;flex-direction:column;gap:7px;padding:4px 8px 8px;}
+#sess-q{width:100%;border:1px solid var(--line);border-radius:var(--field-radius);
+  background:var(--panel-2);color:var(--text);font:inherit;font-size:14px;padding:7px 10px;}
+#sess-q:focus-visible{outline:2px solid var(--accent);outline-offset:1px;}
+.sess-filters{display:flex;gap:6px;}
+.sf-chip{flex:1;border:1px solid var(--line);background:transparent;color:var(--dim);
+  font:inherit;font-size:12.5px;padding:4px 8px;border-radius:var(--btn-radius);cursor:pointer;}
+.sf-chip:hover{color:var(--text);}
+.sf-chip.active{background:var(--accent);border-color:var(--accent);color:#fff;font-weight:600;}
+/* 釘選鈕:平時隱形,hover 列 / 聚焦 / 已釘選才現,不搶視覺重量 */
+.sess-pin{flex:none;min-width:34px;min-height:44px;background:none;border:0;cursor:pointer;
+  color:var(--dim);font-size:15px;line-height:1;opacity:0;transition:opacity .12s;}
+.session-row:hover .sess-pin,.sess-pin:focus-visible,.sess-pin.on{opacity:1;}
+.sess-pin.on{color:var(--star-yellow);}
+.sess-pin:hover{color:var(--text);}
+.sess.pinned{box-shadow:inset 3px 0 0 var(--star-yellow);}
+.sess.active.pinned{box-shadow:inset 3px 0 0 var(--accent);}

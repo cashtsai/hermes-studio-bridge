@@ -62,7 +62,11 @@ function harness() {
     workPhase: s => s.status || 'idle',
     sessionPreview: s => s._preview || '',
     unreadMark: s => (s._unread ? '<u>未讀</u>' : ''),
+    sessionUnread: s => !!s._unread,
+    workMatches: (s, q) => String(s.title || s.id).toLowerCase().includes(String(q).toLowerCase()),
     listActivity: new Map(),
+    localStorage: (() => { const m = new Map();
+      return { getItem: k => (m.has(k) ? m.get(k) : null), setItem: (k, v) => m.set(k, String(v)), removeItem: k => m.delete(k) }; })(),
     state,
   });
   vm.runInContext(section('function sessionRank(', 'function activityTime('), c);
@@ -135,4 +139,53 @@ test('removing a session detaches its node and drops it from the list', () => {
   h.render();
   assert.ok(!h.order().includes('claude_code:c'), 'c removed from list');
   assert.equal(c1.parentNode, null, 'c node detached from DOM');
+});
+
+// ── W1-④ 篩選 / 搜尋 / 釘選 ───────────────────────────────
+test('search query filters the list to matching sessions only', () => {
+  const h = harness();
+  h.state.sessions = [S('claude_code:alpha', 'idle'), S('claude_code:beta', 'idle'), S('claude_code:gamma', 'idle')];
+  h.render();
+  assert.equal(h.rows().length, 3);
+  h.state.listQuery = 'bet';
+  h.render();
+  assert.deepEqual(h.order(), ['claude_code:beta'], 'only beta matches "bet"');
+  h.state.listQuery = 'zzz';
+  h.render();
+  assert.equal(h.rows().length, 0, 'no matches → zero rows (shows 找不到 message)');
+  assert.ok(h.listEl.textContent.includes('找不到'), 'zero-match message shown');
+});
+
+test('filter=unread shows only unread sessions', () => {
+  const h = harness();
+  h.state.sessions = [S('claude_code:a', 'idle'), S('claude_code:b', 'idle', { _unread: true })];
+  h.render();
+  assert.equal(h.rows().length, 2);
+  h.state.listFilter = 'unread';
+  h.render();
+  assert.deepEqual(h.order(), ['claude_code:b'], 'only the unread one remains');
+});
+
+test('filter=attn shows only rank-0 (actionable / needs_input) sessions', () => {
+  const h = harness();
+  h.state.sessions = [S('claude_code:a', 'idle'), S('claude_code:b', 'needs_input'), S('claude_code:c', 'awaiting')];
+  h.render();
+  h.state.listFilter = 'attn';
+  h.render();
+  assert.deepEqual(h.order().sort(), ['claude_code:b', 'claude_code:c'], 'idle a hidden; needs_input + awaiting shown');
+});
+
+test('pinned session floats to the top of its provider group and persists', () => {
+  const h = harness();
+  h.state.sessions = [S('claude_code:a', 'idle'), S('claude_code:b', 'idle'), S('claude_code:c', 'idle')];
+  h.render();
+  assert.deepEqual(h.order(), ['claude_code:a', 'claude_code:b', 'claude_code:c'], 'default id order');
+  h.c.togglePin('claude_code:c');   // togglePin re-renders internally
+  assert.equal(h.order()[0], 'claude_code:c', 'pinned c jumps to top');
+  // the pinned row carries the on-state toggle
+  const cRow = h.rows().find(n => n.dataset.id === 'claude_code:c');
+  assert.ok(cRow.innerHTML.includes('sess-pin on'), 'pin button marked on');
+  assert.ok(cRow.innerHTML.includes('sess pinned') || cRow.innerHTML.includes('pinned'), 'row marked pinned');
+  h.c.togglePin('claude_code:c');   // unpin
+  assert.deepEqual(h.order(), ['claude_code:a', 'claude_code:b', 'claude_code:c'], 'back to id order after unpin');
 });
