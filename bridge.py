@@ -865,7 +865,14 @@ CONSOLE_REMOTE_FILE_ROOTS = [
 # 前提是「人不一定在可信的電腦前」,安靜放行等於把新端點預設交出去。
 # 白名單的代價是新增端點要記得加,但漏加只會壞功能、不會漏權限。
 _CONSOLE_GET = {"/console", "/console/manifest.json", "/console/sw.js", "/health",
-                "/file", "/filediff", "/app/v2/sessions"}
+                "/file", "/filediff", "/app/v2/sessions",
+                # 2026-11-21(W1-⑤):roster 差分 SSE,取代遠端原本的 10s 輪詢。
+                # 安全:_roster_build() 疊在 v2_sessions() 之上(見其 docstring),
+                # 遠端時同一套 _console_remote_list 投影照樣套用 —— 這條**不是**
+                # 新的資料面,是既有 /app/v2/sessions 過濾結果的差分推播,只省掉
+                # client 每 10 秒重抓整包的延遲。千萬別把 /app/v2/events(全域、
+                # 跨 session、無過濾)也加進來 —— 那才是會洩漏的那條。
+                "/app/v2/sessions/roster/events"}
 _CONSOLE_SESSION_OPS = {
     ("GET", "cards"): "replay", ("GET", "events"): "follow",
     ("GET", "changes"): "changes", ("GET", "diff"): "changes",
@@ -22667,10 +22674,22 @@ def _roster_activity(row: dict, updated_ts: float) -> str:
 
 
 async def _roster_build(request: Request) -> dict:
-    """roster 全量:疊在 /app/v2/sessions 之上(provider 邏輯零複製)。"""
+    """roster 全量:疊在 /app/v2/sessions 之上(provider 邏輯零複製)。
+
+    ⚠️ **遠端(console-remote)時不拉訊息內容**(2026-11-21,W1-⑤ 查證時抓到):
+    `_console_remote_list`(套在 `v2_sessions` 裡)只剝 capabilities/meta,
+    **從不**過濾列也不碰訊息內容 —— 它的設計前提是「`/app/v2/sessions` 本來就
+    不吐訊息預覽」(只有 title/workdir/status)。但 `_roster_enrich` 會直接從
+    `event_log` 撈最新訊息原文當 `last_turn_summary`,且完全不看 remote scope。
+    若遠端也走這條,等於把**全部 session 的真實訊息內容**送到借來的電腦 ——
+    比既有 `/app/v2/sessions` 的揭露面大得多,是這支 roster 疊加層自己造出來的洞,
+    不是本來就有的。修法:遠端時跳過 `_roster_enrich`,summary 一律空字串,
+    順便省一次 DB 連線。
+    """
     base = await v2_sessions(request)
     rows = base.get("sessions") or []
-    enrich = _roster_enrich([str(r.get("id") or "") for r in rows])
+    remote = getattr(getattr(request, "state", None), "console_remote", False) is True
+    enrich = {} if remote else _roster_enrich([str(r.get("id") or "") for r in rows])
     out = []
     for r in rows:
         rid = str(r.get("id") or "")
