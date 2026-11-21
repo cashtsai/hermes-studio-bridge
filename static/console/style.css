@@ -715,53 +715,62 @@ body[data-console-access="remote"] [data-mode="memory"]{display:none;}
   .work-row{grid-template-columns:2.3em minmax(0,1fr) minmax(4em,7.3em);gap:6px;}
 }
 
-/* ── W1-④ 清單篩選 / 搜尋 / 釘選(2026-11-21)──────────────────── */
-.side-filter{display:flex;flex-direction:column;gap:7px;padding:4px 8px 8px;}
+/* ── W1-④ 清單篩選 / 搜尋 / 釘選(2026-11-21,對齊 Pocket CIS v1.1)──────
+   引用既有 token:field-radius(欄位/籤)、btn-radius(膠囊)、on-accent、
+   surface-hover、duration/ease 動效,不再硬寫秒數與色值。 */
+.side-filter{display:flex;flex-direction:column;gap:8px;padding:4px 10px 10px;}
 #sess-q{width:100%;border:1px solid var(--line);border-radius:var(--field-radius);
-  background:var(--panel-2);color:var(--text);font:inherit;font-size:14px;padding:7px 10px;}
-#sess-q:focus-visible{outline:2px solid var(--accent);outline-offset:1px;}
+  background:var(--panel-2);color:var(--text);font:inherit;font-size:14px;padding:8px 11px;
+  transition:border-color var(--duration-base) var(--ease-standard);}
+#sess-q::placeholder{color:var(--faint);}
+#sess-q:focus-visible{outline:none;border-color:var(--accent);}
+/* 分段控制(三籤):沿用 att-chip 的 field-radius 語彙;選中=accent 填+on-accent 字。 */
 .sess-filters{display:flex;gap:6px;}
-.sf-chip{flex:1;border:1px solid var(--line);background:transparent;color:var(--dim);
-  font:inherit;font-size:12.5px;padding:4px 8px;border-radius:var(--btn-radius);cursor:pointer;}
-.sf-chip:hover{color:var(--text);}
-.sf-chip.active{background:var(--accent);border-color:var(--accent);color:#fff;font-weight:600;}
-/* 釘選鈕:平時隱形,hover 列 / 聚焦 / 已釘選才現,不搶視覺重量 */
-.sess-pin{flex:none;min-width:34px;min-height:44px;background:none;border:0;cursor:pointer;
-  color:var(--dim);font-size:15px;line-height:1;opacity:0;transition:opacity .12s;}
+.sf-chip{flex:1;border:1px solid var(--line);background:var(--panel-2);color:var(--dim);
+  font:inherit;font-size:13px;font-weight:600;padding:6px 10px;border-radius:var(--field-radius);cursor:pointer;
+  transition:background var(--duration-base) var(--ease-standard),color var(--duration-base) var(--ease-standard);}
+.sf-chip:hover{background:var(--surface-hover);color:var(--text);}
+.sf-chip.active{background:var(--accent);border-color:var(--accent);color:var(--on-accent);}
+/* 釘選鈕:平時安靜(hover 列/聚焦/已釘才現),不搶視覺重量。 */
+.sess-pin{flex:none;min-width:36px;min-height:44px;background:none;border:0;cursor:pointer;
+  color:var(--faint);font-size:15px;line-height:1;opacity:0;
+  transition:opacity var(--duration-base) var(--ease-standard),color var(--duration-base) var(--ease-standard);}
 .session-row:hover .sess-pin,.sess-pin:focus-visible,.sess-pin.on{opacity:1;}
 .sess-pin.on{color:var(--star-yellow);}
 .sess-pin:hover{color:var(--text);}
 .sess.pinned{box-shadow:inset 3px 0 0 var(--star-yellow);}
 .sess.active.pinned{box-shadow:inset 3px 0 0 var(--accent);}
 
-/* ── W1-⑥ 有引導的空狀態(2026-11-21)─────────────────────────── */
+/* ── W1-⑥ 有引導的空狀態(對齊 CIS:主按鈕=accent 膠囊、次按鈕=描邊膠囊)──── */
 .list-empty{display:flex;flex-direction:column;align-items:center;text-align:center;
-  gap:8px;padding:40px 20px;color:var(--dim);}
-.list-empty-ic{font-size:30px;line-height:1;opacity:.8;}
+  gap:10px;padding:48px 24px;color:var(--dim);}
+.list-empty-ic{font-size:32px;line-height:1;opacity:.7;}
 .list-empty-title{font-size:15px;font-weight:700;color:var(--text);}
-.list-empty-hint{font-size:13px;line-height:1.6;max-width:30ch;}
-.list-empty-btn{margin-top:8px;border:1px solid var(--line);background:var(--accent);
-  color:#fff;font:inherit;font-size:13px;font-weight:600;padding:7px 14px;
-  border-radius:var(--btn-radius);cursor:pointer;}
-.list-empty-btn.list-empty-clear{background:transparent;color:var(--accent);border-color:var(--accent);}
-.list-empty-btn:hover{filter:brightness(1.05);}
+.list-empty-hint{font-size:13px;line-height:1.6;max-width:30ch;color:var(--dim);}
+.list-empty-btn{margin-top:4px;min-height:40px;padding:0 18px;border:0;border-radius:var(--btn-radius);
+  background:var(--accent);color:var(--on-accent);font:inherit;font-size:14px;font-weight:600;cursor:pointer;
+  transition:filter var(--duration-base) var(--ease-standard);}
+.list-empty-btn.list-empty-clear{background:transparent;color:var(--accent);box-shadow:inset 0 0 0 1px var(--accent);}
+.list-empty-btn:hover{filter:brightness(1.06);}
 
-/* 快捷鍵說明浮層 */
+/* 快捷鍵說明浮層(沿用 .palette/.pal-box 的遮罩與卡片語彙:dialog-radius + shadow-4)── */
 #shortcuts.hidden{display:none;}
 #shortcuts{position:fixed;inset:0;z-index:60;display:flex;align-items:center;justify-content:center;
-  background:rgba(23,23,26,.45);}
-#shortcuts .sc-card{background:var(--panel);border:1px solid var(--line);border-radius:14px;
-  padding:22px 26px;max-width:360px;width:calc(100% - 40px);box-shadow:0 20px 60px rgba(0,0,0,.3);}
-#shortcuts h3{margin:0 0 14px;font-size:16px;color:var(--text);}
-#shortcuts dl{display:grid;grid-template-columns:auto 1fr;gap:9px 16px;margin:0;}
+  padding:24px;background:rgba(0,0,0,.42);}
+#shortcuts .sc-card{width:min(360px,92vw);background:var(--panel);color:var(--text);
+  border:1px solid var(--line);border-radius:var(--dialog-radius);box-shadow:var(--shadow-4);padding:22px 24px;}
+#shortcuts h3{margin:0 0 16px;font-size:16px;font-weight:700;}
+#shortcuts dl{display:grid;grid-template-columns:auto 1fr;gap:10px 16px;margin:0;}
 #shortcuts dt{font-family:var(--mono,ui-monospace,monospace);font-size:12px;color:var(--text);
-  background:var(--panel-2);border:1px solid var(--line);border-radius:6px;padding:2px 8px;justify-self:start;}
+  background:var(--panel-2);border:1px solid var(--line);border-radius:var(--field-radius);padding:3px 9px;justify-self:start;}
 #shortcuts dd{margin:0;font-size:13px;color:var(--dim);align-self:center;}
-#shortcuts .sc-close{margin-top:16px;width:100%;border:1px solid var(--line);background:transparent;
-  color:var(--text);font:inherit;padding:8px;border-radius:var(--btn-radius);cursor:pointer;}
+#shortcuts .sc-close{margin-top:18px;width:100%;min-height:40px;border:0;border-radius:var(--btn-radius);
+  background:var(--panel-2);color:var(--text);font:inherit;font-weight:600;cursor:pointer;
+  transition:background var(--duration-base) var(--ease-standard);}
+#shortcuts .sc-close:hover{background:var(--surface-hover);}
 
-/* ── Wave2 跟上手機:強制停止升級態(2026-11-21)─────────────────── */
-#interrupt.force{background:var(--bad,#C8402E);color:#fff;border-color:var(--bad,#C8402E);
-  font-weight:700;animation:force-pulse 1s ease-in-out infinite;}
-@keyframes force-pulse{0%,100%{opacity:1}50%{opacity:.6}}
+/* ── Wave2:強制停止升級態(CIS danger 變體 = 透明底 + danger 邊/字,細邊膠囊)──── */
+#interrupt.force{background:transparent;color:var(--bad);border:1px solid var(--bad);font-weight:700;
+  animation:force-pulse 1.1s var(--ease-standard) infinite;}
+@keyframes force-pulse{0%,100%{opacity:1}50%{opacity:.55}}
 @media (prefers-reduced-motion: reduce){#interrupt.force{animation:none}}
