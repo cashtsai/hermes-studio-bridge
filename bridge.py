@@ -37583,6 +37583,113 @@ async def app_agents_auth(request: Request):
 POCKET_AGENT_LOGIN_IN_APP = os.environ.get("POCKET_AGENT_LOGIN_IN_APP", "0") != "0"
 
 
+# ── Hermes 人格後端模型 key(2026-11-22,機主點名)────────────────────
+# 人格(xcash/fliper/shuijing)的模型 key 原本只能 SSH 改各 profile 的 .env。
+# 這組端點把它面板化:App 貼 key → 先向 upstream 驗證 → 寫入各 profile
+# .env → kickstart 對應 gateway(hermes 行程自己讀 .env,重啟即重讀)。
+# 安全姿態照抄 gemini/key:device token only、console-remote 403、key 不進 log、
+# POCKET_AGENT_LOGIN_IN_APP 旗標(預設關 → 合併不改變現行行為)。
+
+_HERMES_PROFILE_ROOT = os.path.expanduser("~/apps/hermes-agent/home/profiles")
+_HERMES_KEY_PROFILES = ("xcash", "fliper", "shuijing")   # pantianqing 無 .env,跳過
+_HERMES_GATEWAY_FMT = "ai.hermes.gateway-%s"
+
+def _hermes_env_path(profile: str) -> str:
+    return os.path.join(_HERMES_PROFILE_ROOT, profile, ".env")
+
+def _hermes_read_key(profile: str) -> str:
+    try:
+        with open(_hermes_env_path(profile), encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("OPENAI_API_KEY="):
+                    return line.split("=", 1)[1].strip()
+    except OSError:
+        pass
+    return ""
+
+def _hermes_write_key(profile: str, key: str) -> bool:
+    """只改 OPENAI_API_KEY 那一行,其餘行原封不動(.env 裡還有 TG token 等)。"""
+    path = _hermes_env_path(profile)
+    try:
+        with open(path, encoding="utf-8") as f:
+            lines = f.readlines()
+    except OSError:
+        return False
+    out, hit = [], False
+    for line in lines:
+        if line.startswith("OPENAI_API_KEY="):
+            out.append(f"OPENAI_API_KEY={key}\n"); hit = True
+        else:
+            out.append(line)
+    if not hit:
+        out.append(f"OPENAI_API_KEY={key}\n")
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.writelines(out)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+    return True
+
+async def _hermes_validate_key(key: str) -> bool:
+    """向 upstream 驗 key(GET /models)。驗不過不落檔 —— 寧可退回,
+    不要寫一把壞 key 進三個 production gateway。"""
+    import urllib.request as _u
+    def _probe() -> bool:
+        req = _u.Request("https://api.openai.com/v1/models",
+                         headers={"Authorization": f"Bearer {key}"})
+        try:
+            with _u.urlopen(req, timeout=12) as r:
+                return 200 <= r.status < 300
+        except Exception:
+            return False
+    return await asyncio.to_thread(_probe)
+
+@app.get("/app/v1/agents/hermes/backend")
+async def app_hermes_backend_status(request: Request):
+    """人格後端模型的登入狀態(面板用)。不回 key 本身,只回有無與長度級距。"""
+    if not POCKET_AGENT_LOGIN_IN_APP:
+        raise HTTPException(status_code=404, detail="not found")
+    _check_auth(request)
+    per = {}
+    for prof in _HERMES_KEY_PROFILES:
+        k = _hermes_read_key(prof)
+        per[prof] = {"key_set": bool(k)}
+    return {"model": "gpt-5.6-luna", "provider": "openai-api", "profiles": per}
+
+@app.put("/app/v1/agents/hermes/key")
+async def app_hermes_set_key(request: Request):
+    if not POCKET_AGENT_LOGIN_IN_APP:
+        raise HTTPException(status_code=404, detail="not found")
+    _check_auth(request)
+    if _token_scope(_request_token(request)) == CONSOLE_REMOTE_SCOPE:
+        raise http_err(403, "SCOPE_FORBIDDEN",
+                       "遠端控制台不能設定帳號憑證,請用已配對的手機")
+    body = await _json_body(request)
+    key = str(body.get("api_key") or "").strip()
+    if not key:
+        raise http_err(400, "MISSING_KEY", "api_key 不可為空")
+    if not await _hermes_validate_key(key):
+        raise http_err(422, "KEY_INVALID", "這把 key 向 upstream 驗證失敗,未套用")
+    written, restarted = [], []
+    for prof in _HERMES_KEY_PROFILES:
+        if _hermes_write_key(prof, key):
+            written.append(prof)
+            # hermes gateway 自己讀 .env → kickstart 重啟行程即重讀
+            # (不是 launchd EnvironmentVariables,不需要 bootout+bootstrap)。
+            label = _HERMES_GATEWAY_FMT % prof
+            proc = await asyncio.create_subprocess_exec(
+                "launchctl", "kickstart", "-k",
+                f"gui/{os.getuid()}/{label}",
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL)
+            await proc.wait()
+            if proc.returncode == 0:
+                restarted.append(prof)
+    _log_event("hermes_backend_key_set", written=",".join(written),
+               restarted=",".join(restarted))   # 不記 key 本身
+    return {"ok": True, "written": written, "restarted": restarted}
+
+
 @app.put("/app/v1/agents/gemini/key")
 async def app_gemini_set_key(request: Request):
     """把使用者貼的 Gemini API key 寫進 ~/.pocket/gemini.json(0600)。
