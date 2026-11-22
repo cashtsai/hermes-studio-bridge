@@ -278,6 +278,33 @@ window.PocketSessionOps = (() => {
   }
   function pendingHub() { return hubRows.filter(a=>!resolvedApprovals.has(String(a.id)) && a.status==="pending" &&
     (!activityTime(a.expires_at)||activityTime(a.expires_at)>Date.now())); }
+  // 可安全批次的 = 二元 permission(明確 allow/deny)。刻意**跳過 question/多選**:
+  // 那些要「選哪個」,盲批會答錯;批次只碰「准/駁」語意清楚的。
+  function binaryPending() {
+    return pendingHub().filter(a=>{
+      const v=approvalView({meta:{approval:a}});
+      return v.kind==="permission" && !v.multiselect;
+    });
+  }
+  async function batchDecide(approve) {
+    const items=binaryPending();
+    if (!items.length) return;
+    const skipped=pendingHub().length-items.length;
+    const extra=skipped ? `（略過 ${skipped} 項需選項的問題,要逐條處理）` : "";
+    const msg=approve
+      ? `確定核准全部 ${items.length} 項二元請求？${extra}\n核准＝放行這些 agent 動作,請確認你信任它們。`
+      : `否決全部 ${items.length} 項？${extra}`;
+    if (!window.confirm(msg)) return;
+    el("hub-approve-all").disabled=el("hub-deny-all").disabled=true;
+    let ok=0, fail=0;
+    for (const a of items) {
+      try { await request("/app/v1/approvals/"+encodeURIComponent(a.id)+"/decision",{approve,approval_id:a.id});
+        noteApprovalResolved(a.id); ok++; }
+      catch(e) { fail++; }
+    }
+    toast(`已${approve ? "核准" : "否決"} ${ok} 項`+(fail ? `,${fail} 項失敗` : ""), fail>0);
+    renderHub(); void loadHub();
+  }
   function renderHub() {
     const list=el("hub-list"); list.replaceChildren();
     el("hub-status").textContent=hubError || (hubLoading ? "讀取待審清單…" : hubReady && !pendingHub().length ? "目前沒有待審項目" : "");
@@ -297,6 +324,11 @@ window.PocketSessionOps = (() => {
       b.append(title,detail); list.append(b);
     }
     el("hub-more").hidden=hubNext===null; el("hub-more").disabled=hubLoading;
+    // 批次列:只有 ≥2 項可安全批次(二元 permission)時才出現,避免一兩項也擺一排鈕。
+    const bin=binaryPending().length;
+    el("hub-batch").hidden=bin<2;
+    if (bin>=2) { el("hub-batch-label").textContent=`${bin} 項二元請求`;
+      el("hub-approve-all").disabled=el("hub-deny-all").disabled=false; }
     renderAwaiting();
   }
   function renderAwaiting() {
@@ -379,6 +411,8 @@ window.PocketSessionOps = (() => {
     el("session-compact").addEventListener("click",()=>compact(currentSession()));
     el("hub-refresh").addEventListener("click",()=>loadHub());
     el("hub-more").addEventListener("click",()=>loadHub(true));
+    el("hub-approve-all").addEventListener("click",()=>batchDecide(true));
+    el("hub-deny-all").addEventListener("click",()=>batchDecide(false));
     el("hub-close").addEventListener("click",()=>{el("approval-hub").hidden=true;renderAwaiting();});
     window.addEventListener("focus",scheduleRead);
     document.addEventListener("visibilitychange",()=>{
