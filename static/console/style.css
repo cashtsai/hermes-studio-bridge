@@ -774,3 +774,11 @@ body[data-console-access="remote"] [data-mode="memory"]{display:none;}
   animation:force-pulse 1.1s var(--ease-standard) infinite;}
 @keyframes force-pulse{0%,100%{opacity:1}50%{opacity:.55}}
 @media (prefers-reduced-motion: reduce){#interrupt.force{animation:none}}
+
+/* ── W3 批次審批列(對齊 CIS)─────────────────────────────────── */
+.hub-batch{display:flex;align-items:center;gap:8px;padding:4px 0 10px;flex-wrap:wrap;}
+.hub-batch[hidden]{display:none;}
+#hub-batch-label{font-size:13px;color:var(--dim);margin-inline-end:auto;}
+#hub-approve-all{background:var(--accent);border-color:var(--accent);color:var(--on-accent);flex:none;}
+#hub-deny-all{background:transparent;color:var(--bad);border-color:var(--bad);flex:none;}
+.hub-batch .sf-chip:disabled{opacity:.5;cursor:default;}

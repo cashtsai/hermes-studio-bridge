@@ -555,3 +555,26 @@ test("顯示用的 q_index 不准流到線上 —— 借用機的授權守門是
   await new Promise(r => setImmediate(r));
   assert.equal(h2.calls[0].body.expected_q_index, 2, "codex question 的頂層 q_index 照舊要帶");
 });
+
+// W3 批次審批的安全閘:binaryPending 只收「二元 permission」,跳過 question/多選。
+// 這裡驗判準本身(approvalView.kind + multiselect)對各型 approval 分類正確 ——
+// 盲批最怕把需要「選哪個」的問題也一鍵送出,這條守住那個邊界。
+test("batch-approve safety gate: only binary permissions are eligible", () => {
+  const h = harness();
+  const eligible = a => {
+    const v = h.ctx.approvalView({ meta: { approval: a } });
+    return v.kind === "permission" && !v.multiselect;
+  };
+  const permission = { id: "p1", status: "pending", kind: "permission",
+    session_id: "codex:01JD", provider: "codex",
+    options: [{ key: "approve", label: "允許" }, { key: "deny", label: "拒絕" }] };
+  const question = { id: "q1", status: "pending", kind: "question", q_index: 0,
+    session_id: "codex:01JD", provider: "codex",
+    options: [{ key: "a", label: "甲" }, { key: "b", label: "乙" }] };
+  const multi = { id: "m1", status: "pending", kind: "permission", multiselect: true,
+    session_id: "codex:01JD", provider: "codex",
+    options: [{ key: "x", label: "X" }, { key: "y", label: "Y" }] };
+  assert.equal(eligible(permission), true, "二元 permission 可批次");
+  assert.equal(eligible(question), false, "question(需選項)不可批次");
+  assert.equal(eligible(multi), false, "多選不可批次");
+});

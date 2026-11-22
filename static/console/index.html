@@ -43,7 +43,13 @@
     <header><h2 id="hub-title">待審清單</h2>
       <button id="hub-refresh" class="icon-btn" title="重新整理待審清單" aria-label="重新整理待審清單">↻</button>
       <button id="hub-close" class="icon-btn" title="收起待審清單" aria-label="收起待審清單">×</button></header>
-    <p id="hub-status" role="status"></p><div id="hub-list"></div>
+    <p id="hub-status" role="status"></p>
+    <div id="hub-batch" class="hub-batch" hidden>
+      <span id="hub-batch-label"></span>
+      <button type="button" id="hub-approve-all" class="sf-chip">全部核准</button>
+      <button type="button" id="hub-deny-all" class="sf-chip">全部否決</button>
+    </div>
+    <div id="hub-list"></div>
     <button id="hub-more" class="btn-ghost" hidden>更多待審項目</button>
   </section>
   <div id="toast" class="toast hidden" role="status" aria-live="polite" aria-relevant="additions"></div>
