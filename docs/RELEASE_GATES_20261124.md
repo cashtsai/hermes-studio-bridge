@@ -10,6 +10,9 @@ must finish before merging/deploying. A prepared IPA is not an uploaded release.
 - Media matrix: Hermes already resolves its dedicated outbox. Remove the stale
   missing-cwd claim and pin that hook. Unknown personas get no attachment root,
   never another persona's outbox.
+  The end-to-end fixture now registers its test persona explicitly and verifies
+  unknown personas cannot borrow the default home; it no longer relies on that
+  invalid fallback to make a nonexistent persona appear configured.
 - Infrastructure scanner: replace ambiguous sample paths with explicit redacted
   placeholders. Validate public IPv4 candidates with ipaddress; invalid octets
   and reserved numeric library versions are not public addresses. Tests still

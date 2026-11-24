@@ -383,9 +383,17 @@ class MediaSessionCwdTests(unittest.TestCase):
 
     def test_persona_sessions_resolve_to_outbox(self):
         # 人格的附件 root = 人格 home 下的 outbox 子目錄(不是整個 home)。
-        cwd = bridge._media_session_cwd("hermes:cash")
-        self.assertTrue(cwd.endswith(os.sep + "outbox"), cwd)
-        self.assertNotEqual(cwd, "")
+        with patch.dict(bridge.PERSONAS, {"example": {}}, clear=True), \
+                patch.object(bridge, "home_for", return_value="/tmp/example-home") as home:
+            self.assertEqual(bridge._media_session_cwd("hermes:example"),
+                             "/tmp/example-home/outbox")
+            home.assert_called_once_with("example")
+
+    def test_unknown_persona_cannot_borrow_another_outbox(self):
+        with patch.dict(bridge.PERSONAS, {"example": {}}, clear=True), \
+                patch.object(bridge, "home_for") as home:
+            self.assertEqual(bridge._media_session_cwd("hermes:missing"), "")
+            home.assert_not_called()
 
     def test_resolution_is_failsafe(self):
         with patch.object(bridge, "_cc_conf_rows",
