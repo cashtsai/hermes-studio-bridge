@@ -16,6 +16,7 @@ agent 閘道 —— 把 tailnet 名、主機名與路徑佈局公開,等於把�
 ⚠️ 清洗只能管「現在的檔案」,git 歷史裡的仍在。這支的作用是**不再新增**。
 """
 import hashlib
+import ipaddress
 import os
 import re
 import subprocess
@@ -122,6 +123,21 @@ def _domain_hits(text):
     return counts
 
 
+def _shape_hits(label, pattern, text):
+    hits = [m for m in pattern.findall(text) if not _PLACEHOLDER.search(m)]
+    if label != "公網 IPv4":
+        return hits
+    public = []
+    for value in hits:
+        try:
+            address = ipaddress.IPv4Address(value)
+        except ipaddress.AddressValueError:
+            continue
+        if address.is_global and not address.is_reserved:
+            public.append(value)
+    return public
+
+
 def tracked_files():
     """掃描語料 = git 追蹤的全部檔案。
 
@@ -139,6 +155,21 @@ def tracked_files():
 
 
 class NoPrivateInfraLeak(unittest.TestCase):
+    def test_numeric_library_versions_are_not_public_addresses(self):
+        pattern = SHAPES["公網 IPv4"]
+        self.assertEqual(_shape_hits("公網 IPv4", pattern,
+                         "library (250.0.0.3) framework (917.0.1.403)"), [])
+
+    def test_real_public_address_is_still_rejected(self):
+        self.assertEqual(_shape_hits("公網 IPv4", SHAPES["公網 IPv4"],
+                                    "peer=8.8.4.4"), ["8.8.4.4"])
+
+    def test_home_and_tailnet_detection_still_reject_non_placeholders(self):
+        self.assertEqual(_shape_hits("家目錄路徑", SHAPES["家目錄路徑"],
+                                    "/Users/alice/project"), ["/Users/alice"])
+        self.assertEqual(_shape_hits("tailnet IP", SHAPES["tailnet IP"],
+                                    "100.101.102.103"), ["100.101.102.103"])
+
     def test_tailnet_suffix_is_not_a_hostname(self):
         pattern = SHAPES["tailnet 主機名"]
         self.assertIsNone(pattern.search('name.endswith(".ts.net")'))
@@ -154,7 +185,7 @@ class NoPrivateInfraLeak(unittest.TestCase):
             except (UnicodeDecodeError, FileNotFoundError, IsADirectoryError):
                 continue            # 二進位/符號連結:跳過,不是我們要管的
             for label, rx in SHAPES.items():
-                real = [m for m in rx.findall(text) if not _PLACEHOLDER.search(m)]
+                real = _shape_hits(label, rx, text)
                 if real:
                     hits.append(f"{rel}: {label} ×{len(real)}{_sample(real[0])}")
             for label, n in _domain_hits(text).items():

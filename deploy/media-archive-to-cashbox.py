@@ -44,6 +44,9 @@ import sys
 import time
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from process_runner import run as run_command
+
 ROOT = Path(os.environ.get("POCKET_MEDIA_DIR",
                            os.path.expanduser("~/.pocket/media-artifacts")))
 INDEX = ROOT / "index.sqlite3"
@@ -64,8 +67,8 @@ def human(n: float) -> str:
 
 
 def ssh(*args: str) -> subprocess.CompletedProcess:
-    return subprocess.run(["ssh", f"{NAS_USER}@{NAS_HOST}", *args],
-                          capture_output=True, text=True, timeout=120)
+    return run_command(["ssh", f"{NAS_USER}@{NAS_HOST}", *args],
+                       operation="archive.ssh", timeout=120)
 
 
 def candidates(conn: sqlite3.Connection, cutoff: float) -> list[sqlite3.Row]:
@@ -148,12 +151,15 @@ def archive_orphans(args) -> int:
     listing.write_text(
         "\n".join(str(p.relative_to(ROOT)) for p, _ in items) + "\n",
         encoding="utf-8")
-    ssh(f"mkdir -p {shlex.quote(dest)}")
-    send = subprocess.run(
-        ["rsync", "-a", "--partial", "--files-from", str(listing),
-         str(ROOT), f"{NAS_USER}@{NAS_HOST}:{dest}/"],
-        capture_output=True, text=True, timeout=7200)
-    listing.unlink(missing_ok=True)
+    try:
+        if ssh(f"mkdir -p {shlex.quote(dest)}").returncode != 0:
+            return 1
+        send = run_command(
+            ["rsync", "-a", "--partial", "--files-from", str(listing),
+             str(ROOT), f"{NAS_USER}@{NAS_HOST}:{dest}/"],
+            operation="archive.orphans.copy", timeout=7200)
+    finally:
+        listing.unlink(missing_ok=True)
     if send.returncode != 0:
         print(f"rsync 失敗,本機一個檔都沒動:\n{send.stderr[-500:]}",
               file=sys.stderr)
@@ -171,9 +177,12 @@ def archive_orphans(args) -> int:
     remote_cmd = (f"cd {_shlex.quote(dest)} && while IFS= read -r f; do "
                   f"s=$(stat -c %s \"$f\" 2>/dev/null || echo MISSING); "
                   f"printf '%s\\t%s\\n' \"$f\" \"$s\"; done")
-    probe = subprocess.run(
+    probe = run_command(
         ["ssh", f"{NAS_USER}@{NAS_HOST}", remote_cmd],
-        input="\n".join(rels) + "\n", capture_output=True, text=True, timeout=600)
+        input="\n".join(rels) + "\n", operation="archive.orphans.verify", timeout=600)
+    if probe.returncode != 0:
+        print("Remote verification failed; all local files retained", file=sys.stderr)
+        return 1
     remote_size = {}
     for line in probe.stdout.splitlines():
         rel, _, s = line.rpartition("\t")
@@ -274,11 +283,13 @@ def main() -> int:
     listing.write_text(
         "\n".join(rel for rel, _, _, _ in present) + "\n",
         encoding="utf-8")
-    send = subprocess.run(
-        ["rsync", "-a", "--partial", "--files-from", str(listing),
-         str(ROOT), f"{NAS_USER}@{NAS_HOST}:{NAS_BASE}/"],
-        capture_output=True, text=True, timeout=14400)
-    listing.unlink(missing_ok=True)
+    try:
+        send = run_command(
+            ["rsync", "-a", "--partial", "--files-from", str(listing),
+             str(ROOT), f"{NAS_USER}@{NAS_HOST}:{NAS_BASE}/"],
+            operation="archive.retention.copy", timeout=14400)
+    finally:
+        listing.unlink(missing_ok=True)
     if send.returncode != 0:
         print(f"rsync 失敗,本機一個檔都沒動:\n{send.stderr[-500:]}", file=sys.stderr)
         return 1
@@ -291,9 +302,12 @@ def main() -> int:
     rels = [rel for rel, _, _, _ in present]
     remote_cmd = (f"cd {shlex.quote(NAS_BASE)} && "
                   f"xargs stat -c '%n %s' 2>/dev/null")
-    probe = subprocess.run(
+    probe = run_command(
         ["ssh", f"{NAS_USER}@{NAS_HOST}", remote_cmd],
-        input="\n".join(rels) + "\n", capture_output=True, text=True, timeout=1200)
+        input="\n".join(rels) + "\n", operation="archive.retention.verify", timeout=1200)
+    if probe.returncode != 0:
+        print("Remote verification failed; all local files retained", file=sys.stderr)
+        return 1
     got = {}
     for line in probe.stdout.splitlines():
         rel, _, s = line.rpartition(" ")

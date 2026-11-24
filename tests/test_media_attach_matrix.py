@@ -67,8 +67,6 @@ _MEDIA_HOOK_KNOWN_GAPS = {
     # ── hermes:persona 對話不是 code agent ────────────────────────────────
     ("turn_end_attach", "hermes"):
         "persona 走 canonical store 的訊息分頁,不產生本機檔案產出",
-    ("session_cwd", "hermes"):
-        "persona 沒有工作目錄概念(TG 式常駐),沒有可授權的根",
 
     # ── claude_code / cc2:掛點在,但不是這兩條 regex 認得的具名寫法 ────────
     # 這兩筆**不是**能力缺口 —— 它們有掛點,只是形狀不同,見下面兩支
@@ -204,6 +202,11 @@ class HookShapesArePinnedTest(unittest.TestCase):
         self.assertIn("if not rest:", body,
                       "裸 CC session 名(無 provider 前綴)的 cwd 分支不見了 —— "
                       "舊 app 與 console 兩條路徑都還會送裸名")
+
+    def test_hermes_root_is_its_dedicated_outbox(self):
+        body = _media_cwd_body()
+        self.assertIn('prov in ("hermes", "persona")', body)
+        self.assertIn("return _media_persona_outbox(rest)", body)
 
 
 class KnownGapsAreHonestTest(unittest.TestCase):

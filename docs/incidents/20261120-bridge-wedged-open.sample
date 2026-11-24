@@ -768,10 +768,10 @@ Binary Images:
        0x105aac000 -        0x105aaee93 +_bz2.cpython-314-darwin.so (0) <844C5B6B-9254-3E78-9FF5-7EDB02490739> /opt/homebrew/*/Python.framework/Versions/3.14/lib/python3.14/lib-dynload/_bz2.cpython-314-darwin.so
        0x105ac0000 -        0x105ac6fa7 +zlib.cpython-314-darwin.so (0) <CD2497FD-4558-3EBB-84A8-9BA2EBE03026> /opt/homebrew/*/Python.framework/Versions/3.14/lib/python3.14/lib-dynload/zlib.cpython-314-darwin.so
        0x105ae0000 -        0x105b7afcf +libssl.4.dylib (0) <46957FB5-1F3C-3111-BB92-1BB40C6B3FEE> /opt/homebrew/*/libssl.4.dylib
-       0x105fc4000 -        0x105fdef63 +parser.cpython-314-darwin.so (0) <E4055A17-7B69-3733-BD07-D6C3092E66B4> /Users/*/parser.cpython-314-darwin.so
+       0x105fc4000 -        0x105fdef63 +parser.cpython-314-darwin.so (0) <E4055A17-7B69-3733-BD07-D6C3092E66B4> /Users/redacted/parser.cpython-314-darwin.so
        0x105ff8000 -        0x105ffaf0b +termios.cpython-314-darwin.so (0) <32C5CB93-2EB6-3EA3-ADDE-9C6E4E874F56> /opt/homebrew/*/Python.framework/Versions/3.14/lib/python3.14/lib-dynload/termios.cpython-314-darwin.so
        0x106008000 -        0x106009b07 +_scproxy.cpython-314-darwin.so (0) <6F7460C4-830E-3014-BB7E-DA9A690E7FB3> /opt/homebrew/*/Python.framework/Versions/3.14/lib/python3.14/lib-dynload/_scproxy.cpython-314-darwin.so
-       0x106018000 -        0x106024db7 +url_parser.cpython-314-darwin.so (0) <6CB7B368-3A0B-3692-A312-1B6065B06F80> /Users/*/url_parser.cpython-314-darwin.so
+       0x106018000 -        0x106024db7 +url_parser.cpython-314-darwin.so (0) <6CB7B368-3A0B-3692-A312-1B6065B06F80> /Users/redacted/url_parser.cpython-314-darwin.so
        0x106038000 -        0x10603d463 +_lzma.cpython-314-darwin.so (0) <52B54ADC-338C-331E-B6AC-A138BB6BC210> /opt/homebrew/*/Python.framework/Versions/3.14/lib/python3.14/lib-dynload/_lzma.cpython-314-darwin.so
        0x10605c000 -        0x10639c59f +libcrypto.4.dylib (0) <C11B0873-E823-3733-8D85-9162927B8F91> /opt/homebrew/*/libcrypto.4.dylib
        0x1065f4000 -        0x1065fc8b3 +_zstd.cpython-314-darwin.so (0) <B0D16085-274A-3DF9-865B-C8F128EBEF58> /opt/homebrew/*/Python.framework/Versions/3.14/lib/python3.14/lib-dynload/_zstd.cpython-314-darwin.so
@@ -781,35 +781,35 @@ Binary Images:
        0x10666c000 -        0x106672d2f +_blake2.cpython-314-darwin.so (0) <85755F80-CC8E-3705-88DE-BC20FA15ADF3> /opt/homebrew/*/Python.framework/Versions/3.14/lib/python3.14/lib-dynload/_blake2.cpython-314-darwin.so
        0x106694000 -        0x106698e63 +_zoneinfo.cpython-314-darwin.so (0) <0332413A-AE50-390C-9627-9818A40D5C09> /opt/homebrew/*/Python.framework/Versions/3.14/lib/python3.14/lib-dynload/_zoneinfo.cpython-314-darwin.so
        0x1066a8000 -        0x1066ba1eb +_sqlite3.cpython-314-darwin.so (0) <EC80C4EC-5EC6-31C6-A472-7F0D67A37586> /opt/homebrew/*/Python.framework/Versions/3.14/lib/python3.14/lib-dynload/_sqlite3.cpython-314-darwin.so
-       0x1066d0000 -        0x1066d1963 +libXau.6.dylib (0) <076C8F8E-760A-39F4-A37C-3F99E4B3ED4C> /Users/*/libXau.6.dylib
-       0x1066e4000 -        0x1067806cf +_rust_notify.abi3.so (0) <CC65B703-8C09-35FA-9C4F-97DD97F21071> /Users/*/_rust_notify.abi3.so
+       0x1066d0000 -        0x1066d1963 +libXau.6.dylib (0) <076C8F8E-760A-39F4-A37C-3F99E4B3ED4C> /Users/redacted/libXau.6.dylib
+       0x1066e4000 -        0x1067806cf +_rust_notify.abi3.so (0) <CC65B703-8C09-35FA-9C4F-97DD97F21071> /Users/redacted/_rust_notify.abi3.so
        0x1068e8000 -        0x1068ec033 +mmap.cpython-314-darwin.so (0) <90494242-1DB9-3776-83D8-395C83060B48> /opt/homebrew/*/Python.framework/Versions/3.14/lib/python3.14/lib-dynload/mmap.cpython-314-darwin.so
        0x106904000 -        0x10692012f +_decimal.cpython-314-darwin.so (0) <0BDAAC62-0066-3755-A13C-9B27C0F24FB6> /opt/homebrew/*/Python.framework/Versions/3.14/lib/python3.14/lib-dynload/_decimal.cpython-314-darwin.so
        0x106934000 -        0x10694f4e7 +libmpdec.4.0.1.dylib (0) <A90FD8EC-2E82-33DE-9D8B-1A1EB800C02A> /opt/homebrew/*/libmpdec.4.0.1.dylib
        0x106974000 -        0x1069fb44f +libzstd.1.5.7.dylib (0) <1CE1197A-4A2B-3036-984E-95599210332B> /opt/homebrew/*/libzstd.1.5.7.dylib
        0x106b18000 -        0x106b20d5f +pyexpat.cpython-314-darwin.so (0) <B901B6D1-EC66-36C2-9109-477635E6555C> /opt/homebrew/*/Python.framework/Versions/3.14/lib/python3.14/lib-dynload/pyexpat.cpython-314-darwin.so
        0x106b34000 -        0x106b3f0ef +_elementtree.cpython-314-darwin.so (0) <CE664057-8A15-39C7-BAD5-3361BBD3C03B> /opt/homebrew/*/Python.framework/Versions/3.14/lib/python3.14/lib-dynload/_elementtree.cpython-314-darwin.so
-       0x106b50000 -        0x106b6bcd7 +libz.1.3.1.zlib-ng.dylib (0) <9EA7C0DD-E134-3F03-993D-5684959B80CA> /Users/*/libz.1.3.1.zlib-ng.dylib
-       0x106b7c000 -        0x106b84ddb +_imagingft.cpython-314-darwin.so (0) <CC9C0242-D414-34DE-836A-FB098FCA1B96> /Users/*/_imagingft.cpython-314-darwin.so
-       0x106ba0000 -        0x106cd9007 +loop.cpython-314-darwin.so (0) <88FF8D66-2F51-350B-8A5F-578353210F29> /Users/*/loop.cpython-314-darwin.so
-       0x107098000 -        0x1070a2183 +libbrotlidec.1.2.0.dylib (0) <7600E45C-7628-37D9-A368-75067100C065> /Users/*/libbrotlidec.1.2.0.dylib
-       0x1070dc000 -        0x107100787 +libxcb.1.1.0.dylib (0) <E113EB59-2487-3314-BA50-A1600863D73D> /Users/*/libxcb.1.1.0.dylib
-       0x107120000 -        0x10713ffff +libbrotlicommon.1.2.0.dylib (0) <BD0011F0-7730-3AE7-B698-FB8E9D3991F4> /Users/*/libbrotlicommon.1.2.0.dylib
+       0x106b50000 -        0x106b6bcd7 +libz.1.3.1.zlib-ng.dylib (0) <9EA7C0DD-E134-3F03-993D-5684959B80CA> /Users/redacted/libz.1.3.1.zlib-ng.dylib
+       0x106b7c000 -        0x106b84ddb +_imagingft.cpython-314-darwin.so (0) <CC9C0242-D414-34DE-836A-FB098FCA1B96> /Users/redacted/_imagingft.cpython-314-darwin.so
+       0x106ba0000 -        0x106cd9007 +loop.cpython-314-darwin.so (0) <88FF8D66-2F51-350B-8A5F-578353210F29> /Users/redacted/loop.cpython-314-darwin.so
+       0x107098000 -        0x1070a2183 +libbrotlidec.1.2.0.dylib (0) <7600E45C-7628-37D9-A368-75067100C065> /Users/redacted/libbrotlidec.1.2.0.dylib
+       0x1070dc000 -        0x107100787 +libxcb.1.1.0.dylib (0) <E113EB59-2487-3314-BA50-A1600863D73D> /Users/redacted/libxcb.1.1.0.dylib
+       0x107120000 -        0x10713ffff +libbrotlicommon.1.2.0.dylib (0) <BD0011F0-7730-3AE7-B698-FB8E9D3991F4> /Users/redacted/libbrotlicommon.1.2.0.dylib
        0x107158000 -        0x10720957b +unicodedata.cpython-314-darwin.so (0) <F29ACA5B-B283-3A2F-9624-9F52325D3DFE> /opt/homebrew/*/Python.framework/Versions/3.14/lib/python3.14/lib-dynload/unicodedata.cpython-314-darwin.so
        0x107350000 -        0x10745af8f +libsqlite3.3.54.1.dylib (0) <FFAE9354-8A9B-3A76-B3A2-7E784729967D> /opt/homebrew/*/libsqlite3.3.54.1.dylib
-       0x107988000 -        0x1079f1aff +_imaging.cpython-314-darwin.so (0) <FA291EEC-3799-3E32-B188-59C5109C45E0> /Users/*/_imaging.cpython-314-darwin.so
-       0x107a84000 -        0x107e34a37 +_pydantic_core.cpython-314-darwin.so (0) <CD899DE6-EA55-3224-A82A-C93F78C16BB9> /Users/*/_pydantic_core.cpython-314-darwin.so
-       0x108880000 -        0x10891f723 +libtiff.6.dylib (0) <D6423D17-C1D0-3D07-878A-9313993F323B> /Users/*/libtiff.6.dylib
-       0x10893c000 -        0x1089c555f +libjpeg.62.4.0.dylib (0) <ED74D7AE-7C43-3421-9076-3139840106A9> /Users/*/libjpeg.62.4.0.dylib
-       0x1089e0000 -        0x108a6adff +libopenjp2.2.5.4.dylib (0) <1CCAE3DF-8F33-3D89-A003-74AB46296CCE> /Users/*/libopenjp2.2.5.4.dylib
-       0x108a84000 -        0x108abe487 +liblzma.5.dylib (0) <44F9E356-56FF-3BBF-A891-AC38F38D5BCF> /Users/*/liblzma.5.dylib
-       0x108ad4000 -        0x108b121e3 +libpng16.16.dylib (0) <099CF0FE-76BE-39A4-B8E0-5A76DE06A11F> /Users/*/libpng16.16.dylib
-       0x108be8000 -        0x108ccf9a7 +libfreetype.6.dylib (0) <57B0CD08-F911-3E6A-BB65-809CE3C1F878> /Users/*/libfreetype.6.dylib
-       0x108e7c000 -        0x108e9ccaf +_cffi_backend.cpython-314-darwin.so (0) <F3CE924B-55B9-356D-B708-F0F3661A9CAC> /Users/*/_cffi_backend.cpython-314-darwin.so
-       0x108eb8000 -        0x108f74e3d +libharfbuzz.0.dylib (0) <5332F212-183E-398C-A699-CC568FF4243A> /Users/*/libharfbuzz.0.dylib
-       0x10b324000 -        0x10b3a43af +jiter.cpython-314-darwin.so (0) <FC2D8F5A-7D8F-3E8C-B55A-6B07600674C2> /Users/*/jiter.cpython-314-darwin.so
-       0x10bdc0000 -        0x10c61bf13 +_rust.abi3.so (0) <9E0D3F12-5B6C-34DF-9E4C-5467D6B232C8> /Users/*/_rust.abi3.so
-       0x10d700000 -        0x10d798347 +rpds.cpython-314-darwin.so (0) <053CE01F-BE08-3734-BDFA-5969C1DA6815> /Users/*/rpds.cpython-314-darwin.so
+       0x107988000 -        0x1079f1aff +_imaging.cpython-314-darwin.so (0) <FA291EEC-3799-3E32-B188-59C5109C45E0> /Users/redacted/_imaging.cpython-314-darwin.so
+       0x107a84000 -        0x107e34a37 +_pydantic_core.cpython-314-darwin.so (0) <CD899DE6-EA55-3224-A82A-C93F78C16BB9> /Users/redacted/_pydantic_core.cpython-314-darwin.so
+       0x108880000 -        0x10891f723 +libtiff.6.dylib (0) <D6423D17-C1D0-3D07-878A-9313993F323B> /Users/redacted/libtiff.6.dylib
+       0x10893c000 -        0x1089c555f +libjpeg.62.4.0.dylib (0) <ED74D7AE-7C43-3421-9076-3139840106A9> /Users/redacted/libjpeg.62.4.0.dylib
+       0x1089e0000 -        0x108a6adff +libopenjp2.2.5.4.dylib (0) <1CCAE3DF-8F33-3D89-A003-74AB46296CCE> /Users/redacted/libopenjp2.2.5.4.dylib
+       0x108a84000 -        0x108abe487 +liblzma.5.dylib (0) <44F9E356-56FF-3BBF-A891-AC38F38D5BCF> /Users/redacted/liblzma.5.dylib
+       0x108ad4000 -        0x108b121e3 +libpng16.16.dylib (0) <099CF0FE-76BE-39A4-B8E0-5A76DE06A11F> /Users/redacted/libpng16.16.dylib
+       0x108be8000 -        0x108ccf9a7 +libfreetype.6.dylib (0) <57B0CD08-F911-3E6A-BB65-809CE3C1F878> /Users/redacted/libfreetype.6.dylib
+       0x108e7c000 -        0x108e9ccaf +_cffi_backend.cpython-314-darwin.so (0) <F3CE924B-55B9-356D-B708-F0F3661A9CAC> /Users/redacted/_cffi_backend.cpython-314-darwin.so
+       0x108eb8000 -        0x108f74e3d +libharfbuzz.0.dylib (0) <5332F212-183E-398C-A699-CC568FF4243A> /Users/redacted/libharfbuzz.0.dylib
+       0x10b324000 -        0x10b3a43af +jiter.cpython-314-darwin.so (0) <FC2D8F5A-7D8F-3E8C-B55A-6B07600674C2> /Users/redacted/jiter.cpython-314-darwin.so
+       0x10bdc0000 -        0x10c61bf13 +_rust.abi3.so (0) <9E0D3F12-5B6C-34DF-9E4C-5467D6B232C8> /Users/redacted/_rust.abi3.so
+       0x10d700000 -        0x10d798347 +rpds.cpython-314-darwin.so (0) <053CE01F-BE08-3734-BDFA-5969C1DA6815> /Users/redacted/rpds.cpython-314-darwin.so
        0x189f98000 -        0x189fe75f7  libobjc.A.dylib (973.1) <C0680DF6-9900-3C29-A071-95A031686EF8> /usr/lib/libobjc.A.dylib
        0x189fe8000 -        0x189ff223f  libsharedcache.dylib (0) <BBF95357-BEBF-3D89-8900-2BBB14A667C5> /usr/lib/libsharedcache.dylib
        0x189ff3000 -        0x18a019d3b  libdyld.dylib (27062) <62863BCA-DD60-3D32-A9DB-89099BA6F3D7> /usr/lib/system/libdyld.dylib

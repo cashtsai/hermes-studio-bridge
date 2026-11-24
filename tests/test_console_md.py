@@ -138,8 +138,8 @@ FEATURE_CASES = [
      "contains": ['data-dl="/app/v2/artifacts/def456"', "report.pdf"], "not": ["!["]},
     # 本地路徑的圖:載不出來,但要降成乾淨檔名,不是丟一坨原始 markdown 在那。
     {"name": "local-path image → clean label not raw markdown",
-     "src": "![screenshot.jpg](/Users/x/screenshot.jpg)",
-     "contains": ["screenshot.jpg"], "not": ["![", "/Users/x/screenshot.jpg"]},
+     "src": "![screenshot.jpg](/Users/example/screenshot.jpg)",
+     "contains": ["screenshot.jpg"], "not": ["![", "/Users/example/screenshot.jpg"]},
 ]
 
 # ── CJK 樣本(主場是台灣,這些是每天都會打出來的句子)──────────────────────

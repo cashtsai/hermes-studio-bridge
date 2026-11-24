@@ -617,10 +617,13 @@ def _media_persona_outbox(persona: str) -> str:
     路徑就變成可下載,正是家目錄外洩那類洞。人格把要給使用者的檔寫進 outbox、
     在訊息裡用 `[[attach:/…/outbox/檔名]]` 標明,就能安全掛成附件。
     """
-    pid = str(persona or "").strip() or "xcash"
+    pid = str(persona or "").strip()
+    if pid not in PERSONAS:
+        return ""
     try:
-        base = home_for(pid if pid in PERSONAS else "xcash")
-    except Exception:  # noqa: BLE001 — 查不到人格 home 就當作沒有 root(不炸)
+        base = home_for(pid)
+    except Exception as exc:  # noqa: BLE001
+        _log_exc("media_persona_outbox", exc, expected=True, error_message="[redacted]")
         return ""
     return os.path.join(base, "outbox") if base else ""
 
@@ -668,8 +671,8 @@ def _media_vet_logged(ref, roots, session_id: str, allow_any_kind: bool = False)
                     else "non_attachable_kind"
                 _log_event("media_ref_rejected", session=session_id,
                            reason=reason, roots=len(roots), explicit=allow_any_kind)
-        except Exception:  # noqa: BLE001 — 診斷用,絕不能反過來弄壞附件流程
-            pass
+        except Exception as exc:  # noqa: BLE001
+            _log_exc("media_ref_diagnostic", exc, expected=True, error_message="[redacted]")
     return verdict
 
 
@@ -10602,11 +10605,14 @@ async def _capture_stdout(*args, cwd=None, timeout: float = 20.0, diagnose=False
         stderr=asyncio.subprocess.PIPE if diagnose else asyncio.subprocess.DEVNULL)
     try:
         out, err = await asyncio.wait_for(proc.communicate(), timeout)
-    except asyncio.TimeoutError:
+    except (asyncio.TimeoutError, asyncio.CancelledError) as exc:
         try:
             proc.kill()
         except ProcessLookupError:
-            pass
+            _log_event("capture_process_already_exited")
+        await asyncio.wait_for(proc.communicate(), 5)
+        if isinstance(exc, asyncio.CancelledError):
+            raise
         _log_event("subprocess_timeout", executable=args[0], timeout_s=timeout)
         return 124, ""
     data = err if diagnose and proc.returncode else out
@@ -37314,19 +37320,8 @@ async def _make_worktree(base: str, sid: str):
 
 
 async def _git_out(*args, timeout: float = 15.0):
-    """Run git, return (rc, stdout_str). Kill-on-timeout like _tmux_run."""
-    p = await asyncio.create_subprocess_exec(
-        "git", *args,
-        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
-    try:
-        out, _ = await asyncio.wait_for(p.communicate(), timeout)
-    except asyncio.TimeoutError:
-        try:
-            p.kill()
-        except ProcessLookupError:
-            pass
-        return 124, ""
-    return p.returncode, (out or b"").decode("utf-8", "replace")
+    """Share timeout/cancellation cleanup with other captured commands."""
+    return await _capture_stdout("git", *args, timeout=timeout)
 
 
 async def _worktree_try_remove(sid: str, wt: str, origin: str) -> bool:
