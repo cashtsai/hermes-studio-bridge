@@ -37,7 +37,7 @@ internals.
 This extension requires coordinated Pocket ID and iOS updates. It is not a
 new provider runtime and does not collect provider OAuth/API credentials.
 
-- `GET /app/v1/line/targets` (owner device token): `{targets, degraded_providers, host_id}`.
+- `GET /app/v1/line/targets` (owner device token): `{targets, degraded_providers, host_id, approval_mode}`.
   Targets are drawn from the same v2 session roster, require `input`, and exclude
   archived/offline/stopped rows and arbitrary terminals/delegations. Supported
   providers: Hermes, Claude Code (tmux and cc2), Codex, Gemini, Grok, OpenCode,
@@ -74,7 +74,7 @@ The host-local `<CANON_DB>.line.db` holds transport receipts, input hashes and
 pending replies, not a second transcript. Completed replies go to the fixed
 Pocket ID `/v1/line/notify` callback with token, session ID and client ID. Only
 the matching incoming LINE event can receive the result. Text is sanitized;
-reasoning/tool output is excluded. Approval remains in Pocket. Existing Hermes
+reasoning/tool output is excluded. Manual approval exceptions remain in Pocket. Existing Hermes
 delegation notices remain restricted to the bound Hermes persona.
 
 Limits: at most 16 tracked LINE tasks per host; 30-minute reply observation;
@@ -90,6 +90,46 @@ Pocket ID activation and database update are not a distributed transaction.
 If a connection fails during switching, refresh status and reselect the target;
 never silently route to another host. Production acceptance must cover this
 failure, multi-host switching, provider login/quota errors and long tasks.
+
+#### LINE Automatic Permissions (2026-11-24)
+
+New LINE session inputs default to single-use tool permission approval. The
+host may opt out with `POCKET_LINE_AUTO_APPROVE=0` and a service restart.
+`GET /app/v1/line/targets` and fresh input acceptance receipts expose
+`approval_mode: "auto-once" | "manual"`; this is a policy, not a promise that
+every request can be resolved automatically. No provider login, sandbox or
+session-wide permission settings change. Existing unfinished tasks and legacy
+persona inputs are not replayed or retroactively approved.
+
+- Only the tracked LINE turn is eligible, using the provider request's explicit
+  turn ID (`approval.body.request_turn_id`), not the card's inferred display turn.
+  Native Claude Code requires the matching native user echo and no intervening
+  human user message, plus the existing live-prompt check before sending a key.
+- The active LINE binding is checked again under the shared approval-decision
+  lock. Revoked, pending, expired or switched bindings cannot approve old work.
+  The row must match the session, be pending, unexpired and created after input
+  tracking began (second-granularity providers use that same second boundary).
+- Only known single-use options are selected: never `allow_always`,
+  `acceptForSession`, session-level bypass, questionnaires, notices or guest
+  message approvals. ACP option objects now preserve their additive `kind`.
+  Missing turn proof or a single-use option leaves the existing manual flow.
+- Codex, cc2, Gemini, Grok and OpenCode carry request-turn correlation. OpenClaw
+  is eligible only when the gateway supplies the request run ID. Hermes native
+  tool permissions retain their existing behavior; business/harness approval
+  rows without authoritative turn correlation remain manual.
+- Decisions reuse the canonical Approval Hub and provider handlers, with
+  existing resolved-card broadcasts and receipts. Structured logs use
+  `line_permission_auto_decided` / `line_permission_auto_failed` with hashed
+  client/approval IDs, never tokens or prompt content. Observer cleanup,
+  30-minute tracking limit and restart no-replay rules remain unchanged.
+
+Verification: `tests/test_line_auto_approval.py` covers endpoint dispatch,
+single-use provider outcomes, manual-decision races, revocation, event gaps,
+cross-device turn isolation, question exclusions and waiter cleanup. Use the
+production runtime Python for smoke tests. Restart only after all turns are
+idle, from an external launchd job: an active bridge-backed Codex session must
+not restart its own bridge. Read back `approval_mode` after restart; a queued
+deployment is not a completed deployment.
 
 ### Console W2 Operations (2026-11-18, Additive)
 
