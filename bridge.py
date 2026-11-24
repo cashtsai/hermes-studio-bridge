@@ -39900,6 +39900,41 @@ class _InternalAuthRequest:
         return self._body
 
 
+def _line_helper_token_value() -> str:
+    """這台的 LINE 小幫手 device token(綁定時鑄的那枚,platform=line)。
+    沒綁過 = 空字串。token 本身就是 store 的 key(現有設計),拿第一枚即可
+    (line/token 端點保證一機一枚)。"""
+    with _PAIR_LOCK:
+        for t, d in _DEVICE_TOKENS.items():
+            if d.get("platform") == "line":
+                return t
+    return ""
+
+
+async def _line_async_notify(persona: str, text: str) -> None:
+    """把人格收到的異步回報轉知 pocket-id → push 到綁定的 LINE。
+
+    認證=LINE 小幫手 token(pocket-id 綁定時收過同一把,查表即驗明正身)。
+    pocket-id 端會再驗權益與人格是否就是綁定的那位(別的人格的動靜不推)。
+    沒綁定/沒設 POCKET_ID_URL → 靜默跳過,零成本。"""
+    tok = _line_helper_token_value()
+    if not tok or not POCKET_ID_URL.startswith("https://"):
+        return
+    payload = json.dumps({"bridge_token": tok, "persona": persona,
+                          "text": text[:4000]}, ensure_ascii=False).encode()
+
+    def _post() -> int:
+        req = urllib.request.Request(
+            f"{POCKET_ID_URL}/v1/line/notify", data=payload, method="POST",
+            headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return r.status
+
+    status = await asyncio.to_thread(_post)
+    _log_event("line_async_notify", persona=persona, status=status,
+               chars=len(text))
+
+
 async def _agent_call_maybe_deliver(call_id: str) -> None:
     """auto-bridge(closure 契約):call 結案時把結果**送回 caller 的
     session 喚醒它**,而不是等 caller 自己想起來輪詢。
@@ -39939,6 +39974,17 @@ async def _agent_call_maybe_deliver(call_id: str) -> None:
                                                   "deliver_error": str(_exc)[:200]})
         _log_exc("_agent_call_maybe_deliver", _exc, expected=True,
                  call=call_id, caller=caller)
+        return
+    # LINE 異步回報(2026-11-24):交辦完成的回報除了喚醒 caller 人格,若這台
+    # 有 LINE 小幫手綁定(platform=line 的 device token)就一併通知 pocket-id
+    # push 給綁定的 LINE 使用者 —— reply token 只活 60 秒,分鐘/小時級的
+    # 完成回報只有 push 這條路。best-effort:失敗只留痕,絕不影響主投遞。
+    if caller.startswith("hermes:"):
+        try:
+            await _line_async_notify(caller.split(":", 1)[1],
+                                     f"{head} {text}")
+        except Exception as _exc:  # noqa: BLE001
+            _log_exc("_line_async_notify", _exc, expected=True, call=call_id)
 
 
 async def _agent_call_waiter(call_id: str, caller: str, target: str,
