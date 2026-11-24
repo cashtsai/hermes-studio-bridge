@@ -214,8 +214,8 @@ def check_card_stream(base, token, sessions, res: Result):
     return True
 
 
-def check_ring_headroom(base, token, sessions, res: Result):
-    """事件環餘裕:latest_seq 逼近上限 → 客戶端會頻繁 410 整包重載。"""
+def check_event_cursor(base, token, sessions, res: Result):
+    """Validate the snapshot cursor; cumulative sequence is not ring occupancy."""
     target = next((s for s in sessions if s.get("thread_id")), None)
     if not target:
         return
@@ -223,16 +223,13 @@ def check_ring_headroom(base, token, sessions, res: Result):
     try:
         snap = get(base, f"/app/v2/sessions/codex:{tid}/cards?limit=1",
                    token, timeout=20)
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
+        res.add("事件游標有效", False, f"snapshot unavailable: {type(exc).__name__}")
         return
     seq = snap.get("latest_seq")
-    ring = int(os.environ.get("POCKET_CARD_RING_MAX", "8000"))
-    if isinstance(seq, int) and seq > ring * 0.8:
-        res.add("事件環有餘裕", False,
-                f"latest_seq={seq} 逼近 ring_max={ring} → 客戶端會頻繁 410",
-                warn=True)
-    else:
-        res.add("事件環有餘裕", True, note=f"latest_seq={seq} / ring_max={ring}")
+    res.add("事件游標有效", type(seq) is int and seq >= 0,
+            "latest_seq must be a nonnegative integer",
+            note=f"latest_seq={seq}; buffer occupancy is not exposed by this endpoint")
 
 
 def check_live_roundtrip(base, token, session_id, res: Result):
@@ -286,7 +283,7 @@ def main() -> int:
             sessions = check_codex_sessions(args.base, token, res)
             if isinstance(sessions, list) and sessions:
                 check_card_stream(args.base, token, sessions, res)
-                check_ring_headroom(args.base, token, sessions, res)
+                check_event_cursor(args.base, token, sessions, res)
             if args.live:
                 check_live_roundtrip(args.base, token, args.live, res)
 

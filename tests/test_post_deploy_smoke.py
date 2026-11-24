@@ -11,6 +11,7 @@ import os
 import plistlib
 import tempfile
 import unittest
+from unittest.mock import patch
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _SPEC = importlib.util.spec_from_file_location(
@@ -153,6 +154,30 @@ class CardStreamInvariantTests(unittest.TestCase):
         out = self._run([{"ts": 300}], many)
         self.assertTrue(out["卡片按時間遞增"]["ok"])
         self.assertTrue(out["小 limit 給最新段"]["ok"])
+
+
+class EventCursorTests(unittest.TestCase):
+    def test_large_sequence_does_not_mean_ring_full(self):
+        with patch.object(smoke, "get", return_value={"latest_seq": 1000000}):
+            res = smoke.Result()
+            smoke.check_event_cursor("http://x", "tok", [session()], res)
+        self.assertFalse(res.failed)
+        self.assertFalse(res.warned)
+        self.assertEqual(len(res.checks), 1)
+
+    def test_invalid_cursor_fails(self):
+        for seq in (None, -1, True, "1"):
+            with self.subTest(seq=seq), patch.object(smoke, "get", return_value={"latest_seq": seq}):
+                res = smoke.Result()
+                smoke.check_event_cursor("http://x", "tok", [session()], res)
+                self.assertEqual(len(res.failed), 1)
+
+    def test_snapshot_failure_is_not_silently_skipped(self):
+        with patch.object(smoke, "get", side_effect=TimeoutError("private detail")):
+            res = smoke.Result()
+            smoke.check_event_cursor("http://x", "tok", [session()], res)
+        self.assertEqual(len(res.failed), 1)
+        self.assertNotIn("private detail", str(res.checks))
 
 
 if __name__ == "__main__":

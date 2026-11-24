@@ -32,6 +32,12 @@ exception entry is removed; no existing violation count is increased.
 
 ## Deployment Incident
 
+The smoke check also confused cumulative latest_seq with ring occupancy. A
+large sequence does not imply a client cursor has fallen behind retained events.
+Validate the cursor shape instead; do not claim buffer headroom from an endpoint
+that does not expose it. Missing/malformed snapshots fail rather than silently
+passing, and synthetic tests cover high valid sequences and bad responses.
+
 The previous attempt restarted the bridge, then stopped at the read-only
 canonical DB smoke check. Pocket ID and build 246 upload were not reached.
 The one-shot job was removed; its original state/logs/lock remain for audit.
