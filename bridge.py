@@ -921,6 +921,8 @@ def _console_entry_expired(entry: dict, now: float | None = None) -> bool:
 
 
 def _browser_token_expired(entry: dict) -> bool:
+    if entry.get("platform") == "line" and entry.get("pending"):
+        return _expires_passed(entry.get("expires"))
     if entry.get("scope") == CONSOLE_REMOTE_SCOPE:
         return _console_entry_expired(entry)
     if not entry.get("console_session"):
@@ -1049,6 +1051,18 @@ def _token_is_valid(token: str) -> bool:
     return False
 
 
+def _line_path_allowed(entry, request):
+    if getattr(getattr(request, "state", None), "line_remote", False) is True:
+        return True  # Only the internal, target-checked shim sets this attribute.
+    allowed = {("GET", "/app/v1/line/binding"), ("POST", "/app/v1/line/activate")}
+    if entry.get("scope") == "line-session" and not entry.get("pending"):
+        allowed.add(("POST", "/app/v1/line/messages"))
+    elif not entry.get("scope"):
+        allowed.add(("POST", "/app/v1/messages"))
+    scope = getattr(request, "scope", {})
+    return (scope.get("method"), scope.get("path")) in allowed
+
+
 def _check_auth(request: Request) -> None:
     auth = request.headers.get("authorization", "")
     token = auth[7:].strip() if auth.lower().startswith("bearer ") else ""
@@ -1060,6 +1074,8 @@ def _check_auth(request: Request) -> None:
         with _PAIR_LOCK:
             dev = _DEVICE_TOKENS.get(token)
             if dev is not None:
+                if dev.get("platform") == "line" and not _line_path_allowed(dev, request):
+                    raise http_err(403, "SCOPE_FORBIDDEN", "LINE 憑證只能操作綁定對話")
                 # console-remote 是**唯一有有效期**的 device token(規格 §9)。
                 # middleware 已經擋過一次,這裡是第二道 —— WS upgrade 之類
                 # 不走 HTTP middleware 的路徑只會經過這裡。
@@ -1359,6 +1375,16 @@ async def acp_full(model: str, prompt: str) -> str:
 
 
 app = FastAPI(title="Hermes ↔ OpenAI bridge")
+
+
+@app.middleware("http")
+async def _line_scope_guard(request: Request, call_next):
+    entry = _token_entry(_request_token(request)) or {}
+    if entry.get("platform") == "line":
+        if not _line_path_allowed(entry, request):
+            return JSONResponse(status_code=403, content={"error": {
+                "code": "SCOPE_FORBIDDEN", "message": "LINE 憑證只能操作綁定對話"}})
+    return await call_next(request)
 
 
 @app.middleware("http")
@@ -11071,16 +11097,17 @@ def _line_seed_pocket_home(home: str) -> None:
 
 @app.post("/app/v1/line/token")
 async def line_helper_token(request: Request):
-    """已配對裝置幫「LINE 小幫手」鑄一枚專屬 token(綁定流程上繳 pocket-id,
-    pocket-id 收到 LINE 訊息時拿它打本機的 /app/v1/messages 跟人格對話)。
+    """Mint a separately revocable LINE credential for Pocket ID.
 
-    權限面:呼叫端必須已持有 device token(或 master)—— 鑄出來的也是一枚
-    device token,不是權限擴大。獨立一枚的理由:
-      · **可單獨撤銷**:解除 LINE 綁定殺這枚就好,不動手機自己的 token
-      · 裝置清單(/pair/devices)看得見「LINE 小幫手」這一項,不是隱形憑證
-    一機同時只留一枚(重綁先撤舊的)—— 舊 token 在 pocket-id 那邊已被覆蓋,
-    留著只是殭屍。"""
+    With session_id, issue a ten-minute pending, session-scoped token. Keep
+    the active binding until /line/activate confirms the replacement. Legacy
+    no-body clients retain persona-only routing and immediate replacement.
+    Both token types remain visible to the owner in /pair/devices.
+    """
     _check_auth(request)
+    raw = await request.body()
+    body = await _json_body(request) if raw else {}
+    target = str(body.get("session_id") or "").strip()
     # 綁定即開箱可用(機主 2026-11-24 拍板):這台還沒有「pocket」人格就
     # 自動開一個預設的,使用者之後在智能體裡可換綁別的人格。
     # ⚠️ home 必須是 **profiles/pocket 專屬目錄**,不能用 HOME_ROOT ——
@@ -11095,23 +11122,197 @@ async def line_helper_token(request: Request):
             _personas_reload()
             _log_event("persona_created", id="pocket", home=pocket_home,
                        provisioned=False, via="line_bind_default")
+    if target:
+        await _line_target(target, request)
     with _PAIR_LOCK:
         stale = [t for t, d in _DEVICE_TOKENS.items()
-                 if d.get("platform") == "line"]
+                 if d.get("platform") == "line" and
+                 (not target or d.get("pending"))]
         for t in stale:
             _DEVICE_TOKENS.pop(t, None)
         if stale:
             _save_device_tokens(_DEVICE_TOKENS)
-    token, _device = _pair_issue_device_token("LINE 小幫手", "line")
-    # 一併回報這台在 pocket-id 的 host_id:綁定時釘住**這一台**,多主機
-    # 帳號才不會把 LINE 訊息路由到別台(機主 2026-11-24 實測:帳號下有
-    # 龍蝦 + Mac,「取第一台」可能挑到沒有這枚 token 的機器)。
-    # 沒 enroll 過回空字串 —— pocket-id 退回舊的「取第一台」行為。
+    token, _device = _pair_issue_device_token("LINE 小幫手", "line", extra={
+        "scope": "line-session", "session_id": target,
+        "pending": True, "expires": time.time() + 600,
+    } if target else None)
+    # Preserve the host identity from enrollment; Pocket ID checks ownership.
     host_id = str((_pocket_id_state() or {}).get("host_id") or "")
     _log_event("line_helper_token_minted", replaced=len(stale),
                token_hash=_short_hash(token),
                host_id_hash=_short_hash(host_id))
     return {"token": token, "host_id": host_id}
+
+
+import line_sessions
+
+_LINE_RECEIPTS = None
+_LINE_TASKS = {}
+
+
+def _line_receipts():
+    global _LINE_RECEIPTS
+    if _LINE_RECEIPTS is None:
+        _LINE_RECEIPTS = line_sessions.Receipts(CANON_DB + ".line.db")
+    return _LINE_RECEIPTS
+
+
+@app.get("/app/v1/line/targets")
+async def line_targets(request: Request):
+    rows = await v2_sessions(request)
+    return {"targets": [{k: r.get(k) for k in ("id", "provider", "title", "status")}
+                        for r in rows["sessions"]
+                        if r.get("provider") in line_sessions.PROVIDERS
+                        and str(r.get("id", "")).partition(":")[0] in line_sessions.PROVIDERS
+                        and "input" in (r.get("capabilities") or [])
+                        and r.get("status") not in {"archived", "offline", "stopped"}],
+            "degraded_providers": rows.get("degraded_providers", []),
+            "host_id": str((_pocket_id_state() or {}).get("host_id") or "")}
+
+
+async def _line_target(sid, request):
+    if len(sid) > 256:
+        raise http_err(422, "BAD_TARGET", "對話代號過長")
+    rows = await line_targets(request)
+    row = next((r for r in rows["targets"] if r["id"] == sid), None)
+    if row is None:
+        raise http_err(404, "SESSION_NOT_FOUND", "請選擇目前主機上的可用對話")
+    return row
+
+
+@app.get("/app/v1/line/binding")
+async def line_binding_info(request: Request):
+    _check_auth(request)
+    entry = _token_entry(_request_token(request)) or {}
+    if entry.get("scope") != "line-session":
+        raise http_err(403, "SCOPE_FORBIDDEN", "需要新版 LINE 專用憑證")
+    return {"session_id": entry["session_id"], "scope": "line-session"}
+
+
+@app.post("/app/v1/line/activate")
+async def line_binding_activate(request: Request):
+    await line_binding_info(request)
+    token = _request_token(request)
+    with _PAIR_LOCK:
+        entry = _DEVICE_TOKENS[token]
+        for old in [t for t, d in _DEVICE_TOKENS.items()
+                    if d.get("platform") == "line" and t != token and not d.get("pending")]:
+            _DEVICE_TOKENS.pop(old, None)
+        entry["pending"] = False
+        entry.pop("expires", None)
+        _save_device_tokens(_DEVICE_TOKENS)
+    return {"ok": True}
+
+
+class _LineInputRequest:
+    client = None
+
+    def __init__(self, request, body):
+        self.headers = request.headers
+        self.state = type("LineState", (), {"line_remote": True})()
+        self._body = body
+
+    async def json(self):
+        return self._body
+
+
+@app.post("/app/v1/line/messages")
+async def line_session_message(request: Request):
+    info = await line_binding_info(request)
+    token = _request_token(request)
+    if (_token_entry(token) or {}).get("pending"):
+        raise http_err(403, "SCOPE_FORBIDDEN", "LINE 綁定尚未啟用")
+    body = await _json_body(request)
+    cid, text = str(body.get("client_id") or ""), str(body.get("content") or "").strip()
+    sid = info["session_id"]
+    if (set(body) - {"session_id", "client_id", "content"} or body.get("session_id") != sid
+            or not re.fullmatch(r"line-[a-f0-9]{64}", cid) or not 0 < len(text) <= 5000):
+        raise http_err(422, "BAD_LINE_INPUT", "訊息或綁定對話不符")
+    if len(_LINE_TASKS) >= 16 and cid not in _LINE_TASKS:
+        raise http_err(429, "LINE_BUSY", "主機的 LINE 工作已滿，請稍後再傳")
+    receipts = _line_receipts()
+    try:
+        fresh, row = receipts.claim(cid, token, sid, text)
+    except ValueError:
+        raise http_err(409, "CLIENT_ID_CONFLICT", "訊息識別碼已使用")
+    if not fresh:
+        return {"ok": True, "accepted": True, "duplicate": True, "status": row["status"]}
+
+    async def run():
+        try:
+            # Validate against the current roster, not just a syntactically valid ID.
+            await _line_target(sid, request)
+            store = await _v2_card_store(sid)
+            seq = store.seq
+            store.subscribers += 1
+            try:
+                ack = await v2_session_input(sid, _LineInputRequest(request, {
+                    "content": text, "client_id": cid}))
+            finally:
+                store.subscribers -= 1
+            turn_id = ack.get("turn_id") or ("turn-" + ack["run_id"] if ack.get("run_id") else "")
+            answer = await line_sessions.wait_reply(store, cid, seq, turn_id,
+                                                    native_cc=sid.startswith("claude_code:"))
+            receipts.finish(cid, "done", answer)
+        except asyncio.CancelledError:
+            # Kept pending on disk; restart reconciliation sends an honest notice.
+            raise
+        except Exception as exc:
+            _log_event("line_input_failed", provider=sid.partition(":")[0], error=type(exc).__name__)
+            receipts.finish(cid, "error", "對話暫時無法執行，可能未登入、離線或等待審核。請回 Pocket 查看；沒有自動重送。")
+        finally:
+            _LINE_TASKS.pop(cid, None)
+
+    task = asyncio.create_task(run())
+    _LINE_TASKS[cid] = task
+    _BG_TASKS.add(task)
+    task.add_done_callback(_BG_TASKS.discard)
+    return {"ok": True, "accepted": True, "client_id": cid}
+
+
+async def _line_delivery_once():
+    for row in _line_receipts().pending_delivery():
+        _line_receipts().attempted(row)
+        with _PAIR_LOCK:
+            token = next((t for t, d in _DEVICE_TOKENS.items()
+                          if d.get("platform") == "line" and not d.get("pending")
+                          and line_sessions.digest(t) == row["token_hash"]), "")
+        if not token:
+            _line_receipts().delivered(row["id"])
+            continue
+        payload = json.dumps({"bridge_token": token, "session_id": row["session_id"],
+                              "client_id": row["id"], "text": row["result"]}, ensure_ascii=False).encode()
+        def post():
+            req = urllib.request.Request(f"{POCKET_ID_URL}/v1/line/notify", data=payload,
+                                         headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=10) as res:
+                return json.loads(res.read())
+        try:
+            result = await asyncio.to_thread(post)
+            if result.get("pushed") or result.get("reason") in {
+                    "target_mismatch", "not_entitled", "duplicate", "empty"}:
+                _line_receipts().delivered(row["id"])
+        except urllib.error.HTTPError as exc:
+            if exc.code in (401, 403, 404):
+                _line_receipts().delivered(row["id"])
+        except Exception as exc:
+            _log_event("line_delivery_retry", error=type(exc).__name__)
+
+
+@app.on_event("startup")
+async def _line_delivery_startup():
+    _line_receipts().recover()
+    async def worker():
+        while True:
+            if POCKET_ID_URL.startswith("https://"):
+                try:
+                    await _line_delivery_once()
+                except Exception as exc:
+                    _log_event("line_delivery_retry", error=type(exc).__name__)
+            await asyncio.sleep(10)
+    task = asyncio.create_task(worker())
+    _BG_TASKS.add(task)
+    task.add_done_callback(_BG_TASKS.discard)
 
 
 @app.get("/pair/devices")
@@ -23015,6 +23216,10 @@ async def v2_session_input(session_id: str, request: Request):
     _check_auth(request)
     body = await _json_body(request)
     src = _v2_card_source(session_id)
+    if getattr(getattr(request, "state", None), "line_remote", False) is True and src[0] == "cc":
+        message = str(body.get("text") or body.get("content") or "").lstrip()
+        if message.startswith(("!", "/")) or _cc_composer_region(await _cc_capture_pane_fresh(src[1])) is None:
+            raise http_err(403, "SCOPE_FORBIDDEN", "LINE 只能在 Claude 對話輸入區傳訊息")
     if getattr(getattr(request, "state", None), "console_remote", False) is True:
         atts = body.get("attachments") or []
         if (set(body) - {"content", "text", "client_id", "attachments"} or
@@ -23031,7 +23236,9 @@ async def v2_session_input(session_id: str, request: Request):
     if src[0] == "cx" and not session_id.startswith("codex:"):
         _registry_call_safe("touch", f"codex:{src[1]}")
     if src[0] == "cc":
-        marker = _CONSOLE_CC_INPUT.set(getattr(getattr(request, "state", None), "console_remote", False) is True)
+        marker = _CONSOLE_CC_INPUT.set(
+            getattr(getattr(request, "state", None), "console_remote", False) is True or
+            getattr(getattr(request, "state", None), "line_remote", False) is True)
         try:
             res = await _cc_input_core(src[1], body)
         finally:
@@ -23141,7 +23348,7 @@ async def v2_session_input(session_id: str, request: Request):
             if client.is_active(src[1]) or client.is_thread_locked(src[1]):
                 return _accept_queued_v2()
             try:
-                await client.start_turn(src[1], items, client_id=client_id)
+                turn_result = await client.start_turn(src[1], items, client_id=client_id)
             except CodexAppServerError as e:
                 # 直送當下才第一次撞鎖 → 一樣入佇列(鎖已由 start_turn 記進
                 # 狀態機 + 推卡,這裡只補收訊息)。
@@ -23150,7 +23357,10 @@ async def v2_session_input(session_id: str, request: Request):
                 _codex_http_error(e)
             _cx_feed_input_accepted(src[1], client_id, text, attachments,
                                     typed_text=text, create_if_missing=True)
-            res = {"delivery": "accepted", "queued": False}
+            turn = turn_result.get("turn") if isinstance(turn_result, dict) else None
+            turn_id = turn.get("id") if isinstance(turn, dict) else None
+            res = {"delivery": "accepted", "queued": False,
+                   "turn_id": turn_id if isinstance(turn_id, str) else ""}
             _cx_input_settle(entry, res)
             return {"ok": True, "session_id": session_id, "accepted": True, **res}
         except BaseException:
@@ -23228,7 +23438,8 @@ async def _v2_persona_input(session: str, session_id: str, body: dict,
     # 辨識中…」原地替換成辨識文字(feat/stt-transcript-echo);message_id
     # 仍是回顯卡對位鍵。舊 app 忽略多的欄位,無害。
     return {"ok": True, "session_id": session_id, "accepted": True,
-            "queued": queued, "message_id": user_mid, "content": content}
+            "queued": queued, "message_id": user_mid, "content": content,
+            "turn_id": f"turn-{cid}"}
 
 
 _CX_COMPACT_RUNNING: dict = {}   # thread_id -> started_ts(防重複點)
@@ -23986,6 +24197,9 @@ def _cc_digest_lines(store, lines, jsonl_path: str, start_lineno: int) -> int:
                 d, uid, turn_id=store.turn_id,
                 image_sink=_cc_image_sink(getattr(store, "media_session_id", "") or "cc")):
             card = carddigest.merge_input_accepted_echo(store, card)
+            if d.get("uuid"):
+                card["body"]["native_message_id"] = str(d["uuid"])
+                card["body"]["native_parent_id"] = str(d.get("parentUuid") or "")
             # CC_TOKEN_STREAM:正典助手卡接管 pane-diff 草稿卡的 id(原位換文)。
             card = _cc_stream_reconcile(store, card)
             store.upsert_card(card)
@@ -29668,14 +29882,15 @@ def _gm_turn_end_push(key: str, digest, summary: str, ok: bool) -> None:
 
 
 async def _gm_run_turn(key: str, content: str,
-                       blocks: list | None = None) -> None:
+                       blocks: list | None = None, turn_cid: str = "") -> None:
     d = await _gm_card_digest(key)
-    cid = uuid.uuid4().hex[:10]
+    cid = turn_cid or uuid.uuid4().hex[:10]
     acp_sid = ""
+    d.turn_begin(cid, "已送達 Gemini，回覆中。")
     try:
         acp_sid = await GEMINI.ensure_session(key)
         _GM_TURNS[acp_sid] = {"cid": cid, "text": "", "key": key}
-        d.turn_begin(cid, "已送達 Gemini，回覆中。")
+        _GM_TURNS.pop(f"hold:{cid}", None)
         gemini_provider.touch_session(key, title_hint=content)
         res = await GEMINI.call(
             "session/prompt",
@@ -29709,6 +29924,7 @@ async def _gm_run_turn(key: str, content: str,
     finally:
         if acp_sid:
             _GM_TURNS.pop(acp_sid, None)
+        _GM_TURNS.pop(f"hold:{cid}", None)
         # 回合收尾掃卡掛附件(2026-11-17):gemini 原本只在**使用者上傳**那條
         # 入庫,agent 自己產的檔案一律是裸路徑。放 finally = 成功/失敗共用。
         _schedule_media_attach(d.store, _store_media_sid(d.store, f"gemini:{key}"))
@@ -29717,12 +29933,15 @@ async def _gm_run_turn(key: str, content: str,
         # 而使用者看到的只是「我後來送的那幾則全部沒反應」。
         pending = _GM_INPUT_QUEUE.get(key)
         if pending:
-            nxt_content, nxt_blocks = pending.pop(0)
+            nxt = pending.pop(0)
+            nxt_content, nxt_blocks = nxt[:2]
+            nxt_cid = nxt[2] if len(nxt) > 2 else uuid.uuid4().hex[:10]
             if not pending:
                 _GM_INPUT_QUEUE.pop(key, None)
             _log_event("gemini_queue_drain", session=key[:32],
                        remaining=len(pending))
-            t2 = asyncio.create_task(_gm_run_turn(key, nxt_content, nxt_blocks))
+            _GM_TURNS[f"hold:{nxt_cid}"] = {"key": key}
+            t2 = asyncio.create_task(_gm_run_turn(key, nxt_content, nxt_blocks, turn_cid=nxt_cid))
             _BG_TASKS.add(t2)
             t2.add_done_callback(_BG_TASKS.discard)
 
@@ -29913,19 +30132,22 @@ async def _gm_input_run(key: str, session_id: str, body: dict,
     # 時第二則直接「送出失敗」—— 使用者的訊息就丟了。排隊的話:訊息卡已經
     # 上牆(上面 message_card),佇列深度回給 app 畫「已排入」,上一輪收尾
     # 自動接著跑。訊息比額度珍貴:**收下再說**。
+    turn_cid = uuid.uuid4().hex[:10]
     if _gm_busy(key):
-        _GM_INPUT_QUEUE.setdefault(key, []).append((content, blocks))
+        _GM_INPUT_QUEUE.setdefault(key, []).append((content, blocks, turn_cid))
         depth = len(_GM_INPUT_QUEUE[key])
         _log_event("gemini_input_queued", session=key[:32], depth=depth)
         out = {"ok": True, "session_id": session_id, "accepted": True,
-               "queued": True, "queue_depth": depth, "message_id": mid}
+               "queued": True, "queue_depth": depth, "message_id": mid,
+               "turn_id": f"turn-{turn_cid}"}
         _cc_input_settle(dedup, out)
         return out
-    task = asyncio.create_task(_gm_run_turn(key, content, blocks))
+    _GM_TURNS[f"hold:{turn_cid}"] = {"key": key}
+    task = asyncio.create_task(_gm_run_turn(key, content, blocks, turn_cid=turn_cid))
     _BG_TASKS.add(task)
     task.add_done_callback(_BG_TASKS.discard)
     out = {"ok": True, "session_id": session_id, "accepted": True,
-           "message_id": mid}
+           "message_id": mid, "turn_id": f"turn-{turn_cid}"}
     # ⚠️ 不再回 `attachments_dropped` —— 附件從 2026-10-10 起是**真的收下**的
     # (影像進 prompt block、其他存檔後附路徑)。繼續回這個欄位是誤導:
     # 它的字面意思是「丟掉了幾個」,而我們一個都沒丟。
@@ -30305,7 +30527,7 @@ def _gk_turn_end_push(key: str, digest, summary: str, ok: bool) -> None:
 
 async def _gk_run_turn(key: str, content: str,
                        blocks: list | None = None,
-                       hold: str = "") -> None:
+                       hold: str = "", turn_cid: str = "") -> None:
     """`hold` = 呼叫端在 create_task 前先壓進 _GK_TURNS 的佔位鍵。
 
     為什麼要佔位(review 抓的,gemini rail 的同款窗口):真正的登記要等
@@ -30315,14 +30537,14 @@ async def _gk_run_turn(key: str, content: str,
     busy 從 create_task 那一刻就為真;拿到 acp_sid 後換成正式登記,
     finally 無條件把佔位收掉(turn 半路炸掉也不准把 busy 卡死)。"""
     d = await _gk_card_digest(key)
-    cid = uuid.uuid4().hex[:10]
+    cid = turn_cid or uuid.uuid4().hex[:10]
     acp_sid = ""
+    d.turn_begin(cid, "已送達 Grok，回覆中。")
     try:
         acp_sid = await GROK.ensure_session(key)
         _GK_TURNS[acp_sid] = {"cid": cid, "text": "", "key": key}
         if hold:
             _GK_TURNS.pop(hold, None)
-        d.turn_begin(cid, "已送達 Grok，回覆中。")
         grok_sdk.touch_session(key, title_hint=content)
         res = await GROK.call(
             "session/prompt",
@@ -30360,14 +30582,15 @@ async def _gk_run_turn(key: str, content: str,
         # C11 drain:失敗也 drain,否則後送的訊息永遠卡著(S5 同款)。
         pending = _GK_INPUT_QUEUE.get(key)
         if pending:
-            nxt_content, nxt_blocks = pending.pop(0)
+            nxt = pending.pop(0)
+            nxt_content, nxt_blocks = nxt[:2]
             if not pending:
                 _GK_INPUT_QUEUE.pop(key, None)
             _log_event("grok_queue_drain", session=key[:32],
                        remaining=len(pending))
             t2 = asyncio.create_task(
                 _gk_run_turn(key, nxt_content, nxt_blocks,
-                             hold=_gk_turn_hold(key)))
+                             hold=_gk_turn_hold(key), turn_cid=nxt[2] if len(nxt) > 2 else ""))
             _BG_TASKS.add(t2)
             t2.add_done_callback(_BG_TASKS.discard)
 
@@ -30496,20 +30719,22 @@ async def _gk_input_run(key: str, session_id: str, body: dict,
     d.message_card({"id": mid, "role": "user", "content": content,
                     "attachments": att_meta, "ts": time.time()})
     # 忙碌 → 排隊不 409(訊息比額度珍貴,S5/C11 同款)。
+    turn_cid = uuid.uuid4().hex[:10]
     if _gk_busy(key):
-        _GK_INPUT_QUEUE.setdefault(key, []).append((content, blocks))
+        _GK_INPUT_QUEUE.setdefault(key, []).append((content, blocks, turn_cid))
         depth = len(_GK_INPUT_QUEUE[key])
         _log_event("grok_input_queued", session=key[:32], depth=depth)
         out = {"ok": True, "session_id": session_id, "accepted": True,
-               "queued": True, "queue_depth": depth, "message_id": mid}
+               "queued": True, "queue_depth": depth, "message_id": mid,
+               "turn_id": f"turn-{turn_cid}"}
         _cc_input_settle(dedup, out)
         return out
     task = asyncio.create_task(
-        _gk_run_turn(key, content, blocks, hold=_gk_turn_hold(key)))
+        _gk_run_turn(key, content, blocks, hold=_gk_turn_hold(key), turn_cid=turn_cid))
     _BG_TASKS.add(task)
     task.add_done_callback(_BG_TASKS.discard)
     out = {"ok": True, "session_id": session_id, "accepted": True,
-           "message_id": mid}
+           "message_id": mid, "turn_id": f"turn-{turn_cid}"}
     _cc_input_settle(dedup, out)
     return out
 
@@ -30935,20 +31160,20 @@ def _oce_turn_end_push(key: str, digest, summary: str, ok: bool) -> None:
 
 async def _oce_run_turn(key: str, content: str,
                         blocks: list | None = None,
-                        hold: str = "") -> None:
+                        hold: str = "", turn_cid: str = "") -> None:
     """`hold` = 呼叫端在 create_task 前先壓進 _OCE_TURNS 的佔位鍵
     (ensure_session 的 await 窗口裡 _oce_busy() 看不到這個 turn,第二則
     輸入會繞過排隊開第二輪 —— S6 review 抓的同款窗口,這裡一開始就有)。
     """
     d = await _oce_card_digest(key)
-    cid = uuid.uuid4().hex[:10]
+    cid = turn_cid or uuid.uuid4().hex[:10]
     acp_sid = ""
+    d.turn_begin(cid, "已送達 OpenCode，回覆中。")
     try:
         acp_sid = await OPENCODE.ensure_session(key)
         _OCE_TURNS[acp_sid] = {"cid": cid, "text": "", "key": key}
         if hold:
             _OCE_TURNS.pop(hold, None)
-        d.turn_begin(cid, "已送達 OpenCode，回覆中。")
         opencode_sdk.touch_session(key, title_hint=content)
         res = await OPENCODE.call(
             "session/prompt",
@@ -30986,14 +31211,15 @@ async def _oce_run_turn(key: str, content: str,
         # drain:失敗也 drain,否則後送的訊息永遠卡著(S5/S6 同款)。
         pending = _OCE_INPUT_QUEUE.get(key)
         if pending:
-            nxt_content, nxt_blocks = pending.pop(0)
+            nxt = pending.pop(0)
+            nxt_content, nxt_blocks = nxt[:2]
             if not pending:
                 _OCE_INPUT_QUEUE.pop(key, None)
             _log_event("opencode_queue_drain", session=key[:32],
                        remaining=len(pending))
             t2 = asyncio.create_task(
                 _oce_run_turn(key, nxt_content, nxt_blocks,
-                              hold=_oce_turn_hold(key)))
+                              hold=_oce_turn_hold(key), turn_cid=nxt[2] if len(nxt) > 2 else ""))
             _BG_TASKS.add(t2)
             t2.add_done_callback(_BG_TASKS.discard)
 
@@ -31124,20 +31350,22 @@ async def _oce_input_run(key: str, session_id: str, body: dict,
     d.message_card({"id": mid, "role": "user", "content": content,
                     "attachments": att_meta, "ts": time.time()})
     # 忙碌 → 排隊不 409(訊息比額度珍貴,S5/S6/C11 同款)。
+    turn_cid = uuid.uuid4().hex[:10]
     if _oce_busy(key):
-        _OCE_INPUT_QUEUE.setdefault(key, []).append((content, blocks))
+        _OCE_INPUT_QUEUE.setdefault(key, []).append((content, blocks, turn_cid))
         depth = len(_OCE_INPUT_QUEUE[key])
         _log_event("opencode_input_queued", session=key[:32], depth=depth)
         out = {"ok": True, "session_id": session_id, "accepted": True,
-               "queued": True, "queue_depth": depth, "message_id": mid}
+               "queued": True, "queue_depth": depth, "message_id": mid,
+               "turn_id": f"turn-{turn_cid}"}
         _cc_input_settle(dedup, out)
         return out
     task = asyncio.create_task(
-        _oce_run_turn(key, content, blocks, hold=_oce_turn_hold(key)))
+        _oce_run_turn(key, content, blocks, hold=_oce_turn_hold(key), turn_cid=turn_cid))
     _BG_TASKS.add(task)
     task.add_done_callback(_BG_TASKS.discard)
     out = {"ok": True, "session_id": session_id, "accepted": True,
-           "message_id": mid}
+           "message_id": mid, "turn_id": f"turn-{turn_cid}"}
     _cc_input_settle(dedup, out)
     return out
 
@@ -39973,7 +40201,7 @@ def _line_helper_token_value() -> str:
     (line/token 端點保證一機一枚)。"""
     with _PAIR_LOCK:
         for t, d in _DEVICE_TOKENS.items():
-            if d.get("platform") == "line":
+            if d.get("platform") == "line" and not d.get("pending"):
                 return t
     return ""
 

@@ -32,6 +32,65 @@ internals.
   commit real tokens to git.
 - `/health` may be used as a lightweight reachability check.
 
+### LINE Session Routing (2026-11-24, Additive)
+
+This extension requires coordinated Pocket ID and iOS updates. It is not a
+new provider runtime and does not collect provider OAuth/API credentials.
+
+- `GET /app/v1/line/targets` (owner device token): `{targets, degraded_providers, host_id}`.
+  Targets are drawn from the same v2 session roster, require `input`, and exclude
+  archived/offline/stopped rows and arbitrary terminals/delegations. Supported
+  providers: Hermes, Claude Code (tmux and cc2), Codex, Gemini, Grok, OpenCode,
+  OpenClaw. Listing is not proof of provider login or available model quota.
+- `POST /app/v1/line/token {session_id}` (owner device token) validates the target
+  and returns `{token, host_id}` with a pending, 10-minute `line-session`
+  credential. `host_id` comes from bridge enrollment. A new pending token
+  does not revoke the active binding. The no-body legacy persona flow remains.
+- `GET /app/v1/line/binding` (LINE token): `{scope: "line-session", session_id}`.
+  Pocket ID calls this through a server-derived relay URL for an account-owned
+  `host_id`, not a caller-supplied URL. Redirects must not forward credentials.
+- `POST /app/v1/line/activate` (pending LINE token) activates it and retires the
+  old active LINE credential on this host. Pocket ID then records the binding.
+- `POST /app/v1/line/messages {session_id,client_id,content}` (active LINE token)
+  accepts text only, for exactly the token's session. `client_id` is
+  `line-<64 hex chars>` derived from the LINE webhook event, and is persisted
+  before dispatch. It returns an acceptance receipt, not model completion.
+
+LINE credentials cannot list devices, mint tokens, access files/terminal/admin
+routes, or approve actions (including WebSocket auth paths). Legacy LINE tokens
+retain only the persona-message path. CC tmux input retains the console's
+composer check under the paste lock and blocks leading `!`/`/` shell/commands.
+
+Dispatch uses the existing `v2_session_input`; history remains in the original
+provider session and is visible to Pocket/Console/native clients as before.
+Hermes/Gemini/Grok/OpenCode and directly started Codex inputs now add `turn_id`
+to receipts. Queue entries preserve the allocated ID. cc2/queued Codex use the
+native user echo's client ID. CC cards add optional `body.native_message_id` and
+`body.native_parent_id` from JSONL UUID/parentUuid: LINE follows that ancestry,
+stops at an intervening user message and waits for idle, never guesses from a
+tmux busy lamp. Missing/evicted correlation produces a notice to inspect Pocket.
+
+The host-local `<CANON_DB>.line.db` holds transport receipts, input hashes and
+pending replies, not a second transcript. Completed replies go to the fixed
+Pocket ID `/v1/line/notify` callback with token, session ID and client ID. Only
+the matching incoming LINE event can receive the result. Text is sanitized;
+reasoning/tool output is excluded. Approval remains in Pocket. Existing Hermes
+delegation notices remain restricted to the bound Hermes persona.
+
+Limits: at most 16 tracked LINE tasks per host; 30-minute reply observation;
+retry backoff 10s to 5min; delivery stops after 23 hours; delivered receipts are
+pruned after seven days on subsequent inputs. A restart marks unfinished
+tracking interrupted and notifies the user; it NEVER resubmits an uncertain
+command. Target changes/unlinking suppress old-target notifications; results
+remain in the original session. Acceptance is not guaranteed LINE delivery.
+Use the existing single-worker bridge deployment: restart recovery assumes
+exclusive ownership of the receipts DB and in-memory provider runtimes.
+
+Pocket ID activation and database update are not a distributed transaction.
+If a connection fails during switching, refresh status and reselect the target;
+never silently route to another host. Production acceptance must cover this
+failure, multi-host switching, provider login/quota errors and long tasks.
+
 ### Console W2 Operations (2026-11-18, Additive)
 
 `GET /app/v2/providers/capabilities` returns `{providers: {provider: caps}}`.

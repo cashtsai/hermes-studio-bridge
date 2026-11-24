@@ -2238,7 +2238,7 @@ class PersonaDigest(ApprovalCardMixin):
         text = self.turn_text.get(cid, "") + delta
         self.turn_text[cid] = text
         self.store.upsert_card(make_card(
-            f"{self._card_prefix}turn-{cid}", self.store.turn_id, "assistant", "markdown",
+            f"{self._card_prefix}turn-{cid}", f"turn-{cid}", "assistant", "markdown",
             {"text": text, "fallback_text": text}, final=False))
         self._status("回覆中")
 
@@ -2250,14 +2250,14 @@ class PersonaDigest(ApprovalCardMixin):
                  error: str = ""):
         """回合收尾:同卡 final=True 全文覆蓋;reply 的 canonical mid 註記
         known,follower 補掃時不會再出第二張。"""
-        self.busy = False
         self.turn_text.pop(cid, None)
+        self.busy = bool(self.turn_text)
         if reply_mid:
             self.known_mids.add(str(reply_mid))
         if full_text:
             clean, sc_bodies = extract_studio_cards(full_text)
             self.store.upsert_card(make_card(
-                f"{self._card_prefix}turn-{cid}", self.store.turn_id, "assistant",
+                f"{self._card_prefix}turn-{cid}", f"turn-{cid}", "assistant",
                 "markdown", {"text": clean, "fallback_text": clean}))
             self._emit_studio_cards(f"{self._card_prefix}turn-{cid}", sc_bodies)
         if error:
@@ -2265,10 +2265,11 @@ class PersonaDigest(ApprovalCardMixin):
             if ul_meta:
                 self.usage_limit = ul_meta
             self.store.upsert_card(make_card(
-                f"{self._card_prefix}turn-{cid}-err", self.store.turn_id, "system", "text",
+                f"{self._card_prefix}turn-{cid}-err", f"turn-{cid}", "system", "text",
                 body))
-        self.store.push_turn("end", self.store.turn_id)
-        self.store.turn_id = ""
+        self.store.push_turn("end", f"turn-{cid}", outcome="error" if error else "done")
+        if self.store.turn_id == f"turn-{cid}":
+            self.store.turn_id = ""
         self._status()
 
 

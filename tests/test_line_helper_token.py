@@ -59,10 +59,12 @@ class TestLineHelperToken(unittest.TestCase):
         self.assertEqual(r.status_code, 200)
         line_tok = r.json()["token"]
         self.assertTrue(line_tok.startswith("pdev-"))
-        # 鑄出來的 token 要真的能過 _check_auth —— 拿它列裝置清單即為證。
+        # LINE credentials must not enumerate devices or mint another token.
         devs = self.client.get("/pair/devices",
                                headers={"Authorization": f"Bearer {line_tok}"})
-        self.assertEqual(devs.status_code, 200)
+        self.assertEqual(devs.status_code, 403)
+        devs = self.client.get("/pair/devices",
+                               headers={"Authorization": f"Bearer {self.dev_token}"})
         names = [d["name"] for d in devs.json()["devices"]]
         self.assertIn("LINE 小幫手", names)
 
