@@ -8,6 +8,29 @@ from contextlib import contextmanager
 PROVIDERS = frozenset({"hermes", "claude_code", "cc2", "codex", "gemini",
                        "grok", "opencode", "openclaw"})
 
+def permission_once(provider, record):
+    """Only known, single-use permission options; never answer a questionnaire."""
+    if (provider not in PROVIDERS or record.get("kind") != "permission"
+            or record.get("status") != "pending"):
+        return None
+    options = record.get("options") or []
+    for option in options:
+        if not isinstance(option, dict):
+            continue
+        key = str(option.get("key") or "")
+        if option.get("style") not in {"primary", "secondary"}:
+            continue
+        if provider in {"gemini", "grok", "opencode"}:
+            allowed = option.get("kind") == "allow_once"
+        elif provider == "claude_code":
+            allowed = str(option.get("label") or "").strip().casefold() in {
+                "yes", "allow", "allow once", "是", "允許", "允許一次"}
+        else:
+            allowed = key in {"approve", "allow-once", "allow_once"}
+        if allowed and key:
+            return {"key": key, "approve": True, "_line_allow_once": True}
+    return None
+
 
 def digest(value):
     return hashlib.sha256(value.encode()).hexdigest()
@@ -95,8 +118,18 @@ class ReplyTracker:
         self.native_root = ""
         self.first_final_seq = {}
         self.idle_seq = -1
+        self.native_users = set()
+        self.latest_native_user = ""
+        self.last_seq = -1
 
     def feed(self, event):
+        # The approval lock recheck can consume events ahead of wait_reply.
+        # Ignore repeats so stale card revisions cannot undo that recheck.
+        seq = event.get("seq")
+        if isinstance(seq, int):
+            if seq <= self.last_seq:
+                return
+            self.last_seq = seq
         data = event.get("data") or {}
         if event.get("type") == "card.upsert":
             card = data.get("card") or {}
@@ -106,6 +139,10 @@ class ReplyTracker:
                 self.turn_id = card["turn_id"]
             if card.get("role") == "user" and body.get("client_id") == self.client_id:
                 self.native_root = body.get("native_message_id") or self.native_root
+            native_id = body.get("native_message_id")
+            if card.get("role") == "user" and native_id and native_id not in self.native_users:
+                self.native_users.add(native_id)
+                self.latest_native_user = native_id
             if card.get("id"):
                 self.cards[card["id"]] = card
                 if body.get("native_message_id") and card.get("final"):
@@ -115,6 +152,18 @@ class ReplyTracker:
         elif (event.get("type") == "session.status" and data.get("busy") is False
               and data.get("phase") == "idle" and not data.get("prompt")):
             self.idle_seq = event.get("seq", 0)
+
+    def owns_permission(self, card):
+        body = card.get("body") or {}
+        if (card.get("kind") != "approval" or card.get("final")
+                or body.get("resolved") or body.get("kind", "permission") != "permission"):
+            return False
+        if self.native_cc:
+            return bool(self.native_root and self.latest_native_user == self.native_root)
+        # UI turn IDs can be inferred from a session's latest activity. Require
+        # the permission request's own provider turn ID, not that display guess.
+        return bool(self.turn_id and self.turn_id not in self.ends
+                    and body.get("request_turn_id") == self.turn_id)
 
     def _cc_reply(self):
         # tmux busy/idle turn IDs are not authoritative. Follow native JSONL
@@ -166,10 +215,12 @@ class ReplyTracker:
         return "\n\n".join(texts + errors) or "這輪已結束，沒有文字回覆；請回 Pocket 查看結果。"
 
 
-async def wait_reply(store, client_id, since_seq, turn_id="", timeout=1800, native_cc=False):
+async def wait_reply(store, client_id, since_seq, turn_id="", timeout=1800, native_cc=False,
+                     approve_permission=None):
     tracker = ReplyTracker(client_id, turn_id, native_cc=native_cc)
     deadline = time.monotonic() + timeout
     cursor = since_seq
+    attempted = set()
     store.subscribers += 1
     waker = store.attach_waker()
     try:
@@ -181,6 +232,12 @@ async def wait_reply(store, client_id, since_seq, turn_id="", timeout=1800, nati
             for ev in events:
                 tracker.feed(ev)
                 cursor = ev["seq"]
+            if approve_permission is not None:
+                for card in list(tracker.cards.values()):
+                    aid = (card.get("body") or {}).get("approval_id")
+                    if aid and aid not in attempted and tracker.owns_permission(card):
+                        attempted.add(aid)
+                        await approve_permission(card, tracker, cursor)
             result = tracker.result()
             if result is not None:
                 return result
