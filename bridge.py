@@ -11022,6 +11022,31 @@ async def pair_claim(request: Request, response: Response = None):
             "account_bound": bool(claim_user_id)}
 
 
+@app.post("/app/v1/line/token")
+async def line_helper_token(request: Request):
+    """已配對裝置幫「LINE 小幫手」鑄一枚專屬 token(綁定流程上繳 pocket-id,
+    pocket-id 收到 LINE 訊息時拿它打本機的 /app/v1/messages 跟人格對話)。
+
+    權限面:呼叫端必須已持有 device token(或 master)—— 鑄出來的也是一枚
+    device token,不是權限擴大。獨立一枚的理由:
+      · **可單獨撤銷**:解除 LINE 綁定殺這枚就好,不動手機自己的 token
+      · 裝置清單(/pair/devices)看得見「LINE 小幫手」這一項,不是隱形憑證
+    一機同時只留一枚(重綁先撤舊的)—— 舊 token 在 pocket-id 那邊已被覆蓋,
+    留著只是殭屍。"""
+    _check_auth(request)
+    with _PAIR_LOCK:
+        stale = [t for t, d in _DEVICE_TOKENS.items()
+                 if d.get("platform") == "line"]
+        for t in stale:
+            _DEVICE_TOKENS.pop(t, None)
+        if stale:
+            _save_device_tokens(_DEVICE_TOKENS)
+    token, _device = _pair_issue_device_token("LINE 小幫手", "line")
+    _log_event("line_helper_token_minted", replaced=len(stale),
+               token_hash=_short_hash(token))
+    return {"token": token}
+
+
 @app.get("/pair/devices")
 async def pair_devices(request: Request):
     """List paired devices (desktop only). Tokens are returned hashed, not raw."""
