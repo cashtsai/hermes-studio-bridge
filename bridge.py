@@ -23357,8 +23357,10 @@ async def v2_session_input(session_id: str, request: Request):
                 _codex_http_error(e)
             _cx_feed_input_accepted(src[1], client_id, text, attachments,
                                     typed_text=text, create_if_missing=True)
+            turn = turn_result.get("turn") if isinstance(turn_result, dict) else None
+            turn_id = turn.get("id") if isinstance(turn, dict) else None
             res = {"delivery": "accepted", "queued": False,
-                   "turn_id": str(((turn_result or {}).get("turn") or {}).get("id") or "")}
+                   "turn_id": turn_id if isinstance(turn_id, str) else ""}
             _cx_input_settle(entry, res)
             return {"ok": True, "session_id": session_id, "accepted": True, **res}
         except BaseException:

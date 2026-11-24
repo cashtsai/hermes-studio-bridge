@@ -217,13 +217,18 @@ class ConsoleRemoteUsableTest(unittest.TestCase):
              patch.object(bridge,"_CODEX_V2_STALE",False), patch.object(bridge,"_cx_feed_input_accepted"):
             res = self.http.get("/app/v2/sessions",headers=self._hdr())
             sid = next(s["id"] for s in res.json()["sessions"] if s["provider"] == "codex")
-            payload = {"content":"continue QA","client_id":"scope-fixture-1"}
-            for _ in range(2):
-                ack = self.http.post("/app/v2/sessions/"+sid+"/input",headers=self._hdr(),json=payload)
-                self.assertEqual(ack.status_code,200,ack.text)
-                self.assertEqual(ack.json()["session_id"],"codex:qa-original")
-            client.start_turn.assert_awaited_once()
-            self.assertEqual(client.start_turn.await_args.args[0],"qa-original")
+            for index, result in enumerate((None, {}, {"turn": {"id": "native-turn"}})):
+                with self.subTest(result=result):
+                    client.start_turn.reset_mock()
+                    client.start_turn.return_value = result
+                    payload = {"content":"continue QA","client_id":f"scope-fixture-{index}"}
+                    for _ in range(2):
+                        ack = self.http.post("/app/v2/sessions/"+sid+"/input",headers=self._hdr(),json=payload)
+                        self.assertEqual(ack.status_code,200,ack.text)
+                        self.assertEqual(ack.json()["session_id"],"codex:qa-original")
+                        self.assertEqual(ack.json()["turn_id"], "native-turn" if result else "")
+                    client.start_turn.assert_awaited_once()
+                    self.assertEqual(client.start_turn.await_args.args[0],"qa-original")
 
     def test_can_load_the_console_itself(self):
         r = self.http.get("/console/manifest.json", headers=self._hdr())
