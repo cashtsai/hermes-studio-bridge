@@ -32,6 +32,15 @@ internals.
   commit real tokens to git.
 - `/health` may be used as a lightweight reachability check.
 
+### Enrollment Continuity (2026-11-24)
+
+If the local Pocket ID enrollment is missing while a relay grant file survives,
+`POST /app/v1/relay/enroll` returns HTTP 409 `RELAY_IDENTITY_CONFLICT` before
+creating a host. Background enrollment uses the same guard. The existing relay
+and account data are not changed; do not delete the grant to bypass this check.
+An owner-verified repair must reconcile enrollment, relay and LINE ownership.
+The operator runbook is `pocket-id/docs/LINE_HOST_IDENTITY_REPAIR.md`.
+
 ### LINE Session Routing (2026-11-24, Additive)
 
 This extension requires coordinated Pocket ID and iOS updates. It is not a
