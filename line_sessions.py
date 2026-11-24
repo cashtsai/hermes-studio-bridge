@@ -172,7 +172,8 @@ class ReplyTracker:
         for c in self.cards.values():
             b = c.get("body") or {}
             if b.get("native_message_id"):
-                nodes[b["native_message_id"]] = (b.get("native_parent_id"), c.get("role"))
+                nodes[b["native_message_id"]] = (
+                    b.get("native_link_parent_id", b.get("native_parent_id")), c.get("role"))
         def belongs(mid):
             seen = set()
             while mid and mid not in seen:

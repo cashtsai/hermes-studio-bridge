@@ -19,6 +19,7 @@ import os
 import hashlib
 import re
 import time
+from collections import OrderedDict
 
 import cjk_text
 import media_artifacts
@@ -622,6 +623,32 @@ def _image_path_in(inp) -> str:
 def _strip_image_caveat(text: str) -> str:
     """去掉 harness 的圖片座標說明行(那是給模型的,不是給人看的)。"""
     return _IMG_CAVEAT_RE.sub("", text).strip()
+
+
+class CCNativeAncestry:
+    """Bounded links through non-rendered transcript metadata, never user turns."""
+    def __init__(self, limit: int = 4096):
+        self.limit = limit
+        self.hidden = OrderedDict()
+
+    def observe(self, event: dict, rendered: bool) -> None:
+        mid = str(event.get("uuid") or "")
+        if not mid:
+            return
+        self.hidden.pop(mid, None)
+        if not rendered and event.get("type") in {"attachment", "progress", "system"}:
+            self.hidden[mid] = str(event.get("parentUuid") or "")
+            while len(self.hidden) > self.limit:
+                self.hidden.popitem(last=False)
+
+    def parent(self, raw_parent: str) -> str:
+        parent, seen = raw_parent, set()
+        while parent in self.hidden:
+            if parent in seen or len(seen) >= 256:
+                return raw_parent
+            seen.add(parent)
+            parent = self.hidden[parent]
+        return parent
 
 
 def cc_event_to_cards(d: dict, uid: str, turn_id: str = "",

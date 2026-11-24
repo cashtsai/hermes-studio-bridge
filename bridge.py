@@ -24248,6 +24248,9 @@ def _cc_digest_lines(store, lines, jsonl_path: str, start_lineno: int) -> int:
     """把 jsonl 行灌進卡片庫;回傳新增/更新的卡數。順手維護人話 label 素材。"""
     n = 0
     media_payloads = []
+    ancestry = getattr(store, "_cc_native_ancestry", None)
+    if ancestry is None:
+        ancestry = store._cc_native_ancestry = carddigest.CCNativeAncestry()
     for off, line in enumerate(lines):
         line = line.strip()
         if not line:
@@ -24259,13 +24262,16 @@ def _cc_digest_lines(store, lines, jsonl_path: str, start_lineno: int) -> int:
             continue
         media_payloads.append(d)
         uid = _cc_card_uid(d, jsonl_path, start_lineno + off)
-        for card in carddigest.cc_event_to_cards(
+        cards = carddigest.cc_event_to_cards(
                 d, uid, turn_id=store.turn_id,
-                image_sink=_cc_image_sink(getattr(store, "media_session_id", "") or "cc")):
+                image_sink=_cc_image_sink(getattr(store, "media_session_id", "") or "cc"))
+        ancestry.observe(d, rendered=bool(cards))
+        for card in cards:
             card = carddigest.merge_input_accepted_echo(store, card)
             if d.get("uuid"):
                 card["body"]["native_message_id"] = str(d["uuid"])
                 card["body"]["native_parent_id"] = str(d.get("parentUuid") or "")
+                card["body"]["native_link_parent_id"] = ancestry.parent(card["body"]["native_parent_id"])
             # CC_TOKEN_STREAM:正典助手卡接管 pane-diff 草稿卡的 id(原位換文)。
             card = _cc_stream_reconcile(store, card)
             store.upsert_card(card)

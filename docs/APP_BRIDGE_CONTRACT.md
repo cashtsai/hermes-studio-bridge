@@ -78,6 +78,12 @@ native user echo's client ID. CC cards add optional `body.native_message_id` and
 `body.native_parent_id` from JSONL UUID/parentUuid: LINE follows that ancestry,
 stops at an intervening user message and waits for idle, never guesses from a
 tmux busy lamp. Missing/evicted correlation produces a notice to inspect Pocket.
+`body.native_link_parent_id` is an optional resolved parent through non-rendered
+`attachment`, `progress`, and `system` metadata. Raw IDs remain unchanged. The
+per-session map is bounded to 4096 links and a 256-hop traversal; cycles, gaps,
+unknown event types, and intervening users never authorize an unrelated reply.
+This handles Claude's hidden attachment nodes without rendering private metadata
+as chat cards. Regression coverage: `tests/test_line_native_ancestry.py`.
 
 The host-local `<CANON_DB>.line.db` holds transport receipts, input hashes and
 pending replies, not a second transcript. Completed replies go to the fixed
