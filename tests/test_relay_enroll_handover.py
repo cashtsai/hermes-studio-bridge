@@ -19,6 +19,7 @@ import os
 import sys
 import tempfile
 import unittest
+from unittest.mock import AsyncMock, patch
 
 _TMP = tempfile.mkdtemp(prefix="relay-enroll-")
 os.environ.setdefault("POCKET_CANON_DB", os.path.join(_TMP, "canonical.db"))
@@ -107,6 +108,23 @@ class RelayEnrollHandoverTest(unittest.TestCase):
         r = self.http.post("/app/v1/relay/enroll", headers=self.owner,
                            json={"enroll_token": "et"})
         self.assertEqual(r.status_code, 502, r.text)
+
+    def test_missing_enrollment_with_existing_tunnel_is_not_a_new_host(self):
+        with patch.object(bridge.os.path, "exists", return_value=True):
+            r = self.http.post("/app/v1/relay/enroll", headers=self.owner,
+                               json={"enroll_token": "et-other-account"})
+        self.assertEqual(r.status_code, 409, r.text)
+        self.assertIn("RELAY_IDENTITY_CONFLICT", r.text)
+        self.assertEqual(self.registered, [])
+
+    def test_internal_registration_also_refuses_orphaned_tunnel(self):
+        import asyncio
+        with patch.object(bridge.os.path, "exists", return_value=True), \
+             patch.object(bridge, "_pocket_id_api", AsyncMock()) as api:
+            with self.assertRaises(bridge.HTTPException) as raised:
+                asyncio.run(self._real_register("et-other-account"))
+        self.assertEqual(raised.exception.status_code, 409)
+        api.assert_not_awaited()
 
 
 if __name__ == "__main__":

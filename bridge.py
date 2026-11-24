@@ -13711,12 +13711,21 @@ async def _pocket_id_api(path: str, payload: dict) -> dict:
         return r.json()
 
 
+def _pocket_id_check_enrollment_continuity() -> None:
+    # A cached tunnel can outlive a lost enrollment file. Treating that host as
+    # new would attach it to another account while the old tunnel keeps working.
+    if not _pocket_id_state().get("host_id") and os.path.exists(_relay_grant_path()):
+        raise http_err(409, "RELAY_IDENTITY_CONFLICT",
+                       "主機登記遺失，但仍有既有遠端通道。請先由機主修復帳號綁定，勿重新註冊。")
+
+
 async def _pocket_id_register(enroll_token: str = "") -> None:
     """一次性 enroll:帶 enroll token 註冊,存回 host 身分 + 服務公鑰。
 
     token 預設取 env 的 POCKET_ID_ENROLL_TOKEN(人工裝機那條路);
     自動 enroll 會把當場換來的 token 傳進來(見 _pocket_id_autoenroll)。
     """
+    _pocket_id_check_enrollment_continuity()
     data = await _pocket_id_api("/v1/hosts/register", {
         "enroll_token": enroll_token or POCKET_ID_ENROLL_TOKEN,
         "name": _pocket_id_host_name(),
@@ -14474,6 +14483,7 @@ async def app_relay_enroll(request: Request):
         raise http_err(400, "ENROLL_TOKEN_REQUIRED", "需要 enroll_token")
 
     existing = _pocket_id_state()
+    _pocket_id_check_enrollment_continuity()
     if existing.get("host_id"):
         # 重綁 = 把這台機器換到另一個帳號底下。只有 owner 能決定。
         auth = request.headers.get("authorization", "")
