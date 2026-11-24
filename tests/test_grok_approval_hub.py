@@ -154,8 +154,9 @@ class RequestFlowTest(unittest.TestCase):
         self.assertEqual(row[1], "grok:gk-key")
         opts = _json.loads(row[2])
         self.assertEqual(opts[0], {"key": "allow-1", "label": "Allow once",
-                                   "style": "primary"})
+                                   "style": "primary", "kind": "allow_once"})
         self.assertEqual(opts[1]["style"], "deny")
+        self.assertEqual(opts[1]["kind"], "reject_once")
 
     def test_unroutable_session_falls_back(self):
         bridge._GK_TURNS.clear()

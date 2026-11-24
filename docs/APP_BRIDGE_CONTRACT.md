@@ -106,7 +106,7 @@ persona inputs are not replayed or retroactively approved.
   Native Claude Code requires the matching native user echo and no intervening
   human user message, plus the existing live-prompt check before sending a key.
 - The active LINE binding is checked again under the shared approval-decision
-  lock. Revoked, pending, expired or switched bindings cannot approve old work.
+  lock. Revoked, pending, expired or rotated host credentials cannot approve old work.
   The row must match the session, be pending, unexpired and created after input
   tracking began (second-granularity providers use that same second boundary).
 - Only known single-use options are selected: never `allow_always`,
@@ -122,6 +122,13 @@ persona inputs are not replayed or retroactively approved.
   `line_permission_auto_decided` / `line_permission_auto_failed` with hashed
   client/approval IDs, never tokens or prompt content. Observer cleanup,
   30-minute tracking limit and restart no-replay rules remain unchanged.
+
+Same-host target changes rotate the host credential and stop its old automatic
+decisions. Pocket ID unlinking or switching to another host stops new delivery
+and old-result notifications, but does not revoke the old host's credential or
+cancel already accepted work. To stop that work, interrupt the original session
+or revoke its LINE device credential on that host. This policy does not add
+cross-host cancellation or a central authorization lookup on every tool call.
 
 Verification: `tests/test_line_auto_approval.py` covers endpoint dispatch,
 single-use provider outcomes, manual-decision races, revocation, event gaps,
