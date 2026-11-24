@@ -75,6 +75,12 @@ class TestLineHelperToken(unittest.TestCase):
         self._mint(self.dev_token)          # 再鑄一次不炸(已存在就不動)
         self.assertIn("pocket", bridge.PERSONAS)
 
+    def test_mint_returns_host_id_for_pinning(self):
+        """回傳帶 host_id —— app 上繳給 pocket-id 釘住這台(多主機路由)。"""
+        r = self._mint(self.dev_token)
+        self.assertEqual(r.status_code, 200)
+        self.assertIn("host_id", r.json())   # 沒 enroll 就是空字串,鍵必在
+
     def test_remint_revokes_previous_line_token(self):
         first = self._mint(self.dev_token).json()["token"]
         second = self._mint(self.dev_token).json()["token"]

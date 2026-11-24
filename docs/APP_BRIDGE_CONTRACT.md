@@ -37,13 +37,14 @@ internals.
 This extension requires coordinated Pocket ID and iOS updates. It is not a
 new provider runtime and does not collect provider OAuth/API credentials.
 
-- `GET /app/v1/line/targets` (owner device token): `{targets, degraded_providers}`.
+- `GET /app/v1/line/targets` (owner device token): `{targets, degraded_providers, host_id}`.
   Targets are drawn from the same v2 session roster, require `input`, and exclude
   archived/offline/stopped rows and arbitrary terminals/delegations. Supported
   providers: Hermes, Claude Code (tmux and cc2), Codex, Gemini, Grok, OpenCode,
   OpenClaw. Listing is not proof of provider login or available model quota.
 - `POST /app/v1/line/token {session_id}` (owner device token) validates the target
-  and returns a pending, 10-minute `line-session` credential. A new pending token
+  and returns `{token, host_id}` with a pending, 10-minute `line-session`
+  credential. `host_id` comes from bridge enrollment. A new pending token
   does not revoke the active binding. The no-body legacy persona flow remains.
 - `GET /app/v1/line/binding` (LINE token): `{scope: "line-session", session_id}`.
   Pocket ID calls this through a server-derived relay URL for an account-owned
@@ -82,6 +83,8 @@ pruned after seven days on subsequent inputs. A restart marks unfinished
 tracking interrupted and notifies the user; it NEVER resubmits an uncertain
 command. Target changes/unlinking suppress old-target notifications; results
 remain in the original session. Acceptance is not guaranteed LINE delivery.
+Use the existing single-worker bridge deployment: restart recovery assumes
+exclusive ownership of the receipts DB and in-memory provider runtimes.
 
 Pocket ID activation and database update are not a distributed transaction.
 If a connection fails during switching, refresh status and reselect the target;

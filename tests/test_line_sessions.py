@@ -149,19 +149,25 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
             async def send(target, request):
                 self.assertEqual(target, sid)
                 self.assertEqual((await request.json())["client_id"], cid)
-                store.upsert_card(carddigest.make_card("u", "t", "user", "text", {"client_id": cid}))
-                store.upsert_card(carddigest.make_card("a", "t", "assistant", "markdown", {"text": provider + " answer"}))
+                store.upsert_card(carddigest.make_card("u", "t", "user", "text", {
+                    "client_id": cid, "native_message_id": "u"}))
+                store.upsert_card(carddigest.make_card("a", "t", "assistant", "markdown", {
+                    "text": provider + " answer", "native_message_id": "a", "native_parent_id": "u"}))
                 store.push_turn("end", "t")
+                store.set_status({"busy": False, "phase": "idle"})
                 return {"accepted": True}
             with patch.object(bridge, "_line_target", AsyncMock()), \
                  patch.object(bridge, "_v2_card_store", AsyncMock(return_value=store)), \
                  patch.object(bridge, "v2_session_input", AsyncMock(side_effect=send)) as input_mock:
                 out = await bridge.line_session_message(Req())
                 self.assertTrue(out["accepted"])
-                await bridge._LINE_TASKS[cid]
+                await asyncio.wait_for(bridge._LINE_TASKS[cid], timeout=1)
                 duplicate = await bridge.line_session_message(Req())
                 self.assertTrue(duplicate["duplicate"])
                 self.assertEqual(input_mock.await_count, 1)
+                fresh, receipt = self.receipts.claim(cid, token, sid, "hello")
+                self.assertFalse(fresh)
+                self.assertEqual(receipt["result"], provider + " answer")
             bridge._DEVICE_TOKENS.pop(token)
         self.assertEqual(len(self.receipts.pending_delivery()), len(PROVIDERS))
 
@@ -170,9 +176,11 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         rows += [{"id": "terminal:x", "provider": "terminal", "capabilities": ["input"]},
                  {"id": "codex:ro", "provider": "codex", "capabilities": []},
                  {"id": "codex:off", "provider": "codex", "capabilities": ["input"], "status": "offline"}]
-        with patch.object(bridge, "v2_sessions", AsyncMock(return_value={"sessions": rows})):
+        with patch.object(bridge, "v2_sessions", AsyncMock(return_value={"sessions": rows})), \
+             patch.object(bridge, "_pocket_id_state", return_value={"host_id": "host-test"}):
             out = await bridge.line_targets(None)
         self.assertEqual(len(out["targets"]), len(PROVIDERS))
+        self.assertEqual(out["host_id"], "host-test")
 
 
 class ScopeTests(unittest.TestCase):

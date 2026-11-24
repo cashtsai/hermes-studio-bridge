@@ -11136,9 +11136,12 @@ async def line_helper_token(request: Request):
         "scope": "line-session", "session_id": target,
         "pending": True, "expires": time.time() + 600,
     } if target else None)
+    # Preserve the host identity from enrollment; Pocket ID checks ownership.
+    host_id = str((_pocket_id_state() or {}).get("host_id") or "")
     _log_event("line_helper_token_minted", replaced=len(stale),
-               token_hash=_short_hash(token))
-    return {"token": token}
+               token_hash=_short_hash(token),
+               host_id_hash=_short_hash(host_id))
+    return {"token": token, "host_id": host_id}
 
 
 import line_sessions
@@ -11163,7 +11166,8 @@ async def line_targets(request: Request):
                         and str(r.get("id", "")).partition(":")[0] in line_sessions.PROVIDERS
                         and "input" in (r.get("capabilities") or [])
                         and r.get("status") not in {"archived", "offline", "stopped"}],
-            "degraded_providers": rows.get("degraded_providers", [])}
+            "degraded_providers": rows.get("degraded_providers", []),
+            "host_id": str((_pocket_id_state() or {}).get("host_id") or "")}
 
 
 async def _line_target(sid, request):
