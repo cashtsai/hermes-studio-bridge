@@ -11103,9 +11103,15 @@ async def line_helper_token(request: Request):
         if stale:
             _save_device_tokens(_DEVICE_TOKENS)
     token, _device = _pair_issue_device_token("LINE 小幫手", "line")
+    # 一併回報這台在 pocket-id 的 host_id:綁定時釘住**這一台**,多主機
+    # 帳號才不會把 LINE 訊息路由到別台(機主 2026-11-24 實測:帳號下有
+    # 龍蝦 + Mac,「取第一台」可能挑到沒有這枚 token 的機器)。
+    # 沒 enroll 過回空字串 —— pocket-id 退回舊的「取第一台」行為。
+    host_id = str((_pocket_id_state() or {}).get("host_id") or "")
     _log_event("line_helper_token_minted", replaced=len(stale),
-               token_hash=_short_hash(token))
-    return {"token": token}
+               token_hash=_short_hash(token),
+               host_id_hash=_short_hash(host_id))
+    return {"token": token, "host_id": host_id}
 
 
 @app.get("/pair/devices")
