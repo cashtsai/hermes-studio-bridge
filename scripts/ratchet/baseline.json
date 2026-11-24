@@ -84,6 +84,13 @@
         "line": 47,
         "snippet": "out = subprocess.run([\"ipconfig\", \"getifaddr\", dev],"
       },
+      "1c4f332c14bb3f67c260bbf4c86a37eb": {
+        "count": 1,
+        "path": "process_runner.py",
+        "line": 25,
+        "snippet": "with subprocess.Popen(argv, stdin=subprocess.PIPE if input is not None else None,",
+        "review": "Single audited maintenance runner boundary; mandatory timeout, isolated process group, kill/reap, redacted outcome logs. Covered by test_process_runner and test_media_archive_runner; replaces five direct archive calls."
+      },
       "32f50b50d96d396c49d8d8e7a6de6cd2": {
         "count": 1,
         "path": "bridge.py",
@@ -277,12 +284,6 @@
         "path": "carddigest.py",
         "line": 36,
         "snippet": "except ValueError:"
-      },
-      "5ad32947220438783f2a7ab8a51a596b": {
-        "count": 1,
-        "path": "bridge.py",
-        "line": 35154,
-        "snippet": "except (OSError, UnicodeError):"
       },
       "5edce41be8da691df9975ea97466797b": {
         "count": 1,
