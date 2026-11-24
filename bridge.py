@@ -7947,6 +7947,7 @@ class CodexAppServerClient:
             "method": method,
             "params": params,
             "thread_id": thread_id,
+            "turn_id": params.get("turnId") or params.get("turn_id") or "",
             "title": self._approval_title(method, params),
             "source": f"codex:{thread_id}" if thread_id else "codex",
             "risk": "high" if "command" in method.lower() or method == "execCommandApproval" else "medium",
@@ -11155,6 +11156,49 @@ import line_sessions
 _LINE_RECEIPTS = None
 _LINE_TASKS = {}
 
+def _line_auto_approve_enabled():
+    return os.environ.get("POCKET_LINE_AUTO_APPROVE", "1").strip().lower() in {"1", "true", "yes", "on"}
+
+
+async def _line_approve_permission(sid, token, store, started, card, tracker, cursor):
+    aid = (card.get("body") or {}).get("approval_id")
+    if not aid:
+        return
+    try:
+        lock = _APPROVAL_DECISION_LOCKS.setdefault(aid, asyncio.Lock())
+        async with lock:
+            entry = _token_entry(token) or {}
+            if (not _line_auto_approve_enabled() or entry.get("platform") != "line"
+                    or entry.get("scope") != "line-session" or entry.get("pending")
+                    or entry.get("session_id") != sid or not _token_is_valid(token)):
+                return
+            newer = store.since(cursor)
+            if newer is None:
+                return
+            # Recheck events that arrived while another device held the decision
+            # lock. Do not approve an old request after an intervening user turn.
+            for event in newer:
+                tracker.feed(event)
+            current = store.cards.get(card.get("id")) or {}
+            if not tracker.owns_permission(current):
+                return
+            row = _approval_get_row(aid)
+            if (not row or row.get("session_id") != sid
+                    or float(row.get("created_at") or 0) < int(started)
+                    or float(row.get("expires_at") or 0) <= time.time()):
+                return
+            body = line_sessions.permission_once(sid.partition(":")[0], row)
+            if body is None:
+                return
+            result = await _approval_decide_serial(aid, body)
+            _log_event("line_permission_auto_decided", provider=sid.partition(":")[0],
+                       client_id_hash=_short_hash(tracker.client_id),
+                       approval_id_hash=_short_hash(aid), status=result.get("status"))
+    except Exception as exc:  # noqa: BLE001
+        # A failed automatic decision remains available for manual review.
+        _log_event("line_permission_auto_failed", provider=sid.partition(":")[0],
+                   approval_id_hash=_short_hash(aid), error=type(exc).__name__)
+
 
 def _line_receipts():
     global _LINE_RECEIPTS
@@ -11173,6 +11217,7 @@ async def line_targets(request: Request):
                         and "input" in (r.get("capabilities") or [])
                         and r.get("status") not in {"archived", "offline", "stopped"}],
             "degraded_providers": rows.get("degraded_providers", []),
+            "approval_mode": "auto-once" if _line_auto_approve_enabled() else "manual",
             "host_id": str((_pocket_id_state() or {}).get("host_id") or "")}
 
 
@@ -11250,6 +11295,7 @@ async def line_session_message(request: Request):
             await _line_target(sid, request)
             store = await _v2_card_store(sid)
             seq = store.seq
+            started = time.time()
             store.subscribers += 1
             try:
                 ack = await v2_session_input(sid, _LineInputRequest(request, {
@@ -11258,7 +11304,10 @@ async def line_session_message(request: Request):
                 store.subscribers -= 1
             turn_id = ack.get("turn_id") or ("turn-" + ack["run_id"] if ack.get("run_id") else "")
             answer = await line_sessions.wait_reply(store, cid, seq, turn_id,
-                                                    native_cc=sid.startswith("claude_code:"))
+                native_cc=sid.startswith("claude_code:"),
+                approve_permission=(lambda card, tracker, cursor: _line_approve_permission(
+                    sid, token, store, started, card, tracker, cursor))
+                if _line_auto_approve_enabled() else None)
             receipts.finish(cid, "done", answer)
         except asyncio.CancelledError:
             # Kept pending on disk; restart reconciliation sends an honest notice.
@@ -11273,7 +11322,8 @@ async def line_session_message(request: Request):
     _LINE_TASKS[cid] = task
     _BG_TASKS.add(task)
     task.add_done_callback(_BG_TASKS.discard)
-    return {"ok": True, "accepted": True, "client_id": cid}
+    return {"ok": True, "accepted": True, "client_id": cid,
+            "approval_mode": "auto-once" if _line_auto_approve_enabled() else "manual"}
 
 
 async def _line_delivery_once():
@@ -25479,6 +25529,8 @@ def _oc_approval_record(payload: dict, kind: str) -> dict | None:
     expires_at = (expires / 1000.0 if isinstance(expires, (int, float)) and expires
                   else now + _OC_APPROVAL_TTL_FALLBACK)
     return {"id": aid, "title": _oc_approval_title(kind, request),
+            "turn_id": ("turn-" + str(request.get("runId") or payload.get("runId")))
+                       if (request.get("runId") or payload.get("runId")) else "",
             "source": f"openclaw:{key}" if key else "openclaw",
             "risk": _oc_approval_risk(kind, request),
             "detail": _oc_approval_detail(kind, request),
@@ -29608,7 +29660,7 @@ def _gm_normalize_options(options: list) -> list:
         # 空 label 就是那顆空白按鈕的來源。
         out.append({"key": oid,
                     "label": str(o.get("name") or kind or "選項")[:60],
-                    "style": style})
+                    "style": style, "kind": kind})
     return out
 
 
@@ -29707,6 +29759,7 @@ async def _gm_on_request(req: dict):
         "created_at": now,
         "expires_at": now + int(_GM_PERM_TIMEOUT),
         "session_id": f"gemini:{key}",
+        "turn_id": "turn-" + str(t["cid"]) if t and t.get("cid") else "",
         # 正規化成契約形狀 —— 直接塞 ACP 原形會讓 app 畫出空白按鈕(見該函式)。
         "options": _gm_normalize_options(options),
     }
@@ -29752,7 +29805,8 @@ async def _gm_on_request(req: dict):
 
     if approve:
         # allow 選項一定存在(上面已經擋過沒有的情況)。
-        opt = _gm_pick_option(options, True) or ""
+        opt = (approve["optionId"] if isinstance(approve, dict)
+               else _gm_pick_option(options, True)) or ""
         _gm_approval_set_status(aid, "approved")
         _gm_resolve_approval_card(key, record, "approved")
         _gm_perm_card(key, f"✅ 已放行「{tool}」。")
@@ -29855,6 +29909,12 @@ def _gm_approval_decide(aid: str, b: dict) -> dict:
         raise HTTPException(status_code=409,
                             detail="already decided or expired")
     approve = _gm_decision_is_approve(aid, b)
+    if approve and b.get("_line_allow_once"):
+        option = next((o for o in _gm_approval_options(aid)
+                       if o.get("key") == b.get("key") and o.get("kind") == "allow_once"), None)
+        if option is None:
+            raise http_err(400, "BAD_APPROVAL_CHOICE", "A single-use option is required")
+        approve = {"optionId": option["key"]}
     fut.set_result(approve)
     _log_event("gemini_approval_decision", approval_id=aid, approve=approve)
     return {"id": aid, "status": "approved" if approve else "denied",
@@ -30446,6 +30506,7 @@ async def _gk_on_request(req: dict):
         "created_at": now,
         "expires_at": now + int(_GK_PERM_TIMEOUT),
         "session_id": f"grok:{key}",
+        "turn_id": "turn-" + str(t["cid"]) if t and t.get("cid") else "",
         # 正規化成契約形狀(ACP 原形會讓 app 畫出空白按鈕 —— S5 的教訓;
         # _gm_normalize_options 是純函式,ACP options 兩家同形,直接共用)。
         "options": _gm_normalize_options(options),
@@ -31087,6 +31148,7 @@ async def _oce_on_request(req: dict):
         # expired(待審掃描回空、列表看不出在等你)。下限 1 秒。
         "expires_at": now + max(1, int(_OCE_PERM_TIMEOUT)),
         "session_id": f"opencode:{key}",
+        "turn_id": "turn-" + str(t["cid"]) if t and t.get("cid") else "",
         # 正規化成契約形狀(ACP 原形會讓 app 畫出空白按鈕 —— S5 的事故;
         # _gm_normalize_options 是純函式,ACP options 三家同形,共用一份)。
         "options": _gm_normalize_options(options),

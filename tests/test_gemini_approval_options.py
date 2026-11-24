@@ -47,7 +47,9 @@ class NormalizeTest(unittest.TestCase):
     def test_shape_matches_the_contract(self):
         """三個鍵都要在,而且名字要跟其他四家一致 —— app 只認這個形狀。"""
         for o in bridge._gm_normalize_options(_ACP):
-            self.assertEqual(set(o), {"key", "label", "style"})
+            self.assertEqual(set(o), {"key", "label", "style", "kind"})
+        self.assertEqual([o["kind"] for o in bridge._gm_normalize_options(_ACP)],
+                         [o["kind"] for o in _ACP])
 
     def test_label_is_never_empty(self):
         """**空 label 就是那顆空白按鈕的來源。**"""

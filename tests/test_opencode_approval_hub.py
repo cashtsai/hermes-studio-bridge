@@ -176,8 +176,9 @@ class RequestFlowTest(unittest.TestCase):
         self.assertEqual(row[1], "opencode:oce-key")
         opts = json.loads(row[2])
         self.assertEqual(opts[0], {"key": "once", "label": "Allow once",
-                                   "style": "primary"})
+                                   "style": "primary", "kind": "allow_once"})
         self.assertEqual(opts[-1]["style"], "deny")
+        self.assertEqual(opts[-1]["kind"], "reject_once")
 
     def test_approval_row_reports_provider_opencode(self):
         """讀側也要對:_approval_row 的 provider 推導不能把它歸成 openclaw。"""

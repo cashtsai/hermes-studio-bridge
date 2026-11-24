@@ -1236,6 +1236,8 @@ class ApprovalCardMixin:
                     {"key": "deny", "label": "拒絕", "style": "danger"}],
                 "source": self._appr_source,
                 "fallback_text": f"🔐 {title}"}
+        if record.get("turn_id"):
+            body["request_turn_id"] = record["turn_id"]
         if record.get("kind") in ("question", "notice"):
             # A3:加值欄位 —— app 靠它做 question 直選/notice 單鍵;
             # 不認得就忽略(fallback 原則)。

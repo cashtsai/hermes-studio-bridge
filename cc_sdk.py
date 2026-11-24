@@ -1632,6 +1632,7 @@ class CCSdkSession:
             "created_at": now, "expires_at": now + approval_timeout() + 5.0,
             "status": "pending", "decided_at": None, "result": None,
             "session_id": f"cc2:{self.name}", "provider": "cc2",
+            "turn_id": self.digest.store.turn_id,
             # 提問與權限是**不同的東西**:app 的渲染與 `_approval_decide_core`
             # 的字彙都分(question→answered / permission→approved|denied)。
             "kind": "question" if ask_opts else "permission",
