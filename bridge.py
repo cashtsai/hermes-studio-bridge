@@ -11034,6 +11034,16 @@ async def line_helper_token(request: Request):
     一機同時只留一枚(重綁先撤舊的)—— 舊 token 在 pocket-id 那邊已被覆蓋,
     留著只是殭屍。"""
     _check_auth(request)
+    # 綁定即開箱可用(機主 2026-11-24 拍板):這台還沒有「pocket」人格就
+    # 自動開一個預設的(home=HOME_ROOT,吃共用 SOUL 契約),使用者之後在
+    # 智能體裡可換綁別的人格。冪等:已存在(含 builtin/自建)就不動。
+    if "pocket" not in PERSONAS:
+        row = _persona_row_get("pocket")
+        if row is None or row[4]:          # 不存在,或先前被刪 → 復活
+            _persona_row_upsert("pocket", "Pocket 小幫手", HOME_ROOT, 1, 0)
+            _personas_reload()
+            _log_event("persona_created", id="pocket", home=HOME_ROOT,
+                       provisioned=False, via="line_bind_default")
     with _PAIR_LOCK:
         stale = [t for t, d in _DEVICE_TOKENS.items()
                  if d.get("platform") == "line"]

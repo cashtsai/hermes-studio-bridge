@@ -66,6 +66,13 @@ class TestLineHelperToken(unittest.TestCase):
         names = [d["name"] for d in devs.json()["devices"]]
         self.assertIn("LINE 小幫手", names)
 
+    def test_mint_auto_creates_default_pocket_persona(self):
+        """綁定即開箱可用:鑄 token 順手確保「pocket」人格存在(冪等)。"""
+        self._mint(self.dev_token)
+        self.assertIn("pocket", bridge.PERSONAS)
+        self._mint(self.dev_token)          # 再鑄一次不炸(已存在就不動)
+        self.assertIn("pocket", bridge.PERSONAS)
+
     def test_remint_revokes_previous_line_token(self):
         first = self._mint(self.dev_token).json()["token"]
         second = self._mint(self.dev_token).json()["token"]
