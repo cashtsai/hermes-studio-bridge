@@ -11022,6 +11022,48 @@ async def pair_claim(request: Request, response: Response = None):
             "account_bound": bool(claim_user_id)}
 
 
+_POCKET_SOUL = """You are Hermes Agent, an intelligent AI assistant. You are helpful, knowledgeable, and direct.
+
+## 身分:Pocket 小幫手
+你是「Pocket 小幫手」,使用者透過 LINE 或 Pocket App 跟你對話的預設助理人格。
+- 用**繁體中文**、口語、精簡回答;LINE 對話保持兩三句內,不列點、不冗長。
+- 你跑在使用者**自己的主機**上,對話不經過雲端保存 —— 這是產品的隱私承諾,行為要配得上。
+- 不確定的事老實說不知道;絕不分享 .env、憑證、token、私鑰類檔案。
+
+## 交辦長線工作(handoff)
+你能把長線/工程型工作轉交給這台主機上的常駐 agent(CC/CX session)長期執行:
+- `handoff targets` 看有哪些 session;`handoff send <session_id> <任務>` 交辦(background,對方做完會自動回報)。
+- 判準:要跑超過一兩分鐘、要動 code/repo/部署、或使用者說「之後」「長期」「盯著」的 → 交辦;閒聊、查資料、一句話答得完的 → 自己來。
+- 交辦後**立刻**回使用者一句人話:「已交辦給 ○○,完成會再通知你」(LINE 的回覆時窗只有 60 秒,絕不空等)。完成回報會自動送回,LINE 也會自動收到推播,不用輪詢。
+- 鐵律:工具回傳非 2xx 或 409(對方卡審批)→ 如實回報使用者,不等、不猜、不硬送。
+
+## 找真人
+使用者要找真人客服 → 請他訊息開頭加「客服」兩個字(例:「客服 我要退款」),就會轉給 Pocket 官方團隊。
+"""
+
+_POCKET_HANDOFF_WRAPPER = """#!/bin/zsh
+# Pocket 小幫手的交辦工具。契約:handoff --help
+export AGENT_SELF="${AGENT_SELF:-hermes:pocket}"
+exec python3 "%s" "$@"
+"""
+
+
+def _line_seed_pocket_home(home: str) -> None:
+    """第一次建 pocket 人格時種家:專屬 SOUL + handoff 工具。冪等 ——
+    檔案已在就不動(使用者改過的人設不能被我們洗掉)。"""
+    os.makedirs(os.path.join(home, "bin"), exist_ok=True)
+    soul = os.path.join(home, "SOUL.md")
+    if not os.path.exists(soul):
+        with open(soul, "w", encoding="utf-8") as f:
+            f.write(_POCKET_SOUL)
+    cli = os.path.join(HOME_ROOT, "bin", "handoff-cli")
+    wrapper = os.path.join(home, "bin", "handoff")
+    if os.path.exists(cli) and not os.path.exists(wrapper):
+        with open(wrapper, "w", encoding="utf-8") as f:
+            f.write(_POCKET_HANDOFF_WRAPPER % cli)
+        os.chmod(wrapper, 0o755)
+
+
 @app.post("/app/v1/line/token")
 async def line_helper_token(request: Request):
     """已配對裝置幫「LINE 小幫手」鑄一枚專屬 token(綁定流程上繳 pocket-id,
@@ -11035,14 +11077,18 @@ async def line_helper_token(request: Request):
     留著只是殭屍。"""
     _check_auth(request)
     # 綁定即開箱可用(機主 2026-11-24 拍板):這台還沒有「pocket」人格就
-    # 自動開一個預設的(home=HOME_ROOT,吃共用 SOUL 契約),使用者之後在
-    # 智能體裡可換綁別的人格。冪等:已存在(含 builtin/自建)就不動。
+    # 自動開一個預設的,使用者之後在智能體裡可換綁別的人格。
+    # ⚠️ home 必須是 **profiles/pocket 專屬目錄**,不能用 HOME_ROOT ——
+    # HOME_ROOT 是 main 人格的家(機主實測:指過去就會用袁方的人設回話)。
+    # 第一次建家時種最小 SOUL(繁中精簡助理 + handoff 契約)與 bin/handoff。
     if "pocket" not in PERSONAS:
         row = _persona_row_get("pocket")
         if row is None or row[4]:          # 不存在,或先前被刪 → 復活
-            _persona_row_upsert("pocket", "Pocket 小幫手", HOME_ROOT, 1, 0)
+            pocket_home = os.path.join(HOME_ROOT, "profiles", "pocket")
+            _line_seed_pocket_home(pocket_home)
+            _persona_row_upsert("pocket", "Pocket 小幫手", pocket_home, 1, 0)
             _personas_reload()
-            _log_event("persona_created", id="pocket", home=HOME_ROOT,
+            _log_event("persona_created", id="pocket", home=pocket_home,
                        provisioned=False, via="line_bind_default")
     with _PAIR_LOCK:
         stale = [t for t, d in _DEVICE_TOKENS.items()
