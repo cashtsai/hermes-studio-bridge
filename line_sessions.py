@@ -36,6 +36,12 @@ def digest(value):
     return hashlib.sha256(value.encode()).hexdigest()
 
 
+def delivery_is_terminal(result):
+    return bool(result.get("pushed") or result.get("reason") in {
+        "target_mismatch", "not_entitled", "duplicate", "empty", "quota_exhausted",
+        "delivery_expired", "delivery_content_changed", "delivery_owner_changed"})
+
+
 class Receipts:
     """Host-local outbox. Never replay an uncertain input after a process restart."""
     def __init__(self, path):
