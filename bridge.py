@@ -11345,8 +11345,7 @@ async def _line_delivery_once():
                 return json.loads(res.read())
         try:
             result = await asyncio.to_thread(post)
-            if result.get("pushed") or result.get("reason") in {
-                    "target_mismatch", "not_entitled", "duplicate", "empty"}:
+            if line_sessions.delivery_is_terminal(result):
                 _line_receipts().delivered(row["id"])
         except urllib.error.HTTPError as exc:
             if exc.code in (401, 403, 404):
