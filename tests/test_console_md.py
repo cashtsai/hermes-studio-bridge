@@ -47,6 +47,12 @@ process.stdin.on("end", () => {
 
 # 每一條 XSS 樣本都自帶全域紅線(見 _redlines);contains/not 是樣本專屬斷言。
 XSS_CASES = [
+    {"name": "local report attribute escape", "src": '[R](</tmp/quote"test.md>)',
+     "contains": ['data-report-ref="/tmp/quote&quot;test.md"'], "not": ['href="/tmp']},
+    {"name": "local report spaces and line", "src": '[Report](</tmp/release report.md:12>)',
+     "contains": ['data-report-ref="/tmp/release report.md:12"', '閱讀報告']},
+    {"name": "report image stays non-executable", "src": '![R](/tmp/report.md)',
+     "not": ['data-report-ref', '<img']},
     {"name": "raw html tag", "src": "<img src=x onerror=alert(1)>",
      "contains": ["&lt;img src=x onerror=alert(1)&gt;"], "not": ["<img"]},
     {"name": "script tag", "src": "hi <script>alert(1)</script>",

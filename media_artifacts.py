@@ -861,6 +861,18 @@ class MediaArtifactStore:
             "next_cursor": items[-1]["cursor"] if has_more and items else None,
         }
 
+    def find_session_artifact(self, session_id: str, *, media_id: str | None = None,
+                              source_ref: str | None = None) -> dict | None:
+        if (media_id is None) == (source_ref is None):
+            raise ValueError("provide exactly one artifact selector")
+        column, value = ("media_id", media_id) if media_id else ("source_ref", source_ref)
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                "SELECT rowid AS cursor, * FROM artifacts WHERE session_id = ? AND " + column + " = ?",
+                (session_id, value),
+            ).fetchone()
+        return self.public_item(self._row_item(row)) if row else None
+
     def open_media(self, media_id: str) -> tuple[str, str, str] | None:
         with closing(self._connect()) as conn, conn:
             row = conn.execute(

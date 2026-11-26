@@ -210,6 +210,7 @@ async function leaveConsole(broadcast = false) {
   if (leaveRequest) return;
   signingOut = true;
   window.PocketSessionOps?.leave();
+  window.PocketReports?.close();
   forgetWork();
   writeHash(null);
   leaveRequest = true;
@@ -680,6 +681,7 @@ function renderHome() {
 }
 
 function showHome() {
+  window.PocketReports?.close();
   ++state.view;
   resetHistory();
   if (state.stopStream) { state.stopStream(); state.stopStream = null; }
@@ -721,6 +723,7 @@ function focusComposer() {
 }
 function openSession(id, preserveMode = false, focusInput = true) {
   if (signingOut) return;
+  if (id !== state.current) window.PocketReports?.close();
   ensureNotifyPermission();                   // 開對話是使用者手勢 → 這時才問通知權限
   resetForceStop();                           // 換對話,收掉上一條的強制停止升級
   if (borrowed() && !state.sessions.find(s => s.id === id)?.capabilities?.includes("replay")) {
@@ -1467,6 +1470,9 @@ function attachmentsHtml(c) {
       a.download_url.startsWith("/app/v2/artifacts/") ? a.download_url : "";
     const ext = safeHttpUrl(a.url || a.source_url);
     const size = fmtBytes(a.byte_size);
+    if (local && /\.(md|markdown)$/i.test(name) && c.role !== "user")
+      return '<button type="button" class="att-chip report-link" data-report-ref="' + esc(local) +
+        '" title="閱讀報告">📄 ' + esc(name) + '</button>';
     if (a.kind === "image" && local && a.available !== false)
       return '<figure class="att-media"><img class="att-img" alt="' + esc(name) +
         '" data-src="' + esc(local) + '"><figcaption>' + esc(name) + "</figcaption></figure>";
@@ -1984,6 +1990,8 @@ function autosize() {
 // ───────────────────────── 綁定 + 啟動 ─────────────────────────
 function wire() {
   window.PocketSessionOps?.init();
+  window.PocketReports?.init({api, copy: copyText});
+  $("session-reports").addEventListener("click", () => window.PocketReports?.open(state.current));
   // Safari's software keyboard shrinks the visual, not the layout viewport.
   const fitViewport = () => {
     if (mobileConsole() && window.visualViewport?.scale === 1)
@@ -2003,6 +2011,8 @@ function wire() {
   $("cards").addEventListener("scroll", e => trackCardScroll(e.currentTarget), { passive: true });
   // 訊息區的互動全走事件代理:卡片每次重畫都換節點,逐顆綁太浪費。
   $("cards").addEventListener("click", (e) => {
+    const report = e.target.closest("[data-report-ref]");
+    if (report) { void window.PocketReports?.open(state.current, report.dataset.reportRef); return; }
     const copy = e.target.closest(".md-copy");
     if (copy) {
       const code = copy.closest(".md-code")?.querySelector("code");
@@ -2169,7 +2179,7 @@ function wireKeys() {
   window.addEventListener("blur", imeReset);
   document.addEventListener("keydown", (e) => {
     if (imeKey(e)) return;
-    if ($("session-ops")?.open) return; // Native dialog owns focus and Escape.
+    if ($("session-ops")?.open || $("report-reader")?.open) return; // Native dialogs own focus and Escape.
     if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
       e.preventDefault(); openPalette(); return;
     }

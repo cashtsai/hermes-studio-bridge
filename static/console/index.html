@@ -93,6 +93,7 @@
       <div id="stream-head" class="stream-head hidden">
         <div class="sh-title"><button type="button" id="back-home" class="icon-btn" aria-label="回到工作接力" title="回到工作接力">←</button><span id="sh-provider" class="pill"></span><span id="sh-name"></span></div>
         <div class="sh-actions">
+          <button id="session-reports" class="icon-btn" title="對話報告" aria-label="對話報告">📄</button>
           <button id="session-settings" class="icon-btn" title="對話設定" aria-label="對話設定" hidden>⚙</button>
           <button id="session-compact" class="icon-btn" title="壓縮脈絡" aria-label="壓縮脈絡" hidden>⇣</button>
           <button id="session-more" class="icon-btn" title="對話操作" aria-label="對話操作" hidden>⋯</button>
@@ -239,6 +240,19 @@
     <header><h2 id="op-title"></h2><button id="op-close" class="icon-btn" title="關閉" aria-label="關閉對話操作">×</button></header>
     <p id="op-session"></p><div id="op-content"></div><p id="op-status" role="status"></p>
   </dialog>
+  <dialog id="report-reader" aria-labelledby="report-title">
+    <header class="report-head"><h2 id="report-title">對話報告</h2><button id="report-close" class="icon-btn" title="關閉報告" aria-label="關閉報告">×</button></header>
+    <div class="report-tools">
+      <select id="report-select" aria-label="選擇報告"></select>
+      <div class="report-modes" role="group" aria-label="報告檢視方式">
+        <button id="report-preview" type="button" aria-pressed="true">閱讀</button>
+        <button id="report-source" type="button" aria-pressed="false">原文</button>
+      </div>
+      <button id="report-download" class="icon-btn" title="下載報告" aria-label="下載報告" disabled>↓</button>
+    </div>
+    <p id="report-status" role="status"></p>
+    <div class="report-layout"><nav id="report-toc" aria-label="報告目錄"></nav><article id="report-content" tabindex="0" aria-label="報告內容"></article></div>
+  </dialog>
 </div>
 <section id="logout-screen" class="hidden" aria-live="polite">
   <p id="logout-state"></p>
@@ -262,6 +276,7 @@
 <script src="/console/static/md.js"></script>
 <script src="/console/static/transcript.js"></script>
 <script src="/console/static/ops.js"></script>
+<script src="/console/static/report-reader.js"></script>
 <script src="/console/static/app.js"></script>
 <script src="/console/static/filebrowser.js"></script>
 <script src="/console/static/changes.js"></script>

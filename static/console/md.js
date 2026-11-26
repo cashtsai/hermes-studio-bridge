@@ -91,8 +91,12 @@
 
     // [文字](url) 與 ![alt](url)。圖片語法降級成連結 —— Console 的 CSP 只准
     // 'self'/blob 圖,外部圖直接 <img> 既載不出來也不該去打。
-    s = s.replace(/(!?)\[([^\]\n]*)\]\(([^()\s]+)\)/g, (m, bang, label, url) => {
+    s = s.replace(/(!?)\[([^\]\n]*)\]\((<[^>\n]+>|[^()\s]+)\)/g, (m, bang, label, url) => {
+      if (url.startsWith("<")) url = url.slice(1, -1);
       const name = esc(label.trim() || url.split(/[?#]/)[0].split("/").pop() || "附件");
+      if (!bang && /^(?:\/|file:\/\/)/.test(url) && /\.(md|markdown)(?::\d+(?::\d+)?)?$/i.test(url))
+        return stash('<button type="button" class="att-chip report-link" data-report-ref="' + esc(url) +
+          '" title="閱讀報告">📄 ' + name + '</button>');
       const asset = localAsset(url);
       // 自家 artifact(圖或檔):走 authed 下載 chip(#cards 既有 handler 用 Bearer 抓)。
       // 刻意**不**吐 <img>:md.js 渲染任意 agent 文字,維持「永不產生 <img>」的 XSS
