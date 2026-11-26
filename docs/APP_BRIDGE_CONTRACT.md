@@ -1336,6 +1336,7 @@ These fields are additive; existing runtime processes and settings are untouched
 | `GET  /app/v2/sessions/{id}/events?since_seq=&profile=&after_durable_seq=` | SSE 卡片事件流（§5；`after_durable_seq` = 持久補洞,§5.1） | ✅ 上線（S1：cc；同上） |
 | `GET  /app/v2/sessions/{id}/media?limit=&cursor=` | session 媒體永久索引（§7） | ✅ 上線（cc/cx/persona） |
 | `GET  /app/v2/artifacts/{media_id}` | 已封存 artifact 位元組 | ✅ 上線 |
+| `GET /app/v2/sessions/{id}/reports[?media_id=...]` | 已交付 Markdown 報告清單/讀取，沿用 replay grant | 候選版，見 `CONSOLE_REPORT_READER.md` |
 | `POST /app/v1/guest-links` | 建立短效、唯讀、無帳號分享連結 | ✅ 上線 |
 | `POST /app/v1/guest-links/revoke-all` | authenticated owner/device 輪替 guest signing secret，使既有連結全部失效 | ✅ 上線 |
 | `POST /app/v2/sessions/{id}/approve` | 核准/拒絕（body: `{approve: bool}` 或 `{decision}`；`for_session` 可記住） | ✅ 上線（現路由僅 cx；cc/persona 併入待批次 2 統一路由） |
