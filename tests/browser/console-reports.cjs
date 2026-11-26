@@ -24,7 +24,10 @@ async function setup(t) {
     }
     const finish = () => {
       res.writeHead(200, {"Content-Type":"text/plain", ...(control.chunked ? {} : {"Content-Length":Buffer.byteLength(control.payload)})});
-      if (control.chunked) {res.write(control.payload.slice(0,100));res.end(control.payload.slice(100));}
+      if (control.chunked) {
+        const bytes=Buffer.from(control.payload);
+        res.write(bytes.subarray(0,100));res.end(bytes.subarray(100));
+      }
       else res.end(control.payload);
     };
     if (control.delay) control.pending = finish; else finish();
@@ -37,7 +40,8 @@ async function setup(t) {
 }
 
 test("report links render authenticated Markdown, source, TOC, download and keyboard isolation", async t => {
-  const {page,calls,model} = await setup(t);
+  const {page,calls,model,control} = await setup(t);
+  control.chunked=true;
   await page.locator("#cards .report-link").first().click();
   await page.locator("#report-content table").waitFor();
   assert.equal(await page.locator("#report-title").textContent(), "Bridge 上線檢查");
