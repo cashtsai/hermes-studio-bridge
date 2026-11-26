@@ -619,6 +619,7 @@ class BridgeWiringTests(unittest.TestCase):
             bridge._oc_push_final = orig_push
 
     def test_push_final_skips_heartbeat_runs(self):
+        origin, _ = bridge._OC_PUSH_ORIGINS.begin("agent:main:main", "hb-2")
         bridge._OC_HEARTBEAT_RUNS["hb-2"] = True
         sent = []
         orig = bridge.push_notify
@@ -636,6 +637,7 @@ class BridgeWiringTests(unittest.TestCase):
             self.assertEqual(sent, [])
         finally:
             bridge.push_notify = orig
+            bridge._OC_PUSH_ORIGINS.revoke(origin)
 
     # config 端點
 

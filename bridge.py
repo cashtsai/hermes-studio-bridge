@@ -66,6 +66,7 @@ import media_artifacts
 import session_reports
 import hermes_media
 import openclaw_provider
+from openclaw_push import PushOrigins
 import gemini_provider
 import grok_sdk
 import opencode_sdk
@@ -5484,7 +5485,8 @@ def _approval_decision_keys(aid: str) -> tuple:
     return ok, dk
 
 
-def _approval_push(aid: str, title: str, body: str, session_id: str = ""):
+def _approval_push(aid: str, title: str, body: str, session_id: str = "",
+                   *, persona: str | None = None):
     """審核推播(批次 3 斷點①):category 出動作鈕、payload 巢與 app 端約定對齊、
     thread-id 以 session 分串。Stage 1b 翻新:新 `pocket.{kind, approvalId,
     sessionId}` 巢 + category;**相容期保留** 舊 `scarf` 巢與更舊頂層 {kind, id},
@@ -5503,6 +5505,8 @@ def _approval_push(aid: str, title: str, body: str, session_id: str = ""):
     task = asyncio.create_task(push_notify(
         f"🔐 {title}", body[:120], data,
         category=_APNS_APPROVAL_CATEGORY,
+        persona=persona,
+        no_preview_body="有一項待審請求" if persona else None,
         thread_id=session_id or "approvals"))
     _BG_TASKS.add(task)
     task.add_done_callback(_BG_TASKS.discard)
@@ -25382,6 +25386,7 @@ async def _hp_card_digest(session: str):
 # - seed:chat.history(重連後 digest 標記重 seed,SPEC §6-4)
 
 OPENCLAW = openclaw_provider.OpenClawClient(log=_log_event)
+_OC_PUSH_ORIGINS = PushOrigins()
 _OC_CARD_DIGESTS: dict = {}      # sessionKey -> carddigest.OpenClawDigest
 
 # B(即時推播):openclaw 訊息版本計數 + 等待者,給 /app/v1/messages/events 的
@@ -28730,13 +28735,19 @@ async def _oc_approval_resolved_async(event: str, payload: dict) -> None:
 def _oc_approval_push(record: dict) -> None:
     """待審推播(沿用審核中心既有 `_approval_push`,鎖屏動作鈕/巢形狀一致)。
     無執行中 event loop(純 sync 匯入期/測試)則跳過。"""
+    sid = str(record.get("session_id") or "")
+    turn = str(record.get("turn_id") or "")
+    key = sid.removeprefix("openclaw:") if sid.startswith("openclaw:") else ""
+    rid = turn.removeprefix("turn-") if turn.startswith("turn-") else ""
+    if _OC_PUSH_ORIGINS.get(key, rid) is None:
+        return
     try:
         asyncio.get_running_loop()
     except RuntimeError:
         return
     try:
         _approval_push(record["id"], record["title"], record["detail"],
-                       record.get("session_id") or "")
+                       sid, persona=sid)
     except Exception as e:  # noqa: BLE001 — 推播失敗不該讓待審整筆掉
         _log_event("oc_approval_push_failed", approval_id=record.get("id"),
                    error=type(e).__name__, error_message=str(e)[:160])
@@ -28909,6 +28920,10 @@ def _oc_push_final(key: str, payload: dict) -> None:
     rid = str(payload.get("runId") or "")
     if rid and rid in _OC_HEARTBEAT_RUNS:
         return
+    # A gateway broadcast, an opened session, or a run-id prefix is not consent.
+    origin = _OC_PUSH_ORIGINS.get(key, rid)
+    if origin is None or origin.final_sent:
+        return
     msg = payload.get("message") or {}
     text = carddigest._oc_msg_text(msg.get("content")).strip()
     if not text:
@@ -28920,8 +28935,10 @@ def _oc_push_final(key: str, payload: dict) -> None:
         loop = asyncio.get_running_loop()
     except RuntimeError:
         return
+    origin.final_sent = True
     t = loop.create_task(push_notify(title, text[:140], data,
                                      thread_id=f"openclaw:{key}",
+                                     persona=f"openclaw:{key}",
                                      content_available=True,
                                      no_preview_body="傳了一則訊息"))
     _BG_TASKS.add(t)
@@ -31853,11 +31870,18 @@ async def _oc_input_core(key: str, session_id: str, body: dict) -> dict:
     params = {"sessionKey": key, "message": content, "idempotencyKey": idem}
     if oc_atts:
         params["attachments"] = oc_atts
+    # Register before awaiting: a fast final can arrive before chat.send's ack.
+    origin, new_origin = _OC_PUSH_ORIGINS.begin(key, idem)
     try:
         # B2:chat.send 冪等安全(idempotencyKey 上面一定帶)→ 允許重試。
         res = await _oc_call_with_retry("chat.send", params, session_key=key)
-    except openclaw_provider.OpenClawError as e:
-        _oc_http_error(e)
+    except BaseException as e:
+        if new_origin:
+            _OC_PUSH_ORIGINS.revoke(origin)
+        if isinstance(e, openclaw_provider.OpenClawError):
+            _oc_http_error(e)
+        raise
+    _OC_PUSH_ORIGINS.bind(origin, str((res or {}).get("runId") or ""))
     d = _OC_CARD_DIGESTS.get(key)
     if d is not None:
         # user 回顯卡:openclaw 的 chat 事件只帶 assistant 訊息,app 送話
@@ -31893,6 +31917,7 @@ async def openclaw_config_put(request: Request):
     token = str(body.get("token") or "").strip()
     openclaw_provider.save_config(base, token)
     OPENCLAW.reset()
+    _OC_PUSH_ORIGINS.clear()
     _oc_reseed_on_reconnect()
     if OPENCLAW.configured():
         _oc_ensure_pump()
