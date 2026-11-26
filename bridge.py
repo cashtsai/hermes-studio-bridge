@@ -63,6 +63,7 @@ from harness import model as harness_model
 from harness import store as harness_store
 from harness import trajectory as harness_traj
 import media_artifacts
+import session_reports
 import hermes_media
 import openclaw_provider
 import gemini_provider
@@ -877,6 +878,7 @@ _CONSOLE_GET = {"/console", "/console/manifest.json", "/console/sw.js", "/health
                 # 跨 session、無過濾)也加進來 —— 那才是會洩漏的那條。
                 "/app/v2/sessions/roster/events"}
 _CONSOLE_SESSION_OPS = {
+    ("GET", "reports"): "replay",
     ("GET", "cards"): "replay", ("GET", "events"): "follow",
     ("GET", "changes"): "changes", ("GET", "diff"): "changes",
     ("POST", "input"): "input", ("POST", "interrupt"): "interrupt", ("POST", "approve"): "approve",
@@ -32033,6 +32035,29 @@ async def v2_session_media(session_id: str, request: Request, limit: int = 100,
     )
     page["items"] = [_media_wire_item(item) for item in page["items"]]
     return page
+
+
+@app.get("/app/v2/sessions/{session_id}/reports")
+async def v2_session_reports(session_id: str, request: Request, media_id: str | None = None):
+    """Only Markdown reports explicitly delivered in this session's retained cards.
+
+    Never capture caller-supplied paths or expose the raw tool media inventory.
+    The same replay grant protects both discovery and each download.
+    """
+    _check_auth(request)
+    store = await _v2_card_store(session_id)
+    refs = session_reports.delivered_refs(list(store.cards.values()))
+    items = await asyncio.to_thread(session_reports.report_manifest, _media_store(), session_id, refs)
+    headers = {"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"}
+    if media_id is None:
+        return JSONResponse({"items": items, "max_preview_bytes": session_reports.MAX_REPORT_BYTES}, headers=headers)
+    if not any(item["media_id"] == media_id for item in items):
+        raise http_err(404, "REPORT_UNAVAILABLE", "報告未交付到此對話或已不在保留歷史內")
+    opened = await asyncio.to_thread(_media_store().open_media, media_id)
+    if opened is None:
+        raise http_err(404, "REPORT_UNAVAILABLE", "報告未封存或來源已失效")
+    path, _mime, filename = opened
+    return FileResponse(path, media_type="text/plain; charset=utf-8", filename=filename, headers=headers)
 
 
 @app.get("/app/v2/artifacts/{media_id}")
