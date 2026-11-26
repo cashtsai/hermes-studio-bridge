@@ -65,12 +65,15 @@ def _run(coro):
 class _Base(unittest.TestCase):
     def setUp(self):
         self._orig = bridge.OPENCLAW
+        self._orig_push_origins = bridge._OC_PUSH_ORIGINS
+        bridge._OC_PUSH_ORIGINS = bridge.PushOrigins()
         self._env = {k: os.environ.get(k) for k in _ENV_KEYS}
         os.environ["OPENCLAW_RESILIENCE"] = "1"
         self._clear_state()
 
     def tearDown(self):
         bridge.OPENCLAW = self._orig
+        bridge._OC_PUSH_ORIGINS = self._orig_push_origins
         for k, v in self._env.items():
             if v is None:
                 os.environ.pop(k, None)
@@ -356,6 +359,7 @@ class CatchupTests(_Base):
         ]}
         fake.responses["chat.history"] = self._history("gap 收尾回覆")
         bridge.OPENCLAW = fake
+        bridge._OC_PUSH_ORIGINS.begin("agent:main:gap", "run-gap")
         # bridge 記帳:gap/running/stale 認定在跑,idle 沒有
         for k in ("agent:main:gap", "agent:main:running", "agent:main:stale"):
             st = bridge._oc_turn_state(k)
@@ -387,6 +391,7 @@ class CatchupTests(_Base):
             self._sessions_row("agent:main:gap", now - 60)]}
         fake.responses["chat.history"] = self._history("一次就好")
         bridge.OPENCLAW = fake
+        bridge._OC_PUSH_ORIGINS.begin("agent:main:gap", "run-gap")
         st = bridge._oc_turn_state("agent:main:gap")
         st["busy"] = True
 
@@ -408,6 +413,7 @@ class CatchupTests(_Base):
                                                        run_id="hb-1")
         bridge.OPENCLAW = fake
         bridge._OC_HEARTBEAT_RUNS["hb-1"] = True
+        bridge._OC_PUSH_ORIGINS.begin("agent:main:gap", "hb-1")
         st = bridge._oc_turn_state("agent:main:gap")
         st["busy"] = True
 
@@ -428,6 +434,7 @@ class CatchupTests(_Base):
             self._sessions_row(KEY, now - 60)]}
         fake.responses["chat.history"] = self._history("回來了")
         bridge.OPENCLAW = fake
+        bridge._OC_PUSH_ORIGINS.begin(KEY, "run-gap")
 
         async def scenario():
             os.environ["OPENCLAW_TURN_STALL_SECS"] = "60"

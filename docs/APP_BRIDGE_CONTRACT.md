@@ -404,6 +404,9 @@ Request body:
 - `personas` (optional, default `null`): `null` subscribes to every persona; a
   list of persona session keys limits persona-message pushes to those personas.
   Non-persona pushes (task done, approvals, test) are not affected.
+  OpenClaw reply and approval pushes use the full `openclaw:{sessionKey}` as
+  their preference key and respect `preview`. Preferences can restrict these
+  pushes, but cannot authorize unrelated gateway turns.
 
 Response: `{ok, devices, prefs: {preview, personas}, apns_configured}`.
 `apns_configured=false` means the bridge has no usable APNs key
@@ -1064,6 +1067,18 @@ provider（app-server）自己回報的 `ThreadStatus` 是權威來源：
   不再重複出現在裸 `codex:` 列。
 
 ### 4.1b OpenClaw（第四 provider，選配）
+
+Notification isolation (2026-11-26): only exact `(sessionKey, runId)` pairs
+issued by this bridge's input path may produce reply or approval APNs pushes.
+Telegram/CLI/cron broadcasts, opening a session, and a `pocket-` run-id prefix
+do not grant notification consent. History catch-up uses the same check; an
+absent run ID fails closed. Input grants are registered before awaiting the
+gateway and revoked on failed/cancelled submissions. Final events and their
+acknowledged run aliases share one delivery attempt to prevent duplicate pushes.
+The ledger is bounded to 4096 aliases with a 24-hour TTL and is process-local:
+after a bridge restart, pre-restart turns remain readable but are not pushed.
+This change does not implement per-user session/history authorization or an
+external-session subscription API; it removes unsolicited gateway pushes.
 
 完整規格在 [`OPENCLAW_PROVIDER_SPEC.md`](OPENCLAW_PROVIDER_SPEC.md)；這裡只寫
 client 對接要知道的最小集合（2026-08-01 補：Android 端曾因本節缺席猜了不存在的
