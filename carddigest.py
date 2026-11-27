@@ -773,6 +773,8 @@ def cc_status_label(busy: bool, prompt, last_tool: str = "",
                     saw_output: bool = False) -> str:
     """契約 §1 session.status 的人話 label —— UI 原樣顯示，不再自己猜。"""
     if prompt:
+        if isinstance(prompt, dict) and prompt.get("semantic") == "notice":
+            return "等待操作"
         return "等待核准"
     if not busy:
         return "待命"
