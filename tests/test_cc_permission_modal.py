@@ -14,12 +14,12 @@ Reading 1 file...
 ────────────────────────────────────────────────────────────────────────────────
  Read file
 ╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
- Read(/Users/test/workspace/external/scripts/story-material-render.js)
+ Read(/Users/you/workspace/external/scripts/story-material-render.js)
 ╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
  Do you want to proceed?
  ❯ 1. Yes
    2. Yes, allow reading from
-      /Users/test/workspace/external/scripts during this
+      /Users/you/workspace/external/scripts during this
       session
    3. No
 
@@ -37,7 +37,7 @@ class PermissionModalTests(unittest.TestCase):
     def test_wrapped_scope_is_visible_on_the_approval_card(self):
         p = bridge._cc_prompt(READ_MODAL)
         row = bridge._cc_approval_payload("test-permission", p)
-        self.assertIn("/Users/test/workspace/external/scripts during this session",
+        self.assertIn("/Users/you/workspace/external/scripts during this session",
                       row["options"][1].get("description", ""))
         self.assertEqual(row["options"][2]["style"], "danger")
 
