@@ -137,6 +137,8 @@ test("capability menus, rename identity, archive undo and retry",async t=>{
   await menu(page,"cc2:new-name");await action(page,"封存");
   assert.equal(posts(data,"/archive").length,0);
   await action(page,"確認封存");await page.locator("#ops-notices").getByRole("button",{name:"取消封存",exact:true}).waitFor();
+  // Undo snackbar 契約(APP_BRIDGE_CONTRACT):role="status",保留到 dismiss 為止。
+  assert.equal(await page.locator("#ops-notices .op-notice").first().getAttribute("role"),"status");
   assert.equal(await page.locator('#session-list .sess[data-id="cc2:new-name"]').count(),0);
   data.undoFail=true;
   await page.locator("#ops-notices").getByRole("button",{name:"取消封存",exact:true}).click();
