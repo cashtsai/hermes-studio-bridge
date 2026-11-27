@@ -68,6 +68,7 @@ function harness() {
     unreadMark: () => '',
     sessionUnread: () => false,
     workMatches: (s, q) => String(s.title || s.id).includes(q),
+    activityTime: value => (typeof value === 'number' ? value * 1000 : (Date.parse(value) || 0)),
     listActivity: new Map(),
     localStorage: (() => { const m = new Map();
       return { getItem: k => (m.has(k) ? m.get(k) : null), setItem: (k, v) => m.set(k, String(v)), removeItem: k => m.delete(k) }; })(),
