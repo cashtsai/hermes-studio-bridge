@@ -8,7 +8,7 @@ test("personal resume is opt-in, login bound, subordinate to a deep link and una
   const {page,origin,model} = await workstation(t);
   const home = page.locator("#personal-work"), pref = page.locator("#remember-work");
   const launch = () => page.goto(origin+"/console");
-  const pick = id => page.locator('#session-list [data-id="codex:'+id+'"]').click();
+  const pick = id => page.locator('#session-list .sess[data-id="codex:'+id+'"]').click();
   await home.waitFor();
   assert.equal(await pref.isChecked(),false);
   await pick("a"); await launch(); await home.waitFor();
@@ -68,7 +68,7 @@ for (const mode of ["browser","standalone"]) test("1366x768 "+mode+": work, late
     assert.equal(await input.inputValue(),"第一行\n第二行選字");
     assert.equal(model.posts.length,0);
     // Include clipping by scrolling ancestors, not only the viewport rectangle.
-    for (const item of [last,input,page.locator('#session-list [data-id="codex:b"]'),page.locator("#rail-reload")]) {
+    for (const item of [last,input,page.locator('#session-list .sess[data-id="codex:b"]'),page.locator("#rail-reload")]) {
       assert.ok(await item.evaluate(el => {
         const b=el.getBoundingClientRect();
         return [0.15,0.85].every(y=>el.contains(document.elementFromPoint(b.x+b.width/2,b.y+b.height*y)));

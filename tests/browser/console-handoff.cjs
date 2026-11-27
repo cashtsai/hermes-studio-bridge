@@ -27,6 +27,8 @@ async function fixture(t, handle, list, viewport, sessionMeta = () => ({})) {
   await page.route("**/*", async route => {
     const url = new URL(route.request().url());
     assert.equal(url.host, "console.test");
+    // Roster subscriptions are not a provider session's replay stream.
+    if (url.pathname === "/app/v2/sessions/roster/events") return stream(route);
     const match = /^\/app\/v2\/sessions\/([^/]+)\/(\w+)$/.exec(url.pathname);
     if (match) return handle(route, decodeURIComponent(match[1]), match[2], url);
     if (url.pathname === "/app/v2/sessions" && list) return list(route);
@@ -63,10 +65,10 @@ test("recent history first, collapsed traces, visible final replies and stable l
       {...row("mixed","<details><summary>執行記錄</summary>trace & <img src=x></details>Final answer"),ts:4}
     ]),older_cursor:"req"}});
   },r=>r.fulfill({json:{sessions:[{id:A,provider:"claude_code",title:"Alpha",capabilities:["replay"]}]}}));
-  await page.locator('#session-list [data-id="'+A+'"]').click();
+  await page.locator('#session-list .sess[data-id="'+A+'"]').click();
   const cards=page.locator("#cards");
   await cards.getByText("Final answer",{exact:true}).waitFor();
-  assert.deepEqual(await page.locator(".prov-head").allTextContents(),["人格","CC","CX","Gemini"]);
+  assert.deepEqual(await page.locator(".prov-name").allTextContents(),["Hermes","Claude Code","Codex","Gemini"]);
   assert.equal(await cards.locator("details").count(),2);
   assert.equal(await cards.locator("pre,img").count(),0);
   await cards.getByText("執行記錄",{exact:true}).click();
@@ -91,7 +93,7 @@ test("reading history survives a live card and a prepend; another session starts
     return r.fulfill({json:{...snap(48,older ? rows.slice(0,24) : rows.slice(24)),older_cursor:older ? null : "r24"}});
   }, r => r.fulfill({json:{sessions:[A,B].map(id => ({id,provider:id.split(":")[0],capabilities:["replay"]}))}}));
   const cards=page.locator("#cards");
-  await page.locator('#session-list [data-id="'+A+'"]').click();
+  await page.locator('#session-list .sess[data-id="'+A+'"]').click();
   await cards.locator('[data-key="r47"]').waitFor();
   await cards.hover();
   await page.mouse.wheel(0,-48);
@@ -118,7 +120,7 @@ test("reading history survives a live card and a prepend; another session starts
   await page.locator("#earlier-cards").click();
   await cards.locator('[data-key="r0"]').waitFor();
   assert.ok(Math.abs(await anchorY()-anchor.y)<=1,"older page moved the reader");
-  await page.locator('#session-list [data-id="'+B+'"]').click();
+  await page.locator('#session-list .sess[data-id="'+B+'"]').click();
   await cards.locator('[data-key="r47"]').waitFor();
   assert.ok(await jump.isHidden());
   assert.ok(await cards.evaluate(el => el.scrollHeight-el.clientHeight-el.scrollTop<=1),"new session inherited detached mode");
@@ -213,14 +215,14 @@ test("Chromebook-sized fresh Chrome profile: resume host activity, distinguish n
   await recent.first().click();
   assert.equal(await page.locator("#input").inputValue(),"my draft");
   await page.locator("#back-home").click();
-  await page.getByRole("searchbox").fill("brand release");
+  await page.getByRole("searchbox",{name:"搜尋工作"}).fill("brand release");
   const hit = page.locator("#home-results .work-row");
   assert.equal(await hit.count(),1);
   assert.match(await hit.innerText(),/job-31/);
   await hit.click();
   await page.locator("#cards").getByText("original codex:job-31").waitFor();
   await page.locator("#back-home").click();
-  await page.getByRole("searchbox").fill("");
+  await page.getByRole("searchbox",{name:"搜尋工作"}).fill("");
   await pending.click();
   await page.getByRole("button",{name:"核准", exact:true}).click();
   await page.locator("#awaiting").waitFor({state:"hidden"});
@@ -286,7 +288,8 @@ test("lost HTTP acknowledgement: read back by ID, never post twice or change the
   lose.resolve();
   assert.equal(await page.locator("#input").inputValue(), "B stays here");
   await page.getByText("Alpha", {exact:true}).first().click();
-  await page.getByRole("button", {name:"確認送達"}).click();
+  // The shipped flow first performs read-only checks after 2s, 8s and 20s.
+  await page.getByRole("button", {name:"確認送達"}).click({timeout:45000});
   await page.getByText("目前未找到收據", {exact:false}).waitFor();
   showReceipt = true;
   await page.getByRole("button", {name:"確認送達"}).click();
@@ -320,7 +323,7 @@ test("live card envelope, cursor on reconnect, expired cursor snapshot without d
   });
   await page.getByText("Beta", {exact:true}).click();
   await page.locator("#cards").getByText("live reply").waitFor();
-  assert.equal(await page.locator("#sh-status").textContent(), "執行中");
+  assert.equal(await page.locator("#sh-status").textContent(), "● 執行中");
   await page.locator('[data-mode="changes"]').click();
   expire.resolve();
   await page.locator("#cards").getByText("from phone while away").waitFor({state:"attached"});
@@ -421,8 +424,8 @@ test("next question shares an approval ID; each displayed step sends its own ind
   }, undefined, undefined, id => id === B && step < 2 ? {approval:{id:"aid", kind:"question", q_index:step, q_total:2,
     title:"Question " + step}, console_options:[{key:"opt0",label:"Option " + step}]} : {});
   await page.locator('#pending-list [data-id="' + B + '"]').click();
-  await page.getByRole("button",{name:"opt0. Option 0",exact:true}).click();
-  await page.getByRole("button",{name:"opt0. Option 1",exact:true}).click();
+  await page.getByRole("button",{name:"Option 0",exact:true}).click();
+  await page.getByRole("button",{name:"Option 1",exact:true}).click();
   await page.locator("#approval").waitFor({state:"hidden"});
   assert.deepEqual(decisions, [["aid",0,"opt0"],["aid",1,"opt0"]]);
 });
