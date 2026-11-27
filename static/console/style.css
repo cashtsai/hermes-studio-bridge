@@ -4,10 +4,17 @@
      canvas / surface / text / accent 族)
    → L3 元件只引用語意名(--bg/--panel/--dim… = L2 的過渡別名)。
 
-   ⚠️ 合流打樁:L2 token 未來由 PocketThemeSpec JSON 生成
-   (schema 見 pocket app repo docs/THEME_SPEC.md,53-role 跨端單一真相;
-   生成器把同一份 JSON 吐成 iOS/Android/console 三端主題)。
-   本檔 L2 命名已對齊該 spec 的 role 名,真生成器留下一波。
+   ⚠️ 單一出處(刀④):L2 的值不再是「手抄 CIS」—— 正本是共享
+   PocketThemeSpec(53-role JSON,跨端單一真相):
+     · pocket-cis repo `tokens/themes/{pocket,white,dark}.json`
+       (schema `tokens/pocket-theme.schema.json`;散文版 pa-ship
+       `docs/THEME_SPEC.md`;web 鏡像 `tokens/css/pocket-tokens.css`;
+       站點 design.pocketone.app)
+   同步步驟:改色 → 先改 pocket-cis 的 themes/*.json(或重跑其生成管線)→
+   把本檔 L2 區塊對齊 → 跑 `tests/test_console_theme_tokens.py`:它把本檔
+   三個主題的每個共享 role 值與 themes/*.json 逐一比對(含 border 的
+   alpha-壓平配方),飄移即紅。真的 JSON→CSS 生成器仍在 pocket-cis
+   ROADMAP;在它落地前,這條測試就是手抄值的守門。
 
    主題 = App 的 PocketPalettes 對位(CIS v2 五色:Pocket Red / Overall Blue /
    White / Star Yellow / Ink)。三個 preset 與 App 同名:
@@ -382,6 +389,15 @@ body{background:var(--bg);color:var(--text);font-family:var(--sans);
 .trace summary{cursor:pointer;padding:6px 8px;border-radius:var(--field-radius);background:var(--panel-2);}
 .trace pre{max-height:22rem;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;color:var(--text);font-family:var(--mono);}
 .provider-empty{padding:4px 12px 8px;color:var(--dim);font-size:13px;line-height:1.6;}
+/* 刀④ 增量渲染哨兵:群組尾端「顯示更多」/ 卡片流頂端「顯示更早」 */
+.sess-more-rows{display:block;width:100%;min-height:36px;margin:2px 0 6px;padding:6px 11px;
+  border:0;border-radius:var(--field-radius);background:transparent;color:var(--accent-2);
+  font:inherit;font-size:13px;text-align:start;cursor:pointer;}
+.sess-more-rows:hover{background:var(--surface-hover);}
+.cards-older{display:block;margin:4px auto 10px;min-height:36px;padding:6px 16px;
+  border:1px solid var(--line);border-radius:var(--btn-radius);background:var(--panel);
+  color:var(--dim);font:inherit;font-size:13px;cursor:pointer;}
+.cards-older:hover{color:var(--text);background:var(--surface-hover);}
 #earlier-cards{margin-inline-start:auto;font-size:13px;}
 .composer{display:flex;gap:8px;padding:12px max(16px,env(safe-area-inset-right)) max(12px,env(safe-area-inset-bottom)) max(16px,env(safe-area-inset-left));
   border-top:1px solid var(--line);background:var(--panel);flex:none;}

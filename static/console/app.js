@@ -487,6 +487,7 @@ function renderSessions() {
   const focusedId = el.contains(document.activeElement) ? document.activeElement.dataset.id : null;
   if (!state.sessions.length) {
     el._provGroups = null;        // 下次有 session 時重建群組結構
+    el._orderedIds = null;
     el.innerHTML = (state.listHealth === "failed" || state.degraded.length)
       ? listEmptyHTML("⚠️", "清單暫時不完整",
           "部分服務連不上。按 ↻ 重新整理,或檢查橋接是否在線。")
@@ -501,6 +502,7 @@ function renderSessions() {
   const visible = filtering ? state.sessions.filter(sessionVisible) : state.sessions;
   if (!visible.length) {
     el._provGroups = null;
+    el._orderedIds = null;
     const what = state.listQuery ? ('「' + esc(state.listQuery) + '」')
       : (state.listFilter === "attn" ? "「需要我」" : "「未讀」");
     el.innerHTML = listEmptyHTML("⌕", "找不到符合的 session",
@@ -584,14 +586,30 @@ function reconcileSessionList(el, byProv) {
     if (g._head._sig !== headHTML) { g._head.innerHTML = headHTML; g._head._sig = headHTML; }
     reconcileRows(g, rows, dim);
   }
+  // j/k 導航的完整順序(含增量視窗外的列)—— 讀 DOM 只看得到窗內。
+  el._orderedIds = Array.from(byProv.values(), rows => rows.map(s => s.id)).flat();
 }
 
+// 刀④:群組內增量渲染。排序/rank/未讀全在資料層算好,只有「畫出來的」列數
+// 設上限 —— 視窗外的列摺進群組尾端一顆「顯示更多」鈕。刻意**不用**
+// IntersectionObserver 自動展開:哨兵在群組與群組之間,捲去下一組會路過它,
+// 自動展開等於永遠到不了下一組。鍵盤 j/k 的目標在窗外時由 moveSelection 展窗。
+const LIST_RENDER_CHUNK = 40, LIST_RENDER_SLACK = 8;
 function reconcileRows(g, rows, dim) {
-  const rowMap = g._rows, desired = new Set(rows.map(s => s.id));
+  g._orderedIds = rows.map(s => s.id);
+  if (!g._limit) g._limit = LIST_RENDER_CHUNK;
+  // 展開中的那一列(state.current)永遠要在窗內 —— 不然 aria-current/高亮會消失。
+  const curAt = rows.findIndex(s => s.id === state.current);
+  if (curAt >= g._limit) g._limit = curAt + 1;
+  // 差一點點就全畫(不為了尾巴 3 列擺一顆「顯示更多」)。
+  const windowed = rows.length > g._limit + LIST_RENDER_SLACK ? rows.slice(0, g._limit) : rows;
+  const hidden = rows.length - windowed.length;
+  const rowMap = g._rows, desired = new Set(windowed.map(s => s.id));
   for (const [id, node] of rowMap) {
     if (!desired.has(id)) { node.remove(); rowMap.delete(id); }
   }
   if (g._empty) { g._empty.remove(); g._empty = null; }
+  if (g._more && (!rows.length || !hidden)) { g._more.remove(); g._more = null; }
   if (!rows.length) {
     g._empty = document.createElement("div");
     g._empty.className = "provider-empty";
@@ -600,7 +618,7 @@ function reconcileRows(g, rows, dim) {
     return;
   }
   let prev = g._head;
-  for (const s of rows) {
+  for (const s of windowed) {
     const html = sessionRowHTML(s);
     let node = rowMap.get(s.id);
     if (!node) {
@@ -616,6 +634,16 @@ function reconcileRows(g, rows, dim) {
     }
     if (prev.nextSibling !== node) g.insertBefore(node, prev.nextSibling);
     prev = node;
+  }
+  if (hidden > 0) {
+    if (!g._more) {
+      g._more = document.createElement("button");
+      g._more.type = "button";
+      g._more.className = "sess-more-rows";
+      g._more.addEventListener("click", () => { g._limit += LIST_RENDER_CHUNK; renderSessions(); });
+    }
+    g._more.textContent = "顯示更多（還有 " + hidden + " 條）";
+    g.appendChild(g._more);   // 恆為群組最後一個節點
   }
 }
 
@@ -740,6 +768,7 @@ let historyAbort, olderCursor = null, loadingOlder = false;
 function resetHistory() {
   $("new-reply").hidden = true;
   cardScroll.replyView = null;
+  resetCardWindow();
   historyAbort?.abort();
   historyAbort = new AbortController();
   olderCursor = null;
@@ -906,8 +935,12 @@ async function loadOlderCards() {
     if (!currentView(view) || olderCursor !== cursor) return;
     if (!Array.isArray(page.cards)) throw new Error("invalid page");
     const known = new Set(state.cards.map(c => c.id));
-    state.cards = page.cards.filter(c => !known.has(c.id)).concat(state.cards);
+    const fresh = page.cards.filter(c => !known.has(c.id));
+    state.cards = fresh.concat(state.cards);
     olderCursor = page.older_cursor || null;
+    // 使用者按了「更早訊息」就是要看它們:視窗錨移到本頁最舊那張,整頁入窗。
+    if (fresh.length) cardRenderFirstId =
+      fresh.reduce((p, c) => ((c.ts || 0) < (p.ts || 0) ? c : p)).id;
     renderCards(true); // Paging never advances the live SSE cursor.
   } catch (err) {
     if (!currentView(view) || olderCursor !== cursor) return;
@@ -1695,6 +1728,45 @@ function groupTurns(cards) {
   return turns;
 }
 
+// ── 刀④:卡片流視窗化(長對話不整串進 DOM)─────────────────────────────
+// 資料層(state.cards)永遠完整 —— 收據比對(confirmEcho)、已讀回報、純文字
+// 保底都照舊讀全量;只有「畫出來的」範圍被限制在尾端一個視窗。視窗之外的
+// 更早卡片摺進頂端一顆哨兵鈕:點擊展開一段,支援 IntersectionObserver 的
+// 瀏覽器捲到頂也會自動展開(展開走翻頁的 prepend 錨定,不跳不閃)。
+// 貼底跟讀時視窗收斂回上限 —— 長串流/深翻頁離開後,DOM 不永久變大。
+const CARD_RENDER_MAX = 200, CARD_RENDER_CHUNK = 100;
+let cardRenderFirstId = null;   // 視窗首卡錨(卡片 id,不是索引 —— 插入不漂移)
+function orderedCards() { return state.cards.slice().sort((a, b) => (a.ts || 0) - (b.ts || 0)); }
+function resetCardWindow() {
+  const el = $("cards");
+  cardRenderFirstId = null;
+  if (el._olderIO) el._olderIO.disconnect();
+  if (el._olderSentinel) el._olderSentinel.remove();
+  el._olderIO = el._olderSentinel = null;
+}
+function revealOlderCards() {
+  const ordered = orderedCards();
+  const start = cardRenderFirstId ? ordered.findIndex((c) => c.id === cardRenderFirstId) : -1;
+  if (start <= 0) return;
+  cardRenderFirstId = ordered[Math.max(0, start - CARD_RENDER_CHUNK)].id;
+  renderCards(true);   // 展開=向上補一段,沿用翻頁的捲動錨定
+}
+function olderSentinel(el) {
+  if (!el._olderSentinel) {
+    const b = document.createElement("button");
+    b.type = "button"; b.className = "cards-older"; b.dataset.key = "__older__";
+    b.addEventListener("click", revealOlderCards);
+    if (typeof IntersectionObserver === "function") {
+      el._olderIO = new IntersectionObserver((entries) => {
+        if (entries.some((x) => x.isIntersecting)) revealOlderCards();
+      }, { root: el });
+      el._olderIO.observe(b);
+    }
+    el._olderSentinel = b;
+  }
+  return el._olderSentinel;
+}
+
 const cardScroll = { follow: true, top: 0, replyView: null };
 function trackCardScroll(el) {
   if (!el.clientHeight || el.scrollTop === cardScroll.top) return;
@@ -1711,13 +1783,22 @@ function renderCards(prepending = false) {
   trackCardScroll(el); // Native scrolling can precede its queued scroll event.
   const follow = !prepending && cardScroll.follow;
   const oldNodes = new Map(Array.from(el.children, n => [n.dataset.key, n]));
+  oldNodes.delete("__older__");   // 哨兵自己管生滅,不走 keyed diff
   const firstVisible = follow ? null : Array.from(el.children).find(n =>
     n.getBoundingClientRect().bottom > el.getBoundingClientRect().top);
   const anchorTop = firstVisible?.getBoundingClientRect().top;
-  if (!state.cards.length) { el.innerHTML = '<div class="placeholder">（還沒有卡片）</div>'; return; }
-  const ordered = state.cards.slice().sort((a,b) => (a.ts || 0) - (b.ts || 0));
+  if (!state.cards.length) { resetCardWindow(); el.innerHTML = '<div class="placeholder">（還沒有卡片）</div>'; return; }
+  const ordered = orderedCards();
+  // 視窗起點:跟著錨卡走(id,不隨插入漂移);貼底跟讀時收斂回上限,被翻走的
+  // 舊卡退出 DOM。往上閱讀中(非 follow)絕不前移起點 —— 移了會把讀者腳下的
+  // 列抽掉。
+  let start = cardRenderFirstId ? ordered.findIndex((c) => c.id === cardRenderFirstId) : -1;
+  if (start < 0) start = Math.max(0, ordered.length - CARD_RENDER_MAX);
+  if (follow) start = Math.max(start, ordered.length - CARD_RENDER_MAX);
+  cardRenderFirstId = ordered.length > start ? ordered[start].id : null;
   let cursor = el.firstElementChild;
-  for (const turn of groupTurns(ordered)) {
+  if (cursor && cursor === el._olderSentinel) cursor = cursor.nextElementSibling;
+  for (const turn of groupTurns(ordered.slice(start))) {
     const key = turn.cards[0].id;
     const node = oldNodes.get(key) || document.createElement("div");
     oldNodes.delete(key);
@@ -1732,6 +1813,16 @@ function renderCards(prepending = false) {
     cursor = node.nextElementSibling;
   }
   for (const n of oldNodes.values()) n.remove();
+  // 頂端哨兵:只在還有被折疊的更早卡片時存在,文案帶數量(不靜默吃掉)。
+  if (start > 0) {
+    const b = olderSentinel(el);
+    b.textContent = "顯示更早的 " + start + " 則訊息";
+    if (el.firstChild !== b) el.insertBefore(b, el.firstChild);
+  } else if (el._olderSentinel) {
+    if (el._olderIO) el._olderIO.disconnect();
+    el._olderSentinel.remove();
+    el._olderIO = el._olderSentinel = null;
+  }
   if (follow) el.scrollTop = el.scrollHeight;
   else if (firstVisible?.isConnected) el.scrollTop += firstVisible.getBoundingClientRect().top - anchorTop;
   else if (prepending) el.scrollTop = oldTop + el.scrollHeight - oldHeight;
@@ -2165,13 +2256,23 @@ function typingNow() {
   return t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable);
 }
 function moveSelection(delta) {
-  const ids = Array.from($("session-list").querySelectorAll(".sess"), n => n.dataset.id);
+  const el = $("session-list");
+  // 完整順序含增量視窗外的列 —— 只讀 DOM 會讓 j/k 撞到視窗邊緣就停。
+  const ids = el._orderedIds || Array.from(el.querySelectorAll(".sess"), n => n.dataset.id);
   if (!ids.length) return;
   const i = ids.indexOf(state.current);
   const next = ids[Math.max(0, Math.min(ids.length - 1, (i < 0 ? 0 : i + delta)))];
   if (next && next !== state.current) {
+    // 目標在視窗外 → 先把所屬群組的窗開到那裡,聚焦才有節點可聚。
+    if (el._provGroups && !Array.from(el.querySelectorAll(".sess")).some(n => n.dataset.id === next)) {
+      for (const g of el._provGroups.values()) {
+        const at = g._orderedIds ? g._orderedIds.indexOf(next) : -1;
+        if (at >= 0) { if (at >= g._limit) g._limit = at + LIST_RENDER_CHUNK; break; }
+      }
+      renderSessions();
+    }
     openSession(next, false, false);
-    const row = Array.from($("session-list").querySelectorAll(".sess")).find(n => n.dataset.id === next);
+    const row = Array.from(el.querySelectorAll(".sess")).find(n => n.dataset.id === next);
     row?.focus({preventScroll:true}); row?.scrollIntoView({block:"nearest"});
   }
 }

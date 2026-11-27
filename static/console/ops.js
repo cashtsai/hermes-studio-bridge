@@ -39,6 +39,9 @@ window.PocketSessionOps = (() => {
   function notice(text, retry, actionLabel="重試", error=false) {
     if (signingOut) return;
     const row=document.createElement("div"); row.className="op-notice"+(error ? " op-error" : "");
+    // W4 對 toast 的 a11y 要求同樣適用這條 snackbar(含封存 Undo):
+    // role="status" + 外層 aria-live,螢幕閱讀器才聽得到「已封存/取消封存」。
+    row.setAttribute("role","status");
     const message=document.createElement("span"); message.textContent=text; row.append(message);
     if (retry) row.append(button(actionLabel, async e=>{
       e.target.disabled=true;
