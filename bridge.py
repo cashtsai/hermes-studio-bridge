@@ -5481,6 +5481,8 @@ def _approval_decision_keys(aid: str) -> tuple:
         return None, None
     if not d or (d.get("kind") or "permission") != "permission":
         return None, None
+    if (d.get("meta") or {}).get("requires_explicit_choice"):
+        return None, None
     opts = [o for o in (d.get("options") or []) if isinstance(o, dict)]
     ok = next((str(o.get("key")) for o in opts
                if o.get("style") == "primary" and o.get("key")), None)
@@ -20726,12 +20728,19 @@ async def _cc_hook_deferred_disambiguate(body: dict, names: list[str],
 def _cc_live_permission_prompt(pane: str):
     """A bottom-anchored permission modal outranks stale progress above it."""
     lines = pane.rstrip().splitlines()
+    # The ccs wrapper may append its branded rule after Claude's live footer.
+    # Never strip arbitrary trailing output: it can prove the modal is stale.
+    if lines and re.fullmatch(r"[─━═]{8,}\s+ccs\s+[─━═]+", lines[-1].strip()):
+        lines.pop()
+        while lines and not lines[-1].strip():
+            lines.pop()
     if not lines or not re.fullmatch(
             r"esc to cancel(?:\s*[·•].*)?", lines[-1].strip(), re.IGNORECASE):
         return None
     footer = len(lines) - 1
     questions = [i for i, line in enumerate(lines[:footer])
-                 if re.match(r"\s*do you want\b.*\?\s*$", line, re.IGNORECASE)]
+                 if re.match(r"\s*(?:do you want\b.*|allow this read outside the working directories)\?\s*$",
+                             line, re.IGNORECASE)]
     if not questions:
         return None
     question = questions[-1]
@@ -20758,9 +20767,14 @@ def _cc_live_permission_prompt(pane: str):
                   if lines[i].strip() and set(lines[i].strip()) <= {"─", "━", "═"}), question)
     subject = "\n".join(line.strip() for line in lines[start:question]
                         if line.strip() and not _cc_is_border(line.strip()))
-    title = (subject.replace("\n", " ") + " · " if subject else "") + lines[question].strip()
-    return {"kind": "menu", "semantic": "permission", "title": title,
-            "detail": subject, "options": options}
+    outside_read = lines[question].strip().lower() == "allow this read outside the working directories?"
+    heading = subject.split("\nAuto mode and the sandbox", 1)[0] if outside_read else subject
+    title = (heading.replace("\n", " ") + " · " if heading else "") + lines[question].strip()
+    result = {"kind": "menu", "semantic": "permission", "title": title,
+              "detail": subject, "options": options}
+    if outside_read:
+        result["requires_explicit_choice"] = True
+    return result
 
 
 def _cc_prompt(pane: str):
@@ -21204,13 +21218,13 @@ def _cc_pane_tab_bar(pane: str) -> dict | None:
     return None
 
 
-async def _cc_key_core(name: str, raw: str) -> dict:
+async def _cc_key_core(name: str, raw: str, *, expected_prompt_sig: str | None = None) -> dict:
     """cc 控制鍵核心 — v1 與 v2 統一路由(key/approve)共用。"""
     async with _cc_seq_guard(name, f"key:{raw}"):
-        return await _cc_key_core_locked(name, raw)
+        return await _cc_key_core_locked(name, raw, expected_prompt_sig=expected_prompt_sig)
 
 
-async def _cc_key_core_locked(name: str, raw: str) -> dict:
+async def _cc_key_core_locked(name: str, raw: str, *, expected_prompt_sig: str | None = None) -> dict:
     if not await _tmux_alive(name):
         raise http_err(409, "SESSION_NOT_RUNNING", "session not running")
     args = ["send-keys", "-t", name]
@@ -21230,6 +21244,9 @@ async def _cc_key_core_locked(name: str, raw: str) -> dict:
         _PANE_CACHE.pop(name, None)           # 強制拿最新畫面,不吃快取
         pane_now = await _tmux_capture_cached(name)
         prompt_now = _cc_prompt(pane_now)
+        if expected_prompt_sig is not None and (
+                not prompt_now or _cc_prompt_sig(prompt_now) != expected_prompt_sig):
+            raise http_err(409, "PROMPT_STALE", "the permission request has changed")
         # Keep key validation in sync with /status: AskUserQuestion details may
         # only be visible in the transcript jsonl, while the pane has a trimmed
         # or transient rendering. Still avoid resurrecting stale asks mid-turn.
@@ -21861,6 +21878,9 @@ def _cc_reseed_approvals_from_db() -> int:
 def _cc_choice_key(prompt: dict, approve: bool) -> str:
     """approve 布林 → prompt option key。認得 allow/deny 字樣就精準選;
     認不得時 approve=第一個選項、deny=Esc(TUI 的通用取消)。"""
+    if prompt.get("requires_explicit_choice"):
+        raise http_err(400, "EXPLICIT_CHOICE_REQUIRED",
+                       "請選擇明確選項；這個確認包含永久權限設定，不能只傳允許或拒絕")
     options = prompt.get("options") or []
     pat = _CC_ALLOW_RE if approve else _CC_DENY_RE
     for o in options:
@@ -21934,6 +21954,8 @@ def _cc_approval_payload(name: str, prompt: dict) -> dict:
                 ent["style"] = "secondary"
         options.append(ent)
     meta = {}
+    if prompt.get("requires_explicit_choice"):
+        meta["requires_explicit_choice"] = True
     if kind == "question":
         meta["multiselect"] = bool(prompt.get("multiselect"))
     for k in ("q_index", "q_total"):
@@ -37379,17 +37401,31 @@ async def _approval_decide_serial(aid: str, b: dict) -> dict:
         if not prompt or not active or active.get("aid") != aid:
             _cc_approval_set_status(aid, "expired")
             raise HTTPException(status_code=409, detail="already decided or expired")
+        explicit_choice = bool(prompt.get("requires_explicit_choice")
+                               or (d.get("meta") or {}).get("requires_explicit_choice"))
+        if explicit_choice:
+            if _cc_prompt_sig(prompt) != _cc_prompt_sig(d):
+                _cc_approval_set_status(aid, "expired")
+                raise http_err(409, "PROMPT_STALE", "the permission request has changed")
+            if not key:
+                raise http_err(400, "EXPLICIT_CHOICE_REQUIRED",
+                               "請選擇明確選項；不能將單次讀取與永久權限混為一談")
+            if key not in {str(o.get("key")) for o in prompt.get("options") or []}:
+                raise http_err(400, "UNKNOWN_KEY", "choose one of the offered options")
         key = key or _cc_choice_key(prompt, bool(b.get("approve")))
         # 決議語意:帶 approve bool 用 bool;只給 {key} 時由該鍵的 style 判斷
         # (danger/esc=否決)— 之前 {key} 決定一律被記成 rejected 是誤標。
-        if "approve" in b:
+        if "approve" in b and not explicit_choice:
             decision = "approved" if b.get("approve") else "denied"
         else:
             styles = {str(o.get("key") or ""): o.get("style")
                       for o in (d.get("options") or [])}
             decision = "denied" if (key == "esc" or styles.get(key) == "danger") \
                 else "approved"
-        await _cc_key_core(name, key)
+        if explicit_choice:
+            await _cc_key_core(name, key, expected_prompt_sig=_cc_prompt_sig(d))
+        else:
+            await _cc_key_core(name, key)
         _cc_approval_set_status(aid, decision)
         _CC_APPROVAL_ACTIVE.pop(name, None)
         try:
