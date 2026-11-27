@@ -405,17 +405,34 @@ function sortSessions(rows, now) {
     (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
 }
 
+const PROVIDER_NAV = {
+  hermes: { code: "H", name: "Hermes" },
+  claude_code: { code: "CC", name: "Claude Code" },
+  codex: { code: "CX", name: "Codex" },
+  gemini: { code: "GM", name: "Gemini" },
+  openclaw: { code: "OC", name: "OpenClaw" },
+  grok: { code: "GR", name: "Grok" },
+  opencode: { code: "OP", name: "OpenCode" },
+};
+function providerIdentity(provider) {
+  const key = provider === "cc2" ? "claude_code" : provider;
+  return Object.hasOwn(PROVIDER_NAV, key) ? PROVIDER_NAV[key]
+    : { code: "?", name: String(provider || "未知來源") };
+}
+
 // 一列的內容 HTML(.session-row 的內部)。當這串與上次相同 → 完全不碰 DOM。
 function sessionRowHTML(s) {
   const active = s.id === state.current;
   const locked = s.meta && s.meta.locked ? ' 🔒' : "";
   const pinned = isPinned(s.id);
+  const provider = providerIdentity(s.provider);
   return '<button type="button" class="sess' + (active ? " active" : "") + (pinned ? " pinned" : "") +
     '" data-id="' + esc(s.id) + '" aria-current="' + (active ? "true" : "false") + '">' +
     '<span class="sess-name">' + esc(s.title || s.id) + locked + unreadMark(s) + "</span>" +
-    '<span class="sess-sub"><span class="st st-' + esc(s.status || "idle") + '">' +
+    '<span class="sess-sub"><span class="sess-provider" title="' + esc(provider.name) +
+    '" aria-label="' + esc(provider.name) + '">' + esc(provider.code) + '</span><span class="st st-' + esc(s.status || "idle") + '">' +
     (phaseGlyph(s) ? esc(phaseGlyph(s)) + " " : "") + esc(workPhase(s)) +
-    "</span> " + esc(sessionPreview(s)) + "</span></button>" +
+    '</span><span class="sess-preview">' + esc(sessionPreview(s)) + "</span></span></button>" +
     '<button type="button" class="sess-pin' + (pinned ? " on" : "") + '" data-id="' + esc(s.id) +
     '" title="' + (pinned ? "取消釘選" : "釘選到頂") + '" aria-label="' + (pinned ? "取消釘選" : "釘選") +
     '">' + (pinned ? "★" : "☆") + "</button>" +
@@ -529,7 +546,10 @@ function reconcileSessionList(el, byProv) {
     if (!g) {
       g = document.createElement("div");
       g.className = "prov-group";
-      g._head = document.createElement("div");
+      g.dataset.provider = prov;
+      g.setAttribute("role", "group");
+      g.setAttribute("aria-label", providerIdentity(prov).name);
+      g._head = document.createElement("h3");
       g.appendChild(g._head);
       g._rows = new Map();   // id → .session-row
       g._empty = null;
@@ -541,10 +561,14 @@ function reconcileSessionList(el, byProv) {
     prevGroup = g;
     // 群組標頭(降級態)
     const dim = state.degraded.includes(prov) || (prov === "claude_code" && state.degraded.includes("cc2"));
-    const headText = (PROVIDER_LABEL[prov] || prov) + (dim ? " ⚠" : "");
+    const provider = providerIdentity(prov);
+    const headHTML = '<span class="prov-code" aria-hidden="true">' + esc(provider.code) +
+      '</span><span class="prov-name">' + esc(provider.name) + '</span>' +
+      '<span class="prov-count" aria-label="' + rows.length + ' 個對話">' + rows.length + '</span>' +
+      (dim ? '<span class="prov-warning" role="img" aria-label="連線異常，清單可能不完整" title="連線異常，清單可能不完整">⚠</span>' : "");
     const headCls = "prov-head" + (dim ? " degraded" : "");
     if (g._head.className !== headCls) g._head.className = headCls;
-    if (g._head.textContent !== headText) g._head.textContent = headText;
+    if (g._head._sig !== headHTML) { g._head.innerHTML = headHTML; g._head._sig = headHTML; }
     reconcileRows(g, rows, dim);
   }
 }

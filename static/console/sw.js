@@ -1,6 +1,6 @@
 // The same /console URL can return a private login challenge or a workbench.
 // Never cache navigations (including query strings), even for offline launch.
-const SHELL = "pocket-console-shell-v28";
+const SHELL = "pocket-console-shell-v29";
 const ASSETS = ["style.css", "interaction.css", "JetBrainsMono-Regular.woff2", "JetBrainsMono-SemiBold.woff2",
   "sse.js", "md.js", "app.js", "report-reader.js", "transcript.js", "filebrowser.js", "changes.js",
   "terminal.js", "memory.js", "ops.js", "icon-192.png"].map(name => "/console/static/" + name);

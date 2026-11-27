@@ -63,10 +63,10 @@ test("recent history first, collapsed traces, visible final replies and stable l
       {...row("mixed","<details><summary>執行記錄</summary>trace & <img src=x></details>Final answer"),ts:4}
     ]),older_cursor:"req"}});
   },r=>r.fulfill({json:{sessions:[{id:A,provider:"claude_code",title:"Alpha",capabilities:["replay"]}]}}));
-  await page.locator('#session-list [data-id="'+A+'"]').click();
+  await page.locator('#session-list .sess[data-id="'+A+'"]').click();
   const cards=page.locator("#cards");
   await cards.getByText("Final answer",{exact:true}).waitFor();
-  assert.deepEqual(await page.locator(".prov-head").allTextContents(),["人格","CC","CX","Gemini"]);
+  assert.deepEqual(await page.locator(".prov-name").allTextContents(),["Hermes","Claude Code","Codex","Gemini"]);
   assert.equal(await cards.locator("details").count(),2);
   assert.equal(await cards.locator("pre,img").count(),0);
   await cards.getByText("執行記錄",{exact:true}).click();
@@ -91,7 +91,7 @@ test("reading history survives a live card and a prepend; another session starts
     return r.fulfill({json:{...snap(48,older ? rows.slice(0,24) : rows.slice(24)),older_cursor:older ? null : "r24"}});
   }, r => r.fulfill({json:{sessions:[A,B].map(id => ({id,provider:id.split(":")[0],capabilities:["replay"]}))}}));
   const cards=page.locator("#cards");
-  await page.locator('#session-list [data-id="'+A+'"]').click();
+  await page.locator('#session-list .sess[data-id="'+A+'"]').click();
   await cards.locator('[data-key="r47"]').waitFor();
   await cards.hover();
   await page.mouse.wheel(0,-48);
@@ -118,7 +118,7 @@ test("reading history survives a live card and a prepend; another session starts
   await page.locator("#earlier-cards").click();
   await cards.locator('[data-key="r0"]').waitFor();
   assert.ok(Math.abs(await anchorY()-anchor.y)<=1,"older page moved the reader");
-  await page.locator('#session-list [data-id="'+B+'"]').click();
+  await page.locator('#session-list .sess[data-id="'+B+'"]').click();
   await cards.locator('[data-key="r47"]').waitFor();
   assert.ok(await jump.isHidden());
   assert.ok(await cards.evaluate(el => el.scrollHeight-el.clientHeight-el.scrollTop<=1),"new session inherited detached mode");

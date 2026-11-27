@@ -24,6 +24,7 @@ function makeNode(tag) {
     get textContent() { return this._text; },
     set innerHTML(v) { this._html = String(v); this.children = []; },  // 設 innerHTML(空或非空)都換掉子節點(同瀏覽器)
     get innerHTML() { return this._html; },
+    setAttribute(k, v) { this[k] = String(v); },
     appendChild(c) { c.parentNode = this; this.children.push(c); return c; },
     insertBefore(c, ref) {
       if (c.parentNode) { const i = c.parentNode.children.indexOf(c); if (i >= 0) c.parentNode.children.splice(i, 1); }
@@ -189,4 +190,44 @@ test('pinned session floats to the top of its provider group and persists', () =
   assert.ok(cRow.innerHTML.includes('sess pinned') || cRow.innerHTML.includes('pinned'), 'row marked pinned');
   h.c.togglePin('claude_code:c');   // unpin
   assert.deepEqual(h.order(), ['claude_code:a', 'claude_code:b', 'claude_code:c'], 'back to id order after unpin');
+});
+
+test('provider headings carry full names, visible counts and row identities, including cc2', () => {
+  const h = harness();
+  h.state.sessions = [S('cc2:a', 'idle', {provider:'cc2',title:'Same title'}),
+    S('claude_code:b', 'idle', {title:'Same title'}),
+    S('codex:a', 'idle', {provider:'codex',title:'Same title'})];
+  h.render();
+  const cc = h.listEl._provGroups.get('claude_code');
+  const cx = h.listEl._provGroups.get('codex');
+  assert.equal(cc.dataset.provider, 'claude_code');
+  assert.equal(cc['aria-label'], 'Claude Code');
+  assert.match(cc._head.innerHTML, /prov-name">Claude Code/);
+  assert.match(cc._head.innerHTML, /aria-label="2 個對話">2/);
+  assert.match(cx._head.innerHTML, /prov-name">Codex/);
+  assert.match(h.rows()[0].innerHTML, /class="sess-provider" title="Claude Code" aria-label="Claude Code">CC/);
+  assert.match(h.rows()[2].innerHTML, /class="sess-provider" title="Codex" aria-label="Codex">CX/);
+  const header = cc._head, sig = header._sig;
+  h.render();
+  assert.equal(cc._head, header);
+  assert.equal(header._sig, sig);
+  h.state.listQuery = 'Same'; h.state.listFilter = 'unread';
+  h.state.sessions[0]._unread = true;
+  h.render();
+  assert.equal(h.listEl._provGroups.size, 1);
+  assert.match(cc._head.innerHTML, /aria-label="1 個對話">1/);
+});
+
+test('degraded provider retains its identity and an explicit warning; unknown providers stay readable', () => {
+  const h = harness();
+  h.state.sessions = [S('cc2:a','idle',{provider:'cc2'}), S('future:a','idle',{provider:'Future Provider'})];
+  h.state.degraded = ['cc2'];
+  h.render();
+  const cc = h.listEl._provGroups.get('claude_code');
+  assert.match(cc._head.className, /degraded/);
+  assert.match(cc._head.innerHTML, /連線異常，清單可能不完整/);
+  assert.equal(h.listEl._provGroups.get('Future Provider')['aria-label'], 'Future Provider');
+  assert.match(h.c.sessionRowHTML(h.state.sessions[1]), /title="Future Provider"/);
+  h.state.degraded = []; h.render();
+  assert.doesNotMatch(cc._head.innerHTML, /prov-warning/);
 });

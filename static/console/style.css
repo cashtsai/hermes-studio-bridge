@@ -24,6 +24,9 @@
   --overall-blue:#049CD8;  --overall-blue-300:#2AA8E0;
   --star-yellow:#FBD000;   --star-yellow-300:#FFD426;
   --ink:#17171A;           --paper-cream:#FFF2D6;      /* 品牌奶油底,拍板保留 */
+  /* Pocket CIS v1.1 tool identity accents, never execution-status lamps. */
+  --provider-claude:#D47345; --provider-codex:#338C80;
+  --provider-openclaw:#C41E30; --provider-gemini:#4285F4;
 
   /* ── 結構 token(跨主題不變)── */
   --btn-radius:9999px;   /* 按鈕=膠囊(SDS 簽名):送出/繼續/中斷/mode 鈕 */
@@ -155,9 +158,23 @@ body{background:var(--bg);color:var(--text);font-family:var(--sans);
 .icon-btn{background:none;border:none;color:var(--dim);cursor:pointer;font-size:16px;
   min-width:44px;min-height:44px;padding:8px;flex:none;}
 .icon-btn:hover{color:var(--text);}
-#session-list{overflow-y:auto;flex:1;padding:6px;}
-.prov-head{font-size:13px;line-height:1.6;color:var(--dim);padding:8px 8px 4px;letter-spacing:.1em;}
-.prov-head.degraded{color:var(--warn);}
+#session-list{overflow-y:auto;flex:1;padding:0 6px 6px;scroll-padding-block:64px 8px;}
+.prov-group{--provider-identity:var(--faint);position:relative;padding-bottom:8px;}
+.prov-group + .prov-group{margin-top:12px;border-top:1px solid var(--line);}
+.prov-group[data-provider="claude_code"]{--provider-identity:var(--provider-claude);}
+.prov-group[data-provider="codex"]{--provider-identity:var(--provider-codex);}
+.prov-group[data-provider="openclaw"]{--provider-identity:var(--provider-openclaw);}
+.prov-group[data-provider="gemini"]{--provider-identity:var(--provider-gemini);}
+/* Each opaque heading sticks only within its own group. No scroll listener. */
+.prov-head{position:sticky;top:0;z-index:2;display:flex;align-items:center;gap:8px;
+  min-height:48px;margin:0 0 4px;padding:8px;color:var(--text);background:var(--panel);
+  border-bottom:1px solid var(--line);font-size:14px;line-height:1.5;letter-spacing:0;}
+.prov-code{display:grid;place-items:center;flex:none;min-width:36px;height:28px;
+  padding:0 4px;border-inline-start:3px solid var(--provider-identity);border-radius:4px;
+  background:var(--panel-2);font:600 13px/1 var(--mono);}
+.prov-name{flex:1;min-width:0;overflow-wrap:anywhere;}
+.prov-count{flex:none;color:var(--dim);font:400 13px/1.6 var(--mono);font-variant-numeric:tabular-nums;}
+.prov-warning{flex:none;color:var(--warn);font-size:16px;}
 .sess{display:block;width:100%;min-height:44px;text-align:start;font:inherit;color:inherit;
   border:0;background:transparent;padding:8px 10px;border-radius:var(--field-radius);cursor:pointer;margin-bottom:2px;}
 .sess-name,.sess-sub{display:block;}
@@ -206,6 +223,10 @@ body{background:var(--bg);color:var(--text);font-family:var(--sans);
 .hub-row:hover{background:var(--surface-hover);}
 .sess-name{font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
 .sess-sub{font-size:13px;line-height:1.6;color:var(--dim);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.sess .sess-sub{display:flex;align-items:center;gap:6px;min-width:0;}
+.sess-provider{flex:none;min-width:2ch;color:var(--text);font:600 12px/1.6 var(--mono);}
+.sess-sub .st{flex:none;}
+.sess-preview{min-width:0;overflow:hidden;text-overflow:ellipsis;}
 .st{padding:0 8px;border-radius:var(--field-radius);font-size:13px;line-height:1.6;background:var(--panel-2);}
 .unread-mark{display:inline-block;margin-inline-start:8px;color:var(--accent);font-size:12px;font-weight:700;}
 .empty,.placeholder{color:var(--dim);padding:24px 16px;text-align:center;}
