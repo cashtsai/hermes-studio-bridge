@@ -20763,6 +20763,34 @@ def _cc_live_permission_prompt(pane: str):
             "detail": subject, "options": options}
 
 
+def _cc_live_onboarding_prompt(pane: str):
+    """Recognize the live auto-mode setup form, exposing cancellation only."""
+    lines = pane.rstrip().splitlines()[-40:]
+    if not lines or not re.fullmatch(
+            r"↑/?↓ to navigate\s*[·•]\s*space to toggle\s*[·•]\s*esc to cancel",
+            lines[-1].strip(), re.IGNORECASE):
+        return None
+    start = next((i + 1 for i in range(len(lines) - 2, -1, -1)
+                  if re.fullmatch(r"[▔─━═]{8,}", lines[i].strip())), None)
+    if start is None:
+        return None
+    body = [line.strip() for line in lines[start:-1] if line.strip()]
+    if not body or body[0] != "Teach auto mode about your environment?":
+        return None
+    if not any(re.match(r"❯\s+(?:How you use Claude here|Also scan|Continue)\b", line)
+               for line in body):
+        return None
+    rows = [line.removeprefix("❯").strip() for line in body]
+    if not all(any(re.fullmatch(label + r"\s+(?:on|off)", line) for line in rows)
+               for label in ("Also scan shell history", "Also scan your other repos")):
+        return None
+    return {"kind": "menu", "semantic": "notice",
+            "title": "Claude Code 環境設定：等待操作",
+            "detail": "\n".join(rows) + "\n可取消此導覽；如需設定，請回桌面操作。",
+            "options": [{"key": "cancel_onboarding", "label": "取消導覽",
+                         "description": "只關閉導覽，不同意掃描或變更權限。"}]}
+
+
 def _cc_prompt(pane: str):
     """Detect a Claude Code interactive choice prompt so the app can render real
     buttons. Returns {kind,title,options:[{key,label}]} or None.
@@ -20771,6 +20799,9 @@ def _cc_prompt(pane: str):
     made every Chinese question invisible to the app); (2) permission prompts —
     the original STRICT keyword path, kept as fallback for older layouts.
     Live permission modals take precedence over historical busy text."""
+    onboarding = _cc_live_onboarding_prompt(pane)
+    if onboarding:
+        return onboarding
     permission = _cc_live_permission_prompt(pane)
     if permission:
         return permission
@@ -21048,6 +21079,10 @@ async def _cc_status_core(name: str) -> dict:
     else:
         mode = "normal"
     prompt = _cc_prompt(pane)
+    if prompt and prompt.get("semantic") == "notice":
+        # This live form hides the mode bar and is waiting for the user, not
+        # executing the turn described by an earlier busy hook.
+        busy, mode = False, None
     # wave 2: usage meter + full plan text from the transcript jsonl.
     row = next((r for r in _cc_conf_rows() if r[0] == name), None)
     jsonl = await _cc_session_jsonl(name, row[1]) if row else None
@@ -21217,7 +21252,15 @@ async def _cc_key_core_locked(name: str, raw: str) -> dict:
     mapped = _CC_KEYS.get(raw.lower())
     submit_after_key = False
     need_enter = False                       # 只有問答路徑會設 True(見下)
-    if mapped:
+    if raw == "cancel_onboarding":
+        # A semantic key keeps a stale card from sending Escape to a new turn.
+        # Validate inside the same session lock as the actual keystroke.
+        _PANE_CACHE.pop(name, None)
+        pane_now = await _tmux_capture_cached(name)
+        if not _cc_live_onboarding_prompt(pane_now):
+            raise http_err(409, "PROMPT_STALE", "onboarding is no longer open")
+        args.append("Escape")
+    elif mapped:
         args.append(mapped)                  # named control key
     elif len(raw) == 1 and raw.isprintable():
         # 選單/是否題的單字元答案(y/n/1-9)—— 送出前先拿「現在」的畫面重驗一次
@@ -21895,7 +21938,8 @@ def _cc_approval_kind(prompt: dict) -> str:
     # A1:語意在誕生點標好 — _cc_prompt 的分支即分類(泛選單=question、
     # 權限/yesno=permission);permission 的鍵由 bridge 標 style,app 只渲染,
     # 不再用 label 猜「哪顆是拒絕」。question 無 danger 語意(spec §2)。
-    return "question" if prompt.get("semantic") == "question" else "permission"
+    semantic = prompt.get("semantic")
+    return semantic if semantic in ("question", "notice") else "permission"
 
 
 def _cc_approval_payload(name: str, prompt: dict) -> dict:
@@ -23952,7 +23996,7 @@ def _cc_dispatch_status(store, st: dict, now: float | None = None) -> dict | Non
     if st.get("prompt"):
         return {"busy": False, "mode": st.get("mode"),
                 "prompt": st.get("prompt"), "phase": "blocked",
-                "label": "等待核准"}
+                "label": carddigest.cc_status_label(False, st["prompt"])}
     started = float(getattr(store, "dispatch_started_at", 0.0) or 0.0)
     elapsed = max(0.0, (now if now is not None else time.time()) - started)
     label = ("已送達，等待 Claude Code 開始…"
@@ -24468,6 +24512,7 @@ async def _cc_card_follower(name: str, workdir: str):
             if subs_now > 0 or bg_watch:
                 st = await _cc_status_core(name)
                 busy = bool(st.get("busy"))
+                waiting_notice = (st.get("prompt") or {}).get("semantic") == "notice"
                 if busy:
                     store.queued_until = 0.0   # 真忙了 → 排隊寬限交還正常路徑
                 # 新訂閱者(開啟/重連時可能在「忙碌中途」接入)→ 強制重發一次當前
@@ -24475,7 +24520,7 @@ async def _cc_card_follower(name: str, workdir: str):
                 # 整段回覆期看起來像沒反應。
                 if subs_now > subs_was:
                     store.status = None
-                if prev_busy is not None and busy != prev_busy:
+                if prev_busy is not None and busy != prev_busy and not waiting_notice:
                     if busy:
                         store.turn_id = "turn-" + uuid.uuid4().hex[:12]
                         store.saw_output = False
@@ -24492,9 +24537,14 @@ async def _cc_card_follower(name: str, workdir: str):
                             # 背景收尾:沒人在看畫面 → 推播叫人回來
                             # (委派/節流的「不推」判定在函式內)。
                             _cc_turn_end_push(name, store)
-                prev_busy = busy
+                if not waiting_notice:
+                    prev_busy = busy
                 dispatch_status = None if busy else _cc_dispatch_status(store, st)
-                if dispatch_status is not None:
+                if waiting_notice:
+                    status = {"busy": False, "mode": st.get("mode"),
+                              "prompt": st["prompt"], "phase": "blocked",
+                              "label": carddigest.cc_status_label(False, st["prompt"])}
+                elif dispatch_status is not None:
                     # The TUI is idle because it handed work to a background
                     # process, but the accepted input has not produced a
                     # follow-up card yet. Keep this visible until a real card
@@ -37379,16 +37429,29 @@ async def _approval_decide_serial(aid: str, b: dict) -> dict:
         if not prompt or not active or active.get("aid") != aid:
             _cc_approval_set_status(aid, "expired")
             raise HTTPException(status_code=409, detail="already decided or expired")
-        key = key or _cc_choice_key(prompt, bool(b.get("approve")))
-        # 決議語意:帶 approve bool 用 bool;只給 {key} 時由該鍵的 style 判斷
-        # (danger/esc=否決)— 之前 {key} 決定一律被記成 rejected 是誤標。
-        if "approve" in b:
-            decision = "approved" if b.get("approve") else "denied"
+        if d.get("kind") == "notice" or prompt.get("semantic") == "notice":
+            if (d.get("kind") != "notice" or prompt.get("semantic") != "notice"
+                    or _cc_prompt_sig(d) != _cc_prompt_sig(prompt)):
+                _cc_approval_set_status(aid, "expired")
+                raise http_err(409, "PROMPT_STALE", "onboarding is no longer open")
+            # Shipped CC card clients send only an approve bool. For this
+            # single-action notice either value means cancel, never Continue.
+            if not key and isinstance(b.get("approve"), bool):
+                key = "cancel_onboarding"
+            if key != "cancel_onboarding":
+                raise http_err(400, "UNKNOWN_KEY", "choose the offered cancel action")
+            decision = "acknowledged"
         else:
-            styles = {str(o.get("key") or ""): o.get("style")
-                      for o in (d.get("options") or [])}
-            decision = "denied" if (key == "esc" or styles.get(key) == "danger") \
-                else "approved"
+            key = key or _cc_choice_key(prompt, bool(b.get("approve")))
+            # 決議語意:帶 approve bool 用 bool;只給 {key} 時由該鍵的 style 判斷
+            # (danger/esc=否決)— 之前 {key} 決定一律被記成 rejected 是誤標。
+            if "approve" in b:
+                decision = "approved" if b.get("approve") else "denied"
+            else:
+                styles = {str(o.get("key") or ""): o.get("style")
+                          for o in (d.get("options") or [])}
+                decision = "denied" if (key == "esc" or styles.get(key) == "danger") \
+                    else "approved"
         await _cc_key_core(name, key)
         _cc_approval_set_status(aid, decision)
         _CC_APPROVAL_ACTIVE.pop(name, None)

@@ -1797,6 +1797,30 @@ app 端先行件（不等 bridge）：卡片渲染元件 + 傳輸層抽象
 - **hermes waiting_approval**:persona 有 pending 時 v2 sessions 該列
   `status=waiting_approval` + `meta.approval`(之前恆 idle)。
 
+### CC auto-mode onboarding (2026-11-27)
+
+- The live `Teach auto mode about your environment?` form is a `notice`, not
+  a permission request. `/ccsessions/{name}/status` exposes a `menu` prompt
+  with `semantic: notice`, `busy: false`, and `mode: null` (the bar is hidden).
+  The card stream reports `phase: blocked`, label `等待操作`, even while an
+  earlier input is queued. The existing approval watcher deduplicates and
+  publishes a notice card and notification.
+- Its only option is `{key: cancel_onboarding, label: 取消導覽}`. Clients must
+  send that key unchanged through the approval decision or CC key endpoint.
+  It rechecks the live form under the session input lock and sends **Escape
+  only**, never Enter, Space, Continue, scan consent, or a permission change.
+- A resolved notice returns `acknowledged`; repeated decisions return the
+  existing receipt. An obsolete action returns `409 PROMPT_STALE` without
+  sending a key. Shipped CC card clients that send only `{approve: bool}` are
+  supported: either boolean value activates this notice's **sole cancel
+  action**, never Continue or consent. Unoffered keys return `400 UNKNOWN_KEY`.
+- Detection never dismisses the form automatically. New chat input is rejected
+  with `409 CC_INPUT_NOT_ACCEPTED` until it is handled, rather than being
+  pasted into a settings control. No previous command is automatically retried.
+- Recognition is intentionally limited to the known, bottom-anchored form
+  with its navigation/toggle/cancel footer. Future CLI layout changes require
+  new fixtures; arbitrary terminal prose is not treated as actionable UI.
+
 ## 13. 全機發現與收編(`/app/v2/discovery`,SUBPROCESS_HARNESS_DESIGN §2.3)
 
 > 善彰定調:Pocket 是那台機器的**指揮艙**,不是只管「從 Pocket 開的」。
