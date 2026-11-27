@@ -25,7 +25,7 @@ OPENCLAW_CONFIG_FILE="${OPENCLAW_CONFIG_FILE:-$HOME/.pocket/openclaw.json}"
 # 以前這個 env 沒進 plist,所以出貨的 Mac 一律 enroll 不了 ——
 # 使用者打開「遠端連線」只會看到「還沒接上 Pocket ID」然後卡死。
 # 設成空字串即可整段關閉(bridge 那邊是 env 閘,沒值就完全靜默)。
-POCKET_ID_URL="${POCKET_ID_URL-https://id.pocket.shan.house}"
+POCKET_ID_URL="${POCKET_ID_URL-https://id.pocketone.app}"
 PROVIDER_CHOICE="${POCKET_PROVIDER:-${POCKET_INSTALL_PROVIDER:-auto}}"
 if [ -z "$PROVIDER_CHOICE" ] && [ "${POCKET_INSTALL_PROVIDERS:-0}" = "1" ]; then
   PROVIDER_CHOICE="auto"
