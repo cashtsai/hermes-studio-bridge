@@ -940,6 +940,12 @@ and file path are retained in the title/detail, and wrapped permission scopes
 remain in each option's description. Detection only publishes the existing
 approval card/push; it never grants permission or changes Claude's permission mode.
 
+The outside-directory read modal (`Allow this read outside the working
+directories?`) retains all four numbered choices, including the distinction
+between one-time decisions and persistent read policy. A trailing `ccs` branded
+horizontal rule does not hide a live modal; arbitrary later output still makes
+the old modal stale. The full policy warning remains in `detail`.
+
 ### `POST /app/v1/approvals/{id}/decision`
 
 Records approve/reject decisions. PocketAgent must not call this in smoke tests.
@@ -1784,6 +1790,10 @@ app 端先行件（不等 bridge）：卡片渲染元件 + 傳輸層抽象
   v2 統一 body:`POST /app/v2/sessions/{id}/approve {approval_id, key}`;
   三種舊 body(`{key}`/`{approve}`/`{approval_id}`)相容期照收。
   409 語意不變(已決/失效);未知 key 回 400 `UNKNOWN_KEY`。
+  CC 工作目錄外讀取確認含單次與永久設定,標記 `meta.requires_explicit_choice=true`。
+  此類確認只收確切 `key`,布林相容糖回 400 `EXPLICIT_CHOICE_REQUIRED`,不得猜選項。
+  Push 不提供二元允許/拒絕捷徑。送鍵前再次比對即時題目與卡片,不同回
+  409 `PROMPT_STALE`,不傳按鍵。App 的 CC 卡片一律保留使用者點擊的 option key。
   CX 的指令／檔案核准若帶 `availableDecisions`，卡片只顯示本次可表達的選項。
   沒有 `acceptForSession` 就不提供「本次全允許」；永久規則修改不是 session 授權。
   若可拒絕指令，`deny` 送 `decline`；若供應端只提供取消回合，按鈕改標
