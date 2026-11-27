@@ -25,6 +25,8 @@ decision routing would risk changing permanent policy unintentionally.
 - Preserve ordinary permission/question behavior and idempotent receipts.
 
 Companion iOS branch: `fix/cc-explicit-approval-choice-20261128` in pocketagent.
+PRs: [Bridge #155](https://github.com/cashtsai/hermes-studio-bridge/pull/155),
+[iOS #308](https://github.com/cashtsai/pocketagent/pull/308).
 It sends `{approval_id, key}` instead of collapsing CC choices into a Boolean.
 Existing Approval Center exact-key handling does not need an app update. An old
 inline-card client gets an explicit-choice error safely; a Bridge restart alone
@@ -36,6 +38,8 @@ cannot update that client.
   multiselect, blocked status, input delivery, Approval Hub, resolved events,
   and Console approval suites. Includes 18 new regression tests.
 - The standalone `test_a3_approval_card_parity.py` reported ALL PASS.
+- The 32 outside-read/permission tests were rerun after removing the binary
+  push category for these prompts; the APNs registration/push script also passed.
 - Python compile and `git diff --check` passed.
 - A read-only live Pocket-branch pane parsed all four exact choices using the
   new parser in an isolated test process. No tmux key was sent.
