@@ -180,7 +180,18 @@ class OutsideReadDecisionTests(unittest.IsolatedAsyncioTestCase):
         self.send.assert_not_awaited()
 
     async def test_push_does_not_advertise_ambiguous_yes_no_shortcuts(self):
-        self.assertEqual(bridge._approval_decision_keys(self.pending()), (None, None))
+        aid = self.pending()
+        self.assertEqual(bridge._approval_decision_keys(aid), (None, None))
+        notify = self.mock("push_notify", AsyncMock())
+        bridge._approval_push(aid, "Read outside working directories", "Review choices",
+                              "claude_code:qa-outside-read")
+        await asyncio.sleep(0)
+        notify.assert_awaited_once()
+        args, kwargs = notify.call_args
+        self.assertIsNone(kwargs["category"])
+        self.assertEqual(args[2]["pocket"]["approvalId"], aid)
+        self.assertNotIn("approveKey", args[2]["pocket"])
+        self.assertNotIn("denyKey", args[2]["pocket"])
 
     async def test_watcher_only_creates_approval_no_keystroke(self):
         ticks = 0

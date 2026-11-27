@@ -5506,6 +5506,14 @@ def _approval_push(aid: str, title: str, body: str, session_id: str = "",
     _approval_nest = {"kind": "approval", "approvalId": aid,
                       "sessionId": session_id}
     _ok, _dk = _approval_decision_keys(aid)
+    category = _APNS_APPROVAL_CATEGORY
+    try:
+        approval = _approval_get_row(aid) or {}
+        if (approval.get("meta") or {}).get("requires_explicit_choice"):
+            category = None
+    except Exception as exc:  # noqa: BLE001
+        _log_exc("_approval_push_choice_category", exc, expected=True)
+        category = None  # No binary actions when the permission scope is unknown.
     if _ok and _dk:
         _approval_nest["approveKey"] = _ok
         _approval_nest["denyKey"] = _dk
@@ -5514,7 +5522,7 @@ def _approval_push(aid: str, title: str, body: str, session_id: str = "",
             "scarf": _approval_nest}         # 舊巢(相容期保留;Stage 1c 移除)
     task = asyncio.create_task(push_notify(
         f"🔐 {title}", body[:120], data,
-        category=_APNS_APPROVAL_CATEGORY,
+        category=category,
         persona=persona,
         no_preview_body="有一項待審請求" if persona else None,
         thread_id=session_id or "approvals"))
