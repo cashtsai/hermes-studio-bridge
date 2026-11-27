@@ -20347,7 +20347,7 @@ _CC_MARKER_CHARS = "❯>•· "
 
 def _cc_is_border(s: str) -> bool:
     """整行只有框線字元(TUI 會在選單上下、甚至選項之間畫線)。"""
-    return bool(s) and set(s) <= {"─", "-", "═", "—", "_", "━"}
+    return bool(s) and set(s) <= {"─", "-", "═", "—", "_", "━", "╌"}
 
 
 def _cc_opt_match(raw: str):
@@ -20723,6 +20723,46 @@ async def _cc_hook_deferred_disambiguate(body: dict, names: list[str],
                    error_message=str(e)[:160])
 
 
+def _cc_live_permission_prompt(pane: str):
+    """A bottom-anchored permission modal outranks stale progress above it."""
+    lines = pane.rstrip().splitlines()
+    if not lines or not re.fullmatch(
+            r"esc to cancel(?:\s*[·•].*)?", lines[-1].strip(), re.IGNORECASE):
+        return None
+    footer = len(lines) - 1
+    questions = [i for i, line in enumerate(lines[:footer])
+                 if re.match(r"\s*do you want\b.*\?\s*$", line, re.IGNORECASE)]
+    if not questions:
+        return None
+    question = questions[-1]
+    options = []
+    for line in lines[question + 1:footer]:
+        match = _cc_opt_match(line)
+        if match:
+            key, label = match.groups()
+            if key != str(len(options) + 1):
+                return None
+            options.append({"key": key, "label": label.strip(), "description": ""})
+        elif line.strip():
+            if not options or _cc_indent(line) < 4:
+                return None
+            options[-1]["description"] = (
+                options[-1]["description"] + " " + line.strip()).strip()
+    if not 2 <= len(options) <= 8:
+        return None
+    if not (any(re.match(r"(?i)^(yes|allow)\b", o["label"]) for o in options)
+            and any(re.match(r"(?i)^(no|deny|don't allow)\b", o["label"]) for o in options)):
+        return None
+    # Include the operation/path, not just an indistinguishable "proceed?".
+    start = next((i + 1 for i in range(question - 1, -1, -1)
+                  if lines[i].strip() and set(lines[i].strip()) <= {"─", "━", "═"}), question)
+    subject = "\n".join(line.strip() for line in lines[start:question]
+                        if line.strip() and not _cc_is_border(line.strip()))
+    title = (subject.replace("\n", " ") + " · " if subject else "") + lines[question].strip()
+    return {"kind": "menu", "semantic": "permission", "title": title,
+            "detail": subject, "options": options}
+
+
 def _cc_prompt(pane: str):
     """Detect a Claude Code interactive choice prompt so the app can render real
     buttons. Returns {kind,title,options:[{key,label}]} or None.
@@ -20730,11 +20770,19 @@ def _cc_prompt(pane: str):
     "Enter to select" footer, labels can be ANY language (a keyword filter here
     made every Chinese question invisible to the app); (2) permission prompts —
     the original STRICT keyword path, kept as fallback for older layouts.
-    Never when working."""
+    Live permission modals take precedence over historical busy text."""
+    permission = _cc_live_permission_prompt(pane)
+    if permission:
+        return permission
+    # A fresh composer below a historical permission must not resurrect it.
+    lines = pane.rstrip().splitlines()
+    if any(re.match(r"\s*❯(?:\s|$)", lines[i]) and not _cc_opt_match(lines[i])
+           and any("esc to cancel" in line.lower() for line in lines[:i])
+           for i in range(max(0, len(lines) - 4), len(lines))):
+        return None
     low = pane.lower()
     if "esc to interrupt" in low or _CC_BUSY_RE.search(pane):
         return None
-    lines = pane.splitlines()
     tail = lines[-16:]                  # the prompt always sits at the bottom
     tail_low = "\n".join(tail).lower()
     # (1) generic choice menu: the selection footer only exists while a menu is
@@ -21862,6 +21910,8 @@ def _cc_approval_payload(name: str, prompt: dict) -> dict:
     opts_txt = " / ".join(str(o.get("label") or "")[:30]
                           for o in (prompt.get("options") or [])[:4])
     detail = f"session: {name}\n{title}" + (f"\n選項: {opts_txt}" if opts_txt else "")
+    if prompt.get("detail") and prompt["detail"] not in title:
+        detail += "\n" + str(prompt["detail"])[:4000]
     kind = _cc_approval_kind(prompt)
     options = []
     for o in (prompt.get("options") or [])[:8]:

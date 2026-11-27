@@ -933,6 +933,13 @@ CloudKit.
 
 Returns approval cards for app review.
 
+CC permission modals are anchored to the live terminal footer. A live permission
+must remain visible even when historical progress text appears above it; a newer
+composer or running footer must not resurrect an old permission. The operation
+and file path are retained in the title/detail, and wrapped permission scopes
+remain in each option's description. Detection only publishes the existing
+approval card/push; it never grants permission or changes Claude's permission mode.
+
 ### `POST /app/v1/approvals/{id}/decision`
 
 Records approve/reject decisions. PocketAgent must not call this in smoke tests.
