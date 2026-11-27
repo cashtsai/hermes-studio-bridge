@@ -43,11 +43,11 @@ All UI data is synthetic, in isolated browser profiles with no production access
 - Session-button selectors in handoff/workstation tests now explicitly target
   `.sess`, not the row container and pin button sharing its data-id.
 
-### Existing Browser Gate Failures
+### Browser Gate Follow-up
 
 The untouched baseline produced 10 failures in handoff/workstation, with one
 standalone-PWA test skipped. The session-button selector fixes remove four
-failures. Six handoff failures remain and reproduce on the untouched baseline:
+failures. Six handoff failures also reproduced on the untouched baseline:
 
 1. Borrowed scope fixture records roster events as a session operation.
 2. Home search selector matches both home and sidebar search inputs.
@@ -56,8 +56,13 @@ failures. Six handoff failures remain and reproduce on the untouched baseline:
 5. Expired-stream fixture returns multiple cards where it expects only one.
 6. Multi-step approval test cannot find its expected option button.
 
-These need separate fixture/behavior triage; do not represent this as a full
-handoff E2E pass. No failed checks were disabled or given weaker assertions.
+Release triage found stale test fixtures rather than a sidebar regression:
+the roster SSE now has its own fixture route; the home search is selected by
+its accessible name; receipt recovery waits for the shipped 2s/8s/20s checks;
+approval labels omit nonnumeric internal keys; running status includes the
+shipped phase glyph. No production behavior was changed for these fixes, and
+no failed checks were disabled. Physical-device and production validation
+remain separate from the synthetic browser gate.
 
 Existing production smoke: health/capabilities/LINE targets responded, invalid
 token was denied, and the message dry-run finished with no canonical count
