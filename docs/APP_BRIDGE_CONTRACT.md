@@ -200,6 +200,32 @@ last_read_seq. Only the focused visible tab, valid snapshot and bottom-follow
 position may report. Repeated renders/focus events are deduplicated; incoming
 read_cursor.update.global advances the same high-water mark.
 
+### Persona Unread State (2026-11-27)
+
+Hermes `/app/v2/sessions` rows and roster deltas include optional `read_state`:
+`{version,last_read_seq,last_read_ts,incoming_seq,incoming_ts,last_message_ts}`.
+Values are content-free metadata from the existing event log and cursor table.
+`null` means unavailable, not read. The unread predicate is incoming seq beyond
+the read seq AND (message timestamp unknown OR beyond the read timestamp).
+Use message timestamps, not event ingestion time. Own sends and tool/system
+messages are not inbound replies. Edits of already-read messages keep their
+original message time and must not resurrect unread. Merge cursors monotonically
+in both dimensions; timestamp-only receipts are valid. Prefer the aggregate
+`global` cursor over the reporting device's cursor.
+
+Console-remote may POST `/app/v2/sessions/hermes:{id}/read` only with a current
+inventory grant carrying `read_cursor`. The body supplies `last_read_ts` and an
+optional `message_id`. The session is bound to the path, the device identity is
+server-derived, future timestamps and ring-sequence reports are rejected.
+The response includes `global` and refreshed `read_state`. Global `/app/v2/read`
+and `/app/v2/events` remain forbidden for console-remote. Roster change detection
+includes read metadata so another device's receipt updates the remote sidebar.
+
+Sidebar order: provider groups, pins, attention/running/ordinary rank (15-second
+demotion hysteresis), captured recent activity, ID tie-break. Recency is captured
+on first appearance and reset by explicit Refresh, not by SSE or background
+snapshot refresh. iOS retains its existing pin + live recency ordering.
+
 The owner approval hub reads all pending approval objects (including multiple
 objects per session), with next_offset pagination. Decision writes use the
 selected `/app/v1/approvals/{aid}/decision` and the existing P0 renderer.
