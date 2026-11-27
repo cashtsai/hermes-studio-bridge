@@ -38,12 +38,12 @@ test("status events expose lock reason, queue depth, reset time and distinct sta
   }
   const reason = "已被桌面版 Codex 佔用，3 則訊息已排隊，桌面釋放後自動送出";
   await status("running", {locked:true, lock_message:reason, queue_depth:3});
-  assert.equal(await page.locator("#sh-status").textContent(), reason);
+  assert.equal(await page.locator("#sh-status").textContent(), "🔒 " + reason);
   assert.equal(await page.locator("#sh-status").evaluate(n=>n.classList.contains("working")), false);
   await page.screenshot({path:path.join(previews,"locked.png")});
   // Same-phase HTTP refresh must not hide richer status text.
   await page.evaluate(()=>loadSessions());
-  assert.equal(await page.locator("#sh-status").textContent(), reason);
+  assert.equal(await page.locator("#sh-status").textContent(), "🔒 " + reason);
   for (const phase of phases) {
     const meta = phase === "queued" ? {queue_depth:3} : phase === "usage_limited"
       ? {usage_limit_reset_at:"2026-11-18T15:00:00Z"} : phase === "running"
@@ -63,9 +63,9 @@ test("status events expose lock reason, queue depth, reset time and distinct sta
   assert.notEqual(colors.error, colors.idle);
   assert.notEqual(colors.completed, colors.idle);
   await page.evaluate(()=>updateStatusChip("usage_limited", {usage_limit_reset_at:"invalid"}));
-  assert.equal(await page.locator("#sh-status").textContent(), "用量受限");
+  assert.equal(await page.locator("#sh-status").textContent(), "⏳ 用量受限");
   await page.evaluate(()=>updateStatusChip("queued", {queue_depth:0}));
-  assert.equal(await page.locator("#sh-status").textContent(), "排隊中");
+  assert.equal(await page.locator("#sh-status").textContent(), "⋯ 排隊中");
   await status("needs_input");
   await page.locator("#workbar").waitFor({state:"hidden"});
   await page.evaluate(()=>applyTheme("dark"));
@@ -183,7 +183,7 @@ test("an older in-flight list snapshot cannot overwrite newer status details", a
   await page.waitForFunction(()=>state.phase === "running");
   await pending.fulfill({json:{sessions:[{...job}]}});
   await page.evaluate(()=>window.pendingList);
-  assert.equal(await page.locator("#sh-status").textContent(),reason);
-  assert.equal(await page.locator('.sess[data-id="hermes:yuanfang"] .st').textContent(),"被佔用");
+  assert.equal(await page.locator("#sh-status").textContent(),"🔒 " + reason);
+  assert.equal(await page.locator('.sess[data-id="hermes:yuanfang"] .st').textContent(),"🔒 被佔用");
   await page.unroute("**/app/v2/sessions");
 });

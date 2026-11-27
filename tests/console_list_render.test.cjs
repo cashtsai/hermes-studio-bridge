@@ -67,6 +67,7 @@ function harness() {
     sessionUnread: s => !!s._unread,
     workMatches: (s, q) => String(s.title || s.id).toLowerCase().includes(String(q).toLowerCase()),
     listActivity: new Map(),
+    activityTime: value => typeof value === 'number' ? value * 1000 : (Date.parse(value) || 0),
     localStorage: (() => { const m = new Map();
       return { getItem: k => (m.has(k) ? m.get(k) : null), setItem: (k, v) => m.set(k, String(v)), removeItem: k => m.delete(k) }; })(),
     state,
@@ -81,6 +82,20 @@ function harness() {
   };
 }
 const S = (id, status, extra = {}) => ({ id, provider: 'claude_code', title: id, status, meta: {}, last_event_at: 0, ...extra });
+
+test('initial same-rank order uses recency, with deterministic ID ties', () => {
+  const h = harness();
+  h.state.sessions = [S('claude_code:a', 'idle', {last_event_at:100}),
+    S('claude_code:c', 'idle', {last_event_at:200}), S('claude_code:b', 'idle', {last_event_at:200})];
+  h.render();
+  assert.deepEqual(h.order(), ['claude_code:b','claude_code:c','claude_code:a']);
+  h.state.sessions[0].last_event_at = 300;
+  h.render();
+  assert.equal(h.order()[2], 'claude_code:a');
+  vm.runInContext('sessionOrder.clear()', h.c);
+  h.render();
+  assert.equal(h.order()[0], 'claude_code:a');
+});
 
 test('activity update does NOT reorder same-rank rows (the anti-dizzy invariant)', () => {
   const h = harness();

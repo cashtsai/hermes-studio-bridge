@@ -36,30 +36,26 @@ test('returning to active resets downgrade; an urgent state takes effect immedia
   assert.equal(c.stickyRank(row('a', 'idle'), 30999), 1);
   assert.equal(c.stickyRank(row('a', 'awaiting'), 31000), 0);
 });
-// 2026-11-21 契約變更(機主拍板):同 rank 之內**不再按活動時間重排**,改穩定 id
-// 序。原本「活動最近的浮上去」就是機主回報的「session 跑上跑下看到頭暈」的真因
-// ——rank(需要你 > 執行中 > 一般,含 15s 降級遲滯)仍決定分層,但同層位置鎖定、
-// 不隨每則訊息漂移。活動/未讀改由列上的狀態晶片/未讀標表達(位置不動)。
-test('single-row groups retain rank history; within a rank, order is stable by id (not activity)', () => {
+// Initial recency is frozen during streaming; ID only breaks timestamp ties.
+test('single-row groups retain rank history; initial recency stays stable during updates', () => {
   const c = ranking();
   c.sortSessions([row('single', 'running')], 0);
   assert.equal(c.stickyRank(row('single', 'idle'), 20000), 1);
   const items = [row('b', 'idle', 5), row('a', 'idle', 5), row('recent', 'idle', 6),
     row('running', 'running'), row('urgent', 'awaiting')];
-  // rank:urgent(0) > running(1) > 其餘(2);rank 2 之內純按 id → a,b,recent
-  // (recent 的較新活動不再把它拉上去 —— 這正是治頭暈的點)。
   assert.deepEqual(Array.from(c.sortSessions(items, 0), s => s.id),
-    ['urgent', 'running', 'a', 'b', 'recent']);
+    ['urgent', 'running', 'recent', 'a', 'b']);
+  items.find(s => s.id === 'b').last_event_at = 99;
+  assert.deepEqual(Array.from(c.sortSessions(items, 1000), s => s.id),
+    ['urgent', 'running', 'recent', 'a', 'b']);
 });
-test('needs_input and dispatching have rank priority; within a rank, stable id order', () => {
+test('needs_input and dispatching retain rank priority; mirrored SSE does not reshuffle rows', () => {
   const c = ranking();
   c.listActivity.set('mirrored', {latest:{at:10}});
   const items = [row('old', 'idle', 9), row('mirrored', 'idle', 1),
     row('dispatch', 'dispatching'), row('input', 'needs_input')];
-  // input(0) > dispatch(1) > 其餘(2);rank 2 之內按 id → mirrored < old。
-  // (mirrored 的鏡像活動時間不再影響位置;排在前面純粹因為 id 序。)
   assert.deepEqual(Array.from(c.sortSessions(items, 0), s => s.id),
-    ['input', 'dispatch', 'mirrored', 'old']);
+    ['input', 'dispatch', 'old', 'mirrored']);
 });
 
 function delivery(responses = []) {

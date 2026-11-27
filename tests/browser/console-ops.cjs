@@ -52,6 +52,11 @@ async function fixture(t, options={}) {
       return json({latest_seq:999999,cards:data.cards,older_cursor:data.ringCursor||null});
     }
     if(p==="/app/v2/read") return json({ok:true});
+    if(p==="/app/v2/sessions/hermes:reader/read") {
+      const s=model.jobs.find(j=>j.id==="hermes:reader");
+      s.read_state={...s.read_state,version:s.read_state.version+1,last_read_ts:body.last_read_ts};
+      return json({ok:true,global:s.read_state,read_state:s.read_state});
+    }
     if(p.startsWith("/app/v1/approvals/") && p.endsWith("/decision")) {
       const a=data.approvals.find(a=>a.id===p.split("/").at(-2));
       if(data.questionNext && a.q_index===0) {
@@ -270,6 +275,15 @@ test("read cursor only at visible bottom, deduplicates render/focus and uses mes
     Object.defineProperty(document,"hidden",{configurable:true,value:false});
     document.dispatchEvent(new Event("visibilitychange"));
   });await received(3);
+  await page.evaluate(()=>{
+    document.getElementById("report-reader").showModal();
+    state.cards.push({id:"behind-report",ts:1700000400,kind:"text",body:{text:"報告底下的新訊息"}});
+    renderCards();
+  });await page.waitForTimeout(550);
+  assert.equal(posts(data,"/app/v2/read").length,3);
+  await page.evaluate(()=>document.getElementById("report-reader").close());
+  await received(4);
+  assert.equal(posts(data,"/app/v2/read")[3].body.last_read_ts,1700000400);
 });
 
 test("questionnaire keeps one approval ID across questions with expected_q_index on each answer",async t=>{
@@ -311,5 +325,29 @@ test("borrowed sessions never fetch global hub/caps, reveal ops, compact fallbac
   assert.equal(await page.locator("[data-session-ops]").count(),0);
   assert.ok(await page.locator("#session-compact").isHidden());
   assert.ok(await page.locator("#session-settings").isHidden());
+  assert.equal(data.calls.filter(c=>["/app/v1/approvals","/app/v2/providers/capabilities","/app/v2/read"].includes(c.path)).length,0);
+});
+
+test("remote persona unread survives reload, clears via scoped receipt, and ignores stale snapshots",async t=>{
+  const {page,origin,model,data}=await fixture(t);
+  const reader=model.jobs.find(s=>s.id==="hermes:reader");
+  reader.capabilities=[...caps,"read_cursor"];
+  reader.read_state={version:100,incoming_seq:100,incoming_ts:1700000059,last_read_seq:0,last_read_ts:0,last_message_ts:1700000059};
+  model.remote=true;data.calls=[];
+  await page.goto(origin+"/console");
+  const badge=page.locator('.sess[data-id="hermes:reader"] .unread-mark');
+  await badge.waitFor();
+  await select(page,"hermes:reader");
+  await badge.waitFor({state:"detached"});
+  assert.equal(posts(data,"/app/v2/sessions/hermes:reader/read").length,1);
+  assert.equal(posts(data,"/app/v2/read").length,0);
+  await page.evaluate(()=>{
+    applyReadState("hermes:reader",{version:99,incoming_seq:99,incoming_ts:1700000059,last_read_seq:0,last_read_ts:0});
+    renderSessions();
+  });
+  assert.equal(await badge.count(),0);
+  await page.goto(origin+"/console");
+  await page.locator('.sess[data-id="hermes:reader"]').waitFor();
+  assert.equal(await badge.count(),0);
   assert.equal(data.calls.filter(c=>["/app/v1/approvals","/app/v2/providers/capabilities","/app/v2/read"].includes(c.path)).length,0);
 });
