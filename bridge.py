@@ -1581,7 +1581,12 @@ async def run_hermes(model: str, prompt: str) -> str:
     # the TG gateway looks — instead of a private owui-<persona> session the
     # phone/TG never see. Only without a mapping do we keep the old behaviour.
     sid = canonical_telegram_session(home)
-    cont = ["--resume", sid] if sid else ["--continue", session_name(model)]
+    # 全新人格第一次冷啟 fallback:owui-<persona> session 還沒存在,
+    # 光 `--continue` 會回「No session found matching …, pass
+    # --create-if-missing」(機主 2026-11-24 LINE 測 pocket 人格踩到)。
+    # 帶上 --create-if-missing:老 session 照常續、新 session 自動開。
+    cont = (["--resume", sid] if sid
+            else ["--continue", session_name(model), "--create-if-missing"])
     proc = await asyncio.create_subprocess_exec(
         HERMES_BIN, "-z", prompt, *cont,
         env=env,
@@ -11106,6 +11111,20 @@ def _line_seed_pocket_home(home: str) -> None:
         with open(wrapper, "w", encoding="utf-8") as f:
             f.write(_POCKET_HANDOFF_WRAPPER % cli)
         os.chmod(wrapper, 0o755)
+    # 空殼 home 缺兩樣東西,缺一樣 pocket 人格就啞:
+    #   auth.json   — ACP 暖路徑認帳號;缺了退冷啟 run_hermes,而新人格的
+    #                 owui session 還不存在 → 機主 2026-11-24 LINE 實測
+    #                 "No session found matching 'owui-pocket'"。
+    #   config.yaml — 模型/供應商選擇;缺了 hermes 回 "not connected to
+    #                 any AI provider"(同日第二坑)。
+    # 都從 HOME_ROOT 原樣複製(runtime 沒有 yaml 可安全改寫);冪等,
+    # 已存在不覆蓋 —— 人格可能已換綁自己的帳號或被手動瘦身過。
+    for fname, mode in (("auth.json", 0o600), ("config.yaml", 0o600)):
+        src = os.path.join(HOME_ROOT, fname)
+        dst = os.path.join(home, fname)
+        if os.path.exists(src) and not os.path.exists(dst):
+            shutil.copyfile(src, dst)
+            os.chmod(dst, mode)
 
 
 @app.post("/app/v1/line/token")
