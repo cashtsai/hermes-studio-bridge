@@ -33,6 +33,36 @@ function replySegments(text) {
   return parts.filter(p => p.label || p.text.trim());
 }
 
+// CC 把多行輸入(bridge 走 tmux bracketed paste)一律包成 <pasted_content id=…>
+// —— 那是 Claude Code 的貼上管線,不是使用者打的字。顯示端拆掉包裝(含嵌套
+// 轉義形 <\pasted_content / <\/pasted_content),只留內容;copy/reply 拿到的
+// 也是拆過的乾淨文字(cardText 不動,這裡是唯一消費點之前的過濾)。
+function stripPasteWrap(text) {
+  if (!/<\\?\/?pasted_content\b/.test(text)) return text;
+  return text.replace(/<\\?\/?pasted_content\b[^>]*>/g, "")
+    .replace(/\n{3,}/g, "\n\n").trim();
+}
+
+// 對齊手機版 StudioReply.splitLeadingQuote:開頭連續 "> " 行=引文,之後要嘛
+// 整則結束,要嘛必須隔空行再接正文;格式不符原文返還,絕不誤拆正文開頭
+// 恰好帶 ">" 的訊息。
+function splitLeadingQuote(text) {
+  const lines = text.split("\n");
+  if (!lines[0] || !lines[0].startsWith(">")) return { quote: null, body: text };
+  const q = [];
+  let i = 0;
+  while (i < lines.length && lines[i].startsWith(">")) {
+    let l = lines[i].slice(1);
+    if (l.startsWith(" ")) l = l.slice(1);
+    q.push(l); i++;
+  }
+  if (i < lines.length) {
+    if (lines[i].trim() !== "") return { quote: null, body: text };
+    while (i < lines.length && lines[i].trim() === "") i++;
+  }
+  return { quote: q.join("\n"), body: lines.slice(i).join("\n") };
+}
+
 // 每則訊息泡下方的動作列(對齊手機版):時間戳常駐小字,動作鈕 hover 才現。
 // 按鈕走 #cards 的事件代理(app.js wire()),這裡只畫靜態結構。
 function messageActionsHtml(c) {
@@ -106,6 +136,15 @@ function renderTurnContent(turn, node) {
         if (p.label) details(c.id + ":" + i, p.label, () => p.text);
         else bubble(c, proseHtml(c, p.text.trim()), i === parts.length - 1);
       });
+    } else if (turn.role === "user") {
+      // 手機版同款:引文渲染成泡泡上方小卡,不把 "> " 原文牆糊進泡泡;
+      // pasted_content 包裝一律拆掉再顯示。
+      const clean = stripPasteWrap(text);
+      const sq = splitLeadingQuote(clean);
+      if (sq.quote !== null || clean !== text) {
+        bubble(c, (sq.quote !== null ? '<div class="user-quote">' + esc(sq.quote) + "</div>" : "") +
+          proseHtml(c, sq.body) + attachmentsHtml(c));
+      } else bubble(c, cardBodyHtmlCached(c));
     } else bubble(c, cardBodyHtmlCached(c));
   }
   flush();

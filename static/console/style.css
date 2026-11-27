@@ -841,3 +841,19 @@ body[data-console-access="remote"] [data-mode="memory"]{display:none;}
   #report-toc{display:none;}
   #report-content{padding:16px 18px;}
 }
+
+/* ── 回覆引文(2026-11-27,對齊手機版 StudioReply)────────────────────
+   composer 上方引文列 + 使用者泡泡裡的引文小卡:左側 accent 細條、淡字、
+   截斷 —— 不再把 "> " 原文牆糊進輸入框/泡泡。 */
+.quote-bar{display:flex;align-items:flex-start;gap:8px;margin:0 12px 6px;
+  padding:6px 8px 6px 10px;border-left:3px solid var(--accent);
+  background:color-mix(in srgb, var(--accent) 6%, var(--surface));
+  border-radius:6px;}
+.quote-bar .quote-text{flex:1;font-size:12px;line-height:1.5;opacity:.78;
+  white-space:pre-wrap;overflow:hidden;display:-webkit-box;
+  -webkit-line-clamp:3;-webkit-box-orient:vertical;word-break:break-word;}
+.quote-bar #quote-clear{flex:none;line-height:1;padding:2px 6px;}
+.user-quote{border-left:3px solid var(--accent);padding:2px 8px;margin:0 0 8px;
+  font-size:12px;line-height:1.5;opacity:.72;white-space:pre-wrap;
+  overflow:hidden;display:-webkit-box;-webkit-line-clamp:3;
+  -webkit-box-orient:vertical;word-break:break-word;}

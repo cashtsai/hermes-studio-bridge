@@ -81,7 +81,7 @@ function applyListEvent(event) {
   return true;
 }
 function draftFor(id) {
-  if (!drafts.has(id)) drafts.set(id, { text: "", atts: [], reading: 0, pending: null, notice: "" });
+  if (!drafts.has(id)) drafts.set(id, { text: "", atts: [], reading: 0, pending: null, notice: "", quote: "" });
   return drafts.get(id);
 }
 function currentView(view) { return !signingOut && view === state.view; }
@@ -1609,16 +1609,18 @@ async function copyText(text, doneMsg) {
 function handleMessageAction(act, cardId) {
   const card = state.cards.find((c) => c.id === cardId);
   if (!card) { toast("這則訊息已不在目前視窗", true); return; }
-  const text = cardText(card);
+  const text = typeof stripPasteWrap === "function" ? stripPasteWrap(cardText(card)) : cardText(card);
   if (act === "copy") { void copyText(text); return; }
   if (act === "reply") {
     if (!canUse("input")) { toast("這台電腦無法在此對話輸入", true); return; }
-    const quote = text.trim().split("\n").slice(0, 6).map((l) => "> " + l).join("\n");
-    const input = $("input");
+    // 手機版同款(2026-11-27 機主回報「塞輸入框很難操作」):引文掛在
+    // composer 上方的小列,輸入框保持乾淨;送出時才組成 "> " blockquote
+    // (wire 契約與 iOS composeWithQuote 一致,模型拿到的形狀不變)。
     const d = draftFor(state.current);
-    d.text = quote + "\n\n" + (d.text ? d.text : "");
-    input.value = d.text; autosize(); input.focus();
-    input.setSelectionRange(input.value.length, input.value.length);
+    const clean = typeof stripPasteWrap === "function" ? stripPasteWrap(text) : text;
+    d.quote = clean.trim().slice(0, 600);
+    showDraft(state.current);
+    $("input").focus();
     return;
   }
   if (act === "share") {
@@ -1851,6 +1853,11 @@ function showDraft(id) {
   $("input").readOnly = !!pending;
   $("attach").disabled = !!pending;
   $("send").disabled = !!pending || d.reading > 0;
+  const qb = $("quote-bar");
+  if (qb) {
+    qb.classList.toggle("hidden", !d.quote);
+    $("quote-text").textContent = d.quote;
+  }
   $("delivery").classList.toggle("hidden", !d.notice);
   $("delivery-text").textContent = d.notice;
   $("delivery-text").classList.toggle("working", ["checking","sending","verifying"].includes(pending?.phase));
@@ -1862,7 +1869,7 @@ function showDraft(id) {
 }
 
 function finishInput(id, d, notice) {
-  d.pending = null; d.text = ""; d.atts = []; d.notice = notice;
+  d.pending = null; d.text = ""; d.atts = []; d.notice = notice; d.quote = "";
   showDraft(id);
 }
 
@@ -1896,8 +1903,13 @@ async function sendInput(text) {
   if (!id || signingOut || !canUse("input")) return;
   const d = draftFor(id);
   if (d.atts.length && !canUse("attachments")) { toast("這條對話不允許附件，請先移除", true); return; }
-  if (d.pending || d.reading || (!text.trim() && !d.atts.length)) return;
+  if (d.pending || d.reading || (!text.trim() && !d.atts.length && !d.quote)) return;
   d.text = text;
+  // 引文在送出這一刻才接上(與 iOS composeWithQuote 同形:blockquote+空行+正文);
+  // d.text 永遠只存使用者打的字,失敗重試時輸入框不會長出引文牆。
+  const content = d.quote
+    ? d.quote.split("\n").map((l) => "> " + l).join("\n") + (text.trim() ? "\n\n" + text : "")
+    : text;
   if (!navigator.onLine) { d.notice = "目前離線，訊息尚未送出"; showDraft(id); return; }
   const cid = crypto.randomUUID ? crypto.randomUUID() : Array.from(crypto.getRandomValues(
     new Uint32Array(4)), n => n.toString(16).padStart(8, "0")).join("");
@@ -1907,7 +1919,7 @@ async function sendInput(text) {
     const r = await api("/app/v2/sessions/" + encodeURIComponent(id) + "/input", {
       method: "POST", headers: { "Content-Type": "application/json" },
       signal: AbortSignal.timeout(90000),
-      body: JSON.stringify({ content: text, client_id: cid, ...(d.atts.length ? { attachments: d.atts } : {}) }),
+      body: JSON.stringify({ content, client_id: cid, ...(d.atts.length ? { attachments: d.atts } : {}) }),
     });
     const ack = await r.json();
     if (d.pending !== p) return; // SSE may acknowledge first, freeing the next draft.
@@ -2111,6 +2123,9 @@ function wire() {
   });
   $("interrupt").addEventListener("click", interrupt);
   $("composer").addEventListener("submit", (e) => { e.preventDefault(); if (!composing) sendInput($("input").value); });
+  $("quote-clear").addEventListener("click", () => {
+    const d = draftFor(state.current); d.quote = ""; showDraft(state.current);
+  });
   $("input").addEventListener("input", () => {
     if (state.current) {
       const d = draftFor(state.current);
