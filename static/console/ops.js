@@ -373,27 +373,33 @@ window.PocketSessionOps = (() => {
     }
   }
   function scheduleRead() {
-    if (readTimer||borrowed()||signingOut) return;
+    if (readTimer||signingOut) return;
     readTimer=setTimeout(()=>{ readTimer=null; void reportRead(); },400);
   }
   async function reportRead() {
     const s=currentSession(), cards=el("cards");
     // Ring seq is NOT the global event-log seq. Report the visible message timestamp.
-    if (!s||!canAct("read_cursor",s)||capability("read_cursor",s)!==true||borrowed()||document.hidden||
-        !document.hasFocus()||el("session-ops").open||state.snapshotView!==state.view||!cards.clientHeight||!cardScroll.follow||
+    const supported = borrowed() ? s?.capabilities?.includes("read_cursor") : capability("read_cursor",s) === true;
+    if (!s||!canAct("read_cursor",s)||!supported||document.hidden||
+        !document.hasFocus()||el("session-ops").open||el("report-reader")?.open||state.snapshotView!==state.view||!cards.clientHeight||!cardScroll.follow||
         cards.scrollHeight-cards.clientHeight-cards.scrollTop>2) return;
-    const last=state.cards.filter(c=>c.final!==false && ["text","markdown"].includes(c.kind||"text"))
+    const last=state.cards.filter(c=>c.final!==false && ["user","agent","assistant"].includes(c.role||"agent") &&
+      ["text","markdown"].includes(c.kind||"text"))
       .reduce((prev,c)=>activityTime(c.ts)>activityTime(prev?.ts) ? c : prev,null);
     const ts=activityTime(last?.ts)/1000, key=s.id.substring(s.id.indexOf(":")+1);
     const r=reads.get(key)||{sent:0}; reads.set(key,r);
     if (!ts || r.inflight || r.warned || ts<=r.sent) return;
-    if (!readDevice) {
+    if (!readDevice && !borrowed()) {
       try { readDevice=localStorage.getItem("pocket.console.read-device")||crypto.randomUUID(); localStorage.setItem("pocket.console.read-device",readDevice); }
       catch (_) { readDevice=crypto.randomUUID(); }
     }
     r.inflight=true;
     try {
-      await request("/app/v2/read",{session:key,device_id:readDevice,last_read_ts:ts,message_id:last.id});
+      const result = await request(borrowed() ? endpoint(s,"read") : "/app/v2/read",
+        {session:key,device_id:readDevice,last_read_ts:ts,message_id:last.id});
+      if (result.read_state) applyReadState(s.id, result.read_state);
+      else if (result.global) applyListEvent({type:"read_cursor.update",session:key,data:result});
+      renderSessions(); renderHome();
       r.sent=Math.max(r.sent,ts); scheduleRead();
     } catch(err) {
       if (!r.warned) { r.warned=true; notice("已讀狀態同步失敗："+err.message,()=>{r.warned=false;scheduleRead();},"重試",true); }
@@ -406,6 +412,8 @@ window.PocketSessionOps = (() => {
     });
     el("op-close").addEventListener("click",close);
     el("session-ops").addEventListener("cancel",()=>{modalVersion++;});
+    el("session-ops").addEventListener("close",scheduleRead);
+    el("report-reader")?.addEventListener("close",scheduleRead);
     el("session-more").addEventListener("click",()=>menu(currentSession()));
     el("session-settings").addEventListener("click",()=>config(currentSession()));
     el("session-compact").addEventListener("click",()=>compact(currentSession()));

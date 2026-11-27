@@ -45,6 +45,17 @@ function sessionUnread(s) {
   const a = listActivity.get(s.id), m = a?.incoming;
   return !!m && m.seq > a.readSeq && (!m.at || m.at > a.readAt);
 }
+function applyReadState(id, cursor) {
+  if (!cursor || !Number.isSafeInteger(cursor.version)) return;
+  const a = listActivityFor(id);
+  a.readSeq = Math.max(a.readSeq, Number(cursor.last_read_seq) || 0);
+  a.readAt = Math.max(a.readAt, activityTime(cursor.last_read_ts));
+  if (cursor.version < (a.snapshotVersion || 0)) return;
+  a.snapshotVersion = cursor.version;
+  const next = {seq:cursor.incoming_seq, at:activityTime(cursor.incoming_ts)};
+  if (next.seq > 0 && (!a.incoming || next.at > a.incoming.at ||
+      (next.at === a.incoming.at && next.seq > a.incoming.seq))) a.incoming = next;
+}
 function unreadMark(s) {
   return sessionUnread(s) ? '<span class="unread-mark">未讀</span>' : "";
 }
@@ -269,7 +280,7 @@ async function apiJSON(path, opts) {
 const PROVIDER_LABEL = { claude_code: "CC", codex: "CX", hermes: "人格", gemini: "Gemini", openclaw: "OC", cc2: "CC" };
 
 let listRequest = 0;
-async function loadSessions() {
+async function loadSessions(resetOrder = false) {
   const request = ++listRequest;
   const statusRevision = state.statusRevision;
   try {
@@ -290,6 +301,8 @@ async function loadSessions() {
       return live?._statusRevision > (statusRevision || 0)
         ? {...s, status:live.status, meta:{...s.meta, ...live.meta}, _statusRevision:live._statusRevision} : s;
     });
+    if (resetOrder === true) sessionOrder.clear();
+    for (const s of state.sessions) applyReadState(s.id, s.read_state);
     state.host = d.host_name || location.hostname;
     state.listHealth = "ready";
     const degraded = state.degraded = d.degraded_providers || [];
@@ -346,6 +359,7 @@ function sessionRank(s) {
 // 資料到達順序飄)。
 const RANK_DEMOTE_MS = 15000;
 const rankMemo = new Map();   // id → { rank, pending, since }
+const sessionOrder = new Map();
 
 function stickyRank(s, now) {
   const raw = sessionRank(s);
@@ -391,17 +405,16 @@ function sessionVisible(s) {
 }
 
 function sortSessions(rows, now) {
-  // 每個 session 每次快照只更新一次,包括只有一列的 provider。
-  // 2026-11-21:**同 rank 之內不再按活動時間重排**。原本的次層
-  // `max(last_event_at, latest.at)` 會在每一則訊息到達時把列往上搬,就是
-  // 「跑上跑下」的真因(遲滯只擋住 rank 層的彈跳,擋不住這層)。改成:釘選優先、
-  // 再 rank(需要你 > 執行中 > 一般,已含 15s 降級遲滯),同 rank 用 id 墊底 →
-  // 位置完全確定、不隨活動漂移。活動/未讀改由列上的狀態晶片與未讀標表達
-  // (renderSessions 就地更新那一列),不靠「整列跳位」。
+  // Capture recency once per page visit / explicit refresh. Stream updates must
+  // not shuffle rows while the user is reading or about to click one.
+  for (const s of rows) if (!sessionOrder.has(s.id)) {
+    sessionOrder.set(s.id, activityTime(s.last_event_at));
+  }
   const ranks = new Map(rows.map(s => [s.id, stickyRank(s, now)]));
   return rows.sort((a, b) =>
     ((isPinned(b.id) ? 1 : 0) - (isPinned(a.id) ? 1 : 0)) ||
     (ranks.get(a.id) - ranks.get(b.id)) ||
+    (sessionOrder.get(b.id) - sessionOrder.get(a.id)) ||
     (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
 }
 
@@ -2062,7 +2075,7 @@ function wire() {
   });
   $("back-home").addEventListener("click", showHome);
   $("all-work").addEventListener("click", openPalette);
-  $("home-refresh").addEventListener("click", loadSessions);
+  $("home-refresh").addEventListener("click", () => loadSessions(true));
   $("home-q").addEventListener("input", renderHome);
   $("handoff").addEventListener("click", e => {
     const row = e.target.closest(".work-row");
@@ -2076,7 +2089,7 @@ function wire() {
   });
   window.addEventListener("pagehide", e => { if (e.persisted) $("app").classList.add("hidden"); });
   window.addEventListener("pageshow", e => { if (e.persisted) location.reload(); });
-  $("refresh").addEventListener("click", loadSessions);
+  $("refresh").addEventListener("click", () => loadSessions(true));
   $("sess-q").addEventListener("input", (e) => { state.listQuery = e.target.value.trim(); renderSessions(); });
   $("sess-filters").addEventListener("click", (e) => {
     const chip = e.target.closest(".sf-chip");

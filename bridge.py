@@ -879,6 +879,7 @@ _CONSOLE_GET = {"/console", "/console/manifest.json", "/console/sw.js", "/health
                 # 跨 session、無過濾)也加進來 —— 那才是會洩漏的那條。
                 "/app/v2/sessions/roster/events"}
 _CONSOLE_SESSION_OPS = {
+    ("POST", "read"): "read_cursor",
     ("GET", "reports"): "replay",
     ("GET", "cards"): "replay", ("GET", "events"): "follow",
     ("GET", "changes"): "changes", ("GET", "diff"): "changes",
@@ -965,6 +966,8 @@ def _console_remote_list(rows, token, started, degraded):
     grants = {}
     for row in rows:
         caps = set(row.get("capabilities") or ()) & {"input", "attachments", "interrupt", "approve", "replay", "follow"}
+        if row.get("provider") == "hermes" and row.get("read_state") is not None:
+            caps.add("read_cursor")
         meta = row.get("meta") or {}
         prefix = row["id"].partition(":")[0]
         wd = (row.get("subtitle") if prefix in ("claude_code", "codex") else
@@ -22592,6 +22595,7 @@ async def v2_sessions(request: Request, provider: str = "", status: str = "",
     # meta.approval 統一物件(之前恆 idle 是 spec 點名的缺口)。
     hp_pending = _hermes_pending_by_session()
     for mid, (disp, _home) in PERSONAS.items():
+        read_state = await asyncio.to_thread(_persona_read_state, mid)
         pend = hp_pending.get(f"hermes:{mid}")
         # 注意變數名:這個 endpoint 的查詢參數叫 `status`(結尾過濾用),
         # 這裡不能撞名。
@@ -22613,7 +22617,10 @@ async def v2_sessions(request: Request, provider: str = "", status: str = "",
         out.append({"id": f"hermes:{mid}", "provider": "hermes", "title": disp,
                     "subtitle": None,
                     "status": hp_status,
-                    "last_event_at": pend.get("created_at") if pend else None,
+                    "last_event_at": _v2_iso_utc(max(
+                        _roster_ts_epoch(pend.get("created_at")) if pend else 0,
+                        (read_state or {}).get("last_message_ts", 0))) or None,
+                    "read_state": read_state,
                     "capabilities": ["input", "attachments", "replay", "follow", "approve"],
                     "meta": meta})
     delegated_codex_ids = _delegated_codex_thread_ids()
@@ -23085,6 +23092,7 @@ async def _roster_build(request: Request) -> dict:
             "activity": _roster_activity(r, ts),
             "last_turn_summary": summary,
             "updated_ts": ts or None,
+            "read_state": r.get("read_state"),
         })
     return {"sessions": out,
             "degraded_providers": base.get("degraded_providers") or []}
@@ -35412,6 +35420,57 @@ async def app_v2_events(request: Request, session: str | None = None,
                              headers=SSE_HEADERS)
 
 
+_PERSONA_READ_STATE_CACHE: dict = {}
+
+
+def _persona_read_state(session: str) -> dict | None:
+    """Content-free unread snapshot. No live DB writes or global message stream.
+
+    Cache by the durable per-session event version; receipt updates invalidate it
+    just like messages. Query only the requested persona and never return text.
+    """
+    import sqlite3
+    try:
+        con = sqlite3.connect(f"file:{CANON_DB}?mode=ro", uri=True, timeout=5)
+        try:
+            con.execute("BEGIN")
+            version = con.execute("SELECT COALESCE(MAX(id),0) FROM event_log WHERE session=?",
+                                  (session,)).fetchone()[0]
+            cache_key = (CANON_DB, session)
+            cached = _PERSONA_READ_STATE_CACHE.get(cache_key)
+            if cached and cached["version"] == version:
+                return dict(cached)
+            seq, ts = con.execute(
+                "SELECT COALESCE(MAX(last_read_seq),0),COALESCE(MAX(last_read_ts),0) "
+                "FROM read_cursors WHERE session=?", (session,)).fetchone()
+            row = con.execute("""
+                SELECT id, COALESCE(json_extract(payload,'$.message.ts'),0)
+                FROM event_log WHERE session=? AND type='message.upsert'
+                AND json_extract(payload,'$.message.role') IN ('assistant','agent')
+                AND (length(trim(COALESCE(json_extract(payload,'$.message.content'),'')))>0
+                     OR json_array_length(payload,'$.message.attachments')>0)
+                ORDER BY COALESCE(json_extract(payload,'$.message.ts'),0) DESC,id DESC LIMIT 1
+                """, (session,)).fetchone()
+            latest = con.execute("""
+                SELECT MAX(COALESCE(json_extract(payload,'$.message.ts'),0)) FROM event_log
+                WHERE session=? AND type='message.upsert'
+                AND json_extract(payload,'$.message.role') IN ('user','assistant','agent')
+                """, (session,)).fetchone()[0]
+            result = {"version": version, "last_read_seq": seq, "last_read_ts": ts,
+                      "incoming_seq": row[0] if row else 0,
+                      "incoming_ts": row[1] if row else 0, "last_message_ts": latest or 0}
+            # Bound removed/test personas as well as configured ones.
+            if len(_PERSONA_READ_STATE_CACHE) >= 128:
+                _PERSONA_READ_STATE_CACHE.pop(next(iter(_PERSONA_READ_STATE_CACHE)))
+            _PERSONA_READ_STATE_CACHE[cache_key] = result
+            return dict(result)
+        finally:
+            con.close()
+    except (sqlite3.Error, ValueError, TypeError) as exc:
+        _log_event("persona_read_state_failed", session=session, error=type(exc).__name__)
+        return None
+
+
 def _read_cursor_rows(session: str) -> list[dict]:
     import sqlite3
     try:
@@ -35463,9 +35522,39 @@ async def app_v2_read_post(request: Request):
     游標只進不退(多裝置/亂序回報取 max);真的前進才追加一筆
     read_cursor.update 事件,其他訂閱中的裝置從 /app/v2/events 收到就能
     同步已讀狀態 — 未讀從此有伺服器真相,不再是各裝置本地計數器瞎猜。"""
-    import sqlite3
     _check_auth(request)
     body = await _json_body(request)
+    return _read_cursor_write(body)
+
+
+@app.post("/app/v2/sessions/{session_id}/read")
+async def v2_session_read(session_id: str, request: Request):
+    """Remote read receipts are bound to a current roster grant, not a body ID."""
+    _check_auth(request)
+    provider, _, session = session_id.partition(":")
+    if provider != "hermes" or session not in PERSONAS:
+        raise http_err(404, "SESSION_NOT_FOUND", "unknown persona session")
+    body = await _json_body(request)
+    if body.get("session", session) != session or body.get("last_read_seq"):
+        raise http_err(400, "CURSOR_INVALID", "use the visible message timestamp")
+    try:
+        ts = float(body.get("last_read_ts") or 0)
+    except (ValueError, TypeError, OverflowError):
+        ts = 0
+    snapshot = await asyncio.to_thread(_persona_read_state, session)
+    if not math.isfinite(ts) or ts <= 0 or snapshot is None or ts > snapshot["last_message_ts"] + 0.001:
+        raise http_err(400, "CURSOR_INVALID", "timestamp is not in this conversation")
+    ts = min(ts, snapshot["last_message_ts"])
+    # A browser cannot overwrite another device's cursor or choose a persona.
+    device = "console-" + hashlib.sha256(_request_token(request).encode()).hexdigest()[:24]
+    result = await asyncio.to_thread(_read_cursor_write, {
+        "session": session, "device_id": device, "last_read_ts": ts,
+        "message_id": body.get("message_id")})
+    return {**result, "read_state": await asyncio.to_thread(_persona_read_state, session)}
+
+
+def _read_cursor_write(body: dict) -> dict:
+    import sqlite3
     session = (body.get("session") or "").strip()
     device_id = (body.get("device_id") or "").strip()
     if session not in PERSONAS:
@@ -35476,8 +35565,10 @@ async def app_v2_read_post(request: Request):
     try:
         req_seq = max(0, int(body.get("last_read_seq") or 0))
         req_ts = max(0.0, float(body.get("last_read_ts") or 0))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         raise http_err(400, "CURSOR_INVALID", "last_read_seq/last_read_ts 需為數字")
+    if not math.isfinite(req_ts):
+        raise http_err(400, "CURSOR_INVALID", "last_read_ts must be finite")
     message_id = str(body.get("message_id") or "").strip() or None
     if req_seq <= 0 and req_ts <= 0:
         raise http_err(400, "CURSOR_REQUIRED",
