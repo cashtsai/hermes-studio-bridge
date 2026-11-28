@@ -1868,6 +1868,9 @@ function showDraft(id) {
   $("delivery-text").textContent = d.notice;
   $("delivery-text").classList.toggle("working", ["checking","sending","verifying"].includes(pending?.phase));
   $("check-delivery").hidden = !pending || pending.phase !== "unknown";
+  // 「重新送出」只在送達狀態不明時出現 —— 帶同一個 client_id,主機端有
+  // (session, client_id) 冪等閘,第一次其實有送到的話只會回放結果、不會執行兩次。
+  $("retry-delivery").hidden = !pending || pending.phase !== "unknown";
   // 自動確認(verifying)期間查詢鈕不用出(機器正在查),但「結束追蹤」要
   // 可按,讓使用者在等待間隔及網路查詢期間都能退出。
   $("forget-delivery").hidden = !pending || !["unknown", "verifying"].includes(pending.phase);
@@ -1896,7 +1899,7 @@ async function checkDelivery() {
     const snap = await apiJSON("/app/v2/sessions/" + encodeURIComponent(id) + "/cards?limit=100",
       { signal: AbortSignal.timeout(15000), cache: "no-store" });
     if (d.pending !== p || confirmEcho(id, snap.cards || [])) return;
-    d.notice = "目前未找到收據，請核對原對話。未重新送出。";
+    d.notice = "目前未找到收據，可按「重新送出」（同一識別碼，不會重複執行）。";
   } catch (_) {
     if (d.pending !== p) return;
     d.notice = "暫時無法確認送達。未重新送出。";
@@ -1914,13 +1917,19 @@ async function sendInput(text) {
   if (!navigator.onLine) { d.notice = "目前離線，訊息尚未送出"; showDraft(id); return; }
   const cid = crypto.randomUUID ? crypto.randomUUID() : Array.from(crypto.getRandomValues(
     new Uint32Array(4)), n => n.toString(16).padStart(8, "0")).join("");
-  const p = { cid, phase: "sending" };
+  const p = { cid, phase: "sending", startedAt: Date.now() };
   d.pending = p; d.notice = "送出中…"; showDraft(id);
+  await postInput(id, d, p);
+}
+
+// 實際把草稿 POST 出去。sendInput(第一次)與 retryDelivery(重送)共用 ——
+// 兩者帶**同一個** client_id,主機端的 (session, client_id) 冪等閘保證不會執行兩次。
+async function postInput(id, d, p) {
   try {
     const r = await api("/app/v2/sessions/" + encodeURIComponent(id) + "/input", {
       method: "POST", headers: { "Content-Type": "application/json" },
       signal: AbortSignal.timeout(90000),
-      body: JSON.stringify({ content: text, client_id: cid, ...(d.atts.length ? { attachments: d.atts } : {}) }),
+      body: JSON.stringify({ content: d.text, client_id: p.cid, ...(d.atts.length ? { attachments: d.atts } : {}) }),
     });
     const ack = await r.json();
     if (d.pending !== p) return; // SSE may acknowledge first, freeing the next draft.
@@ -1935,9 +1944,22 @@ async function sendInput(text) {
     // POST 逾時/斷線 ≠ 沒送到 —— CC 的投遞走 tmux,慢起來會超過 90s,而指令
     // 其實已經在跑(2026-11-13 機主回報「多次送出好像沒成功」,就是每次都
     // 被丟進手動確認)。所以先**自動**查收據(憑 client_id 比對),三次都
-    // 找不到才降級成手動的「查詢送達/結束追蹤」。
+    // 找不到才降級成手動的「查詢送達/結束追蹤/重新送出」。
     autoVerifyDelivery(id, d, p);
   }
+}
+
+// 「重新送出」:主機忙碌(執行中)時 POST 走 tmux 常拖過 90s 逾時,訊息會卡在
+// 「狀態不明」。這顆鈕用**原本那個** client_id 再送一次 —— 10 分鐘內主機只會
+// 回放第一次的結果(或繼續排隊),不會把指令執行兩次;超過去重時限才需要人判斷。
+async function retryDelivery() {
+  const id = state.current, d = draftFor(id), p = d.pending;
+  if (!p || p.phase !== "unknown") return;
+  const ageMin = (Date.now() - (p.startedAt || Date.now())) / 60000;
+  if (ageMin > 9 && !confirm(
+    "距第一次送出已超過主機的去重時限（10 分鐘）。若第一次其實已送達，重新送出會執行兩次。\n建議先按「確認送達」查一次。仍要重新送出？")) return;
+  p.phase = "sending"; d.notice = "重新送出中…（同一識別碼，不會重複執行）"; showDraft(id);
+  await postInput(id, d, p);
 }
 
 /// 送出結果不明時的自動確認:2s/8s/20s 三次查收據,中間使用者仍可「結束追蹤」。
@@ -1954,7 +1976,9 @@ async function autoVerifyDelivery(id, d, p) {
       if (confirmEcho(id, snap.cards || [])) return;   // 找到收據 → 解鎖,結案
     } catch (_) { if (d.pending !== p) return; }
   }
-  p.phase = "unknown"; d.notice = "送達狀態不明，請先確認。未重新送出。"; showDraft(id);
+  p.phase = "unknown";
+  d.notice = "送達狀態不明。可「重新送出」（同一識別碼，不會重複執行）、「確認送達」或「結束追蹤」。";
+  showDraft(id);
 }
 
 // 「停止沒反應」的沉默失敗現形(t3code #1 病:silent failure):按了中斷後若 6 秒
@@ -2133,6 +2157,7 @@ function wire() {
     autosize();
   });
   $("check-delivery").addEventListener("click", checkDelivery);
+  $("retry-delivery").addEventListener("click", retryDelivery);
   $("forget-delivery").addEventListener("click", () => {
     const id = state.current, d = draftFor(id);
     if (["unknown", "verifying"].includes(d.pending?.phase) && confirm("指令可能已在執行。結束追蹤並清空這則草稿？不會重送或停止工作。"))
