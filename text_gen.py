@@ -340,6 +340,9 @@ async def _lane_api(cfg: dict, prompt: str, system: str, max_tokens: int,
 _LOCAL_COOLDOWN_SECS = float(os.environ.get("POCKET_TEXTGEN_LOCAL_COOLDOWN",
                                             "600"))
 _local_blocked_until = 0.0
+#: 連續逾時幾次就冷卻(見 _lane_local 內 2026-11-28 事故註解)。
+_LOCAL_TIMEOUT_STREAK_MAX = 3
+_local_timeout_streak = 0
 
 
 def local_enabled() -> bool:
@@ -354,8 +357,9 @@ def local_enabled() -> bool:
 
 def reset_local_cooldown() -> None:
     """清掉本機 lane 的冷卻(設定一改就該重試;測試也用這支隔離狀態)。"""
-    global _local_blocked_until
+    global _local_blocked_until, _local_timeout_streak
     _local_blocked_until = 0.0
+    _local_timeout_streak = 0
 
 
 async def _lane_local(prompt: str, system: str, timeout: float) -> TextGenResult:
@@ -366,7 +370,7 @@ async def _lane_local(prompt: str, system: str, timeout: float) -> TextGenResult
     關掉**(靜默失敗紅線)。實作沿用 `harness/model.py` 的唯一實作,不在
     這裡複製第四份 Ollama 呼叫。
     """
-    global _local_blocked_until
+    global _local_blocked_until, _local_timeout_streak
     if not local_enabled():
         return TextGenResult(reason="local_disabled")
     if time.monotonic() < _local_blocked_until:
@@ -390,7 +394,17 @@ async def _lane_local(prompt: str, system: str, timeout: float) -> TextGenResult
             # 連不上(沒裝/沒開)→ 冷卻。逾時不冷卻:那是「在跑但慢」,
             # 把它當成缺席會讓慢機器永遠拿不到本機 lane。
             _local_blocked_until = time.monotonic() + _LOCAL_COOLDOWN_SECS
+        elif reason == "timeout":
+            # ……但**連續**逾時另當別論(2026-11-28 事故):每次逾時 httpx 棄單,
+            # Ollama 卻把生成跑完 —— 棄單堆起來把唯一 slot 永久佔滿,之後每發
+            # 必逾時、每發又加深飽和(575% CPU 連燒 3 小時)。偶發慢(1~2 次)
+            # 照舊不冷卻;連三次是病態,冷卻讓佇列有機會排空。
+            _local_timeout_streak += 1
+            if _local_timeout_streak >= _LOCAL_TIMEOUT_STREAK_MAX:
+                _local_blocked_until = time.monotonic() + _LOCAL_COOLDOWN_SECS
+                _local_timeout_streak = 0
         return TextGenResult(reason="local_" + reason, model=model_name)
+    _local_timeout_streak = 0
     text = strip_wrapping(text)
     if not text:
         return TextGenResult(reason="local_empty_text", model=model_name)

@@ -43,7 +43,7 @@ def distill_model() -> str:
 async def ollama_text(prompt: str, *, model: str | None = None,
                       num_ctx: int | None = None, timeout: float = 90.0,
                       temperature: float = 0.2, keep_alive: str = "15m",
-                      fmt: str | None = None) -> str:
+                      fmt: str | None = None, think: bool = False) -> str:
     """送一段提示詞給本機 Ollama,回傳純文字。
 
     **會拋**(`asyncio.TimeoutError` / httpx 例外)—— 由呼叫端決定 fail-soft
@@ -51,12 +51,20 @@ async def ollama_text(prompt: str, *, model: str | None = None,
     跑批錯誤、今晚不出提案」,兩種語意不該由這裡替人決定。
 
     `fmt="json"` 會請 Ollama 走 JSON mode(蒸餾用,回傳必為合法 JSON)。
+
+    `think` 預設 **False**:這裡的工作全是有時間預算的雜務(清稿/蒸餾/
+    roster 摘要),不需要 chain-of-thought。2026-11-28 事故:HARNESS_MODEL
+    被設成會思考的 qwen3.6 後,每次生成先燒幾百個思考 token,12 秒預算的
+    text_gen 本機 lane **必逾時**;httpx 棄單後 Ollama 照樣把生成跑完,
+    單一 slot 被棄單永久佔滿(575% CPU 連燒 3 小時),整台 Ollama 排不進
+    任何請求。模型不支援 think 欄位(400)就自動退一次、不帶再送。
     """
     import httpx
     payload: dict = {
         "model": model or distill_model(),
         "stream": False,
         "keep_alive": keep_alive,
+        "think": think,
         "messages": [{"role": "user", "content": prompt}],
         "options": {"temperature": temperature},
     }
@@ -68,6 +76,11 @@ async def ollama_text(prompt: str, *, model: str | None = None,
     async def _run() -> str:
         async with httpx.AsyncClient(timeout=timeout + 30) as client:
             r = await client.post(ollama_url() + "/api/chat", json=payload)
+            if r.status_code == 400 and "think" in payload and "think" in r.text:
+                # 舊版 Ollama / 不支援思考開關的模型會拒收這個欄位 —— 拿掉重送
+                # 一次,保持對既有模型(mistral 等)的行為不變。
+                payload.pop("think", None)
+                r = await client.post(ollama_url() + "/api/chat", json=payload)
             r.raise_for_status()
             return ((r.json().get("message") or {}).get("content") or "").strip()
 
